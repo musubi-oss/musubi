@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use musubi_auth::AuthService;
 use musubi_core::config::Config;
+use musubi_storage::StorageService;
 use sqlx::PgPool;
 use tokio::signal;
 use tracing::info;
@@ -13,6 +14,7 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub db: PgPool,
     pub auth: AuthService,
+    pub storage: StorageService,
     pub started_at: std::time::Instant,
 }
 
@@ -23,10 +25,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         db::migrate(&db).await?;
     }
     let auth = AuthService::new(db.clone(), &cfg.session)?;
+    let storage = StorageService::new(db.clone());
     let state = AppState {
         cfg: Arc::new(cfg),
         db,
         auth,
+        storage,
         started_at: std::time::Instant::now(),
     };
     let listener = tokio::net::TcpListener::bind(state.cfg.http.listen).await?;

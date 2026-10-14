@@ -1227,6 +1227,15 @@ dependencies = [
 [[package]]
 name = "musubi-cli"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "musubi-core",
+ "musubi-server",
+ "serde_json",
+ "tokio",
+ "toml",
+]
 
 [[package]]
 name = "musubi-cluster"
@@ -1263,6 +1272,7 @@ dependencies = [
  "http-body-util",
  "musubi-auth",
  "musubi-core",
+ "musubi-storage",
  "serde",
  "serde_json",
  "sqlx",
@@ -1272,11 +1282,22 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "musubi-storage"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "musubi-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "time",
+ "uuid",
+]
 
 [[package]]
 name = "musubi-transport"

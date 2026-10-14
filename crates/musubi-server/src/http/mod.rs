@@ -1,6 +1,7 @@
 mod auth;
 mod error;
 mod extract;
+mod storage;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -21,6 +22,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
         .merge(auth::routes())
+        .merge(storage::routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

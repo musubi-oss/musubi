@@ -6,6 +6,29 @@ clustered out of the box.
 
 Status: pre-alpha (M0 — foundation). Not usable yet.
 
+## Quick start (dev)
+
+```sh
+docker run -d --name musubi-pg -e POSTGRES_USER=musubi -e POSTGRES_PASSWORD=musubi \
+  -e POSTGRES_DB=musubi -p 5432:5432 postgres:16-alpine
+cargo run -p musubi-cli -- dev            # all roles in one process, migrates on start
+curl -s localhost:7350/v1/auth/device -H 'content-type: application/json' \
+  -d '{"id":"my-device-id-0001"}'          # → access_token / refresh_token
+```
+
+Configuration: TOML/YAML file via `--config`, every key overridable with
+`MUSUBI__SECTION__KEY` (e.g. `MUSUBI__DATABASE__URL`). `musubi config` prints the effective config.
+
+## HTTP API (so far)
+
+| route | auth | purpose |
+|---|---|---|
+| `GET /healthz`, `GET /readyz`, `GET /v1/node` | — | liveness, DB readiness, node info |
+| `POST /v1/auth/device`, `POST /v1/auth/email` | — | authenticate / create account, returns JWT access + refresh |
+| `POST /v1/auth/refresh` | — | rotate refresh token (reuse revokes the family) |
+| `POST /v1/auth/logout`, `GET /v1/account/me` | bearer | |
+| `POST /v1/storage/{read,write,delete}`, `GET /v1/storage/{collection}` | bearer | legacy KV storage, Nakama permission codes, CAS versions |
+
 ## Layout
 
 | crate | role |
