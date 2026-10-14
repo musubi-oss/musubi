@@ -5,6 +5,7 @@ mod error;
 mod extract;
 mod friends;
 mod groups;
+mod leaderboards;
 mod notifications;
 mod storage;
 mod ws;
@@ -20,7 +21,7 @@ use tower_http::trace::TraceLayer;
 use crate::app::AppState;
 
 pub use error::ApiError;
-pub use extract::Bearer;
+pub use extract::{Bearer, ServerKey};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .merge(groups::routes())
         .merge(notifications::routes())
         .merge(chat::routes())
+        .merge(leaderboards::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

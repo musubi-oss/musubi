@@ -33,6 +33,7 @@ async fn app() -> Option<Router> {
             hub.clone(),
         ),
         chat: musubi_chat::ChatService::new(db.clone()),
+        leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         hub,
         db,
         started_at: std::time::Instant::now(),
@@ -844,4 +845,262 @@ async fn migrate_once(db: &sqlx::PgPool) {
     static ONCE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     ONCE.get_or_init(|| async { musubi_server::db::migrate(db).await.unwrap() })
         .await;
+}
+
+async fn call_server(
+    app: &Router,
+    method: &str,
+    path: &str,
+    key: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-musubi-server-key", key);
+    let body = match body {
+        Some(b) => {
+            req = req.header(header::CONTENT_TYPE, "application/json");
+            Body::from(b.to_string())
+        }
+        None => Body::empty(),
+    };
+    let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn leaderboards_operators_ranks_and_authority() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("lb")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let lb = unique("weekly");
+
+    // server key required for creation
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        "wrong",
+        Some(json!({"id": lb})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, b) = call_server(&app, "POST", "/v1/server/leaderboards", "defaultkey", Some(json!({"id": lb, "sort_order": "desc", "operator": "best", "reset_schedule": "0 0 * * 1"}))).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert!(b["next_reset"].as_i64().unwrap() > 0);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        "defaultkey",
+        Some(json!({"id": lb})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // scores: best keeps the max; ranks are 1-based
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["rank"], 1);
+    let (_, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 50})),
+    )
+    .await;
+    assert_eq!(r["score"], 100);
+    assert_eq!(r["num_score"], 2);
+    call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&users[1].0),
+        Some(json!({"score": 300, "subscore": 1})),
+    )
+    .await;
+    let (_, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&users[2].0),
+        Some(json!({"score": 200})),
+    )
+    .await;
+    assert_eq!(r["rank"], 2);
+    assert!(r["expiry_time"].as_i64().unwrap() > 0);
+
+    // listing: ordered desc with ranks, owner_records with rank, paging
+    let (_, l) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/leaderboards/{lb}/records?limit=2&owner_ids={}",
+            users[0].1
+        ),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(l["records"].as_array().unwrap().len(), 2);
+    assert_eq!(l["records"][0]["owner_id"], users[1].1);
+    assert_eq!(l["records"][1]["rank"], 2);
+    assert_eq!(l["owner_records"][0]["rank"], 3);
+    assert_eq!(l["next_cursor"], "2");
+    let (_, l2) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/records?limit=2&cursor=2"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(l2["records"][0]["rank"], 3);
+    assert!(l2["next_cursor"].is_null());
+
+    // around
+    let (st, a) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/around/{}?limit=1", users[2].1),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["records"][0]["owner_id"], users[2].1);
+
+    // client cannot override operator; server can (set)
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 1, "operator": "set"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/leaderboards/{lb}/records/{}", users[0].1),
+        "defaultkey",
+        Some(json!({"score": 1, "operator": "set"})),
+    )
+    .await;
+    assert_eq!(r["score"], 1);
+
+    // own delete, then list shows 2
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(l["records"].as_array().unwrap().len(), 2);
+
+    // authoritative board rejects client writes, incr operator accumulates
+    let auth_lb = unique("auth");
+    call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        "defaultkey",
+        Some(json!({"id": auth_lb, "authoritative": true, "operator": "incr"})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{auth_lb}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/leaderboards/{auth_lb}/records/{}", users[0].1),
+        "defaultkey",
+        Some(json!({"score": 5})),
+    )
+    .await;
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/leaderboards/{auth_lb}/records/{}", users[0].1),
+        "defaultkey",
+        Some(json!({"score": 7})),
+    )
+    .await;
+    assert_eq!(r["score"], 12);
+    let (_, b) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{auth_lb}"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(b["next_reset"], 0);
+
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/leaderboards/{auth_lb}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{auth_lb}"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

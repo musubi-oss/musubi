@@ -51,6 +51,8 @@ pub struct NodeConfig {
 pub struct HttpConfig {
     pub listen: SocketAddr,
     pub max_body_bytes: usize,
+    /// Shared secret for server-to-server calls (`X-Musubi-Server-Key`). Change it outside dev.
+    pub server_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +96,7 @@ impl Default for HttpConfig {
         Self {
             listen: "0.0.0.0:7350".parse().unwrap(),
             max_body_bytes: 1 << 20,
+            server_key: "defaultkey".into(),
         }
     }
 }

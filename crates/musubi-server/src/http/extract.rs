@@ -28,3 +28,32 @@ impl FromRequestParts<AppState> for Bearer {
         Ok(Bearer(state.auth.verify_access(token)?))
     }
 }
+
+/// Server-to-server caller authenticated by the shared `http.server_key`.
+pub struct ServerKey;
+
+impl FromRequestParts<AppState> for ServerKey {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let given = parts
+            .headers
+            .get("x-musubi-server-key")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Key".into()))?;
+        let expected = state.cfg.http.server_key.as_bytes();
+        let ok = given.len() == expected.len()
+            && given
+                .bytes()
+                .zip(expected)
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !ok {
+            return Err(Error::Unauthenticated("bad server key".into()).into());
+        }
+        Ok(ServerKey)
+    }
+}
