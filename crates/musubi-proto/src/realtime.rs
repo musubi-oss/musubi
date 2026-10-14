@@ -51,6 +51,30 @@ pub enum ClientMessage {
         channel_id: String,
         message_id: String,
     },
+    /// Enter the matchmaker. Replies with `MatchmakerTicket`; later `MatchmakerMatched`.
+    MatchmakerAdd {
+        min_count: u32,
+        max_count: u32,
+        #[serde(default = "default_query")]
+        query: String,
+        #[serde(default)]
+        string_properties: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        numeric_properties: std::collections::HashMap<String, f64>,
+        #[serde(default = "one")]
+        count_multiple: u32,
+    },
+    MatchmakerRemove {
+        ticket: String,
+    },
+}
+
+fn default_query() -> String {
+    "*".into()
+}
+
+fn one() -> u32 {
+    1
 }
 
 /// Server → client.
@@ -109,6 +133,26 @@ pub enum ServerMessage {
         joins: Vec<UserPresence>,
         leaves: Vec<UserPresence>,
     },
+    MatchmakerTicket {
+        ticket: String,
+    },
+    /// A group was formed. `token` is presented when joining the resulting match.
+    MatchmakerMatched {
+        ticket: String,
+        token: String,
+        users: Vec<MatchmakerUser>,
+        #[serde(rename = "self")]
+        me: MatchmakerUser,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchmakerUser {
+    pub presence: UserPresence,
+    #[serde(default)]
+    pub string_properties: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub numeric_properties: std::collections::HashMap<String, f64>,
 }
 
 impl ServerMessage {

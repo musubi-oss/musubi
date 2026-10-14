@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use musubi_chat::{Channel, ChatService};
 use musubi_core::{AccountId, Error, GroupId};
-use musubi_proto::realtime::ChannelKind;
+use musubi_matchmaker::{AddTicket, Matchmaker};
+use musubi_proto::realtime::{ChannelKind, MatchmakerUser};
 use musubi_proto::{ClientMessage, Encoding, Envelope, ServerMessage, UserPresence};
 use musubi_transport::{Connection, Frame, Limits};
 use tokio::sync::mpsc;
@@ -17,6 +18,7 @@ pub struct ConnectParams {
     pub encoding: Encoding,
     pub limits: Limits,
     pub chat: ChatService,
+    pub matchmaker: Arc<Matchmaker>,
 }
 
 /// Drive one realtime connection until it closes. Registers with the hub on entry and
@@ -27,6 +29,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         encoding,
         limits,
         chat,
+        matchmaker,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -39,9 +42,11 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     let ctx = Ctx {
         hub: &hub,
         chat: &chat,
+        matchmaker: &matchmaker,
         presence: &presence,
     };
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
+    matchmaker.remove_session(sid);
     hub.leave(sid);
     conn.close().await;
     match result {
@@ -53,6 +58,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
 struct Ctx<'a> {
     hub: &'a Hub,
     chat: &'a ChatService,
+    matchmaker: &'a Matchmaker,
     presence: &'a UserPresence,
 }
 
@@ -158,6 +164,39 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                 .await
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
+        ClientMessage::MatchmakerAdd {
+            min_count,
+            max_count,
+            query,
+            string_properties,
+            numeric_properties,
+            count_multiple,
+        } => {
+            let me = MatchmakerUser {
+                presence: ctx.presence.clone(),
+                string_properties,
+                numeric_properties,
+            };
+            let res = ctx.matchmaker.add(AddTicket {
+                party_id: None,
+                members: vec![me],
+                query,
+                min_count: min_count as usize,
+                max_count: max_count as usize,
+                count_multiple: count_multiple as usize,
+            });
+            match res {
+                Ok(ticket) => {
+                    super::matchmaking::process_and_deliver(hub, ctx.matchmaker);
+                    Some(ServerMessage::MatchmakerTicket { ticket })
+                }
+                Err(e) => Some(ServerMessage::error(&e)),
+            }
+        }
+        ClientMessage::MatchmakerRemove { ticket } => match ctx.matchmaker.remove(sid, &ticket) {
+            Ok(()) => None,
+            Err(e) => Some(ServerMessage::error(&e)),
+        },
         ClientMessage::Ping => Some(ServerMessage::Pong),
         ClientMessage::StatusUpdate { status } => {
             if status.as_ref().is_some_and(|s| s.chars().count() > 128) {

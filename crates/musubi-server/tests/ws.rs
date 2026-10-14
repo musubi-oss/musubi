@@ -37,6 +37,7 @@ async fn start() -> Option<(String, axum::Router)> {
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
+        matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         hub,
         cfg: Arc::new(cfg),
         db,
@@ -418,4 +419,117 @@ async fn chat_room_and_direct_with_history_and_blocks() {
     assert!(
         matches!(recv(&mut b).await.msg, ServerMessage::ChannelPresenceEvent { leaves, .. } if leaves.len() == 1)
     );
+}
+
+#[tokio::test]
+async fn matchmaker_pairs_two_players_and_remove_works() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "binary";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    let region = uuid::Uuid::now_v7().simple().to_string();
+    let add = |rank: f64| ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: format!("+region:{region} +rank:>=5"),
+        string_properties: [("region".to_string(), region.clone())].into(),
+        numeric_properties: [("rank".to_string(), rank)].into(),
+        count_multiple: 1,
+    };
+    // C has too low a rank for A's query → never matched with A
+    send(&mut c, f, None, add(1.0)).await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    send(&mut a, f, Some("t"), add(10.0)).await;
+    let r = recv(&mut a).await;
+    assert_eq!(r.cid.as_deref(), Some("t"));
+    let ticket_a = match r.msg {
+        ServerMessage::MatchmakerTicket { ticket } => ticket,
+        m => panic!("{m:?}"),
+    };
+    // invalid counts → error
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchmakerAdd {
+            min_count: 1,
+            max_count: 1,
+            query: "*".into(),
+            string_properties: Default::default(),
+            numeric_properties: Default::default(),
+            count_multiple: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Error { .. }
+    ));
+
+    send(&mut b, f, None, add(7.0)).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    let ma = match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerMatched {
+            ticket,
+            token,
+            users,
+            me,
+        } => {
+            assert_eq!(ticket, ticket_a);
+            assert_eq!(users.len(), 2);
+            assert_eq!(me.numeric_properties["rank"], 10.0);
+            token
+        }
+        m => panic!("{m:?}"),
+    };
+    match recv(&mut b).await.msg {
+        ServerMessage::MatchmakerMatched { token, users, .. } => {
+            assert_eq!(token, ma);
+            assert_eq!(users.len(), 2);
+        }
+        m => panic!("{m:?}"),
+    }
+    // consumed ticket cannot be removed; C's own can
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchmakerRemove { ticket: ticket_a },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::NotFound,
+            ..
+        }
+    ));
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchmakerRemove {
+            ticket: "nope".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::NotFound,
+            ..
+        }
+    ));
 }

@@ -62,6 +62,7 @@ async fn upgrade(
                 encoding,
                 limits: Limits::default(),
                 chat: s.chat.clone(),
+                matchmaker: s.matchmaker.clone(),
             };
             crate::realtime::serve(hub, Box::new(WsConnection::new(socket)), params).await;
         }))

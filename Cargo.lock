@@ -1489,6 +1489,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "musubi-matchmaker"
+version = "0.1.0"
+dependencies = [
+ "musubi-core",
+ "musubi-proto",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "musubi-proto"
 version = "0.1.0"
 dependencies = [
@@ -1516,6 +1528,7 @@ dependencies = [
  "musubi-chat",
  "musubi-core",
  "musubi-leaderboard",
+ "musubi-matchmaker",
  "musubi-proto",
  "musubi-social",
  "musubi-storage",

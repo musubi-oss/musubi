@@ -18,6 +18,7 @@ musubi-account.workspace = true
 musubi-social.workspace = true
 musubi-chat.workspace = true
 musubi-leaderboard.workspace = true
+musubi-matchmaker.workspace = true
 musubi-proto.workspace = true
 musubi-transport.workspace = true
 dashmap.workspace = true

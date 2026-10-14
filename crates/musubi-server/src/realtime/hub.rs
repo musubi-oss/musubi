@@ -221,6 +221,12 @@ impl Hub {
         }
     }
 
+    pub fn send_to_session(&self, session_id: SessionId, msg: ServerMessage) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|h| h.tx.try_send(msg).is_ok())
+    }
+
     pub fn send_to_account(&self, account_id: AccountId, msg: ServerMessage) -> usize {
         let Some(sids) = self.by_account.get(&account_id) else {
             return 0;

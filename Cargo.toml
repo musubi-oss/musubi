@@ -21,6 +21,7 @@ musubi-account = { path = "crates/musubi-account" }
 musubi-social = { path = "crates/musubi-social" }
 musubi-chat = { path = "crates/musubi-chat" }
 musubi-leaderboard = { path = "crates/musubi-leaderboard" }
+musubi-matchmaker = { path = "crates/musubi-matchmaker" }
 musubi-storage = { path = "crates/musubi-storage" }
 musubi-server = { path = "crates/musubi-server" }
 

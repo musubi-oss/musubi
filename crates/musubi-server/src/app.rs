@@ -5,6 +5,7 @@ use musubi_auth::AuthService;
 use musubi_chat::ChatService;
 use musubi_core::config::Config;
 use musubi_leaderboard::{LeaderboardService, TournamentService};
+use musubi_matchmaker::Matchmaker;
 use musubi_social::{GroupService, NotificationService, SocialService};
 
 use crate::notify::Notifier;
@@ -29,6 +30,7 @@ pub struct AppState {
     pub chat: ChatService,
     pub leaderboards: LeaderboardService,
     pub tournaments: TournamentService,
+    pub matchmaker: Arc<Matchmaker>,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -48,6 +50,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let leaderboards = LeaderboardService::new(db.clone());
     let tournaments = TournamentService::new(db.clone());
     let hub = Arc::new(Hub::new());
+    let matchmaker = Arc::new(Matchmaker::default());
+    crate::realtime::matchmaking::spawn_ticker(
+        hub.clone(),
+        matchmaker.clone(),
+        std::time::Duration::from_secs(1),
+    );
     let notify = Notifier::new(NotificationService::new(db.clone()), hub.clone());
     let state = AppState {
         cfg: Arc::new(cfg),
@@ -61,6 +69,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         chat,
         leaderboards,
         tournaments,
+        matchmaker,
         hub,
         started_at: std::time::Instant::now(),
     };

@@ -35,6 +35,7 @@ async fn app() -> Option<Router> {
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
+        matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         hub,
         db,
         started_at: std::time::Instant::now(),

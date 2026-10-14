@@ -2,6 +2,7 @@
 //! Cluster-wide presence arrives with `musubi-cluster`; the Hub API is already shaped for it.
 
 mod hub;
+pub mod matchmaking;
 mod session;
 
 pub use hub::Hub;
