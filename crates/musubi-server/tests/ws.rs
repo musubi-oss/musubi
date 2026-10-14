@@ -70,7 +70,7 @@ async fn send(ws: &mut Ws, format: &str, cid: Option<&str>, msg: ClientMessage) 
         msg,
     };
     let m = if format == "json" {
-        Message::Text(serde_json::to_string(&env).unwrap().into())
+        Message::Text(serde_json::to_string(&env).unwrap())
     } else {
         Message::Binary(Encoding::Postcard.encode(&env).unwrap().to_vec())
     };
@@ -173,7 +173,6 @@ async fn rejects_bad_token() {
     };
     let err = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token=garbage"))
         .await
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
     assert!(err.to_string().contains("401"), "{err}");
 }
