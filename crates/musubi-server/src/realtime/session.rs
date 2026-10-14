@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::hub::SessionHandle;
-use super::Hub;
+use super::{Hub, PartyRegistry};
 
 pub struct ConnectParams {
     pub presence: UserPresence,
@@ -19,6 +19,7 @@ pub struct ConnectParams {
     pub limits: Limits,
     pub chat: ChatService,
     pub matchmaker: Arc<Matchmaker>,
+    pub parties: Arc<PartyRegistry>,
 }
 
 /// Drive one realtime connection until it closes. Registers with the hub on entry and
@@ -30,6 +31,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         limits,
         chat,
         matchmaker,
+        parties,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -43,9 +45,13 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         hub: &hub,
         chat: &chat,
         matchmaker: &matchmaker,
+        parties: &parties,
         presence: &presence,
     };
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
+    for t in parties.leave_all(&hub, sid) {
+        matchmaker.cancel(&t);
+    }
     matchmaker.remove_session(sid);
     hub.leave(sid);
     conn.close().await;
@@ -59,6 +65,7 @@ struct Ctx<'a> {
     hub: &'a Hub,
     chat: &'a ChatService,
     matchmaker: &'a Matchmaker,
+    parties: &'a PartyRegistry,
     presence: &'a UserPresence,
 }
 
@@ -187,7 +194,7 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             });
             match res {
                 Ok(ticket) => {
-                    super::matchmaking::process_and_deliver(hub, ctx.matchmaker);
+                    super::matchmaking::process_and_deliver(hub, ctx.parties, ctx.matchmaker);
                     Some(ServerMessage::MatchmakerTicket { ticket })
                 }
                 Err(e) => Some(ServerMessage::error(&e)),
@@ -197,6 +204,94 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             Ok(()) => None,
             Err(e) => Some(ServerMessage::error(&e)),
         },
+        ClientMessage::PartyCreate { open, max_size } => Some(
+            ctx.parties
+                .create(ctx.presence, open, max_size)
+                .unwrap_or_else(|e| ServerMessage::error(&e)),
+        ),
+        ClientMessage::PartyJoin { party_id } => {
+            match ctx.parties.join(hub, ctx.presence, &party_id) {
+                Ok(reply) => reply,
+                Err(e) => Some(ServerMessage::error(&e)),
+            }
+        }
+        ClientMessage::PartyLeave { party_id } => match ctx.parties.leave(hub, sid, &party_id) {
+            Ok(tickets) => {
+                for t in tickets {
+                    ctx.matchmaker.cancel(&t);
+                }
+                None
+            }
+            Err(e) => Some(ServerMessage::error(&e)),
+        },
+        ClientMessage::PartyPromote { party_id, presence } => ctx
+            .parties
+            .promote(hub, sid, &party_id, &presence)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
+        ClientMessage::PartyAccept { party_id, presence } => ctx
+            .parties
+            .accept(hub, sid, &party_id, &presence)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
+        ClientMessage::PartyRemove { party_id, presence } => ctx
+            .parties
+            .remove(hub, sid, &party_id, &presence)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
+        ClientMessage::PartyClose { party_id } => match ctx.parties.close(hub, sid, &party_id) {
+            Ok(tickets) => {
+                for t in tickets {
+                    ctx.matchmaker.cancel(&t);
+                }
+                None
+            }
+            Err(e) => Some(ServerMessage::error(&e)),
+        },
+        ClientMessage::PartyJoinRequestList { party_id } => Some(
+            ctx.parties
+                .requests(sid, &party_id)
+                .unwrap_or_else(|e| ServerMessage::error(&e)),
+        ),
+        ClientMessage::PartyDataSend {
+            party_id,
+            op_code,
+            data,
+        } => ctx
+            .parties
+            .data(hub, ctx.presence, &party_id, op_code, data)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
+        ClientMessage::PartyMatchmakerAdd {
+            party_id,
+            min_count,
+            max_count,
+            query,
+            string_properties,
+            numeric_properties,
+            count_multiple,
+        } => Some(
+            party_matchmake(
+                ctx,
+                &party_id,
+                min_count,
+                max_count,
+                query,
+                string_properties,
+                numeric_properties,
+                count_multiple,
+            )
+            .unwrap_or_else(|e| ServerMessage::error(&e)),
+        ),
+        ClientMessage::PartyMatchmakerRemove { party_id, ticket } => {
+            match ctx.parties.untrack_ticket(sid, &party_id, &ticket) {
+                Ok(()) => {
+                    ctx.matchmaker.cancel(&ticket);
+                    None
+                }
+                Err(e) => Some(ServerMessage::error(&e)),
+            }
+        }
         ClientMessage::Ping => Some(ServerMessage::Pong),
         ClientMessage::StatusUpdate { status } => {
             if status.as_ref().is_some_and(|s| s.chars().count() > 128) {
@@ -325,4 +420,47 @@ fn ack_of(m: &musubi_proto::realtime::ChannelMessage) -> ServerMessage {
         update_time: m.update_time,
         persistent: m.persistent,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn party_matchmake(
+    ctx: &Ctx<'_>,
+    party_id: &str,
+    min_count: u32,
+    max_count: u32,
+    query: String,
+    string_properties: std::collections::HashMap<String, String>,
+    numeric_properties: std::collections::HashMap<String, f64>,
+    count_multiple: u32,
+) -> musubi_core::Result<ServerMessage> {
+    let sid = ctx.presence.session_id;
+    let members = ctx.parties.members_for_ticket(sid, party_id)?;
+    let candidates = members
+        .into_iter()
+        .map(|presence| MatchmakerUser {
+            presence,
+            string_properties: string_properties.clone(),
+            numeric_properties: numeric_properties.clone(),
+        })
+        .collect();
+    let ticket = ctx.matchmaker.add(AddTicket {
+        party_id: Some(party_id.to_string()),
+        members: candidates,
+        query,
+        min_count: min_count as usize,
+        max_count: max_count as usize,
+        count_multiple: count_multiple as usize,
+    })?;
+    ctx.parties.track_ticket(party_id, &ticket);
+    let msg = ServerMessage::PartyMatchmakerTicket {
+        party_id: party_id.to_string(),
+        ticket: ticket.clone(),
+    };
+    for s in ctx.parties.member_sessions(party_id) {
+        if s != sid {
+            ctx.hub.send_to_session(s, msg.clone());
+        }
+    }
+    super::matchmaking::process_and_deliver(ctx.hub, ctx.parties, ctx.matchmaker);
+    Ok(msg)
 }

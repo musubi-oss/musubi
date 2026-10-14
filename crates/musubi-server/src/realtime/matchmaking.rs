@@ -6,12 +6,15 @@ use std::time::Duration;
 use musubi_matchmaker::{Matched, Matchmaker};
 use musubi_proto::ServerMessage;
 
-use super::Hub;
+use super::{Hub, PartyRegistry};
 
 /// Deliver a formed group to every member session.
-pub fn deliver(hub: &Hub, m: &Matched) {
+pub fn deliver(hub: &Hub, parties: &PartyRegistry, m: &Matched) {
     let users = m.users();
     for t in &m.tickets {
+        if let Some(pid) = &t.party_id {
+            parties.ticket_consumed(pid, &t.id);
+        }
         for member in &t.members {
             hub.send_to_session(
                 member.presence.session_id,
@@ -26,15 +29,16 @@ pub fn deliver(hub: &Hub, m: &Matched) {
     }
 }
 
-pub fn process_and_deliver(hub: &Hub, mm: &Matchmaker) {
+pub fn process_and_deliver(hub: &Hub, parties: &PartyRegistry, mm: &Matchmaker) {
     for m in mm.process() {
-        deliver(hub, &m);
+        deliver(hub, parties, &m);
     }
 }
 
 /// Background pass so tickets that waited out `min_wait` still get matched without new arrivals.
 pub fn spawn_ticker(
     hub: Arc<Hub>,
+    parties: Arc<PartyRegistry>,
     mm: Arc<Matchmaker>,
     every: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -42,7 +46,7 @@ pub fn spawn_ticker(
         let mut tick = tokio::time::interval(every);
         loop {
             tick.tick().await;
-            process_and_deliver(&hub, &mm);
+            process_and_deliver(&hub, &parties, &mm);
         }
     })
 }

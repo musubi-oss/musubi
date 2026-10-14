@@ -160,6 +160,17 @@ impl Matchmaker {
         Ok(())
     }
 
+    /// Cancel a ticket by id regardless of who asks (party composition changed, disconnect cleanup).
+    pub fn cancel(&self, ticket: &str) -> bool {
+        let mut pool = self.pool.lock();
+        let Some(idx) = pool.tickets.iter().position(|t| t.id == ticket) else {
+            return false;
+        };
+        let t = pool.tickets.remove(idx);
+        unindex(&mut pool, &t);
+        true
+    }
+
     /// Drop every ticket the session takes part in (disconnect). Returns the affected ticket ids.
     pub fn remove_session(&self, session: SessionId) -> Vec<String> {
         let mut pool = self.pool.lock();

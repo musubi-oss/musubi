@@ -67,6 +67,69 @@ pub enum ClientMessage {
     MatchmakerRemove {
         ticket: String,
     },
+    /// Parties: small realtime groups with a leader. Closed parties admit members via join requests.
+    PartyCreate {
+        #[serde(default)]
+        open: bool,
+        #[serde(default = "default_party_size")]
+        max_size: u32,
+    },
+    PartyJoin {
+        party_id: String,
+    },
+    PartyLeave {
+        party_id: String,
+    },
+    /// Leader only: make another member leader.
+    PartyPromote {
+        party_id: String,
+        presence: UserPresence,
+    },
+    /// Leader only: accept a pending join request.
+    PartyAccept {
+        party_id: String,
+        presence: UserPresence,
+    },
+    /// Leader only: kick a member or reject a join request.
+    PartyRemove {
+        party_id: String,
+        presence: UserPresence,
+    },
+    /// Leader only: disband.
+    PartyClose {
+        party_id: String,
+    },
+    PartyJoinRequestList {
+        party_id: String,
+    },
+    PartyDataSend {
+        party_id: String,
+        op_code: i64,
+        #[serde(default)]
+        data: Vec<u8>,
+    },
+    /// Leader only: matchmake the whole party as one ticket.
+    PartyMatchmakerAdd {
+        party_id: String,
+        min_count: u32,
+        max_count: u32,
+        #[serde(default = "default_query")]
+        query: String,
+        #[serde(default)]
+        string_properties: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        numeric_properties: std::collections::HashMap<String, f64>,
+        #[serde(default = "one")]
+        count_multiple: u32,
+    },
+    PartyMatchmakerRemove {
+        party_id: String,
+        ticket: String,
+    },
+}
+
+fn default_party_size() -> u32 {
+    4
 }
 
 fn default_query() -> String {
@@ -143,6 +206,43 @@ pub enum ServerMessage {
         users: Vec<MatchmakerUser>,
         #[serde(rename = "self")]
         me: MatchmakerUser,
+    },
+    /// Reply to create/join/accept: the party as the receiver sees it.
+    Party {
+        party_id: String,
+        open: bool,
+        max_size: u32,
+        #[serde(rename = "self")]
+        me: UserPresence,
+        leader: UserPresence,
+        presences: Vec<UserPresence>,
+    },
+    /// Sent to the leader when someone asks to join a closed party, and as the reply to `PartyJoinRequestList`.
+    PartyJoinRequest {
+        party_id: String,
+        presences: Vec<UserPresence>,
+    },
+    PartyLeader {
+        party_id: String,
+        presence: UserPresence,
+    },
+    PartyPresenceEvent {
+        party_id: String,
+        joins: Vec<UserPresence>,
+        leaves: Vec<UserPresence>,
+    },
+    PartyData {
+        party_id: String,
+        presence: UserPresence,
+        op_code: i64,
+        data: Vec<u8>,
+    },
+    PartyMatchmakerTicket {
+        party_id: String,
+        ticket: String,
+    },
+    PartyClose {
+        party_id: String,
     },
 }
 

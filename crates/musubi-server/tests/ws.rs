@@ -38,6 +38,7 @@ async fn start() -> Option<(String, axum::Router)> {
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
+        parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         hub,
         cfg: Arc::new(cfg),
         db,
@@ -525,6 +526,288 @@ async fn matchmaker_pairs_two_players_and_remove_works() {
         },
     )
     .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::NotFound,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn parties_create_join_requests_leader_data_and_party_matchmaking() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+
+    // A creates a closed party of 2
+    send(
+        &mut a,
+        f,
+        Some("c"),
+        ClientMessage::PartyCreate {
+            open: false,
+            max_size: 2,
+        },
+    )
+    .await;
+    let (pid, pa) = match recv(&mut a).await.msg {
+        ServerMessage::Party {
+            party_id,
+            me,
+            leader,
+            presences,
+            open,
+            ..
+        } => {
+            assert!(!open);
+            assert_eq!(leader, me);
+            assert_eq!(presences.len(), 1);
+            (party_id, me)
+        }
+        m => panic!("{m:?}"),
+    };
+    // B asks to join → A gets a join request, B gets nothing yet
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyJoin {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    let pb = match recv(&mut a).await.msg {
+        ServerMessage::PartyJoinRequest { presences, .. } => presences[0].clone(),
+        m => panic!("{m:?}"),
+    };
+    // C is not leader → cannot accept
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::PartyAccept {
+            party_id: pid.clone(),
+            presence: pb.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error { .. }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyAccept {
+            party_id: pid.clone(),
+            presence: pb.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::PartyPresenceEvent { joins, .. } if joins.len() == 1)
+    );
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::Party { presences, .. } if presences.len() == 2)
+    );
+    // full now: C's request is queued but cannot be accepted
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::PartyJoin {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    let pc = match recv(&mut a).await.msg {
+        ServerMessage::PartyJoinRequest { presences, .. } => presences[0].clone(),
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyAccept {
+            party_id: pid.clone(),
+            presence: pc.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::ResourceExhausted,
+            ..
+        }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyRemove {
+            party_id: pid.clone(),
+            presence: pc,
+        },
+    )
+    .await;
+
+    // party data reaches both members
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyDataSend {
+            party_id: pid.clone(),
+            op_code: 7,
+            data: vec![1, 2, 3],
+        },
+    )
+    .await;
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::PartyData {
+                op_code,
+                data,
+                presence,
+                ..
+            } => {
+                assert_eq!(op_code, 7);
+                assert_eq!(data, vec![1, 2, 3]);
+                assert_eq!(presence.session_id, pb.session_id);
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+
+    // party matchmaking: only the leader may; both get the ticket
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyMatchmakerAdd {
+            party_id: pid.clone(),
+            min_count: 2,
+            max_count: 2,
+            query: "*".into(),
+            string_properties: Default::default(),
+            numeric_properties: Default::default(),
+            count_multiple: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::PermissionDenied,
+            ..
+        }
+    ));
+    let region = uuid::Uuid::now_v7().simple().to_string();
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyMatchmakerAdd {
+            party_id: pid.clone(),
+            min_count: 2,
+            max_count: 2,
+            query: format!("+region:{region}"),
+            string_properties: [("region".to_string(), region.clone())].into(),
+            numeric_properties: Default::default(),
+            count_multiple: 1,
+        },
+    )
+    .await;
+    let ticket = match recv(&mut a).await.msg {
+        ServerMessage::PartyMatchmakerTicket { ticket, .. } => ticket,
+        m => panic!("{m:?}"),
+    };
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::PartyMatchmakerTicket { ticket: t, .. } if t == ticket)
+    );
+    // the party alone fills a 2-player match
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::MatchmakerMatched {
+                ticket: t, users, ..
+            } => {
+                assert_eq!(t, ticket);
+                assert_eq!(users.len(), 2);
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+
+    // leader promotes B, then leaves → B stays leader, A can create a new party
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyPromote {
+            party_id: pid.clone(),
+            presence: pb.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::PartyLeader { presence, .. } if presence.session_id == pb.session_id)
+    );
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::PartyLeader { .. }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyLeave {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::PartyPresenceEvent { leaves, .. } if leaves[0].session_id == pa.session_id)
+    );
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyCreate {
+            open: true,
+            max_size: 4,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Party { .. }
+    ));
+    // B closes its party; A's open party accepts C directly
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyClose {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::PartyClose { .. }
+    ));
+    send(&mut c, f, None, ClientMessage::PartyJoin { party_id: pid }).await;
     assert!(matches!(
         recv(&mut c).await.msg,
         ServerMessage::Error {

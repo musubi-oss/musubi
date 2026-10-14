@@ -3,7 +3,9 @@
 
 mod hub;
 pub mod matchmaking;
+pub mod party;
 mod session;
 
 pub use hub::Hub;
+pub use party::PartyRegistry;
 pub use session::{serve, ConnectParams};
