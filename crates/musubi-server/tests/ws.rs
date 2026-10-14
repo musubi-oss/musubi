@@ -36,6 +36,7 @@ async fn start() -> Option<(String, axum::Router)> {
         ),
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
+        tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
         hub,
         cfg: Arc::new(cfg),
         db,

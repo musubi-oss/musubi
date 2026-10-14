@@ -8,6 +8,7 @@ mod groups;
 mod leaderboards;
 mod notifications;
 mod storage;
+mod tournaments;
 mod ws;
 
 use axum::extract::State;
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .merge(notifications::routes())
         .merge(chat::routes())
         .merge(leaderboards::routes())
+        .merge(tournaments::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

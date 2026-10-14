@@ -34,6 +34,7 @@ async fn app() -> Option<Router> {
         ),
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
+        tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
         hub,
         db,
         started_at: std::time::Instant::now(),
@@ -1103,4 +1104,198 @@ async fn leaderboards_operators_ranks_and_authority() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn tournaments_join_caps_and_lifetime() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("tn")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let id = unique("cup");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/tournaments",
+        "defaultkey",
+        Some(json!({"id": id, "title": "Cup"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "needs duration/end/reset");
+    let (st, t) = call_server(&app, "POST", "/v1/server/tournaments", "defaultkey", Some(json!({
+        "id": id, "title": "Cup", "category": 7, "duration": 3600, "max_size": 2, "max_num_score": 2, "join_required": true
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["can_enter"], true);
+    assert!(t["end_active"].as_i64().unwrap() > 0);
+    assert_eq!(t["size"], 0);
+
+    // join_required: writing before joining is denied
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/join"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/join"),
+        Some(&users[1].0),
+        None,
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/join"),
+        Some(&users[2].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "max_size");
+    let (_, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/tournaments/{id}"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(t["size"], 2);
+    assert_eq!(t["can_enter"], false);
+
+    // max_num_score = 2 submissions
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["num_score"], 1);
+    call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 20})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 30})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "max_num_score");
+    let (_, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(&users[1].0),
+        None,
+    )
+    .await;
+    assert_eq!(l["records"][0]["score"], 20);
+    assert_eq!(l["records"][0]["rank"], 1);
+
+    // category filter in list
+    let (_, l) = call(
+        &app,
+        "GET",
+        "/v1/tournaments?category_start=7&category_end=7&limit=100",
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert!(l["tournaments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["id"] == id));
+    let (_, l) = call(
+        &app,
+        "GET",
+        "/v1/tournaments?category_start=8",
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert!(!l["tournaments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["id"] == id));
+
+    // ended tournament: not active, join/write fail with 503
+    let past = unique("past");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let (st, t) = call_server(
+        &app,
+        "POST",
+        "/v1/server/tournaments",
+        "defaultkey",
+        Some(json!({"id": past, "start_time": now - 7200, "end_time": now - 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["can_enter"], false);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{past}/join"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+
+    // a tournament is not a plain leaderboard and vice versa
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/tournaments/{}", "nope"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/tournaments/{id}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
 }

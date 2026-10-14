@@ -4,7 +4,7 @@ use musubi_account::AccountService;
 use musubi_auth::AuthService;
 use musubi_chat::ChatService;
 use musubi_core::config::Config;
-use musubi_leaderboard::LeaderboardService;
+use musubi_leaderboard::{LeaderboardService, TournamentService};
 use musubi_social::{GroupService, NotificationService, SocialService};
 
 use crate::notify::Notifier;
@@ -28,6 +28,7 @@ pub struct AppState {
     pub notify: Notifier,
     pub chat: ChatService,
     pub leaderboards: LeaderboardService,
+    pub tournaments: TournamentService,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -45,6 +46,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let groups = GroupService::new(db.clone());
     let chat = ChatService::new(db.clone());
     let leaderboards = LeaderboardService::new(db.clone());
+    let tournaments = TournamentService::new(db.clone());
     let hub = Arc::new(Hub::new());
     let notify = Notifier::new(NotificationService::new(db.clone()), hub.clone());
     let state = AppState {
@@ -58,6 +60,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         notify,
         chat,
         leaderboards,
+        tournaments,
         hub,
         started_at: std::time::Instant::now(),
     };

@@ -1,5 +1,8 @@
 //! Leaderboards: definitions, score submission with operators, ranked listing and reset windows.
 
+pub mod tournament;
+pub use tournament::{CreateTournament, Tournament, TournamentFilter, TournamentService};
+
 use std::str::FromStr;
 
 use musubi_core::{AccountId, Error, Result};
@@ -170,7 +173,7 @@ pub fn window(
     Ok((to_t(prev), to_t(next)))
 }
 
-fn parse_cron(s: &str) -> Result<cron::Schedule> {
+pub(crate) fn parse_cron(s: &str) -> Result<cron::Schedule> {
     // Accept standard 5-field crontab; the `cron` crate wants seconds first.
     let fields = s.split_whitespace().count();
     let spec = match fields {
