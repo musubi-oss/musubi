@@ -18,6 +18,7 @@ musubi-transport = { path = "crates/musubi-transport" }
 musubi-edge = { path = "crates/musubi-edge" }
 musubi-auth = { path = "crates/musubi-auth" }
 musubi-account = { path = "crates/musubi-account" }
+musubi-social = { path = "crates/musubi-social" }
 musubi-storage = { path = "crates/musubi-storage" }
 musubi-server = { path = "crates/musubi-server" }
 

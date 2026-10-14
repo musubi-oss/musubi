@@ -2,6 +2,7 @@ mod account;
 mod auth;
 mod error;
 mod extract;
+mod friends;
 mod storage;
 mod ws;
 
@@ -25,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/node", get(node_info))
         .merge(auth::routes())
         .merge(account::routes())
+        .merge(friends::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

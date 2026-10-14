@@ -25,6 +25,7 @@ async fn app() -> Option<Router> {
         auth,
         storage,
         accounts: musubi_account::AccountService::new(db.clone()),
+        social: musubi_social::SocialService::new(db.clone()),
         hub: std::sync::Arc::new(musubi_server::realtime::Hub::new()),
         db,
         started_at: std::time::Instant::now(),
@@ -471,4 +472,134 @@ async fn account_update_link_unlink_and_users_lookup() {
     assert_eq!(st, StatusCode::OK);
     let (st, _) = call(&app, "GET", "/v1/account", Some(t), None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn friends_invite_accept_remove_block() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("fr")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, a) = &users[0];
+    let (tb, b) = &users[1];
+    let (tc, c) = &users[2];
+
+    // A invites B → A sees state 1, B sees state 2
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(ta), None).await;
+    assert_eq!(l["friends"][0]["state"], 1);
+    assert_eq!(l["friends"][0]["user"]["id"], *b);
+    let (_, l) = call(&app, "GET", "/v1/friends?state=2", Some(tb), None).await;
+    assert_eq!(l["friends"][0]["state"], 2);
+
+    // B accepts → both 0
+    call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(tb),
+        Some(json!({"ids": [a]})),
+    )
+    .await;
+    let (_, l) = call(&app, "GET", "/v1/friends?state=0", Some(ta), None).await;
+    assert_eq!(l["friends"].as_array().unwrap().len(), 1);
+    let (_, l) = call(&app, "GET", "/v1/friends?state=0", Some(tb), None).await;
+    assert_eq!(l["friends"].as_array().unwrap().len(), 1);
+
+    // self / empty / unknown
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(ta),
+        Some(json!({"ids": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(ta),
+        Some(json!({"ids": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(ta),
+        Some(json!({"ids": [uuid::Uuid::now_v7()]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // A removes B → both empty
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        "/v1/friends",
+        Some(ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(tb), None).await;
+    assert!(l["friends"].as_array().unwrap().is_empty());
+
+    // C blocks A: A's invite to C is dropped silently, C sees state 3, A sees nothing
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends/block",
+        Some(tc),
+        Some(json!({"ids": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(ta),
+        Some(json!({"ids": [c]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(ta), None).await;
+    assert!(l["friends"].as_array().unwrap().is_empty(), "{l}");
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(tc), None).await;
+    assert_eq!(l["friends"][0]["state"], 3);
+    // unblock = delete
+    call(
+        &app,
+        "DELETE",
+        "/v1/friends",
+        Some(tc),
+        Some(json!({"ids": [a]})),
+    )
+    .await;
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(tc), None).await;
+    assert!(l["friends"].as_array().unwrap().is_empty());
 }

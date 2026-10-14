@@ -1427,6 +1427,7 @@ dependencies = [
  "musubi-auth",
  "musubi-core",
  "musubi-proto",
+ "musubi-social",
  "musubi-storage",
  "musubi-transport",
  "serde",
@@ -1439,6 +1440,19 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "musubi-social"
+version = "0.1.0"
+dependencies = [
+ "musubi-account",
+ "musubi-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
  "uuid",
 ]
 

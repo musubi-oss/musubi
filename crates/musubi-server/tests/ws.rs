@@ -26,6 +26,7 @@ async fn start() -> Option<(String, axum::Router)> {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
         accounts: musubi_account::AccountService::new(db.clone()),
+        social: musubi_social::SocialService::new(db.clone()),
         hub: Arc::new(Hub::new()),
         cfg: Arc::new(cfg),
         db,
