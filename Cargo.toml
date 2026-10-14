@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/musubi/musubi"
+repository = "https://github.com/musubi-oss/musubi"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tonic = "0.12"
 prost = "0.13"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "time", "json", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "time", "json", "migrate", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
