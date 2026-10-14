@@ -3,7 +3,9 @@ use std::sync::Arc;
 use musubi_account::AccountService;
 use musubi_auth::AuthService;
 use musubi_core::config::Config;
-use musubi_social::{GroupService, SocialService};
+use musubi_social::{GroupService, NotificationService, SocialService};
+
+use crate::notify::Notifier;
 use musubi_storage::StorageService;
 use sqlx::PgPool;
 use tokio::signal;
@@ -21,6 +23,7 @@ pub struct AppState {
     pub accounts: AccountService,
     pub social: SocialService,
     pub groups: GroupService,
+    pub notify: Notifier,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -36,6 +39,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let accounts = AccountService::new(db.clone());
     let social = SocialService::new(db.clone());
     let groups = GroupService::new(db.clone());
+    let hub = Arc::new(Hub::new());
+    let notify = Notifier::new(NotificationService::new(db.clone()), hub.clone());
     let state = AppState {
         cfg: Arc::new(cfg),
         db,
@@ -44,7 +49,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         accounts,
         social,
         groups,
-        hub: Arc::new(Hub::new()),
+        notify,
+        hub,
         started_at: std::time::Instant::now(),
     };
     let listener = tokio::net::TcpListener::bind(state.cfg.http.listen).await?;

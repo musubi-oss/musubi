@@ -2,7 +2,8 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::AccountId;
-use musubi_social::{FriendList, FriendState};
+use musubi_social::notifications::code;
+use musubi_social::{FriendList, FriendState, NewNotification};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -41,7 +42,36 @@ async fn add(
     Json(b): Json<Ids>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ids = resolve(&s, b).await?;
-    s.social.add(me.account_id, &ids).await?;
+    let outcomes = s.social.add(me.account_id, &ids).await?;
+    if !outcomes.is_empty() {
+        let username = s
+            .accounts
+            .get_users(&[me.account_id], &[])
+            .await?
+            .pop()
+            .map(|u| u.username)
+            .unwrap_or_default();
+        let batch = outcomes
+            .into_iter()
+            .map(|(other, accepted)| NewNotification {
+                user_id: other,
+                sender_id: Some(me.account_id),
+                subject: if accepted {
+                    format!("{username} accepted your friend request")
+                } else {
+                    format!("{username} wants to add you as a friend")
+                },
+                content: json!({ "username": username }),
+                code: if accepted {
+                    code::FRIEND_ACCEPTED
+                } else {
+                    code::FRIEND_REQUEST
+                },
+                persistent: true,
+            })
+            .collect();
+        s.notify.send(batch).await?;
+    }
     Ok(Json(json!({ "ok": true })))
 }
 

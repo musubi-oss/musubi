@@ -20,6 +20,7 @@ async fn app() -> Option<Router> {
     migrate_once(&db).await;
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
     let storage = StorageService::new(db.clone());
+    let hub = Arc::new(musubi_server::realtime::Hub::new());
     Some(musubi_server::http::router(AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -27,7 +28,11 @@ async fn app() -> Option<Router> {
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
         groups: musubi_social::GroupService::new(db.clone()),
-        hub: std::sync::Arc::new(musubi_server::realtime::Hub::new()),
+        notify: musubi_server::notify::Notifier::new(
+            musubi_social::NotificationService::new(db.clone()),
+            hub.clone(),
+        ),
+        hub,
         db,
         started_at: std::time::Instant::now(),
     }))

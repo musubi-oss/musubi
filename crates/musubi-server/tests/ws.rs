@@ -22,13 +22,18 @@ async fn start() -> Option<(String, axum::Router)> {
     cfg.database.url = url;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
+    let hub = Arc::new(Hub::new());
     let state = AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
         groups: musubi_social::GroupService::new(db.clone()),
-        hub: Arc::new(Hub::new()),
+        notify: musubi_server::notify::Notifier::new(
+            musubi_social::NotificationService::new(db.clone()),
+            hub.clone(),
+        ),
+        hub,
         cfg: Arc::new(cfg),
         db,
         started_at: std::time::Instant::now(),

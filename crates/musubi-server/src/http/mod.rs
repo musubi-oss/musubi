@@ -4,6 +4,7 @@ mod error;
 mod extract;
 mod friends;
 mod groups;
+mod notifications;
 mod storage;
 mod ws;
 
@@ -29,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .merge(account::routes())
         .merge(friends::routes())
         .merge(groups::routes())
+        .merge(notifications::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

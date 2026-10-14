@@ -1,10 +1,12 @@
 //! Social graph: friends, invites, blocks, groups.
 
 pub mod groups;
+pub mod notifications;
 pub use groups::{
     CreateGroup, Group, GroupFilter, GroupMember, GroupService, MemberState, Page, UpdateGroup,
     UserGroup,
 };
+pub use notifications::{NewNotification, Notification, NotificationList, NotificationService};
 
 use musubi_account::User;
 use musubi_core::{AccountId, Error, Result};
@@ -84,7 +86,8 @@ impl SocialService {
     }
 
     /// Add friends: sends an invite, or accepts an incoming one. Blocked (by either side) is a no-op.
-    pub async fn add(&self, me: AccountId, others: &[AccountId]) -> Result<()> {
+    /// Returns `(other, accepted)` for every relationship that actually changed.
+    pub async fn add(&self, me: AccountId, others: &[AccountId]) -> Result<Vec<(AccountId, bool)>> {
         check_batch(me, others)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let count: i64 = sqlx::query_scalar(
@@ -99,6 +102,7 @@ impl SocialService {
                 "friend limit {MAX_FRIENDS}"
             )));
         }
+        let mut changed = Vec::new();
         for other in others {
             let exists: Option<i64> = sqlx::query_scalar(
                 "select 1::bigint from musubi.accounts where id = $1 and deleted_at is null",
@@ -127,12 +131,15 @@ impl SocialService {
                 // They invited me → both become friends.
                 upsert(&mut tx, me, *other, 0).await?;
                 upsert(&mut tx, *other, me, 0).await?;
+                changed.push((*other, true));
             } else {
                 upsert(&mut tx, me, *other, 1).await?;
                 upsert(&mut tx, *other, me, 2).await?;
+                changed.push((*other, false));
             }
         }
-        tx.commit().await.map_err(Error::internal)
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(changed)
     }
 
     /// Remove friends, cancel sent invites, reject received invites, or unblock.

@@ -3,6 +3,7 @@
 pub mod app;
 pub mod db;
 pub mod http;
+pub mod notify;
 pub mod realtime;
 
 pub use app::run;
