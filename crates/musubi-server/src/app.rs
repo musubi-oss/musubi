@@ -100,6 +100,33 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             "resumed authoritative matches from snapshots"
         );
     }
+    // Failover: adopt matches whose node stopped heartbeating.
+    {
+        let (cluster, matches, hub) = (cluster.clone(), matches.clone(), hub.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
+            loop {
+                tick.tick().await;
+                let dead: Vec<uuid::Uuid> = match cluster.nodes().await {
+                    Ok(nodes) => nodes.iter().filter(|n| !n.alive).map(|n| n.id.0).collect(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "node list failed");
+                        continue;
+                    }
+                };
+                if dead.is_empty() {
+                    continue;
+                }
+                match matches.recover(hub.clone(), &dead).await {
+                    Ok(ids) if !ids.is_empty() => {
+                        tracing::info!(count = ids.len(), ?dead, "adopted matches from dead nodes")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "failover recover failed"),
+                }
+            }
+        });
+    }
     let fanout = Fanout::new(hub.clone(), Some(cluster.clone()));
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {

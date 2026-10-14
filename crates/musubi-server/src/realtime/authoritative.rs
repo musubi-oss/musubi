@@ -122,10 +122,14 @@ impl MatchRegistry {
         let Some(db) = &self.db else {
             return Ok(vec![]);
         };
+        // Claim atomically so two surviving nodes never resume the same match.
         let rows = sqlx::query_as::<_, (Uuid, String, String, serde_json::Value, Vec<u8>, i64)>(
-            "select match_id, module, label, params, state, tick from musubi.match_snapshots where node_id is null or node_id = any($1)",
+            "update musubi.match_snapshots set node_id = $2, updated_at = now()
+             where node_id is null or node_id = any($1)
+             returning match_id, module, label, params, state, tick",
         )
         .bind(dead_nodes)
+        .bind(self.node_id)
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
