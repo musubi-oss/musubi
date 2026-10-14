@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::hub::SessionHandle;
-use super::{Hub, PartyRegistry, RelayedRegistry};
+use super::{Hub, MatchRegistry, PartyRegistry, RelayedRegistry};
 
 pub struct ConnectParams {
     pub presence: UserPresence,
@@ -24,6 +24,7 @@ pub struct ConnectParams {
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
+    pub matches: Arc<MatchRegistry>,
     pub runtime: Arc<Runtime>,
     pub fanout: Fanout,
 }
@@ -39,6 +40,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         matchmaker,
         parties,
         relayed,
+        matches,
         runtime,
         fanout,
     } = params;
@@ -56,6 +58,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         matchmaker: &matchmaker,
         parties: &parties,
         relayed: &relayed,
+        matches: &matches,
         runtime: &runtime,
         fanout: &fanout,
         presence: &presence,
@@ -66,6 +69,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     }
     matchmaker.remove_session(sid);
     relayed.leave_all(&hub, sid);
+    matches.leave_all(sid);
     hub.leave(sid);
     conn.close().await;
     match result {
@@ -80,6 +84,7 @@ struct Ctx<'a> {
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
     relayed: &'a RelayedRegistry,
+    matches: &'a MatchRegistry,
     runtime: &'a Arc<Runtime>,
     fanout: &'a Fanout,
     presence: &'a UserPresence,
@@ -320,36 +325,71 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
         ClientMessage::MatchJoin {
-            match_id, token, ..
-        } => Some(
+            match_id,
+            token,
+            metadata,
+        } => {
+            if let Some(id) = match_id
+                .as_deref()
+                .filter(|id| ctx.matches.get(id).is_some())
+            {
+                return Some(
+                    ctx.matches
+                        .join(ctx.presence, id, metadata)
+                        .await
+                        .unwrap_or_else(|e| ServerMessage::error(&e)),
+                );
+            }
+            Some(
+                ctx.relayed
+                    .join(hub, ctx.presence, match_id.as_deref(), token.as_deref())
+                    .unwrap_or_else(|e| ServerMessage::error(&e)),
+            )
+        }
+        ClientMessage::MatchLeave { match_id } => {
+            if ctx.matches.get(&match_id).is_some() {
+                return ctx
+                    .matches
+                    .leave(sid, &match_id)
+                    .err()
+                    .map(|e| ServerMessage::error(&e));
+            }
             ctx.relayed
-                .join(hub, ctx.presence, match_id.as_deref(), token.as_deref())
-                .unwrap_or_else(|e| ServerMessage::error(&e)),
-        ),
-        ClientMessage::MatchLeave { match_id } => ctx
-            .relayed
-            .leave(hub, sid, &match_id)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
+                .leave(hub, sid, &match_id)
+                .err()
+                .map(|e| ServerMessage::error(&e))
+        }
         ClientMessage::MatchDataSend {
             match_id,
             op_code,
             data,
             presences,
             reliable,
-        } => ctx
-            .relayed
-            .send(
-                hub,
-                ctx.presence,
-                &match_id,
-                op_code,
-                data,
-                &presences,
-                reliable,
-            )
-            .err()
-            .map(|e| ServerMessage::error(&e)),
+        } => {
+            if let Some(h) = ctx.matches.get(&match_id) {
+                return h
+                    .data(musubi_actor::Input {
+                        presence: ctx.presence.clone(),
+                        op_code,
+                        data,
+                        reliable,
+                    })
+                    .err()
+                    .map(|e| ServerMessage::error(&e));
+            }
+            ctx.relayed
+                .send(
+                    hub,
+                    ctx.presence,
+                    &match_id,
+                    op_code,
+                    data,
+                    &presences,
+                    reliable,
+                )
+                .err()
+                .map(|e| ServerMessage::error(&e))
+        }
         ClientMessage::Ping => Some(ServerMessage::Pong),
         ClientMessage::StatusUpdate { status } => {
             if status.as_ref().is_some_and(|s| s.chars().count() > 128) {

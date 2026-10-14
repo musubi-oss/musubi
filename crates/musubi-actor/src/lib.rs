@@ -1,1 +1,414 @@
-//! musubi-actor
+//! Authoritative match actors. A handler is pure over an opaque state blob: every callback receives
+//! the current state and returns the next one, so the latest state is always a complete snapshot
+//! (the basis for failover and migration). The actor owns the tick loop, membership and delivery.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use musubi_core::{Error, MatchId, Result, SessionId};
+use musubi_proto::{ServerMessage, UserPresence};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot, RwLock};
+
+/// A client message routed to the match.
+#[derive(Debug, Clone)]
+pub struct Input {
+    pub presence: UserPresence,
+    pub op_code: i64,
+    pub data: Vec<u8>,
+    pub reliable: bool,
+}
+
+/// Data the handler wants delivered. Empty `to` = everyone in the match.
+#[derive(Debug, Clone, Default)]
+pub struct Outbound {
+    pub to: Vec<SessionId>,
+    pub op_code: i64,
+    pub data: Vec<u8>,
+    pub reliable: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Init {
+    pub state: Vec<u8>,
+    pub tick_rate: u32,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TickResult {
+    pub state: Vec<u8>,
+    pub outbound: Vec<Outbound>,
+    pub label: Option<String>,
+    pub terminate: bool,
+}
+
+/// Match logic. Implemented natively in Rust today; the WebAssembly binding exposes the same shape.
+pub trait MatchHandler: Send + Sync {
+    fn init(&self, params: &serde_json::Value) -> Result<Init>;
+    /// `Err` rejects the join with that message.
+    fn join_attempt(
+        &self,
+        state: Vec<u8>,
+        presence: &UserPresence,
+        metadata: &HashMap<String, String>,
+        members: &[UserPresence],
+    ) -> Result<(Vec<u8>, Result<()>)>;
+    fn join(
+        &self,
+        state: Vec<u8>,
+        joined: &[UserPresence],
+        members: &[UserPresence],
+    ) -> Result<Vec<u8>>;
+    fn leave(
+        &self,
+        state: Vec<u8>,
+        left: &[UserPresence],
+        members: &[UserPresence],
+    ) -> Result<Vec<u8>>;
+    fn tick(
+        &self,
+        state: Vec<u8>,
+        tick: u64,
+        inputs: Vec<Input>,
+        members: &[UserPresence],
+    ) -> Result<TickResult>;
+    fn terminate(&self, state: Vec<u8>, grace_seconds: u32) -> Result<Vec<u8>>;
+}
+
+pub type Deliver = Arc<dyn Fn(Vec<SessionId>, ServerMessage) + Send + Sync>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchInfo {
+    pub match_id: String,
+    pub module: String,
+    pub label: String,
+    pub size: u32,
+    pub tick_rate: u32,
+    pub tick: u64,
+    pub state_bytes: usize,
+}
+
+enum Cmd {
+    Join {
+        presence: UserPresence,
+        metadata: HashMap<String, String>,
+        reply: oneshot::Sender<Result<ServerMessage>>,
+    },
+    Leave {
+        session: SessionId,
+    },
+    Data(Input),
+    Terminate {
+        grace_seconds: u32,
+    },
+}
+
+#[derive(Clone)]
+pub struct MatchHandle {
+    pub id: MatchId,
+    tx: mpsc::Sender<Cmd>,
+    info: Arc<RwLock<MatchInfo>>,
+}
+
+impl MatchHandle {
+    pub async fn join(
+        &self,
+        presence: UserPresence,
+        metadata: HashMap<String, String>,
+    ) -> Result<ServerMessage> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Join {
+                presence,
+                metadata,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::NotFound("match ended".into()))?;
+        rx.await
+            .map_err(|_| Error::NotFound("match ended".into()))?
+    }
+
+    pub fn leave(&self, session: SessionId) {
+        let _ = self.tx.try_send(Cmd::Leave { session });
+    }
+
+    pub fn data(&self, input: Input) -> Result<()> {
+        self.tx
+            .try_send(Cmd::Data(input))
+            .map_err(|_| Error::ResourceExhausted("match inbox full".into()))
+    }
+
+    pub fn terminate(&self, grace_seconds: u32) {
+        let _ = self.tx.try_send(Cmd::Terminate { grace_seconds });
+    }
+
+    pub async fn info(&self) -> MatchInfo {
+        self.info.read().await.clone()
+    }
+
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+}
+
+/// Spawn a match actor. `on_end` runs when the actor stops (for registry cleanup).
+pub fn spawn(
+    module: &str,
+    handler: Arc<dyn MatchHandler>,
+    params: serde_json::Value,
+    deliver: Deliver,
+    on_end: Box<dyn FnOnce(MatchId) + Send>,
+) -> Result<MatchHandle> {
+    let init = handler.init(&params)?;
+    if !(1..=60).contains(&init.tick_rate) {
+        return Err(Error::InvalidArgument("tick_rate must be 1..=60".into()));
+    }
+    if init.label.len() > 2048 {
+        return Err(Error::InvalidArgument("label ≤ 2 KB".into()));
+    }
+    let id = MatchId::new();
+    let info = Arc::new(RwLock::new(MatchInfo {
+        match_id: id.to_string(),
+        module: module.to_string(),
+        label: init.label.clone(),
+        size: 0,
+        tick_rate: init.tick_rate,
+        tick: 0,
+        state_bytes: init.state.len(),
+    }));
+    let (tx, rx) = mpsc::channel(1024);
+    let handle = MatchHandle {
+        id,
+        tx,
+        info: info.clone(),
+    };
+    tokio::spawn(run(id, handler, init, rx, deliver, info, on_end));
+    Ok(handle)
+}
+
+async fn run(
+    id: MatchId,
+    handler: Arc<dyn MatchHandler>,
+    init: Init,
+    mut rx: mpsc::Receiver<Cmd>,
+    deliver: Deliver,
+    info: Arc<RwLock<MatchInfo>>,
+    on_end: Box<dyn FnOnce(MatchId) + Send>,
+) {
+    let match_id = id.to_string();
+    let mut state = init.state;
+    let mut label = init.label;
+    let mut members: Vec<UserPresence> = Vec::new();
+    let mut inputs: Vec<Input> = Vec::new();
+    let mut tick: u64 = 0;
+    let mut interval = tokio::time::interval(Duration::from_millis(1000 / init.tick_rate as u64));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let sessions = |m: &[UserPresence]| m.iter().map(|p| p.session_id).collect::<Vec<_>>();
+    let mut grace: Option<u32> = None;
+    loop {
+        tokio::select! {
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                match cmd {
+                    Cmd::Join { presence, metadata, reply } => {
+                        if members.iter().any(|p| p.session_id == presence.session_id) {
+                            let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
+                            continue;
+                        }
+                        match handler.join_attempt(std::mem::take(&mut state), &presence, &metadata, &members) {
+                            Ok((s, verdict)) => {
+                                state = s;
+                                match verdict {
+                                    Ok(()) => {
+                                        match handler.join(std::mem::take(&mut state), std::slice::from_ref(&presence), &members) {
+                                            Ok(s) => state = s,
+                                            Err(e) => { tracing::error!(%match_id, error = %e, "join handler failed"); }
+                                        }
+                                        let others = sessions(&members);
+                                        members.push(presence.clone());
+                                        deliver(others, ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![presence.clone()], leaves: vec![] });
+                                        let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
+                                    }
+                                    Err(e) => { let _ = reply.send(Err(e)); }
+                                }
+                            }
+                            Err(e) => { let _ = reply.send(Err(e)); }
+                        }
+                    }
+                    Cmd::Leave { session } => {
+                        if let Some(idx) = members.iter().position(|p| p.session_id == session) {
+                            let gone = members.remove(idx);
+                            match handler.leave(std::mem::take(&mut state), std::slice::from_ref(&gone), &members) {
+                                Ok(s) => state = s,
+                                Err(e) => tracing::error!(%match_id, error = %e, "leave handler failed"),
+                            }
+                            deliver(sessions(&members), ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![], leaves: vec![gone] });
+                        }
+                    }
+                    Cmd::Data(input) => {
+                        if members.iter().any(|p| p.session_id == input.presence.session_id) {
+                            inputs.push(input);
+                        }
+                    }
+                    Cmd::Terminate { grace_seconds } => { grace = Some(grace_seconds); }
+                }
+                let mut i = info.write().await;
+                i.size = members.len() as u32;
+                i.state_bytes = state.len();
+            }
+            _ = interval.tick() => {
+                tick += 1;
+                let batch = std::mem::take(&mut inputs);
+                let res = match handler.tick(std::mem::take(&mut state), tick, batch, &members) {
+                    Ok(r) => r,
+                    Err(e) => { tracing::error!(%match_id, error = %e, "tick handler failed; terminating"); break; }
+                };
+                state = res.state;
+                if let Some(l) = res.label { label = l; }
+                for out in res.outbound {
+                    let to = if out.to.is_empty() { sessions(&members) } else { out.to };
+                    deliver(to, ServerMessage::MatchData { match_id: match_id.clone(), presence: None, op_code: out.op_code, data: out.data, reliable: out.reliable });
+                }
+                {
+                    let mut i = info.write().await;
+                    i.tick = tick;
+                    i.size = members.len() as u32;
+                    i.label = label.clone();
+                    i.state_bytes = state.len();
+                }
+                if res.terminate || grace.is_some_and(|g| g == 0) {
+                    break;
+                }
+                if let Some(g) = grace.as_mut() { *g = g.saturating_sub(1000 / init.tick_rate.max(1)); }
+            }
+        }
+    }
+    if let Err(e) = handler.terminate(std::mem::take(&mut state), 0) {
+        tracing::warn!(%match_id, error = %e, "terminate handler failed");
+    }
+    let all = sessions(&members);
+    if !all.is_empty() {
+        deliver(
+            all,
+            ServerMessage::MatchPresenceEvent {
+                match_id: match_id.clone(),
+                joins: vec![],
+                leaves: members.clone(),
+            },
+        );
+    }
+    on_end(id);
+}
+
+fn snapshot(
+    match_id: &str,
+    label: &str,
+    members: &[UserPresence],
+    me: &UserPresence,
+) -> ServerMessage {
+    ServerMessage::Match {
+        match_id: match_id.to_string(),
+        authoritative: true,
+        label: Some(label.to_string()),
+        size: members.len() as u32,
+        presences: members.to_vec(),
+        me: me.clone(),
+    }
+}
+
+/// Reference handler: relays every input to everyone as a server message, caps players via
+/// `params.max_players` (default 8), ends when empty for `params.empty_ticks` ticks (default 10 s worth).
+pub struct EchoMatch;
+
+#[derive(Serialize, Deserialize, Default)]
+struct EchoState {
+    max_players: usize,
+    empty_ticks: u64,
+    idle: u64,
+    relayed: u64,
+}
+
+impl MatchHandler for EchoMatch {
+    fn init(&self, params: &serde_json::Value) -> Result<Init> {
+        let tick_rate = params
+            .get("tick_rate")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as u32;
+        let st = EchoState {
+            max_players: params
+                .get("max_players")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8) as usize,
+            empty_ticks: params
+                .get("empty_ticks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(tick_rate as u64 * 10),
+            ..Default::default()
+        };
+        Ok(Init {
+            state: serde_json::to_vec(&st)?,
+            tick_rate,
+            label: params
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("echo")
+                .to_string(),
+        })
+    }
+    fn join_attempt(
+        &self,
+        state: Vec<u8>,
+        _p: &UserPresence,
+        _m: &HashMap<String, String>,
+        members: &[UserPresence],
+    ) -> Result<(Vec<u8>, Result<()>)> {
+        let st: EchoState = serde_json::from_slice(&state)?;
+        let verdict = if members.len() >= st.max_players {
+            Err(Error::ResourceExhausted("match is full".into()))
+        } else {
+            Ok(())
+        };
+        Ok((state, verdict))
+    }
+    fn join(&self, state: Vec<u8>, _j: &[UserPresence], _m: &[UserPresence]) -> Result<Vec<u8>> {
+        Ok(state)
+    }
+    fn leave(&self, state: Vec<u8>, _l: &[UserPresence], _m: &[UserPresence]) -> Result<Vec<u8>> {
+        Ok(state)
+    }
+    fn tick(
+        &self,
+        state: Vec<u8>,
+        _tick: u64,
+        inputs: Vec<Input>,
+        members: &[UserPresence],
+    ) -> Result<TickResult> {
+        let mut st: EchoState = serde_json::from_slice(&state)?;
+        let outbound = inputs
+            .into_iter()
+            .map(|i| {
+                st.relayed += 1;
+                Outbound {
+                    to: vec![],
+                    op_code: i.op_code,
+                    data: i.data,
+                    reliable: i.reliable,
+                }
+            })
+            .collect();
+        st.idle = if members.is_empty() { st.idle + 1 } else { 0 };
+        let terminate = st.idle >= st.empty_ticks;
+        Ok(TickResult {
+            state: serde_json::to_vec(&st)?,
+            outbound,
+            label: None,
+            terminate,
+        })
+    }
+    fn terminate(&self, state: Vec<u8>, _g: u32) -> Result<Vec<u8>> {
+        Ok(state)
+    }
+}

@@ -42,6 +42,7 @@ async fn start() -> Option<(String, axum::Router)> {
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
+        matches: Arc::new(musubi_server::realtime::MatchRegistry::new()),
         runtime: test_runtime(),
         cluster: cluster.clone(),
         fanout,
@@ -1177,4 +1178,163 @@ async fn cross_node_chat_and_notification_fanout() {
     ));
     let (_, acc_b) = (0, b);
     let _ = acc_b;
+}
+
+#[tokio::test]
+async fn authoritative_echo_match_lifecycle() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    // server creates a match from the built-in `echo` module
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"module": "echo", "params": {"tick_rate": 20, "max_players": 2, "label": "duel", "empty_ticks": 2}}).to_string()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+    assert_eq!(info["label"], "duel");
+
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Match {
+            authoritative: true,
+            size: 1,
+            ..
+        }
+    ));
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Match {
+            authoritative: true,
+            size: 2,
+            ..
+        }
+    ));
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::MatchPresenceEvent { joins, .. } if joins.len() == 1)
+    );
+    // full
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::ResourceExhausted,
+            ..
+        }
+    ));
+
+    // input is relayed by the handler on the next tick, to everyone, as a server message
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 5,
+            data: vec![1, 2],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::MatchData {
+                op_code,
+                data,
+                presence,
+                ..
+            } => {
+                assert_eq!(op_code, 5);
+                assert_eq!(data, vec![1, 2]);
+                assert!(presence.is_none());
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    // listing shows it with size 2
+    let req = Request::get("/v1/matches?label=duel")
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["match_id"] == mid && m["size"] == 2));
+
+    // leave → presence event; when empty for 2 ticks the match ends and disappears
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::MatchPresenceEvent { leaves, .. } if leaves.len() == 1)
+    );
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let req = Request::get(format!("/v1/server/matches/{mid}"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
 }

@@ -7,3 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+musubi-core.workspace = true
+musubi-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

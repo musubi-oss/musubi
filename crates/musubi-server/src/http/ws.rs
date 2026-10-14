@@ -65,6 +65,7 @@ async fn upgrade(
                 matchmaker: s.matchmaker.clone(),
                 parties: s.parties.clone(),
                 relayed: s.relayed.clone(),
+                matches: s.matches.clone(),
                 runtime: s.runtime.clone(),
                 fanout: s.fanout.clone(),
             };

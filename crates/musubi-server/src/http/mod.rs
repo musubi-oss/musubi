@@ -7,6 +7,7 @@ mod extract;
 mod friends;
 mod groups;
 mod leaderboards;
+mod matches;
 mod notifications;
 mod rpc;
 mod storage;
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .merge(tournaments::routes())
         .merge(rpc::routes())
         .merge(cluster::routes())
+        .merge(matches::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())
@@ -70,6 +72,7 @@ async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "uptime_secs": s.started_at.elapsed().as_secs(),
         "realtime_sessions": s.hub.session_count(),
         "relayed_matches": s.relayed.match_count(),
+        "authoritative_matches": s.matches.count(),
         "parties": s.parties.party_count(),
         "matchmaker_tickets": s.matchmaker.ticket_count(),
     }))

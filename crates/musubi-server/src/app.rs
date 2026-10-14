@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use tokio::signal;
 use tracing::info;
 
-use crate::realtime::{Hub, PartyRegistry, RelayedRegistry};
+use crate::realtime::{Hub, MatchRegistry, PartyRegistry, RelayedRegistry};
 use crate::{db, http};
 
 #[derive(Clone)]
@@ -37,6 +37,7 @@ pub struct AppState {
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
+    pub matches: Arc<MatchRegistry>,
     pub runtime: Arc<Runtime>,
     pub cluster: Option<Arc<Cluster>>,
     pub fanout: Fanout,
@@ -62,6 +63,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let matchmaker = Arc::new(Matchmaker::default());
     let parties = Arc::new(PartyRegistry::new());
     let relayed = Arc::new(RelayedRegistry::new());
+    let matches = Arc::new(MatchRegistry::new());
     let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
         fuel: cfg.runtime.fuel,
         max_memory_bytes: cfg.runtime.max_memory_mb << 20,
@@ -108,6 +110,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         matchmaker,
         parties,
         relayed,
+        matches,
         runtime,
         cluster: Some(cluster),
         fanout,
