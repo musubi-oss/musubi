@@ -1,3 +1,7 @@
+mod auth;
+mod error;
+mod extract;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -8,11 +12,15 @@ use tower_http::trace::TraceLayer;
 
 use crate::app::AppState;
 
+pub use error::ApiError;
+pub use extract::Bearer;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
+        .merge(auth::routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

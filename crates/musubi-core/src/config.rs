@@ -26,7 +26,7 @@ impl Role {
     ];
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub node: NodeConfig,
@@ -124,18 +124,6 @@ impl Default for LogConfig {
         Self {
             filter: "info".into(),
             json: false,
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            node: NodeConfig::default(),
-            http: HttpConfig::default(),
-            database: DatabaseConfig::default(),
-            session: SessionConfig::default(),
-            log: LogConfig::default(),
         }
     }
 }
