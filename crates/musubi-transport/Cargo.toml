@@ -7,3 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+musubi-core.workspace = true
+musubi-proto.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true

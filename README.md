@@ -28,6 +28,7 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 | `POST /v1/auth/refresh` | — | rotate refresh token (reuse revokes the family) |
 | `POST /v1/auth/logout`, `GET /v1/account/me` | bearer | |
 | `POST /v1/storage/{read,write,delete}`, `GET /v1/storage/{collection}` | bearer | legacy KV storage, Nakama permission codes, CAS versions |
+| `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
 
 ## Layout
 

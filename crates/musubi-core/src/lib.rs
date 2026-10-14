@@ -4,5 +4,5 @@ pub mod config;
 pub mod error;
 pub mod id;
 
-pub use error::{Error, Result};
+pub use error::{Code, Error, Result};
 pub use id::*;

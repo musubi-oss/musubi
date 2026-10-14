@@ -7,6 +7,7 @@ use sqlx::PgPool;
 use tokio::signal;
 use tracing::info;
 
+use crate::realtime::Hub;
 use crate::{db, http};
 
 #[derive(Clone)]
@@ -15,6 +16,7 @@ pub struct AppState {
     pub db: PgPool,
     pub auth: AuthService,
     pub storage: StorageService,
+    pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
 
@@ -31,6 +33,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         db,
         auth,
         storage,
+        hub: Arc::new(Hub::new()),
         started_at: std::time::Instant::now(),
     };
     let listener = tokio::net::TcpListener::bind(state.cfg.http.listen).await?;

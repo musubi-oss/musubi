@@ -22,7 +22,7 @@ musubi-storage = { path = "crates/musubi-storage" }
 musubi-server = { path = "crates/musubi-server" }
 
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws", "macros"] }
 tonic = "0.12"
 prost = "0.13"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "time", "json", "migrate", "macros"] }

@@ -3,6 +3,7 @@
 pub mod app;
 pub mod db;
 pub mod http;
+pub mod realtime;
 
 pub use app::run;
 pub use musubi_core::config::Config;

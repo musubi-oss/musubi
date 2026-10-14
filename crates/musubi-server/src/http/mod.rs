@@ -2,6 +2,7 @@ mod auth;
 mod error;
 mod extract;
 mod storage;
+mod ws;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -23,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/node", get(node_info))
         .merge(auth::routes())
         .merge(storage::routes())
+        .merge(ws::routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -48,5 +50,6 @@ async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "roles": s.cfg.node.roles,
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": s.started_at.elapsed().as_secs(),
+        "realtime_sessions": s.hub.session_count(),
     }))
 }

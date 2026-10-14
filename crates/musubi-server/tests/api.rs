@@ -25,6 +25,7 @@ async fn app() -> Option<Router> {
         db,
         auth,
         storage,
+        hub: std::sync::Arc::new(musubi_server::realtime::Hub::new()),
         started_at: std::time::Instant::now(),
     }))
 }
