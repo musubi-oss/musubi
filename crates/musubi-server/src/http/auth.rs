@@ -47,18 +47,36 @@ async fn device(
     State(s): State<AppState>,
     Json(r): Json<DeviceReq>,
 ) -> Result<Json<Session>, ApiError> {
-    Ok(Json(s.auth.authenticate_device(&r.id, r.opts).await?))
+    let sess = s.auth.authenticate_device(&r.id, r.opts).await?;
+    authenticated(&s, &sess, musubi_auth::provider::DEVICE);
+    Ok(Json(sess))
+}
+
+/// Fire the `authenticated` runtime event without delaying the response.
+fn authenticated(s: &AppState, sess: &Session, provider: &'static str) {
+    if !s.runtime.has_hook("hook_authenticated") {
+        return;
+    }
+    let rt = s.runtime.clone();
+    let ctx = musubi_runtime::CallContext {
+        account_id: Some(sess.account_id),
+        session_id: Some(sess.session_id),
+        ..Default::default()
+    };
+    let payload = serde_json::json!({ "provider": provider, "created": sess.created });
+    tokio::spawn(async move { rt.event("authenticated", ctx, payload).await });
 }
 
 async fn email(
     State(s): State<AppState>,
     Json(r): Json<EmailReq>,
 ) -> Result<Json<Session>, ApiError> {
-    Ok(Json(
-        s.auth
-            .authenticate_email(&r.email, &r.password, r.opts)
-            .await?,
-    ))
+    let sess = s
+        .auth
+        .authenticate_email(&r.email, &r.password, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::EMAIL);
+    Ok(Json(sess))
 }
 
 async fn refresh(

@@ -7,6 +7,9 @@
 //!   `(ctx_ptr: i32, ctx_len: i32, payload_ptr: i32, payload_len: i32) -> i64` is registered as RPC `<id>`.
 //!   `ctx` is JSON (`CallContext`), `payload` is the raw request body. The return value packs the
 //!   response region as `(ptr << 32) | len`; return `0` after calling `musubi.error` to fail.
+//! * optional hooks with the same signature: `before_rpc_<id>` (its return value replaces the
+//!   payload; call `musubi.error` to reject), `after_rpc_<id>` (receives the response, result ignored)
+//!   and `hook_<event>` for server events (`authenticated`, …).
 //! * host imports under module `musubi`: `log(level: i32, ptr: i32, len: i32)` and
 //!   `error(ptr: i32, len: i32)` (sets the error message for the current call).
 //!
@@ -62,6 +65,7 @@ pub struct CallContext {
 struct Loaded {
     name: String,
     module: Module,
+    exports: std::collections::HashSet<String>,
 }
 
 struct State {
@@ -95,6 +99,8 @@ pub struct Runtime {
     limits: Limits,
     /// rpc id → module exporting it
     rpcs: RwLock<HashMap<String, Arc<Loaded>>>,
+    /// hook export name → module
+    hooks: RwLock<HashMap<String, Arc<Loaded>>>,
     modules: RwLock<HashMap<String, Arc<Loaded>>>,
 }
 
@@ -147,6 +153,7 @@ impl Runtime {
             linker,
             limits,
             rpcs: RwLock::new(HashMap::new()),
+            hooks: RwLock::new(HashMap::new()),
             modules: RwLock::new(HashMap::new()),
         })
     }
@@ -156,15 +163,23 @@ impl Runtime {
         let module = Module::new(&self.engine, bytes)
             .map_err(|e| Error::InvalidArgument(format!("module {name}: {e}")))?;
         let mut ids = Vec::new();
+        let mut hooks = Vec::new();
+        let mut exports = std::collections::HashSet::new();
         let mut has_alloc = false;
         let mut has_memory = false;
         for exp in module.exports() {
+            exports.insert(exp.name().to_string());
             match exp.name() {
                 "alloc" => has_alloc = true,
                 "memory" => has_memory = true,
                 n => {
                     if let Some(id) = n.strip_prefix("rpc_") {
                         ids.push(id.to_string());
+                    } else if n.starts_with("before_rpc_")
+                        || n.starts_with("after_rpc_")
+                        || n.starts_with("hook_")
+                    {
+                        hooks.push(n.to_string());
                     }
                 }
             }
@@ -177,14 +192,20 @@ impl Runtime {
         let loaded = Arc::new(Loaded {
             name: name.to_string(),
             module,
+            exports,
         });
         let mut rpcs = self.rpcs.write();
+        let mut hooks_map = self.hooks.write();
         let mut modules = self.modules.write();
         if let Some(old) = modules.insert(name.to_string(), loaded.clone()) {
             rpcs.retain(|_, m| !Arc::ptr_eq(m, &old));
+            hooks_map.retain(|_, m| !Arc::ptr_eq(m, &old));
         }
         for id in &ids {
             rpcs.insert(id.clone(), loaded.clone());
+        }
+        for h in &hooks {
+            hooks_map.insert(h.clone(), loaded.clone());
         }
         tracing::info!(module = name, rpcs = ?ids, "runtime module loaded");
         Ok(ids)
@@ -231,7 +252,8 @@ impl Runtime {
         self.rpcs.read().contains_key(id)
     }
 
-    /// Invoke an RPC off the async runtime (wasm execution is blocking).
+    /// Invoke an RPC off the async runtime (wasm execution is blocking). Runs `before_rpc_<id>` /
+    /// `after_rpc_<id>` hooks when a module exports them.
     pub async fn call(
         self: &Arc<Self>,
         id: &str,
@@ -247,9 +269,65 @@ impl Runtime {
             .get(id)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("rpc {id}")))?;
+        let payload = match self
+            .hook(&format!("before_rpc_{id}"), ctx.clone(), payload.clone())
+            .await
+        {
+            Some(Ok(rewritten)) => rewritten,
+            Some(Err(e)) => return Err(e),
+            None => payload,
+        };
+        let out = self
+            .invoke(loaded, &format!("rpc_{id}"), ctx.clone(), payload)
+            .await?;
+        if let Some(Err(e)) = self
+            .hook(&format!("after_rpc_{id}"), ctx, out.clone())
+            .await
+        {
+            tracing::warn!(rpc = id, error = %e, "after hook failed");
+        }
+        Ok(out)
+    }
+
+    /// Run a hook export if any module provides it. `None` when nobody listens.
+    pub async fn hook(
+        self: &Arc<Self>,
+        name: &str,
+        ctx: CallContext,
+        payload: Vec<u8>,
+    ) -> Option<Result<Vec<u8>>> {
+        let loaded = self.hooks.read().get(name).cloned()?;
+        Some(self.invoke(loaded, name, ctx, payload).await)
+    }
+
+    /// Fire a server event (`hook_<event>`) with a JSON payload; errors are logged, not propagated.
+    pub async fn event(
+        self: &Arc<Self>,
+        event: &str,
+        ctx: CallContext,
+        payload: serde_json::Value,
+    ) {
+        let name = format!("hook_{event}");
+        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        if let Some(Err(e)) = self.hook(&name, ctx, bytes).await {
+            tracing::warn!(hook = name, error = %e, "hook failed");
+        }
+    }
+
+    pub fn has_hook(&self, name: &str) -> bool {
+        self.hooks.read().contains_key(name)
+    }
+
+    async fn invoke(
+        self: &Arc<Self>,
+        loaded: Arc<Loaded>,
+        export: &str,
+        ctx: CallContext,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
         let this = self.clone();
-        let id = id.to_string();
-        tokio::task::spawn_blocking(move || this.call_blocking(&loaded, &id, &ctx, &payload))
+        let export = export.to_string();
+        tokio::task::spawn_blocking(move || this.call_blocking(&loaded, &export, &ctx, &payload))
             .await
             .map_err(Error::internal)?
     }
@@ -257,10 +335,11 @@ impl Runtime {
     fn call_blocking(
         &self,
         loaded: &Loaded,
-        id: &str,
+        export: &str,
         ctx: &CallContext,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
+        let id = export;
         let state = State {
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.limits.max_memory_bytes)
@@ -284,9 +363,12 @@ impl Runtime {
         let alloc = instance
             .get_typed_func::<i32, i32>(&mut store, "alloc")
             .map_err(|e| Error::Internal(format!("alloc: {e}")))?;
+        if !loaded.exports.contains(export) {
+            return Err(Error::NotFound(format!("export {export}")));
+        }
         let func = instance
-            .get_func(&mut store, &format!("rpc_{id}"))
-            .ok_or_else(|| Error::NotFound(format!("rpc {id}")))?;
+            .get_func(&mut store, export)
+            .ok_or_else(|| Error::NotFound(format!("export {export}")))?;
 
         let ctx_bytes = serde_json::to_vec(ctx)?;
         let ctx_ptr = write_guest(&mut store, &memory, &alloc, &ctx_bytes)?;
@@ -396,6 +478,19 @@ pub const EXAMPLE_WAT: &str = r#"
   (func (export "rpc_whoami") (param i32 i32 i32 i32) (result i64)
     local.get 0 i64.extend_i32_u i64.const 32 i64.shl
     local.get 1 i64.extend_i32_u i64.or)
+  ;; echo2 is echo with a before-hook that rewrites the payload and an after-hook that logs
+  (func (export "rpc_echo2") (param i32 i32 i32 i32) (result i64)
+    local.get 2 i64.extend_i32_u i64.const 32 i64.shl
+    local.get 3 i64.extend_i32_u i64.or)
+  (data (i32.const 16) "{\"hooked\":true}")
+  (func (export "before_rpc_echo2") (param i32 i32 i32 i32) (result i64)
+    i64.const 16 i64.const 32 i64.shl i64.const 15 i64.or)
+  (func (export "after_rpc_echo2") (param i32 i32 i32 i32) (result i64)
+    i32.const 2 local.get 2 local.get 3 call $log
+    i64.const 0)
+  (func (export "hook_authenticated") (param i32 i32 i32 i32) (result i64)
+    i32.const 2 local.get 2 local.get 3 call $log
+    i64.const 0)
   (data (i32.const 0) "boom")
   (func (export "rpc_fail") (param i32 i32 i32 i32) (result i64)
     i32.const 0 i32.const 4 call $error
@@ -420,7 +515,23 @@ mod tests {
             .unwrap(),
         );
         let ids = rt.load_bytes("example", EXAMPLE_WAT.as_bytes()).unwrap();
-        assert_eq!(ids, vec!["echo", "whoami", "fail", "spin"]);
+        assert_eq!(ids, vec!["echo", "whoami", "echo2", "fail", "spin"]);
+        let hooked = rt
+            .call("echo2", CallContext::default(), b"ignored".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(hooked, br#"{"hooked":true}"#);
+        assert!(rt.has_hook("hook_authenticated"));
+        assert!(rt
+            .hook("hook_nope", CallContext::default(), vec![])
+            .await
+            .is_none());
+        rt.event(
+            "authenticated",
+            CallContext::default(),
+            serde_json::json!({"created": true}),
+        )
+        .await;
         let out = rt
             .call("echo", CallContext::default(), b"{\"hi\":1}".to_vec())
             .await
