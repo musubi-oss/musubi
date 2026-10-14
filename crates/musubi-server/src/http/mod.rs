@@ -65,5 +65,8 @@ async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": s.started_at.elapsed().as_secs(),
         "realtime_sessions": s.hub.session_count(),
+        "relayed_matches": s.relayed.match_count(),
+        "parties": s.parties.party_count(),
+        "matchmaker_tickets": s.matchmaker.ticket_count(),
     }))
 }

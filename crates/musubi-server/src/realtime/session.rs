@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::hub::SessionHandle;
-use super::{Hub, PartyRegistry};
+use super::{Hub, PartyRegistry, RelayedRegistry};
 
 pub struct ConnectParams {
     pub presence: UserPresence,
@@ -20,6 +20,7 @@ pub struct ConnectParams {
     pub chat: ChatService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
+    pub relayed: Arc<RelayedRegistry>,
 }
 
 /// Drive one realtime connection until it closes. Registers with the hub on entry and
@@ -32,6 +33,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         chat,
         matchmaker,
         parties,
+        relayed,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -46,6 +48,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         chat: &chat,
         matchmaker: &matchmaker,
         parties: &parties,
+        relayed: &relayed,
         presence: &presence,
     };
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
@@ -53,6 +56,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         matchmaker.cancel(&t);
     }
     matchmaker.remove_session(sid);
+    relayed.leave_all(&hub, sid);
     hub.leave(sid);
     conn.close().await;
     match result {
@@ -66,6 +70,7 @@ struct Ctx<'a> {
     chat: &'a ChatService,
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
+    relayed: &'a RelayedRegistry,
     presence: &'a UserPresence,
 }
 
@@ -194,7 +199,12 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             });
             match res {
                 Ok(ticket) => {
-                    super::matchmaking::process_and_deliver(hub, ctx.parties, ctx.matchmaker);
+                    super::matchmaking::process_and_deliver(
+                        hub,
+                        ctx.parties,
+                        ctx.relayed,
+                        ctx.matchmaker,
+                    );
                     Some(ServerMessage::MatchmakerTicket { ticket })
                 }
                 Err(e) => Some(ServerMessage::error(&e)),
@@ -292,6 +302,42 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                 Err(e) => Some(ServerMessage::error(&e)),
             }
         }
+        ClientMessage::MatchCreate { name } => Some(
+            ctx.relayed
+                .create(ctx.presence, name)
+                .unwrap_or_else(|e| ServerMessage::error(&e)),
+        ),
+        ClientMessage::MatchJoin {
+            match_id, token, ..
+        } => Some(
+            ctx.relayed
+                .join(hub, ctx.presence, match_id.as_deref(), token.as_deref())
+                .unwrap_or_else(|e| ServerMessage::error(&e)),
+        ),
+        ClientMessage::MatchLeave { match_id } => ctx
+            .relayed
+            .leave(hub, sid, &match_id)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
+        ClientMessage::MatchDataSend {
+            match_id,
+            op_code,
+            data,
+            presences,
+            reliable,
+        } => ctx
+            .relayed
+            .send(
+                hub,
+                ctx.presence,
+                &match_id,
+                op_code,
+                data,
+                &presences,
+                reliable,
+            )
+            .err()
+            .map(|e| ServerMessage::error(&e)),
         ClientMessage::Ping => Some(ServerMessage::Pong),
         ClientMessage::StatusUpdate { status } => {
             if status.as_ref().is_some_and(|s| s.chars().count() > 128) {
@@ -461,6 +507,6 @@ fn party_matchmake(
             ctx.hub.send_to_session(s, msg.clone());
         }
     }
-    super::matchmaking::process_and_deliver(ctx.hub, ctx.parties, ctx.matchmaker);
+    super::matchmaking::process_and_deliver(ctx.hub, ctx.parties, ctx.relayed, ctx.matchmaker);
     Ok(msg)
 }

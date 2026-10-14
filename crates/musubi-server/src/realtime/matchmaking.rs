@@ -6,10 +6,11 @@ use std::time::Duration;
 use musubi_matchmaker::{Matched, Matchmaker};
 use musubi_proto::ServerMessage;
 
-use super::{Hub, PartyRegistry};
+use super::{Hub, PartyRegistry, RelayedRegistry};
 
 /// Deliver a formed group to every member session.
-pub fn deliver(hub: &Hub, parties: &PartyRegistry, m: &Matched) {
+pub fn deliver(hub: &Hub, parties: &PartyRegistry, relayed: &RelayedRegistry, m: &Matched) {
+    relayed.register_token(&m.token);
     let users = m.users();
     for t in &m.tickets {
         if let Some(pid) = &t.party_id {
@@ -29,9 +30,14 @@ pub fn deliver(hub: &Hub, parties: &PartyRegistry, m: &Matched) {
     }
 }
 
-pub fn process_and_deliver(hub: &Hub, parties: &PartyRegistry, mm: &Matchmaker) {
+pub fn process_and_deliver(
+    hub: &Hub,
+    parties: &PartyRegistry,
+    relayed: &RelayedRegistry,
+    mm: &Matchmaker,
+) {
     for m in mm.process() {
-        deliver(hub, parties, &m);
+        deliver(hub, parties, relayed, &m);
     }
 }
 
@@ -39,6 +45,7 @@ pub fn process_and_deliver(hub: &Hub, parties: &PartyRegistry, mm: &Matchmaker) 
 pub fn spawn_ticker(
     hub: Arc<Hub>,
     parties: Arc<PartyRegistry>,
+    relayed: Arc<RelayedRegistry>,
     mm: Arc<Matchmaker>,
     every: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -46,7 +53,7 @@ pub fn spawn_ticker(
         let mut tick = tokio::time::interval(every);
         loop {
             tick.tick().await;
-            process_and_deliver(&hub, &parties, &mm);
+            process_and_deliver(&hub, &parties, &relayed, &mm);
         }
     })
 }

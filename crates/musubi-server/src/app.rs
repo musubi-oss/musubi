@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use tokio::signal;
 use tracing::info;
 
-use crate::realtime::{Hub, PartyRegistry};
+use crate::realtime::{Hub, PartyRegistry, RelayedRegistry};
 use crate::{db, http};
 
 #[derive(Clone)]
@@ -32,6 +32,7 @@ pub struct AppState {
     pub tournaments: TournamentService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
+    pub relayed: Arc<RelayedRegistry>,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -53,9 +54,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let hub = Arc::new(Hub::new());
     let matchmaker = Arc::new(Matchmaker::default());
     let parties = Arc::new(PartyRegistry::new());
+    let relayed = Arc::new(RelayedRegistry::new());
     crate::realtime::matchmaking::spawn_ticker(
         hub.clone(),
         parties.clone(),
+        relayed.clone(),
         matchmaker.clone(),
         std::time::Duration::from_secs(1),
     );
@@ -74,6 +77,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tournaments,
         matchmaker,
         parties,
+        relayed,
         hub,
         started_at: std::time::Instant::now(),
     };

@@ -37,6 +37,7 @@ async fn app() -> Option<Router> {
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
+        relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
         hub,
         db,
         started_at: std::time::Instant::now(),

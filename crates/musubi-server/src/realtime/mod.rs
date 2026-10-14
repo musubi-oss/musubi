@@ -4,8 +4,10 @@
 mod hub;
 pub mod matchmaking;
 pub mod party;
+pub mod relayed;
 mod session;
 
 pub use hub::Hub;
 pub use party::PartyRegistry;
+pub use relayed::RelayedRegistry;
 pub use session::{serve, ConnectParams};

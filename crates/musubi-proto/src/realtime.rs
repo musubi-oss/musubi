@@ -126,6 +126,39 @@ pub enum ClientMessage {
         party_id: String,
         ticket: String,
     },
+    /// Relayed multiplayer: create a client-hosted match (server relays data, no authority).
+    MatchCreate {
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Join by match id, or by matchmaker `token` (all matched users may join the same match).
+    MatchJoin {
+        #[serde(default)]
+        match_id: Option<String>,
+        #[serde(default)]
+        token: Option<String>,
+        #[serde(default)]
+        metadata: std::collections::HashMap<String, String>,
+    },
+    MatchLeave {
+        match_id: String,
+    },
+    /// Send to everyone in the match (or only `presences` when given). `reliable=false` lets
+    /// transports drop under pressure.
+    MatchDataSend {
+        match_id: String,
+        op_code: i64,
+        #[serde(default)]
+        data: Vec<u8>,
+        #[serde(default)]
+        presences: Vec<UserPresence>,
+        #[serde(default = "yes")]
+        reliable: bool,
+    },
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_party_size() -> u32 {
@@ -243,6 +276,30 @@ pub enum ServerMessage {
     },
     PartyClose {
         party_id: String,
+    },
+    /// Reply to `MatchCreate` / `MatchJoin`.
+    Match {
+        match_id: String,
+        /// `true` when a server-side handler owns the match; relayed matches are `false`.
+        authoritative: bool,
+        #[serde(default)]
+        label: Option<String>,
+        size: u32,
+        presences: Vec<UserPresence>,
+        #[serde(rename = "self")]
+        me: UserPresence,
+    },
+    MatchData {
+        match_id: String,
+        presence: Option<UserPresence>,
+        op_code: i64,
+        data: Vec<u8>,
+        reliable: bool,
+    },
+    MatchPresenceEvent {
+        match_id: String,
+        joins: Vec<UserPresence>,
+        leaves: Vec<UserPresence>,
     },
 }
 

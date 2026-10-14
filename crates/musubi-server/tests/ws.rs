@@ -39,6 +39,7 @@ async fn start() -> Option<(String, axum::Router)> {
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
+        relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
         hub,
         cfg: Arc::new(cfg),
         db,
@@ -808,6 +809,220 @@ async fn parties_create_join_requests_leader_data_and_party_matchmaking() {
         ServerMessage::PartyClose { .. }
     ));
     send(&mut c, f, None, ClientMessage::PartyJoin { party_id: pid }).await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::NotFound,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn relayed_matches_create_join_data_and_matchmaker_token() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "binary";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+
+    send(
+        &mut a,
+        f,
+        Some("m"),
+        ClientMessage::MatchCreate {
+            name: Some("duel".into()),
+        },
+    )
+    .await;
+    let mid = match recv(&mut a).await.msg {
+        ServerMessage::Match {
+            match_id,
+            authoritative,
+            label,
+            size,
+            ..
+        } => {
+            assert!(!authoritative);
+            assert_eq!(label.as_deref(), Some("duel"));
+            assert_eq!(size, 1);
+            match_id
+        }
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Match { size: 2, .. }
+    ));
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::MatchPresenceEvent { joins, .. } if joins.len() == 1)
+    );
+
+    // data goes to the other member only
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 1,
+            data: vec![9],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::MatchData {
+            op_code,
+            data,
+            presence,
+            ..
+        } => {
+            assert_eq!(op_code, 1);
+            assert_eq!(data, vec![9]);
+            assert!(presence.is_some());
+        }
+        m => panic!("{m:?}"),
+    }
+    // outsider cannot send
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 1,
+            data: vec![],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::PermissionDenied,
+            ..
+        }
+    ));
+
+    // leave: B notified; A leaving empties and removes the match
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::MatchPresenceEvent { leaves, .. } if leaves.len() == 1)
+    );
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::NotFound,
+            ..
+        }
+    ));
+
+    // matchmaker token → both land in the same relayed match
+    let region = uuid::Uuid::now_v7().simple().to_string();
+    let add = ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: format!("+region:{region}"),
+        string_properties: [("region".to_string(), region.clone())].into(),
+        numeric_properties: Default::default(),
+        count_multiple: 1,
+    };
+    send(&mut a, f, None, add.clone()).await;
+    recv(&mut a).await;
+    send(&mut b, f, None, add).await;
+    recv(&mut b).await;
+    let tok = match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerMatched { token, .. } => token,
+        m => panic!("{m:?}"),
+    };
+    recv(&mut b).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: None,
+            token: Some(tok.clone()),
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    let m1 = match recv(&mut a).await.msg {
+        ServerMessage::Match { match_id, .. } => match_id,
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: None,
+            token: Some(tok),
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::Match { match_id, size: 2, .. } if match_id == m1)
+    );
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: None,
+            token: Some("bogus".into()),
+            metadata: Default::default(),
+        },
+    )
+    .await;
     assert!(matches!(
         recv(&mut c).await.msg,
         ServerMessage::Error {
