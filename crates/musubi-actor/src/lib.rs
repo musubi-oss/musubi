@@ -329,6 +329,7 @@ struct EchoState {
     empty_ticks: u64,
     idle: u64,
     relayed: u64,
+    had_members: bool,
 }
 
 impl MatchHandler for EchoMatch {
@@ -399,7 +400,14 @@ impl MatchHandler for EchoMatch {
                 }
             })
             .collect();
-        st.idle = if members.is_empty() { st.idle + 1 } else { 0 };
+        if !members.is_empty() {
+            st.had_members = true;
+        }
+        st.idle = if members.is_empty() && st.had_members {
+            st.idle + 1
+        } else {
+            0
+        };
         let terminate = st.idle >= st.empty_ticks;
         Ok(TickResult {
             state: serde_json::to_vec(&st)?,
