@@ -38,6 +38,7 @@ async fn app() -> Option<Router> {
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
+        runtime: test_runtime(),
         hub,
         db,
         started_at: std::time::Instant::now(),
@@ -1301,4 +1302,49 @@ async fn tournaments_join_caps_and_lifetime() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+}
+
+fn test_runtime() -> Arc<musubi_runtime::Runtime> {
+    let rt = Arc::new(musubi_runtime::Runtime::new(musubi_runtime::Limits::default()).unwrap());
+    rt.load_bytes("example", musubi_runtime::EXAMPLE_WAT.as_bytes())
+        .unwrap();
+    rt
+}
+
+#[tokio::test]
+async fn rpc_over_http_with_bearer_and_server_key() {
+    let Some(app) = app().await else { return };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("rpc")})),
+    )
+    .await;
+    let t = s["access_token"].as_str().unwrap();
+    let (st, out) = call(&app, "POST", "/v1/rpc/echo", Some(t), Some(json!({"x": 1}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(out["x"], 1);
+    let (_, who) = call(&app, "POST", "/v1/rpc/whoami", Some(t), Some(json!({}))).await;
+    assert_eq!(who["account_id"], s["account_id"]);
+    assert_eq!(who["server"], false);
+    let (_, who) = call_server(
+        &app,
+        "POST",
+        "/v1/rpc/whoami",
+        "defaultkey",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(who["server"], true);
+    let (st, _) = call(&app, "POST", "/v1/rpc/echo", None, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, e) = call(&app, "POST", "/v1/rpc/fail", Some(t), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(e["message"].as_str().unwrap().ends_with("boom"), "{e}");
+    let (st, _) = call(&app, "POST", "/v1/rpc/missing", Some(t), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, l) = call(&app, "GET", "/v1/rpc", Some(t), None).await;
+    assert!(l["rpcs"].as_array().unwrap().iter().any(|r| r == "echo"));
 }

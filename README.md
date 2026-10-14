@@ -40,6 +40,7 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 | socket `matchmaker_add` / `matchmaker_remove` → `matchmaker_ticket`, `matchmaker_matched` | token | matchmaker: mutual queries (`+field:value`, `-field:value`, `>=`, `[a TO b]`, `*`), min/max count, count_multiple, 15 s wait for max before settling for min |
 | socket `party_create/join/leave/promote/accept/remove/close/join_request_list/data_send/matchmaker_add/matchmaker_remove` → `party`, `party_join_request`, `party_leader`, `party_presence_event`, `party_data`, `party_matchmaker_ticket`, `party_close` | token | parties: open or request-to-join, leader moderation, leader hand-off on leave, party-wide matchmaking tickets |
 | socket `match_create`, `match_join` (by id or matchmaker token), `match_leave`, `match_data_send` → `match`, `match_data`, `match_presence_event` | token | relayed (client-hosted) matches, ≤64 players, targeted or broadcast data; authoritative matches come with the actor runtime |
+| `POST /v1/rpc/{id}`, `GET /v1/rpc`; socket `rpc` | bearer or server key | server logic: sandboxed WebAssembly modules from `runtime.modules_dir` (fuel, memory cap, wall-clock deadline, hot reload per module); ABI v0 documented in `musubi-runtime` |
 | `POST /v1/storage/{read,write,delete}`, `GET /v1/storage/{collection}` | bearer | legacy KV storage, Nakama permission codes, CAS versions |
 | `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
 

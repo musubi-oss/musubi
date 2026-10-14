@@ -34,6 +34,7 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub session: SessionConfig,
     pub log: LogConfig,
+    pub runtime: RuntimeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,5 +166,30 @@ mod tests {
         let c = Config::load(None).unwrap();
         assert_eq!(c.http.listen.port(), 7350);
         assert_eq!(c.node.roles.len(), 6);
+    }
+}
+
+/// Server-logic (WebAssembly) runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// Directory with `*.wasm` / `*.wat` modules loaded at startup (none = runtime empty).
+    pub modules_dir: Option<std::path::PathBuf>,
+    /// Fuel budget per call (~instructions).
+    pub fuel: u64,
+    pub max_memory_mb: usize,
+    pub timeout_ms: u64,
+    pub max_payload_kb: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            modules_dir: None,
+            fuel: 50_000_000,
+            max_memory_mb: 64,
+            timeout_ms: 2000,
+            max_payload_kb: 1024,
+        }
     }
 }

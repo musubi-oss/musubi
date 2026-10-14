@@ -6,6 +6,7 @@ use musubi_core::{AccountId, Error, GroupId};
 use musubi_matchmaker::{AddTicket, Matchmaker};
 use musubi_proto::realtime::{ChannelKind, MatchmakerUser};
 use musubi_proto::{ClientMessage, Encoding, Envelope, ServerMessage, UserPresence};
+use musubi_runtime::{CallContext, Runtime};
 use musubi_transport::{Connection, Frame, Limits};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -21,6 +22,7 @@ pub struct ConnectParams {
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
+    pub runtime: Arc<Runtime>,
 }
 
 /// Drive one realtime connection until it closes. Registers with the hub on entry and
@@ -34,6 +36,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         matchmaker,
         parties,
         relayed,
+        runtime,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -49,6 +52,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         matchmaker: &matchmaker,
         parties: &parties,
         relayed: &relayed,
+        runtime: &runtime,
         presence: &presence,
     };
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
@@ -71,6 +75,7 @@ struct Ctx<'a> {
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
     relayed: &'a RelayedRegistry,
+    runtime: &'a Arc<Runtime>,
     presence: &'a UserPresence,
 }
 
@@ -135,6 +140,7 @@ async fn send(
 
 async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
     let hub = ctx.hub;
+    let ctx_runtime = ctx.runtime;
     let sid = ctx.presence.session_id;
     match msg {
         ClientMessage::ChannelJoin {
@@ -362,9 +368,23 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             hub.unfollow(sid, &account_ids);
             None
         }
-        ClientMessage::Rpc { id, .. } => Some(ServerMessage::error(&Error::NotFound(format!(
-            "rpc {id}: runtime not loaded"
-        )))),
+        ClientMessage::Rpc { id, payload } => {
+            let ctx = CallContext {
+                account_id: Some(ctx.presence.account_id),
+                session_id: Some(sid),
+                username: Some(ctx.presence.username.clone()),
+                server: false,
+                vars: Default::default(),
+            };
+            let body = serde_json::to_vec(&payload).unwrap_or_default();
+            Some(match ctx_runtime.call(&id, ctx, body).await {
+                Ok(out) => ServerMessage::Rpc {
+                    id,
+                    payload: serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null),
+                },
+                Err(e) => ServerMessage::error(&e),
+            })
+        }
     }
 }
 

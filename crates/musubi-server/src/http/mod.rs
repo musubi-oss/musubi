@@ -7,6 +7,7 @@ mod friends;
 mod groups;
 mod leaderboards;
 mod notifications;
+mod rpc;
 mod storage;
 mod tournaments;
 mod ws;
@@ -37,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(leaderboards::routes())
         .merge(tournaments::routes())
+        .merge(rpc::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

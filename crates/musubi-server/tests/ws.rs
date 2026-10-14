@@ -40,6 +40,7 @@ async fn start() -> Option<(String, axum::Router)> {
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
+        runtime: test_runtime(),
         hub,
         cfg: Arc::new(cfg),
         db,
@@ -1027,6 +1028,59 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
         recv(&mut c).await.msg,
         ServerMessage::Error {
             code: musubi_core::Code::NotFound,
+            ..
+        }
+    ));
+}
+
+fn test_runtime() -> Arc<musubi_runtime::Runtime> {
+    let rt = Arc::new(musubi_runtime::Runtime::new(musubi_runtime::Limits::default()).unwrap());
+    rt.load_bytes("example", musubi_runtime::EXAMPLE_WAT.as_bytes())
+        .unwrap();
+    rt
+}
+
+#[tokio::test]
+async fn rpc_over_socket() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let (ta, acc) = token(&router).await;
+    let mut a = connect(&addr, &ta, "json").await;
+    send(
+        &mut a,
+        "json",
+        Some("r1"),
+        ClientMessage::Rpc {
+            id: "whoami".into(),
+            payload: json!({}),
+        },
+    )
+    .await;
+    let r = recv(&mut a).await;
+    assert_eq!(r.cid.as_deref(), Some("r1"));
+    match r.msg {
+        ServerMessage::Rpc { id, payload } => {
+            assert_eq!(id, "whoami");
+            assert_eq!(payload["account_id"], acc);
+            assert!(payload["session_id"].is_string());
+        }
+        m => panic!("{m:?}"),
+    }
+    send(
+        &mut a,
+        "json",
+        None,
+        ClientMessage::Rpc {
+            id: "spin".into(),
+            payload: json!({}),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::ResourceExhausted,
             ..
         }
     ));

@@ -6,6 +6,7 @@ use musubi_chat::ChatService;
 use musubi_core::config::Config;
 use musubi_leaderboard::{LeaderboardService, TournamentService};
 use musubi_matchmaker::Matchmaker;
+use musubi_runtime::Runtime;
 use musubi_social::{GroupService, NotificationService, SocialService};
 
 use crate::notify::Notifier;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
+    pub runtime: Arc<Runtime>,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -55,6 +57,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let matchmaker = Arc::new(Matchmaker::default());
     let parties = Arc::new(PartyRegistry::new());
     let relayed = Arc::new(RelayedRegistry::new());
+    let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
+        fuel: cfg.runtime.fuel,
+        max_memory_bytes: cfg.runtime.max_memory_mb << 20,
+        timeout: std::time::Duration::from_millis(cfg.runtime.timeout_ms),
+        max_payload_bytes: cfg.runtime.max_payload_kb << 10,
+    })?);
+    if let Some(dir) = &cfg.runtime.modules_dir {
+        let (m, r) = runtime.load_dir(dir)?;
+        tracing::info!(modules = m, rpcs = r, dir = %dir.display(), "runtime modules loaded");
+    }
     crate::realtime::matchmaking::spawn_ticker(
         hub.clone(),
         parties.clone(),
@@ -78,6 +90,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         matchmaker,
         parties,
         relayed,
+        runtime,
         hub,
         started_at: std::time::Instant::now(),
     };
