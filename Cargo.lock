@@ -1367,6 +1367,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "musubi-chat"
+version = "0.1.0"
+dependencies = [
+ "musubi-core",
+ "musubi-proto",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "musubi-cli"
 version = "0.1.0"
 dependencies = [
@@ -1425,6 +1438,7 @@ dependencies = [
  "http-body-util",
  "musubi-account",
  "musubi-auth",
+ "musubi-chat",
  "musubi-core",
  "musubi-proto",
  "musubi-social",

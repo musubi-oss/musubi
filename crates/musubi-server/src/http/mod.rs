@@ -1,5 +1,6 @@
 mod account;
 mod auth;
+mod chat;
 mod error;
 mod extract;
 mod friends;
@@ -31,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .merge(friends::routes())
         .merge(groups::routes())
         .merge(notifications::routes())
+        .merge(chat::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

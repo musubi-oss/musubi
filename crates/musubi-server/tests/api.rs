@@ -32,6 +32,7 @@ async fn app() -> Option<Router> {
             musubi_social::NotificationService::new(db.clone()),
             hub.clone(),
         ),
+        chat: musubi_chat::ChatService::new(db.clone()),
         hub,
         db,
         started_at: std::time::Instant::now(),

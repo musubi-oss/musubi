@@ -61,6 +61,7 @@ async fn upgrade(
                 presence,
                 encoding,
                 limits: Limits::default(),
+                chat: s.chat.clone(),
             };
             crate::realtime::serve(hub, Box::new(WsConnection::new(socket)), params).await;
         }))

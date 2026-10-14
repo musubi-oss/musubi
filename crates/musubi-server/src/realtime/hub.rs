@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dashmap::DashMap;
 use musubi_core::{AccountId, SessionId};
@@ -20,6 +20,10 @@ pub struct Hub {
     followers: DashMap<AccountId, HashSet<SessionId>>,
     /// session → accounts it follows (for cleanup)
     following: DashMap<SessionId, HashSet<AccountId>>,
+    /// chat channel id → sessions in it (hidden flag per session)
+    channels: DashMap<String, HashMap<SessionId, bool>>,
+    /// session → channels joined (for cleanup)
+    in_channels: DashMap<SessionId, HashSet<String>>,
 }
 
 impl Hub {
@@ -61,7 +65,119 @@ impl Hub {
                 }
             }
         }
+        if let Some((_, chans)) = self.in_channels.remove(&session_id) {
+            for c in chans {
+                self.leave_channel_inner(&c, &p);
+            }
+        }
         self.notify_followers(p.account_id, vec![], vec![p]);
+    }
+
+    /// Join a chat channel; returns the visible presences already there (excluding the joiner).
+    pub fn join_channel(
+        &self,
+        channel_id: &str,
+        session_id: SessionId,
+        hidden: bool,
+    ) -> Vec<UserPresence> {
+        let Some(h) = self.sessions.get(&session_id) else {
+            return vec![];
+        };
+        let me = h.presence.clone();
+        drop(h);
+        let mut members = self.channels.entry(channel_id.to_string()).or_default();
+        let already = members.insert(session_id, hidden).is_some();
+        let others: Vec<UserPresence> = members
+            .iter()
+            .filter(|(sid, hidden)| **sid != session_id && !**hidden)
+            .filter_map(|(sid, _)| self.sessions.get(sid).map(|h| h.presence.clone()))
+            .collect();
+        let targets: Vec<SessionId> = members
+            .keys()
+            .copied()
+            .filter(|s| *s != session_id)
+            .collect();
+        drop(members);
+        self.in_channels
+            .entry(session_id)
+            .or_default()
+            .insert(channel_id.to_string());
+        if !hidden && !already {
+            self.fan_out(
+                &targets,
+                ServerMessage::ChannelPresenceEvent {
+                    channel_id: channel_id.to_string(),
+                    joins: vec![me],
+                    leaves: vec![],
+                },
+            );
+        }
+        others
+    }
+
+    pub fn leave_channel(&self, channel_id: &str, session_id: SessionId) {
+        let Some(h) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let me = h.presence.clone();
+        drop(h);
+        if let Some(mut set) = self.in_channels.get_mut(&session_id) {
+            set.remove(channel_id);
+        }
+        self.leave_channel_inner(channel_id, &me);
+    }
+
+    fn leave_channel_inner(&self, channel_id: &str, me: &UserPresence) {
+        let Some(mut members) = self.channels.get_mut(channel_id) else {
+            return;
+        };
+        let Some(hidden) = members.remove(&me.session_id) else {
+            return;
+        };
+        let targets: Vec<SessionId> = members.keys().copied().collect();
+        let empty = members.is_empty();
+        drop(members);
+        if empty {
+            self.channels.remove_if(channel_id, |_, m| m.is_empty());
+        }
+        if !hidden {
+            self.fan_out(
+                &targets,
+                ServerMessage::ChannelPresenceEvent {
+                    channel_id: channel_id.to_string(),
+                    joins: vec![],
+                    leaves: vec![me.clone()],
+                },
+            );
+        }
+    }
+
+    pub fn in_channel(&self, channel_id: &str, session_id: SessionId) -> bool {
+        self.channels
+            .get(channel_id)
+            .is_some_and(|m| m.contains_key(&session_id))
+    }
+
+    /// Deliver to every session in the channel (including the sender). Returns the count reached.
+    pub fn broadcast_channel(&self, channel_id: &str, msg: ServerMessage) -> usize {
+        let Some(members) = self.channels.get(channel_id) else {
+            return 0;
+        };
+        let targets: Vec<SessionId> = members.keys().copied().collect();
+        drop(members);
+        self.fan_out(&targets, msg)
+    }
+
+    fn fan_out(&self, targets: &[SessionId], msg: ServerMessage) -> usize {
+        let mut n = 0;
+        for sid in targets {
+            if let Some(h) = self.sessions.get(sid) {
+                if h.tx.try_send(msg.clone()).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     /// Change the status text; followers get a leave (old) + join (new) pair, like Nakama.

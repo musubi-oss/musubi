@@ -8,6 +8,7 @@ use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use musubi_auth::AuthService;
 use musubi_core::config::Config;
+use musubi_proto::realtime::ChannelKind;
 use musubi_proto::{ClientMessage, Encoding, Envelope, ServerMessage};
 use musubi_server::app::AppState;
 use musubi_server::realtime::Hub;
@@ -33,6 +34,7 @@ async fn start() -> Option<(String, axum::Router)> {
             musubi_social::NotificationService::new(db.clone()),
             hub.clone(),
         ),
+        chat: musubi_chat::ChatService::new(db.clone()),
         hub,
         cfg: Arc::new(cfg),
         db,
@@ -190,4 +192,228 @@ async fn migrate_once(db: &sqlx::PgPool) {
     static ONCE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     ONCE.get_or_init(|| async { musubi_server::db::migrate(db).await.unwrap() })
         .await;
+}
+
+#[tokio::test]
+async fn chat_room_and_direct_with_history_and_blocks() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let room = format!("lobby-{}", uuid::Uuid::now_v7().simple());
+
+    // A joins empty room, B joins → A gets presence event, B sees A
+    send(
+        &mut a,
+        f,
+        Some("j"),
+        ClientMessage::ChannelJoin {
+            target: room.clone(),
+            kind: ChannelKind::Room,
+            persistence: false,
+            hidden: false,
+        },
+    )
+    .await;
+    let r = recv(&mut a).await;
+    let room_id = match r.msg {
+        ServerMessage::Channel { id, presences, .. } => {
+            assert!(presences.is_empty());
+            id
+        }
+        m => panic!("{m:?}"),
+    };
+    assert_eq!(room_id, format!("2.{room}"));
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::ChannelJoin {
+            target: room.clone(),
+            kind: ChannelKind::Room,
+            persistence: false,
+            hidden: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::Channel { presences, .. } if presences.len() == 1)
+    );
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::ChannelPresenceEvent { joins, .. } if joins.len() == 1)
+    );
+
+    // room message: non-persistent, both receive, sender also gets ack
+    send(
+        &mut a,
+        f,
+        Some("m1"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: serde_json::json!({"text": "hi"}),
+        },
+    )
+    .await;
+    let mut got_ack = false;
+    let mut got_msg = false;
+    for _ in 0..2 {
+        let r = recv(&mut a).await;
+        match r.msg {
+            ServerMessage::ChannelMessageAck { persistent, .. } => {
+                assert_eq!(r.cid.as_deref(), Some("m1"));
+                assert!(!persistent);
+                got_ack = true;
+            }
+            ServerMessage::ChannelMessage(m) => {
+                assert_eq!(m.content["text"], "hi");
+                got_msg = true;
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    assert!(got_ack && got_msg);
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::ChannelMessage(m) if m.sender_id == Some(acc_a.parse().unwrap()))
+    );
+
+    // sending to a channel you haven't joined is denied
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelMessageSend {
+            channel_id: "2.other".into(),
+            content: serde_json::json!({}),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::PermissionDenied,
+            ..
+        }
+    ));
+
+    // direct chat: persisted, editable, removable, visible via HTTP history
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelJoin {
+            target: acc_b.clone(),
+            kind: ChannelKind::Direct,
+            persistence: true,
+            hidden: false,
+        },
+    )
+    .await;
+    let dm = match recv(&mut a).await.msg {
+        ServerMessage::Channel { id, .. } => id,
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelMessageSend {
+            channel_id: dm.clone(),
+            content: serde_json::json!({"text": "secret"}),
+        },
+    )
+    .await;
+    let mut mid = None;
+    for _ in 0..2 {
+        if let ServerMessage::ChannelMessageAck {
+            message_id,
+            persistent,
+            ..
+        } = recv(&mut a).await.msg
+        {
+            assert!(persistent);
+            mid = Some(message_id);
+        }
+    }
+    let mid = mid.unwrap();
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelMessageUpdate {
+            channel_id: dm.clone(),
+            message_id: mid.clone(),
+            content: serde_json::json!({"text": "edited"}),
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        match recv(&mut a).await.msg {
+            ServerMessage::ChannelMessageAck { code, .. } => assert_eq!(code, 1),
+            ServerMessage::ChannelMessage(m) => assert_eq!(m.content["text"], "edited"),
+            m => panic!("{m:?}"),
+        }
+    }
+    // B is not in the DM channel yet but can read history over HTTP
+    let req = Request::get(format!("/v1/channel/{dm}/messages"))
+        .header(header::AUTHORIZATION, format!("Bearer {tb}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["messages"][0]["content"]["text"], "edited");
+    assert_eq!(v["messages"][0]["code"], 1);
+
+    // B blocks A → A can no longer join the DM; a stranger cannot read it either
+    let req = Request::post("/v1/friends/block")
+        .header(header::AUTHORIZATION, format!("Bearer {tb}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"ids": [acc_a]}).to_string()))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelLeave {
+            channel_id: dm.clone(),
+        },
+    )
+    .await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelJoin {
+            target: acc_b.clone(),
+            kind: ChannelKind::Direct,
+            persistence: true,
+            hidden: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::PermissionDenied,
+            ..
+        }
+    ));
+    let (tc, _) = token(&router).await;
+    let req = Request::get(format!("/v1/channel/{dm}/messages"))
+        .header(header::AUTHORIZATION, format!("Bearer {tc}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 403);
+
+    // A disconnects → B gets a room leave event
+    a.close(None).await.unwrap();
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::ChannelPresenceEvent { leaves, .. } if leaves.len() == 1)
+    );
 }

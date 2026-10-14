@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use musubi_account::AccountService;
 use musubi_auth::AuthService;
+use musubi_chat::ChatService;
 use musubi_core::config::Config;
 use musubi_social::{GroupService, NotificationService, SocialService};
 
@@ -24,6 +25,7 @@ pub struct AppState {
     pub social: SocialService,
     pub groups: GroupService,
     pub notify: Notifier,
+    pub chat: ChatService,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -39,6 +41,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let accounts = AccountService::new(db.clone());
     let social = SocialService::new(db.clone());
     let groups = GroupService::new(db.clone());
+    let chat = ChatService::new(db.clone());
     let hub = Arc::new(Hub::new());
     let notify = Notifier::new(NotificationService::new(db.clone()), hub.clone());
     let state = AppState {
@@ -50,6 +53,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         social,
         groups,
         notify,
+        chat,
         hub,
         started_at: std::time::Instant::now(),
     };
