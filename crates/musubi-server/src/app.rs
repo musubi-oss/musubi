@@ -73,13 +73,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let (m, r) = runtime.load_dir(dir)?;
         tracing::info!(modules = m, rpcs = r, dir = %dir.display(), "runtime modules loaded");
     }
-    crate::realtime::matchmaking::spawn_ticker(
-        hub.clone(),
-        parties.clone(),
-        relayed.clone(),
-        matchmaker.clone(),
-        std::time::Duration::from_secs(1),
-    );
     let cluster = Arc::new(Cluster::new(
         db.clone(),
         &cfg.node.name,
@@ -131,7 +124,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         });
     }
-    let fanout = Fanout::new(hub.clone(), Some(cluster.clone()));
+    let fanout = Fanout::new(
+        hub.clone(),
+        Some(cluster.clone()),
+        matchmaker.clone(),
+        parties.clone(),
+        relayed.clone(),
+    );
+    crate::realtime::matchmaking::spawn_ticker(
+        hub.clone(),
+        parties.clone(),
+        relayed.clone(),
+        matchmaker.clone(),
+        fanout.clone(),
+        Some(cluster.clone()),
+        std::time::Duration::from_secs(1),
+    );
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {
         cfg: Arc::new(cfg),

@@ -24,6 +24,7 @@ pub struct Ticket {
     pub party_id: Option<String>,
     pub members: Vec<Candidate>,
     pub query: Query,
+    pub query_src: String,
     pub props: Properties,
     pub min_count: usize,
     pub max_count: usize,
@@ -43,6 +44,81 @@ impl Matched {
             .iter()
             .flat_map(|t| t.members.iter().cloned())
             .collect()
+    }
+}
+
+/// Serializable ticket for replication between nodes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TicketWire {
+    pub id: String,
+    pub party_id: Option<String>,
+    pub members: Vec<Candidate>,
+    pub query: String,
+    pub min_count: usize,
+    pub max_count: usize,
+    pub count_multiple: usize,
+    pub age_ms: u64,
+}
+
+impl From<&Ticket> for TicketWire {
+    fn from(t: &Ticket) -> Self {
+        Self {
+            id: t.id.clone(),
+            party_id: t.party_id.clone(),
+            members: t.members.clone(),
+            query: t.query_src.clone(),
+            min_count: t.min_count,
+            max_count: t.max_count,
+            count_multiple: t.count_multiple,
+            age_ms: t.created.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+impl TicketWire {
+    pub fn into_ticket(self) -> Result<Ticket> {
+        let query = Query::parse(&self.query)?;
+        let props = merged_props(&self.members);
+        Ok(Ticket {
+            id: self.id,
+            party_id: self.party_id,
+            members: self.members,
+            query,
+            query_src: self.query,
+            props,
+            min_count: self.min_count,
+            max_count: self.max_count,
+            count_multiple: self.count_multiple,
+            created: Instant::now()
+                .checked_sub(Duration::from_millis(self.age_ms))
+                .unwrap_or_else(Instant::now),
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MatchedWire {
+    pub token: String,
+    pub tickets: Vec<TicketWire>,
+}
+
+impl Matched {
+    pub fn to_wire(&self) -> MatchedWire {
+        MatchedWire {
+            token: self.token.clone(),
+            tickets: self.tickets.iter().map(TicketWire::from).collect(),
+        }
+    }
+
+    pub fn from_wire(w: MatchedWire) -> Result<Self> {
+        Ok(Self {
+            token: w.token,
+            tickets: w
+                .tickets
+                .into_iter()
+                .map(TicketWire::into_ticket)
+                .collect::<Result<_>>()?,
+        })
     }
 }
 
@@ -133,6 +209,7 @@ impl Matchmaker {
             party_id: t.party_id,
             members: t.members,
             query,
+            query_src: t.query,
             props,
             min_count: t.min_count,
             max_count: t.max_count,
@@ -140,6 +217,32 @@ impl Matchmaker {
             created: Instant::now(),
         });
         Ok(id)
+    }
+
+    pub fn get(&self, ticket: &str) -> Option<TicketWire> {
+        self.pool
+            .lock()
+            .tickets
+            .iter()
+            .find(|t| t.id == ticket)
+            .map(TicketWire::from)
+    }
+
+    /// Insert a ticket replicated from another node (no per-session limits; idempotent).
+    pub fn add_replica(&self, w: TicketWire) -> Result<bool> {
+        let t = w.into_ticket()?;
+        let mut pool = self.pool.lock();
+        if pool.tickets.iter().any(|x| x.id == t.id) {
+            return Ok(false);
+        }
+        for m in &t.members {
+            pool.by_session
+                .entry(m.presence.session_id)
+                .or_default()
+                .push(t.id.clone());
+        }
+        pool.tickets.push(t);
+        Ok(true)
     }
 
     /// Remove a ticket; only a session that is part of it may do so.

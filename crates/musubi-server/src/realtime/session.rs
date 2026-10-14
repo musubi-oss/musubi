@@ -66,8 +66,11 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
     for t in parties.leave_all(&hub, sid) {
         matchmaker.cancel(&t);
+        fanout.mm_remove(&t);
     }
-    matchmaker.remove_session(sid);
+    for t in matchmaker.remove_session(sid) {
+        fanout.mm_remove(&t);
+    }
     relayed.leave_all(&hub, sid);
     matches.leave_all(sid);
     hub.leave(sid);
@@ -216,11 +219,13 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             });
             match res {
                 Ok(ticket) => {
+                    ctx.fanout.mm_add(&ticket);
                     super::matchmaking::process_and_deliver(
                         hub,
                         ctx.parties,
                         ctx.relayed,
                         ctx.matchmaker,
+                        ctx.fanout,
                     );
                     Some(ServerMessage::MatchmakerTicket { ticket })
                 }
@@ -228,7 +233,10 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             }
         }
         ClientMessage::MatchmakerRemove { ticket } => match ctx.matchmaker.remove(sid, &ticket) {
-            Ok(()) => None,
+            Ok(()) => {
+                ctx.fanout.mm_remove(&ticket);
+                None
+            }
             Err(e) => Some(ServerMessage::error(&e)),
         },
         ClientMessage::PartyCreate { open, max_size } => Some(
@@ -246,6 +254,7 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             Ok(tickets) => {
                 for t in tickets {
                     ctx.matchmaker.cancel(&t);
+                    ctx.fanout.mm_remove(&t);
                 }
                 None
             }
@@ -270,6 +279,7 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             Ok(tickets) => {
                 for t in tickets {
                     ctx.matchmaker.cancel(&t);
+                    ctx.fanout.mm_remove(&t);
                 }
                 None
             }
@@ -314,6 +324,7 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             match ctx.parties.untrack_ticket(sid, &party_id, &ticket) {
                 Ok(()) => {
                     ctx.matchmaker.cancel(&ticket);
+                    ctx.fanout.mm_remove(&ticket);
                     None
                 }
                 Err(e) => Some(ServerMessage::error(&e)),
@@ -573,6 +584,13 @@ fn party_matchmake(
             ctx.hub.send_to_session(s, msg.clone());
         }
     }
-    super::matchmaking::process_and_deliver(ctx.hub, ctx.parties, ctx.relayed, ctx.matchmaker);
+    ctx.fanout.mm_add(&ticket);
+    super::matchmaking::process_and_deliver(
+        ctx.hub,
+        ctx.parties,
+        ctx.relayed,
+        ctx.matchmaker,
+        ctx.fanout,
+    );
     Ok(msg)
 }

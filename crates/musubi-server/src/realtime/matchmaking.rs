@@ -3,7 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use musubi_cluster::Cluster;
 use musubi_matchmaker::{Matched, Matchmaker};
+
+use crate::fanout::Fanout;
 use musubi_proto::ServerMessage;
 
 use super::{Hub, PartyRegistry, RelayedRegistry};
@@ -30,14 +33,20 @@ pub fn deliver(hub: &Hub, parties: &PartyRegistry, relayed: &RelayedRegistry, m:
     }
 }
 
+/// Leader-only: form groups, deliver locally and announce them to the other nodes.
 pub fn process_and_deliver(
     hub: &Hub,
     parties: &PartyRegistry,
     relayed: &RelayedRegistry,
     mm: &Matchmaker,
+    fanout: &Fanout,
 ) {
+    if !fanout.is_leader() {
+        return;
+    }
     for m in mm.process() {
         deliver(hub, parties, relayed, &m);
+        fanout.mm_matched(&m);
     }
 }
 
@@ -47,13 +56,31 @@ pub fn spawn_ticker(
     parties: Arc<PartyRegistry>,
     relayed: Arc<RelayedRegistry>,
     mm: Arc<Matchmaker>,
+    fanout: Fanout,
+    cluster: Option<Arc<Cluster>>,
     every: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
+        let mut n: u64 = 0;
         loop {
             tick.tick().await;
-            process_and_deliver(&hub, &parties, &relayed, &mm);
+            // Leader = lowest id among live nodes; re-evaluated every 5 passes.
+            if let Some(c) = &cluster {
+                if n % 5 == 0 {
+                    match c.nodes().await {
+                        Ok(nodes) => {
+                            let leader = nodes.iter().filter(|x| x.alive).map(|x| x.id.0).min();
+                            fanout.set_leader(leader.is_none_or(|l| l == c.node_id().0));
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "node list failed; keeping leadership state")
+                        }
+                    }
+                }
+                n += 1;
+            }
+            process_and_deliver(&hub, &parties, &relayed, &mm, &fanout);
         }
     })
 }

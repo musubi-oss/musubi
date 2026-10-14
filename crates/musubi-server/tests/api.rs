@@ -23,7 +23,16 @@ async fn app() -> Option<Router> {
     let hub = Arc::new(musubi_server::realtime::Hub::new());
     let runtime = test_runtime();
     let cluster = test_cluster(&db).await;
-    let fanout = musubi_server::fanout::Fanout::new(hub.clone(), cluster.clone());
+    let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
+    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new());
+    let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new());
+    let fanout = musubi_server::fanout::Fanout::new(
+        hub.clone(),
+        cluster.clone(),
+        matchmaker.clone(),
+        parties.clone(),
+        relayed.clone(),
+    );
     Some(musubi_server::http::router(AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -38,9 +47,9 @@ async fn app() -> Option<Router> {
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
-        matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
-        parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
-        relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
+        matchmaker,
+        parties,
+        relayed,
         matches: test_matches(&db, &runtime),
         runtime: runtime.clone(),
         cluster: cluster.clone(),

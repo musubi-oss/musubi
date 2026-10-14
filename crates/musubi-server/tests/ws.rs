@@ -18,6 +18,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
 
 async fn start() -> Option<(String, axum::Router)> {
+    start_with(true).await
+}
+
+/// `leader=false` builds a node that replicates tickets but never runs matchmaker passes.
+async fn start_with(leader: bool) -> Option<(String, axum::Router)> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
@@ -26,7 +31,17 @@ async fn start() -> Option<(String, axum::Router)> {
     let hub = Arc::new(Hub::new());
     let runtime = test_runtime();
     let cluster = test_cluster(&db).await;
-    let fanout = musubi_server::fanout::Fanout::new(hub.clone(), cluster.clone());
+    let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
+    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new());
+    let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new());
+    let fanout = musubi_server::fanout::Fanout::new(
+        hub.clone(),
+        cluster.clone(),
+        matchmaker.clone(),
+        parties.clone(),
+        relayed.clone(),
+    );
+    fanout.set_leader(leader);
     let state = AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
@@ -40,9 +55,9 @@ async fn start() -> Option<(String, axum::Router)> {
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
-        matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
-        parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
-        relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
+        matchmaker,
+        parties,
+        relayed,
         matches: test_matches(&db, &runtime),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
@@ -1502,4 +1517,56 @@ async fn wasm_match_module_runs_as_authoritative_match() {
     let v: Value =
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert!(v["tick"].as_u64().unwrap() >= 1, "{v}");
+}
+
+#[tokio::test]
+async fn cross_node_matchmaking() {
+    let Some((addr1, router1)) = start_with(true).await else {
+        return;
+    };
+    let Some((addr2, _)) = start_with(false).await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _) = token(&router1).await;
+    let (tb, _) = token(&router1).await;
+    let mut a = connect(&addr1, &ta, f).await;
+    let mut b = connect(&addr2, &tb, f).await;
+    let mode = format!("xn-{}", uuid::Uuid::now_v7().simple());
+    let add = |mode: &str| ClientMessage::MatchmakerAdd {
+        query: format!("+properties.mode:{mode}"),
+        min_count: 2,
+        max_count: 2,
+        count_multiple: 1,
+        string_properties: [("mode".to_string(), mode.to_string())]
+            .into_iter()
+            .collect(),
+        numeric_properties: Default::default(),
+    };
+    // follower node adds first: its ticket is replicated to the leader
+    send(&mut b, f, None, add(&mode)).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    send(&mut a, f, None, add(&mode)).await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    let ta_tok = match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerMatched { token, users, .. } => {
+            assert_eq!(users.len(), 2);
+            token
+        }
+        m => panic!("{m:?}"),
+    };
+    match recv(&mut b).await.msg {
+        ServerMessage::MatchmakerMatched { token, users, .. } => {
+            assert_eq!(token, ta_tok);
+            assert_eq!(users.len(), 2);
+        }
+        m => panic!("{m:?}"),
+    }
 }
