@@ -42,7 +42,10 @@ async fn start() -> Option<(String, axum::Router)> {
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
-        matches: Arc::new(musubi_server::realtime::MatchRegistry::new()),
+        matches: Arc::new(musubi_server::realtime::MatchRegistry::new(
+            Some(db.clone()),
+            uuid::Uuid::now_v7(),
+        )),
         runtime: test_runtime(),
         cluster: cluster.clone(),
         fanout,
@@ -1337,4 +1340,62 @@ async fn authoritative_echo_match_lifecycle() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn match_snapshots_persist_and_resume_on_another_registry() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"module": "echo", "params": {"tick_rate": 20, "label": "persist", "empty_ticks": 1000}}).to_string()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+    let (ta, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, "json").await;
+    send(
+        &mut a,
+        "json",
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    recv(&mut a).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let row: Option<(String, i64)> =
+        sqlx::query_as("select label, tick from musubi.match_snapshots where match_id = $1")
+            .bind(uuid::Uuid::parse_str(&mid).unwrap())
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+    let (label, _) = row.expect("snapshot written on join");
+    assert_eq!(label, "persist");
+
+    // another node: detach the row from its owner and resume it there
+    sqlx::query("update musubi.match_snapshots set node_id = null where match_id = $1")
+        .bind(uuid::Uuid::parse_str(&mid).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    let other = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
+    let hub2 = Arc::new(Hub::new());
+    let resumed = other.recover(hub2, &[]).await.unwrap();
+    assert_eq!(resumed, vec![mid.clone()]);
+    let resumed_info = other.get(&mid).unwrap().info().await;
+    assert_eq!(resumed_info.label, "persist");
+    assert!(resumed_info.tick > 0, "resumes from the snapshot tick");
+    other.get(&mid).unwrap().terminate(0);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(other.get(&mid).is_none());
 }

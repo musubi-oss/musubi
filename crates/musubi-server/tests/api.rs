@@ -40,7 +40,10 @@ async fn app() -> Option<Router> {
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
-        matches: Arc::new(musubi_server::realtime::MatchRegistry::new()),
+        matches: Arc::new(musubi_server::realtime::MatchRegistry::new(
+            Some(db.clone()),
+            uuid::Uuid::now_v7(),
+        )),
         runtime: test_runtime(),
         cluster: cluster.clone(),
         fanout,

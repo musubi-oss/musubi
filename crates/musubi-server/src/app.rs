@@ -63,7 +63,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let matchmaker = Arc::new(Matchmaker::default());
     let parties = Arc::new(PartyRegistry::new());
     let relayed = Arc::new(RelayedRegistry::new());
-    let matches = Arc::new(MatchRegistry::new());
     let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
         fuel: cfg.runtime.fuel,
         max_memory_bytes: cfg.runtime.max_memory_mb << 20,
@@ -93,6 +92,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         &cfg.http.listen.to_string(),
     ));
     cluster.start().await?;
+    let matches = Arc::new(MatchRegistry::new(Some(db.clone()), cluster.node_id().0));
+    let resumed = matches.recover(hub.clone(), &[]).await?;
+    if !resumed.is_empty() {
+        tracing::info!(
+            count = resumed.len(),
+            "resumed authoritative matches from snapshots"
+        );
+    }
     let fanout = Fanout::new(hub.clone(), Some(cluster.clone()));
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {

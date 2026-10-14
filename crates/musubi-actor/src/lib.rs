@@ -79,6 +79,31 @@ pub trait MatchHandler: Send + Sync {
 
 pub type Deliver = Arc<dyn Fn(Vec<SessionId>, ServerMessage) + Send + Sync>;
 
+/// Persisted view of a match; `None` state on `on_snapshot` means the match ended.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub module: String,
+    pub label: String,
+    pub params: serde_json::Value,
+    pub state: Vec<u8>,
+    pub tick: u64,
+}
+
+pub type OnSnapshot = Arc<dyn Fn(MatchId, Option<Snapshot>) + Send + Sync>;
+
+/// How a match starts: fresh from `init`, or resumed from a snapshot taken elsewhere.
+pub struct Spawn {
+    pub id: Option<MatchId>,
+    pub module: String,
+    pub params: serde_json::Value,
+    pub resume: Option<Snapshot>,
+    pub deliver: Deliver,
+    pub on_end: Box<dyn FnOnce(MatchId) + Send>,
+    pub on_snapshot: Option<OnSnapshot>,
+    /// Snapshot every N ticks (0 = only on membership changes and end).
+    pub snapshot_every: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchInfo {
     pub match_id: String,
@@ -154,7 +179,7 @@ impl MatchHandle {
     }
 }
 
-/// Spawn a match actor. `on_end` runs when the actor stops (for registry cleanup).
+/// Spawn a match actor.
 pub fn spawn(
     module: &str,
     handler: Arc<dyn MatchHandler>,
@@ -162,21 +187,48 @@ pub fn spawn(
     deliver: Deliver,
     on_end: Box<dyn FnOnce(MatchId) + Send>,
 ) -> Result<MatchHandle> {
-    let init = handler.init(&params)?;
+    spawn_with(
+        handler,
+        Spawn {
+            id: None,
+            module: module.to_string(),
+            params,
+            resume: None,
+            deliver,
+            on_end,
+            on_snapshot: None,
+            snapshot_every: 0,
+        },
+    )
+}
+
+pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHandle> {
+    let init = match &sp.resume {
+        Some(snap) => {
+            let fresh = handler.init(&sp.params)?;
+            Init {
+                state: snap.state.clone(),
+                tick_rate: fresh.tick_rate,
+                label: snap.label.clone(),
+            }
+        }
+        None => handler.init(&sp.params)?,
+    };
     if !(1..=60).contains(&init.tick_rate) {
         return Err(Error::InvalidArgument("tick_rate must be 1..=60".into()));
     }
     if init.label.len() > 2048 {
         return Err(Error::InvalidArgument("label ≤ 2 KB".into()));
     }
-    let id = MatchId::new();
+    let id = sp.id.unwrap_or_default();
+    let start_tick = sp.resume.as_ref().map(|r| r.tick).unwrap_or(0);
     let info = Arc::new(RwLock::new(MatchInfo {
         match_id: id.to_string(),
-        module: module.to_string(),
+        module: sp.module.clone(),
         label: init.label.clone(),
         size: 0,
         tick_rate: init.tick_rate,
-        tick: 0,
+        tick: start_tick,
         state_bytes: init.state.len(),
     }));
     let (tx, rx) = mpsc::channel(1024);
@@ -185,10 +237,56 @@ pub fn spawn(
         tx,
         info: info.clone(),
     };
-    tokio::spawn(run(id, handler, init, rx, deliver, info, on_end));
+    tokio::spawn(run(
+        id,
+        handler,
+        init,
+        rx,
+        sp.deliver,
+        info,
+        sp.on_end,
+        Persist {
+            module: sp.module,
+            params: sp.params,
+            on_snapshot: sp.on_snapshot,
+            every: sp.snapshot_every,
+            start_tick,
+        },
+    ));
     Ok(handle)
 }
 
+struct Persist {
+    module: String,
+    params: serde_json::Value,
+    on_snapshot: Option<OnSnapshot>,
+    every: u64,
+    start_tick: u64,
+}
+
+impl Persist {
+    fn save(&self, id: MatchId, label: &str, state: &[u8], tick: u64) {
+        if let Some(cb) = &self.on_snapshot {
+            cb(
+                id,
+                Some(Snapshot {
+                    module: self.module.clone(),
+                    label: label.to_string(),
+                    params: self.params.clone(),
+                    state: state.to_vec(),
+                    tick,
+                }),
+            );
+        }
+    }
+    fn clear(&self, id: MatchId) {
+        if let Some(cb) = &self.on_snapshot {
+            cb(id, None);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run(
     id: MatchId,
     handler: Arc<dyn MatchHandler>,
@@ -197,13 +295,14 @@ async fn run(
     deliver: Deliver,
     info: Arc<RwLock<MatchInfo>>,
     on_end: Box<dyn FnOnce(MatchId) + Send>,
+    persist: Persist,
 ) {
     let match_id = id.to_string();
     let mut state = init.state;
     let mut label = init.label;
     let mut members: Vec<UserPresence> = Vec::new();
     let mut inputs: Vec<Input> = Vec::new();
-    let mut tick: u64 = 0;
+    let mut tick: u64 = persist.start_tick;
     let mut interval = tokio::time::interval(Duration::from_millis(1000 / init.tick_rate as u64));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let sessions = |m: &[UserPresence]| m.iter().map(|p| p.session_id).collect::<Vec<_>>();
@@ -258,6 +357,8 @@ async fn run(
                 let mut i = info.write().await;
                 i.size = members.len() as u32;
                 i.state_bytes = state.len();
+                drop(i);
+                persist.save(id, &label, &state, tick);
             }
             _ = interval.tick() => {
                 tick += 1;
@@ -278,6 +379,9 @@ async fn run(
                     i.size = members.len() as u32;
                     i.label = label.clone();
                     i.state_bytes = state.len();
+                }
+                if persist.every > 0 && tick % persist.every == 0 {
+                    persist.save(id, &label, &state, tick);
                 }
                 if res.terminate || grace.is_some_and(|g| g == 0) {
                     break;
@@ -300,6 +404,7 @@ async fn run(
             },
         );
     }
+    persist.clear(id);
     on_end(id);
 }
 
