@@ -22,10 +22,11 @@ async fn app() -> Option<Router> {
     let storage = StorageService::new(db.clone());
     Some(musubi_server::http::router(AppState {
         cfg: Arc::new(cfg),
-        db,
         auth,
         storage,
+        accounts: musubi_account::AccountService::new(db.clone()),
         hub: std::sync::Arc::new(musubi_server::realtime::Hub::new()),
+        db,
         started_at: std::time::Instant::now(),
     }))
 }
@@ -355,4 +356,119 @@ async fn storage_permissions_cas_and_paging() {
     assert_eq!(st, StatusCode::OK);
     let (_, l) = call(&app, "GET", &format!("/v1/storage/{col}"), Some(ta), None).await;
     assert_eq!(l["objects"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn account_update_link_unlink_and_users_lookup() {
+    let Some(app) = app().await else { return };
+    let dev = unique("dev");
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    let t = s["access_token"].as_str().unwrap();
+
+    let (st, acc) = call(&app, "GET", "/v1/account", Some(t), None).await;
+    assert_eq!(st, StatusCode::OK, "{acc}");
+    assert_eq!(acc["identities"].as_array().unwrap().len(), 1);
+
+    let name = unique("nm").replace('-', "_");
+    let name = &name[..name.len().min(32)];
+    let (st, acc) = call(
+        &app,
+        "PATCH",
+        "/v1/account",
+        Some(t),
+        Some(json!({"username": name, "display_name": "Alice", "metadata": {"lvl": 3}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{acc}");
+    assert_eq!(acc["username"], name);
+    assert_eq!(acc["metadata"]["lvl"], 3);
+    let (st, _) = call(
+        &app,
+        "PATCH",
+        "/v1/account",
+        Some(t),
+        Some(json!({"metadata": [1]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let email = format!("{}@example.test", unique("l"));
+    let (st, e0) = call(
+        &app,
+        "POST",
+        "/v1/account/link/email",
+        Some(t),
+        Some(json!({"email": email, "password": "secret123"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{e0}");
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/account/link/email",
+        Some(t),
+        Some(json!({"email": email, "password": "secret123"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{e}");
+    let (_, acc) = call(&app, "GET", "/v1/account", Some(t), None).await;
+    assert_eq!(acc["identities"].as_array().unwrap().len(), 2);
+    assert!(acc["identities"][1]["subject"]
+        .as_str()
+        .unwrap()
+        .contains("***@"));
+
+    // email login now reaches the same account
+    let (_, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(json!({"email": email, "password": "secret123"})),
+    )
+    .await;
+    assert_eq!(s2["account_id"], s["account_id"]);
+
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        "/v1/account/unlink/device",
+        Some(t),
+        Some(json!({"id": dev})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, e) = call(
+        &app,
+        "DELETE",
+        "/v1/account/unlink/email",
+        Some(t),
+        Some(json!({"email": email})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "last identity: {e}");
+
+    let (st, u) = call(
+        &app,
+        "GET",
+        &format!("/v1/users?usernames={name}"),
+        Some(t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+    assert_eq!(u["users"][0]["id"], s["account_id"]);
+    assert!(u["users"][0].get("identities").is_none());
+
+    let (st, _) = call(&app, "DELETE", "/v1/account", Some(t), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(t), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

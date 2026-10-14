@@ -14,6 +14,7 @@ path = "src/main.rs"
 musubi-core.workspace = true
 musubi-auth.workspace = true
 musubi-storage.workspace = true
+musubi-account.workspace = true
 musubi-proto.workspace = true
 musubi-transport.workspace = true
 dashmap.workspace = true
@@ -35,5 +36,6 @@ http-body-util = "0.1"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+musubi-account.workspace = true
 tokio-tungstenite.workspace = true
 musubi-proto.workspace = true

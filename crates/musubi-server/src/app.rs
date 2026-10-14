@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use musubi_account::AccountService;
 use musubi_auth::AuthService;
 use musubi_core::config::Config;
 use musubi_storage::StorageService;
@@ -16,6 +17,7 @@ pub struct AppState {
     pub db: PgPool,
     pub auth: AuthService,
     pub storage: StorageService,
+    pub accounts: AccountService,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -28,11 +30,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     let auth = AuthService::new(db.clone(), &cfg.session)?;
     let storage = StorageService::new(db.clone());
+    let accounts = AccountService::new(db.clone());
     let state = AppState {
         cfg: Arc::new(cfg),
         db,
         auth,
         storage,
+        accounts,
         hub: Arc::new(Hub::new()),
         started_at: std::time::Instant::now(),
     };

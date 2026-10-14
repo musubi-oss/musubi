@@ -25,6 +25,7 @@ async fn start() -> Option<(String, axum::Router)> {
     let state = AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
+        accounts: musubi_account::AccountService::new(db.clone()),
         hub: Arc::new(Hub::new()),
         cfg: Arc::new(cfg),
         db,

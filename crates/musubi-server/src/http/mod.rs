@@ -1,3 +1,4 @@
+mod account;
 mod auth;
 mod error;
 mod extract;
@@ -23,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
         .merge(auth::routes())
+        .merge(account::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

@@ -219,15 +219,43 @@ impl AuthService {
         }
     }
 
+    pub async fn link_device(&self, account_id: AccountId, device_id: &str) -> Result<IdentityId> {
+        if device_id.len() < 10 || device_id.len() > 128 {
+            return Err(Error::InvalidArgument(
+                "device id must be 10..=128 chars".into(),
+            ));
+        }
+        self.link(account_id, provider::DEVICE, device_id, None)
+            .await
+    }
+
+    pub async fn link_email(
+        &self,
+        account_id: AccountId,
+        email: &str,
+        pass: &str,
+    ) -> Result<IdentityId> {
+        let email = normalize_email(email)?;
+        password::validate(pass)?;
+        let hash = password::hash(pass.to_owned()).await?;
+        self.link(account_id, provider::EMAIL, &email, Some(&hash))
+            .await
+    }
+
     pub async fn unlink(&self, account_id: AccountId, provider: &str, subject: &str) -> Result<()> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        let count: i64 = sqlx::query_scalar(
-            "select count(*) from musubi.identities where account_id = $1 for update",
-        )
-        .bind(account_id.0)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(Error::internal)?;
+        // Serialize unlinks per account so two concurrent unlinks cannot both pass the check.
+        sqlx::query("select 1 from musubi.accounts where id = $1 for update")
+            .bind(account_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from musubi.identities where account_id = $1")
+                .bind(account_id.0)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
         if count <= 1 {
             return Err(Error::Conflict("cannot unlink the last identity".into()));
         }

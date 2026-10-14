@@ -27,6 +27,9 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 | `POST /v1/auth/device`, `POST /v1/auth/email` | — | authenticate / create account, returns JWT access + refresh |
 | `POST /v1/auth/refresh` | — | rotate refresh token (reuse revokes the family) |
 | `POST /v1/auth/logout`, `GET /v1/account/me` | bearer | |
+| `GET\|PATCH\|DELETE /v1/account` | bearer | own account: profile fields, metadata, identities (masked), soft delete |
+| `POST /v1/account/link/{device,email}`, `DELETE /v1/account/unlink/{device,email}` | bearer | link/unlink identities (the last one cannot be unlinked) |
+| `GET /v1/users?ids=…&usernames=…` | bearer | public profiles, ≤100 per call |
 | `POST /v1/storage/{read,write,delete}`, `GET /v1/storage/{collection}` | bearer | legacy KV storage, Nakama permission codes, CAS versions |
 | `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
 
