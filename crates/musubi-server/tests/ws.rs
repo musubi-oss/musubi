@@ -21,12 +21,13 @@ async fn start() -> Option<(String, axum::Router)> {
     let mut cfg = Config::default();
     cfg.database.url = url;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
-    musubi_server::db::migrate(&db).await.unwrap();
+    migrate_once(&db).await;
     let state = AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
+        groups: musubi_social::GroupService::new(db.clone()),
         hub: Arc::new(Hub::new()),
         cfg: Arc::new(cfg),
         db,
@@ -177,4 +178,11 @@ async fn rejects_bad_token() {
         .await
         .expect_err("must fail");
     assert!(err.to_string().contains("401"), "{err}");
+}
+
+/// Tests in one binary run concurrently against a shared database: apply migrations once per process.
+async fn migrate_once(db: &sqlx::PgPool) {
+    static ONCE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    ONCE.get_or_init(|| async { musubi_server::db::migrate(db).await.unwrap() })
+        .await;
 }

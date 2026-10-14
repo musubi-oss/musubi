@@ -17,7 +17,7 @@ async fn app() -> Option<Router> {
     let mut cfg = Config::default();
     cfg.database.url = url;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
-    musubi_server::db::migrate(&db).await.unwrap();
+    migrate_once(&db).await;
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
     let storage = StorageService::new(db.clone());
     Some(musubi_server::http::router(AppState {
@@ -26,6 +26,7 @@ async fn app() -> Option<Router> {
         storage,
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
+        groups: musubi_social::GroupService::new(db.clone()),
         hub: std::sync::Arc::new(musubi_server::realtime::Hub::new()),
         db,
         started_at: std::time::Instant::now(),
@@ -602,4 +603,239 @@ async fn friends_invite_accept_remove_block() {
     .await;
     let (_, l) = call(&app, "GET", "/v1/friends", Some(tc), None).await;
     assert!(l["friends"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn groups_lifecycle_and_moderation() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("gr")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, a) = &users[0];
+    let (tb, b) = &users[1];
+    let (tc, c) = &users[2];
+
+    let name = unique("clan");
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(ta),
+        Some(json!({"name": name, "open": false, "max_count": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    assert_eq!(g["edge_count"], 1);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(tb),
+        Some(json!({"name": name})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // closed group → join request, visible to admin only
+    let (_, j) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(j["state"], 3);
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/members"),
+        Some(tc),
+        None,
+    )
+    .await;
+    assert_eq!(m["items"].as_array().unwrap().len(), 1);
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/members?state=3"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert_eq!(m["items"][0]["user"]["id"], *b);
+
+    // non-admin cannot accept; admin accepts → edge_count 2
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/add"),
+        Some(tc),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/add"),
+        Some(ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, g) = call(&app, "GET", &format!("/v1/groups/{gid}"), Some(ta), None).await;
+    assert_eq!(g["edge_count"], 2);
+
+    // full: C joining stays a request even after open=true? open → immediate join fails with 429
+    call(
+        &app,
+        "PATCH",
+        &format!("/v1/groups/{gid}"),
+        Some(ta),
+        Some(json!({"open": true})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    call(
+        &app,
+        "PATCH",
+        &format!("/v1/groups/{gid}"),
+        Some(ta),
+        Some(json!({"max_count": 10})),
+    )
+    .await;
+    let (_, j) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(tc),
+        None,
+    )
+    .await;
+    assert_eq!(j["state"], 2);
+
+    // promote B to admin; B cannot kick A (higher), can kick C
+    call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/promote"),
+        Some(ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/kick"),
+        Some(tb),
+        Some(json!({"ids": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/kick"),
+        Some(tb),
+        Some(json!({"ids": [c]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, ug) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/{c}/groups"),
+        Some(tc),
+        None,
+    )
+    .await;
+    assert!(ug["items"].as_array().unwrap().is_empty());
+
+    // last superadmin can't leave while others remain; after promoting B it can
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/leave"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/promote"),
+        Some(ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/leave"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, ug) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/{b}/groups?state=0"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(ug["items"][0]["group"]["id"], gid);
+    assert_eq!(ug["items"][0]["group"]["edge_count"], 1);
+
+    // listing by prefix; delete by superadmin
+    let (_, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups?name={}", &name[..8]),
+        Some(tc),
+        None,
+    )
+    .await;
+    assert!(l["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g["id"] == gid));
+    let (st, _) = call(&app, "DELETE", &format!("/v1/groups/{gid}"), Some(tc), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(&app, "DELETE", &format!("/v1/groups/{gid}"), Some(tb), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", &format!("/v1/groups/{gid}"), Some(tb), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// Tests in one binary run concurrently against a shared database: apply migrations once per process.
+async fn migrate_once(db: &sqlx::PgPool) {
+    static ONCE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    ONCE.get_or_init(|| async { musubi_server::db::migrate(db).await.unwrap() })
+        .await;
 }

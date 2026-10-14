@@ -1,4 +1,10 @@
-//! Social graph: friends, invites, blocks. Groups and parties live in their own modules.
+//! Social graph: friends, invites, blocks, groups.
+
+pub mod groups;
+pub use groups::{
+    CreateGroup, Group, GroupFilter, GroupMember, GroupService, MemberState, Page, UpdateGroup,
+    UserGroup,
+};
 
 use musubi_account::User;
 use musubi_core::{AccountId, Error, Result};
