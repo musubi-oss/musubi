@@ -5,6 +5,8 @@ use musubi_core::{AccountId, SessionId};
 use musubi_proto::{ServerMessage, UserPresence};
 use tokio::sync::mpsc;
 
+pub type RemoteHook = Box<dyn Fn(AccountId, Vec<UserPresence>, Vec<UserPresence>) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct SessionHandle {
     pub presence: UserPresence,
@@ -20,6 +22,7 @@ pub struct Hub {
     followers: DashMap<AccountId, HashSet<SessionId>>,
     /// session → accounts it follows (for cleanup)
     following: DashMap<SessionId, HashSet<AccountId>>,
+    remote: std::sync::OnceLock<RemoteHook>,
     /// chat channel id → sessions in it (hidden flag per session)
     channels: DashMap<String, HashMap<SessionId, bool>>,
     /// session → channels joined (for cleanup)
@@ -251,7 +254,25 @@ impl Hub {
             .collect()
     }
 
+    /// Install the cross-node hook: every local presence change is also handed to it.
+    pub fn set_remote(&self, hook: RemoteHook) {
+        let _ = self.remote.set(hook);
+    }
+
     fn notify_followers(
+        &self,
+        target: AccountId,
+        joins: Vec<UserPresence>,
+        leaves: Vec<UserPresence>,
+    ) {
+        if let Some(hook) = self.remote.get() {
+            hook(target, joins.clone(), leaves.clone());
+        }
+        self.notify_followers_local(target, joins, leaves);
+    }
+
+    /// Deliver a presence change (local or received from another node) to local followers.
+    pub fn notify_followers_local(
         &self,
         target: AccountId,
         joins: Vec<UserPresence>,

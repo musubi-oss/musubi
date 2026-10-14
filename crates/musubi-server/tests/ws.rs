@@ -1399,3 +1399,49 @@ async fn match_snapshots_persist_and_resume_on_another_registry() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(other.get(&mid).is_none());
 }
+
+#[tokio::test]
+async fn cross_node_presence_follow() {
+    let Some((addr1, router1)) = start().await else {
+        return;
+    };
+    let Some((addr2, _)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, acc_a) = token(&router1).await;
+    let (tb, _) = token(&router1).await;
+    let mut b = connect(&addr2, &tb, f).await;
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::StatusFollow {
+            account_ids: vec![acc_a.parse().unwrap()],
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::Status { presences } if presences.is_empty())
+    );
+    let mut a = connect(&addr1, &ta, f).await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::StatusPresenceEvent { joins, .. } if joins.len() == 1 && joins[0].account_id.to_string() == acc_a)
+    );
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::StatusUpdate {
+            status: Some("remote".into()),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::StatusPresenceEvent { joins, .. } if joins[0].status.as_deref() == Some("remote"))
+    );
+    a.close(None).await.unwrap();
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::StatusPresenceEvent { leaves, .. } if leaves.len() == 1)
+    );
+}

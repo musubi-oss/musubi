@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use musubi_cluster::{BusMessage, Cluster};
 use musubi_core::AccountId;
-use musubi_proto::ServerMessage;
+use musubi_proto::{ServerMessage, UserPresence};
 use serde::{Deserialize, Serialize};
 
 use crate::realtime::Hub;
@@ -18,6 +18,11 @@ enum Wire {
     Channel {
         channel_id: String,
         msg: ServerMessage,
+    },
+    Presence {
+        target: AccountId,
+        joins: Vec<UserPresence>,
+        leaves: Vec<UserPresence>,
     },
 }
 
@@ -33,6 +38,14 @@ impl Fanout {
     pub fn new(hub: Arc<Hub>, cluster: Option<Arc<Cluster>>) -> Self {
         let f = Self { hub, cluster };
         if let Some(c) = &f.cluster {
+            let publisher = f.clone();
+            f.hub.set_remote(Box::new(move |target, joins, leaves| {
+                publisher.publish(Wire::Presence {
+                    target,
+                    joins,
+                    leaves,
+                });
+            }));
             let mut rx = c.subscribe();
             let hub = f.hub.clone();
             tokio::spawn(async move {
@@ -85,6 +98,13 @@ fn apply(hub: &Hub, m: &BusMessage) {
         }
         Ok(Wire::Channel { channel_id, msg }) => {
             hub.broadcast_channel(&channel_id, msg);
+        }
+        Ok(Wire::Presence {
+            target,
+            joins,
+            leaves,
+        }) => {
+            hub.notify_followers_local(target, joins, leaves);
         }
         Err(e) => tracing::warn!(error = %e, "bad fanout message"),
     }
