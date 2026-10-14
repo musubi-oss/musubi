@@ -150,6 +150,18 @@ impl MatchRegistry {
         Ok(out)
     }
 
+    /// Register every `match_<m>_*` module the runtime currently exposes.
+    pub fn register_wasm(&self, runtime: &Arc<musubi_runtime::Runtime>) -> Vec<String> {
+        let mods = runtime.match_modules();
+        for m in &mods {
+            self.register(
+                m,
+                Arc::new(super::wasm_match::WasmMatchHandler::new(runtime.clone(), m)),
+            );
+        }
+        mods
+    }
+
     pub fn register(&self, module: &str, handler: Arc<dyn MatchHandler>) {
         self.handlers.write().insert(module.to_string(), handler);
     }

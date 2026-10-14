@@ -93,6 +93,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     ));
     cluster.start().await?;
     let matches = Arc::new(MatchRegistry::new(Some(db.clone()), cluster.node_id().0));
+    let wasm_mods = matches.register_wasm(&runtime);
+    if !wasm_mods.is_empty() {
+        tracing::info!(modules = ?wasm_mods, "wasm match modules registered");
+    }
     let resumed = matches.recover(hub.clone(), &[]).await?;
     if !resumed.is_empty() {
         tracing::info!(

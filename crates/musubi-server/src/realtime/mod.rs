@@ -7,6 +7,7 @@ pub mod matchmaking;
 pub mod party;
 pub mod relayed;
 mod session;
+pub mod wasm_match;
 
 pub use authoritative::MatchRegistry;
 pub use hub::Hub;

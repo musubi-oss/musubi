@@ -21,6 +21,7 @@ async fn app() -> Option<Router> {
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
     let storage = StorageService::new(db.clone());
     let hub = Arc::new(musubi_server::realtime::Hub::new());
+    let runtime = test_runtime();
     let cluster = test_cluster(&db).await;
     let fanout = musubi_server::fanout::Fanout::new(hub.clone(), cluster.clone());
     Some(musubi_server::http::router(AppState {
@@ -40,11 +41,8 @@ async fn app() -> Option<Router> {
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
-        matches: Arc::new(musubi_server::realtime::MatchRegistry::new(
-            Some(db.clone()),
-            uuid::Uuid::now_v7(),
-        )),
-        runtime: test_runtime(),
+        matches: test_matches(&db, &runtime),
+        runtime: runtime.clone(),
         cluster: cluster.clone(),
         fanout,
         hub,
@@ -1367,4 +1365,13 @@ async fn test_cluster(db: &sqlx::PgPool) -> Option<Arc<musubi_cluster::Cluster>>
     ));
     c.start().await.unwrap();
     Some(c)
+}
+
+fn test_matches(
+    db: &sqlx::PgPool,
+    runtime: &Arc<musubi_runtime::Runtime>,
+) -> Arc<musubi_server::realtime::MatchRegistry> {
+    let m = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
+    assert_eq!(m.register_wasm(runtime), vec!["demo"]);
+    Arc::new(m)
 }

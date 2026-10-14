@@ -24,6 +24,7 @@ async fn start() -> Option<(String, axum::Router)> {
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let hub = Arc::new(Hub::new());
+    let runtime = test_runtime();
     let cluster = test_cluster(&db).await;
     let fanout = musubi_server::fanout::Fanout::new(hub.clone(), cluster.clone());
     let state = AppState {
@@ -42,11 +43,8 @@ async fn start() -> Option<(String, axum::Router)> {
         matchmaker: Arc::new(musubi_matchmaker::Matchmaker::default()),
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
-        matches: Arc::new(musubi_server::realtime::MatchRegistry::new(
-            Some(db.clone()),
-            uuid::Uuid::now_v7(),
-        )),
-        runtime: test_runtime(),
+        matches: test_matches(&db, &runtime),
+        runtime: runtime.clone(),
         cluster: cluster.clone(),
         fanout,
         hub,
@@ -1444,4 +1442,64 @@ async fn cross_node_presence_follow() {
     assert!(
         matches!(recv(&mut b).await.msg, ServerMessage::StatusPresenceEvent { leaves, .. } if leaves.len() == 1)
     );
+}
+
+fn test_matches(
+    db: &sqlx::PgPool,
+    runtime: &Arc<musubi_runtime::Runtime>,
+) -> Arc<musubi_server::realtime::MatchRegistry> {
+    let m = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
+    assert_eq!(m.register_wasm(runtime), vec!["demo"]);
+    Arc::new(m)
+}
+
+#[tokio::test]
+async fn wasm_match_module_runs_as_authoritative_match() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"module": "demo", "params": {}}).to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(info["label"], "demo");
+    assert_eq!(info["tick_rate"], 10);
+    let mid = info["match_id"].as_str().unwrap().to_string();
+    let (ta, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, "json").await;
+    send(
+        &mut a,
+        "json",
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Match {
+            authoritative: true,
+            size: 1,
+            ..
+        }
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let req = Request::get(format!("/v1/server/matches/{mid}"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(v["tick"].as_u64().unwrap() >= 1, "{v}");
 }

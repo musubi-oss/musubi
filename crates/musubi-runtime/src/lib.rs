@@ -10,6 +10,9 @@
 //! * optional hooks with the same signature: `before_rpc_<id>` (its return value replaces the
 //!   payload; call `musubi.error` to reject), `after_rpc_<id>` (receives the response, result ignored)
 //!   and `hook_<event>` for server events (`authenticated`, …).
+//! * match handlers: exports `match_<module>_{init,join_attempt,join,leave,tick,terminate}` with the same
+//!   signature exchange JSON (state as base64); the server registers `<module>` as an authoritative
+//!   match module.
 //! * host imports under module `musubi`: `log(level: i32, ptr: i32, len: i32)` and
 //!   `error(ptr: i32, len: i32)` (sets the error message for the current call).
 //!
@@ -101,6 +104,8 @@ pub struct Runtime {
     rpcs: RwLock<HashMap<String, Arc<Loaded>>>,
     /// hook export name → module
     hooks: RwLock<HashMap<String, Arc<Loaded>>>,
+    /// every function export → module (for `invoke_sync`)
+    exports: RwLock<HashMap<String, Arc<Loaded>>>,
     modules: RwLock<HashMap<String, Arc<Loaded>>>,
 }
 
@@ -154,6 +159,7 @@ impl Runtime {
             limits,
             rpcs: RwLock::new(HashMap::new()),
             hooks: RwLock::new(HashMap::new()),
+            exports: RwLock::new(HashMap::new()),
             modules: RwLock::new(HashMap::new()),
         })
     }
@@ -196,10 +202,15 @@ impl Runtime {
         });
         let mut rpcs = self.rpcs.write();
         let mut hooks_map = self.hooks.write();
+        let mut exports_map = self.exports.write();
         let mut modules = self.modules.write();
         if let Some(old) = modules.insert(name.to_string(), loaded.clone()) {
             rpcs.retain(|_, m| !Arc::ptr_eq(m, &old));
             hooks_map.retain(|_, m| !Arc::ptr_eq(m, &old));
+            exports_map.retain(|_, m| !Arc::ptr_eq(m, &old));
+        }
+        for e in &loaded.exports {
+            exports_map.insert(e.clone(), loaded.clone());
         }
         for id in &ids {
             rpcs.insert(id.clone(), loaded.clone());
@@ -312,6 +323,38 @@ impl Runtime {
         if let Some(Err(e)) = self.hook(&name, ctx, bytes).await {
             tracing::warn!(hook = name, error = %e, "hook failed");
         }
+    }
+
+    /// Match modules: every `<m>` with a complete `match_<m>_*` export set.
+    pub fn match_modules(&self) -> Vec<String> {
+        const PARTS: [&str; 6] = ["init", "join_attempt", "join", "leave", "tick", "terminate"];
+        let ex = self.exports.read();
+        let mut v: Vec<String> = ex
+            .keys()
+            .filter_map(|k| {
+                k.strip_prefix("match_")?
+                    .strip_suffix("_init")
+                    .map(str::to_string)
+            })
+            .filter(|m| {
+                PARTS
+                    .iter()
+                    .all(|p| ex.contains_key(&format!("match_{m}_{p}")))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Synchronous invoke of any export (used by match actors on their own task).
+    pub fn invoke_sync(&self, export: &str, ctx: &CallContext, payload: &[u8]) -> Result<Vec<u8>> {
+        let loaded = self
+            .exports
+            .read()
+            .get(export)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("export {export}")))?;
+        self.call_blocking(&loaded, export, ctx, payload)
     }
 
     pub fn has_hook(&self, name: &str) -> bool {
@@ -491,6 +534,23 @@ pub const EXAMPLE_WAT: &str = r#"
   (func (export "hook_authenticated") (param i32 i32 i32 i32) (result i64)
     i32.const 2 local.get 2 local.get 3 call $log
     i64.const 0)
+  ;; demo match module: constant JSON replies (state stays empty)
+  (data (i32.const 64) "{\"state\":\"\",\"tick_rate\":10,\"label\":\"demo\"}")
+  (func (export "match_demo_init") (param i32 i32 i32 i32) (result i64)
+    i64.const 64 i64.const 32 i64.shl i64.const 42 i64.or)
+  (data (i32.const 128) "{\"state\":\"\",\"accept\":true}")
+  (func (export "match_demo_join_attempt") (param i32 i32 i32 i32) (result i64)
+    i64.const 128 i64.const 32 i64.shl i64.const 26 i64.or)
+  (data (i32.const 192) "{\"state\":\"\"}")
+  (func (export "match_demo_join") (param i32 i32 i32 i32) (result i64)
+    i64.const 192 i64.const 32 i64.shl i64.const 12 i64.or)
+  (func (export "match_demo_leave") (param i32 i32 i32 i32) (result i64)
+    i64.const 192 i64.const 32 i64.shl i64.const 12 i64.or)
+  (func (export "match_demo_terminate") (param i32 i32 i32 i32) (result i64)
+    i64.const 192 i64.const 32 i64.shl i64.const 12 i64.or)
+  (data (i32.const 256) "{\"state\":\"\",\"outbound\":[],\"terminate\":false}")
+  (func (export "match_demo_tick") (param i32 i32 i32 i32) (result i64)
+    i64.const 256 i64.const 32 i64.shl i64.const 44 i64.or)
   (data (i32.const 0) "boom")
   (func (export "rpc_fail") (param i32 i32 i32 i32) (result i64)
     i32.const 0 i32.const 4 call $error
@@ -522,6 +582,14 @@ mod tests {
             .unwrap();
         assert_eq!(hooked, br#"{"hooked":true}"#);
         assert!(rt.has_hook("hook_authenticated"));
+        assert_eq!(rt.match_modules(), vec!["demo"]);
+        let init = rt
+            .invoke_sync("match_demo_init", &CallContext::default(), b"{}")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&init).unwrap()["label"],
+            "demo"
+        );
         assert!(rt
             .hook("hook_nope", CallContext::default(), vec![])
             .await
