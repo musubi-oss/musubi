@@ -3,10 +3,13 @@ use std::sync::Arc;
 use musubi_account::AccountService;
 use musubi_auth::AuthService;
 use musubi_chat::ChatService;
+use musubi_cluster::Cluster;
 use musubi_core::config::Config;
 use musubi_leaderboard::{LeaderboardService, TournamentService};
 use musubi_matchmaker::Matchmaker;
 use musubi_runtime::Runtime;
+
+use crate::fanout::Fanout;
 use musubi_social::{GroupService, NotificationService, SocialService};
 
 use crate::notify::Notifier;
@@ -35,6 +38,8 @@ pub struct AppState {
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
     pub runtime: Arc<Runtime>,
+    pub cluster: Option<Arc<Cluster>>,
+    pub fanout: Fanout,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
 }
@@ -74,7 +79,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         matchmaker.clone(),
         std::time::Duration::from_secs(1),
     );
-    let notify = Notifier::new(NotificationService::new(db.clone()), hub.clone());
+    let cluster = Arc::new(Cluster::new(
+        db.clone(),
+        &cfg.node.name,
+        &cfg.node.region,
+        cfg.node
+            .roles
+            .iter()
+            .map(|r| format!("{r:?}").to_lowercase())
+            .collect(),
+        &cfg.http.listen.to_string(),
+    ));
+    cluster.start().await?;
+    let fanout = Fanout::new(hub.clone(), Some(cluster.clone()));
+    let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {
         cfg: Arc::new(cfg),
         db,
@@ -91,6 +109,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         parties,
         relayed,
         runtime,
+        cluster: Some(cluster),
+        fanout,
         hub,
         started_at: std::time::Instant::now(),
     };

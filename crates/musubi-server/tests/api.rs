@@ -21,6 +21,8 @@ async fn app() -> Option<Router> {
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
     let storage = StorageService::new(db.clone());
     let hub = Arc::new(musubi_server::realtime::Hub::new());
+    let cluster = test_cluster(&db).await;
+    let fanout = musubi_server::fanout::Fanout::new(hub.clone(), cluster.clone());
     Some(musubi_server::http::router(AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -30,7 +32,7 @@ async fn app() -> Option<Router> {
         groups: musubi_social::GroupService::new(db.clone()),
         notify: musubi_server::notify::Notifier::new(
             musubi_social::NotificationService::new(db.clone()),
-            hub.clone(),
+            fanout.clone(),
         ),
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
@@ -39,6 +41,8 @@ async fn app() -> Option<Router> {
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
         runtime: test_runtime(),
+        cluster: cluster.clone(),
+        fanout,
         hub,
         db,
         started_at: std::time::Instant::now(),
@@ -1347,4 +1351,16 @@ async fn rpc_over_http_with_bearer_and_server_key() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (_, l) = call(&app, "GET", "/v1/rpc", Some(t), None).await;
     assert!(l["rpcs"].as_array().unwrap().iter().any(|r| r == "echo"));
+}
+
+async fn test_cluster(db: &sqlx::PgPool) -> Option<Arc<musubi_cluster::Cluster>> {
+    let c = Arc::new(musubi_cluster::Cluster::new(
+        db.clone(),
+        "test-node",
+        "local",
+        vec!["all".into()],
+        "127.0.0.1:0",
+    ));
+    c.start().await.unwrap();
+    Some(c)
 }

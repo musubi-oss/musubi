@@ -1668,6 +1668,16 @@ dependencies = [
 [[package]]
 name = "musubi-cluster"
 version = "0.1.0"
+dependencies = [
+ "musubi-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "musubi-core"
@@ -1751,6 +1761,7 @@ dependencies = [
  "musubi-account",
  "musubi-auth",
  "musubi-chat",
+ "musubi-cluster",
  "musubi-core",
  "musubi-leaderboard",
  "musubi-matchmaker",

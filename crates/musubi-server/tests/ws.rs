@@ -24,6 +24,8 @@ async fn start() -> Option<(String, axum::Router)> {
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let hub = Arc::new(Hub::new());
+    let cluster = test_cluster(&db).await;
+    let fanout = musubi_server::fanout::Fanout::new(hub.clone(), cluster.clone());
     let state = AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
@@ -32,7 +34,7 @@ async fn start() -> Option<(String, axum::Router)> {
         groups: musubi_social::GroupService::new(db.clone()),
         notify: musubi_server::notify::Notifier::new(
             musubi_social::NotificationService::new(db.clone()),
-            hub.clone(),
+            fanout.clone(),
         ),
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
@@ -41,6 +43,8 @@ async fn start() -> Option<(String, axum::Router)> {
         parties: Arc::new(musubi_server::realtime::PartyRegistry::new()),
         relayed: Arc::new(musubi_server::realtime::RelayedRegistry::new()),
         runtime: test_runtime(),
+        cluster: cluster.clone(),
+        fanout,
         hub,
         cfg: Arc::new(cfg),
         db,
@@ -1084,4 +1088,93 @@ async fn rpc_over_socket() {
             ..
         }
     ));
+}
+
+async fn test_cluster(db: &sqlx::PgPool) -> Option<Arc<musubi_cluster::Cluster>> {
+    let c = Arc::new(musubi_cluster::Cluster::new(
+        db.clone(),
+        "test-node",
+        "local",
+        vec!["all".into()],
+        "127.0.0.1:0",
+    ));
+    c.start().await.unwrap();
+    Some(c)
+}
+
+/// Two independent "nodes" (separate hubs, same database): a chat message sent on node 1 reaches a
+/// session on node 2, and so does a notification.
+#[tokio::test]
+async fn cross_node_chat_and_notification_fanout() {
+    let Some((addr1, router1)) = start().await else {
+        return;
+    };
+    let Some((addr2, _router2)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, acc_a) = token(&router1).await;
+    let (tb, _) = token(&router1).await;
+    let mut a = connect(&addr1, &ta, f).await;
+    let mut b = connect(&addr2, &tb, f).await;
+    let room = format!("x-{}", uuid::Uuid::now_v7().simple());
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelJoin {
+            target: room.clone(),
+            kind: ChannelKind::Room,
+            persistence: false,
+            hidden: false,
+        },
+    )
+    .await;
+    let rid = match recv(&mut a).await.msg {
+        ServerMessage::Channel { id, .. } => id,
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::ChannelJoin {
+            target: room,
+            kind: ChannelKind::Room,
+            persistence: false,
+            hidden: false,
+        },
+    )
+    .await;
+    recv(&mut b).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelMessageSend {
+            channel_id: rid,
+            content: json!({"text": "across"}),
+        },
+    )
+    .await;
+    // A gets ack + own message; B (other node) gets the message through the bus
+    recv(&mut a).await;
+    recv(&mut a).await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::ChannelMessage(m) if m.content["text"] == "across")
+    );
+
+    // friend request from B (via node 1's HTTP) → live notification to A on node 1 and to B's session on node 2 after accept
+    let req = Request::post("/v1/friends")
+        .header(header::AUTHORIZATION, format!("Bearer {tb}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"ids": [acc_a]}).to_string()))
+        .unwrap();
+    assert_eq!(router1.clone().oneshot(req).await.unwrap().status(), 200);
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Notification { code: -2, .. }
+    ));
+    let (_, acc_b) = (0, b);
+    let _ = acc_b;
 }

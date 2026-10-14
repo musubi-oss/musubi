@@ -66,6 +66,7 @@ async fn upgrade(
                 parties: s.parties.clone(),
                 relayed: s.relayed.clone(),
                 runtime: s.runtime.clone(),
+                fanout: s.fanout.clone(),
             };
             crate::realtime::serve(hub, Box::new(WsConnection::new(socket)), params).await;
         }))

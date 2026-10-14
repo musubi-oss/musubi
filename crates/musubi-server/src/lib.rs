@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod db;
+pub mod fanout;
 pub mod http;
 pub mod notify;
 pub mod realtime;

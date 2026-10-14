@@ -1,6 +1,7 @@
 mod account;
 mod auth;
 mod chat;
+mod cluster;
 mod error;
 mod extract;
 mod friends;
@@ -39,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .merge(leaderboards::routes())
         .merge(tournaments::routes())
         .merge(rpc::routes())
+        .merge(cluster::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

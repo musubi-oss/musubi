@@ -7,6 +7,8 @@ use musubi_matchmaker::{AddTicket, Matchmaker};
 use musubi_proto::realtime::{ChannelKind, MatchmakerUser};
 use musubi_proto::{ClientMessage, Encoding, Envelope, ServerMessage, UserPresence};
 use musubi_runtime::{CallContext, Runtime};
+
+use crate::fanout::Fanout;
 use musubi_transport::{Connection, Frame, Limits};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -23,6 +25,7 @@ pub struct ConnectParams {
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
     pub runtime: Arc<Runtime>,
+    pub fanout: Fanout,
 }
 
 /// Drive one realtime connection until it closes. Registers with the hub on entry and
@@ -37,6 +40,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         parties,
         relayed,
         runtime,
+        fanout,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -53,6 +57,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         parties: &parties,
         relayed: &relayed,
         runtime: &runtime,
+        fanout: &fanout,
         presence: &presence,
     };
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
@@ -76,6 +81,7 @@ struct Ctx<'a> {
     parties: &'a PartyRegistry,
     relayed: &'a RelayedRegistry,
     runtime: &'a Arc<Runtime>,
+    fanout: &'a Fanout,
     presence: &'a UserPresence,
 }
 
@@ -454,8 +460,8 @@ async fn channel_send(
         )
         .await?;
     let ack = ack_of(&msg);
-    ctx.hub
-        .broadcast_channel(channel_id, ServerMessage::ChannelMessage(msg));
+    ctx.fanout
+        .channel(channel_id, ServerMessage::ChannelMessage(msg));
     Ok(ack)
 }
 
@@ -472,8 +478,8 @@ async fn channel_edit(
         None => ctx.chat.remove(&channel, me, message_id).await?,
     };
     let ack = ack_of(&msg);
-    ctx.hub
-        .broadcast_channel(channel_id, ServerMessage::ChannelMessage(msg));
+    ctx.fanout
+        .channel(channel_id, ServerMessage::ChannelMessage(msg));
     Ok(ack)
 }
 

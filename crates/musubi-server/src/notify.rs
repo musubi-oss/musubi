@@ -1,27 +1,25 @@
 //! Persist + live-push notifications in one call.
 
-use std::sync::Arc;
-
 use musubi_core::Result;
 use musubi_proto::ServerMessage;
 use musubi_social::{NewNotification, NotificationService};
 
-use crate::realtime::Hub;
+use crate::fanout::Fanout;
 
 #[derive(Clone)]
 pub struct Notifier {
     pub service: NotificationService,
-    hub: Arc<Hub>,
+    fanout: Fanout,
 }
 
 impl Notifier {
-    pub fn new(service: NotificationService, hub: Arc<Hub>) -> Self {
-        Self { service, hub }
+    pub fn new(service: NotificationService, fanout: Fanout) -> Self {
+        Self { service, fanout }
     }
 
     pub async fn send(&self, batch: Vec<NewNotification>) -> Result<()> {
         for (user, n) in self.service.send(batch).await? {
-            self.hub.send_to_account(
+            self.fanout.account(
                 user,
                 ServerMessage::Notification {
                     id: n.id.to_string(),
