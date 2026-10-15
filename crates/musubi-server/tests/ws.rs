@@ -110,6 +110,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         hub,
         cfg: Arc::new(cfg),
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
+        banned: Arc::new(musubi_server::bans::Bans::default()),
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),

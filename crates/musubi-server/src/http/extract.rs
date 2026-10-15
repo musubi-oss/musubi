@@ -26,6 +26,7 @@ impl FromRequestParts<AppState> for Bearer {
             .or_else(|| header.strip_prefix("bearer "))
             .ok_or_else(|| Error::Unauthenticated("malformed authorization header".into()))?;
         let auth = state.auth.verify_access(token)?;
+        state.banned.check(auth.account_id)?;
         state.limits.account(auth.account_id)?;
         Ok(Bearer(auth))
     }

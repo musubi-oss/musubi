@@ -82,6 +82,7 @@ async fn app() -> Option<Router> {
         fanout,
         hub,
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
+        banned: Arc::new(musubi_server::bans::Bans::default()),
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),
@@ -4215,4 +4216,64 @@ async fn webhooks_deliver_signed_events_with_backoff_and_pull() {
         .await;
         assert_eq!(st, 200);
     }
+}
+
+#[tokio::test]
+async fn ban_takes_effect_on_the_next_request_despite_valid_jwt() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let srv = |req: axum::http::request::Builder| req.header("x-musubi-server-key", "defaultkey");
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/auth/device")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"id": unique("ban-dev-")}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sess: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let me = |app: axum::Router, tok: String| async move {
+        app.oneshot(
+            Request::get("/v1/account")
+                .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    };
+    assert_eq!(me(app.clone(), tok.clone()).await, 200);
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::post(format!("/v1/admin/accounts/{acc}/ban")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        me(app.clone(), tok.clone()).await,
+        403,
+        "same JWT, banned now"
+    );
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::post(format!("/v1/admin/accounts/{acc}/unban")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(me(app.clone(), tok).await, 200);
 }

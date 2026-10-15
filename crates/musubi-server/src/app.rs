@@ -56,6 +56,7 @@ pub struct AppState {
     pub metrics: metrics_exporter_prometheus::PrometheusHandle,
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
+    pub banned: Arc<crate::bans::Bans>,
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -321,6 +322,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let state = AppState {
         cfg: Arc::new(cfg),
         events: Arc::new(crate::events::Events::new(db.clone())),
+        banned: Arc::new(crate::bans::Bans::default()),
         db,
         auth,
         storage,
@@ -354,6 +356,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     crate::runtime_host::install(&state);
     if let Some(c) = state.cluster.clone() {
         state.limits.start_gossip(c);
+    }
+    match state.banned.load(&state.db).await {
+        Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
+        Err(e) => tracing::warn!(error = %e, "ban cache load failed"),
+    }
+    if let Some(c) = &state.cluster {
+        state.banned.start(c);
     }
     if let Some(c) = state.cluster.clone() {
         let ev = state.events.clone();
