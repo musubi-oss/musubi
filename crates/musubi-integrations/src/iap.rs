@@ -9,6 +9,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use musubi_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +50,8 @@ pub struct AppleStoreClient {
     key_id: String,
     bundle_id: String,
     key: EncodingKey,
+    /// Trust anchor for signed payloads (Apple Root CA - G3 in production).
+    root: Vec<u8>,
 }
 
 impl AppleStoreClient {
@@ -58,6 +61,25 @@ impl AppleStoreClient {
         key_id: &str,
         bundle_id: &str,
         private_key_pem: &str,
+    ) -> Result<Arc<Self>> {
+        Self::new_with_root(
+            url,
+            issuer_id,
+            key_id,
+            bundle_id,
+            private_key_pem,
+            APPLE_ROOT_CA_G3,
+        )
+    }
+
+    /// Like [`Self::new`] with an explicit trust anchor (DER) for the `x5c` chain; tests use it.
+    pub fn new_with_root(
+        url: &str,
+        issuer_id: &str,
+        key_id: &str,
+        bundle_id: &str,
+        private_key_pem: &str,
+        root_der: &[u8],
     ) -> Result<Arc<Self>> {
         let key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
             .map_err(|e| Error::InvalidArgument(format!("apple private key: {e}")))?;
@@ -71,6 +93,7 @@ impl AppleStoreClient {
             key_id: key_id.into(),
             bundle_id: bundle_id.into(),
             key,
+            root: root_der.to_vec(),
         }))
     }
 
@@ -111,7 +134,7 @@ impl AppleStoreClient {
         let jws = body["signedTransactionInfo"]
             .as_str()
             .ok_or_else(|| Error::Internal("apple: missing signedTransactionInfo".into()))?;
-        let t = jws_payload(jws)?;
+        let t = verify_apple_jws(jws, &self.root, OffsetDateTime::now_utc())?;
         if t["bundleId"].as_str() != Some(self.bundle_id.as_str()) {
             return Err(Error::PermissionDenied(
                 "apple: transaction belongs to another app".into(),
@@ -263,4 +286,91 @@ impl GooglePlayClient {
             raw: v,
         })
     }
+}
+
+/// Apple Root CA - G3 (DER), the trust anchor for App Store Server API signed payloads.
+pub const APPLE_ROOT_CA_G3: &[u8] = include_bytes!("../certs/AppleRootCA-G3.der");
+/// Extension Apple places on App Store receipt/transaction signing certificates.
+const APPLE_RECEIPT_SIGNING_OID: &str = "1.2.840.113635.100.6.11.1";
+
+fn denied(what: &str) -> Error {
+    Error::PermissionDenied(format!("apple: {what}"))
+}
+
+/// Verify an App Store Server API JWS (`signedTransactionInfo`, notifications): the `x5c` chain
+/// must lead to `root_der`, every certificate must be valid at `now`, the leaf must carry Apple's
+/// receipt-signing extension, and the ES256 signature must verify with the leaf key.
+pub fn verify_apple_jws(jws: &str, root_der: &[u8], now: OffsetDateTime) -> Result<Value> {
+    use x509_parser::prelude::*;
+    let parts: Vec<&str> = jws.split('.').collect();
+    if parts.len() != 3 {
+        return Err(denied("malformed JWS"));
+    }
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header: Value = b64
+        .decode(parts[0])
+        .ok()
+        .and_then(|h| serde_json::from_slice(&h).ok())
+        .ok_or_else(|| denied("bad JWS header"))?;
+    if header["alg"].as_str() != Some("ES256") {
+        return Err(denied("unexpected JWS algorithm"));
+    }
+    let x5c = header["x5c"]
+        .as_array()
+        .filter(|a| a.len() >= 2)
+        .ok_or_else(|| denied("x5c chain missing"))?;
+    let ders: Vec<Vec<u8>> = x5c
+        .iter()
+        .map(|c| {
+            base64::engine::general_purpose::STANDARD
+                .decode(c.as_str().unwrap_or(""))
+                .map_err(|_| denied("bad x5c encoding"))
+        })
+        .collect::<Result<_>>()?;
+    let certs: Vec<X509Certificate> = ders
+        .iter()
+        .map(|d| {
+            X509Certificate::from_der(d)
+                .map(|(_, c)| c)
+                .map_err(|_| denied("bad x5c certificate"))
+        })
+        .collect::<Result<_>>()?;
+    let (_, root) = X509Certificate::from_der(root_der)
+        .map_err(|_| Error::Internal("apple root cert".into()))?;
+    let at = ASN1Time::from_timestamp(now.unix_timestamp())
+        .map_err(|_| Error::Internal("time".into()))?;
+    for (i, c) in certs.iter().enumerate() {
+        if !c.validity().is_valid_at(at) {
+            return Err(denied("certificate not valid at this time"));
+        }
+        if i > 0 && !c.is_ca() {
+            return Err(denied("intermediate is not a CA"));
+        }
+        let last = i + 1 == certs.len();
+        if last && ders[i] == root_der {
+            continue;
+        }
+        let issuer = if last { &root } else { &certs[i + 1] };
+        c.verify_signature(Some(issuer.public_key()))
+            .map_err(|_| denied("certificate chain does not lead to Apple Root CA"))?;
+    }
+    let leaf = &certs[0];
+    if !leaf
+        .extensions()
+        .iter()
+        .any(|e| e.oid.to_id_string() == APPLE_RECEIPT_SIGNING_OID)
+    {
+        return Err(denied("leaf is not an App Store signing certificate"));
+    }
+    let sig = b64
+        .decode(parts[2])
+        .map_err(|_| denied("bad signature encoding"))?;
+    let spki = leaf.public_key().subject_public_key.data.as_ref();
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, spki)
+        .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
+        .map_err(|_| denied("JWS signature invalid"))?;
+    let payload = b64
+        .decode(parts[1])
+        .map_err(|_| denied("bad payload encoding"))?;
+    serde_json::from_slice(&payload).map_err(|_| denied("bad payload"))
 }

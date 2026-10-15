@@ -2672,11 +2672,87 @@ async fn zanshin_and_aurix_integrations() {
     assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 403);
 }
 
-async fn mock_stores(bundle_id: &str, item_product: &str) -> String {
+/// A test PKI shaped like Apple's: root (P-384) → intermediate (P-384) → leaf (P-256, receipt
+/// signing OID), plus a rogue root/leaf for negative cases.
+struct TestChain {
+    root: Vec<u8>,
+    inter: Vec<u8>,
+    leaf: Vec<u8>,
+    leaf_key: Vec<u8>,
+    rogue_root: Vec<u8>,
+    rogue_leaf: Vec<u8>,
+    rogue_key: Vec<u8>,
+}
+
+impl TestChain {
+    fn generate() -> Self {
+        use rcgen::{BasicConstraints, CertificateParams, CustomExtension, DnType, IsCa, KeyPair};
+        let ca = |cn: &str| {
+            let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            p.distinguished_name.push(DnType::CommonName, cn);
+            p
+        };
+        let leaf_params = || {
+            let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.distinguished_name
+                .push(DnType::CommonName, "Test App Store Signing");
+            p.custom_extensions.push(CustomExtension::from_oid_content(
+                &[1, 2, 840, 113635, 100, 6, 11, 1],
+                vec![0x05, 0x00],
+            ));
+            p
+        };
+        let root_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let root = ca("Test Apple Root CA - G3")
+            .self_signed(&root_key)
+            .unwrap();
+        let inter_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let inter = ca("Test Apple WWDR CA")
+            .signed_by(&inter_key, &root, &root_key)
+            .unwrap();
+        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf = leaf_params()
+            .signed_by(&leaf_key, &inter, &inter_key)
+            .unwrap();
+        let rogue_root_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let rogue_root = ca("Rogue Root").self_signed(&rogue_root_key).unwrap();
+        let rogue_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let rogue_leaf = leaf_params()
+            .signed_by(&rogue_key, &rogue_root, &rogue_root_key)
+            .unwrap();
+        Self {
+            root: root.der().to_vec(),
+            inter: inter.der().to_vec(),
+            leaf: leaf.der().to_vec(),
+            leaf_key: leaf_key.serialize_der(),
+            rogue_root: rogue_root.der().to_vec(),
+            rogue_leaf: rogue_leaf.der().to_vec(),
+            rogue_key: rogue_key.serialize_der(),
+        }
+    }
+
+    /// `badsig`: genuine chain, signature from another key. `badchain`: chain to a rogue root.
+    fn sign(&self, payload: &Value, id: &str) -> String {
+        use base64::Engine;
+        let e = base64::engine::general_purpose::STANDARD;
+        let (chain, key) = match id {
+            "badsig" => (vec![&self.leaf, &self.inter, &self.root], &self.rogue_key),
+            "badchain" => (vec![&self.rogue_leaf, &self.rogue_root], &self.rogue_key),
+            _ => (vec![&self.leaf, &self.inter, &self.root], &self.leaf_key),
+        };
+        let mut h = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        h.x5c = Some(chain.iter().map(|c| e.encode(c)).collect());
+        jsonwebtoken::encode(&h, payload, &jsonwebtoken::EncodingKey::from_ec_der(key)).unwrap()
+    }
+}
+
+async fn mock_stores(bundle_id: &str, item_product: &str) -> (String, Vec<u8>) {
     use axum::extract::Path;
     use axum::routing::{get, post};
     use axum::Json;
-    use base64::Engine;
+    let ch = Arc::new(TestChain::generate());
+    let root_der = ch.root.clone();
     let b = bundle_id.to_string();
     let prod = item_product.to_string();
     let app = axum::Router::new()
@@ -2685,6 +2761,7 @@ async fn mock_stores(bundle_id: &str, item_product: &str) -> String {
             get(move |Path(id): Path<String>, headers: axum::http::HeaderMap| {
                 let b = b.clone();
                 let prod = prod.clone();
+                let ch = ch.clone();
                 async move {
                     let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
                     if !auth.starts_with("Bearer ey") {
@@ -2698,8 +2775,7 @@ async fn mock_stores(bundle_id: &str, item_product: &str) -> String {
                         "productId": prod, "purchaseDate": 1_700_000_000_000i64, "quantity": 1, "environment": "Sandbox", "type": "Consumable",
                         "revocationDate": if id == "refunded" { json!(1_700_000_100_000i64) } else { Value::Null }
                     });
-                    let e = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-                    let jws = format!("{}.{}.sig", e.encode(r#"{"alg":"ES256"}"#), e.encode(payload.to_string()));
+                    let jws = ch.sign(&payload, &id);
                     (axum::http::StatusCode::OK, Json(json!({"signedTransactionInfo": jws})))
                 }
             }),
@@ -2722,7 +2798,7 @@ async fn mock_stores(bundle_id: &str, item_product: &str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    (base, root_der)
 }
 
 async fn http_json(
@@ -2764,7 +2840,7 @@ async fn iap_apple_and_google_receipts_redeem_once() {
         format!("gems-{suffix}"),
         format!("com.musubi.gems100.{suffix}"),
     );
-    let upstream = mock_stores("com.musubi.test", &product).await;
+    let (upstream, apple_root) = mock_stores("com.musubi.test", &product).await;
     let apple_pem = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/apple_test_ec.pem"
@@ -2776,12 +2852,13 @@ async fn iap_apple_and_google_receipts_redeem_once() {
     ))
     .unwrap();
     state.apple_iap = Some(
-        musubi_integrations::AppleStoreClient::new(
+        musubi_integrations::AppleStoreClient::new_with_root(
             &upstream,
             "ISSUER",
             "KEYID",
             "com.musubi.test",
             &apple_pem,
+            &apple_root,
         )
         .unwrap(),
     );
@@ -2905,6 +2982,28 @@ async fn iap_apple_and_google_receipts_redeem_once() {
         Some(&ta),
         false,
         Some(json!({"transaction_id": "refunded"})),
+    )
+    .await;
+    assert_eq!(st, 403);
+
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": "badsig"})),
+    )
+    .await;
+    assert_eq!(st, 403);
+
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": "badchain"})),
     )
     .await;
     assert_eq!(st, 403);
