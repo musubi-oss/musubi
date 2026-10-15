@@ -205,6 +205,32 @@ impl AccountService {
         .map_err(Error::internal)?;
         Ok(rows.into_iter().map(to_user).collect())
     }
+
+    /// Users whose username starts with `prefix` (case-insensitive), shortest/alphabetical first.
+    pub async fn search_users(&self, prefix: &str, limit: usize) -> Result<Vec<User>> {
+        let prefix = prefix.trim().to_lowercase();
+        if prefix.is_empty() || prefix.chars().count() > 32 {
+            return Err(Error::InvalidArgument("q must be 1..=32 chars".into()));
+        }
+        let pattern = format!(
+            "{}%",
+            prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let rows = sqlx::query_as::<_, UserRow>(&format!(
+            "select {USER_COLS} from musubi.accounts
+             where deleted_at is null and lower(username) like $1
+             order by length(username), lower(username) limit $2"
+        ))
+        .bind(pattern)
+        .bind(limit.clamp(1, 50) as i64)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(to_user).collect())
+    }
 }
 
 fn to_user(r: UserRow) -> User {

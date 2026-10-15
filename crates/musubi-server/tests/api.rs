@@ -5930,3 +5930,61 @@ async fn notifications_read_state() {
     assert_eq!(l["unread_count"], 0, "{l}");
     assert!(l["notifications"].as_array().unwrap().is_empty(), "{l}");
 }
+
+/// `GET /v1/users/search?q=` finds usernames by case-insensitive prefix, shortest first.
+#[tokio::test]
+async fn users_search_by_prefix() {
+    let Some(app) = app().await else { return };
+    let raw: String = unique("zq")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let tag = format!("zq{}", &raw[raw.len() - 8..]).to_lowercase();
+    let mut tok = String::new();
+    for suffix in ["alpha", "alphabet", "beta"] {
+        let (st, a) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("dev"), "username": format!("{tag}{suffix}")})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{a}");
+        tok = a["access_token"].as_str().unwrap().to_string();
+    }
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/search?q={}", format!("{tag}AL").to_uppercase()),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let names: Vec<&str> = v["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["username"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![format!("{tag}alpha"), format!("{tag}alphabet")],
+        "{v}"
+    );
+    let (st, v) = call(&app, "GET", "/v1/users/search?q=", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/search?q={tag}%25"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert!(
+        v["users"].as_array().unwrap().is_empty(),
+        "wildcards are literal: {v}"
+    );
+}

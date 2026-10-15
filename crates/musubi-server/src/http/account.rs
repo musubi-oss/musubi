@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/account/unlink/device", delete(unlink_device))
         .route("/v1/account/unlink/email", delete(unlink_email))
         .route("/v1/users", get(get_users))
+        .route("/v1/users/search", get(search_users))
 }
 
 async fn get_account(
@@ -148,6 +149,27 @@ async fn get_users(
         .map(String::from)
         .collect();
     let users: Vec<User> = s.accounts.get_users(&ids, &names).await?;
+    Ok(Json(json!({ "users": users })))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    #[serde(default = "search_limit")]
+    limit: usize,
+}
+
+fn search_limit() -> usize {
+    20
+}
+
+/// `GET /v1/users/search?q=<username prefix>&limit=20` — case-insensitive prefix match.
+async fn search_users(
+    State(s): State<AppState>,
+    Bearer(_): Bearer,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let users: Vec<User> = s.accounts.search_users(&q.q, q.limit).await?;
     Ok(Json(json!({ "users": users })))
 }
 

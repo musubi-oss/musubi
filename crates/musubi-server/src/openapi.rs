@@ -274,6 +274,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/trades/{id}/accept", "economy"),
     ("POST", "/v1/trades/{id}/cancel", "economy"),
     ("POST", "/v1/trades/{id}/decline", "economy"),
+    ("GET", "/v1/users/search", "account"),
     ("GET", "/v1/users", "account"),
     ("GET", "/v1/users/{id}/groups", "groups"),
     ("POST", "/v1/voice/token", "integrations"),
