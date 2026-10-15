@@ -4924,3 +4924,153 @@ fn urlencoding(s: &str) -> String {
     }
     out
 }
+
+/// Email verification and password reset flow driven by outbox events (the game's mailer reads
+/// the token from `account.email_verification` / `account.password_reset`).
+#[tokio::test]
+async fn email_verification_and_password_reset() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let email = format!("{}@example.test", unique("u"));
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(json!({"email": email, "password": "Passw0rd!long"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_default();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/verify/request",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["verified"], false);
+    let token_for = |kind: &'static str| {
+        let app = app.clone();
+        let email = email.clone();
+        async move {
+            let (st, ev) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/server/events?kinds={kind}&limit=1000"),
+                "defaultkey",
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{ev}");
+            ev["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["payload"]["email"] == email)
+                .map(|e| e["payload"]["token"].as_str().unwrap().to_string())
+                .unwrap_or_else(|| panic!("no {kind} event for {email}: {ev}"))
+        }
+    };
+    let vt = token_for("account.email_verification").await;
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/verify",
+        None,
+        Some(json!({"token": vt})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/verify",
+        None,
+        Some(json!({"token": vt})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "token must be single-use");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/verify/request",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["verified"], true, "{v}");
+
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/reset/request",
+        None,
+        Some(json!({"email": "nobody-here@example.test"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "unknown email must not be distinguishable"
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/reset/request",
+        None,
+        Some(json!({"email": email})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let rt = token_for("account.password_reset").await;
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/reset",
+        None,
+        Some(json!({"token": rt, "new_password": "An0ther!long-pass"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(json!({"email": email, "password": "Passw0rd!long"})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "old password must fail");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(json!({"email": email, "password": "An0ther!long-pass"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": sess["refresh_token"]})),
+    )
+    .await;
+    assert_ne!(
+        st,
+        StatusCode::OK,
+        "old refresh sessions must be revoked: {v}"
+    );
+    let _ = acc;
+}

@@ -14,6 +14,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/email", post(email))
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/logout", post(logout))
+        .route("/v1/auth/email/verify/request", post(verify_request))
+        .route("/v1/auth/email/verify", post(verify))
+        .route("/v1/auth/email/reset/request", post(reset_request))
+        .route("/v1/auth/email/reset", post(reset))
         .route("/v1/account/me", get(me))
 }
 
@@ -141,4 +145,158 @@ async fn me(
         "session_id": me.session_id,
         "vars": me.vars,
     })))
+}
+
+const VERIFY_TTL_SECS: i64 = 24 * 3600;
+const RESET_TTL_SECS: i64 = 3600;
+
+/// Mint a one-shot token: the raw value goes to the outbox event, only its hash is stored.
+async fn mint_token(
+    s: &AppState,
+    account: musubi_core::AccountId,
+    kind: &str,
+    email: &str,
+    ttl_secs: i64,
+) -> Result<String, ApiError> {
+    let raw = crate::keys::hash(&format!(
+        "{}{}{:?}",
+        uuid::Uuid::now_v7().simple(),
+        uuid::Uuid::now_v7().simple(),
+        std::time::SystemTime::now()
+    ));
+    sqlx::query(
+        "insert into musubi.email_tokens (token_hash, account_id, kind, email, expires_at)
+         values ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+    )
+    .bind(crate::keys::hash(&raw))
+    .bind(account.0)
+    .bind(kind)
+    .bind(email)
+    .bind(ttl_secs as f64)
+    .execute(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    Ok(raw)
+}
+
+/// Consume a token of the given kind; None when unknown, used or expired.
+async fn consume_token(
+    s: &AppState,
+    raw: &str,
+    kind: &str,
+) -> Result<Option<(musubi_core::AccountId, String)>, ApiError> {
+    let row: Option<(uuid::Uuid, String)> = sqlx::query_as(
+        "update musubi.email_tokens set used_at = now()
+         where token_hash = $1 and kind = $2 and used_at is null and expires_at > now()
+         returning account_id, email",
+    )
+    .bind(crate::keys::hash(raw))
+    .bind(kind)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    Ok(row.map(|(a, e)| (musubi_core::AccountId(a), e)))
+}
+
+/// Start email verification for the caller: emits `account.email_verification` with the token so
+/// the game's mailer (webhook) can send the link. Already-verified addresses are a no-op.
+async fn verify_request(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some((email, verified)) = s.auth.email_of(me.account_id).await? else {
+        return Err(musubi_core::Error::NotFound("no email identity".into()).into());
+    };
+    if verified {
+        return Ok(Json(json!({ "ok": true, "verified": true })));
+    }
+    let token = mint_token(&s, me.account_id, "verify", &email, VERIFY_TTL_SECS).await?;
+    s.events
+        .emit(
+            "account.email_verification",
+            Some(me.account_id),
+            json!({ "account_id": me.account_id, "email": email, "token": token, "expires_in_secs": VERIFY_TTL_SECS }),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "verified": false })))
+}
+
+#[derive(Deserialize)]
+struct TokenReq {
+    token: String,
+}
+
+async fn verify(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<TokenReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let Some((account, email)) = consume_token(&s, &r.token, "verify").await? else {
+        return Err(musubi_core::Error::NotFound("token unknown, used or expired".into()).into());
+    };
+    s.auth.mark_email_verified(account, &email).await?;
+    s.events
+        .emit(
+            "account.email_verified",
+            Some(account),
+            json!({ "account_id": account, "email": email }),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "account_id": account })))
+}
+
+#[derive(Deserialize)]
+struct ResetReq {
+    email: String,
+}
+
+/// Always 200 (no account enumeration); emits `account.password_reset` when the email exists.
+async fn reset_request(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<ResetReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    if let Some(account) = s.auth.account_by_email(&r.email).await? {
+        let email = r.email.trim().to_lowercase();
+        let token = mint_token(&s, account, "reset", &email, RESET_TTL_SECS).await?;
+        s.events
+            .emit(
+                "account.password_reset",
+                Some(account),
+                json!({ "account_id": account, "email": email, "token": token, "expires_in_secs": RESET_TTL_SECS }),
+            )
+            .await;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ResetConfirmReq {
+    token: String,
+    new_password: String,
+}
+
+/// Set the new password and revoke all refresh sessions of the account.
+async fn reset(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<ResetConfirmReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let Some((account, email)) = consume_token(&s, &r.token, "reset").await? else {
+        return Err(musubi_core::Error::NotFound("token unknown, used or expired".into()).into());
+    };
+    s.auth
+        .set_email_password(account, &email, &r.new_password)
+        .await?;
+    s.events
+        .emit(
+            "account.password_changed",
+            Some(account),
+            json!({ "account_id": account, "email": email }),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true })))
 }

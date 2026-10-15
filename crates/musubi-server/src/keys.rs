@@ -73,7 +73,7 @@ pub struct ServerKeys {
     touched: DashMap<Uuid, Instant>,
 }
 
-fn hash(secret: &str) -> String {
+pub(crate) fn hash(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
 

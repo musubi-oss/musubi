@@ -242,6 +242,78 @@ impl AuthService {
             .await
     }
 
+    /// The account's email identity: (address, verified).
+    pub async fn email_of(&self, account_id: AccountId) -> Result<Option<(String, bool)>> {
+        sqlx::query_as::<_, (String, bool)>(
+            "select subject, verified from musubi.identities where provider = $1 and account_id = $2",
+        )
+        .bind(provider::EMAIL)
+        .bind(account_id.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
+    pub async fn account_by_email(&self, email: &str) -> Result<Option<AccountId>> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "select account_id from musubi.identities where provider = $1 and subject = $2",
+        )
+        .bind(provider::EMAIL)
+        .bind(email.trim().to_lowercase())
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.map(|r| AccountId(r.0)))
+    }
+
+    pub async fn mark_email_verified(&self, account_id: AccountId, email: &str) -> Result<bool> {
+        let n = sqlx::query(
+            "update musubi.identities set verified = true, updated_at = now()
+             where provider = $1 and account_id = $2 and subject = $3",
+        )
+        .bind(provider::EMAIL)
+        .bind(account_id.0)
+        .bind(email)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// Replace the password and revoke every refresh session of the account (password reset).
+    pub async fn set_email_password(
+        &self,
+        account_id: AccountId,
+        email: &str,
+        new_password: &str,
+    ) -> Result<()> {
+        password::validate(new_password)?;
+        let hash = password::hash(new_password.to_owned()).await?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let n = sqlx::query(
+            "update musubi.identities set secret_hash = $4, updated_at = now()
+             where provider = $1 and account_id = $2 and subject = $3",
+        )
+        .bind(provider::EMAIL)
+        .bind(account_id.0)
+        .bind(email)
+        .bind(&hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::NotFound("email identity".into()));
+        }
+        sqlx::query("update musubi.sessions set revoked_at = now() where account_id = $1 and revoked_at is null")
+            .bind(account_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)
+    }
+
     pub async fn unlink(&self, account_id: AccountId, provider: &str, subject: &str) -> Result<()> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         // Serialize unlinks per account so two concurrent unlinks cannot both pass the check.
