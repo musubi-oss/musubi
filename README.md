@@ -67,3 +67,7 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 ## License
 
 Apache-2.0.
+
+## Server meshing (v0 core, `musubi-mesh`)
+
+Replication-layer data model independent of transport/engine: grid cells with simulator leases (`lease_ttl_ticks`), entity-level authority (only the lease holder writes; versioned components), ghosts within `ghost_margin` of a neighbour's border, handover state machine (border + `hysteresis` → `Started` → `handover_ack` by the new owner → `Completed`, or `Cancelled` after `handover_timeout_ticks`; inputs during transit are buffered for the new owner), interest subscriptions with per-client deltas that never see ownership changes, persistent-entity snapshots/restore, orphaned-cell detection when a lease lapses. Wiring to the realtime protocol and simulator SDK (WASM/Unreal headless) is next.

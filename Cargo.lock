@@ -1781,6 +1781,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "musubi-mesh"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "musubi-proto"
 version = "0.1.0"
 dependencies = [

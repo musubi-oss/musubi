@@ -15,6 +15,7 @@ musubi-proto = { path = "crates/musubi-proto" }
 musubi-cluster = { path = "crates/musubi-cluster" }
 musubi-actor = { path = "crates/musubi-actor" }
 musubi-fleet = { path = "crates/musubi-fleet" }
+musubi-mesh = { path = "crates/musubi-mesh" }
 musubi-transport = { path = "crates/musubi-transport" }
 musubi-edge = { path = "crates/musubi-edge" }
 musubi-auth = { path = "crates/musubi-auth" }
