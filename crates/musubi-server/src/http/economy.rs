@@ -4,7 +4,10 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
-use musubi_economy::{CreateItem, CreateStoreItem, EnergyDef, RewardTable, StreakDef, Track};
+use musubi_economy::{
+    CreateItem, CreateStoreItem, EnergyDef, IapProduct, ReceiptInput, RewardTable, StreakDef, Track,
+};
+use musubi_integrations::StoreTransaction;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -43,6 +46,14 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/energy", get(energies).post(upsert_energy))
         .route("/v1/server/energy/grant", post(energy_grant))
         .route("/v1/server/streaks", get(streak_defs).post(upsert_streak))
+        .route("/v1/iap/apple", post(iap_apple))
+        .route("/v1/iap/google", post(iap_google))
+        .route("/v1/iap/receipts", get(iap_receipts))
+        .route(
+            "/v1/server/iap/products",
+            get(iap_products).post(upsert_iap_product),
+        )
+        .route("/v1/server/iap/receipts", get(iap_receipts_of))
         .route(
             "/v1/server/currencies",
             get(currencies).post(upsert_currency),
@@ -512,5 +523,99 @@ async fn upsert_streak(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         serde_json::to_value(s.economy.upsert_streak(d).await?).map_err(Error::internal)?,
+    ))
+}
+
+// ----- in-app purchases -----
+
+fn receipt_input(t: StoreTransaction) -> ReceiptInput {
+    ReceiptInput {
+        provider: t.provider,
+        transaction_id: t.transaction_id,
+        product_id: t.product_id,
+        environment: t.environment,
+        purchased_at_ms: t.purchased_at_ms,
+        quantity: t.quantity,
+        raw: t.raw,
+    }
+}
+
+#[derive(Deserialize)]
+struct AppleReq {
+    transaction_id: String,
+}
+
+async fn iap_apple(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<AppleReq>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(c) = &s.apple_iap else {
+        return Err(Error::NotFound("apple iap is not configured".into()).into());
+    };
+    let t = c.transaction(&r.transaction_id).await?;
+    let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
+    Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct GoogleReq {
+    product_id: String,
+    purchase_token: String,
+}
+
+async fn iap_google(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<GoogleReq>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(c) = &s.google_iap else {
+        return Err(Error::NotFound("google iap is not configured".into()).into());
+    };
+    let t = c.product_purchase(&r.product_id, &r.purchase_token).await?;
+    let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
+    Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
+}
+
+async fn iap_receipts(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<LimitQ>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "receipts": s.economy.receipts(me.account_id, q.limit.unwrap_or(20)).await? }),
+    ))
+}
+
+async fn iap_products(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "products": s.economy.iap_products().await? })))
+}
+
+async fn upsert_iap_product(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(p): Json<IapProduct>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_iap_product(p).await?).map_err(Error::internal)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct AccountQ {
+    account_id: String,
+    limit: Option<i64>,
+}
+
+async fn iap_receipts_of(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<AccountQ>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "receipts": s.economy.receipts(account(&q.account_id)?, q.limit.unwrap_or(20)).await? }),
     ))
 }

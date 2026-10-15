@@ -1,0 +1,266 @@
+//! In-app purchase validation: Apple App Store Server API and Google Play Developer API.
+//! Both return a normalized [`StoreTransaction`]; mapping to catalog items lives in the economy.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use base64::Engine;
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use musubi_core::{Error, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::sync::Mutex;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreTransaction {
+    pub provider: String,
+    pub transaction_id: String,
+    pub product_id: String,
+    pub environment: String,
+    pub purchased_at_ms: i64,
+    pub quantity: i64,
+    pub raw: Value,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Decodes the payload segment of a JWS without signature verification. Only used on
+/// responses fetched from the provider over an authenticated TLS connection.
+pub fn jws_payload(jws: &str) -> Result<Value> {
+    let payload = jws
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| Error::Internal("malformed JWS".into()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|e| Error::Internal(format!("JWS payload: {e}")))?;
+    serde_json::from_slice(&bytes).map_err(|e| Error::Internal(format!("JWS payload: {e}")))
+}
+
+pub struct AppleStoreClient {
+    http: reqwest::Client,
+    url: String,
+    issuer_id: String,
+    key_id: String,
+    bundle_id: String,
+    key: EncodingKey,
+}
+
+impl AppleStoreClient {
+    pub fn new(
+        url: &str,
+        issuer_id: &str,
+        key_id: &str,
+        bundle_id: &str,
+        private_key_pem: &str,
+    ) -> Result<Arc<Self>> {
+        let key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
+            .map_err(|e| Error::InvalidArgument(format!("apple private key: {e}")))?;
+        Ok(Arc::new(Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(Error::internal)?,
+            url: url.trim_end_matches('/').to_string(),
+            issuer_id: issuer_id.into(),
+            key_id: key_id.into(),
+            bundle_id: bundle_id.into(),
+            key,
+        }))
+    }
+
+    fn auth_jwt(&self) -> Result<String> {
+        let mut h = Header::new(Algorithm::ES256);
+        h.kid = Some(self.key_id.clone());
+        h.typ = Some("JWT".into());
+        let now = now_secs();
+        let claims = json!({
+            "iss": self.issuer_id, "iat": now, "exp": now + 300,
+            "aud": "appstoreconnect-v1", "bid": self.bundle_id,
+        });
+        jsonwebtoken::encode(&h, &claims, &self.key).map_err(Error::internal)
+    }
+
+    /// Looks up a StoreKit 2 transaction id and checks bundle id + revocation.
+    pub async fn transaction(&self, transaction_id: &str) -> Result<StoreTransaction> {
+        if transaction_id.is_empty() || transaction_id.len() > 128 {
+            return Err(Error::InvalidArgument("transaction_id".into()));
+        }
+        let res = self
+            .http
+            .get(format!(
+                "{}/inApps/v1/transactions/{transaction_id}",
+                self.url
+            ))
+            .bearer_auth(self.auth_jwt()?)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("apple: {e}")))?;
+        match res.status().as_u16() {
+            200 => {}
+            404 => return Err(Error::NotFound("apple transaction".into())),
+            401 => return Err(Error::Internal("apple: rejected server credentials".into())),
+            s => return Err(Error::Unavailable(format!("apple: status {s}"))),
+        }
+        let body: Value = res.json().await.map_err(Error::internal)?;
+        let jws = body["signedTransactionInfo"]
+            .as_str()
+            .ok_or_else(|| Error::Internal("apple: missing signedTransactionInfo".into()))?;
+        let t = jws_payload(jws)?;
+        if t["bundleId"].as_str() != Some(self.bundle_id.as_str()) {
+            return Err(Error::PermissionDenied(
+                "apple: transaction belongs to another app".into(),
+            ));
+        }
+        if !t["revocationDate"].is_null() {
+            return Err(Error::PermissionDenied("apple: transaction revoked".into()));
+        }
+        if t["transactionId"].as_str() != Some(transaction_id) {
+            return Err(Error::Internal("apple: transaction id mismatch".into()));
+        }
+        Ok(StoreTransaction {
+            provider: "apple".into(),
+            transaction_id: transaction_id.into(),
+            product_id: t["productId"].as_str().unwrap_or("").into(),
+            environment: t["environment"].as_str().unwrap_or("Production").into(),
+            purchased_at_ms: t["purchaseDate"].as_i64().unwrap_or(0),
+            quantity: t["quantity"].as_i64().unwrap_or(1).max(1),
+            raw: t,
+        })
+    }
+}
+
+pub struct GooglePlayClient {
+    http: reqwest::Client,
+    url: String,
+    token_url: String,
+    package_name: String,
+    client_email: String,
+    key: EncodingKey,
+    token: Mutex<Option<(String, Instant)>>,
+}
+
+impl GooglePlayClient {
+    pub fn new(
+        url: &str,
+        token_url: &str,
+        package_name: &str,
+        client_email: &str,
+        private_key_pem: &str,
+    ) -> Result<Arc<Self>> {
+        let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+            .map_err(|e| Error::InvalidArgument(format!("google private key: {e}")))?;
+        Ok(Arc::new(Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(Error::internal)?,
+            url: url.trim_end_matches('/').to_string(),
+            token_url: token_url.into(),
+            package_name: package_name.into(),
+            client_email: client_email.into(),
+            key,
+            token: Mutex::new(None),
+        }))
+    }
+
+    async fn access_token(&self) -> Result<String> {
+        let mut guard = self.token.lock().await;
+        if let Some((t, exp)) = guard.as_ref() {
+            if *exp > Instant::now() + Duration::from_secs(60) {
+                return Ok(t.clone());
+            }
+        }
+        let now = now_secs();
+        let claims = json!({
+            "iss": self.client_email, "scope": "https://www.googleapis.com/auth/androidpublisher",
+            "aud": self.token_url, "iat": now, "exp": now + 3600,
+        });
+        let assertion = jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.key)
+            .map_err(Error::internal)?;
+        let body = format!("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={assertion}");
+        let res = self
+            .http
+            .post(&self.token_url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("google oauth: {e}")))?;
+        if !res.status().is_success() {
+            return Err(Error::Internal(format!(
+                "google oauth: status {}",
+                res.status()
+            )));
+        }
+        let v: Value = res.json().await.map_err(Error::internal)?;
+        let token = v["access_token"]
+            .as_str()
+            .ok_or_else(|| Error::Internal("google oauth: no access_token".into()))?
+            .to_string();
+        let ttl = v["expires_in"].as_u64().unwrap_or(3600);
+        *guard = Some((token.clone(), Instant::now() + Duration::from_secs(ttl)));
+        Ok(token)
+    }
+
+    /// Validates a one-time product purchase token; requires `purchaseState == 0` (purchased).
+    pub async fn product_purchase(
+        &self,
+        product_id: &str,
+        purchase_token: &str,
+    ) -> Result<StoreTransaction> {
+        if product_id.is_empty() || purchase_token.is_empty() || purchase_token.len() > 1024 {
+            return Err(Error::InvalidArgument("product_id / purchase_token".into()));
+        }
+        let token = self.access_token().await?;
+        let res = self
+            .http
+            .get(format!(
+                "{}/androidpublisher/v3/applications/{}/purchases/products/{product_id}/tokens/{purchase_token}",
+                self.url, self.package_name
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("google: {e}")))?;
+        match res.status().as_u16() {
+            200 => {}
+            400 | 404 => return Err(Error::NotFound("google purchase".into())),
+            401 | 403 => {
+                return Err(Error::Internal(
+                    "google: rejected server credentials".into(),
+                ))
+            }
+            s => return Err(Error::Unavailable(format!("google: status {s}"))),
+        }
+        let v: Value = res.json().await.map_err(Error::internal)?;
+        let state = v["purchaseState"].as_i64().unwrap_or(-1);
+        if state != 0 {
+            return Err(Error::PermissionDenied(format!(
+                "google: purchase not completed (state {state})"
+            )));
+        }
+        let order_id = v["orderId"].as_str().unwrap_or(purchase_token).to_string();
+        Ok(StoreTransaction {
+            provider: "google".into(),
+            transaction_id: order_id,
+            product_id: product_id.into(),
+            environment: if v["purchaseType"].as_i64() == Some(0) {
+                "Test".into()
+            } else {
+                "Production".into()
+            },
+            purchased_at_ms: v["purchaseTimeMillis"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            quantity: v["quantity"].as_i64().unwrap_or(1).max(1),
+            raw: v,
+        })
+    }
+}

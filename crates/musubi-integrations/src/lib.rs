@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use musubi_core::{Error, Result};
+
+pub mod iap;
+pub use iap::{AppleStoreClient, GooglePlayClient, StoreTransaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;

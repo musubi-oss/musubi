@@ -90,6 +90,8 @@ async fn build_state(leader: bool) -> Option<AppState> {
         worlds: worlds.clone(),
         liveops: None,
         voice: None,
+        apple_iap: None,
+        google_iap: None,
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),
@@ -2668,4 +2670,313 @@ async fn zanshin_and_aurix_integrations() {
         .body(body(&pid))
         .unwrap();
     assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 403);
+}
+
+async fn mock_stores(bundle_id: &str, item_product: &str) -> String {
+    use axum::extract::Path;
+    use axum::routing::{get, post};
+    use axum::Json;
+    use base64::Engine;
+    let b = bundle_id.to_string();
+    let prod = item_product.to_string();
+    let app = axum::Router::new()
+        .route(
+            "/inApps/v1/transactions/{id}",
+            get(move |Path(id): Path<String>, headers: axum::http::HeaderMap| {
+                let b = b.clone();
+                let prod = prod.clone();
+                async move {
+                    let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+                    if !auth.starts_with("Bearer ey") {
+                        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
+                    }
+                    if id == "missing" {
+                        return (axum::http::StatusCode::NOT_FOUND, Json(json!({})));
+                    }
+                    let payload = json!({
+                        "transactionId": id, "originalTransactionId": id, "bundleId": if id == "foreign" { "com.other.app" } else { b.as_str() },
+                        "productId": prod, "purchaseDate": 1_700_000_000_000i64, "quantity": 1, "environment": "Sandbox", "type": "Consumable",
+                        "revocationDate": if id == "refunded" { json!(1_700_000_100_000i64) } else { Value::Null }
+                    });
+                    let e = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+                    let jws = format!("{}.{}.sig", e.encode(r#"{"alg":"ES256"}"#), e.encode(payload.to_string()));
+                    (axum::http::StatusCode::OK, Json(json!({"signedTransactionInfo": jws})))
+                }
+            }),
+        )
+        .route("/token", post(|body: String| async move {
+            assert!(body.starts_with("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=ey"), "{body}");
+            Json(json!({"access_token": "gtok", "expires_in": 3600, "token_type": "Bearer"}))
+        }))
+        .route(
+            "/androidpublisher/v3/applications/{pkg}/purchases/products/{product}/tokens/{token}",
+            get(|Path((pkg, _product, token)): Path<(String, String, String)>, headers: axum::http::HeaderMap| async move {
+                assert_eq!(pkg, "com.musubi.test");
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer gtok");
+                Json(json!({
+                    "purchaseState": if token == "pending" { 2 } else { 0 }, "consumptionState": 0, "orderId": format!("GPA.{token}"),
+                    "purchaseTimeMillis": "1700000000000", "purchaseType": 0, "quantity": 2
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+async fn http_json(
+    router: &axum::Router,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    server_key: bool,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut req = Request::builder().method(method).uri(path);
+    if let Some(t) = bearer {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    if server_key {
+        req = req.header("x-musubi-server-key", "defaultkey");
+    }
+    let req = match body {
+        Some(b) => req
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(b.to_string()))
+            .unwrap(),
+        None => req.body(Body::empty()).unwrap(),
+    };
+    let res = router.clone().oneshot(req).await.unwrap();
+    let st = res.status().as_u16();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (st, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn iap_apple_and_google_receipts_redeem_once() {
+    let Some(mut state) = build_state(true).await else {
+        return;
+    };
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let (gem_pack, gems_item, product) = (
+        format!("pack-{suffix}"),
+        format!("gems-{suffix}"),
+        format!("com.musubi.gems100.{suffix}"),
+    );
+    let upstream = mock_stores("com.musubi.test", &product).await;
+    let apple_pem = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/apple_test_ec.pem"
+    ))
+    .unwrap();
+    let google_pem = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/google_test_rsa.pem"
+    ))
+    .unwrap();
+    state.apple_iap = Some(
+        musubi_integrations::AppleStoreClient::new(
+            &upstream,
+            "ISSUER",
+            "KEYID",
+            "com.musubi.test",
+            &apple_pem,
+        )
+        .unwrap(),
+    );
+    state.google_iap = Some(
+        musubi_integrations::GooglePlayClient::new(
+            &upstream,
+            &format!("{upstream}/token"),
+            "com.musubi.test",
+            "sa@test.iam",
+            &google_pem,
+        )
+        .unwrap(),
+    );
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    // catalog: item + store listing + provider product mapping
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/items",
+        None,
+        true,
+        Some(json!({"id": gems_item, "name": "Gems", "stackable": true, "max_stack": 100000})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, b) = http_json(
+        &router,
+        "POST",
+        "/v1/server/store",
+        None,
+        true,
+        Some(json!({"id": gem_pack, "item_id": gems_item, "quantity": 100, "prices": {}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/iap/products",
+        None,
+        true,
+        Some(json!({"provider": "apple", "product_id": product, "store_item_id": "nope"})),
+    )
+    .await;
+    assert_eq!(st, 404, "unknown store item");
+    for prov in ["apple", "google"] {
+        let (st, b) = http_json(
+            &router,
+            "POST",
+            "/v1/server/iap/products",
+            None,
+            true,
+            Some(json!({"provider": prov, "product_id": product, "store_item_id": gem_pack})),
+        )
+        .await;
+        assert_eq!(st, 200, "{b}");
+    }
+    // apple: valid transaction grants 100 gems
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": format!("tx-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["quantity"], 100);
+    assert_eq!(r["replayed"], false);
+    assert_eq!(r["environment"], "Sandbox");
+    // replay by the same account is idempotent, by another account is a conflict
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": format!("tx-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(r["replayed"], true);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&tb),
+        false,
+        Some(json!({"transaction_id": format!("tx-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 409);
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    assert_eq!(
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["item_id"] == gems_item)
+            .unwrap()["quantity"],
+        100
+    );
+    // rejected transactions: unknown, refunded, another app's bundle
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": "missing"})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": "refunded"})),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": "foreign"})),
+    )
+    .await;
+    assert_eq!(st, 403);
+    // google: pending purchase is refused, completed one grants quantity × listing
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/google",
+        Some(&tb),
+        false,
+        Some(json!({"product_id": product, "purchase_token": "pending"})),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/google",
+        Some(&tb),
+        false,
+        Some(json!({"product_id": product, "purchase_token": format!("ok-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["quantity"], 200);
+    assert_eq!(r["transaction_id"], format!("GPA.ok-{suffix}"));
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&tb), false, None).await;
+    assert_eq!(
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["item_id"] == gems_item)
+            .unwrap()["quantity"],
+        200
+    );
+    // receipts are listed for the player and for the server
+    let (_, rc) = http_json(&router, "GET", "/v1/iap/receipts", Some(&ta), false, None).await;
+    assert_eq!(rc["receipts"].as_array().unwrap().len(), 1);
+    assert_eq!(rc["receipts"][0]["provider"], "apple");
+    let (st, rc) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/iap/receipts?account_id={acc_b}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{rc}");
+    assert_eq!(rc["receipts"][0]["provider"], "google");
+    // without a configured provider the endpoint says so
+    state.apple_iap = None;
+    let router2 = musubi_server::http::router(state);
+    let (st, _) = http_json(
+        &router2,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": "x"})),
+    )
+    .await;
+    assert_eq!(st, 404);
 }

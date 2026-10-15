@@ -38,6 +38,7 @@ pub struct Config {
     pub quic: QuicConfig,
     pub zanshin: ZanshinConfig,
     pub aurix: AurixConfig,
+    pub iap: IapConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,4 +228,61 @@ pub struct AurixConfig {
     /// Aurix channel type for party / match channels.
     pub party_channel_type: String,
     pub match_channel_type: String,
+}
+
+/// In-app purchase validation providers. A provider is enabled when its key path is set.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct IapConfig {
+    pub apple: AppleIapConfig,
+    pub google: GoogleIapConfig,
+}
+
+/// Apple App Store Server API (StoreKit 2 transaction ids).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppleIapConfig {
+    /// `https://api.storekit.itunes.apple.com` (prod) or `https://api.storekit-sandbox.itunes.apple.com`.
+    pub url: String,
+    pub issuer_id: String,
+    pub key_id: String,
+    pub bundle_id: String,
+    /// PKCS#8 PEM of the App Store Connect API key (ES256).
+    pub private_key_pem_path: String,
+}
+
+impl Default for AppleIapConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://api.storekit.itunes.apple.com".into(),
+            issuer_id: String::new(),
+            key_id: String::new(),
+            bundle_id: String::new(),
+            private_key_pem_path: String::new(),
+        }
+    }
+}
+
+/// Google Play Developer API via a service account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoogleIapConfig {
+    pub url: String,
+    pub token_url: String,
+    pub package_name: String,
+    pub client_email: String,
+    /// PKCS#8 PEM of the service-account private key (RS256).
+    pub private_key_pem_path: String,
+}
+
+impl Default for GoogleIapConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://androidpublisher.googleapis.com".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            package_name: String::new(),
+            client_email: String::new(),
+            private_key_pem_path: String::new(),
+        }
+    }
 }

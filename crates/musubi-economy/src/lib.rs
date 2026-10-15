@@ -9,7 +9,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod iap;
 pub mod progression;
+pub use iap::{IapProduct, Receipt, ReceiptInput};
 pub mod rewards;
 pub use progression::{EnergyDef, Level, StreakDef, Track};
 pub use rewards::{Pity, RewardEntry, RewardTable, Roll};
@@ -589,7 +591,8 @@ impl EconomyService {
 
     pub async fn upsert_store_item(&self, c: CreateStoreItem) -> Result<StoreItem> {
         check_code(&c.id)?;
-        if !c.prices.is_object() || c.prices.as_object().is_some_and(|m| m.is_empty()) {
+        // An empty price map is allowed: the listing is then only obtainable via IAP / rewards.
+        if !c.prices.is_object() {
             return Err(Error::InvalidArgument("prices: {currency: amount}".into()));
         }
         for (k, v) in c.prices.as_object().unwrap() {

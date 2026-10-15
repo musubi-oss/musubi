@@ -1811,10 +1811,13 @@ dependencies = [
 name = "musubi-integrations"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "jsonwebtoken",
  "musubi-core",
  "reqwest",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tracing",
 ]

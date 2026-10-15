@@ -72,6 +72,8 @@ async fn app() -> Option<Router> {
         worlds: worlds.clone(),
         liveops: None,
         voice: None,
+        apple_iap: None,
+        google_iap: None,
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),

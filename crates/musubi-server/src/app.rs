@@ -44,6 +44,8 @@ pub struct AppState {
     pub worlds: Arc<crate::realtime::WorldRegistry>,
     pub liveops: Option<Arc<ZanshinClient>>,
     pub voice: Option<Arc<AurixClient>>,
+    pub apple_iap: Option<Arc<musubi_integrations::AppleStoreClient>>,
+    pub google_iap: Option<Arc<musubi_integrations::GooglePlayClient>>,
     pub runtime: Arc<Runtime>,
     pub cluster: Option<Arc<Cluster>>,
     pub fleets: Arc<FleetService>,
@@ -173,6 +175,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .url
         .as_deref()
         .map(|u| AurixClient::new(u, &cfg.aurix.api_key));
+    let apple_iap = iap_client("apple", &cfg.iap.apple.private_key_pem_path, |pem| {
+        musubi_integrations::AppleStoreClient::new(
+            &cfg.iap.apple.url,
+            &cfg.iap.apple.issuer_id,
+            &cfg.iap.apple.key_id,
+            &cfg.iap.apple.bundle_id,
+            pem,
+        )
+    });
+    let google_iap = iap_client("google", &cfg.iap.google.private_key_pem_path, |pem| {
+        musubi_integrations::GooglePlayClient::new(
+            &cfg.iap.google.url,
+            &cfg.iap.google.token_url,
+            &cfg.iap.google.package_name,
+            &cfg.iap.google.client_email,
+            pem,
+        )
+    });
     worlds.clone().spawn_ticker(fanout.clone());
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {
@@ -195,6 +215,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         worlds,
         liveops,
         voice,
+        apple_iap,
+        google_iap,
         runtime,
         cluster: Some(cluster),
         fleets,
@@ -228,4 +250,24 @@ async fn shutdown() {
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     info!("shutdown signal received");
+}
+
+fn iap_client<T>(
+    name: &str,
+    pem_path: &str,
+    build: impl FnOnce(&str) -> musubi_core::Result<Arc<T>>,
+) -> Option<Arc<T>> {
+    if pem_path.is_empty() {
+        return None;
+    }
+    match std::fs::read_to_string(pem_path)
+        .map_err(musubi_core::Error::internal)
+        .and_then(|pem| build(&pem))
+    {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(provider = name, error = %e, "iap provider disabled");
+            None
+        }
+    }
 }
