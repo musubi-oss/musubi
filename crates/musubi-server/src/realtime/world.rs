@@ -36,6 +36,73 @@ struct WorldState {
     subs: HashMap<SessionId, Uuid>,
     /// simulator → pending events (handover requests, inputs, …)
     sim_events: HashMap<Uuid, Vec<Value>>,
+    /// Persistent-entity ops since the last journal flush (see `musubi.world_journal`).
+    journal: Vec<WorldOp>,
+}
+
+const JOURNAL_EVERY: u64 = 5;
+
+/// One journaled mutation of a persistent entity; replayed on top of a snapshot when a world is
+/// adopted by another node, so a rehome loses at most `JOURNAL_EVERY` ticks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldOp {
+    pub tick: u64,
+    pub op: WorldMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorldMutation {
+    Spawn {
+        id: Uuid,
+        pos: Pos,
+        components: Value,
+    },
+    Despawn {
+        id: Uuid,
+    },
+    Apply {
+        id: Uuid,
+        pos: Option<Pos>,
+        components: Value,
+    },
+}
+
+fn replay(world: &mut World, ops: &[WorldOp], from_tick: u64) -> usize {
+    let mut n = 0;
+    // ops at the snapshot's own tick may or may not be in it; every op is idempotent, so replay them
+    for o in ops.iter().filter(|o| o.tick >= from_tick) {
+        let comps = |v: &Value| -> std::collections::BTreeMap<String, Value> {
+            v.as_object()
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default()
+        };
+        match &o.op {
+            WorldMutation::Spawn {
+                id,
+                pos,
+                components,
+            } => {
+                if world.get(*id).is_none() {
+                    world.spawn_with_id(*id, *pos, comps(components), true);
+                }
+            }
+            WorldMutation::Despawn { id } => {
+                world.despawn(*id);
+            }
+            WorldMutation::Apply {
+                id,
+                pos,
+                components,
+            } => {
+                let _ = world.force_apply(*id, *pos, comps(components));
+            }
+        }
+        if o.tick > world.tick {
+            world.tick = o.tick;
+        }
+        n += 1;
+    }
+    n
 }
 
 pub struct WorldRegistry {
@@ -174,6 +241,12 @@ impl WorldRegistry {
         .execute(db)
         .await
         .map_err(Error::internal)?;
+        sqlx::query("delete from musubi.world_journal where name = $1 and tick_to < $2")
+            .bind(name)
+            .bind(tick as i64)
+            .execute(db)
+            .await
+            .map_err(Error::internal)?;
         Ok(())
     }
 
@@ -228,6 +301,28 @@ impl WorldRegistry {
                 world.restore(ents);
                 world.tick = tick as u64;
             }
+            let rows: Vec<(Value,)> = sqlx::query_as(
+                "select entries from musubi.world_journal where name = $1 and tick_to >= $2 order by tick_from",
+            )
+            .bind(&name)
+            .bind(world.tick as i64)
+            .fetch_all(db)
+            .await
+            .map_err(Error::internal)?;
+            let mut ops: Vec<WorldOp> = Vec::new();
+            for (v,) in rows {
+                match serde_json::from_value::<Vec<WorldOp>>(v) {
+                    Ok(mut o) => ops.append(&mut o),
+                    Err(e) => {
+                        tracing::warn!(world = %name, error = %e, "bad world journal chunk skipped")
+                    }
+                }
+            }
+            let from = world.tick;
+            let replayed = replay(&mut world, &ops, from);
+            if replayed > 0 {
+                tracing::info!(world = %name, ops = replayed, tick = world.tick, "world journal replayed");
+            }
             self.worlds.insert(
                 name.clone(),
                 Arc::new(Mutex::new(WorldState {
@@ -235,6 +330,7 @@ impl WorldRegistry {
                     controller: Controller::new(ctl),
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
+                    journal: Vec::new(),
                 })),
             );
             self.homes.insert(name.clone(), self.node_id);
@@ -371,6 +467,7 @@ impl WorldRegistry {
                 controller: Controller::new(ctl),
                 subs: HashMap::new(),
                 sim_events: HashMap::new(),
+                journal: Vec::new(),
             })),
         );
         self.publish_home(name, Some(self.node_id)).await;
@@ -478,7 +575,7 @@ impl WorldRegistry {
         components: Value,
         persistent: bool,
     ) -> Result<WorldEntity> {
-        let comps = components
+        let comps: std::collections::BTreeMap<String, Value> = components
             .as_object()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
@@ -503,7 +600,17 @@ impl WorldRegistry {
             }
             None => return Err(Error::Conflict(format!("cell {cell:?} has no live lease"))),
         }
-        let id = st.world.spawn(pos, comps, persistent);
+        let id = st.world.spawn(pos, comps.clone(), persistent);
+        if persistent {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Spawn {
+                    id,
+                    pos,
+                    components: Value::Object(comps.into_iter().collect()),
+                },
+            });
+        }
         Ok(to_wire(st.world.get(id).unwrap()))
     }
 
@@ -520,7 +627,14 @@ impl WorldRegistry {
         if st.world.owner(cell) != Some(sim) {
             return Err(Error::PermissionDenied("not the owner".into()));
         }
+        let persistent = st.world.get(id).is_some_and(|e| e.persistent);
         st.world.despawn(id);
+        if persistent {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Despawn { id },
+            });
+        }
         Ok(())
     }
 
@@ -533,14 +647,57 @@ impl WorldRegistry {
         components: Value,
     ) -> Result<()> {
         let id = parse_entity(entity)?;
-        let comps = components
+        let comps: std::collections::BTreeMap<String, Value> = components
             .as_object()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
-        st.world.apply(sim, id, pos, comps).map_err(mesh_err)
+        st.world
+            .apply(sim, id, pos, comps.clone())
+            .map_err(mesh_err)?;
+        if st.world.get(id).is_some_and(|e| e.persistent) {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Apply {
+                    id,
+                    pos,
+                    components: Value::Object(comps.into_iter().collect()),
+                },
+            });
+        }
+        Ok(())
+    }
+
+    /// Persist the pending journal of a world now (the ticker does it every `JOURNAL_EVERY` ticks).
+    pub async fn flush_journal(&self, name: &str) -> Result<()> {
+        let Some(db) = &self.db else { return Ok(()) };
+        let (ops, tick) = {
+            let w = self.get(name)?;
+            let mut st = w.lock();
+            (std::mem::take(&mut st.journal), st.world.tick)
+        };
+        Self::write_journal(db, name, ops, tick).await
+    }
+
+    async fn write_journal(db: &PgPool, name: &str, ops: Vec<WorldOp>, tick: u64) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let from = ops.first().map(|o| o.tick).unwrap_or(tick);
+        sqlx::query(
+            "insert into musubi.world_journal (name, tick_from, tick_to, entries) values ($1, $2, $3, $4)
+             on conflict (name, tick_from) do update set tick_to = excluded.tick_to, entries = excluded.entries",
+        )
+        .bind(name)
+        .bind(from as i64)
+        .bind(tick as i64)
+        .bind(serde_json::to_value(&ops)?)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
     }
 
     pub fn view(&self, name: &str, cell: CellId) -> Result<Value> {
@@ -649,6 +806,17 @@ impl WorldRegistry {
             let st = &mut *st;
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
+            if st.world.tick % JOURNAL_EVERY == 0 && !st.journal.is_empty() {
+                if let Some(db) = self.db.clone() {
+                    let (ops, tick, n) =
+                        (std::mem::take(&mut st.journal), st.world.tick, name.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::write_journal(&db, &n, ops, tick).await {
+                            tracing::warn!(world = %n, error = %e, "world journal failed");
+                        }
+                    });
+                }
+            }
             if st.world.tick % SNAPSHOT_EVERY == 0 {
                 if let Some(db) = self.db.clone() {
                     let (entities, tick, n) =

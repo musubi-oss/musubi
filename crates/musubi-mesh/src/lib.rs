@@ -323,7 +323,17 @@ impl World {
         components: BTreeMap<String, serde_json::Value>,
         persistent: bool,
     ) -> EntityId {
-        let id = Uuid::now_v7();
+        self.spawn_with_id(Uuid::now_v7(), pos, components, persistent)
+    }
+
+    /// Spawn under a known id (journal replay).
+    pub fn spawn_with_id(
+        &mut self,
+        id: EntityId,
+        pos: Pos,
+        components: BTreeMap<String, serde_json::Value>,
+        persistent: bool,
+    ) -> EntityId {
         let cell = self.cell_of(pos);
         let e = Entity {
             id,
@@ -389,6 +399,16 @@ impl World {
                 "cell {cell:?} is owned by {owner}"
             )));
         }
+        self.force_apply(id, pos, components)
+    }
+
+    /// `apply` without the ownership check (journal replay on a node that holds no leases).
+    pub fn force_apply(
+        &mut self,
+        id: EntityId,
+        pos: Option<Pos>,
+        components: BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), MeshError> {
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
         if let Some(p) = pos {
             e.pos = p;

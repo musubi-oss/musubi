@@ -3674,3 +3674,79 @@ async fn cluster_membership_changes_reach_the_outbox() {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 }
+
+/// Ops after the last snapshot are journaled and replayed when another node adopts the world.
+#[tokio::test]
+async fn world_journal_is_replayed_on_rehome() {
+    let Some(url) = std::env::var("MUSUBI_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    migrate_once(&db).await;
+    let n1 = uuid::Uuid::now_v7();
+    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone()));
+    let name = format!("wj-{}", n1.simple());
+    r1.create(
+        &name,
+        musubi_mesh::WorldConfig::default(),
+        musubi_mesh::controller::ControllerConfig::default(),
+    )
+    .await
+    .unwrap();
+    let sim = uuid::Uuid::now_v7();
+    r1.register_sim(&name, sim, 8).unwrap();
+    let keep = r1
+        .spawn(
+            &name,
+            sim,
+            musubi_mesh::Pos { x: 1.0, y: 1.0 },
+            json!({"hp": 10}),
+            true,
+        )
+        .unwrap();
+    r1.snapshot_now(&name).await.unwrap();
+    // after the snapshot: damage the first entity, spawn a second persistent one, despawn a third
+    r1.apply(&name, sim, &keep.id, None, json!({"hp": 5}))
+        .unwrap();
+    let late = r1
+        .spawn(
+            &name,
+            sim,
+            musubi_mesh::Pos { x: 1.5, y: 1.5 },
+            json!({"kind": "chest"}),
+            true,
+        )
+        .unwrap();
+    let gone = r1
+        .spawn(
+            &name,
+            sim,
+            musubi_mesh::Pos { x: 1.2, y: 1.2 },
+            json!({}),
+            true,
+        )
+        .unwrap();
+    r1.despawn(&name, sim, &gone.id).unwrap();
+    r1.flush_journal(&name).await.unwrap();
+    let rows: i64 = sqlx::query_scalar("select count(*) from musubi.world_journal where name = $1")
+        .bind(&name)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    let r2 = musubi_server::realtime::WorldRegistry::new(uuid::Uuid::now_v7(), Some(db.clone()));
+    assert_eq!(r2.recover(&[]).await.unwrap(), vec![name.clone()]);
+    assert_eq!(r2.info(&name).unwrap().entities, 2, "keep + late, not gone");
+    let view = r2
+        .view(&name, musubi_mesh::CellId { x: 0, y: 0 })
+        .unwrap()
+        .to_string();
+    assert!(
+        view.contains(&keep.id) && view.contains(&late.id) && !view.contains(&gone.id),
+        "{view}"
+    );
+    assert!(view.contains("\"name\":\"hp\",\"value\":5"), "{view}");
+    assert!(view.contains("chest"), "{view}");
+    r2.delete(&name).await.unwrap();
+}
