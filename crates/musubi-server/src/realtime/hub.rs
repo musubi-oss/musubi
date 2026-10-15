@@ -39,6 +39,8 @@ pub struct Hub {
     channels: DashMap<String, HashMap<SessionId, bool>>,
     /// session → channels joined (for cleanup)
     in_channels: DashMap<SessionId, HashSet<String>>,
+    /// Set by `close_all`: sessions ending now keep their resume record (parked) for another node.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl Hub {
@@ -65,7 +67,13 @@ impl Hub {
 
     /// Close every session (node draining): a best-effort `Unavailable` hint first so clients
     /// reconnect elsewhere, then the same kick path admins use.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn close_all(&self) -> usize {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut n = 0;
         for h in self.sessions.iter() {
             let _ =

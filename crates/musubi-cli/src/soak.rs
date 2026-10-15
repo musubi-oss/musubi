@@ -261,11 +261,17 @@ async fn ws_client(
     let mut rng = Rng::new();
     let ping = ping_text();
     let mut resume: Option<(String, String)> = None; // (node url, token)
+    let mut resume_attempts = 0u32;
+    // a real client backs off and retries: after a kill the holder is only declared dead by SWIM
+    // a few seconds later, and until then the cluster refuses to hand the session to another node
+    const RESUME_RETRIES: u32 = 8;
+    const RESUME_PAUSE: Duration = Duration::from_millis(1500);
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         let Some(url) = pick_alive(&alive, &mut rng).await else {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
+        let pending = resume.clone();
         let (target, resumed) = match resume.take() {
             Some((u, t)) => (format!("{}?resume={t}&format=json", ws_url(&u)), true),
             None => (
@@ -281,7 +287,13 @@ async fn ws_client(
         .map_err(|_| ())
         .and_then(|r| r.map_err(|_| ())) else {
             if resumed {
-                c.ws_fresh.fetch_add(1, Ordering::Relaxed);
+                if resume_attempts < RESUME_RETRIES {
+                    resume_attempts += 1;
+                    resume = pending.map(|(_, t)| (url.clone(), t));
+                    tokio::time::sleep(RESUME_PAUSE).await;
+                } else {
+                    c.ws_fresh.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 c.ws_err.fetch_add(1, Ordering::Relaxed);
             }
@@ -295,8 +307,14 @@ async fn ws_client(
         {
             if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                 if find_str(&v, "code").is_some() && resumed {
-                    // resume rejected (parked state died with the node): fall back to a fresh session
-                    c.ws_fresh.fetch_add(1, Ordering::Relaxed);
+                    // rejected: the holder may not be declared dead yet, retry before giving up
+                    if resume_attempts < RESUME_RETRIES {
+                        resume_attempts += 1;
+                        resume = pending.map(|(_, t)| (url.clone(), t));
+                        tokio::time::sleep(RESUME_PAUSE).await;
+                    } else {
+                        c.ws_fresh.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 resume_token = find_str(&v, "resume_token").map(str::to_string);
@@ -305,6 +323,7 @@ async fn ws_client(
         if resumed {
             c.ws_resumed.fetch_add(1, Ordering::Relaxed);
         }
+        resume_attempts = 0;
         let session_node = url.clone();
         loop {
             if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {

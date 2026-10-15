@@ -45,6 +45,10 @@ pub struct ResumeTracker {
     token_hash: String,
     presence: UserPresence,
     state: Mutex<State>,
+    parked: std::sync::atomic::AtomicBool,
+    /// Held from reading the state to the row being written, so saves spawned in order cannot
+    /// overwrite each other with stale snapshots.
+    save_lock: Mutex<()>,
 }
 
 pub fn hash_token(token: &str) -> String {
@@ -58,6 +62,8 @@ impl ResumeTracker {
             token_hash: hash_token(token),
             presence,
             state: Mutex::new(State::default()),
+            parked: std::sync::atomic::AtomicBool::new(false),
+            save_lock: Mutex::new(()),
         })
     }
 
@@ -121,6 +127,8 @@ impl ResumeTracker {
     }
 
     async fn save(&self) -> Result<()> {
+        let _guard = self.save_lock.lock().await;
+        let parked = self.parked.load(std::sync::atomic::Ordering::Relaxed);
         let (channels, matches, follows) = {
             let st = self.state.lock().await;
             (
@@ -132,10 +140,10 @@ impl ResumeTracker {
         sqlx::query(
             "insert into musubi.resumable_sessions
                (token_hash, session_id, account_id, username, status, node_id, cluster_group,
-                channels, matches, follows, expires_at, updated_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now() + make_interval(secs => $11), now())
+                channels, matches, follows, expires_at, updated_at, parked)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now() + make_interval(secs => $11), now(), $12)
              on conflict (token_hash) do update set
-               node_id = excluded.node_id, parked = false, status = excluded.status, channels = excluded.channels,
+               node_id = excluded.node_id, parked = excluded.parked, status = excluded.status, channels = excluded.channels,
                matches = excluded.matches, follows = excluded.follows,
                expires_at = excluded.expires_at, updated_at = now()",
         )
@@ -150,6 +158,7 @@ impl ResumeTracker {
         .bind(matches)
         .bind(follows)
         .bind(self.store.ttl.as_secs_f64())
+        .bind(parked)
         .execute(&self.store.db)
         .await
         .map_err(Error::internal)?;
@@ -159,6 +168,9 @@ impl ResumeTracker {
     /// Transport lost (true) or re-attached (false). Only a parked record may be taken over by
     /// another node while this one is alive.
     pub async fn set_parked(&self, parked: bool) {
+        self.parked
+            .store(parked, std::sync::atomic::Ordering::Relaxed);
+        let _guard = self.save_lock.lock().await;
         if let Err(e) = sqlx::query(
             "update musubi.resumable_sessions set parked = $3, updated_at = now()
              where token_hash = $1 and node_id = $2",

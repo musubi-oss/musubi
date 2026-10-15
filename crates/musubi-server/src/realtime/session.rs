@@ -205,7 +205,12 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     matches.leave_all(sid);
     hub.leave(sid);
     if let Some(tr) = &tracker {
-        tr.forget();
+        if hub.is_draining() {
+            // the node is going away: leave the record parked so any node can rebuild the session
+            tr.set_parked(true).await;
+        } else {
+            tr.forget();
+        }
     }
     conn.close().await;
     match result {
