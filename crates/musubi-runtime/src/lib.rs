@@ -65,10 +65,74 @@ pub struct CallContext {
     pub vars: serde_json::Map<String, serde_json::Value>,
 }
 
+enum Kind {
+    /// Core module with the v0 ABI (`memory`/`alloc`, `rpc_<id>(ctx_ptr, ctx_len, ptr, len) -> i64`).
+    Module(Module),
+    /// Component Model guest implementing the `musubi:runtime/guest` world (see `wit::WIT`).
+    Component(wasmtime::component::Component),
+}
+
 struct Loaded {
     name: String,
-    module: Module,
+    kind: Kind,
     exports: std::collections::HashSet<String>,
+}
+
+/// The Component Model world guests target. Typed ABI: `exports()` lists the callable names
+/// (same naming as the core ABI: `rpc_<id>`, `before_rpc_<id>`, `hook_*`, `match_<m>_*`), `call`
+/// dispatches by name with the call context as JSON and an opaque payload.
+pub mod wit {
+    pub const WIT: &str = r#"
+package musubi:runtime@0.1.0;
+
+interface host {
+    /// level: 0 error, 1 warn, 2 info, 3 debug
+    log: func(level: u8, msg: string);
+}
+
+interface guest-api {
+    exports: func() -> list<string>;
+    call: func(name: string, ctx: string, payload: list<u8>) -> result<list<u8>, string>;
+}
+
+world guest {
+    import host;
+    export guest-api;
+}
+"#;
+
+    wasmtime::component::bindgen!({
+        inline: r#"
+package musubi:runtime@0.1.0;
+
+interface host {
+    log: func(level: u8, msg: string);
+}
+
+interface guest-api {
+    exports: func() -> list<string>;
+    call: func(name: string, ctx: string, payload: list<u8>) -> result<list<u8>, string>;
+}
+
+world guest {
+    import host;
+    export guest-api;
+}
+"#,
+        world: "guest",
+    });
+}
+
+impl wit::musubi::runtime::host::Host for State {
+    fn log(&mut self, level: u8, msg: String) {
+        let module = self.module.clone();
+        match level {
+            0 => tracing::error!(module, "{msg}"),
+            1 => tracing::warn!(module, "{msg}"),
+            2 => tracing::info!(module, "{msg}"),
+            _ => tracing::debug!(module, "{msg}"),
+        }
+    }
 }
 
 struct State {
@@ -99,6 +163,7 @@ impl ResourceLimiter for State {
 pub struct Runtime {
     engine: Engine,
     linker: Linker<State>,
+    component_linker: wasmtime::component::Linker<State>,
     limits: Limits,
     /// rpc id → module exporting it
     rpcs: RwLock<HashMap<String, Arc<Loaded>>>,
@@ -153,9 +218,13 @@ impl Runtime {
                 ticker.increment_epoch();
             })
             .map_err(Error::internal)?;
+        let mut component_linker = wasmtime::component::Linker::new(&engine);
+        wit::Guest::add_to_linker(&mut component_linker, |s: &mut State| s)
+            .map_err(Error::internal)?;
         Ok(Self {
             engine,
             linker,
+            component_linker,
             limits,
             rpcs: RwLock::new(HashMap::new()),
             hooks: RwLock::new(HashMap::new()),
@@ -166,38 +235,39 @@ impl Runtime {
 
     /// Compile and register a module (`.wasm` or `.wat`). Re-loading a name replaces its RPCs (hot reload).
     pub fn load_bytes(&self, name: &str, bytes: &[u8]) -> Result<Vec<String>> {
-        let module = Module::new(&self.engine, bytes)
-            .map_err(|e| Error::InvalidArgument(format!("module {name}: {e}")))?;
+        let (kind, names) = if is_component(bytes) {
+            let component = wasmtime::component::Component::new(&self.engine, bytes)
+                .map_err(|e| Error::InvalidArgument(format!("component {name}: {e}")))?;
+            let names = self.component_exports(name, &component)?;
+            (Kind::Component(component), names)
+        } else {
+            let module = Module::new(&self.engine, bytes)
+                .map_err(|e| Error::InvalidArgument(format!("module {name}: {e}")))?;
+            let names: Vec<String> = module.exports().map(|e| e.name().to_string()).collect();
+            if !names.iter().any(|n| n == "alloc") || !names.iter().any(|n| n == "memory") {
+                return Err(Error::InvalidArgument(format!(
+                    "module {name}: must export `memory` and `alloc`"
+                )));
+            }
+            (Kind::Module(module), names)
+        };
         let mut ids = Vec::new();
         let mut hooks = Vec::new();
         let mut exports = std::collections::HashSet::new();
-        let mut has_alloc = false;
-        let mut has_memory = false;
-        for exp in module.exports() {
-            exports.insert(exp.name().to_string());
-            match exp.name() {
-                "alloc" => has_alloc = true,
-                "memory" => has_memory = true,
-                n => {
-                    if let Some(id) = n.strip_prefix("rpc_") {
-                        ids.push(id.to_string());
-                    } else if n.starts_with("before_rpc_")
-                        || n.starts_with("after_rpc_")
-                        || n.starts_with("hook_")
-                    {
-                        hooks.push(n.to_string());
-                    }
-                }
+        for n in names {
+            if let Some(id) = n.strip_prefix("rpc_") {
+                ids.push(id.to_string());
+            } else if n.starts_with("before_rpc_")
+                || n.starts_with("after_rpc_")
+                || n.starts_with("hook_")
+            {
+                hooks.push(n.clone());
             }
-        }
-        if !has_alloc || !has_memory {
-            return Err(Error::InvalidArgument(format!(
-                "module {name}: must export `memory` and `alloc`"
-            )));
+            exports.insert(n);
         }
         let loaded = Arc::new(Loaded {
             name: name.to_string(),
-            module,
+            kind,
             exports,
         });
         let mut rpcs = self.rpcs.write();
@@ -375,6 +445,77 @@ impl Runtime {
             .map_err(Error::internal)?
     }
 
+    fn new_store(&self, module: &str) -> Result<Store<State>> {
+        let state = State {
+            limits: StoreLimitsBuilder::new()
+                .memory_size(self.limits.max_memory_bytes)
+                .instances(1)
+                .build(),
+            error: None,
+            module: module.to_string(),
+        };
+        let mut store = Store::new(&self.engine, state);
+        store.limiter(|s| s);
+        store.set_fuel(self.limits.fuel).map_err(Error::internal)?;
+        let ticks = (self.limits.timeout.as_millis() / 10).max(1) as u64;
+        store.set_epoch_deadline(ticks);
+        Ok(store)
+    }
+
+    fn trap_error(id: &str, store: &mut Store<State>, trap: wasmtime::Error) -> Error {
+        if let Some(msg) = store.data_mut().error.take() {
+            return Error::InvalidArgument(msg);
+        }
+        let text = trap.to_string();
+        if text.contains("fuel") {
+            Error::ResourceExhausted(format!("rpc {id}: fuel exhausted"))
+        } else if text.contains("epoch") || text.contains("interrupt") {
+            Error::ResourceExhausted(format!("rpc {id}: timed out"))
+        } else {
+            Error::Internal(format!(
+                "rpc {id}: {}",
+                text.lines().next().unwrap_or("trap")
+            ))
+        }
+    }
+
+    /// Ask a component which names it serves (one throwaway instance under the usual limits).
+    fn component_exports(
+        &self,
+        name: &str,
+        component: &wasmtime::component::Component,
+    ) -> Result<Vec<String>> {
+        let mut store = self.new_store(name)?;
+        let guest = wit::Guest::instantiate(&mut store, component, &self.component_linker)
+            .map_err(|e| Error::InvalidArgument(format!("component {name}: {e}")))?;
+        guest
+            .musubi_runtime_guest_api()
+            .call_exports(&mut store)
+            .map_err(|e| Self::trap_error("exports", &mut store, e))
+    }
+
+    fn call_component(
+        &self,
+        loaded: &Loaded,
+        component: &wasmtime::component::Component,
+        export: &str,
+        ctx: &CallContext,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut store = self.new_store(&loaded.name)?;
+        let guest = wit::Guest::instantiate(&mut store, component, &self.component_linker)
+            .map_err(|e| Error::Internal(format!("instantiate {}: {e}", loaded.name)))?;
+        let ctx_json = serde_json::to_string(ctx)?;
+        match guest
+            .musubi_runtime_guest_api()
+            .call_call(&mut store, export, &ctx_json, payload)
+        {
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(msg)) => Err(Error::InvalidArgument(msg)),
+            Err(trap) => Err(Self::trap_error(export, &mut store, trap)),
+        }
+    }
+
     fn call_blocking(
         &self,
         loaded: &Loaded,
@@ -382,23 +523,18 @@ impl Runtime {
         ctx: &CallContext,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
-        let id = export;
-        let state = State {
-            limits: StoreLimitsBuilder::new()
-                .memory_size(self.limits.max_memory_bytes)
-                .instances(1)
-                .build(),
-            error: None,
-            module: loaded.name.clone(),
+        if !loaded.exports.contains(export) {
+            return Err(Error::NotFound(format!("export {export}")));
+        }
+        let module = match &loaded.kind {
+            Kind::Component(c) => return self.call_component(loaded, c, export, ctx, payload),
+            Kind::Module(m) => m,
         };
-        let mut store = Store::new(&self.engine, state);
-        store.limiter(|s| s);
-        store.set_fuel(self.limits.fuel).map_err(Error::internal)?;
-        let ticks = (self.limits.timeout.as_millis() / 10).max(1) as u64;
-        store.set_epoch_deadline(ticks);
+        let id = export;
+        let mut store = self.new_store(&loaded.name)?;
         let instance = self
             .linker
-            .instantiate(&mut store, &loaded.module)
+            .instantiate(&mut store, module)
             .map_err(|e| Error::Internal(format!("instantiate {}: {e}", loaded.name)))?;
         let memory = instance
             .get_memory(&mut store, "memory")
@@ -406,9 +542,6 @@ impl Runtime {
         let alloc = instance
             .get_typed_func::<i32, i32>(&mut store, "alloc")
             .map_err(|e| Error::Internal(format!("alloc: {e}")))?;
-        if !loaded.exports.contains(export) {
-            return Err(Error::NotFound(format!("export {export}")));
-        }
         let func = instance
             .get_func(&mut store, export)
             .ok_or_else(|| Error::NotFound(format!("export {export}")))?;
@@ -424,20 +557,7 @@ impl Runtime {
         ];
         let mut results = [Val::I64(0)];
         if let Err(trap) = func.call(&mut store, &args, &mut results) {
-            if let Some(msg) = store.data_mut().error.take() {
-                return Err(Error::InvalidArgument(msg));
-            }
-            let text = trap.to_string();
-            return Err(if text.contains("fuel") {
-                Error::ResourceExhausted(format!("rpc {id}: fuel exhausted"))
-            } else if text.contains("epoch") || text.contains("interrupt") {
-                Error::ResourceExhausted(format!("rpc {id}: timed out"))
-            } else {
-                Error::Internal(format!(
-                    "rpc {id}: {}",
-                    text.lines().next().unwrap_or("trap")
-                ))
-            });
+            return Err(Self::trap_error(id, &mut store, trap));
         }
         if let Some(msg) = store.data_mut().error.take() {
             return Err(Error::InvalidArgument(msg));
@@ -457,6 +577,20 @@ impl Runtime {
             .ok_or_else(|| Error::Internal("rpc returned an out-of-bounds region".into()))?;
         Ok(data[ptr..end].to_vec())
     }
+}
+
+/// Component binaries carry layer `0x01` in the version field; text form starts with `(component`.
+fn is_component(bytes: &[u8]) -> bool {
+    if bytes.len() >= 8 && &bytes[..4] == b"\0asm" {
+        return bytes[6] == 1 && bytes[7] == 0;
+    }
+    std::str::from_utf8(bytes)
+        .map(|t| {
+            t.trim_start()
+                .trim_start_matches([';', ' '])
+                .starts_with("(component")
+        })
+        .unwrap_or(false)
 }
 
 fn write_guest(
@@ -630,5 +764,74 @@ mod tests {
         )
         .unwrap();
         assert!(!rt.has_rpc("spin") && rt.has_rpc("loop"));
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    /// Hand-written component: `exports()` → ["rpc_echo", "rpc_err"], `call` echoes the payload
+    /// for names of length 8 and returns `Err("boom")` for `rpc_err`.
+    const COMPONENT: &str = r#"
+(component
+  (core module $M
+    (memory (export "memory") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (global.get $heap))
+      (global.set $heap (i32.add (global.get $heap) (local.get 3)))
+      (local.get $p))
+    (data (i32.const 16) "rpc_echo")
+    (data (i32.const 32) "rpc_err")
+    (data (i32.const 48) "boom")
+    (func (export "exports") (result i32)
+      (i32.store (i32.const 64) (i32.const 16)) (i32.store (i32.const 68) (i32.const 8))
+      (i32.store (i32.const 72) (i32.const 32)) (i32.store (i32.const 76) (i32.const 7))
+      (i32.store (i32.const 96) (i32.const 64)) (i32.store (i32.const 100) (i32.const 2))
+      (i32.const 96))
+    (func (export "call") (param i32 i32 i32 i32 i32 i32) (result i32)
+      (if (i32.eq (local.get 1) (i32.const 7))
+        (then
+          (i32.store (i32.const 128) (i32.const 1))
+          (i32.store (i32.const 132) (i32.const 48))
+          (i32.store (i32.const 136) (i32.const 4)))
+        (else
+          (i32.store (i32.const 128) (i32.const 0))
+          (i32.store (i32.const 132) (local.get 4))
+          (i32.store (i32.const 136) (local.get 5))))
+      (i32.const 128))
+  )
+  (core instance $m (instantiate $M))
+  (func $exports (result (list string))
+    (canon lift (core func $m "exports") (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (func $call (param "name" string) (param "ctx" string) (param "payload" (list u8))
+    (result (result (list u8) (error string)))
+    (canon lift (core func $m "call") (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (instance $api (export "exports" (func $exports)) (export "call" (func $call)))
+  (export "musubi:runtime/guest-api@0.1.0" (instance $api))
+)
+"#;
+
+    #[tokio::test]
+    async fn component_guest_lists_exports_and_dispatches_calls() {
+        let rt = Arc::new(Runtime::new(Limits::default()).unwrap());
+        let ids = rt.load_bytes("demo", COMPONENT.as_bytes()).unwrap();
+        assert_eq!(ids, vec!["echo".to_string(), "err".to_string()]);
+        assert!(rt.has_rpc("echo"));
+        let ctx = CallContext::default();
+        let out = rt
+            .call("echo", ctx.clone(), b"hello".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(out, b"hello");
+        let err = rt.call("err", ctx, b"x".to_vec()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m == "boom"),
+            "{err:?}"
+        );
+        assert!(is_component(COMPONENT.as_bytes()));
+        assert!(!is_component(b"(module)"));
     }
 }
