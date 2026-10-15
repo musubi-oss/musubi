@@ -47,6 +47,7 @@ clap.workspace = true
 http-body-util = "0.1"
 
 [dev-dependencies]
+musubi-sim-sdk.workspace = true
 quinn.workspace = true
 tower = { workspace = true, features = ["util"] }
 musubi-account.workspace = true
