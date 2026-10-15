@@ -9,6 +9,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod rewards;
+pub use rewards::{Pity, RewardEntry, RewardTable, Roll};
+
 pub const MAX_LEDGER_PAGE: i64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,7 +138,7 @@ fn ledger(r: LedgerRow) -> LedgerEntry {
 const LEDGER_COLS: &str =
     "id, currency, delta, balance_after, reason, ref, idempotency_key, metadata, created_at";
 
-fn check_code(code: &str) -> Result<()> {
+pub(crate) fn check_code(code: &str) -> Result<()> {
     if code.is_empty()
         || code.len() > 64
         || !code

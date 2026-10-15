@@ -1807,3 +1807,186 @@ async fn economy_wallet_ledger_inventory_and_store() {
         .iter()
         .any(|i| i["item_id"] == sword && i["instance"]["durability"] == 100));
 }
+
+#[tokio::test]
+async fn rewards_tables_rolls_pity_and_audit() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("rw")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gems = unique("gems");
+    let common = unique("common");
+    let legend = unique("legend");
+    let gacha = unique("gacha");
+    let bonus = unique("bonus");
+    for (code, _) in [(&gems, 0)] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/currencies",
+            k,
+            Some(json!({"code": code, "name": "Gems"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    for id in [&common, &legend] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/items",
+            k,
+            Some(json!({"id": id, "name": id, "stackable": true, "max_stack": 999})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    // weighted gacha: legendary is 1 in 1_000_001 but pity forces it on the 3rd roll
+    let (st, body) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({
+            "id": gacha, "name": "Gacha", "kind": "weighted",
+            "entries": [
+                {"weight": 1_000_000, "rarity": "common", "item_id": common, "amount": 1},
+                {"weight": 1, "rarity": "legendary", "item_id": legend, "amount": 1}
+            ],
+            "pity": {"after": 2, "rarity": "legendary"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    // validation
+    let (st, _) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": unique("bad"), "kind": "weighted", "entries": [{"weight": 0, "item_id": common, "amount": 1}]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // published odds
+    let (st, odds) = call(&app, "GET", "/v1/rewards/tables", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let t = odds["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == gacha)
+        .unwrap();
+    assert!(t["odds"][0]["percent"].as_f64().unwrap() > 99.99);
+    assert_eq!(t["pity"]["after"], 2);
+    // rolls 1-2 common, roll 3 forced legendary
+    let mut hashes = vec![];
+    for i in 0..3 {
+        let (st, r) = call(
+            &app,
+            "POST",
+            &format!("/v1/rewards/{gacha}/roll"),
+            Some(&tok),
+            Some(json!({"client_seed": "abc", "idempotency_key": format!("r{i}")})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!(r["nonce"], i + 1);
+        assert_eq!(r["replayed"], false);
+        let expected =
+            musubi_economy::rewards::roll_hash(r["server_seed"].as_str().unwrap(), "abc", i + 1);
+        assert_eq!(
+            r["roll"], expected,
+            "roll is verifiable from revealed seeds"
+        );
+        hashes.push(r["roll"].as_str().unwrap().to_string());
+        if i < 2 {
+            assert_eq!(r["rewards"][0]["rarity"], "common");
+            assert_eq!(r["pity_forced"], false);
+        } else {
+            assert_eq!(r["rewards"][0]["rarity"], "legendary");
+            assert_eq!(r["pity_forced"], true);
+        }
+    }
+    // idempotent replay returns the same roll, no extra item
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/rewards/{gacha}/roll"),
+        Some(&tok),
+        Some(json!({"client_seed": "abc", "idempotency_key": "r2"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(r["replayed"], true);
+    assert_eq!(r["roll"], hashes[2]);
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    let items = inv["items"].as_array().unwrap();
+    assert_eq!(
+        items.iter().find(|i| i["item_id"] == common).unwrap()["quantity"],
+        2
+    );
+    assert_eq!(
+        items.iter().find(|i| i["item_id"] == legend).unwrap()["quantity"],
+        1
+    );
+    // pity counter reset: the 4th roll is common again
+    let (_, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/rewards/{gacha}/roll"),
+        Some(&tok),
+        Some(json!({"client_seed": "x"})),
+    )
+    .await;
+    assert_eq!(r["pity_forced"], false);
+    assert_eq!(r["nonce"], 4);
+    // history
+    let (_, h) = call(&app, "GET", "/v1/rewards/rolls?limit=10", Some(&tok), None).await;
+    assert_eq!(h["rolls"].as_array().unwrap().len(), 4);
+    // guaranteed table granted from the server: currency + item in one go, ledger reason
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({
+            "id": bonus, "kind": "guaranteed",
+            "entries": [{"currency": gems, "amount": 50}, {"item_id": common, "amount": 3}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, g) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/grant",
+        k,
+        Some(json!({"account_id": acc, "table_id": bonus, "reference": "login-day-1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["rewards"].as_array().unwrap().len(), 2);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], 50);
+    let (_, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/wallet/ledger?currency={gems}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(l["entries"][0]["reason"], "reward.grant");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/rewards/{}/roll", unique("nope")),
+        Some(&tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
