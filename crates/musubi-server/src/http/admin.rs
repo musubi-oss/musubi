@@ -107,7 +107,7 @@ async fn account(
 }
 
 /// Kick the account's live realtime sessions on every node.
-async fn kick_everywhere(s: &AppState, id: AccountId) -> usize {
+pub(crate) async fn kick_everywhere(s: &AppState, id: AccountId) -> usize {
     let local = s.hub.kick_account(id);
     if let Some(c) = &s.cluster {
         if let Err(e) = c.publish(KICK_TOPIC, &json!({ "account_id": id })).await {

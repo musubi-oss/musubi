@@ -28,6 +28,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/account/unlink/device", delete(unlink_device))
         .route("/v1/account/unlink/email", delete(unlink_email))
+        .route("/v1/account/export", get(export_self))
+        .route("/v1/account/delete", post(delete_self))
         .route("/v1/users", get(get_users))
         .route("/v1/users/search", get(search_users))
 }
@@ -264,4 +266,30 @@ async fn push_unregister(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let removed = push_of(&s)?.unregister(me.account_id, &b.token).await?;
     Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+/// `GET /v1/account/export` — everything the server stores about the caller (GDPR-style dump).
+async fn export_self(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(s.accounts.export(me.account_id).await?))
+}
+
+/// `POST /v1/account/delete` — soft-delete the caller: identities and sessions go, every live
+/// session is kicked, the row stays for ledgers/leaderboards. Irreversible for the player.
+async fn delete_self(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    super::admin::kick_everywhere(&s, me.account_id).await;
+    s.accounts.delete(me.account_id).await?;
+    s.events
+        .emit(
+            "account.deleted",
+            Some(me.account_id),
+            json!({ "by": "self" }),
+        )
+        .await;
+    Ok(Json(json!({ "deleted": true })))
 }

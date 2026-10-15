@@ -5988,3 +5988,50 @@ async fn users_search_by_prefix() {
         "wildcards are literal: {v}"
     );
 }
+
+/// A player can dump and delete their own account; the token stops working afterwards.
+#[tokio::test]
+async fn account_self_export_and_delete() {
+    let Some(app) = app().await else { return };
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dev")})),
+    )
+    .await;
+    let tok = a["access_token"].as_str().unwrap().to_string();
+    let acc = a["account_id"].as_str().unwrap().to_string();
+    call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&tok),
+        Some(json!({"objects": [{"collection": "saves", "key": "slot1", "value": {"hp": 7}}]})),
+    )
+    .await;
+    let (st, dump) = call(&app, "GET", "/v1/account/export", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{dump}");
+    let text = dump.to_string();
+    assert!(text.contains(&acc), "{text}");
+    assert!(
+        text.contains("slot1"),
+        "export should include storage: {text}"
+    );
+    let (st, r) = call(&app, "POST", "/v1/account/delete", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["deleted"], true);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&tok), None).await;
+    assert!(
+        st == StatusCode::UNAUTHORIZED
+            || st == StatusCode::FORBIDDEN
+            || st == StatusCode::NOT_FOUND,
+        "deleted account should not be usable: {st}"
+    );
+    let (_, v) = call(&app, "GET", &format!("/v1/users?ids={acc}"), None, None).await;
+    assert!(
+        v["users"].as_array().map(|u| u.is_empty()).unwrap_or(true),
+        "{v}"
+    );
+}
