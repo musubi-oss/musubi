@@ -48,6 +48,7 @@ pub struct AppState {
     pub google_iap: Option<Arc<musubi_integrations::GooglePlayClient>>,
     pub steam_iap: Option<Arc<musubi_integrations::SteamClient>>,
     pub runtime: Arc<Runtime>,
+    pub schedules: Arc<crate::schedules::Schedules>,
     pub cluster: Option<Arc<Cluster>>,
     pub fleets: Arc<FleetService>,
     pub fanout: Fanout,
@@ -348,6 +349,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     );
     let limits = Arc::new(crate::limits::RateLimiter::new(&cfg.limits));
     let logins = Arc::new(crate::logins::Social::new(cfg.social.clone()));
+    let schedules = Arc::new(crate::schedules::Schedules::from_config(&cfg.runtime));
+    for p in &schedules.problems {
+        tracing::warn!(problem = %p, "runtime schedule ignored");
+    }
     let state = AppState {
         cfg: Arc::new(cfg),
         events: Arc::new(crate::events::Events::new(db.clone())),
@@ -378,6 +383,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         google_iap,
         steam_iap,
         runtime,
+        schedules,
         cluster: Some(cluster),
         fleets,
         fanout,
@@ -458,6 +464,42 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 match crate::retention::run(&st.db, &st.cfg.retention).await {
                     Ok(v) => tracing::info!(removed = %v, "retention pass"),
                     Err(e) => tracing::warn!(error = %e, "retention pass failed"),
+                }
+            }
+        });
+    }
+    if !state.schedules.is_empty() {
+        let st = state.clone();
+        let lease = st
+            .cluster
+            .clone()
+            .map(|c| c.lease("schedules", musubi_cluster::DEAD_AFTER));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                if let Some(l) = &lease {
+                    if !l.held() {
+                        // another node runs them; keep our clock in step so we do not replay
+                        // every fire we missed the moment the lease moves here
+                        let _ = st.schedules.due();
+                        continue;
+                    }
+                }
+                for (name, at) in st.schedules.due() {
+                    match st.schedules.run_one(&st.runtime, &name, Some(at)).await {
+                        Ok(_) => tracing::info!(schedule = %name, "schedule ran"),
+                        Err(e) => {
+                            tracing::warn!(schedule = %name, error = %e, "schedule failed");
+                            st.events
+                                .emit(
+                                    "runtime.schedule_failed",
+                                    None,
+                                    serde_json::json!({ "name": name, "scheduled_for": at, "error": e.to_string() }),
+                                )
+                                .await;
+                        }
+                    }
                 }
             }
         });

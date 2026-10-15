@@ -382,6 +382,16 @@ pub struct RuntimeConfig {
     pub max_memory_mb: usize,
     pub timeout_ms: u64,
     pub max_payload_kb: usize,
+    /// Cron-driven calls into module exports named `schedule_<name>` (one runner cluster-wide).
+    pub schedules: Vec<ScheduleConfig>,
+}
+
+/// `[[runtime.schedules]] name = "nightly" cron = "0 3 * * *"` → calls export `schedule_nightly`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    pub name: String,
+    /// 5-field crontab (minute hour day month weekday), UTC; 6/7 fields with seconds also accepted.
+    pub cron: String,
 }
 
 impl Default for RuntimeConfig {
@@ -392,6 +402,7 @@ impl Default for RuntimeConfig {
             max_memory_mb: 64,
             timeout_ms: 2000,
             max_payload_kb: 1024,
+            schedules: Vec::new(),
         }
     }
 }

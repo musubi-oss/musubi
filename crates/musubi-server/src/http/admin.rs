@@ -31,6 +31,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/cluster/worlds", get(cluster_worlds))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/retention/run", post(retention_run))
+        .route("/v1/admin/runtime/schedules", get(schedules_status))
+        .route(
+            "/v1/admin/runtime/schedules/{name}/run",
+            post(schedules_run),
+        )
         .route(
             "/v1/admin/auth/locks/{email}",
             get(login_lock).delete(clear_login_lock),
@@ -567,4 +572,22 @@ async fn clear_login_lock(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cleared = s.auth.clear_login_lock(&email).await?;
     Ok(Json(serde_json::json!({ "cleared": cleared })))
+}
+
+/// Configured cron schedules with next/last run info.
+async fn schedules_status(
+    _k: ServerKey,
+    State(s): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.schedules.status()))
+}
+
+/// Run `schedule_<name>` now on this node, outside its cron.
+async fn schedules_run(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let out = s.schedules.run_one(&s.runtime, &name, None).await?;
+    Ok(Json(json!({ "name": name, "output": out })))
 }

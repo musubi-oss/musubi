@@ -81,6 +81,9 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
+    let schedules = Arc::new(musubi_server::schedules::Schedules::from_config(
+        &cfg.runtime,
+    ));
     Some(AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
@@ -106,6 +109,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         google_iap: None,
         steam_iap: None,
         runtime: runtime.clone(),
+        schedules,
         cluster: cluster.clone(),
         fleets: fleets.clone(),
         fanout,

@@ -20,6 +20,7 @@ pub mod push;
 pub mod realtime;
 pub mod retention;
 pub mod runtime_host;
+pub mod schedules;
 pub mod telemetry;
 
 pub use app::run;

@@ -59,6 +59,9 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     worlds.clone().spawn_ticker(fanout.clone());
     let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
     let push = Arc::new(musubi_server::push::Push::new(cfg.push.clone(), db.clone()));
+    let schedules = Arc::new(musubi_server::schedules::Schedules::from_config(
+        &cfg.runtime,
+    ));
     let state = AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -86,6 +89,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         google_iap: None,
         steam_iap: None,
         runtime: runtime.clone(),
+        schedules,
         cluster: cluster.clone(),
         fleets: fleets.clone(),
         fanout,
@@ -6034,4 +6038,76 @@ async fn account_self_export_and_delete() {
         v["users"].as_array().map(|u| u.is_empty()).unwrap_or(true),
         "{v}"
     );
+}
+
+/// Configured schedules show up with their export name and next fire; a forced run without a
+/// module exporting the hook is a clean 404, as is an unknown schedule.
+#[tokio::test]
+async fn runtime_schedules_status_and_forced_run() {
+    let Some(app) = app_with(|cfg| {
+        cfg.runtime
+            .schedules
+            .push(musubi_core::config::ScheduleConfig {
+                name: "nightly".into(),
+                cron: "0 3 * * *".into(),
+            });
+        cfg.runtime
+            .schedules
+            .push(musubi_core::config::ScheduleConfig {
+                name: "broken".into(),
+                cron: "99 * * * *".into(),
+            });
+    })
+    .await
+    else {
+        return;
+    };
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/runtime/schedules",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let list = v["schedules"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{v}");
+    assert_eq!(list[0]["name"], "nightly");
+    assert_eq!(list[0]["export"], "schedule_nightly");
+    assert!(list[0]["next_run"].is_i64(), "{v}");
+    assert_eq!(list[0]["runs"], 0);
+    assert_eq!(v["problems"].as_array().unwrap().len(), 1, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/runtime/schedules/nightly/run",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("schedule_nightly"),
+        "{v}"
+    );
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/runtime/schedules",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(v["schedules"][0]["runs"], 1, "{v}");
+    assert_eq!(v["schedules"][0]["last_ok"], false, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/runtime/schedules/nope/run",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

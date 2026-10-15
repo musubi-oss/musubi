@@ -32,6 +32,8 @@ musubi-proto.workspace = true
 musubi-transport.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+cron = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes.workspace = true
 uuid.workspace = true
 tokio.workspace = true
