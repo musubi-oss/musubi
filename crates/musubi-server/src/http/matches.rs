@@ -25,6 +25,9 @@ struct ListQuery {
     max_size: Option<u32>,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Matchmaker-style query over the label, e.g. `+label.mode:ranked +label.open:1`.
+    #[serde(default)]
+    query: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -43,10 +46,17 @@ async fn list(
     Bearer(_): Bearer,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = q
+        .query
+        .as_deref()
+        .filter(|q| !q.trim().is_empty() && q.trim() != "*")
+        .map(musubi_matchmaker::Query::parse)
+        .transpose()?;
     let matches: Vec<MatchInfo> = s
         .matches
-        .list(
+        .list_query(
             q.label.as_deref(),
+            query.as_ref(),
             q.min_size,
             q.max_size,
             q.limit.clamp(1, 100),

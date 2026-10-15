@@ -371,6 +371,20 @@ impl MatchRegistry {
         max_size: Option<u32>,
         limit: usize,
     ) -> Vec<MatchInfo> {
+        self.list_query(label, None, min_size, max_size, limit)
+            .await
+    }
+
+    /// `query` uses the matchmaker syntax over the label: a JSON-object label exposes its fields
+    /// as `label.<field>` (and bare `<field>`), any other label as the string `label`.
+    pub async fn list_query(
+        &self,
+        label: Option<&str>,
+        query: Option<&musubi_matchmaker::Query>,
+        min_size: Option<u32>,
+        max_size: Option<u32>,
+        limit: usize,
+    ) -> Vec<MatchInfo> {
         let mut out = Vec::new();
         for h in self
             .matches
@@ -382,6 +396,7 @@ impl MatchRegistry {
             if label.is_some_and(|l| i.label != l)
                 || min_size.is_some_and(|m| i.size < m)
                 || max_size.is_some_and(|m| i.size > m)
+                || query.is_some_and(|q| !q.matches(&label_props(&i.label)))
             {
                 continue;
             }
@@ -395,5 +410,67 @@ impl MatchRegistry {
 
     pub fn count(&self) -> usize {
         self.matches.len()
+    }
+}
+
+/// Matchmaker properties derived from a match label (see `MatchRegistry::list_query`).
+pub fn label_props(label: &str) -> musubi_matchmaker::Properties {
+    let mut p = musubi_matchmaker::Properties::default();
+    match serde_json::from_str::<serde_json::Value>(label) {
+        Ok(serde_json::Value::Object(map)) => {
+            for (k, v) in map {
+                let keys = [format!("label.{k}"), k.clone()];
+                match v {
+                    serde_json::Value::Number(n) => {
+                        if let Some(f) = n.as_f64() {
+                            for key in keys {
+                                p.numbers.insert(key, f);
+                            }
+                        }
+                    }
+                    serde_json::Value::Bool(b) => {
+                        for key in keys {
+                            p.numbers.insert(key.clone(), if b { 1.0 } else { 0.0 });
+                            p.strings.insert(key, b.to_string());
+                        }
+                    }
+                    serde_json::Value::String(st) => {
+                        for key in keys {
+                            p.strings.insert(key, st.clone());
+                        }
+                    }
+                    other => {
+                        for key in keys {
+                            p.strings.insert(key, other.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            p.strings.insert("label".into(), label.to_string());
+        }
+    }
+    p
+}
+
+#[cfg(test)]
+mod label_query_tests {
+    use super::label_props;
+    use musubi_matchmaker::Query;
+
+    #[test]
+    fn label_query_filters_matches() {
+        let open = label_props(r#"{"mode":"ranked","open":true,"players":3,"region":"eu"}"#);
+        let full = label_props(r#"{"mode":"ranked","open":false,"players":8,"region":"us"}"#);
+        let plain = label_props("lobby-1");
+        let q = Query::parse("+label.mode:ranked +label.open:1 +label.players:<5").unwrap();
+        assert!(q.matches(&open));
+        assert!(!q.matches(&full));
+        assert!(!q.matches(&plain));
+        let q2 = Query::parse("+region:us").unwrap();
+        assert!(q2.matches(&full) && !q2.matches(&open));
+        let q3 = Query::parse("+label:lobby-1").unwrap();
+        assert!(q3.matches(&plain));
     }
 }
