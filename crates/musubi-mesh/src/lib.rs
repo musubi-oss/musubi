@@ -609,6 +609,14 @@ impl World {
         self.buffered_inputs.remove(&id).unwrap_or_default()
     }
 
+    /// Drop `id` from every client's known set without reporting a despawn: the entity moved to
+    /// another node's shard, whose own deltas carry it from now on.
+    pub fn forget_for_clients(&mut self, id: EntityId) {
+        for i in self.interests.values_mut() {
+            i.known.remove(&id);
+        }
+    }
+
     /// Abort a handover in progress; the entity stays with its current owner.
     pub fn cancel_handover(&mut self, id: EntityId) -> Option<Transit> {
         self.entities.get_mut(&id).and_then(|e| e.transit.take())

@@ -5131,3 +5131,185 @@ async fn world_cell_host_failover() {
     .await;
     assert_eq!(st, 200, "the cell is leasable on the home again");
 }
+
+/// Three nodes: A is the world's home with cell (0,0), B hosts cell (1,0), a client connected to C
+/// subscribes across both cells. It receives the entity from A, and after the entity crosses the
+/// border it ends up knowing it exactly once, at its new position, streamed by B.
+#[tokio::test]
+async fn world_interest_across_nodes() {
+    let group = format!("xint-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    let Some((addr3, _router3)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(
+            serde_json::json!({"name": name, "config": {"cell_size": 100.0, "ghost_margin": 20.0}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (sim_a, sim_b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    for (router, sim, cell) in [(&router1, sim_a, (0, 0)), (&router2, sim_b, (1, 0))] {
+        let (st, l) = http_json(
+            router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/lease"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "cells": [{"x": cell.0, "y": cell.1}]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{l}");
+    }
+    let (tc, _) = token(&router1).await;
+    let mut c = connect(&addr3, &tc, "json").await;
+    send(
+        &mut c,
+        "json",
+        None,
+        ClientMessage::WorldSubscribe {
+            world: name.clone(),
+            x: 100.0,
+            y: 50.0,
+            radius: 200.0,
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (st, e) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_a, "x": 95.0, "y": 50.0, "components": {"hp": 7}, "persistent": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let id = e["id"].as_str().unwrap().to_string();
+    let mut known: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let apply_delta = |known: &mut std::collections::HashMap<String, f64>, m: ServerMessage| {
+        if let ServerMessage::WorldDelta {
+            spawned,
+            updated,
+            despawned,
+            ..
+        } = m
+        {
+            for d in despawned {
+                known.remove(&d);
+            }
+            for e in spawned.into_iter().chain(updated) {
+                known.insert(e.id, e.x);
+            }
+        }
+    };
+    // the client on C learns about the entity from A
+    for _ in 0..10 {
+        let m = recv(&mut c).await.msg;
+        apply_delta(&mut known, m);
+        if known.get(&id) == Some(&95.0) {
+            break;
+        }
+    }
+    assert_eq!(known.get(&id), Some(&95.0), "{known:?}");
+    let (st, a) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_a, "entity": id, "x": 130.0, "y": 50.0})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    // after the handover B streams it; A's shard reports it gone. Whatever the interleaving, the
+    // client converges on one copy at the new position.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut converged = false;
+    while tokio::time::Instant::now() < deadline {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), c.next()).await;
+        match next {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(env) =
+                    serde_json::from_slice::<Envelope<ServerMessage>>(&frame.into_data())
+                {
+                    apply_delta(&mut known, env.msg);
+                }
+            }
+            Ok(_) => break,
+            Err(_) => {
+                if known.len() == 1 && known.get(&id) == Some(&130.0) {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        converged,
+        "client did not converge on the moved entity: {known:?}"
+    );
+    let (_, vb) = http_json(
+        &router2,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/1/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(vb["owned"].as_array().map(|a| a.len()), Some(1), "{vb}");
+}

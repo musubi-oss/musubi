@@ -40,6 +40,8 @@ struct WorldState {
     journal: Vec<WorldOp>,
     /// Border entities of cells hosted on other nodes, as last received over the bus.
     remote_ghosts: HashMap<CellId, (std::time::Instant, Vec<Entity>)>,
+    /// This shard exists only for cells assigned to this node (it is not the world's home).
+    hosted_only: bool,
 }
 
 /// Remote ghosts older than this are stale (their host stopped publishing or moved).
@@ -288,6 +290,7 @@ impl WorldRegistry {
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
+                    hosted_only: true,
                 }))
             });
         }
@@ -486,6 +489,7 @@ impl WorldRegistry {
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
+                    hosted_only: false,
                 })),
             );
             self.homes.insert(name.clone(), self.node_id);
@@ -693,6 +697,7 @@ impl WorldRegistry {
                 sim_events: HashMap::new(),
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
+                hosted_only: false,
             })),
         );
         self.publish_home(name, Some(self.node_id)).await;
@@ -1035,6 +1040,7 @@ impl WorldRegistry {
         if accepted {
             let inputs = st.world.take_buffered_inputs(id);
             let persistent = st.world.get(id).is_some_and(|e| e.persistent);
+            st.world.forget_for_clients(id);
             st.world.despawn(id);
             if persistent {
                 st.journal.push(WorldOp {
@@ -1074,7 +1080,7 @@ impl WorldRegistry {
 
     /// Are the cells of `name` spread over several nodes? Any explicit cell assignment means
     /// so: the home node sees the foreign hosts, an assigned node sees at least its own entry.
-    fn is_split(&self, name: &str) -> bool {
+    pub fn is_split(&self, name: &str) -> bool {
         self.cell_hosts.iter().any(|e| e.key().0 == name)
     }
 
@@ -1117,7 +1123,16 @@ impl WorldRegistry {
         let st = &mut *st;
         let client = *st.subs.entry(sid).or_insert_with(Uuid::now_v7);
         st.world.subscribe(client, pos, radius);
+        let hosted_only = st.hosted_only;
         for c in st.world.cells_in_radius(pos, radius) {
+            // only cells this shard is responsible for get a simulator from here
+            let here = match self.cell_hosts.get(&(name.to_string(), c)) {
+                Some(h) => *h == self.node_id,
+                None => !hosted_only,
+            };
+            if !here {
+                continue;
+            }
             if let Some(a) = st
                 .controller
                 .ensure_leased(&mut st.world, c, None, "interest")

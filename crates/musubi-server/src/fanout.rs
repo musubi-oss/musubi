@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::realtime::party::PartyCmdEnv;
 use crate::realtime::relayed::RelayedCmdEnv;
-use crate::realtime::world::{WorldCmdEnv, WorldRegistry};
+use crate::realtime::world::{WorldCmd, WorldCmdEnv, WorldRegistry};
 use crate::realtime::{Hub, PartyRegistry, RelayedRegistry};
 
 #[derive(Serialize, Deserialize)]
@@ -571,7 +571,15 @@ impl Fanout {
                 if let Some(w) = self.worlds.get().cloned() {
                     let me = self.clone();
                     tokio::spawn(async move {
-                        if w.home_of(&env.world).await.ok().flatten() != Some(w.node_id()) {
+                        // inputs run on the directory home (which forwards to the owning shard);
+                        // subscriptions run on every node keeping a shard of the world
+                        let run = match env.cmd {
+                            WorldCmd::Input { .. } => {
+                                w.home_of(&env.world).await.ok().flatten() == Some(w.node_id())
+                            }
+                            _ => w.has_shard(&env.world),
+                        };
+                        if !run {
                             return;
                         }
                         let sid = env.session_id;

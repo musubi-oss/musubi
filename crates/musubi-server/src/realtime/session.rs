@@ -840,13 +840,32 @@ async fn world_dispatch(ctx: &Ctx<'_>, world: &str, cmd: WorldCmd) -> Option<Ser
         session_id: ctx.presence.session_id,
         cmd,
     };
-    match ctx.worlds.home_of(world).await {
-        Err(e) => Some(ServerMessage::error(&e)),
-        Ok(None) => Some(ServerMessage::error(&Error::NotFound(format!(
-            "world {world}"
-        )))),
-        Ok(Some(h)) if h == ctx.worlds.node_id() => ctx.worlds.exec(env, ctx.fanout),
-        Ok(Some(_)) => {
+    let home = match ctx.worlds.home_of(world).await {
+        Err(e) => return Some(ServerMessage::error(&e)),
+        Ok(None) => {
+            return Some(ServerMessage::error(&Error::NotFound(format!(
+                "world {world}"
+            ))))
+        }
+        Ok(Some(h)) => h,
+    };
+    match env.cmd {
+        // interest lives on every shard of the world: each cell host streams deltas for its own
+        // entities, so the subscription goes to all of them
+        WorldCmd::Subscribe { .. } | WorldCmd::Unsubscribe => {
+            let local = ctx.worlds.has_shard(world);
+            let reply = if local {
+                ctx.worlds.exec(env.clone(), ctx.fanout)
+            } else {
+                None
+            };
+            if !local || ctx.worlds.is_split(world) {
+                ctx.fanout.world_cmd(env);
+            }
+            reply
+        }
+        WorldCmd::Input { .. } if home == ctx.worlds.node_id() => ctx.worlds.exec(env, ctx.fanout),
+        WorldCmd::Input { .. } => {
             ctx.fanout.world_cmd(env);
             None
         }
