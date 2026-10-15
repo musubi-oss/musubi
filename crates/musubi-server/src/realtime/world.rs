@@ -40,6 +40,8 @@ struct WorldState {
 
 pub struct WorldRegistry {
     node_id: Uuid,
+    /// `node.cluster_group`: worlds of other clusters sharing the database are invisible here.
+    group: String,
     db: Option<PgPool>,
     worlds: DashMap<String, Arc<Mutex<WorldState>>>,
     /// world → home node (cache of `musubi.worlds`)
@@ -109,11 +111,17 @@ impl WorldRegistry {
     pub fn new(node_id: Uuid, db: Option<PgPool>) -> Self {
         Self {
             node_id,
+            group: "default".into(),
             db,
             worlds: DashMap::new(),
             homes: DashMap::new(),
             cluster: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn with_group(mut self, group: &str) -> Self {
+        self.group = group.to_string();
+        self
     }
 
     pub fn set_cluster(&self, cluster: Arc<musubi_cluster::Cluster>) {
@@ -182,12 +190,15 @@ impl WorldRegistry {
         };
         let rows: Vec<(String, Value, Value)> = sqlx::query_as(
             "update musubi.worlds w set node_id = $2
-             where (w.node_id = any($1) or not exists (select 1 from musubi.nodes n where n.id = w.node_id))
-               and not (w.node_id = $2 and $2 <> all($1))
+             where w.cluster_group = $3
+               and (w.node_id is null or w.node_id = any($1)
+                    or not exists (select 1 from musubi.nodes n where n.id = w.node_id))
+               and (w.node_id is null or not (w.node_id = $2 and $2 <> all($1)))
              returning name, config, controller",
         )
         .bind(dead_nodes)
         .bind(self.node_id)
+        .bind(&self.group)
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
@@ -222,6 +233,31 @@ impl WorldRegistry {
             self.homes.insert(name.clone(), self.node_id);
             self.publish_home(&name, Some(self.node_id)).await;
             out.push(name);
+        }
+        Ok(out)
+    }
+
+    /// Drain: snapshot every world we host and disown it so the failover leader re-homes it.
+    pub async fn release_all(&self) -> Result<Vec<String>> {
+        let Some(db) = &self.db else {
+            return Ok(vec![]);
+        };
+        let mut out = Vec::new();
+        for name in self.list() {
+            if let Err(e) = self.snapshot_now(&name).await {
+                tracing::warn!(world = %name, error = %e, "drain snapshot failed");
+            }
+            let r = sqlx::query(
+                "update musubi.worlds set node_id = null where name = $1 and node_id = $2",
+            )
+            .bind(&name)
+            .bind(self.node_id)
+            .execute(db)
+            .await
+            .map_err(Error::internal)?;
+            if r.rows_affected() > 0 {
+                out.push(name);
+            }
         }
         Ok(out)
     }
@@ -300,11 +336,12 @@ impl WorldRegistry {
             return Err(Error::Conflict("world exists".into()));
         }
         if let Some(db) = &self.db {
-            sqlx::query("insert into musubi.worlds (name, node_id, config, controller) values ($1, $2, $3, $4)")
+            sqlx::query("insert into musubi.worlds (name, node_id, config, controller, cluster_group) values ($1, $2, $3, $4, $5)")
                 .bind(name)
                 .bind(self.node_id)
                 .bind(serde_json::to_value(&cfg)?)
                 .bind(serde_json::to_value(&ctl)?)
+                .bind(&self.group)
                 .execute(db)
                 .await
                 .map_err(|e| match e {

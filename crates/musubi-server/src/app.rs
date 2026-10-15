@@ -57,6 +57,8 @@ pub struct AppState {
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
+    /// Set on SIGTERM: `/readyz` answers 503 so load balancers stop routing here.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -143,7 +145,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             move || lease.held()
         });
     let relayed = Arc::new(RelayedRegistry::new(cluster.node_id().0));
-    let matches = Arc::new(MatchRegistry::new(Some(db.clone()), cluster.node_id().0));
+    let matches = Arc::new(
+        MatchRegistry::new(Some(db.clone()), cluster.node_id().0)
+            .with_group(&cfg.node.cluster_group),
+    );
     let wasm_mods = matches.register_wasm(&runtime);
     if !wasm_mods.is_empty() {
         tracing::info!(modules = ?wasm_mods, "wasm match modules registered");
@@ -164,21 +169,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let lease = cluster.lease("failover", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
+            let mut leaves = cluster.subscribe();
             loop {
-                tick.tick().await;
-                if !lease.held() {
+                wait_failover_round(&mut tick, &mut leaves).await;
+                if !await_lease(&lease).await {
                     continue;
                 }
-                let dead: Vec<uuid::Uuid> = match cluster.nodes().await {
-                    Ok(nodes) => nodes.iter().filter(|n| !n.alive).map(|n| n.id.0).collect(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "node list failed");
-                        continue;
-                    }
+                let Some(dead) = dead_nodes(&cluster).await else {
+                    continue;
                 };
-                if dead.is_empty() {
-                    continue;
-                }
                 match matches.recover(hub.clone(), &dead).await {
                     Ok(ids) if !ids.is_empty() => {
                         tracing::info!(count = ids.len(), ?dead, "adopted matches from dead nodes")
@@ -204,10 +203,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         std::time::Duration::from_secs(1),
     );
     fanout.set_fleets(fleets.clone());
-    let worlds = Arc::new(crate::realtime::WorldRegistry::new(
-        cluster.node_id().0,
-        Some(db.clone()),
-    ));
+    let worlds = Arc::new(
+        crate::realtime::WorldRegistry::new(cluster.node_id().0, Some(db.clone()))
+            .with_group(&cfg.node.cluster_group),
+    );
     worlds.set_cluster(cluster.clone());
     // Admin kicks fan out to every node: each hub closes the account's local sockets.
     {
@@ -246,18 +245,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let lease = cluster.lease("world-failover", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
+            let mut leaves = cluster.subscribe();
             loop {
-                tick.tick().await;
-                if !lease.held() {
+                wait_failover_round(&mut tick, &mut leaves).await;
+                if !await_lease(&lease).await {
                     continue;
                 }
-                let dead: Vec<uuid::Uuid> = match cluster.nodes().await {
-                    Ok(nodes) => nodes.iter().filter(|n| !n.alive).map(|n| n.id.0).collect(),
-                    Err(_) => continue,
+                let Some(dead) = dead_nodes(&cluster).await else {
+                    continue;
                 };
-                if dead.is_empty() {
-                    continue;
-                }
                 match worlds.recover(&dead).await {
                     Ok(names) if !names.is_empty() => {
                         tracing::info!(?names, ?dead, "adopted worlds from dead nodes")
@@ -323,6 +319,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cfg: Arc::new(cfg),
         events: Arc::new(crate::events::Events::new(db.clone())),
         banned: Arc::new(crate::bans::Bans::default()),
+        draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         db,
         auth,
         storage,
@@ -408,14 +405,106 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(listen) = state.cfg.quic.listen {
         crate::realtime::quic::start(state.clone(), listen).await?;
     }
+    let draining = state.clone();
     axum::serve(
         listener,
-        http::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        http::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
+    .with_graceful_shutdown(async move {
+        shutdown().await;
+        drain(&draining).await;
+    })
     .await?;
+    if let Some(c) = &state.cluster {
+        c.stop().await;
+    }
     info!("stopped");
     Ok(())
+}
+
+/// Nodes currently considered dead. A failover round is owed when this runs, so a transient
+/// database error (pool contention) is retried a few times instead of losing the round.
+async fn dead_nodes(cluster: &musubi_cluster::Cluster) -> Option<Vec<uuid::Uuid>> {
+    for attempt in 0..3 {
+        match cluster.nodes().await {
+            Ok(nodes) => {
+                return Some(nodes.iter().filter(|n| !n.alive).map(|n| n.id.0).collect());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "node list failed");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+    None
+}
+
+/// A failover round is owed; give leadership up to `DEAD_AFTER` to settle on us (a draining
+/// leader hands over while its leave is in flight) before giving the round up.
+async fn await_lease(lease: &musubi_cluster::Lease) -> bool {
+    let deadline = std::time::Instant::now() + musubi_cluster::DEAD_AFTER;
+    while !lease.held() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    true
+}
+
+/// Next failover round: the periodic tick, or immediately when a node announces it is leaving.
+async fn wait_failover_round(
+    tick: &mut tokio::time::Interval,
+    leaves: &mut tokio::sync::broadcast::Receiver<musubi_cluster::BusMessage>,
+) {
+    loop {
+        tokio::select! {
+            _ = tick.tick() => return,
+            m = leaves.recv() => match m {
+                Ok(m) if m.topic == musubi_cluster::LEAVE_TOPIC => {
+                    // let the leaver finish disowning its matches/worlds
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    return;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => {
+                    tick.tick().await;
+                    return;
+                }
+            },
+        }
+    }
+}
+
+/// SIGTERM drain, bounded by `node.drain_timeout_secs`: stop advertising readiness, snapshot and
+/// disown our matches/worlds so the failover leader re-homes them, leave the cluster (peers mark
+/// us dead at once, leases released), then close every realtime session so clients reconnect to
+/// another node. axum finishes in-flight HTTP after this returns.
+async fn drain(state: &AppState) {
+    state
+        .draining
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let budget = std::time::Duration::from_secs(state.cfg.node.drain_timeout_secs.max(1));
+    let work = async {
+        match state.worlds.release_all().await {
+            Ok(w) if !w.is_empty() => info!(worlds = ?w, "drain: worlds handed off"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "drain: world hand-off failed"),
+        }
+        match state.matches.release_all().await {
+            Ok(n) if n > 0 => info!(matches = n, "drain: matches handed off"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "drain: match hand-off failed"),
+        }
+        if let Some(c) = &state.cluster {
+            c.leave().await;
+        }
+        let closed = state.hub.close_all();
+        info!(sessions = closed, "drain: sessions closed");
+    };
+    if tokio::time::timeout(budget, work).await.is_err() {
+        tracing::warn!(?budget, "drain: timed out, exiting anyway");
+    }
 }
 
 async fn shutdown() {

@@ -21,6 +21,8 @@ pub struct MatchRegistry {
     /// Snapshot store (`musubi.match_snapshots`); `None` = in-memory only.
     db: Option<PgPool>,
     node_id: Uuid,
+    /// `node.cluster_group`: failover only adopts snapshots of our own cluster.
+    group: String,
     /// Periodic snapshot interval in ticks (membership changes and end always snapshot).
     pub snapshot_every: u64,
 }
@@ -39,10 +41,16 @@ impl MatchRegistry {
             by_session: DashMap::new(),
             db,
             node_id,
+            group: "default".into(),
             snapshot_every: 50,
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
         r
+    }
+
+    pub fn with_group(mut self, group: &str) -> Self {
+        self.group = group.to_string();
+        self
     }
 
     fn deliver(hub: Arc<Hub>) -> musubi_actor::Deliver {
@@ -56,13 +64,15 @@ impl MatchRegistry {
     fn on_snapshot(&self) -> Option<musubi_actor::OnSnapshot> {
         let db = self.db.clone()?;
         let node = self.node_id;
+        let group = self.group.clone();
         Some(Arc::new(move |id: MatchId, snap: Option<Snapshot>| {
             let db = db.clone();
+            let group = group.clone();
             tokio::spawn(async move {
                 let res = match snap {
                     Some(s) => sqlx::query(
-                        "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at)
-                         values ($1, $2, $3, $4, $5, $6, $7, now())
+                        "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group)
+                         values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
                          on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = excluded.node_id, updated_at = now()",
                     )
                     .bind(id.0)
@@ -72,6 +82,7 @@ impl MatchRegistry {
                     .bind(&s.state)
                     .bind(s.tick as i64)
                     .bind(node)
+                    .bind(&group)
                     .execute(&db)
                     .await,
                     None => sqlx::query("delete from musubi.match_snapshots where match_id = $1").bind(id.0).execute(&db).await,
@@ -125,11 +136,12 @@ impl MatchRegistry {
         // Claim atomically so two surviving nodes never resume the same match.
         let rows = sqlx::query_as::<_, (Uuid, String, String, serde_json::Value, Vec<u8>, i64)>(
             "update musubi.match_snapshots set node_id = $2, updated_at = now()
-             where node_id is null or node_id = any($1)
+             where cluster_group = $3 and (node_id is null or node_id = any($1))
              returning match_id, module, label, params, state, tick",
         )
         .bind(dead_nodes)
         .bind(self.node_id)
+        .bind(&self.group)
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
@@ -148,6 +160,20 @@ impl MatchRegistry {
             }
         }
         Ok(out)
+    }
+
+    /// Drain: disown our matches in the snapshot store so the failover leader resumes them
+    /// elsewhere (from their last snapshot). Returns how many were handed off.
+    pub async fn release_all(&self) -> Result<u64> {
+        let Some(db) = &self.db else {
+            return Ok(0);
+        };
+        let r = sqlx::query("update musubi.match_snapshots set node_id = null where node_id = $1")
+            .bind(self.node_id)
+            .execute(db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(r.rows_affected())
     }
 
     /// Register every `match_<m>_*` module the runtime currently exposes.

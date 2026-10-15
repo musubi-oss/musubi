@@ -78,6 +78,8 @@ type NodeRow = (
 
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
 pub const DEAD_AFTER: Duration = Duration::from_secs(15);
+/// Bus topic announcing a voluntary departure (payload: node uuid); peers mark it dead at once.
+pub const LEAVE_TOPIC: &str = "cluster.leave";
 const BUS_CHANNEL: &str = "musubi_bus";
 /// Postgres NOTIFY payloads are capped at 8000 bytes.
 const MAX_BUS_PAYLOAD: usize = 7900;
@@ -103,6 +105,8 @@ pub struct Cluster {
     pub(crate) raft: Arc<std::sync::OnceLock<raft::RaftState>>,
     /// Node data directory: stable node id + Raft storage. `None` = ephemeral node.
     pub(crate) data_dir: Option<std::path::PathBuf>,
+    /// Set by `leave()`: stop heartbeating so the deleted row does not come back.
+    left: Arc<AtomicBool>,
 }
 
 /// A message from another node. `topic` routes it; `payload` is topic-specific JSON.
@@ -150,6 +154,7 @@ impl Cluster {
             incarnation: Arc::new(AtomicU64::new(0)),
             raft: Arc::new(std::sync::OnceLock::new()),
             data_dir: None,
+            left: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -252,6 +257,9 @@ impl Cluster {
 
     /// Insert our row, then keep heartbeating and relaying bus notifications until dropped.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        if self.left.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         sqlx::query(
             "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11) on conflict (id) do update set name = excluded.name, region = excluded.region, roles = excluded.roles, version = excluded.version, advertise = excluded.advertise, started_at = excluded.started_at, heartbeat_at = now(), bus_addr = excluded.bus_addr, bus_cert = excluded.bus_cert, raft_id = excluded.raft_id, cluster_group = excluded.cluster_group",
         )
@@ -309,6 +317,7 @@ impl Cluster {
                             if relay.accepts_notify(&msg) {
                                 metrics::counter!("musubi_bus_messages_total", "transport" => "postgres", "dir" => "rx", "ok" => "true").increment(1);
                                 metrics::counter!("musubi_bus_bytes_total", "transport" => "postgres", "dir" => "rx").increment(n.payload().len() as u64);
+                                relay.note_leave(&msg).await;
                                 let _ = relay.bus_tx.send(msg);
                             }
                         }
@@ -340,6 +349,7 @@ impl Cluster {
                                         Ok(msg) if msg.origin != c.me.id => {
                                             metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "rx", "ok" => "true").increment(1);
                                             metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "rx").increment(buf.len() as u64);
+                                            c.note_leave(&msg).await;
                                             let _ = c.bus_tx.send(msg);
                                         }
                                         Ok(_) => {}
@@ -401,6 +411,33 @@ impl Cluster {
             return msg.only.contains(&self.me.id);
         }
         !(msg.via_quic && self.bus.is_some())
+    }
+
+    async fn note_leave(&self, msg: &BusMessage) {
+        if msg.topic == LEAVE_TOPIC {
+            if let Ok(id) = serde_json::from_value::<Uuid>(msg.payload.clone()) {
+                self.set_state(id, swim::State::Dead).await;
+            }
+        }
+    }
+
+    /// Voluntary departure: tell peers (they mark us dead immediately instead of waiting for
+    /// SWIM), drop every lease we hold and our node row, and stop heartbeating. Callers hand off
+    /// matches/worlds before this so the failover leader finds them orphaned.
+    pub async fn leave(&self) {
+        self.left.store(true, Ordering::Relaxed);
+        let _ = sqlx::query("delete from musubi.leases where holder = $1")
+            .bind(self.me.id.0)
+            .execute(&self.db)
+            .await;
+        let _ = sqlx::query("delete from musubi.nodes where id = $1")
+            .bind(self.me.id.0)
+            .execute(&self.db)
+            .await;
+        // announce last: by now the database already shows us gone
+        if let Err(e) = self.publish(LEAVE_TOPIC, &self.me.id.0).await {
+            tracing::warn!(error = %e, "leave broadcast failed");
+        }
     }
 
     pub async fn stop(&self) {
@@ -603,9 +640,14 @@ impl Cluster {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(ttl / 3);
             loop {
-                tick.tick().await;
                 // With Raft running, the elected leader owns every duty; the Postgres CAS lease
-                // is only the fallback for clusters without the QUIC bus.
+                // is only the fallback for clusters without the QUIC bus. Leadership is a local
+                // read, so poll it every second to follow elections promptly.
+                if c.raft.get().is_some() {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    tick.tick().await;
+                }
                 let held = if c.raft.get().is_some() {
                     c.is_raft_leader()
                 } else {

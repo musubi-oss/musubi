@@ -59,6 +59,8 @@ pub struct NodeConfig {
     pub bus_advertise: String,
     /// Cluster group: independent clusters can share one Postgres.
     pub cluster_group: String,
+    /// Upper bound for the SIGTERM drain (hand off matches/worlds, leave the cluster, close sessions).
+    pub drain_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +106,7 @@ impl Default for NodeConfig {
             bus_listen: String::new(),
             bus_advertise: String::new(),
             cluster_group: "default".into(),
+            drain_timeout_secs: 20,
             data_dir: "./data".into(),
         }
     }

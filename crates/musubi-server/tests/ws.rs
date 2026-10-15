@@ -112,6 +112,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         cfg: Arc::new(cfg),
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),

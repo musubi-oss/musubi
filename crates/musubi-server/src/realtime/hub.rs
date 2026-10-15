@@ -53,6 +53,21 @@ impl Hub {
         n
     }
 
+    /// Close every session (node draining): a best-effort `Unavailable` hint first so clients
+    /// reconnect elsewhere, then the same kick path admins use.
+    pub fn close_all(&self) -> usize {
+        let mut n = 0;
+        for h in self.sessions.iter() {
+            let _ =
+                h.tx.try_send(ServerMessage::error(&musubi_core::Error::Unavailable(
+                    "node draining, reconnect".into(),
+                )));
+            h.kick.notify_one();
+            n += 1;
+        }
+        n
+    }
+
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }

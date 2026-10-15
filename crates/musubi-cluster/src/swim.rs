@@ -131,7 +131,7 @@ impl Cluster {
         }
     }
 
-    async fn set_state(&self, id: Uuid, state: State) {
+    pub(crate) async fn set_state(&self, id: Uuid, state: State) {
         let mut m = self.members.write().await;
         let e = m.entry(id).or_insert(Member {
             state: State::Alive,

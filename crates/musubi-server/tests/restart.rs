@@ -37,6 +37,7 @@ fn spawn(n: &mut Node, db: &str, group: &str, name: &str) {
     let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_musubi-server"))
         .env("MUSUBI__DATABASE__URL", db)
         .env("MUSUBI__DATABASE__RUN_MIGRATIONS", "true")
+        .env("MUSUBI__DATABASE__MAX_CONNECTIONS", "4")
         .env("MUSUBI__NODE__NAME", name)
         .env("MUSUBI__NODE__DATA_DIR", &n.dir)
         .env("MUSUBI__NODE__CLUSTER_GROUP", group)
@@ -209,4 +210,126 @@ async fn cluster_survives_full_restart_from_disk() {
         }
     }
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// SIGTERM to a node hosting a world: it disowns the world, announces its departure and exits
+/// within the drain budget; the failover leader re-homes the world on a surviving node right away
+/// (not after the 15 s dead-node timeout).
+#[tokio::test]
+async fn draining_node_hands_off_its_worlds() {
+    let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("musubi-drain-{}", uuid::Uuid::now_v7().simple()));
+    let group = format!("drain-{}", uuid::Uuid::now_v7().simple());
+    let mut nodes: Vec<Node> = (0..3)
+        .map(|i| Node {
+            http: free_port(false),
+            bus: free_port(true),
+            dir: root.join(format!("n{i}")),
+            child: None,
+        })
+        .collect();
+    for (i, n) in nodes.iter_mut().enumerate() {
+        spawn(n, &db, &group, &format!("n{i}"));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    wait_quorum(&client, &nodes).await;
+    let ids = node_ids(&client, &nodes).await;
+
+    // pick a follower to drain so the remaining two keep a Raft leader
+    let mut victim = 0;
+    for (i, n) in nodes.iter().enumerate() {
+        let r = get(&client, n, "/v1/server/cluster/raft").await.unwrap();
+        if r["is_leader"] != true {
+            victim = i;
+            break;
+        }
+    }
+    let other = (victim + 1) % 3;
+    let world = format!("w-{}", uuid::Uuid::now_v7().simple());
+    let res = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/server/worlds",
+            nodes[victim].http
+        ))
+        .header("x-musubi-server-key", KEY)
+        .json(&serde_json::json!({ "name": world, "config": {}, "controller": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let key = format!("world:{world}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let v = get(
+            &client,
+            &nodes[other],
+            &format!("/v1/server/cluster/directory/{key}"),
+        )
+        .await;
+        if v.as_ref().and_then(|v| v["value"]["node_id"].as_str()) == Some(ids[victim].as_str()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "directory not replicated: {v:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // re-check right before the signal: leadership may have moved meanwhile
+    let r = get(&client, &nodes[victim], "/v1/server/cluster/raft")
+        .await
+        .unwrap();
+    assert_ne!(
+        r["is_leader"], true,
+        "victim became leader; test picks followers"
+    );
+    let started = Instant::now();
+    let mut child = nodes[victim].child.take().unwrap();
+    let pid = child.id().unwrap();
+    assert!(std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let status = tokio::time::timeout(Duration::from_secs(25), child.wait())
+        .await
+        .expect("drained node exits within the budget")
+        .unwrap();
+    assert!(status.success(), "{status:?}");
+
+    // the world lives on another node now, well before the 15 s dead-node timeout
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let v = get(
+            &client,
+            &nodes[other],
+            &format!("/v1/server/cluster/directory/{key}"),
+        )
+        .await;
+        let home = v
+            .as_ref()
+            .and_then(|v| v["value"]["node_id"].as_str())
+            .map(String::from);
+        if let Some(h) = &home {
+            if h != &ids[victim] && ids.contains(h) {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "world not re-homed: {v:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    let alive = get(&client, &nodes[other], "/v1/server/cluster/nodes")
+        .await
+        .unwrap();
+    let n = alive["nodes"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(n, 2, "{alive}");
+    let _ = std::fs::remove_dir_all(&root);
 }

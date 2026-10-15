@@ -71,6 +71,9 @@ async fn healthz() -> &'static str {
 }
 
 async fn readyz(State(s): State<AppState>) -> Response {
+    if s.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
+    }
     match sqlx::query_scalar::<_, i32>("select 1")
         .fetch_one(&s.db)
         .await
