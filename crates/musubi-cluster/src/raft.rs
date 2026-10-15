@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -47,6 +48,7 @@ pub(crate) const MAX_RAFT_FRAME: usize = 64 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 const MEMBERSHIP_SYNC: Duration = Duration::from_secs(2);
 const INIT_LEASE_TTL: Duration = Duration::from_secs(10);
+const BOOTSTRAP_GRACE: time::Duration = time::Duration::seconds(3);
 
 /// Raft node id derived from the cluster node uuid.
 pub fn raft_id(id: Uuid) -> RaftNodeId {
@@ -494,17 +496,26 @@ impl Cluster {
             .collect();
         if !initialized {
             // The oldest live raft-capable node bootstraps; the lease makes it exactly one.
+            // Only decide once the peer cache has been loaded (it contains our own row) and we
+            // have been registered long enough for simultaneously starting peers to show up.
+            let loaded = self.peers.read().await.iter().any(|p| p.id == self.me.id);
+            let age = OffsetDateTime::now_utc() - self.me.started_at;
+            if !loaded || age < BOOTSTRAP_GRACE {
+                return;
+            }
             let older = peers.iter().any(|p| p.started_at < self.me.started_at);
             if older {
                 return;
             }
-            match self.try_lease("raft-init", INIT_LEASE_TTL).await {
+            let init_lease = format!("raft-init:{}", self.me.group);
+            match self.try_lease(&init_lease, INIT_LEASE_TTL).await {
                 Ok(true) => {
                     let mut members = BTreeMap::new();
                     members.insert(self.me.raft_id, BasicNode::new(self.me.bus_addr.clone()));
                     match r.raft.initialize(members).await {
                         Ok(()) => {
-                            tracing::info!(raft_id = self.me.raft_id, "raft cluster bootstrapped")
+                            tracing::info!(raft_id = self.me.raft_id, "raft cluster bootstrapped");
+                            let _ = self.release_lease(&init_lease).await;
                         }
                         Err(e) => tracing::debug!(error = %e, "raft initialize"),
                     }

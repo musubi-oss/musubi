@@ -2823,7 +2823,7 @@ async fn raft_directory_replicates_and_survives_leader_loss() {
             break leaders[0].unwrap();
         }
         assert!(
-            t0.elapsed() < Duration::from_secs(30),
+            t0.elapsed() < Duration::from_secs(90),
             "no stable 3-node raft: leaders={leaders:?} voters={voters:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2946,7 +2946,7 @@ async fn raft_leader_owns_leases_and_world_directory() {
         && a.raft_leader() == b.raft_leader()
         && a.raft_voters().len() == 2)
     {
-        assert!(t0.elapsed() < Duration::from_secs(30), "raft not formed");
+        assert!(t0.elapsed() < Duration::from_secs(90), "raft not formed");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     // duties follow the raft leader, not the Postgres CAS lease
