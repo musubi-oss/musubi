@@ -5,9 +5,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use musubi_economy::{
-    CreateItem, CreateStoreItem, EnergyDef, IapProduct, ReceiptInput, RewardTable, StreakDef, Track,
+    Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, ReceiptInput, RewardTable,
+    SendMail, StreakDef, Track,
 };
 use musubi_integrations::StoreTransaction;
+use musubi_social::notifications::NewNotification;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -54,6 +56,20 @@ pub fn routes() -> Router<AppState> {
             get(iap_products).post(upsert_iap_product),
         )
         .route("/v1/server/iap/receipts", get(iap_receipts_of))
+        .route("/v1/mail", get(mail_list))
+        .route("/v1/mail/{id}", axum::routing::delete(mail_delete))
+        .route("/v1/mail/{id}/read", post(mail_read))
+        .route("/v1/mail/{id}/claim", post(mail_claim))
+        .route("/v1/server/mail", post(mail_send))
+        .route("/v1/achievements", get(achievements_mine))
+        .route(
+            "/v1/server/achievements",
+            get(achievements_all).post(upsert_achievement),
+        )
+        .route(
+            "/v1/server/achievements/progress",
+            post(achievement_progress),
+        )
         .route(
             "/v1/server/currencies",
             get(currencies).post(upsert_currency),
@@ -618,4 +634,153 @@ async fn iap_receipts_of(
     Ok(Json(
         json!({ "receipts": s.economy.receipts(account(&q.account_id)?, q.limit.unwrap_or(20)).await? }),
     ))
+}
+
+// ----- mailbox -----
+
+/// Notification code for a new mailbox message.
+pub const NOTIFY_MAIL: i32 = 100;
+
+#[derive(Deserialize)]
+struct MailQ {
+    limit: Option<i64>,
+    #[serde(default)]
+    unread: bool,
+}
+
+async fn mail_list(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<MailQ>,
+) -> Result<Json<Value>, ApiError> {
+    let m = s
+        .economy
+        .mail(
+            me.account_id,
+            q.unread,
+            q.limit.unwrap_or(50),
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(json!({ "mail": m })))
+}
+
+fn mail_id(id: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(id).map_err(|_| Error::InvalidArgument("bad mail id".into()).into())
+}
+
+async fn mail_read(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let m = s
+        .economy
+        .read_mail(me.account_id, mail_id(&id)?, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(serde_json::to_value(m).map_err(Error::internal)?))
+}
+
+async fn mail_claim(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (m, rewards) = s
+        .economy
+        .claim_mail(me.account_id, mail_id(&id)?, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(json!({ "mail": m, "rewards": rewards })))
+}
+
+async fn mail_delete(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    s.economy
+        .delete_mail(me.account_id, mail_id(&id)?, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(json!({})))
+}
+
+async fn mail_send(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(m): Json<SendMail>,
+) -> Result<Json<Value>, ApiError> {
+    let recipients = m.account_ids.clone();
+    let title = m.title.clone();
+    let all = m.all;
+    let n = s.economy.send_mail(m, OffsetDateTime::now_utc()).await?;
+    if !all {
+        let batch = recipients
+            .into_iter()
+            .map(|id| NewNotification {
+                user_id: AccountId(id),
+                sender_id: None,
+                subject: title.clone(),
+                content: json!({ "kind": "mail" }),
+                code: NOTIFY_MAIL,
+                persistent: false,
+            })
+            .collect();
+        s.notify.send(batch).await?;
+    }
+    Ok(Json(json!({ "sent": n })))
+}
+
+// ----- achievements -----
+
+async fn achievements_mine(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "achievements": s.economy.achievement_progress(me.account_id).await? }),
+    ))
+}
+
+async fn achievements_all(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "achievements": s.economy.achievements().await? }),
+    ))
+}
+
+async fn upsert_achievement(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(a): Json<Achievement>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_achievement(a).await?).map_err(Error::internal)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct AchProgressReq {
+    account_id: String,
+    achievement_id: String,
+    #[serde(default = "one_i32")]
+    delta: i32,
+}
+
+async fn achievement_progress(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<AchProgressReq>,
+) -> Result<Json<Value>, ApiError> {
+    let u = s
+        .economy
+        .add_achievement_progress(
+            account(&r.account_id)?,
+            &r.achievement_id,
+            r.delta,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(serde_json::to_value(u).map_err(Error::internal)?))
 }

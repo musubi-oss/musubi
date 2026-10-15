@@ -2179,3 +2179,186 @@ async fn progression_xp_levels_energy_and_streaks() {
     assert_eq!(mine["claimable"], false);
     assert_eq!(mine["count"], 1);
 }
+
+#[tokio::test]
+async fn mailbox_claim_expire_and_achievements() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("mb")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gems = unique("gems");
+    let bonus = unique("bonus");
+    let ach = unique("ach");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gems})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": bonus, "kind": "guaranteed", "entries": [{"currency": gems, "amount": 50}]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    // mail with rewards
+    let (st, r) = call_server(&app, "POST", "/v1/server/mail", k, Some(json!({"account_ids": [acc], "title": "Welcome", "body": "Enjoy", "rewards": bonus, "metadata": {"tag": "onboarding"}}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["sent"], 1);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/mail",
+        k,
+        Some(json!({"account_ids": [acc], "title": "x", "rewards": unique("nope")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, m) = call(&app, "GET", "/v1/mail?unread=true", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let list = m["mail"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["read"], false);
+    assert_eq!(list[0]["metadata"]["tag"], "onboarding");
+    let id = list[0]["id"].as_str().unwrap().to_string();
+    // cannot delete while rewards are unclaimed
+    let (st, _) = call(&app, "DELETE", &format!("/v1/mail/{id}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{id}/read"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(r["read"], true);
+    let (_, m) = call(&app, "GET", "/v1/mail?unread=true", Some(&tok), None).await;
+    assert!(m["mail"].as_array().unwrap().is_empty());
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{id}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["rewards"][0]["amount"], 50);
+    assert_eq!(r["mail"]["claimed"], true);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{id}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], 50);
+    let (st, _) = call(&app, "DELETE", &format!("/v1/mail/{id}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    // expiring mail disappears from the list and cannot be claimed
+    let (st, _) = call_server(&app, "POST", "/v1/server/mail", k, Some(json!({"account_ids": [acc], "title": "Flash", "rewards": bonus, "expires_in_seconds": 1}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, m) = call(&app, "GET", "/v1/mail", Some(&tok), None).await;
+    let id = m["mail"][0]["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, m) = call(&app, "GET", "/v1/mail", Some(&tok), None).await;
+    assert!(m["mail"].as_array().unwrap().is_empty());
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{id}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(&app, "DELETE", &format!("/v1/mail/{id}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "expired mail can be deleted unclaimed");
+    // achievements: unlock at target grants rewards exactly once
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/achievements",
+        k,
+        Some(json!({"id": ach, "name": "Win 3", "target": 3, "rewards": bonus})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let hidden = unique("secret");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/achievements",
+        k,
+        Some(json!({"id": hidden, "target": 1, "hidden": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, a) = call(&app, "GET", "/v1/achievements", Some(&tok), None).await;
+    let mine = a["achievements"].as_array().unwrap();
+    assert!(mine.iter().any(|x| x["achievement_id"] == ach));
+    assert!(
+        !mine.iter().any(|x| x["achievement_id"] == hidden),
+        "hidden without progress"
+    );
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/achievements/progress",
+        k,
+        Some(json!({"account_id": acc, "achievement_id": ach, "delta": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["progress"], 2);
+    assert_eq!(r["unlocked"], false);
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/achievements/progress",
+        k,
+        Some(json!({"account_id": acc, "achievement_id": ach, "delta": 5})),
+    )
+    .await;
+    assert_eq!(r["progress"], 3, "clamped to target");
+    assert_eq!(r["unlocked"], true);
+    assert_eq!(r["rewards"][0]["amount"], 50);
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/achievements/progress",
+        k,
+        Some(json!({"account_id": acc, "achievement_id": ach})),
+    )
+    .await;
+    assert_eq!(r["unlocked"], false, "already unlocked");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], 100);
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/achievements/progress",
+        k,
+        Some(json!({"account_id": acc, "achievement_id": hidden})),
+    )
+    .await;
+    assert_eq!(r["unlocked"], true);
+    let (_, a) = call(&app, "GET", "/v1/achievements", Some(&tok), None).await;
+    let mine = a["achievements"].as_array().unwrap();
+    let h = mine.iter().find(|x| x["achievement_id"] == hidden).unwrap();
+    assert_eq!(h["unlocked"], true);
+    assert!(h["unlocked_at"].is_string());
+}

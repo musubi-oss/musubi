@@ -9,7 +9,11 @@ use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod achievements;
 pub mod iap;
+pub mod mailbox;
+pub use achievements::Achievement;
+pub use mailbox::{Mail, SendMail};
 pub mod progression;
 pub use iap::{IapProduct, Receipt, ReceiptInput};
 pub mod rewards;
