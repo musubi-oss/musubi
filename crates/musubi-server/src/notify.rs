@@ -46,7 +46,7 @@ impl Notifier {
                     persistent: n.persistent,
                 },
             );
-            if live == 0 {
+            if live == 0 && !self.fanout.is_online_anywhere(user) {
                 if let Some(push) = self.push.clone().filter(|p| p.enabled()) {
                     tokio::spawn(async move {
                         if let Err(e) = push.send(user, &n.subject, &n.content, n.code).await {

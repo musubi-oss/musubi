@@ -4030,3 +4030,41 @@ async fn matchmaker_ticket_expires_with_notice() {
     );
     assert_eq!(mm.ticket_count(), 0);
 }
+
+/// A session on node 2 makes the account "online anywhere" on node 1 (so pushes are not sent to
+/// players who are connected elsewhere); disconnecting clears it.
+#[tokio::test]
+async fn presence_is_known_cluster_wide() {
+    let group = test_group();
+    let Some(state1) = build_state(true, &group).await else {
+        return;
+    };
+    let Some(state2) = build_state(false, &group).await else {
+        return;
+    };
+    let router1 = musubi_server::http::router(state1.clone());
+    let addr2 = router_addr(&state2).await;
+    let (tb, acc_b) = token(&router1).await;
+    let acc: musubi_core::AccountId = musubi_core::AccountId(acc_b.parse().unwrap());
+    assert!(!state1.fanout.is_online_anywhere(acc));
+    let mut b = connect(&addr2, &tb, "json").await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !state1.fanout.is_online_anywhere(acc) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 never learned about the session on node 2"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(state2.fanout.is_online_anywhere(acc));
+    let _ = b.close(None).await;
+    drop(b);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state1.fanout.is_online_anywhere(acc) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 still thinks the account is online"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

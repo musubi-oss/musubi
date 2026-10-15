@@ -43,6 +43,12 @@ enum Wire {
     },
     PartyCmd(PartyCmdEnv),
     SessionGone(SessionId),
+    /// Session count change of an account on a node (cluster-wide online set).
+    Online {
+        node: uuid::Uuid,
+        account: AccountId,
+        delta: i64,
+    },
     RelayedCmd(RelayedCmdEnv),
     WorldCmd(WorldCmdEnv),
 }
@@ -53,6 +59,8 @@ const TOPIC: &str = "realtime";
 pub struct Fanout {
     hub: Arc<Hub>,
     cluster: Option<Arc<Cluster>>,
+    /// Accounts with live sessions on other nodes: account → node → session count.
+    online_remote: Arc<dashmap::DashMap<AccountId, std::collections::HashMap<uuid::Uuid, i64>>>,
     mm: Arc<Matchmaker>,
     parties: Arc<PartyRegistry>,
     relayed: Arc<RelayedRegistry>,
@@ -79,10 +87,20 @@ impl Fanout {
             leader: Arc::new(AtomicBool::new(true)),
             fleets: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
+            online_remote: Arc::new(dashmap::DashMap::new()),
         };
         if let Some(c) = &f.cluster {
             let publisher = f.clone();
+            let node = c.node_id().0;
             f.hub.set_remote(Box::new(move |target, joins, leaves| {
+                let delta = joins.len() as i64 - leaves.len() as i64;
+                if delta != 0 {
+                    publisher.publish(Wire::Online {
+                        node,
+                        account: target,
+                        delta,
+                    });
+                }
                 publisher.publish(Wire::Presence {
                     target,
                     joins,
@@ -108,6 +126,12 @@ impl Fanout {
 
     pub fn account(&self, account_id: AccountId, msg: ServerMessage) {
         self.account_live(account_id, msg);
+    }
+
+    /// Online on this node or, as far as the bus has told us, on any other node.
+    pub fn is_online_anywhere(&self, account_id: AccountId) -> bool {
+        !self.hub.presences_of(account_id).is_empty()
+            || self.online_remote.contains_key(&account_id)
     }
 
     /// Like `account`, returning how many local sessions took the message (0 = not online here).
@@ -250,6 +274,23 @@ impl Fanout {
                 leaves,
             }) => {
                 self.hub.notify_followers_local(target, joins, leaves);
+            }
+            Ok(Wire::Online {
+                node,
+                account,
+                delta,
+            }) => {
+                let mut e = self.online_remote.entry(account).or_default();
+                let n = e.entry(node).or_insert(0);
+                *n += delta;
+                if *n <= 0 {
+                    e.remove(&node);
+                }
+                let empty = e.is_empty();
+                drop(e);
+                if empty {
+                    self.online_remote.remove_if(&account, |_, m| m.is_empty());
+                }
             }
             Ok(Wire::MmAdd(w)) => {
                 if let Err(e) = self.mm.add_replica(w) {
