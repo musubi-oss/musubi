@@ -18,6 +18,7 @@ musubi-fleet = { path = "crates/musubi-fleet" }
 musubi-mesh = { path = "crates/musubi-mesh" }
 musubi-sim-sdk = { path = "crates/musubi-sim-sdk" }
 musubi-integrations = { path = "crates/musubi-integrations" }
+musubi-economy = { path = "crates/musubi-economy" }
 musubi-transport = { path = "crates/musubi-transport" }
 musubi-edge = { path = "crates/musubi-edge" }
 musubi-auth = { path = "crates/musubi-auth" }

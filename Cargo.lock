@@ -1774,6 +1774,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "musubi-economy"
+version = "0.1.0"
+dependencies = [
+ "musubi-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "musubi-edge"
 version = "0.1.0"
 
@@ -1883,6 +1895,7 @@ dependencies = [
  "musubi-chat",
  "musubi-cluster",
  "musubi-core",
+ "musubi-economy",
  "musubi-fleet",
  "musubi-integrations",
  "musubi-leaderboard",

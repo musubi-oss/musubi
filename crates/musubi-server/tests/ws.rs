@@ -82,6 +82,7 @@ async fn build_state(leader: bool) -> Option<AppState> {
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
+        economy: musubi_economy::EconomyService::new(db.clone()),
         matchmaker,
         parties,
         relayed,

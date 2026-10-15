@@ -36,6 +36,7 @@ pub struct AppState {
     pub chat: ChatService,
     pub leaderboards: LeaderboardService,
     pub tournaments: TournamentService,
+    pub economy: musubi_economy::EconomyService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
@@ -64,6 +65,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let groups = GroupService::new(db.clone());
     let chat = ChatService::new(db.clone());
     let leaderboards = LeaderboardService::new(db.clone());
+    let economy = musubi_economy::EconomyService::new(db.clone());
     let tournaments = TournamentService::new(db.clone());
     let hub = Arc::new(Hub::new());
     let matchmaker = Arc::new(Matchmaker::default());
@@ -185,6 +187,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         chat,
         leaderboards,
         tournaments,
+        economy,
         matchmaker,
         parties,
         relayed,

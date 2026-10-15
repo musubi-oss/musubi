@@ -64,6 +64,7 @@ async fn app() -> Option<Router> {
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
+        economy: musubi_economy::EconomyService::new(db.clone()),
         matchmaker,
         parties,
         relayed,
@@ -1619,4 +1620,190 @@ async fn fleet_docker_provider_runs_a_container() {
         String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         "container removed on delete"
     );
+}
+
+#[tokio::test]
+async fn economy_wallet_ledger_inventory_and_store() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("eco")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let sword = unique("sword");
+    let potion = unique("potion");
+    let offer = unique("offer");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 1000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // grant with idempotency: the replay does not apply twice
+    let (st, g1) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(json!({"account_id": acc, "currency": gold, "delta": 500, "reason": "daily", "idempotency_key": "d1"}))).await;
+    assert_eq!(st, StatusCode::OK, "{g1}");
+    assert_eq!(g1["entry"]["balance_after"], 500);
+    let (_, g2) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(json!({"account_id": acc, "currency": gold, "delta": 500, "reason": "daily", "idempotency_key": "d1"}))).await;
+    assert_eq!(g2["replayed"], true);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], 500);
+    // cap and no negative balance
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": acc, "currency": gold, "delta": 600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": acc, "currency": gold, "delta": -501})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    // catalog: a unique sword and stackable potions
+    let (st, _) = call_server(&app, "POST", "/v1/server/items", k, Some(json!({"id": sword, "name": "Sword", "category": "weapon", "stackable": false, "properties": {"dmg": 10}}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": potion, "name": "Potion", "category": "consumable", "max_stack": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, s1) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": acc, "item_id": sword, "instance": {"durability": 100}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    let (_, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": acc, "item_id": potion, "quantity": 2})),
+    )
+    .await;
+    let (_, p2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": acc, "item_id": potion, "quantity": 2})),
+    )
+    .await;
+    assert_eq!(p2["quantity"], 4, "stacks merge");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": acc, "item_id": potion, "quantity": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "max_stack 5");
+    // store: buy a potion pack for 100 gold, idempotent
+    let (st, _) = call_server(&app, "POST", "/v1/server/store", k, Some(json!({"id": offer, "item_id": potion, "quantity": 1, "prices": {gold.clone(): 100}, "max_per_account": 2}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, st_list) = call(&app, "GET", "/v1/store", Some(&tok), None).await;
+    assert!(st_list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["id"] == offer));
+    let (st, b1) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": offer, "currency": gold, "idempotency_key": "buy1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b1}");
+    assert_eq!(b1["balance"], 400);
+    assert_eq!(b1["granted"]["quantity"], 5);
+    let (_, b1r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": offer, "currency": gold, "idempotency_key": "buy1"})),
+    )
+    .await;
+    assert_eq!(b1r["replayed"], true);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(
+        w["balances"][0]["balance"], 400,
+        "replay did not charge twice"
+    );
+    // consume potions down, then the per-account purchase limit and ledger
+    let pid = b1["granted"]["id"].as_str().unwrap();
+    let (st, c) = call(
+        &app,
+        "POST",
+        "/v1/inventory/consume",
+        Some(&tok),
+        Some(json!({"id": pid, "quantity": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(c["remaining"].is_null());
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": offer, "currency": gold})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": offer, "currency": gold})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "max_per_account");
+    let (_, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/wallet/ledger?currency={gold}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    let entries = l["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["delta"], -100);
+    assert_eq!(entries[0]["reason"], "store.buy");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    assert!(inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["item_id"] == sword && i["instance"]["durability"] == 100));
 }

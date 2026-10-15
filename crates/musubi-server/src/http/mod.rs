@@ -2,6 +2,7 @@ mod account;
 mod auth;
 mod chat;
 mod cluster;
+mod economy;
 mod error;
 mod extract;
 mod fleets;
@@ -49,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .merge(fleets::routes())
         .merge(worlds::routes())
         .merge(integrations::routes())
+        .merge(economy::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())
