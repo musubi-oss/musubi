@@ -20,6 +20,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
+    cfg.database.max_connections = 4;
     cfg.market.anti_snipe_secs = 0;
     tweak(&mut cfg);
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();

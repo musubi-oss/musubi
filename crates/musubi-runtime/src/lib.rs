@@ -28,7 +28,7 @@ use std::time::Duration;
 use musubi_core::{AccountId, Error, Result, SessionId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use wasmtime::{
     Caller, Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits,
     StoreLimitsBuilder, Val,
@@ -93,6 +93,33 @@ interface host {
     call: func(request: string) -> result<string, string>;
 }
 
+/// Typed host imports: thin wrappers over the same operations as `host.call`, so guests built with
+/// wit-bindgen get real signatures instead of hand-rolled JSON. `owner`/`account` default to the
+/// calling account; JSON documents travel as strings.
+interface storage {
+    read: func(collection: string, key: string, owner: option<string>) -> result<string, string>;
+    write: func(collection: string, key: string, value: string, owner: option<string>) -> result<string, string>;
+    delete: func(collection: string, key: string, owner: option<string>) -> result<_, string>;
+}
+
+interface account {
+    get: func(id: option<string>) -> result<string, string>;
+}
+
+interface wallet {
+    get: func(account: option<string>) -> result<string, string>;
+    adjust: func(currency: string, delta: s64, reason: string, idempotency-key: option<string>, account: option<string>) -> result<string, string>;
+}
+
+interface inventory {
+    get: func(account: option<string>) -> result<string, string>;
+    grant: func(item-id: string, quantity: s64, account: option<string>) -> result<string, string>;
+}
+
+interface notify {
+    send: func(account: string, subject: string, content: string, code: s32, persistent: bool) -> result<string, string>;
+}
+
 interface guest-api {
     exports: func() -> list<string>;
     call: func(name: string, ctx: string, payload: list<u8>) -> result<list<u8>, string>;
@@ -100,6 +127,11 @@ interface guest-api {
 
 world guest {
     import host;
+    import storage;
+    import account;
+    import wallet;
+    import inventory;
+    import notify;
     export guest-api;
 }
 "#;
@@ -113,6 +145,33 @@ interface host {
     call: func(request: string) -> result<string, string>;
 }
 
+/// Typed host imports: thin wrappers over the same operations as `host.call`, so guests built with
+/// wit-bindgen get real signatures instead of hand-rolled JSON. `owner`/`account` default to the
+/// calling account; JSON documents travel as strings.
+interface storage {
+    read: func(collection: string, key: string, owner: option<string>) -> result<string, string>;
+    write: func(collection: string, key: string, value: string, owner: option<string>) -> result<string, string>;
+    delete: func(collection: string, key: string, owner: option<string>) -> result<_, string>;
+}
+
+interface account {
+    get: func(id: option<string>) -> result<string, string>;
+}
+
+interface wallet {
+    get: func(account: option<string>) -> result<string, string>;
+    adjust: func(currency: string, delta: s64, reason: string, idempotency-key: option<string>, account: option<string>) -> result<string, string>;
+}
+
+interface inventory {
+    get: func(account: option<string>) -> result<string, string>;
+    grant: func(item-id: string, quantity: s64, account: option<string>) -> result<string, string>;
+}
+
+interface notify {
+    send: func(account: string, subject: string, content: string, code: s32, persistent: bool) -> result<string, string>;
+}
+
 interface guest-api {
     exports: func() -> list<string>;
     call: func(name: string, ctx: string, payload: list<u8>) -> result<list<u8>, string>;
@@ -120,11 +179,123 @@ interface guest-api {
 
 world guest {
     import host;
+    import storage;
+    import account;
+    import wallet;
+    import inventory;
+    import notify;
     export guest-api;
 }
 "#,
         world: "guest",
     });
+}
+
+impl State {
+    /// Route a typed import through the same `HostApi` as `host.call`.
+    fn op(&mut self, req: Value) -> std::result::Result<String, String> {
+        match self.host.call(&self.ctx, req) {
+            Ok(v) => Ok(v.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+fn json_or_string(s: String) -> Value {
+    serde_json::from_str(&s).unwrap_or(Value::String(s))
+}
+
+impl wit::musubi::runtime::storage::Host for State {
+    fn read(
+        &mut self,
+        collection: String,
+        key: String,
+        owner: Option<String>,
+    ) -> std::result::Result<String, String> {
+        self.op(json!({ "op": "storage.read", "collection": collection, "key": key, "owner_id": owner }))
+    }
+
+    fn write(
+        &mut self,
+        collection: String,
+        key: String,
+        value: String,
+        owner: Option<String>,
+    ) -> std::result::Result<String, String> {
+        self.op(json!({
+            "op": "storage.write", "collection": collection, "key": key,
+            "value": json_or_string(value), "owner_id": owner,
+        }))
+    }
+
+    fn delete(
+        &mut self,
+        collection: String,
+        key: String,
+        owner: Option<String>,
+    ) -> std::result::Result<(), String> {
+        self.op(json!({ "op": "storage.delete", "collection": collection, "key": key, "owner_id": owner }))
+            .map(|_| ())
+    }
+}
+
+impl wit::musubi::runtime::account::Host for State {
+    fn get(&mut self, id: Option<String>) -> std::result::Result<String, String> {
+        self.op(json!({ "op": "account.get", "account_id": id }))
+    }
+}
+
+impl wit::musubi::runtime::wallet::Host for State {
+    fn get(&mut self, account: Option<String>) -> std::result::Result<String, String> {
+        self.op(json!({ "op": "wallet.get", "account_id": account }))
+    }
+
+    fn adjust(
+        &mut self,
+        currency: String,
+        delta: i64,
+        reason: String,
+        idempotency_key: Option<String>,
+        account: Option<String>,
+    ) -> std::result::Result<String, String> {
+        self.op(json!({
+            "op": "wallet.adjust", "currency": currency, "delta": delta, "reason": reason,
+            "idempotency_key": idempotency_key, "account_id": account,
+        }))
+    }
+}
+
+impl wit::musubi::runtime::inventory::Host for State {
+    fn get(&mut self, account: Option<String>) -> std::result::Result<String, String> {
+        self.op(json!({ "op": "inventory.get", "account_id": account }))
+    }
+
+    fn grant(
+        &mut self,
+        item_id: String,
+        quantity: i64,
+        account: Option<String>,
+    ) -> std::result::Result<String, String> {
+        self.op(json!({
+            "op": "inventory.grant", "item_id": item_id, "quantity": quantity, "account_id": account,
+        }))
+    }
+}
+
+impl wit::musubi::runtime::notify::Host for State {
+    fn send(
+        &mut self,
+        account: String,
+        subject: String,
+        content: String,
+        code: i32,
+        persistent: bool,
+    ) -> std::result::Result<String, String> {
+        self.op(json!({
+            "op": "notify.send", "account_id": account, "subject": subject,
+            "content": json_or_string(content), "code": code, "persistent": persistent,
+        }))
+    }
 }
 
 impl wit::musubi::runtime::host::Host for State {
@@ -930,5 +1101,116 @@ mod component_tests {
         );
         assert!(is_component(COMPONENT.as_bytes()));
         assert!(!is_component(b"(module)"));
+    }
+
+    /// Component using the typed `storage` imports: `rpc_kv` writes the payload under c/k and
+    /// returns what `read` gives back. Two core modules because a lowered import that returns a
+    /// string needs the instance's memory/realloc, which cannot come from the importing module.
+    const TYPED_COMPONENT: &str = r#"
+(component
+  (import "musubi:runtime/storage@0.1.0" (instance $storage
+    (export "write" (func (param "collection" string) (param "key" string) (param "value" string)
+      (param "owner" (option string)) (result (result string (error string)))))
+    (export "read" (func (param "collection" string) (param "key" string)
+      (param "owner" (option string)) (result (result string (error string)))))))
+  (core module $M
+    (memory (export "memory") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (global.get $heap))
+      (global.set $heap (i32.add (global.get $heap) (local.get 3)))
+      (local.get $p)))
+  (core instance $m (instantiate $M))
+  (core func $write_l (canon lower (func $storage "write")
+    (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (core func $read_l (canon lower (func $storage "read")
+    (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (core module $N
+    (import "env" "memory" (memory 1))
+    (import "storage" "write" (func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+    (import "storage" "read" (func $read (param i32 i32 i32 i32 i32 i32 i32 i32)))
+    (data (i32.const 16) "rpc_kv")
+    (data (i32.const 32) "c")
+    (data (i32.const 40) "k")
+    (func (export "exports") (result i32)
+      (i32.store (i32.const 64) (i32.const 16)) (i32.store (i32.const 68) (i32.const 6))
+      (i32.store (i32.const 96) (i32.const 64)) (i32.store (i32.const 100) (i32.const 1))
+      (i32.const 96))
+    (func (export "call") (param i32 i32 i32 i32 i32 i32) (result i32)
+      (call $write (i32.const 32) (i32.const 1) (i32.const 40) (i32.const 1)
+        (local.get 4) (local.get 5) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 200))
+      (if (i32.ne (i32.load (i32.const 200)) (i32.const 0))
+        (then
+          (i32.store (i32.const 128) (i32.const 1))
+          (i32.store (i32.const 132) (i32.load (i32.const 204)))
+          (i32.store (i32.const 136) (i32.load (i32.const 208)))
+          (return (i32.const 128))))
+      (call $read (i32.const 32) (i32.const 1) (i32.const 40) (i32.const 1)
+        (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 240))
+      (i32.store (i32.const 128) (i32.load (i32.const 240)))
+      (i32.store (i32.const 132) (i32.load (i32.const 244)))
+      (i32.store (i32.const 136) (i32.load (i32.const 248)))
+      (i32.const 128)))
+  (core instance $n (instantiate $N
+    (with "env" (instance (export "memory" (memory $m "memory"))))
+    (with "storage" (instance (export "write" (func $write_l)) (export "read" (func $read_l))))))
+  (func $exports (result (list string))
+    (canon lift (core func $n "exports") (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (func $call (param "name" string) (param "ctx" string) (param "payload" (list u8))
+    (result (result (list u8) (error string)))
+    (canon lift (core func $n "call") (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (instance $api (export "exports" (func $exports)) (export "call" (func $call)))
+  (export "musubi:runtime/guest-api@0.1.0" (instance $api))
+)
+"#;
+
+    /// In-memory `HostApi` that records requests and serves `storage.read` from its own map.
+    #[derive(Default)]
+    struct MemHost {
+        calls: parking_lot::Mutex<Vec<Value>>,
+        kv: parking_lot::Mutex<HashMap<String, Value>>,
+    }
+
+    impl HostApi for MemHost {
+        fn call(&self, _ctx: &CallContext, request: Value) -> Result<Value> {
+            self.calls.lock().push(request.clone());
+            let k = format!("{}/{}", request["collection"], request["key"]);
+            match request["op"].as_str() {
+                Some("storage.write") => {
+                    self.kv.lock().insert(k, request["value"].clone());
+                    Ok(json!({ "version": "1" }))
+                }
+                Some("storage.read") => Ok(self.kv.lock().get(&k).cloned().unwrap_or(Value::Null)),
+                other => Err(Error::InvalidArgument(format!("unknown op {other:?}"))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn component_guest_uses_typed_storage_imports() {
+        let rt = Arc::new(Runtime::new(Limits::default()).unwrap());
+        let host = Arc::new(MemHost::default());
+        rt.set_host(host.clone());
+        let ids = rt.load_bytes("kv", TYPED_COMPONENT.as_bytes()).unwrap();
+        assert_eq!(ids, vec!["kv".to_string()]);
+        let out = rt
+            .call("kv", CallContext::default(), b"hello".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            out, b"\"hello\"",
+            "read returns the JSON of what write stored"
+        );
+        let calls = host.calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            json!({ "op": "storage.write", "collection": "c", "key": "k", "value": "hello", "owner_id": null })
+        );
+        assert_eq!(
+            calls[1],
+            json!({ "op": "storage.read", "collection": "c", "key": "k", "owner_id": null })
+        );
     }
 }

@@ -46,6 +46,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
+    cfg.database.max_connections = 4;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let hub = Arc::new(Hub::new());
