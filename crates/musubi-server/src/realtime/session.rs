@@ -514,6 +514,10 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
         ClientMessage::PartyJoin { party_id } => party_dispatch(ctx, &party_id, PartyCmd::Join),
+        ClientMessage::PartyInvite {
+            party_id,
+            account_id,
+        } => party_dispatch(ctx, &party_id, PartyCmd::Invite { who: account_id }),
         ClientMessage::PartyLeave { party_id } => party_dispatch(ctx, &party_id, PartyCmd::Leave),
         ClientMessage::PartyPromote { party_id, presence } => {
             party_dispatch(ctx, &party_id, PartyCmd::Promote { who: presence })

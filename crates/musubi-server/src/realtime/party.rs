@@ -22,6 +22,8 @@ struct Party {
     members: Vec<UserPresence>,
     requests: Vec<UserPresence>,
     tickets: Vec<String>,
+    /// Accounts a member invited; they may join a closed party without a request.
+    invited: Vec<musubi_core::AccountId>,
 }
 
 impl Party {
@@ -106,6 +108,7 @@ impl PartyRegistry {
             members: vec![me.clone()],
             requests: vec![],
             tickets: vec![],
+            invited: Vec::new(),
         };
         let snap = party.snapshot(me);
         self.by_session.insert(me.session_id, id.clone());
@@ -128,7 +131,11 @@ impl PartyRegistry {
             .parties
             .get_mut(party_id)
             .ok_or_else(|| Error::NotFound("party".into()))?;
-        if p.open {
+        let invited = p.invited.iter().position(|a| *a == me.account_id);
+        if let Some(i) = invited {
+            p.invited.swap_remove(i);
+        }
+        if p.open || invited.is_some() {
             if p.members.len() as u32 >= p.max_size {
                 return Err(Error::ResourceExhausted("party is full".into()));
             }
@@ -204,6 +211,42 @@ impl PartyRegistry {
     }
 
     /// Leader kicks a member or rejects a request.
+    /// Any member may invite; the invitee's live sessions get `PartyInvite` and a later
+    /// `party_join` into this (even closed) party is accepted without a request.
+    pub fn invite(
+        &self,
+        fanout: &Fanout,
+        me: &UserPresence,
+        party_id: &str,
+        who: musubi_core::AccountId,
+    ) -> Result<()> {
+        let mut p = self
+            .parties
+            .get_mut(party_id)
+            .ok_or_else(|| Error::NotFound("party".into()))?;
+        if p.member(me.session_id).is_none() {
+            return Err(Error::PermissionDenied("not a party member".into()));
+        }
+        if p.members.iter().any(|m| m.account_id == who) {
+            return Err(Error::Conflict("already in the party".into()));
+        }
+        if !p.invited.contains(&who) {
+            if p.invited.len() >= 64 {
+                return Err(Error::ResourceExhausted("too many pending invites".into()));
+            }
+            p.invited.push(who);
+        }
+        drop(p);
+        fanout.account_live(
+            who,
+            ServerMessage::PartyInvite {
+                party_id: party_id.into(),
+                from: me.clone(),
+            },
+        );
+        Ok(())
+    }
+
     pub fn remove(
         &self,
         fanout: &Fanout,
@@ -463,6 +506,9 @@ pub enum PartyCmd {
     MatchmakerRemove {
         ticket: String,
     },
+    Invite {
+        who: musubi_core::AccountId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +590,7 @@ pub fn exec(
             fanout.matchmake_now();
             Ok(Some(msg))
         }
+        PartyCmd::Invite { who } => parties.invite(fanout, me, party_id, who).map(|_| None),
         PartyCmd::MatchmakerRemove { ticket } => {
             parties.untrack_ticket(sid, party_id, &ticket)?;
             mm.cancel(&ticket);

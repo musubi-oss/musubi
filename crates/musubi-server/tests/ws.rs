@@ -4492,3 +4492,99 @@ async fn chat_message_reactions() {
     .await;
     assert_eq!(st, 404);
 }
+
+/// A member invites an account; the invitee's sessions get `PartyInvite` and can join a closed
+/// party without the leader's approval. Outsiders cannot invite.
+#[tokio::test]
+async fn party_invite_lets_invitee_join_closed_party() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyCreate {
+            open: false,
+            max_size: 4,
+        },
+    )
+    .await;
+    let party_id = match recv(&mut a).await.msg {
+        ServerMessage::Party { party_id, .. } => party_id,
+        m => panic!("{m:?}"),
+    };
+    let acc_b_id: musubi_core::AccountId = acc_b.parse().unwrap();
+    // an outsider cannot invite
+    send(
+        &mut c,
+        f,
+        Some("x"),
+        ClientMessage::PartyInvite {
+            party_id: party_id.clone(),
+            account_id: acc_b_id,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error { .. }
+    ));
+    // a member can
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyInvite {
+            party_id: party_id.clone(),
+            account_id: acc_b_id,
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::PartyInvite { party_id: p, from } => {
+            assert_eq!(p, party_id);
+            assert_ne!(from.account_id, acc_b_id);
+        }
+        m => panic!("{m:?}"),
+    }
+    // the invitee joins the closed party directly
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyJoin {
+            party_id: party_id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::Party { presences, .. } => assert_eq!(presences.len(), 2),
+        m => panic!("{m:?}"),
+    }
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::PartyPresenceEvent { joins, .. } if joins.len() == 1
+    ));
+    // c, never invited, only gets queued as a request (no snapshot) — the leader sees the request
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::PartyJoin {
+            party_id: party_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::PartyJoinRequest { .. }
+    ));
+}

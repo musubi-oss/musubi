@@ -171,6 +171,11 @@ pub enum ClientMessage {
         #[serde(default = "yes")]
         reliable: bool,
     },
+    /// Invite an account into my party; the invitee may then `party_join` a closed party directly.
+    PartyInvite {
+        party_id: String,
+        account_id: AccountId,
+    },
 }
 
 fn yes() -> bool {
@@ -347,6 +352,11 @@ pub enum ServerMessage {
         username: String,
         added: bool,
         count: u32,
+    },
+    /// Delivered to every session of the invited account.
+    PartyInvite {
+        party_id: String,
+        from: UserPresence,
     },
 }
 
