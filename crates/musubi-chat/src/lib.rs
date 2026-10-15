@@ -2,7 +2,7 @@
 //! layer's job; this crate owns channel identity, authorization rules and persisted history.
 
 use musubi_core::{AccountId, Error, GroupId, Result};
-use musubi_proto::realtime::{ChannelKind, ChannelMessage};
+use musubi_proto::realtime::{ChannelKind, ChannelMessage, Reaction};
 use serde::Serialize;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -135,6 +135,7 @@ fn to_msg(r: Row) -> ChannelMessage {
         create_time: r.7.unix_timestamp(),
         update_time: r.8.unix_timestamp(),
         persistent: true,
+        reactions: Vec::new(),
     }
 }
 
@@ -229,10 +230,101 @@ impl ChatService {
             create_time: now.unix_timestamp(),
             update_time: now.unix_timestamp(),
             persistent,
+            reactions: Vec::new(),
         })
     }
 
     /// Only the author may edit; code 1 marks the message as updated.
+    /// Add (`add = true`) or remove the caller's `emoji` reaction on a message of `channel`.
+    /// Returns the new total for that emoji. Idempotent.
+    pub async fn react(
+        &self,
+        channel: &Channel,
+        me: AccountId,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> Result<u32> {
+        let n = emoji.chars().count();
+        if n == 0 || n > 32 || emoji.chars().any(char::is_whitespace) {
+            return Err(Error::InvalidArgument(
+                "emoji must be 1..=32 non-blank chars".into(),
+            ));
+        }
+        let id: Uuid = message_id
+            .parse()
+            .map_err(|_| Error::InvalidArgument("bad message id".into()))?;
+        let exists: bool = sqlx::query_scalar(
+            "select exists(select 1 from musubi.chat_messages where id = $1 and channel_id = $2)",
+        )
+        .bind(id)
+        .bind(channel.id())
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        if !exists {
+            return Err(Error::NotFound(
+                "message (only persisted messages can be reacted to; room messages are not stored)"
+                    .into(),
+            ));
+        }
+        if add {
+            sqlx::query(
+                "insert into musubi.chat_reactions (message_id, account_id, emoji) values ($1, $2, $3)
+                 on conflict do nothing",
+            )
+        } else {
+            sqlx::query(
+                "delete from musubi.chat_reactions where message_id = $1 and account_id = $2 and emoji = $3",
+            )
+        }
+        .bind(id)
+        .bind(me.0)
+        .bind(emoji)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.chat_reactions where message_id = $1 and emoji = $2",
+        )
+        .bind(id)
+        .bind(emoji)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(count as u32)
+    }
+
+    /// Reactions for a page of messages, aggregated per emoji; `me` marks the viewer's own.
+    async fn reactions_for(
+        &self,
+        ids: &[Uuid],
+        viewer: Option<AccountId>,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<Reaction>>> {
+        let mut out: std::collections::HashMap<Uuid, Vec<Reaction>> = Default::default();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let rows: Vec<(Uuid, String, i64, bool)> = sqlx::query_as(
+            "select message_id, emoji, count(*), bool_or(account_id = $2)
+             from musubi.chat_reactions where message_id = any($1)
+             group by message_id, emoji order by message_id, min(created_at)",
+        )
+        .bind(ids)
+        .bind(viewer.map(|v| v.0).unwrap_or(Uuid::nil()))
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        for (mid, emoji, count, me) in rows {
+            out.entry(mid).or_default().push(Reaction {
+                emoji,
+                count: count as u32,
+                me,
+            });
+        }
+        Ok(out)
+    }
+
     pub async fn update(
         &self,
         channel: &Channel,
@@ -292,6 +384,7 @@ impl ChatService {
         limit: usize,
         forward: bool,
         cursor: Option<&str>,
+        viewer: Option<AccountId>,
     ) -> Result<History> {
         let limit = limit.clamp(1, 100) as i64;
         let c: Option<Uuid> = match cursor {
@@ -314,8 +407,23 @@ impl ChatService {
             .await
             .map_err(Error::internal)?;
         let more = rows.len() as i64 > limit;
-        let messages: Vec<ChannelMessage> =
+        let mut messages: Vec<ChannelMessage> =
             rows.into_iter().take(limit as usize).map(to_msg).collect();
+        let ids: Vec<Uuid> = messages
+            .iter()
+            .filter_map(|m| m.message_id.parse().ok())
+            .collect();
+        let mut reactions = self.reactions_for(&ids, viewer).await?;
+        for m in &mut messages {
+            if let Some(r) = m
+                .message_id
+                .parse()
+                .ok()
+                .and_then(|id| reactions.remove(&id))
+            {
+                m.reactions = r;
+            }
+        }
         let last = messages.last().map(|m| m.message_id.clone());
         let first = messages.first().map(|m| m.message_id.clone());
         Ok(History {

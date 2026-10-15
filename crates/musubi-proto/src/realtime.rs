@@ -338,6 +338,16 @@ pub enum ServerMessage {
         joins: Vec<UserPresence>,
         leaves: Vec<UserPresence>,
     },
+    /// Someone added (`added = true`) or removed a reaction; `count` is the new total for the emoji.
+    ChannelMessageReaction {
+        channel_id: String,
+        message_id: String,
+        emoji: String,
+        account_id: AccountId,
+        username: String,
+        added: bool,
+        count: u32,
+    },
 }
 
 /// Entity as seen by a client: position plus (changed) components with their versions.
@@ -435,4 +445,16 @@ pub struct ChannelMessage {
     pub create_time: i64,
     pub update_time: i64,
     pub persistent: bool,
+    /// Emoji reactions aggregated per emoji (history only; live messages start empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<Reaction>,
+}
+
+/// One emoji on a message: how many accounts reacted with it, and whether the viewer did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: u32,
+    #[serde(default)]
+    pub me: bool,
 }

@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use musubi_chat::{Channel, History, Moderation};
 use musubi_core::AccountId;
@@ -13,6 +13,14 @@ use crate::http::{ApiError, Bearer, ServerKey};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/channel/{id}/messages", get(history))
+        .route(
+            "/v1/channel/{id}/messages/{message_id}/reactions",
+            post(react),
+        )
+        .route(
+            "/v1/channel/{id}/messages/{message_id}/reactions/{emoji}",
+            delete(unreact),
+        )
         .route(
             "/v1/admin/chat/{id}/moderation",
             get(list_moderation).post(moderate),
@@ -116,7 +124,72 @@ async fn history(
     s.chat.authorize(me.account_id, &channel).await?;
     Ok(Json(
         s.chat
-            .history(&channel, q.limit, q.forward, q.cursor.as_deref())
+            .history(
+                &channel,
+                q.limit,
+                q.forward,
+                q.cursor.as_deref(),
+                Some(me.account_id),
+            )
             .await?,
     ))
+}
+
+#[derive(Deserialize)]
+struct ReactReq {
+    emoji: String,
+}
+
+async fn react(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((id, message_id)): Path<(String, String)>,
+    Json(b): Json<ReactReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    toggle_reaction(&s, me.account_id, &id, &message_id, &b.emoji, true).await
+}
+
+async fn unreact(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((id, message_id, emoji)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    toggle_reaction(&s, me.account_id, &id, &message_id, &emoji, false).await
+}
+
+async fn toggle_reaction(
+    s: &AppState,
+    account_id: musubi_core::AccountId,
+    id: &str,
+    message_id: &str,
+    emoji: &str,
+    add: bool,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let channel = Channel::parse(id)?;
+    s.chat.authorize(account_id, &channel).await?;
+    let count = s
+        .chat
+        .react(&channel, account_id, message_id, emoji, add)
+        .await?;
+    let username = s
+        .accounts
+        .get_users(&[account_id], &[])
+        .await?
+        .into_iter()
+        .next()
+        .map(|u| u.username)
+        .unwrap_or_default();
+    s.fanout.channel(
+        id,
+        musubi_proto::realtime::ServerMessage::ChannelMessageReaction {
+            channel_id: id.to_string(),
+            message_id: message_id.to_string(),
+            emoji: emoji.to_string(),
+            account_id,
+            username,
+            added: add,
+            count,
+        },
+    );
+    Ok(Json(json!({ "emoji": emoji, "count": count, "me": add })))
 }

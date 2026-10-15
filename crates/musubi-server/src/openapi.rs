@@ -96,6 +96,16 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/auth/email/reset", "auth"),
     ("POST", "/v1/auth/refresh", "auth"),
     ("GET", "/v1/channel/{id}/messages", "chat"),
+    (
+        "POST",
+        "/v1/channel/{id}/messages/{message_id}/reactions",
+        "chat",
+    ),
+    (
+        "DELETE",
+        "/v1/channel/{id}/messages/{message_id}/reactions/{emoji}",
+        "chat",
+    ),
     ("GET", "/v1/energy", "economy"),
     ("POST", "/v1/energy/{id}/spend", "economy"),
     ("DELETE", "/v1/friends", "friends"),

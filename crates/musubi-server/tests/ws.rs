@@ -4314,3 +4314,181 @@ async fn resume_rebuilds_session_on_another_node() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// Reactions: HTTP add/remove on a message, live `ChannelMessageReaction` to channel members,
+/// aggregated `reactions` (with `me`) in history.
+#[tokio::test]
+async fn chat_message_reactions() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    // reactions live on persisted messages, so use a direct channel (room messages are not stored)
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelJoin {
+            target: acc_b.clone(),
+            kind: ChannelKind::Direct,
+            persistence: true,
+            hidden: false,
+        },
+    )
+    .await;
+    let room = match recv(&mut a).await.msg {
+        ServerMessage::Channel { id, .. } => id,
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::ChannelJoin {
+            target: acc_a.clone(),
+            kind: ChannelKind::Direct,
+            persistence: true,
+            hidden: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Channel { .. }
+    ));
+    // a may or may not get a presence event for b: drain it if it comes
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(400), a.next()).await;
+    send(
+        &mut a,
+        f,
+        Some("m1"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room.clone(),
+            content: serde_json::json!({"text": "react to me"}),
+        },
+    )
+    .await;
+    let mut mid = None;
+    for _ in 0..2 {
+        if let ServerMessage::ChannelMessageAck { message_id, .. } = recv(&mut a).await.msg {
+            mid = Some(message_id);
+        }
+    }
+    let mid = mid.unwrap();
+    recv(&mut b).await; // the message itself
+
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/channel/{room}/messages/{mid}/reactions"),
+        Some(&tb),
+        false,
+        Some(serde_json::json!({"emoji": "🔥"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["count"], 1);
+    // both members see the live event
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::ChannelMessageReaction {
+                message_id,
+                emoji,
+                account_id,
+                added,
+                count,
+                ..
+            } => {
+                assert_eq!(message_id, mid);
+                assert_eq!(emoji, "🔥");
+                assert_eq!(account_id.to_string(), acc_b);
+                assert!(added);
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected reaction event, got {other:?}"),
+        }
+    }
+    // idempotent re-add, then a's own reaction makes two
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/channel/{room}/messages/{mid}/reactions"),
+        Some(&tb),
+        false,
+        Some(serde_json::json!({"emoji": "🔥"})),
+    )
+    .await;
+    assert_eq!(r["count"], 1, "{r}");
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/channel/{room}/messages/{mid}/reactions"),
+        Some(&ta),
+        false,
+        Some(serde_json::json!({"emoji": "🔥"})),
+    )
+    .await;
+    assert_eq!(r["count"], 2, "{r}");
+    // history aggregates per emoji and marks the viewer's own
+    let (st, h) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/channel/{room}/messages"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{h}");
+    let m = h["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["message_id"] == mid.as_str())
+        .unwrap();
+    assert_eq!(
+        m["reactions"],
+        serde_json::json!([{"emoji": "🔥", "count": 2, "me": true}]),
+        "{h}"
+    );
+    // remove
+    let (st, r) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/channel/{room}/messages/{mid}/reactions/%F0%9F%94%A5"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["count"], 1);
+    // bad inputs
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/channel/{room}/messages/{mid}/reactions"),
+        Some(&ta),
+        false,
+        Some(serde_json::json!({"emoji": ""})),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!(
+            "/v1/channel/{room}/messages/{}/reactions",
+            uuid::Uuid::nil()
+        ),
+        Some(&ta),
+        false,
+        Some(serde_json::json!({"emoji": "x"})),
+    )
+    .await;
+    assert_eq!(st, 404);
+}
