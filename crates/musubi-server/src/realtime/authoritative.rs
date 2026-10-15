@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use musubi_actor::{MatchHandle, MatchHandler, MatchInfo, Snapshot, Spawn};
+use musubi_actor::{
+    JournalChunk, JournalEntry, MatchHandle, MatchHandler, MatchInfo, Snapshot, Spawn,
+};
 use musubi_core::MatchId;
 use musubi_core::{Error, Result};
 use musubi_proto::{ServerMessage, UserPresence};
@@ -27,6 +29,8 @@ pub struct MatchRegistry {
     events: std::sync::OnceLock<Arc<crate::events::Events>>,
     /// Periodic snapshot interval in ticks (membership changes and end always snapshot).
     pub snapshot_every: u64,
+    /// Journal flush interval in ticks (0 = off); bounds what a failover loses.
+    pub journal_every: u64,
 }
 
 impl Default for MatchRegistry {
@@ -46,6 +50,7 @@ impl MatchRegistry {
             group: "default".into(),
             events: std::sync::OnceLock::new(),
             snapshot_every: 50,
+            journal_every: 5,
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
         r
@@ -77,6 +82,7 @@ impl MatchRegistry {
             let db = db.clone();
             let group = group.clone();
             let events = events.clone();
+            let tick_for_journal = snap.as_ref().map(|s| s.tick);
             if snap.is_none() {
                 if let Some(ev) = events {
                     tokio::spawn(async move {
@@ -103,6 +109,21 @@ impl MatchRegistry {
                     .execute(&db)
                     .await,
                     None => sqlx::query("delete from musubi.match_snapshots where match_id = $1").bind(id.0).execute(&db).await,
+                };
+                let _ = match tick_for_journal {
+                    Some(t) => sqlx::query(
+                        "delete from musubi.match_journal where match_id = $1 and tick_to <= $2",
+                    )
+                    .bind(id.0)
+                    .bind(t as i64)
+                    .execute(&db)
+                    .await,
+                    None => {
+                        sqlx::query("delete from musubi.match_journal where match_id = $1")
+                            .bind(id.0)
+                            .execute(&db)
+                            .await
+                    }
                 };
                 if let Err(e) = res {
                     tracing::warn!(match_id = %id, error = %e, "match snapshot write failed");
@@ -139,6 +160,8 @@ impl MatchRegistry {
                 }),
                 on_snapshot: self.on_snapshot(),
                 snapshot_every: self.snapshot_every,
+                on_journal: self.on_journal(),
+                journal_every: self.journal_every,
             },
         )?;
         self.matches.insert(handle.id.to_string(), handle.clone());
@@ -164,12 +187,30 @@ impl MatchRegistry {
         .map_err(Error::internal)?;
         let mut out = Vec::new();
         for (id, module, label, params, state, tick) in rows {
+            let journal: Vec<(serde_json::Value,)> = sqlx::query_as(
+                "select entries from musubi.match_journal where match_id = $1 and tick_to > $2 order by tick_from",
+            )
+            .bind(id)
+            .bind(tick)
+            .fetch_all(db)
+            .await
+            .map_err(Error::internal)?;
+            let mut replay: Vec<JournalEntry> = Vec::new();
+            for (v,) in journal {
+                match serde_json::from_value::<Vec<JournalEntry>>(v) {
+                    Ok(mut e) => replay.append(&mut e),
+                    Err(e) => {
+                        tracing::warn!(match_id = %id, error = %e, "bad journal chunk skipped")
+                    }
+                }
+            }
             let snap = Snapshot {
                 module: module.clone(),
                 label,
                 params: params.clone(),
                 state,
                 tick: tick as u64,
+                replay,
             };
             match self.launch(hub.clone(), &module, params, Some(MatchId(id)), Some(snap)) {
                 Ok(h) => out.push(h.id.to_string()),
@@ -177,6 +218,38 @@ impl MatchRegistry {
             }
         }
         Ok(out)
+    }
+
+    fn on_journal(&self) -> Option<musubi_actor::OnJournal> {
+        let db = self.db.clone()?;
+        if self.journal_every == 0 {
+            return None;
+        }
+        Some(Arc::new(move |id: MatchId, chunk: JournalChunk| {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let entries = match serde_json::to_value(&chunk.entries) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(match_id = %id, error = %e, "journal encode failed");
+                        return;
+                    }
+                };
+                let r = sqlx::query(
+                    "insert into musubi.match_journal (match_id, tick_from, tick_to, entries) values ($1, $2, $3, $4)
+                     on conflict (match_id, tick_from) do update set tick_to = excluded.tick_to, entries = excluded.entries",
+                )
+                .bind(id.0)
+                .bind(chunk.tick_from as i64)
+                .bind(chunk.tick_to as i64)
+                .bind(entries)
+                .execute(&db)
+                .await;
+                if let Err(e) = r {
+                    tracing::warn!(match_id = %id, error = %e, "match journal write failed");
+                }
+            });
+        }))
     }
 
     /// Drain: disown our matches in the snapshot store so the failover leader resumes them

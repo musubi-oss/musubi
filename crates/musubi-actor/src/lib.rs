@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 /// A client message routed to the match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Input {
     pub presence: UserPresence,
     pub op_code: i64,
@@ -87,9 +87,110 @@ pub struct Snapshot {
     pub params: serde_json::Value,
     pub state: Vec<u8>,
     pub tick: u64,
+    /// Journal entries after `tick` (see `replay`); empty when none were persisted.
+    pub replay: Vec<JournalEntry>,
 }
 
 pub type OnSnapshot = Arc<dyn Fn(MatchId, Option<Snapshot>) + Send + Sync>;
+
+/// One journaled step. Membership commands carry the tick they were processed at; `Tick` carries
+/// the tick it produced. Replaying every entry with `tick > snapshot.tick` on top of the snapshot
+/// reproduces the state, provided the handler is deterministic (no clocks/randomness outside state).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalEntry {
+    pub tick: u64,
+    pub op: Op,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Op {
+    Join {
+        presence: UserPresence,
+        metadata: HashMap<String, String>,
+    },
+    Leave {
+        session: SessionId,
+    },
+    Tick {
+        inputs: Vec<Input>,
+    },
+}
+
+/// Entries flushed together (every `journal_every` ticks).
+#[derive(Debug, Clone)]
+pub struct JournalChunk {
+    pub tick_from: u64,
+    pub tick_to: u64,
+    pub entries: Vec<JournalEntry>,
+}
+
+pub type OnJournal = Arc<dyn Fn(MatchId, JournalChunk) + Send + Sync>;
+
+/// Replay journal entries newer than the snapshot on top of its state. Deliveries are dropped;
+/// the members list is rebuilt only to drive the handler and discarded (clients rejoin).
+pub fn replay(
+    handler: &dyn MatchHandler,
+    mut state: Vec<u8>,
+    mut label: String,
+    from_tick: u64,
+    entries: &[JournalEntry],
+) -> (Vec<u8>, String, u64) {
+    let mut members: Vec<UserPresence> = Vec::new();
+    let mut tick = from_tick;
+    for e in entries.iter().filter(|e| e.tick > from_tick) {
+        match &e.op {
+            Op::Join { presence, metadata } => {
+                if members.iter().any(|p| p.session_id == presence.session_id) {
+                    continue;
+                }
+                match handler.join_attempt(std::mem::take(&mut state), presence, metadata, &members)
+                {
+                    Ok((s, Ok(()))) => {
+                        state = s;
+                        if let Ok(s) = handler.join(
+                            std::mem::take(&mut state),
+                            std::slice::from_ref(presence),
+                            &members,
+                        ) {
+                            state = s;
+                        }
+                        members.push(presence.clone());
+                    }
+                    Ok((s, Err(_))) => state = s,
+                    Err(_) => {}
+                }
+            }
+            Op::Leave { session } => {
+                if let Some(i) = members.iter().position(|p| p.session_id == *session) {
+                    let gone = members.remove(i);
+                    if let Ok(s) = handler.leave(
+                        std::mem::take(&mut state),
+                        std::slice::from_ref(&gone),
+                        &members,
+                    ) {
+                        state = s;
+                    }
+                }
+            }
+            Op::Tick { inputs } => {
+                tick = e.tick;
+                match handler.tick(std::mem::take(&mut state), tick, inputs.clone(), &members) {
+                    Ok(r) => {
+                        state = r.state;
+                        if let Some(l) = r.label {
+                            label = l;
+                        }
+                        if r.terminate {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    (state, label, tick)
+}
 
 /// How a match starts: fresh from `init`, or resumed from a snapshot taken elsewhere.
 pub struct Spawn {
@@ -102,6 +203,9 @@ pub struct Spawn {
     pub on_snapshot: Option<OnSnapshot>,
     /// Snapshot every N ticks (0 = only on membership changes and end).
     pub snapshot_every: u64,
+    pub on_journal: Option<OnJournal>,
+    /// Flush journal entries every N ticks (0 = no journal).
+    pub journal_every: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,18 +302,32 @@ pub fn spawn(
             on_end,
             on_snapshot: None,
             snapshot_every: 0,
+            on_journal: None,
+            journal_every: 0,
         },
     )
 }
 
 pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHandle> {
+    let mut start_tick = sp.resume.as_ref().map(|r| r.tick).unwrap_or(0);
     let init = match &sp.resume {
         Some(snap) => {
             let fresh = handler.init(&sp.params)?;
+            let (state, label, tick) = replay(
+                handler.as_ref(),
+                snap.state.clone(),
+                snap.label.clone(),
+                snap.tick,
+                &snap.replay,
+            );
+            if tick > snap.tick {
+                tracing::info!(from = snap.tick, to = tick, "match journal replayed");
+            }
+            start_tick = tick;
             Init {
-                state: snap.state.clone(),
+                state,
                 tick_rate: fresh.tick_rate,
-                label: snap.label.clone(),
+                label,
             }
         }
         None => handler.init(&sp.params)?,
@@ -221,7 +339,6 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
         return Err(Error::InvalidArgument("label ≤ 2 KB".into()));
     }
     let id = sp.id.unwrap_or_default();
-    let start_tick = sp.resume.as_ref().map(|r| r.tick).unwrap_or(0);
     let info = Arc::new(RwLock::new(MatchInfo {
         match_id: id.to_string(),
         module: sp.module.clone(),
@@ -251,6 +368,8 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
             on_snapshot: sp.on_snapshot,
             every: sp.snapshot_every,
             start_tick,
+            on_journal: sp.on_journal,
+            journal_every: sp.journal_every,
         },
     ));
     Ok(handle)
@@ -262,6 +381,8 @@ struct Persist {
     on_snapshot: Option<OnSnapshot>,
     every: u64,
     start_tick: u64,
+    on_journal: Option<OnJournal>,
+    journal_every: u64,
 }
 
 impl Persist {
@@ -275,6 +396,7 @@ impl Persist {
                     params: self.params.clone(),
                     state: state.to_vec(),
                     tick,
+                    replay: vec![],
                 }),
             );
         }
@@ -307,6 +429,8 @@ async fn run(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let sessions = |m: &[UserPresence]| m.iter().map(|p| p.session_id).collect::<Vec<_>>();
     let mut grace: Option<u32> = None;
+    let journaling = persist.on_journal.is_some() && persist.journal_every > 0;
+    let mut journal: Vec<JournalEntry> = Vec::new();
     loop {
         tokio::select! {
             cmd = rx.recv() => {
@@ -327,6 +451,9 @@ async fn run(
                                             Err(e) => { tracing::error!(%match_id, error = %e, "join handler failed"); }
                                         }
                                         let others = sessions(&members);
+                                        if journaling {
+                                            journal.push(JournalEntry { tick, op: Op::Join { presence: presence.clone(), metadata: metadata.clone() } });
+                                        }
                                         members.push(presence.clone());
                                         deliver(others, ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![presence.clone()], leaves: vec![] });
                                         let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
@@ -340,6 +467,9 @@ async fn run(
                     Cmd::Leave { session } => {
                         if let Some(idx) = members.iter().position(|p| p.session_id == session) {
                             let gone = members.remove(idx);
+                            if journaling {
+                                journal.push(JournalEntry { tick, op: Op::Leave { session } });
+                            }
                             match handler.leave(std::mem::take(&mut state), std::slice::from_ref(&gone), &members) {
                                 Ok(s) => state = s,
                                 Err(e) => tracing::error!(%match_id, error = %e, "leave handler failed"),
@@ -363,6 +493,19 @@ async fn run(
             _ = interval.tick() => {
                 tick += 1;
                 let batch = std::mem::take(&mut inputs);
+                if journaling {
+                    journal.push(JournalEntry { tick, op: Op::Tick { inputs: batch.clone() } });
+                    if tick % persist.journal_every == 0 {
+                        if let Some(cb) = &persist.on_journal {
+                            let entries = std::mem::take(&mut journal);
+                            cb(id, JournalChunk {
+                                tick_from: entries.first().map(|e| e.tick).unwrap_or(tick),
+                                tick_to: tick,
+                                entries,
+                            });
+                        }
+                    }
+                }
                 let res = match handler.tick(std::mem::take(&mut state), tick, batch, &members) {
                     Ok(r) => r,
                     Err(e) => { tracing::error!(%match_id, error = %e, "tick handler failed; terminating"); break; }

@@ -4543,3 +4543,122 @@ async fn social_and_leaderboard_events_reach_the_outbox() {
         .unwrap_or(Value::Null);
     assert_eq!(lb_ev["payload"]["record"]["score"], 42, "{lb_ev}");
 }
+
+/// Deterministic test match: state = counter, +1 per tick and +1 per input; label mirrors it.
+struct Counter;
+
+impl musubi_actor::MatchHandler for Counter {
+    fn init(&self, _params: &Value) -> musubi_core::Result<musubi_actor::Init> {
+        Ok(musubi_actor::Init {
+            state: 0u64.to_le_bytes().to_vec(),
+            tick_rate: 30,
+            label: "0".into(),
+        })
+    }
+    fn join_attempt(
+        &self,
+        state: Vec<u8>,
+        _presence: &musubi_proto::UserPresence,
+        _metadata: &std::collections::HashMap<String, String>,
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<(Vec<u8>, musubi_core::Result<()>)> {
+        Ok((state, Ok(())))
+    }
+    fn join(
+        &self,
+        state: Vec<u8>,
+        _joined: &[musubi_proto::UserPresence],
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<Vec<u8>> {
+        Ok(state)
+    }
+    fn leave(
+        &self,
+        state: Vec<u8>,
+        _left: &[musubi_proto::UserPresence],
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<Vec<u8>> {
+        Ok(state)
+    }
+    fn tick(
+        &self,
+        state: Vec<u8>,
+        _tick: u64,
+        inputs: Vec<musubi_actor::Input>,
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<musubi_actor::TickResult> {
+        let n = u64::from_le_bytes(state.try_into().unwrap_or([0; 8])) + 1 + inputs.len() as u64;
+        Ok(musubi_actor::TickResult {
+            state: n.to_le_bytes().to_vec(),
+            outbound: vec![],
+            label: Some(n.to_string()),
+            terminate: false,
+        })
+    }
+    fn terminate(&self, state: Vec<u8>, _grace_seconds: u32) -> musubi_core::Result<Vec<u8>> {
+        Ok(state)
+    }
+}
+
+/// Failover replays the journal on top of the last snapshot: the resumed match is at (about) the
+/// tick the dead node reached, not at the snapshot taken when the player joined.
+#[tokio::test]
+async fn match_failover_replays_the_journal() {
+    let Ok(url) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let mut cfg = Config::default();
+    cfg.database.url = url;
+    cfg.database.max_connections = 2;
+    let db = musubi_server::db::connect(&cfg.database).await.unwrap();
+    migrate_once(&db).await;
+    let node_a = uuid::Uuid::now_v7();
+    let hub = Arc::new(musubi_server::realtime::Hub::new());
+    let mut a = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), node_a);
+    a.snapshot_every = 100_000;
+    a.journal_every = 3;
+    a.register("counter", Arc::new(Counter));
+    let h = a.create(hub.clone(), "counter", json!({})).unwrap();
+    let me: musubi_proto::UserPresence = serde_json::from_value(json!({
+        "account_id": uuid::Uuid::now_v7(), "session_id": uuid::Uuid::now_v7(), "username": "p1", "status": null
+    }))
+    .unwrap();
+    a.join(&me, &h.id.to_string(), Default::default())
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        h.data(musubi_actor::Input {
+            presence: me.clone(),
+            op_code: 1,
+            data: vec![1],
+            reliable: true,
+        })
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let before: u64 = h.info().await.label.parse().unwrap();
+    assert!(before >= 15, "{before}");
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from musubi.match_journal where match_id = $1")
+            .bind(h.id.0)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(rows >= 2, "journal chunks: {rows}");
+
+    let mut b = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
+    b.snapshot_every = 100_000;
+    b.register("counter", Arc::new(Counter));
+    let resumed = b.recover(hub.clone(), &[node_a]).await.unwrap();
+    assert_eq!(resumed, vec![h.id.to_string()]);
+    let hb = b.get(&h.id.to_string()).unwrap();
+    let after: u64 = hb.info().await.label.parse().unwrap();
+    // snapshot was taken at the join (counter ≈ 0); the journal brings it back to within one
+    // flush interval of where node A was, inputs included
+    assert!(
+        after + 4 >= before,
+        "resumed at {after}, node A was at {before}"
+    );
+    assert!(after >= 10, "{after}");
+}
