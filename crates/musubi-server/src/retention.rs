@@ -58,6 +58,7 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
         cfg.chat_days,
     )
     .await?;
+    let idempotency = purge(db, "musubi.idempotency", &age("created_at"), 1).await?;
     let sessions = purge(
         db,
         "musubi.sessions",
@@ -84,7 +85,7 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     .rows_affected();
     Ok(json!({
         "events": events, "webhook_deliveries": deliveries, "audit_log": audit,
-        "notifications": notifications, "chat_messages": chat, "sessions": sessions,
+        "notifications": notifications, "chat_messages": chat, "sessions": sessions, "idempotency": idempotency,
         "match_journal": match_journal, "world_journal": world_journal,
     }))
 }

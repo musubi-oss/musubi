@@ -5427,3 +5427,75 @@ async fn trace_id_is_returned_on_errors() {
     assert_eq!(st, StatusCode::UNAUTHORIZED);
     assert!(v.get("trace_id").is_none(), "{v}");
 }
+
+/// Same request + same Idempotency-Key → the stored response (same storage version), not a second
+/// write; another key or another caller executes afresh.
+#[tokio::test]
+async fn idempotency_key_replays_mutations() {
+    let Some(app) = app().await else {
+        return;
+    };
+    async fn call_h(app: &Router, tok: &str, key: &str, body: Value) -> (StatusCode, bool, Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/storage/write")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", key)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let replayed = res.headers().get("idempotent-replayed").is_some();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            replayed,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("idem-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let col = unique("idem");
+    let body = json!({"objects": [{"collection": col, "key": "k", "value": {"n": 1}}]});
+    let key = unique("key");
+    let (st, replayed, first) = call_h(&app, &tok, &key, body.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{first}");
+    assert!(!replayed);
+    let (st, replayed, second) = call_h(&app, &tok, &key, body.clone()).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(replayed, "second call must be served from the store");
+    assert_eq!(first, second, "identical response incl. storage version");
+    let body2 = json!({"objects": [{"collection": col, "key": "k", "value": {"n": 2}}]});
+    let (st, replayed, third) = call_h(&app, &tok, &unique("key"), body2).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!replayed);
+    assert_ne!(
+        first["acks"][0]["version"], third["acks"][0]["version"],
+        "a new key performs a new write"
+    );
+    // another caller with the same key is independent
+    let (_, sess2) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("idem-")})),
+    )
+    .await;
+    let tok2 = sess2["access_token"].as_str().unwrap().to_string();
+    let (st, replayed, _) = call_h(&app, &tok2, &key, body).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!replayed);
+    // errors are stored too (a 4xx replays), server errors are not
+    let (st, _, _) = call_h(&app, &tok, &unique("bad"), json!({"objects": "nope"})).await;
+    assert!(st.is_client_error(), "{st}");
+}
