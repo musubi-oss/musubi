@@ -29,6 +29,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/admin/cluster/matches", get(cluster_matches))
         .route("/v1/admin/cluster/worlds", get(cluster_worlds))
+        .route(
+            "/v1/admin/worlds/{w}/cells/{x}/{y}/host",
+            post(world_cell_host),
+        )
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/retention/run", post(retention_run))
         .route("/v1/admin/runtime/schedules", get(schedules_status))
@@ -590,4 +594,33 @@ async fn schedules_run(
 ) -> Result<Json<Value>, ApiError> {
     let out = s.schedules.run_one(&s.runtime, &name, None).await?;
     Ok(Json(json!({ "name": name, "output": out })))
+}
+
+#[derive(Deserialize)]
+struct CellHostReq {
+    node_id: Uuid,
+}
+
+/// Assign a cell of a world to a node: the cell's entities and simulators move there, the rest of
+/// the world stays where it is. The directory and the bus carry the assignment to every node.
+async fn world_cell_host(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path((w, x, y)): Path<(String, i32, i32)>,
+    Json(r): Json<CellHostReq>,
+) -> Result<Json<Value>, ApiError> {
+    let cell = musubi_mesh::CellId { x, y };
+    if s.worlds.home_of(&w).await?.is_none() {
+        return Err(Error::NotFound(format!("world {w}")).into());
+    }
+    s.worlds.publish_cell_host(&w, cell, Some(r.node_id)).await;
+    s.fanout.cell_assign(&w, cell, r.node_id);
+    let hosted = if r.node_id == s.worlds.node_id() {
+        s.worlds.host_cell(&w, cell).await?
+    } else {
+        vec![]
+    };
+    Ok(Json(
+        json!({ "world": w, "cell": cell, "node_id": r.node_id, "hosted_here": hosted }),
+    ))
 }

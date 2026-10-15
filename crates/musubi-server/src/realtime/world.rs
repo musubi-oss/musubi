@@ -117,6 +117,8 @@ pub struct WorldRegistry {
     cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
     /// Outbox for `world.rehomed`.
     events: std::sync::OnceLock<Arc<crate::events::Events>>,
+    /// (world, cell) → host node, cached from the directory.
+    cell_hosts: DashMap<(String, CellId), Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +186,7 @@ impl WorldRegistry {
             db,
             worlds: DashMap::new(),
             homes: DashMap::new(),
+            cell_hosts: DashMap::new(),
             cluster: std::sync::OnceLock::new(),
             events: std::sync::OnceLock::new(),
         }
@@ -204,6 +207,103 @@ impl WorldRegistry {
 
     fn directory_key(name: &str) -> String {
         format!("world:{name}")
+    }
+
+    /// Directory key of one cell's host node: cells of a world may live on different nodes.
+    fn cell_key(name: &str, cell: CellId) -> String {
+        format!("world:{name}:cell:{},{}", cell.x, cell.y)
+    }
+
+    /// Record (or clear) which node hosts `cell` of `name`.
+    pub async fn publish_cell_host(&self, name: &str, cell: CellId, host: Option<Uuid>) {
+        match host {
+            Some(h) => {
+                self.cell_hosts.insert((name.to_string(), cell), h);
+            }
+            None => {
+                self.cell_hosts.remove(&(name.to_string(), cell));
+            }
+        }
+        let Some(c) = self.cluster.get() else { return };
+        if c.raft_id() == 0 {
+            return;
+        }
+        let key = Self::cell_key(name, cell);
+        let op = match host {
+            Some(h) => musubi_cluster::DirectoryOp::Set {
+                key,
+                value: serde_json::json!({ "node_id": h }),
+            },
+            None => musubi_cluster::DirectoryOp::Delete { key },
+        };
+        if let Err(e) = c.directory_write(op).await {
+            tracing::warn!(world = name, ?cell, error = %e, "cell directory write failed");
+        }
+    }
+
+    /// Cell containing `pos` under this world's grid (needs a local copy of the world).
+    pub fn cell_of(&self, name: &str, pos: Pos) -> Result<CellId> {
+        let w = self.get(name)?;
+        let st = w.lock();
+        Ok(st.world.cell_of(pos))
+    }
+
+    /// Remember another node's cell assignment (no directory write; the coordinator did that).
+    pub fn note_cell_host(&self, name: &str, cell: CellId, node: Uuid) {
+        self.cell_hosts.insert((name.to_string(), cell), node);
+    }
+
+    /// This node takes `cell` of `name`: make sure a local shard of the world exists (config from
+    /// `musubi.worlds`, defaults without a database); simulators lease the cell here as usual.
+    pub async fn host_cell(&self, name: &str, cell: CellId) -> Result<Vec<CellId>> {
+        if !self.worlds.contains_key(name) {
+            let (cfg, ctl) = match &self.db {
+                Some(db) => {
+                    let row: Option<(Value, Value)> = sqlx::query_as(
+                        "select config, controller from musubi.worlds where name = $1 and cluster_group = $2",
+                    )
+                    .bind(name)
+                    .bind(&self.group)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(Error::internal)?;
+                    let (c, k) = row.ok_or_else(|| Error::NotFound(format!("world {name}")))?;
+                    (
+                        serde_json::from_value(c).map_err(Error::internal)?,
+                        serde_json::from_value(k).map_err(Error::internal)?,
+                    )
+                }
+                None => (WorldConfig::default(), ControllerConfig::default()),
+            };
+            self.worlds.entry(name.to_string()).or_insert_with(|| {
+                Arc::new(Mutex::new(WorldState {
+                    world: World::new(cfg),
+                    controller: Controller::new(ctl),
+                    subs: HashMap::new(),
+                    sim_events: HashMap::new(),
+                    journal: Vec::new(),
+                }))
+            });
+        }
+        self.cell_hosts
+            .insert((name.to_string(), cell), self.node_id);
+        Ok(vec![cell])
+    }
+
+    /// Node hosting `cell`: an explicit assignment wins, otherwise the world's home node.
+    pub async fn cell_host_of(&self, name: &str, cell: CellId) -> Result<Option<Uuid>> {
+        if let Some(h) = self.cell_hosts.get(&(name.to_string(), cell)) {
+            return Ok(Some(*h));
+        }
+        if let Some(c) = self.cluster.get() {
+            if let Some(v) = c.directory_get(&Self::cell_key(name, cell)).await {
+                if let Some(h) = v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()) {
+                    self.cell_hosts.insert((name.to_string(), cell), h);
+                    return Ok(Some(h));
+                }
+            }
+        }
+        self.home_of(name).await
     }
 
     /// Publish the world's home to the replicated directory (best effort; Postgres stays truth).

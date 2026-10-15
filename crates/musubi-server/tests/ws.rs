@@ -4592,3 +4592,133 @@ async fn party_invite_lets_invitee_join_closed_party() {
         ServerMessage::PartyJoinRequest { .. }
     ));
 }
+
+/// One cell of a world is assigned to another node: spawns into that cell are redirected to and
+/// served by the cell host, the rest of the world stays on the home node.
+#[tokio::test]
+async fn world_cell_hosted_on_another_node() {
+    let group = format!("xcell-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": name, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let sim = uuid::Uuid::now_v7();
+    let spawn = serde_json::json!({"sim": sim, "x": 150.0, "y": 10.0, "components": {}, "persistent": false});
+    let (st, _) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(spawn.clone()),
+    )
+    .await;
+    assert!(st == 307 || st == 409, "home node redirects spawns into a cell hosted elsewhere (307, or 409 without an advertised address): {st}");
+    let (st, l) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert!(st == 200 || st == 409, "{l}");
+    let (st, e) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(spawn),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let (st, view) = http_json(
+        &router2,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/1/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{view}");
+    assert_eq!(view["owned"].as_array().map(|a| a.len()), Some(1), "{view}");
+    let (st, _) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/1/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        st == 307 || st == 409,
+        "home node redirects views of the hosted cell: {st}"
+    );
+    let (st, _) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/0/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "other cells stay on the home node");
+}

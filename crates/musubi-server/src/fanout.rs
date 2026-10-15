@@ -53,6 +53,12 @@ enum Wire {
     },
     RelayedCmd(RelayedCmdEnv),
     WorldCmd(WorldCmdEnv),
+    /// Coordinator → cluster: `node` now hosts `cell` of `world` (cells of one world may spread).
+    WorldCellAssign {
+        world: String,
+        cell: musubi_mesh::CellId,
+        node: uuid::Uuid,
+    },
 }
 
 const TOPIC: &str = "realtime";
@@ -258,6 +264,15 @@ impl Fanout {
         self.publish(Wire::WorldCmd(env));
     }
 
+    /// Announce that `node` hosts `cell` of `world`.
+    pub fn cell_assign(&self, world: &str, cell: musubi_mesh::CellId, node: uuid::Uuid) {
+        self.publish(Wire::WorldCellAssign {
+            world: world.to_string(),
+            cell,
+            node,
+        });
+    }
+
     fn mm_matched(&self, m: &Matched, match_id: &str, server: Option<MatchmakerServer>) {
         self.publish(Wire::MmMatched(m.to_wire(match_id, server)));
     }
@@ -405,6 +420,19 @@ impl Fanout {
                 self.relayed.leave_all(self, sid);
                 if let Some(w) = self.worlds.get() {
                     w.unsubscribe_all(sid);
+                }
+            }
+            Ok(Wire::WorldCellAssign { world, cell, node }) => {
+                if let Some(w) = self.worlds.get().cloned() {
+                    if node == w.node_id() {
+                        tokio::spawn(async move {
+                            if let Err(e) = w.host_cell(&world, cell).await {
+                                tracing::warn!(world = %world, ?cell, error = %e, "cell hosting failed");
+                            }
+                        });
+                    } else {
+                        w.note_cell_host(&world, cell, node);
+                    }
                 }
             }
             Ok(Wire::WorldCmd(env)) => {

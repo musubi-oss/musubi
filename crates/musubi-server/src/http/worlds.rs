@@ -30,6 +30,32 @@ async fn ensure_home(s: &AppState, world: &str, uri: &OriginalUri) -> Result<(),
         }
         Err(e) => return Err(ApiError::from(e).into_response()),
     };
+    redirect_to(s, world, home, uri).await
+}
+
+/// Cell-level twin of `ensure_home`: cells of one world may be hosted on different nodes.
+async fn ensure_cell_home(
+    s: &AppState,
+    world: &str,
+    cell: CellId,
+    uri: &OriginalUri,
+) -> Result<(), Response> {
+    let host = match s.worlds.cell_host_of(world, cell).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return Err(ApiError::from(Error::NotFound(format!("world {world}"))).into_response())
+        }
+        Err(e) => return Err(ApiError::from(e).into_response()),
+    };
+    redirect_to(s, world, host, uri).await
+}
+
+async fn redirect_to(
+    s: &AppState,
+    world: &str,
+    home: uuid::Uuid,
+    uri: &OriginalUri,
+) -> Result<(), Response> {
     if home == s.worlds.node_id() {
         return Ok(());
     }
@@ -266,7 +292,10 @@ async fn spawn(
     Path(w): Path<String>,
     Json(r): Json<SpawnReq>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    match s.worlds.cell_of(&w, Pos { x: r.x, y: r.y }) {
+        Ok(c) => ensure_cell_home(&s, &w, c, &uri).await?,
+        Err(_) => ensure_home(&s, &w, &uri).await?,
+    }
     let r: Result<Json<Value>, ApiError> = async {
         let e = s.worlds.spawn(
             &w,
@@ -324,7 +353,7 @@ async fn view(
     ServerKey: ServerKey,
     Path((w, x, y)): Path<(String, i32, i32)>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_cell_home(&s, &w, CellId { x, y }, &uri).await?;
     let r: Result<Json<Value>, ApiError> =
         async { Ok(Json(s.worlds.view(&w, CellId { x, y })?)) }.await;
     r.map_err(IntoResponse::into_response)
