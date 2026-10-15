@@ -34,6 +34,23 @@ pub struct AuthService {
     db: PgPool,
     signer: TokenSigner,
     refresh_ttl_secs: u64,
+    lockout: Lockout,
+}
+
+#[derive(Clone, Copy)]
+struct Lockout {
+    threshold: u32,
+    base_secs: u64,
+    max_secs: u64,
+}
+
+/// Current lock on an email address after too many failed logins.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginLock {
+    pub email: String,
+    pub failures: u32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub locked_until: OffsetDateTime,
 }
 
 struct Device<'a> {
@@ -47,6 +64,11 @@ impl AuthService {
             db,
             signer: TokenSigner::from_config(cfg)?,
             refresh_ttl_secs: cfg.refresh_ttl_secs,
+            lockout: Lockout {
+                threshold: cfg.lockout_threshold,
+                base_secs: cfg.lockout_base_secs.max(1),
+                max_secs: cfg.lockout_max_secs.max(cfg.lockout_base_secs.max(1)),
+            },
         })
     }
 
@@ -83,6 +105,14 @@ impl AuthService {
     ) -> Result<Session> {
         let email = normalize_email(email)?;
         password::validate(pass)?;
+        if let Some(lock) = self.login_lock(&email).await? {
+            let secs = (lock.locked_until - OffsetDateTime::now_utc())
+                .whole_seconds()
+                .max(1);
+            return Err(Error::ResourceExhausted(format!(
+                "too many failed logins; retry in {secs}s"
+            )));
+        }
         let existing = sqlx::query_as::<_, (Uuid, Option<String>)>(
             "select account_id, secret_hash from musubi.identities where provider = $1 and subject = $2",
         )
@@ -95,14 +125,15 @@ impl AuthService {
         let (account_id, created) = match existing {
             Some((acc, Some(hash))) => {
                 if !password::verify(pass.to_owned(), hash).await? {
-                    return Err(Error::Unauthenticated("invalid credentials".into()));
+                    return Err(self.record_login_failure(&email).await?);
                 }
+                self.clear_login_failures(&email).await?;
                 (AccountId(acc), false)
             }
-            Some((_, None)) => return Err(Error::Unauthenticated("invalid credentials".into())),
+            Some((_, None)) => return Err(self.record_login_failure(&email).await?),
             None => {
                 if !opts.create {
-                    return Err(Error::NotFound("account not found".into()));
+                    return Err(self.record_login_failure(&email).await?);
                 }
                 let hash = password::hash(pass.to_owned()).await?;
                 self.find_or_create(provider::EMAIL, &email, Some(&hash), &opts)
@@ -119,6 +150,91 @@ impl AuthService {
             },
         )
         .await
+    }
+
+    /// Active lockout for a (normalised) email address, if any.
+    pub async fn login_lock(&self, email: &str) -> Result<Option<LoginLock>> {
+        if self.lockout.threshold == 0 {
+            return Ok(None);
+        }
+        let email = normalize_email(email)?;
+        let row = sqlx::query_as::<_, (i32, Option<OffsetDateTime>)>(
+            "select failures, locked_until from musubi.login_attempts where email = $1",
+        )
+        .bind(&email)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(match row {
+            Some((failures, Some(until))) if until > OffsetDateTime::now_utc() => Some(LoginLock {
+                email,
+                failures: failures.max(0) as u32,
+                locked_until: until,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Lift a lockout (admin action).
+    pub async fn clear_login_lock(&self, email: &str) -> Result<bool> {
+        let email = normalize_email(email)?;
+        let r = sqlx::query("delete from musubi.login_attempts where email = $1")
+            .bind(&email)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Count a failed login; past the threshold the address locks for base * 2^(excess), capped.
+    /// Unknown addresses are counted too so lock responses never reveal whether an account exists.
+    async fn record_login_failure(&self, email: &str) -> Result<Error> {
+        let invalid = Error::Unauthenticated("invalid credentials".into());
+        if self.lockout.threshold == 0 {
+            return Ok(invalid);
+        }
+        let failures: i32 = sqlx::query_scalar(
+            "insert into musubi.login_attempts (email, failures, updated_at) values ($1, 1, now())
+             on conflict (email) do update set
+               failures = case when musubi.login_attempts.updated_at < now() - interval '1 day' then 1
+                               else musubi.login_attempts.failures + 1 end,
+               updated_at = now()
+             returning failures",
+        )
+        .bind(email)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let excess = failures.max(0) as u32;
+        if excess < self.lockout.threshold {
+            return Ok(invalid);
+        }
+        let factor = 1u64 << (excess - self.lockout.threshold).min(20);
+        let secs = self
+            .lockout
+            .base_secs
+            .saturating_mul(factor)
+            .min(self.lockout.max_secs);
+        sqlx::query(
+            "update musubi.login_attempts set locked_until = now() + make_interval(secs => $2) where email = $1",
+        )
+        .bind(email)
+        .bind(secs as f64)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(Error::ResourceExhausted(format!(
+            "too many failed logins; retry in {secs}s"
+        )))
+    }
+
+    async fn clear_login_failures(&self, email: &str) -> Result<()> {
+        sqlx::query("delete from musubi.login_attempts where email = $1")
+            .bind(email)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
     }
 
     /// Verify an access token. Stateless: no DB hit on the hot path.

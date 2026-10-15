@@ -5755,3 +5755,103 @@ async fn storage_objects_expire() {
         "{v}"
     );
 }
+
+/// Five wrong passwords lock the address (even for the right password afterwards); unknown
+/// addresses lock the same way so the response never reveals whether an account exists; an
+/// admin can lift the lock.
+#[tokio::test]
+async fn email_login_lockout() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let email = format!("{}@example.test", unique("lock"));
+    let body = |pw: &str| json!({"email": email, "password": pw});
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(body("Passw0rd!long")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    for i in 1..=4 {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/email",
+            None,
+            Some(body("Wrong0rd!long")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "attempt {i}: {v}");
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(body("Wrong0rd!long")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(body("Passw0rd!long")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "locked: {v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/auth/locks/{email}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["failures"], 5, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/auth/locks/{email}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["cleared"], true);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(body("Passw0rd!long")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "unlocked: {v}");
+
+    let ghost = format!("{}@example.test", unique("ghost"));
+    for _ in 0..5 {
+        call(
+            &app,
+            "POST",
+            "/v1/auth/email",
+            None,
+            Some(json!({"email": ghost, "password": "Wrong0rd!long", "create": false})),
+        )
+        .await;
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(json!({"email": ghost, "password": "Wrong0rd!long", "create": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "ghost: {v}");
+}

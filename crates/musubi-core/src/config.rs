@@ -97,6 +97,11 @@ pub struct SessionConfig {
     pub signing_key_pem: Option<String>,
     pub access_ttl_secs: u64,
     pub refresh_ttl_secs: u64,
+    /// Failed email logins (per address) before the address is locked; 0 disables lockout.
+    pub lockout_threshold: u32,
+    /// First lock lasts this long; every further failure doubles it up to `lockout_max_secs`.
+    pub lockout_base_secs: u64,
+    pub lockout_max_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +154,9 @@ impl Default for SessionConfig {
             signing_key_pem: None,
             access_ttl_secs: 15 * 60,
             refresh_ttl_secs: 30 * 24 * 3600,
+            lockout_threshold: 5,
+            lockout_base_secs: 30,
+            lockout_max_secs: 15 * 60,
         }
     }
 }

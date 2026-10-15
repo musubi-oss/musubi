@@ -31,6 +31,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/cluster/worlds", get(cluster_worlds))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/retention/run", post(retention_run))
+        .route(
+            "/v1/admin/auth/locks/{email}",
+            get(login_lock).delete(clear_login_lock),
+        )
         .route("/v1/admin/jwt/keys", get(jwt_keys).post(jwt_rotate))
         .route("/v1/admin/jwt/rotate", post(jwt_rotate))
         .route("/v1/admin/jwt/keys/{kid}", delete(jwt_retire))
@@ -541,4 +545,26 @@ async fn jwt_retire(
             .await;
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Current email-login lockout for an address (404 when none).
+async fn login_lock(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(email): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match s.auth.login_lock(&email).await? {
+        Some(lock) => Ok(Json(serde_json::to_value(lock).unwrap_or_default())),
+        None => Err(musubi_core::Error::NotFound("no active lock".into()).into()),
+    }
+}
+
+/// Lift an email-login lockout and forget its failure count.
+async fn clear_login_lock(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(email): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cleared = s.auth.clear_login_lock(&email).await?;
+    Ok(Json(serde_json::json!({ "cleared": cleared })))
 }

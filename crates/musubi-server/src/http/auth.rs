@@ -100,10 +100,27 @@ async fn email(
     Json(r): Json<EmailReq>,
 ) -> Result<Json<Session>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
-    let sess = s
+    let sess = match s
         .auth
         .authenticate_email(&r.email, &r.password, r.opts)
-        .await?;
+        .await
+    {
+        Ok(sess) => sess,
+        Err(e @ musubi_core::Error::ResourceExhausted(_)) => {
+            if let Ok(Some(lock)) = s.auth.login_lock(&r.email).await {
+                let account = s.auth.account_by_email(&lock.email).await.ok().flatten();
+                s.events
+                    .emit(
+                        "account.login_locked",
+                        account,
+                        json!({ "account_id": account, "email": lock.email, "failures": lock.failures, "locked_until": lock.locked_until, "ip": ip.0 }),
+                    )
+                    .await;
+            }
+            return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
     authenticated(&s, &sess, musubi_auth::provider::EMAIL);
     Ok(Json(sess))
 }
