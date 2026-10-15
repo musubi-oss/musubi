@@ -91,8 +91,9 @@ impl Cluster {
         v
     }
 
-    /// SWIM merge rules: Dead wins; Suspect beats Alive at the same incarnation; a higher
-    /// incarnation beats anything but Dead. News about ourselves that is not Alive is refuted.
+    /// SWIM merge rules: Dead wins for its incarnation; Suspect beats Alive at the same
+    /// incarnation; a higher incarnation beats anything, including Dead when the node itself says
+    /// it is alive again. News about ourselves that is not Alive is refuted.
     async fn merge(&self, updates: &[MemberUpdate]) {
         let mut refute = false;
         {
@@ -119,8 +120,12 @@ impl Cluster {
                     });
                 }
                 let apply = match (e.state, u.state) {
+                    // a node we declared dead came back (restart with the same identity):
+                    // only its own, newer incarnation can revive it
+                    (State::Dead, State::Alive) => u.incarnation > e.incarnation,
                     (State::Dead, _) => false,
-                    (_, State::Dead) => true,
+                    // a death verdict about an older incarnation is stale news
+                    (_, State::Dead) => u.incarnation >= e.incarnation,
                     (State::Alive, State::Suspect) => u.incarnation >= e.incarnation,
                     _ => u.incarnation > e.incarnation,
                 };

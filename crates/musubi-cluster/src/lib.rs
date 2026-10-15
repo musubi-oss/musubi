@@ -159,7 +159,14 @@ impl Cluster {
             peers: Arc::new(RwLock::new(Vec::new())),
             bus: None,
             members: Arc::new(RwLock::new(HashMap::new())),
-            incarnation: Arc::new(AtomicU64::new(0)),
+            // seeded from the clock so a process restarted with the same identity outranks every
+            // incarnation its peers saw from the previous life (and can revive from Dead)
+            incarnation: Arc::new(AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1),
+            )),
             raft: Arc::new(std::sync::OnceLock::new()),
             data_dir: None,
             left: Arc::new(AtomicBool::new(false)),

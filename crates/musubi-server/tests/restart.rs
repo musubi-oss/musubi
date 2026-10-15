@@ -471,3 +471,86 @@ async fn keys_and_bans_replicate_across_processes() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A node SIGKILLed and restarted with the same identity (data dir, ports) must be seen alive
+/// again by the survivors: SWIM's Dead verdict is per incarnation, and a restart outranks it.
+#[tokio::test]
+async fn killed_node_rejoins_with_same_identity() {
+    let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let group = format!("rejoin-{}", uuid::Uuid::now_v7().simple());
+    let root = std::env::temp_dir().join(&group);
+    let mut nodes: Vec<Node> = (0..3)
+        .map(|i| Node {
+            http: free_port(false),
+            bus: free_port(true),
+            dir: root.join(format!("n{i}")),
+            child: None,
+        })
+        .collect();
+    for (i, n) in nodes.iter_mut().enumerate() {
+        spawn(n, &db, &group, &format!("n{i}"));
+    }
+    let client = reqwest::Client::new();
+    wait_quorum(&client, &nodes).await;
+    let ids = node_ids(&client, &nodes).await;
+    let mut victim = 0;
+    for (i, n) in nodes.iter().enumerate() {
+        let r = get(&client, n, "/v1/server/cluster/raft").await.unwrap();
+        if r["is_leader"] != true {
+            victim = i;
+            break;
+        }
+    }
+    let other = (victim + 1) % 3;
+    let state_of = |v: &Value, id: &str| -> Option<String> {
+        v["nodes"]
+            .as_array()?
+            .iter()
+            .find(|n| n["id"] == id)
+            .and_then(|n| n["state"].as_str().map(str::to_string))
+    };
+
+    let mut child = nodes[victim].child.take().unwrap();
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let v = get(&client, &nodes[other], "/v1/server/cluster/nodes").await;
+        if v.as_ref()
+            .and_then(|v| state_of(v, &ids[victim]))
+            .as_deref()
+            == Some("dead")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "victim never declared dead: {v:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    spawn(&mut nodes[victim], &db, &group, &format!("n{victim}"));
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let v = get(&client, &nodes[other], "/v1/server/cluster/nodes").await;
+        if v.as_ref()
+            .and_then(|v| state_of(v, &ids[victim]))
+            .as_deref()
+            == Some("alive")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restarted node never seen alive again by a survivor: {v:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // and it kept its identity
+    let back = node_ids(&client, &nodes[victim..=victim]).await;
+    assert_eq!(back[0], ids[victim]);
+    let _ = std::fs::remove_dir_all(&root);
+}
