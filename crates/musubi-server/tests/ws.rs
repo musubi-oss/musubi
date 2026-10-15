@@ -5008,3 +5008,126 @@ async fn world_handover_cross_nodes() {
     }
     assert!(ok, "entity was not handed over to the other node");
 }
+
+/// The node hosting a cell dies: the home node takes the cell back and restores the dead host's
+/// persistent entities from that host's own snapshot.
+#[tokio::test]
+async fn world_cell_host_failover() {
+    let group = format!("xfail-{}", uuid::Uuid::now_v7().simple());
+    let Some(state1) = build_state(true, &group).await else {
+        return;
+    };
+    let Some(state2) = build_state(false, &group).await else {
+        return;
+    };
+    let router1 = musubi_server::http::router(state1.clone());
+    let router2 = musubi_server::http::router(state2.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": name, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let node2 = state2.worlds.node_id();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let sim_b = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    // leasing B's cell through A is routed to B, not served by the home
+    let (st, _) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert!(
+        st == 307 || st == 409,
+        "lease of a cell hosted elsewhere is redirected: {st}"
+    );
+    let (st, e) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "x": 150.0, "y": 50.0, "components": {"kind": "chest"}, "persistent": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let id = e["id"].as_str().unwrap().to_string();
+    state2.worlds.snapshot_now(&name).await.unwrap();
+    let rows: Vec<(uuid::Uuid,)> =
+        sqlx::query_as("select node_id from musubi.world_snapshots where name = $1")
+            .bind(&name)
+            .fetch_all(&state2.db)
+            .await
+            .unwrap();
+    assert!(
+        rows.iter().any(|r| r.0 == node2),
+        "B wrote its own shard snapshot: {rows:?}"
+    );
+    // B is gone: the home re-homes the cell and restores B's shard
+    let cells = state1
+        .worlds
+        .recover_cells(&[node2], &state1.fanout)
+        .await
+        .unwrap();
+    assert_eq!(
+        cells,
+        vec![(name.clone(), musubi_mesh::CellId { x: 1, y: 0 })]
+    );
+    let (st, va) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/1/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "home serves the cell again: {va}");
+    let owned: Vec<&str> = va["owned"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|g| g["id"].as_str())
+        .collect();
+    assert_eq!(owned, vec![id.as_str()], "{va}");
+    let (st, _) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": uuid::Uuid::now_v7(), "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "the cell is leasable on the home again");
+}

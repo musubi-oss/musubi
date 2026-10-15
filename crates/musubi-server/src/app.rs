@@ -275,7 +275,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     // World failover: adopt worlds whose home node died (one adopter at a time).
     {
-        let (cluster, worlds) = (cluster.clone(), worlds.clone());
+        let (cluster, worlds, fanout) = (cluster.clone(), worlds.clone(), fanout.clone());
         let lease = cluster.lease("world-failover", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
@@ -283,6 +283,17 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             let mut members = cluster.member_events();
             loop {
                 wait_failover_round(&mut tick, &mut leaves, &mut members).await;
+                // cells of our worlds hosted on a dead node come back to us (no lease: each home
+                // node handles its own worlds)
+                if let Some(dead) = dead_nodes(&cluster).await {
+                    match worlds.recover_cells(&dead, &fanout).await {
+                        Ok(cells) if !cells.is_empty() => {
+                            tracing::info!(?cells, ?dead, "re-homed cells of dead hosts")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "cell failover failed"),
+                    }
+                }
                 if !await_lease(&lease).await {
                     continue;
                 }

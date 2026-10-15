@@ -568,13 +568,17 @@ impl Fanout {
                 }
             }
             Ok(Wire::WorldCmd(env)) => {
-                if let Some(w) = self.worlds.get() {
-                    if w.is_home(&env.world) {
-                        let sid = env.session_id;
-                        if let Some(reply) = w.exec(env) {
-                            self.session(sid, reply);
+                if let Some(w) = self.worlds.get().cloned() {
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        if w.home_of(&env.world).await.ok().flatten() != Some(w.node_id()) {
+                            return;
                         }
-                    }
+                        let sid = env.session_id;
+                        if let Some(reply) = w.exec(env, &me) {
+                            me.session(sid, reply);
+                        }
+                    });
                 }
             }
             Ok(Wire::RelayedCmd(env)) => {

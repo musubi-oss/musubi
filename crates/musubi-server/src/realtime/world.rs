@@ -331,29 +331,97 @@ impl WorldRegistry {
         }
     }
 
+    /// Snapshot of this node's shard of `name` (cells of a world may live on several nodes, each
+    /// writes its own row) and the journal chunks it supersedes.
     async fn write_snapshot(
         db: &PgPool,
         name: &str,
+        node: Uuid,
         entities: Vec<musubi_mesh::Entity>,
         tick: u64,
     ) -> Result<()> {
         sqlx::query(
-            "insert into musubi.world_snapshots (name, entities, tick, updated_at) values ($1, $2, $3, now())
-             on conflict (name) do update set entities = excluded.entities, tick = excluded.tick, updated_at = now()",
+            "insert into musubi.world_snapshots (name, node_id, entities, tick, updated_at) values ($1, $2, $3, $4, now())
+             on conflict (name, node_id) do update set entities = excluded.entities, tick = excluded.tick, updated_at = now()",
         )
         .bind(name)
+        .bind(node)
         .bind(serde_json::to_value(&entities)?)
         .bind(tick as i64)
         .execute(db)
         .await
         .map_err(Error::internal)?;
-        sqlx::query("delete from musubi.world_journal where name = $1 and tick_to < $2")
-            .bind(name)
-            .bind(tick as i64)
-            .execute(db)
-            .await
-            .map_err(Error::internal)?;
+        sqlx::query(
+            "delete from musubi.world_journal where name = $1 and (node_id = $2 or node_id is null) and tick_to < $3",
+        )
+        .bind(name)
+        .bind(node)
+        .bind(tick as i64)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
         Ok(())
+    }
+
+    /// Entities of the shards of `name`: with `only` the shards kept by `nodes` (plus legacy
+    /// whole-world rows), otherwise every shard except those of `nodes` (live cell hosts). The
+    /// journal ops written after each shard's snapshot are replayed on top.
+    async fn load_shards(
+        db: &PgPool,
+        name: &str,
+        nodes: &[Uuid],
+        only: bool,
+        world: &mut World,
+    ) -> Result<usize> {
+        let mut wanted: Vec<Uuid> = nodes.to_vec();
+        if only {
+            wanted.push(Uuid::nil());
+        }
+        let snaps: Vec<(Uuid, Value, i64)> = sqlx::query_as(if only {
+            "select node_id, entities, tick from musubi.world_snapshots where name = $1 and node_id = any($2) order by updated_at"
+        } else {
+            "select node_id, entities, tick from musubi.world_snapshots where name = $1 and node_id <> all($2) order by updated_at"
+        })
+        .bind(name)
+        .bind(&wanted)
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
+        let mut since: HashMap<Uuid, u64> = HashMap::new();
+        for (node, ents, tick) in snaps {
+            let ents: Vec<musubi_mesh::Entity> = serde_json::from_value(ents)?;
+            world.restore(ents);
+            world.tick = world.tick.max(tick as u64);
+            since.insert(node, tick as u64);
+        }
+        let rows: Vec<(Option<Uuid>, Value)> = sqlx::query_as(if only {
+            "select node_id, entries from musubi.world_journal where name = $1 and (node_id = any($2) or node_id is null) order by tick_from"
+        } else {
+            "select node_id, entries from musubi.world_journal where name = $1 and (node_id <> all($2) or node_id is null) order by tick_from"
+        })
+        .bind(name)
+        .bind(&wanted)
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
+        let mut by_node: HashMap<Uuid, Vec<WorldOp>> = HashMap::new();
+        for (node, v) in rows {
+            match serde_json::from_value::<Vec<WorldOp>>(v) {
+                Ok(mut o) => by_node
+                    .entry(node.unwrap_or(Uuid::nil()))
+                    .or_default()
+                    .append(&mut o),
+                Err(e) => {
+                    tracing::warn!(world = %name, error = %e, "bad world journal chunk skipped")
+                }
+            }
+        }
+        let mut replayed = 0;
+        for (node, ops) in by_node {
+            let from = since.get(&node).copied().unwrap_or(0);
+            replayed += replay(world, &ops, from);
+        }
+        Ok(replayed)
     }
 
     /// Write the world's persistent entities to the snapshot store now (the ticker also does it
@@ -365,7 +433,7 @@ impl WorldRegistry {
             let st = w.lock();
             (st.world.snapshot_persistent(), st.world.tick)
         };
-        Self::write_snapshot(db, name, entities, tick).await
+        Self::write_snapshot(db, name, self.node_id, entities, tick).await
     }
 
     /// Adopt worlds whose home node is dead (or gone from the node table): claim the directory row
@@ -397,37 +465,15 @@ impl WorldRegistry {
             }
             let cfg: WorldConfig = serde_json::from_value(cfg)?;
             let ctl: ControllerConfig = serde_json::from_value(ctl)?;
-            let snap: Option<(Value, i64)> =
-                sqlx::query_as("select entities, tick from musubi.world_snapshots where name = $1")
-                    .bind(&name)
-                    .fetch_optional(db)
-                    .await
-                    .map_err(Error::internal)?;
             let mut world = World::new(cfg);
-            if let Some((ents, tick)) = snap {
-                let ents: Vec<musubi_mesh::Entity> = serde_json::from_value(ents)?;
-                world.restore(ents);
-                world.tick = tick as u64;
-            }
-            let rows: Vec<(Value,)> = sqlx::query_as(
-                "select entries from musubi.world_journal where name = $1 and tick_to >= $2 order by tick_from",
-            )
-            .bind(&name)
-            .bind(world.tick as i64)
-            .fetch_all(db)
-            .await
-            .map_err(Error::internal)?;
-            let mut ops: Vec<WorldOp> = Vec::new();
-            for (v,) in rows {
-                match serde_json::from_value::<Vec<WorldOp>>(v) {
-                    Ok(mut o) => ops.append(&mut o),
-                    Err(e) => {
-                        tracing::warn!(world = %name, error = %e, "bad world journal chunk skipped")
-                    }
-                }
-            }
-            let from = world.tick;
-            let replayed = replay(&mut world, &ops, from);
+            // shards of cell hosts that are still alive keep living there
+            let live: Vec<Uuid> = self
+                .cell_hosts
+                .iter()
+                .filter(|e| e.key().0 == name && !dead_nodes.contains(e.value()))
+                .map(|e| *e.value())
+                .collect();
+            let replayed = Self::load_shards(db, &name, &live, false, &mut world).await?;
             if replayed > 0 {
                 tracing::info!(world = %name, ops = replayed, tick = world.tick, "world journal replayed");
             }
@@ -521,22 +567,85 @@ impl WorldRegistry {
         Ok(row)
     }
 
-    pub fn is_home(&self, name: &str) -> bool {
+    /// This node keeps a shard of `name` (its home shard or an assigned cell's).
+    pub fn has_shard(&self, name: &str) -> bool {
         self.worlds.contains_key(name)
     }
 
-    /// Run a client command on the home node; errors go back to the session as messages.
-    pub fn exec(&self, env: WorldCmdEnv) -> Option<ServerMessage> {
+    /// Run a client command on the home node; errors go back to the session as messages. An input
+    /// for an entity that lives in a cell hosted elsewhere is forwarded over the bus.
+    pub fn exec(&self, env: WorldCmdEnv, fanout: &Fanout) -> Option<ServerMessage> {
         let r = match env.cmd {
             WorldCmd::Subscribe { x, y, radius } => {
                 self.subscribe(&env.world, env.session_id, Pos { x, y }, radius)
             }
             WorldCmd::Unsubscribe => self.unsubscribe(&env.world, env.session_id),
             WorldCmd::Input { entity, input } => {
-                self.input(&env.world, env.session_id, &entity, input)
+                match self.input(&env.world, env.session_id, &entity, input.clone()) {
+                    Err(Error::NotFound(_)) if self.is_split(&env.world) => {
+                        match parse_entity(&entity) {
+                            Ok(id) => {
+                                let ev = json!({"type": "input", "entity": id, "session": env.session_id, "input": input});
+                                fanout.world_input(&env.world, id, ev);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    r => r,
+                }
             }
         };
         r.err().map(|e| ServerMessage::error(&e))
+    }
+
+    /// Cells whose host died: the home node takes them back (directory + bus) and restores the
+    /// dead host's shard snapshot/journal into its own shard. Returns (world, cell) pairs re-homed.
+    pub async fn recover_cells(
+        &self,
+        dead_nodes: &[Uuid],
+        fanout: &Fanout,
+    ) -> Result<Vec<(String, CellId)>> {
+        let orphaned: Vec<(String, CellId, Uuid)> = self
+            .cell_hosts
+            .iter()
+            .filter(|e| dead_nodes.contains(e.value()))
+            .map(|e| (e.key().0.clone(), e.key().1, *e.value()))
+            .collect();
+        let mut out = Vec::new();
+        let mut restored: Vec<(String, Uuid)> = Vec::new();
+        for (name, cell, dead) in orphaned {
+            if self.home_of(&name).await? != Some(self.node_id) {
+                continue;
+            }
+            self.publish_cell_host(&name, cell, Some(self.node_id))
+                .await;
+            fanout.cell_assign(&name, cell, self.node_id);
+            if !restored.contains(&(name.clone(), dead)) {
+                if let (Some(db), Ok(w)) = (&self.db, self.get(&name)) {
+                    let cfg = w.lock().world.cfg.clone();
+                    let mut shard = World::new(cfg);
+                    let n = Self::load_shards(db, &name, &[dead], true, &mut shard).await?;
+                    let ents = shard.snapshot_persistent();
+                    {
+                        let mut st = w.lock();
+                        st.world.restore(ents);
+                    }
+                    tracing::info!(world = %name, node = %dead, replayed = n, "dead cell host's shard restored");
+                    sqlx::query(
+                        "delete from musubi.world_snapshots where name = $1 and node_id = $2",
+                    )
+                    .bind(&name)
+                    .bind(dead)
+                    .execute(db)
+                    .await
+                    .map_err(Error::internal)?;
+                }
+                restored.push((name.clone(), dead));
+            }
+            out.push((name, cell));
+        }
+        Ok(out)
     }
 
     fn get(&self, name: &str) -> Result<Arc<Mutex<WorldState>>> {
@@ -794,22 +903,29 @@ impl WorldRegistry {
             let mut st = w.lock();
             (std::mem::take(&mut st.journal), st.world.tick)
         };
-        Self::write_journal(db, name, ops, tick).await
+        Self::write_journal(db, name, self.node_id, ops, tick).await
     }
 
-    async fn write_journal(db: &PgPool, name: &str, ops: Vec<WorldOp>, tick: u64) -> Result<()> {
+    async fn write_journal(
+        db: &PgPool,
+        name: &str,
+        node: Uuid,
+        ops: Vec<WorldOp>,
+        tick: u64,
+    ) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
         let from = ops.first().map(|o| o.tick).unwrap_or(tick);
         sqlx::query(
-            "insert into musubi.world_journal (name, tick_from, tick_to, entries) values ($1, $2, $3, $4)
+            "insert into musubi.world_journal (name, tick_from, tick_to, entries, node_id) values ($1, $2, $3, $4, $5)
              on conflict (name, tick_from) do update set tick_to = excluded.tick_to, entries = excluded.entries",
         )
         .bind(name)
         .bind(from as i64)
         .bind(tick as i64)
         .bind(serde_json::to_value(&ops)?)
+        .bind(node)
         .execute(db)
         .await
         .map_err(Error::internal)?;
@@ -918,7 +1034,14 @@ impl WorldRegistry {
         };
         if accepted {
             let inputs = st.world.take_buffered_inputs(id);
+            let persistent = st.world.get(id).is_some_and(|e| e.persistent);
             st.world.despawn(id);
+            if persistent {
+                st.journal.push(WorldOp {
+                    tick: st.world.tick,
+                    op: WorldMutation::Despawn { id },
+                });
+            }
             for i in inputs {
                 fanout.world_input(name, id, i);
             }
@@ -1086,10 +1209,14 @@ impl WorldRegistry {
             }
             if st.world.tick % JOURNAL_EVERY == 0 && !st.journal.is_empty() {
                 if let Some(db) = self.db.clone() {
-                    let (ops, tick, n) =
-                        (std::mem::take(&mut st.journal), st.world.tick, name.clone());
+                    let (ops, tick, n, node) = (
+                        std::mem::take(&mut st.journal),
+                        st.world.tick,
+                        name.clone(),
+                        self.node_id,
+                    );
                     tokio::spawn(async move {
-                        if let Err(e) = Self::write_journal(&db, &n, ops, tick).await {
+                        if let Err(e) = Self::write_journal(&db, &n, node, ops, tick).await {
                             tracing::warn!(world = %n, error = %e, "world journal failed");
                         }
                     });
@@ -1097,10 +1224,14 @@ impl WorldRegistry {
             }
             if st.world.tick % SNAPSHOT_EVERY == 0 {
                 if let Some(db) = self.db.clone() {
-                    let (entities, tick, n) =
-                        (st.world.snapshot_persistent(), st.world.tick, name.clone());
+                    let (entities, tick, n, node) = (
+                        st.world.snapshot_persistent(),
+                        st.world.tick,
+                        name.clone(),
+                        self.node_id,
+                    );
                     tokio::spawn(async move {
-                        if let Err(e) = Self::write_snapshot(&db, &n, entities, tick).await {
+                        if let Err(e) = Self::write_snapshot(&db, &n, node, entities, tick).await {
                             tracing::warn!(world = %n, error = %e, "world snapshot failed");
                         }
                     });

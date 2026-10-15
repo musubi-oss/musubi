@@ -33,6 +33,47 @@ async fn ensure_home(s: &AppState, world: &str, uri: &OriginalUri) -> Result<(),
     redirect_to(s, world, home, uri).await
 }
 
+/// Simulator-scoped operations run on any node that keeps a shard of the world (the home or a
+/// cell host); without one, fall back to the home redirect.
+async fn ensure_shard(s: &AppState, world: &str, uri: &OriginalUri) -> Result<(), Response> {
+    if s.worlds.has_shard(world) {
+        return Ok(());
+    }
+    ensure_home(s, world, uri).await
+}
+
+/// A lease names cells; they must all be hosted by one node, which serves the request.
+async fn ensure_cells_home(
+    s: &AppState,
+    world: &str,
+    cells: &[CellId],
+    uri: &OriginalUri,
+) -> Result<(), Response> {
+    let mut host: Option<uuid::Uuid> = None;
+    for c in cells {
+        let h = match s.worlds.cell_host_of(world, *c).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                return Err(
+                    ApiError::from(Error::NotFound(format!("world {world}"))).into_response()
+                )
+            }
+            Err(e) => return Err(ApiError::from(e).into_response()),
+        };
+        if host.is_some_and(|x| x != h) {
+            return Err(ApiError::from(Error::InvalidArgument(
+                "cells are hosted on different nodes; lease them separately".into(),
+            ))
+            .into_response());
+        }
+        host = Some(h);
+    }
+    match host {
+        Some(h) => redirect_to(s, world, h, uri).await,
+        None => ensure_shard(s, world, uri).await,
+    }
+}
+
 /// Cell-level twin of `ensure_home`: cells of one world may be hosted on different nodes.
 async fn ensure_cell_home(
     s: &AppState,
@@ -229,7 +270,7 @@ async fn register_sim(
     Path(w): Path<String>,
     Json(r): Json<RegisterSimReq>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         Ok(Json(
             json!({ "sims": s.worlds.register_sim(&w, r.sim, r.capacity)? }),
@@ -246,7 +287,7 @@ async fn unregister_sim(
     Path(w): Path<String>,
     Json(r): Json<SimQuery>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         s.worlds.unregister_sim(&w, r.sim)?;
         Ok(Json(json!({ "ok": true })))
@@ -262,7 +303,7 @@ async fn lease(
     Path(w): Path<String>,
     Json(r): Json<LeaseReq>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_cells_home(&s, &w, &r.cells, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         Ok(Json(
             json!({ "cells": s.worlds.lease(&w, r.sim, &r.cells)? }),
@@ -279,7 +320,7 @@ async fn renew(
     Path(w): Path<String>,
     Json(r): Json<SimQuery>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> =
         async { Ok(Json(json!({ "cells": s.worlds.renew(&w, r.sim)? }))) }.await;
     r.map_err(IntoResponse::into_response)
@@ -317,7 +358,7 @@ async fn despawn(
     Path(w): Path<String>,
     Json(r): Json<EntityReq>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         s.worlds.despawn(&w, r.sim, &r.entity)?;
         Ok(Json(json!({ "ok": true })))
@@ -333,7 +374,7 @@ async fn apply(
     Path(w): Path<String>,
     Json(r): Json<ApplyReq>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         let pos = match (r.x, r.y) {
             (Some(x), Some(y)) => Some(Pos { x, y }),
@@ -366,7 +407,7 @@ async fn events(
     Path(w): Path<String>,
     Query(q): Query<SimQuery>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> =
         async { Ok(Json(json!({ "events": s.worlds.events(&w, q.sim)? }))) }.await;
     r.map_err(IntoResponse::into_response)
@@ -379,7 +420,7 @@ async fn handover_ack(
     Path(w): Path<String>,
     Json(r): Json<EntityReq>,
 ) -> Result<Json<Value>, Response> {
-    ensure_home(&s, &w, &uri).await?;
+    ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> =
         async { Ok(Json(s.worlds.handover_ack(&w, r.sim, &r.entity)?)) }.await;
     r.map_err(IntoResponse::into_response)

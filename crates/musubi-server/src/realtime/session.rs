@@ -845,7 +845,7 @@ async fn world_dispatch(ctx: &Ctx<'_>, world: &str, cmd: WorldCmd) -> Option<Ser
         Ok(None) => Some(ServerMessage::error(&Error::NotFound(format!(
             "world {world}"
         )))),
-        Ok(Some(h)) if h == ctx.worlds.node_id() => ctx.worlds.exec(env),
+        Ok(Some(h)) if h == ctx.worlds.node_id() => ctx.worlds.exec(env, ctx.fanout),
         Ok(Some(_)) => {
             ctx.fanout.world_cmd(env);
             None
