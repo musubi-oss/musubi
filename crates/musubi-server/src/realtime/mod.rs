@@ -13,8 +13,8 @@ pub mod wasm_match;
 pub mod world;
 
 pub use authoritative::MatchRegistry;
-pub use hub::Hub;
+pub use hub::{Hub, Resumed};
 pub use party::PartyRegistry;
 pub use relayed::RelayedRegistry;
-pub use session::{serve, ConnectParams};
+pub use session::{resume_or_reject, serve, ConnectParams};
 pub use world::WorldRegistry;

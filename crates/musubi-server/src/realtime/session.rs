@@ -22,6 +22,10 @@ use super::{Hub, MatchRegistry, PartyRegistry, RelayedRegistry};
 pub struct ConnectParams {
     pub presence: UserPresence,
     pub encoding: Encoding,
+    /// Client asked for a resume token (`session` is then the first message).
+    pub resumable: bool,
+    /// How long a session survives without a transport before it is torn down.
+    pub resume_ttl: Duration,
     pub limits: Limits,
     pub chat: ChatService,
     pub matchmaker: Arc<Matchmaker>,
@@ -39,7 +43,9 @@ pub struct ConnectParams {
 pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: ConnectParams) {
     let ConnectParams {
         presence,
-        encoding,
+        mut encoding,
+        resumable,
+        resume_ttl,
         limits,
         chat,
         matchmaker,
@@ -74,7 +80,68 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         presence: &presence,
         rate: &rate,
     };
-    let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx, &kick).await;
+    let resume_token = resumable.then(|| {
+        format!(
+            "{}{}",
+            uuid::Uuid::now_v7().simple(),
+            uuid::Uuid::now_v7().simple()
+        )
+    });
+    if let Some(t) = &resume_token {
+        let _ = tx.try_send(ServerMessage::Session {
+            session_id: sid.to_string(),
+            resume_token: t.clone(),
+            resumed: false,
+        });
+    }
+    let result = loop {
+        let exit = run_loop(
+            &ctx,
+            conn.as_mut(),
+            encoding,
+            limits,
+            tx.clone(),
+            &mut rx,
+            &kick,
+        )
+        .await;
+        let Exit::Lost(err) = exit else {
+            break exit;
+        };
+        let Some(token) = &resume_token else {
+            break Exit::Lost(err);
+        };
+        // keep the session (subscriptions, matches, parties, buffered outbound) for resume_ttl
+        conn.close().await;
+        let (slot, wait) = tokio::sync::oneshot::channel();
+        hub.park(token.clone(), slot);
+        info!(session = %sid, error = %err, ttl = ?resume_ttl, "realtime transport lost; parked for resume");
+        match tokio::time::timeout(resume_ttl, wait).await {
+            Ok(Ok(r)) => {
+                conn = r.conn;
+                encoding = r.encoding;
+                if let Err(e) = send(
+                    conn.as_mut(),
+                    encoding,
+                    None,
+                    ServerMessage::Session {
+                        session_id: sid.to_string(),
+                        resume_token: token.clone(),
+                        resumed: true,
+                    },
+                )
+                .await
+                {
+                    debug!(session = %sid, error = %e, "resume hello failed");
+                }
+                info!(session = %sid, transport = conn.kind(), "realtime resumed");
+            }
+            _ => {
+                hub.unpark(token);
+                break Exit::Lost(err);
+            }
+        }
+    };
     for t in parties.leave_all(&fanout, sid) {
         matchmaker.cancel(&t);
         fanout.mm_remove(&t);
@@ -89,9 +156,40 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     hub.leave(sid);
     conn.close().await;
     match result {
-        Ok(()) => info!(session = %sid, "realtime disconnected"),
-        Err(e) => debug!(session = %sid, error = %e, "realtime closed with error"),
+        Exit::Lost(e) => debug!(session = %sid, error = %e, "realtime closed with error"),
+        _ => info!(session = %sid, "realtime disconnected"),
     }
+}
+
+/// Hand a reconnected transport to the parked session owning `token`, or tell the client why not.
+pub async fn resume_or_reject(
+    hub: &Hub,
+    token: &str,
+    conn: Box<dyn Connection>,
+    encoding: Encoding,
+) {
+    match hub.resume(token, super::hub::Resumed { conn, encoding }) {
+        Ok(()) => {}
+        Err(mut conn) => {
+            let _ = send(
+                conn.as_mut(),
+                encoding,
+                None,
+                ServerMessage::error(&Error::NotFound("resume token unknown or expired".into())),
+            )
+            .await;
+            conn.close().await;
+        }
+    }
+}
+
+/// Why `run_loop` returned. Only a lost transport is eligible for resume.
+enum Exit {
+    /// Client sent a close frame or the outbound channel closed.
+    Clean,
+    Kicked,
+    Idle,
+    Lost(Box<dyn std::error::Error + Send + Sync>),
 }
 
 struct Ctx<'a> {
@@ -116,14 +214,29 @@ async fn run_loop(
     tx: mpsc::Sender<ServerMessage>,
     rx: &mut mpsc::Receiver<ServerMessage>,
     kick: &tokio::sync::Notify,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Exit {
+    match run_loop_inner(ctx, conn, encoding, limits, tx, rx, kick).await {
+        Ok(exit) => exit,
+        Err(e) => Exit::Lost(e),
+    }
+}
+
+async fn run_loop_inner(
+    ctx: &Ctx<'_>,
+    conn: &mut dyn Connection,
+    encoding: Encoding,
+    limits: Limits,
+    tx: mpsc::Sender<ServerMessage>,
+    rx: &mut mpsc::Receiver<ServerMessage>,
+    kick: &tokio::sync::Notify,
+) -> Result<Exit, Box<dyn std::error::Error + Send + Sync>> {
     let sid = ctx.presence.session_id;
     let mut idle = tokio::time::interval(limits.idle_timeout);
     idle.reset();
     loop {
         tokio::select! {
             out = rx.recv() => {
-                let Some(msg) = out else { return Ok(()) };
+                let Some(msg) = out else { return Ok(Exit::Clean) };
                 let unreliable = matches!(&msg, ServerMessage::MatchData { reliable: false, .. });
                 let bytes = encoding.encode(&Envelope { cid: None, msg })?;
                 let frame = Frame::encoded(encoding, bytes);
@@ -136,7 +249,7 @@ async fn run_loop(
             inc = conn.recv() => {
                 let frame = inc?;
                 idle.reset();
-                let Some(payload) = frame.payload() else { return Ok(()) };
+                let Some(payload) = frame.payload() else { return Ok(Exit::Clean) };
                 if payload.len() > limits.max_frame_bytes {
                     send(conn, encoding, None, ServerMessage::error(&Error::InvalidArgument("frame too large".into()))).await?;
                     continue;
@@ -161,13 +274,13 @@ async fn run_loop(
             _ = kick.notified() => {
                 warn!(session = %sid, "kicked by admin");
                 send(conn, encoding, None, ServerMessage::error(&Error::PermissionDenied("kicked".into()))).await?;
-                return Ok(());
+                return Ok(Exit::Kicked);
             }
             _ = idle.tick() => {
                 warn!(session = %sid, "idle timeout");
                 let _ = tx.try_send(ServerMessage::error(&Error::Unavailable("idle timeout".into())));
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                return Ok(());
+                return Ok(Exit::Idle);
             }
         }
     }

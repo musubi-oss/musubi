@@ -3750,3 +3750,107 @@ async fn world_journal_is_replayed_on_rehome() {
     assert!(view.contains("chest"), "{view}");
     r2.delete(&name).await.unwrap();
 }
+
+/// A session opened with `resumable=true` survives losing its socket: subscriptions and the
+/// outbound buffer are kept for `realtime.resume_ttl_secs`, and `?resume=<token>` re-attaches.
+#[tokio::test]
+async fn lost_socket_is_resumed_with_its_token() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let (ta, _) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let (mut a, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws?token={ta}&format=json&resumable=true"
+    ))
+    .await
+    .unwrap();
+    let hello = recv(&mut a).await.msg;
+    let ServerMessage::Session {
+        session_id,
+        resume_token,
+        resumed: false,
+    } = hello
+    else {
+        panic!("expected session hello, got {hello:?}");
+    };
+    send(
+        &mut a,
+        "json",
+        Some("f"),
+        ClientMessage::StatusFollow {
+            account_ids: vec![acc_b.parse().unwrap()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Status { .. }
+    ));
+    let mut b = connect(&addr, &tb, "json").await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::StatusPresenceEvent { .. }
+    ));
+
+    // lose the socket without a close frame
+    drop(a);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    send(
+        &mut b,
+        "json",
+        None,
+        ClientMessage::StatusUpdate {
+            status: Some("back".into()),
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // wrong token: rejected and closed
+    let (mut bad, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?resume=nope&format=json"))
+            .await
+            .unwrap();
+    assert!(matches!(
+        recv(&mut bad).await.msg,
+        ServerMessage::Error { .. }
+    ));
+
+    let (mut a2, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws?resume={resume_token}&format=json"
+    ))
+    .await
+    .unwrap();
+    let m = recv(&mut a2).await.msg;
+    assert_eq!(
+        m,
+        ServerMessage::Session {
+            session_id: session_id.clone(),
+            resume_token: resume_token.clone(),
+            resumed: true
+        }
+    );
+    // the presence event that happened while we were gone was buffered
+    match recv(&mut a2).await.msg {
+        ServerMessage::StatusPresenceEvent { joins, .. } => {
+            assert!(
+                joins.iter().any(|p| p.status.as_deref() == Some("back")),
+                "{joins:?}"
+            );
+        }
+        other => panic!("expected buffered presence event, got {other:?}"),
+    }
+    send(&mut a2, "json", Some("p"), ClientMessage::Ping).await;
+    assert_eq!(recv(&mut a2).await.msg, ServerMessage::Pong);
+    // the old token is single-use: a second resume is rejected
+    let (mut again, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws?resume={resume_token}&format=json"
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv(&mut again).await.msg,
+        ServerMessage::Error { .. }
+    ));
+}

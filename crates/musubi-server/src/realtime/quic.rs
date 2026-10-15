@@ -68,6 +68,17 @@ async fn handle(state: AppState, conn: quinn::Connection) {
             Ok(Err(e)) => Err(Error::Internal(e.to_string())),
             Err(_) => Err(Error::InvalidArgument("hello timeout".into())),
         };
+    if let Ok(h) = &hello {
+        if let Some(token) = h.resume.clone() {
+            let encoding = connect::encoding_of(h).unwrap_or(musubi_proto::Encoding::Json);
+            let c = Box::new(QuicConnection::new(conn.clone(), send, recv, max));
+            crate::realtime::resume_or_reject(&state.hub, &token, c, encoding).await;
+            let _ = tokio::time::timeout(Duration::from_millis(500), conn.closed()).await;
+            conn.close(0u32.into(), b"bye");
+            return;
+        }
+    }
+    let resumable = hello.as_ref().map(|h| h.resumable).unwrap_or(false);
     let (presence, encoding) = match async { connect::authorize(&state, &hello?).await }.await {
         Ok(v) => v,
         Err(e) => {
@@ -87,7 +98,8 @@ async fn handle(state: AppState, conn: quinn::Connection) {
             return;
         }
     };
-    let params = connect::params(&state, presence, encoding);
+    let mut params = connect::params(&state, presence, encoding);
+    params.resumable = resumable;
     let hub: Arc<_> = state.hub.clone();
     crate::realtime::serve(
         hub,

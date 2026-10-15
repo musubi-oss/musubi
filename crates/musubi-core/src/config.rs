@@ -43,6 +43,7 @@ pub struct Config {
     pub fleet: FleetConfig,
     pub limits: LimitsConfig,
     pub metrics: MetricsConfig,
+    pub realtime: RealtimeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +433,23 @@ impl Default for MetricsConfig {
             enabled: true,
             require_server_key: false,
             allow_ips: vec![],
+        }
+    }
+}
+
+/// Realtime session settings (WS/QUIC).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RealtimeConfig {
+    /// How long a session that lost its transport is kept (subscriptions, matches, parties,
+    /// buffered outbound) for the client to resume with its token. 0 disables resume.
+    pub resume_ttl_secs: u64,
+}
+
+impl Default for RealtimeConfig {
+    fn default() -> Self {
+        Self {
+            resume_ttl_secs: 30,
         }
     }
 }

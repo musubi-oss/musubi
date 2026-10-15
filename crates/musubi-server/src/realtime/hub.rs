@@ -15,10 +15,18 @@ pub struct SessionHandle {
     pub kick: std::sync::Arc<tokio::sync::Notify>,
 }
 
+/// A reconnected transport handed to a parked session loop.
+pub struct Resumed {
+    pub conn: Box<dyn musubi_transport::Connection>,
+    pub encoding: musubi_proto::Encoding,
+}
+
 /// Process-local registry of live realtime sessions.
 #[derive(Default)]
 pub struct Hub {
     sessions: DashMap<SessionId, SessionHandle>,
+    /// resume token → the parked session loop waiting for a new connection
+    parked: DashMap<String, tokio::sync::oneshot::Sender<Resumed>>,
     by_account: DashMap<AccountId, HashSet<SessionId>>,
     /// target account → sessions that follow its status
     followers: DashMap<AccountId, HashSet<SessionId>>,
@@ -66,6 +74,32 @@ impl Hub {
             n += 1;
         }
         n
+    }
+
+    /// Park a session that lost its transport; `resume` hands it the next connection.
+    pub fn park(&self, token: String, slot: tokio::sync::oneshot::Sender<Resumed>) {
+        self.parked.insert(token, slot);
+    }
+
+    pub fn unpark(&self, token: &str) {
+        self.parked.remove(token);
+    }
+
+    /// Attach a new connection to a parked session; gives the connection back when the token is
+    /// unknown or expired so the caller can tell the client.
+    pub fn resume(
+        &self,
+        token: &str,
+        resumed: Resumed,
+    ) -> std::result::Result<(), Box<dyn musubi_transport::Connection>> {
+        match self.parked.remove(token) {
+            Some((_, slot)) => slot.send(resumed).map_err(|r| r.conn),
+            None => Err(resumed.conn),
+        }
+    }
+
+    pub fn parked_count(&self) -> usize {
+        self.parked.len()
     }
 
     pub fn session_count(&self) -> usize {

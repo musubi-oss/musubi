@@ -16,11 +16,16 @@ pub fn routes() -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct WsQuery {
+    #[serde(default)]
     token: String,
     #[serde(default)]
     format: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    resumable: bool,
+    #[serde(default)]
+    resume: Option<String>,
 }
 
 /// `GET /ws?token=<access jwt>&format=json|binary[&status=...]`
@@ -33,13 +38,25 @@ async fn upgrade(
         token: q.token,
         format: q.format,
         status: q.status,
+        resumable: q.resumable,
+        resume: q.resume,
     };
-    let (presence, encoding) = crate::realtime::connect::authorize(&s, &hello).await?;
     let hub = s.hub.clone();
+    if let Some(token) = hello.resume.clone() {
+        let encoding = crate::realtime::connect::encoding_of(&hello)?;
+        return Ok(ws
+            .max_message_size(Limits::default().max_frame_bytes)
+            .on_upgrade(move |socket| async move {
+                let conn = Box::new(WsConnection::new(socket));
+                crate::realtime::resume_or_reject(&hub, &token, conn, encoding).await;
+            }));
+    }
+    let (presence, encoding) = crate::realtime::connect::authorize(&s, &hello).await?;
     Ok(ws
         .max_message_size(Limits::default().max_frame_bytes)
         .on_upgrade(move |socket| async move {
-            let params = crate::realtime::connect::params(&s, presence, encoding);
+            let mut params = crate::realtime::connect::params(&s, presence, encoding);
+            params.resumable = hello.resumable;
             crate::realtime::serve(hub, Box::new(WsConnection::new(socket)), params).await;
         }))
 }

@@ -194,6 +194,12 @@ fn one() -> u32 {
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
     Pong,
+    /// First message of a session opened with `resumable`, and again after a successful resume.
+    Session {
+        session_id: String,
+        resume_token: String,
+        resumed: bool,
+    },
     Error {
         code: Code,
         message: String,
