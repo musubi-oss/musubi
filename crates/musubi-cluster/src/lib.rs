@@ -5,13 +5,16 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
+
+pub mod swim;
+pub use swim::{MemberUpdate, State};
 
 use musubi_core::{Error, NodeId, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -40,6 +43,9 @@ pub struct NodeInfo {
     /// Hex DER of the node's self-signed bus certificate; peers trust exactly this.
     #[serde(default)]
     pub bus_cert: String,
+    /// SWIM view: `alive` | `suspect` | `dead`.
+    #[serde(default)]
+    pub state: String,
 }
 
 type NodeRow = (
@@ -65,9 +71,9 @@ const BUS_ALPN: &[u8] = b"musubi-bus/1";
 pub const MAX_QUIC_BUS_PAYLOAD: usize = 16 * 1024 * 1024;
 const QUIC_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
-struct QuicBus {
-    endpoint: quinn::Endpoint,
-    conns: Mutex<HashMap<Uuid, quinn::Connection>>,
+pub(crate) struct QuicBus {
+    pub(crate) endpoint: quinn::Endpoint,
+    pub(crate) conns: Mutex<HashMap<Uuid, quinn::Connection>>,
 }
 
 #[derive(Clone)]
@@ -75,8 +81,10 @@ pub struct Cluster {
     db: PgPool,
     me: NodeInfo,
     bus_tx: broadcast::Sender<BusMessage>,
-    peers: Arc<RwLock<Vec<NodeInfo>>>,
-    bus: Option<Arc<QuicBus>>,
+    pub(crate) peers: Arc<RwLock<Vec<NodeInfo>>>,
+    pub(crate) bus: Option<Arc<QuicBus>>,
+    pub(crate) members: Arc<RwLock<HashMap<Uuid, swim::Member>>>,
+    pub(crate) incarnation: Arc<AtomicU64>,
 }
 
 /// A message from another node. `topic` routes it; `payload` is topic-specific JSON.
@@ -111,10 +119,13 @@ impl Cluster {
                 alive: true,
                 bus_addr: String::new(),
                 bus_cert: String::new(),
+                state: "alive".into(),
             },
             bus_tx,
             peers: Arc::new(RwLock::new(Vec::new())),
             bus: None,
+            members: Arc::new(RwLock::new(HashMap::new())),
+            incarnation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -162,8 +173,19 @@ impl Cluster {
     /// Re-read the node table into the peer cache used for QUIC fan-out.
     pub async fn refresh_peers(&self) -> Result<()> {
         let nodes = self.nodes().await?;
+        self.members
+            .write()
+            .await
+            .retain(|id, _| nodes.iter().any(|n| n.id.0 == *id));
         *self.peers.write().await = nodes;
         Ok(())
+    }
+
+    /// Close the QUIC endpoint but keep heartbeating: simulates a node whose network died.
+    pub fn close_bus(&self) {
+        if let Some(bus) = &self.bus {
+            bus.endpoint.close(1u32.into(), b"closed");
+        }
     }
 
     pub fn me(&self) -> &NodeInfo {
@@ -241,28 +263,59 @@ impl Cluster {
             }
         });
         if let Some(bus) = &self.bus {
-            let (ep, tx, me) = (bus.endpoint.clone(), self.bus_tx.clone(), self.me.id);
+            let (ep, cl) = (bus.endpoint.clone(), self.clone());
             tokio::spawn(async move {
                 while let Some(incoming) = ep.accept().await {
-                    let tx = tx.clone();
+                    let cl = cl.clone();
                     tokio::spawn(async move {
                         let Ok(conn) = incoming.await else { return };
-                        while let Ok(mut recv) = conn.accept_uni().await {
-                            let tx = tx.clone();
+                        let (c_uni, conn_uni) = (cl.clone(), conn.clone());
+                        tokio::spawn(async move {
+                            while let Ok(mut recv) = conn_uni.accept_uni().await {
+                                let c = c_uni.clone();
+                                tokio::spawn(async move {
+                                    let Ok(buf) = recv.read_to_end(MAX_QUIC_BUS_PAYLOAD).await
+                                    else {
+                                        return;
+                                    };
+                                    match serde_json::from_slice::<BusMessage>(&buf) {
+                                        Ok(msg) if msg.origin != c.me.id => {
+                                            let _ = c.bus_tx.send(msg);
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => tracing::warn!(error = %e, "bad quic bus frame"),
+                                    }
+                                });
+                            }
+                        });
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            let c = cl.clone();
                             tokio::spawn(async move {
-                                let Ok(buf) = recv.read_to_end(MAX_QUIC_BUS_PAYLOAD).await else {
+                                let Ok(buf) = recv.read_to_end(swim::MAX_SWIM_FRAME).await else {
                                     return;
                                 };
-                                match serde_json::from_slice::<BusMessage>(&buf) {
-                                    Ok(msg) if msg.origin != me => {
-                                        let _ = tx.send(msg);
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => tracing::warn!(error = %e, "bad quic bus frame"),
+                                let Ok(msg) = serde_json::from_slice::<swim::Msg>(&buf) else {
+                                    return;
+                                };
+                                let resp = c.handle_swim(msg).await;
+                                if let Ok(b) = serde_json::to_vec(&resp) {
+                                    let _ = send.write_all(&b).await;
+                                    let _ = send.finish();
+                                    let _ = send.stopped().await;
                                 }
                             });
                         }
                     });
+                }
+            });
+            let probe = self.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(swim::PROBE_INTERVAL);
+                let mut n = 0usize;
+                loop {
+                    tick.tick().await;
+                    probe.probe_round(n).await;
+                    n = n.wrapping_add(1);
                 }
             });
         }
@@ -298,20 +351,32 @@ impl Cluster {
         .await
         .map_err(Error::internal)?;
         let now = OffsetDateTime::now_utc();
+        let members = self.members.read().await.clone();
         Ok(rows
             .into_iter()
-            .map(|r| NodeInfo {
-                id: NodeId(r.0),
-                name: r.1,
-                region: r.2,
-                roles: r.3,
-                version: r.4,
-                advertise: r.5,
-                started_at: r.6,
-                heartbeat_at: r.7,
-                alive: now - r.7 < DEAD_AFTER,
-                bus_addr: r.8,
-                bus_cert: r.9,
+            .map(|r| {
+                let db_alive = now - r.7 < DEAD_AFTER;
+                let swim = members.get(&r.0).map(|m| m.state);
+                let state = match swim {
+                    Some(State::Dead) => "dead",
+                    Some(State::Suspect) if db_alive => "suspect",
+                    _ if db_alive => "alive",
+                    _ => "dead",
+                };
+                NodeInfo {
+                    id: NodeId(r.0),
+                    name: r.1,
+                    region: r.2,
+                    roles: r.3,
+                    version: r.4,
+                    advertise: r.5,
+                    started_at: r.6,
+                    heartbeat_at: r.7,
+                    alive: db_alive && swim != Some(State::Dead),
+                    bus_addr: r.8,
+                    bus_cert: r.9,
+                    state: state.into(),
+                }
             })
             .collect())
     }
@@ -483,7 +548,7 @@ impl BusMessage {
 }
 
 impl QuicBus {
-    async fn connection(&self, peer: &NodeInfo) -> Result<quinn::Connection> {
+    pub(crate) async fn connection(&self, peer: &NodeInfo) -> Result<quinn::Connection> {
         let mut conns = self.conns.lock().await;
         if let Some(c) = conns.get(&peer.id.0) {
             if c.close_reason().is_none() {

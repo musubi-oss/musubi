@@ -2706,3 +2706,84 @@ async fn quic_bus_delivers_large_messages_and_keeps_postgres_fallback() {
     b.stop().await;
     c.stop().await;
 }
+
+#[tokio::test]
+async fn swim_detects_dead_bus_peer_within_seconds() {
+    use std::time::Duration;
+    let Some(_app) = app().await else { return };
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let bus = |name: &str| {
+        Arc::new(
+            musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+                .with_bus("127.0.0.1:0".parse().unwrap(), None)
+                .unwrap(),
+        )
+    };
+    let (a, b, c) = (bus("sa"), bus("sb"), bus("sc"));
+    for n in [&a, &b, &c] {
+        n.start().await.unwrap();
+    }
+    for n in [&a, &b, &c] {
+        n.refresh_peers().await.unwrap();
+    }
+    let state_of = |nodes: &[musubi_cluster::NodeInfo], id: musubi_core::NodeId| {
+        nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| (n.state.clone(), n.alive))
+            .unwrap()
+    };
+    // after a few protocol periods everyone has probed/gossiped everyone
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    let nodes = a.nodes().await.unwrap();
+    assert_eq!(state_of(&nodes, b.node_id()), ("alive".into(), true));
+    assert_eq!(state_of(&nodes, c.node_id()), ("alive".into(), true));
+    assert_eq!(
+        a.member_state(b.node_id().0).await,
+        Some(musubi_cluster::State::Alive)
+    );
+    // c's network dies but its Postgres heartbeat keeps going: SWIM must still call it dead fast
+    c.close_bus();
+    let started = std::time::Instant::now();
+    loop {
+        let na = a.nodes().await.unwrap();
+        let nb = b.nodes().await.unwrap();
+        if state_of(&na, c.node_id()) == ("dead".into(), false)
+            && state_of(&nb, c.node_id()) == ("dead".into(), false)
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "c not declared dead: a={:?} b={:?}",
+            state_of(&na, c.node_id()),
+            state_of(&nb, c.node_id())
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    tracing::info!(elapsed = ?started.elapsed(), "dead detected");
+    // a and b still see each other alive; dead peers are skipped by the bus fan-out
+    let na = a.nodes().await.unwrap();
+    assert_eq!(state_of(&na, b.node_id()), ("alive".into(), true));
+    let mut rb = b.subscribe();
+    let topic = unique("after");
+    a.publish(&topic, &json!({"ok": true})).await.unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let m = rb.recv().await.unwrap();
+            if m.topic == topic {
+                return m;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(m.payload["ok"], true);
+    a.stop().await;
+    b.stop().await;
+    c.stop().await;
+}
