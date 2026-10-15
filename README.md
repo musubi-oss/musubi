@@ -4,7 +4,9 @@ Open-source game backend in Rust: accounts, data, social, chat, leaderboards, ma
 authoritative realtime, dedicated-server fleets and **server meshing** — one Apache-2.0 binary,
 clustered out of the box.
 
-Status: pre-alpha (M0 — foundation). Not usable yet.
+Status: alpha — the backend roadmap v0 is implemented and tested (CI runs the full suite against
+Postgres); client SDKs and the admin console are not written yet, so integrating today means
+talking to the HTTP/WS/QUIC API directly (`GET /openapi.json`).
 
 ## Quick start (dev)
 
@@ -18,6 +20,29 @@ curl -s localhost:7350/v1/auth/device -H 'content-type: application/json' \
 
 Configuration: TOML/YAML file via `--config`, every key overridable with
 `MUSUBI__SECTION__KEY` (e.g. `MUSUBI__DATABASE__URL`). `musubi config` prints the effective config.
+
+## Operating it
+
+| command | what it does |
+|---|---|
+| `musubi doctor` | config sanity (built-in secrets are refused outside `musubi dev`), database + pending migrations, data dir, ports; exit 1 if the server would not start |
+| `musubi migrate` | apply migrations and exit |
+| `musubi export --out dump.jsonl` / `musubi import --input dump.jsonl [--replace]` | move game data between environments (every `musubi` table except runtime state, foreign-key order, idempotent import) |
+| `musubi bench --url … --clients 50 --duration-secs 10 --scenario http\|storage\|ws\|all` | load generator with p50/p95/p99, throughput, errors and 429s |
+| `musubi config --format json` | effective configuration (secrets included — do not paste it anywhere) |
+
+Server-to-server keys: `http.server_key` is the bootstrap admin key; issue scoped keys with
+`POST /v1/admin/keys {"name","role":"server"|"admin"}` and revoke them with `DELETE /v1/admin/keys/{id}`.
+Clean-up of events/deliveries/audit/notifications/sessions runs on the `retention` lease
+(`[retention]`, days per table). Nodes drain on SIGTERM or `POST /v1/admin/cluster/nodes/{id}/drain`.
+
+### Measured (not promised)
+
+`musubi bench` on a laptop-class VM, **debug** build, Postgres 16 in Docker, one node, 12 clients,
+3 s: HTTP `GET /v1/account` p50 2.5 ms / p99 6.7 ms, storage write/read p50 2.4 ms / p99 6.8 ms,
+WebSocket ping p50 0.4 ms / p99 2.6 ms — bounded by the default per-account `[limits]`, not by
+the server. Run it against your own deployment; numbers from a release build on real hardware are
+the ones that matter.
 
 ## HTTP API (so far)
 

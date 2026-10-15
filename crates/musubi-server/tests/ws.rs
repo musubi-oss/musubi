@@ -3855,3 +3855,129 @@ async fn lost_socket_is_resumed_with_its_token() {
         ServerMessage::Error { .. }
     ));
 }
+
+/// QUIC sessions resume the same way as WebSocket ones: hello with `resumable`, lose the
+/// connection, hello again with `resume`.
+#[tokio::test]
+async fn quic_session_resumes_with_its_token() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (cfg, der) = musubi_transport::quic::dev_self_signed().unwrap();
+    let addr = musubi_server::realtime::quic::start_with(
+        state.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        cfg,
+    )
+    .await
+    .unwrap();
+    let (ta, _) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(musubi_transport::quic::client_config(&[der]).unwrap());
+    use musubi_transport::quic::QuicConnection as Q;
+    use musubi_transport::Frame;
+    let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+    Q::write_frame(
+        &mut tx,
+        Frame::Text(json!({"token": ta, "format": "json", "resumable": true}).to_string()),
+    )
+    .await
+    .unwrap();
+    let ServerMessage::Session {
+        resume_token,
+        resumed: false,
+        ..
+    } = quic_read(&mut rx).await
+    else {
+        panic!("expected session hello")
+    };
+    let env = |msg: ClientMessage| {
+        Frame::Text(serde_json::to_string(&Envelope { cid: None, msg }).unwrap())
+    };
+    Q::write_frame(
+        &mut tx,
+        env(ClientMessage::StatusFollow {
+            account_ids: vec![acc_b.parse().unwrap()],
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        quic_read(&mut rx).await,
+        ServerMessage::Status { .. }
+    ));
+    let mut b = connect(&router_addr(&state).await, &tb, "json").await;
+    let _ = &mut b;
+    assert!(matches!(
+        quic_read(&mut rx).await,
+        ServerMessage::StatusPresenceEvent { .. }
+    ));
+
+    // lose the QUIC connection without a close frame
+    conn.close(0u32.into(), b"gone");
+    drop(conn);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    send(
+        &mut b,
+        "json",
+        None,
+        ClientMessage::StatusUpdate {
+            status: Some("back".into()),
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let conn2 = ep.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut tx2, mut rx2) = conn2.open_bi().await.unwrap();
+    Q::write_frame(
+        &mut tx2,
+        Frame::Text(json!({"resume": resume_token, "format": "json"}).to_string()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        quic_read(&mut rx2).await,
+        ServerMessage::Session { resumed: true, .. }
+    ));
+    match quic_read(&mut rx2).await {
+        ServerMessage::StatusPresenceEvent { joins, .. } => {
+            assert!(
+                joins.iter().any(|p| p.status.as_deref() == Some("back")),
+                "{joins:?}"
+            );
+        }
+        other => panic!("expected buffered presence event, got {other:?}"),
+    }
+    Q::write_frame(&mut tx2, env(ClientMessage::Ping))
+        .await
+        .unwrap();
+    assert_eq!(quic_read(&mut rx2).await, ServerMessage::Pong);
+}
+
+/// Serve the HTTP router of an in-process state on a free port (for WS peers in QUIC tests).
+async fn router_addr(state: &musubi_server::app::AppState) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = musubi_server::http::router(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    addr.to_string()
+}
+
+async fn quic_read(rx: &mut quinn::RecvStream) -> ServerMessage {
+    let musubi_transport::Frame::Text(t) =
+        musubi_transport::quic::QuicConnection::read_frame(rx, 1 << 20)
+            .await
+            .unwrap()
+    else {
+        panic!("expected text frame")
+    };
+    serde_json::from_str::<Envelope<ServerMessage>>(&t)
+        .unwrap()
+        .msg
+}
