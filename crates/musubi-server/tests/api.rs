@@ -2591,3 +2591,36 @@ async fn quests_by_events_and_battle_pass_tiers() {
         "daily + one-off + free + premium"
     );
 }
+
+#[tokio::test]
+async fn cluster_lease_has_single_holder_and_moves_on_release() {
+    let Some(_app) = app().await else { return };
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let a = musubi_cluster::Cluster::new(db.clone(), "a", "local", vec![], "");
+    let b = musubi_cluster::Cluster::new(db.clone(), "b", "local", vec![], "");
+    let name = unique("lease");
+    let ttl = std::time::Duration::from_secs(2);
+    assert!(a.try_lease(&name, ttl).await.unwrap());
+    assert!(!b.try_lease(&name, ttl).await.unwrap(), "held by a");
+    assert!(a.try_lease(&name, ttl).await.unwrap(), "owner renews");
+    a.release_lease(&name).await.unwrap();
+    assert!(b.try_lease(&name, ttl).await.unwrap(), "free after release");
+    assert!(!a.try_lease(&name, ttl).await.unwrap());
+    // expiry: a short lease lapses and can be taken over
+    let short = unique("lease");
+    assert!(a
+        .try_lease(&short, std::time::Duration::from_millis(300))
+        .await
+        .unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        b.try_lease(&short, ttl).await.unwrap(),
+        "expired lease is taken over"
+    );
+    b.release_lease(&name).await.unwrap();
+    b.release_lease(&short).await.unwrap();
+}

@@ -661,12 +661,19 @@ impl FleetService {
         Ok((started, reaped))
     }
 
-    /// Background reconciler.
-    pub fn spawn_reconciler(self: Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {
+    /// Background reconciler; `active` gates each pass (cluster-wide: only the lease holder runs it).
+    pub fn spawn_reconciler(
+        self: Arc<Self>,
+        every: Duration,
+        active: impl Fn() -> bool + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
             loop {
                 tick.tick().await;
+                if !active() {
+                    continue;
+                }
                 if let Err(e) = self.reconcile().await {
                     tracing::warn!(error = %e, "fleet reconcile failed");
                 }

@@ -102,7 +102,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     ));
     fleets
         .clone()
-        .spawn_reconciler(std::time::Duration::from_secs(5));
+        .spawn_reconciler(std::time::Duration::from_secs(5), {
+            let lease = cluster.lease("fleets", musubi_cluster::DEAD_AFTER);
+            move || lease.held()
+        });
     let relayed = Arc::new(RelayedRegistry::new(cluster.node_id().0));
     let matches = Arc::new(MatchRegistry::new(Some(db.clone()), cluster.node_id().0));
     let wasm_mods = matches.register_wasm(&runtime);
@@ -119,10 +122,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Failover: adopt matches whose node stopped heartbeating.
     {
         let (cluster, matches, hub) = (cluster.clone(), matches.clone(), hub.clone());
+        let lease = cluster.lease("failover", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
             loop {
                 tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
                 let dead: Vec<uuid::Uuid> = match cluster.nodes().await {
                     Ok(nodes) => nodes.iter().filter(|n| !n.alive).map(|n| n.id.0).collect(),
                     Err(e) => {

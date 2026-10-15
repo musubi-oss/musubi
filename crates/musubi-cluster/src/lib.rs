@@ -3,6 +3,7 @@
 //! and gives multi-process presence/chat/notification fan-out today. The gossip membership, Raft
 //! control plane and QUIC bus from the design replace these pieces behind the same API.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -198,6 +199,81 @@ impl Cluster {
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusMessage> {
         self.bus_tx.subscribe()
+    }
+}
+
+/// A named cluster-wide lease: at most one live holder at a time. The holder renews it in the
+/// background; `held()` is the authoritative answer for "am I the leader for this duty right now".
+pub struct Lease {
+    name: String,
+    held: AtomicBool,
+}
+
+impl Lease {
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Cluster {
+    /// Compare-and-swap acquire/renew: succeeds if the lease is free, expired, or already ours.
+    pub async fn try_lease(&self, name: &str, ttl: Duration) -> Result<bool> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "insert into musubi.leases (name, holder, expires_at)
+             values ($1, $2, now() + make_interval(secs => $3))
+             on conflict (name) do update set holder = excluded.holder, expires_at = excluded.expires_at
+             where musubi.leases.holder = excluded.holder or musubi.leases.expires_at < now()
+             returning holder",
+        )
+        .bind(name)
+        .bind(self.me.id.0)
+        .bind(ttl.as_secs_f64())
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.is_some())
+    }
+
+    pub async fn release_lease(&self, name: &str) -> Result<()> {
+        sqlx::query("delete from musubi.leases where name = $1 and holder = $2")
+            .bind(name)
+            .bind(self.me.id.0)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Keeps trying to hold `name`, renewing every `ttl / 3`. A failed renewal (DB error or lost
+    /// CAS) drops `held()` to false immediately, so a partitioned holder stops acting before the
+    /// lease can be taken by someone else.
+    pub fn lease(self: &Arc<Self>, name: &str, ttl: Duration) -> Arc<Lease> {
+        let lease = Arc::new(Lease {
+            name: name.to_string(),
+            held: AtomicBool::new(false),
+        });
+        let (c, l) = (self.clone(), lease.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(ttl / 3);
+            loop {
+                tick.tick().await;
+                let held = match c.try_lease(&l.name, ttl).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(lease = %l.name, error = %e, "lease renewal failed");
+                        false
+                    }
+                };
+                if l.held.swap(held, Ordering::Relaxed) != held {
+                    tracing::info!(lease = %l.name, held, "lease state changed");
+                }
+            }
+        });
+        lease
     }
 }
 

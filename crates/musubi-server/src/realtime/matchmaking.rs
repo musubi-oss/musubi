@@ -53,6 +53,8 @@ pub fn process_and_deliver(relayed: &RelayedRegistry, mm: &Matchmaker, fanout: &
     }
 }
 
+pub const MATCHMAKER_LEASE_TTL: Duration = Duration::from_secs(6);
+
 /// Background pass so tickets that waited out `min_wait` still get matched without new arrivals.
 pub fn spawn_ticker(
     relayed: Arc<RelayedRegistry>,
@@ -63,24 +65,13 @@ pub fn spawn_ticker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
-        let mut n: u64 = 0;
+        // One matchmaker leader cluster-wide, by lease (short TTL so leadership moves fast).
+        let lease = cluster
+            .as_ref()
+            .map(|c| c.lease("matchmaker", MATCHMAKER_LEASE_TTL));
         loop {
             tick.tick().await;
-            // Leader = lowest id among live nodes; re-evaluated every 5 passes.
-            if let Some(c) = &cluster {
-                if n % 5 == 0 {
-                    match c.nodes().await {
-                        Ok(nodes) => {
-                            let leader = nodes.iter().filter(|x| x.alive).map(|x| x.id.0).min();
-                            fanout.set_leader(leader.is_none_or(|l| l == c.node_id().0));
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "node list failed; keeping leadership state")
-                        }
-                    }
-                }
-                n += 1;
-            }
+            fanout.set_leader(lease.as_ref().is_none_or(|l| l.held()));
             process_and_deliver(&relayed, &mm, &fanout);
         }
     })
