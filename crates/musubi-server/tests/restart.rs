@@ -334,3 +334,140 @@ async fn draining_node_hands_off_its_worlds() {
     assert_eq!(n, 2, "{alive}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Scoped keys and bans are replicated over the node bus: issued/revoked on one process, they
+/// take effect on another within a couple of seconds, without a restart.
+#[tokio::test]
+async fn keys_and_bans_replicate_across_processes() {
+    let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("musubi-repl-{}", uuid::Uuid::now_v7().simple()));
+    let group = format!("repl-{}", uuid::Uuid::now_v7().simple());
+    let mut nodes: Vec<Node> = (0..3)
+        .map(|i| Node {
+            http: free_port(false),
+            bus: free_port(true),
+            dir: root.join(format!("n{i}")),
+            child: None,
+        })
+        .collect();
+    for (i, n) in nodes.iter_mut().enumerate() {
+        spawn(n, &db, &group, &format!("n{i}"));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    wait_quorum(&client, &nodes).await;
+    let url = |n: &Node, path: &str| format!("http://127.0.0.1:{}{path}", n.http);
+
+    // a key issued on node 0 opens /v1/server on node 1 ...
+    let issued: Value = client
+        .post(url(&nodes[0], "/v1/admin/keys"))
+        .header("x-musubi-server-key", KEY)
+        .json(&serde_json::json!({ "name": "repl", "role": "server" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let secret = issued["secret"].as_str().unwrap().to_string();
+    let id = issued["id"].as_str().unwrap().to_string();
+    let status_with = |n: usize, key: String| {
+        let client = client.clone();
+        let u = url(&nodes[n], "/v1/server/events");
+        async move {
+            client
+                .get(u)
+                .header("x-musubi-server-key", key)
+                .send()
+                .await
+                .map(|r| r.status().as_u16())
+                .unwrap_or(0)
+        }
+    };
+    let until = |want: u16, n: usize, key: String| {
+        let status_with = &status_with;
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let st = status_with(n, key.clone()).await;
+                if st == want {
+                    return st;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "node {n} still answers {st}, wanted {want}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    assert_eq!(until(200, 1, secret.clone()).await, 200);
+    assert_eq!(until(200, 2, secret.clone()).await, 200);
+    // ... and is refused everywhere once revoked on node 0
+    let st = client
+        .delete(url(&nodes[0], &format!("/v1/admin/keys/{id}")))
+        .header("x-musubi-server-key", KEY)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(st.as_u16(), 200);
+    assert_eq!(until(401, 1, secret.clone()).await, 401);
+    assert_eq!(until(401, 2, secret.clone()).await, 401);
+
+    // a ban issued on node 0 bites a live JWT on node 1
+    let sess: Value = client
+        .post(url(&nodes[1], "/v1/auth/device"))
+        .json(&serde_json::json!({ "id": format!("repl-dev-{}", uuid::Uuid::now_v7().simple()) }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let me = |client: reqwest::Client, u: String, tok: String| async move {
+        client
+            .get(u)
+            .bearer_auth(tok)
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        me(client.clone(), url(&nodes[1], "/v1/account"), tok.clone()).await,
+        200
+    );
+    let st = client
+        .post(url(&nodes[0], &format!("/v1/admin/accounts/{acc}/ban")))
+        .header("x-musubi-server-key", KEY)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(st.as_u16(), 200);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let st = me(client.clone(), url(&nodes[1], "/v1/account"), tok.clone()).await;
+        if st == 403 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 1 still answers {st} for a banned account"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for n in nodes.iter_mut() {
+        if let Some(mut c) = n.child.take() {
+            let _ = c.kill().await;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
