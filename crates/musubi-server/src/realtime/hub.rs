@@ -27,6 +27,8 @@ pub struct Hub {
     sessions: DashMap<SessionId, SessionHandle>,
     /// resume token → the parked session loop waiting for a new connection
     parked: DashMap<String, tokio::sync::oneshot::Sender<Resumed>>,
+    /// session id → resume token of a parked session (so another node can steal it)
+    parked_sid: DashMap<SessionId, String>,
     by_account: DashMap<AccountId, HashSet<SessionId>>,
     /// target account → sessions that follow its status
     followers: DashMap<AccountId, HashSet<SessionId>>,
@@ -77,12 +79,22 @@ impl Hub {
     }
 
     /// Park a session that lost its transport; `resume` hands it the next connection.
-    pub fn park(&self, token: String, slot: tokio::sync::oneshot::Sender<Resumed>) {
+    pub fn park(&self, token: String, sid: SessionId, slot: tokio::sync::oneshot::Sender<Resumed>) {
+        self.parked_sid.insert(sid, token.clone());
         self.parked.insert(token, slot);
     }
 
     pub fn unpark(&self, token: &str) {
         self.parked.remove(token);
+        self.parked_sid.retain(|_, t| t != token);
+    }
+
+    /// Another node rebuilt this parked session from its record: drop our copy so its loop ends.
+    pub fn steal(&self, sid: SessionId) -> bool {
+        match self.parked_sid.remove(&sid) {
+            Some((_, token)) => self.parked.remove(&token).is_some(),
+            None => false,
+        }
     }
 
     /// Attach a new connection to a parked session; gives the connection back when the token is
@@ -93,7 +105,10 @@ impl Hub {
         resumed: Resumed,
     ) -> std::result::Result<(), Box<dyn musubi_transport::Connection>> {
         match self.parked.remove(token) {
-            Some((_, slot)) => slot.send(resumed).map_err(|r| r.conn),
+            Some((_, slot)) => {
+                self.parked_sid.retain(|_, t| t != token);
+                slot.send(resumed).map_err(|r| r.conn)
+            }
             None => Err(resumed.conn),
         }
     }

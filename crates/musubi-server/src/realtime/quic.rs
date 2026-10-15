@@ -72,7 +72,7 @@ async fn handle(state: AppState, conn: quinn::Connection) {
         if let Some(token) = h.resume.clone() {
             let encoding = connect::encoding_of(h).unwrap_or(musubi_proto::Encoding::Json);
             let c = Box::new(QuicConnection::new(conn.clone(), send, recv, max));
-            crate::realtime::resume_or_reject(&state.hub, &token, c, encoding).await;
+            connect::resume_any(&state, &token, c, encoding).await;
             let _ = tokio::time::timeout(Duration::from_millis(500), conn.closed()).await;
             conn.close(0u32.into(), b"bye");
             return;

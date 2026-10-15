@@ -43,6 +43,8 @@ enum Wire {
     },
     PartyCmd(PartyCmdEnv),
     SessionGone(SessionId),
+    /// A node rebuilt a parked resumable session from its record; the holder drops its copy.
+    SessionSteal(SessionId),
     /// Session count change of an account on a node (cluster-wide online set).
     Online {
         node: uuid::Uuid,
@@ -215,6 +217,10 @@ impl Fanout {
         self.publish(Wire::SessionGone(session_id));
     }
 
+    pub fn steal_session(&self, session_id: SessionId) {
+        self.publish(Wire::SessionSteal(session_id));
+    }
+
     /// Run a matchmaker pass right now (leader only; no-op elsewhere).
     pub fn matchmake_now(&self) {
         crate::realtime::matchmaking::process_and_deliver(&self.relayed, &self.mm, self);
@@ -323,6 +329,11 @@ impl Fanout {
                 leaves,
             }) => {
                 self.hub.notify_followers_local(target, joins, leaves);
+            }
+            Ok(Wire::SessionSteal(sid)) => {
+                if self.hub.steal(sid) {
+                    tracing::info!(session = %sid, "parked session taken over by another node");
+                }
             }
             Ok(Wire::Online {
                 node,

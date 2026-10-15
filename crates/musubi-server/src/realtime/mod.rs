@@ -8,6 +8,7 @@ pub mod matchmaking;
 pub mod party;
 pub mod quic;
 pub mod relayed;
+pub mod resume;
 mod session;
 pub mod wasm_match;
 pub mod world;

@@ -4204,3 +4204,113 @@ async fn presence_purged_when_node_leaves() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// A resumable session whose node is gone (or just not the one the client reached) is rebuilt on
+/// the node that receives `?resume=`: same session id, same token, follows replayed, and the old
+/// parked copy is stolen from the node that held it.
+#[tokio::test]
+async fn resume_rebuilds_session_on_another_node() {
+    let group = test_group();
+    let Some(state1) = build_state(true, &group).await else {
+        return;
+    };
+    let Some(state2) = build_state(false, &group).await else {
+        return;
+    };
+    let router1 = musubi_server::http::router(state1.clone());
+    let addr1 = router_addr(&state1).await;
+    let addr2 = router_addr(&state2).await;
+    let (ta, _) = token(&router1).await;
+    let (tb, acc_b) = token(&router1).await;
+    let (mut a, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr1}/ws?token={ta}&format=json&resumable=true"
+    ))
+    .await
+    .unwrap();
+    let ServerMessage::Session {
+        session_id,
+        resume_token,
+        resumed: false,
+    } = recv(&mut a).await.msg
+    else {
+        panic!("expected session hello");
+    };
+    send(
+        &mut a,
+        "json",
+        Some("f"),
+        ClientMessage::StatusFollow {
+            account_ids: vec![acc_b.parse().unwrap()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Status { .. }
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from musubi.resumable_sessions where session_id = $1")
+            .bind(uuid::Uuid::parse_str(&session_id).unwrap())
+            .fetch_one(&state1.db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1, "record written");
+
+    // transport lost on node 1: the session parks there and its record points at node 1
+    drop(a);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(state1.hub.parked_count(), 1);
+
+    // the client comes back through node 2
+    let (mut a2, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr2}/ws?resume={resume_token}&format=json"
+    ))
+    .await
+    .unwrap();
+    let hello = recv(&mut a2).await.msg;
+    let ServerMessage::Session {
+        session_id: sid2,
+        resume_token: tok2,
+        resumed: true,
+    } = hello
+    else {
+        panic!("expected resumed hello, got {hello:?}");
+    };
+    assert_eq!(sid2, session_id);
+    assert_eq!(tok2, resume_token);
+    // the follow was replayed...
+    assert!(matches!(
+        recv(&mut a2).await.msg,
+        ServerMessage::Status { .. }
+    ));
+    // ...so b's status change reaches the rebuilt session
+    let mut b = connect(&addr1, &tb, "json").await;
+    assert!(matches!(
+        recv(&mut a2).await.msg,
+        ServerMessage::StatusPresenceEvent { .. }
+    ));
+    send(
+        &mut b,
+        "json",
+        None,
+        ClientMessage::StatusUpdate {
+            status: Some("moved".into()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a2).await.msg,
+        ServerMessage::StatusPresenceEvent { .. }
+    ));
+    // node 1 dropped its parked copy
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state1.hub.parked_count() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parked copy not stolen"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

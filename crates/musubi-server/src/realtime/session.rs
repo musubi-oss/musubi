@@ -26,6 +26,12 @@ pub struct ConnectParams {
     pub resumable: bool,
     /// How long a session survives without a transport before it is torn down.
     pub resume_ttl: Duration,
+    /// Where resumable sessions keep their cross-node record (None = local resume only).
+    pub resume_store: Option<Arc<super::resume::ResumeStore>>,
+    /// Reuse this token (cross-node resume keeps the client's token).
+    pub resume_token: Option<String>,
+    /// Rebuild from this record: joins are replayed right after the `session` hello.
+    pub restore: Option<super::resume::ResumeRecord>,
     pub limits: Limits,
     pub chat: ChatService,
     pub matchmaker: Arc<Matchmaker>,
@@ -46,6 +52,9 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         mut encoding,
         resumable,
         resume_ttl,
+        resume_store,
+        resume_token: given_token,
+        restore,
         limits,
         chat,
         matchmaker,
@@ -79,20 +88,55 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         fanout: &fanout,
         presence: &presence,
         rate: &rate,
+        resume: None,
     };
-    let resume_token = resumable.then(|| {
-        format!(
-            "{}{}",
-            uuid::Uuid::now_v7().simple(),
-            uuid::Uuid::now_v7().simple()
-        )
+    let resume_token = given_token.or_else(|| {
+        resumable.then(|| {
+            format!(
+                "{}{}",
+                uuid::Uuid::now_v7().simple(),
+                uuid::Uuid::now_v7().simple()
+            )
+        })
     });
+    let tracker = match (&resume_store, &resume_token) {
+        (Some(store), Some(t)) => Some(super::resume::ResumeTracker::new(
+            store.clone(),
+            t,
+            presence.clone(),
+        )),
+        _ => None,
+    };
+    let ctx = Ctx {
+        resume: tracker.clone(),
+        ..ctx
+    };
     if let Some(t) = &resume_token {
         let _ = tx.try_send(ServerMessage::Session {
             session_id: sid.to_string(),
             resume_token: t.clone(),
-            resumed: false,
+            resumed: restore.is_some(),
         });
+    }
+    if let Some(rec) = restore {
+        if let Some(tr) = &tracker {
+            tr.seed(&rec).await;
+        }
+        let mut replay = rec.channels;
+        replay.extend(rec.matches);
+        if !rec.follows.is_empty() {
+            replay.push(ClientMessage::StatusFollow {
+                account_ids: rec.follows,
+            });
+        }
+        for m in replay {
+            if let Some(reply) = handle(&ctx, m).await {
+                let _ = tx.try_send(reply);
+            }
+        }
+    }
+    if let Some(tr) = &tracker {
+        tr.touch();
     }
     let result = loop {
         let exit = run_loop(
@@ -114,12 +158,18 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         // keep the session (subscriptions, matches, parties, buffered outbound) for resume_ttl
         conn.close().await;
         let (slot, wait) = tokio::sync::oneshot::channel();
-        hub.park(token.clone(), slot);
+        if let Some(tr) = &tracker {
+            tr.set_parked(true).await;
+        }
+        hub.park(token.clone(), sid, slot);
         info!(session = %sid, error = %err, ttl = ?resume_ttl, "realtime transport lost; parked for resume");
         match tokio::time::timeout(resume_ttl, wait).await {
             Ok(Ok(r)) => {
                 conn = r.conn;
                 encoding = r.encoding;
+                if let Some(tr) = &tracker {
+                    tr.set_parked(false).await;
+                }
                 if let Err(e) = send(
                     conn.as_mut(),
                     encoding,
@@ -154,6 +204,9 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     worlds.unsubscribe_all(sid);
     matches.leave_all(sid);
     hub.leave(sid);
+    if let Some(tr) = &tracker {
+        tr.forget();
+    }
     conn.close().await;
     match result {
         Exit::Lost(e) => debug!(session = %sid, error = %e, "realtime closed with error"),
@@ -204,6 +257,7 @@ struct Ctx<'a> {
     fanout: &'a Fanout,
     presence: &'a UserPresence,
     rate: &'a crate::limits::RateLimiter,
+    resume: Option<Arc<super::resume::ResumeTracker>>,
 }
 
 async fn run_loop(
@@ -297,7 +351,53 @@ async fn send(
     Ok(())
 }
 
+/// Dispatch a client message; joins and follows are mirrored into the resume record (if any).
 async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
+    let Some(tr) = &ctx.resume else {
+        return handle_inner(ctx, msg).await;
+    };
+    let join = match &msg {
+        ClientMessage::ChannelJoin { .. } | ClientMessage::MatchJoin { .. } => Some(msg.clone()),
+        _ => None,
+    };
+    let track: Option<(u8, Vec<AccountId>, Option<String>)> = match &msg {
+        ClientMessage::ChannelLeave { channel_id } => Some((1, vec![], Some(channel_id.clone()))),
+        ClientMessage::MatchLeave { match_id } => Some((2, vec![], Some(match_id.clone()))),
+        ClientMessage::StatusFollow { account_ids } => Some((3, account_ids.clone(), None)),
+        ClientMessage::StatusUnfollow { account_ids } => Some((4, account_ids.clone(), None)),
+        _ => None,
+    };
+    let reply = handle_inner(ctx, msg).await;
+    if matches!(reply, Some(ServerMessage::Error { .. })) {
+        return reply;
+    }
+    if let Some(join) = join {
+        let id = reply
+            .as_ref()
+            .and_then(|r| serde_json::to_value(r).ok())
+            .and_then(|v| {
+                v.get("channel_id")
+                    .or_else(|| v.get("match_id"))
+                    .and_then(|x| x.as_str().map(str::to_string))
+            });
+        if let Some(id) = id {
+            match join {
+                ClientMessage::ChannelJoin { .. } => tr.joined_channel(&id, join).await,
+                _ => tr.joined_match(&id, join).await,
+            }
+        }
+    }
+    match track {
+        Some((1, _, Some(id))) => tr.left_channel(&id).await,
+        Some((2, _, Some(id))) => tr.left_match(&id).await,
+        Some((3, ids, _)) => tr.followed(&ids).await,
+        Some((4, ids, _)) => tr.unfollowed(&ids).await,
+        _ => {}
+    }
+    reply
+}
+
+async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
     let hub = ctx.hub;
     let ctx_runtime = ctx.runtime;
     let sid = ctx.presence.session_id;

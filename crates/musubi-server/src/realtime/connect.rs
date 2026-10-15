@@ -63,6 +63,9 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         encoding,
         resumable: false,
         resume_ttl: std::time::Duration::from_secs(s.cfg.realtime.resume_ttl_secs),
+        resume_store: resume_store(s),
+        resume_token: None,
+        restore: None,
         limits: Limits::default(),
         rate: s.limits.clone(),
         chat: s.chat.clone(),
@@ -73,5 +76,77 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         worlds: s.worlds.clone(),
         runtime: s.runtime.clone(),
         fanout: s.fanout.clone(),
+    }
+}
+
+fn resume_store(s: &AppState) -> Option<std::sync::Arc<crate::realtime::resume::ResumeStore>> {
+    if s.cfg.realtime.resume_ttl_secs == 0 {
+        return None;
+    }
+    Some(std::sync::Arc::new(crate::realtime::resume::ResumeStore {
+        db: s.db.clone(),
+        node_id: s
+            .cluster
+            .as_ref()
+            .map(|c| c.node_id().0)
+            .unwrap_or_else(uuid::Uuid::nil),
+        group: s.cfg.node.cluster_group.clone(),
+        ttl: std::time::Duration::from_secs(s.cfg.realtime.resume_ttl_secs),
+    }))
+}
+
+/// `?resume=<token>`: re-attach to the parked session if this node holds it, otherwise rebuild it
+/// from its record (taking it over from whichever node last held it), or tell the client why not.
+pub async fn resume_any(
+    s: &AppState,
+    token: &str,
+    conn: Box<dyn musubi_transport::Connection>,
+    encoding: Encoding,
+) {
+    let conn = match s
+        .hub
+        .resume(token, crate::realtime::hub::Resumed { conn, encoding })
+    {
+        Ok(()) => return,
+        Err(conn) => conn,
+    };
+    let loaded = match resume_store(s) {
+        Some(store) => store.load(token).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "resume record lookup failed");
+            None
+        }),
+        None => None,
+    };
+    let Some((rec, holder, parked)) = loaded else {
+        crate::realtime::resume_or_reject(&s.hub, token, conn, encoding).await;
+        return;
+    };
+    // a live session on a live node keeps its token to itself; only a parked one or one whose
+    // node is gone can be taken over
+    if !parked && holder_alive(s, holder).await {
+        crate::realtime::resume_or_reject(&s.hub, token, conn, encoding).await;
+        return;
+    }
+    s.fanout.steal_session(rec.presence.session_id);
+    let mut params = params(s, rec.presence.clone(), encoding);
+    params.resumable = true;
+    params.resume_token = Some(token.to_string());
+    params.restore = Some(rec);
+    tracing::info!(session = %params.presence.session_id, "resumable session rebuilt from its record");
+    crate::realtime::serve(s.hub.clone(), conn, params).await;
+}
+
+async fn holder_alive(s: &AppState, holder: uuid::Uuid) -> bool {
+    match &s.cluster {
+        Some(c) => {
+            if c.node_id().0 == holder {
+                return true;
+            }
+            match c.nodes().await {
+                Ok(nodes) => nodes.iter().any(|n| n.id.0 == holder && n.alive),
+                Err(_) => true,
+            }
+        }
+        None => true,
     }
 }

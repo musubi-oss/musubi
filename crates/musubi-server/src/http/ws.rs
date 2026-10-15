@@ -48,7 +48,7 @@ async fn upgrade(
             .max_message_size(Limits::default().max_frame_bytes)
             .on_upgrade(move |socket| async move {
                 let conn = Box::new(WsConnection::new(socket));
-                crate::realtime::resume_or_reject(&hub, &token, conn, encoding).await;
+                crate::realtime::connect::resume_any(&s, &token, conn, encoding).await;
             }));
     }
     let (presence, encoding) = crate::realtime::connect::authorize(&s, &hello).await?;
