@@ -42,7 +42,9 @@ async fn build_state(leader: bool) -> Option<AppState> {
     let runtime = test_runtime();
     let cluster = test_cluster(&db).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
-    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new());
+    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
+        cluster.as_ref().unwrap().node_id().0,
+    ));
     let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new());
     let fanout = musubi_server::fanout::Fanout::new(
         hub.clone(),
@@ -1647,4 +1649,87 @@ async fn quic_transport_ping_and_rpc() {
     };
     let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
     assert!(matches!(r.msg, ServerMessage::Error { .. }));
+}
+
+#[tokio::test]
+async fn cross_node_party() {
+    let Some((addr1, router1)) = start().await else {
+        return;
+    };
+    let Some((addr2, _)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _) = token(&router1).await;
+    let (tb, acc_b) = token(&router1).await;
+    let mut a = connect(&addr1, &ta, f).await;
+    let mut b = connect(&addr2, &tb, f).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyCreate {
+            open: true,
+            max_size: 4,
+        },
+    )
+    .await;
+    let pid = match recv(&mut a).await.msg {
+        ServerMessage::Party { party_id, .. } => party_id,
+        m => panic!("{m:?}"),
+    };
+    // B lives on node 2; the party is homed on node 1
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyJoin {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::Party { presences, .. } if presences.len() == 2)
+    );
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::PartyPresenceEvent { joins, .. } if joins[0].account_id.to_string() == acc_b)
+    );
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyDataSend {
+            party_id: pid.clone(),
+            op_code: 7,
+            data: vec![9],
+        },
+    )
+    .await;
+    for ws in [&mut a, &mut b] {
+        assert!(
+            matches!(recv(ws).await.msg, ServerMessage::PartyData { op_code: 7, data, .. } if data == vec![9])
+        );
+    }
+    // leader-only op from a non-leader on the remote node is refused with an async error
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyClose {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::PermissionDenied,
+            ..
+        }
+    ));
+    // remote disconnect removes B from the party on the home node
+    b.close(None).await.unwrap();
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::PartyPresenceEvent { leaves, .. } if leaves.len() == 1)
+    );
 }

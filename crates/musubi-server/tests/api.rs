@@ -24,7 +24,9 @@ async fn app() -> Option<Router> {
     let runtime = test_runtime();
     let cluster = test_cluster(&db).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
-    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new());
+    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
+        cluster.as_ref().unwrap().node_id().0,
+    ));
     let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new());
     let fanout = musubi_server::fanout::Fanout::new(
         hub.clone(),

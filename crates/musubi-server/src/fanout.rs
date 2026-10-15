@@ -5,11 +5,12 @@ use std::sync::Arc;
 use musubi_cluster::{BusMessage, Cluster};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use musubi_core::AccountId;
+use musubi_core::{AccountId, SessionId};
 use musubi_matchmaker::{Matched, MatchedWire, Matchmaker, TicketWire};
 use musubi_proto::{ServerMessage, UserPresence};
 use serde::{Deserialize, Serialize};
 
+use crate::realtime::party::PartyCmdEnv;
 use crate::realtime::{Hub, PartyRegistry, RelayedRegistry};
 
 #[derive(Serialize, Deserialize)]
@@ -30,6 +31,12 @@ enum Wire {
     MmAdd(TicketWire),
     MmRemove(String),
     MmMatched(MatchedWire),
+    Session {
+        session_id: SessionId,
+        msg: ServerMessage,
+    },
+    PartyCmd(PartyCmdEnv),
+    SessionGone(SessionId),
 }
 
 const TOPIC: &str = "realtime";
@@ -100,6 +107,34 @@ impl Fanout {
         });
     }
 
+    /// Deliver to one session wherever it lives: locally if we have it, otherwise via the bus.
+    pub fn session(&self, session_id: SessionId, msg: ServerMessage) {
+        if !self.hub.send_to_session(session_id, msg.clone()) {
+            self.publish(Wire::Session { session_id, msg });
+        }
+    }
+
+    /// Forward a party command to the party's home node.
+    pub fn party_cmd(&self, env: PartyCmdEnv) {
+        self.publish(Wire::PartyCmd(env));
+    }
+
+    /// A session disconnected: every node drops it from parties homed there.
+    pub fn session_gone(&self, session_id: SessionId) {
+        self.publish(Wire::SessionGone(session_id));
+    }
+
+    /// Run a matchmaker pass right now (leader only; no-op elsewhere).
+    pub fn matchmake_now(&self) {
+        crate::realtime::matchmaking::process_and_deliver(
+            &self.hub,
+            &self.parties,
+            &self.relayed,
+            &self.mm,
+            self,
+        );
+    }
+
     pub fn is_leader(&self) -> bool {
         self.leader.load(Ordering::Relaxed)
     }
@@ -164,6 +199,29 @@ impl Fanout {
                 }
                 Err(e) => tracing::warn!(error = %e, "bad matched message"),
             },
+            Ok(Wire::Session { session_id, msg }) => {
+                self.hub.send_to_session(session_id, msg);
+            }
+            Ok(Wire::PartyCmd(env)) => {
+                if self.parties.is_home(&env.party_id) {
+                    if let Some(reply) = crate::realtime::party::exec(
+                        &self.parties,
+                        self,
+                        &self.mm,
+                        &env.me,
+                        &env.party_id,
+                        env.cmd,
+                    ) {
+                        self.session(env.me.session_id, reply);
+                    }
+                }
+            }
+            Ok(Wire::SessionGone(sid)) => {
+                for t in self.parties.leave_all(self, sid) {
+                    self.mm.cancel(&t);
+                    self.mm_remove(&t);
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "bad fanout message"),
         }
     }

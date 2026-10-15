@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::hub::SessionHandle;
+use super::party::{PartyCmd, PartyCmdEnv};
 use super::{Hub, MatchRegistry, PartyRegistry, RelayedRegistry};
 
 pub struct ConnectParams {
@@ -64,10 +65,11 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         presence: &presence,
     };
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
-    for t in parties.leave_all(&hub, sid) {
+    for t in parties.leave_all(&fanout, sid) {
         matchmaker.cancel(&t);
         fanout.mm_remove(&t);
     }
+    fanout.session_gone(sid);
     for t in matchmaker.remove_session(sid) {
         fanout.mm_remove(&t);
     }
@@ -244,61 +246,26 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                 .create(ctx.presence, open, max_size)
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
-        ClientMessage::PartyJoin { party_id } => {
-            match ctx.parties.join(hub, ctx.presence, &party_id) {
-                Ok(reply) => reply,
-                Err(e) => Some(ServerMessage::error(&e)),
-            }
+        ClientMessage::PartyJoin { party_id } => party_dispatch(ctx, &party_id, PartyCmd::Join),
+        ClientMessage::PartyLeave { party_id } => party_dispatch(ctx, &party_id, PartyCmd::Leave),
+        ClientMessage::PartyPromote { party_id, presence } => {
+            party_dispatch(ctx, &party_id, PartyCmd::Promote { who: presence })
         }
-        ClientMessage::PartyLeave { party_id } => match ctx.parties.leave(hub, sid, &party_id) {
-            Ok(tickets) => {
-                for t in tickets {
-                    ctx.matchmaker.cancel(&t);
-                    ctx.fanout.mm_remove(&t);
-                }
-                None
-            }
-            Err(e) => Some(ServerMessage::error(&e)),
-        },
-        ClientMessage::PartyPromote { party_id, presence } => ctx
-            .parties
-            .promote(hub, sid, &party_id, &presence)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
-        ClientMessage::PartyAccept { party_id, presence } => ctx
-            .parties
-            .accept(hub, sid, &party_id, &presence)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
-        ClientMessage::PartyRemove { party_id, presence } => ctx
-            .parties
-            .remove(hub, sid, &party_id, &presence)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
-        ClientMessage::PartyClose { party_id } => match ctx.parties.close(hub, sid, &party_id) {
-            Ok(tickets) => {
-                for t in tickets {
-                    ctx.matchmaker.cancel(&t);
-                    ctx.fanout.mm_remove(&t);
-                }
-                None
-            }
-            Err(e) => Some(ServerMessage::error(&e)),
-        },
-        ClientMessage::PartyJoinRequestList { party_id } => Some(
-            ctx.parties
-                .requests(sid, &party_id)
-                .unwrap_or_else(|e| ServerMessage::error(&e)),
-        ),
+        ClientMessage::PartyAccept { party_id, presence } => {
+            party_dispatch(ctx, &party_id, PartyCmd::Accept { who: presence })
+        }
+        ClientMessage::PartyRemove { party_id, presence } => {
+            party_dispatch(ctx, &party_id, PartyCmd::Remove { who: presence })
+        }
+        ClientMessage::PartyClose { party_id } => party_dispatch(ctx, &party_id, PartyCmd::Close),
+        ClientMessage::PartyJoinRequestList { party_id } => {
+            party_dispatch(ctx, &party_id, PartyCmd::RequestList)
+        }
         ClientMessage::PartyDataSend {
             party_id,
             op_code,
             data,
-        } => ctx
-            .parties
-            .data(hub, ctx.presence, &party_id, op_code, data)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
+        } => party_dispatch(ctx, &party_id, PartyCmd::Data { op_code, data }),
         ClientMessage::PartyMatchmakerAdd {
             party_id,
             min_count,
@@ -307,28 +274,20 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             string_properties,
             numeric_properties,
             count_multiple,
-        } => Some(
-            party_matchmake(
-                ctx,
-                &party_id,
+        } => party_dispatch(
+            ctx,
+            &party_id,
+            PartyCmd::MatchmakerAdd {
                 min_count,
                 max_count,
                 query,
                 string_properties,
                 numeric_properties,
                 count_multiple,
-            )
-            .unwrap_or_else(|e| ServerMessage::error(&e)),
+            },
         ),
         ClientMessage::PartyMatchmakerRemove { party_id, ticket } => {
-            match ctx.parties.untrack_ticket(sid, &party_id, &ticket) {
-                Ok(()) => {
-                    ctx.matchmaker.cancel(&ticket);
-                    ctx.fanout.mm_remove(&ticket);
-                    None
-                }
-                Err(e) => Some(ServerMessage::error(&e)),
-            }
+            party_dispatch(ctx, &party_id, PartyCmd::MatchmakerRemove { ticket })
         }
         ClientMessage::MatchCreate { name } => Some(
             ctx.relayed
@@ -545,52 +504,26 @@ fn ack_of(m: &musubi_proto::realtime::ChannelMessage) -> ServerMessage {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn party_matchmake(
-    ctx: &Ctx<'_>,
-    party_id: &str,
-    min_count: u32,
-    max_count: u32,
-    query: String,
-    string_properties: std::collections::HashMap<String, String>,
-    numeric_properties: std::collections::HashMap<String, f64>,
-    count_multiple: u32,
-) -> musubi_core::Result<ServerMessage> {
-    let sid = ctx.presence.session_id;
-    let members = ctx.parties.members_for_ticket(sid, party_id)?;
-    let candidates = members
-        .into_iter()
-        .map(|presence| MatchmakerUser {
-            presence,
-            string_properties: string_properties.clone(),
-            numeric_properties: numeric_properties.clone(),
-        })
-        .collect();
-    let ticket = ctx.matchmaker.add(AddTicket {
-        party_id: Some(party_id.to_string()),
-        members: candidates,
-        query,
-        min_count: min_count as usize,
-        max_count: max_count as usize,
-        count_multiple: count_multiple as usize,
-    })?;
-    ctx.parties.track_ticket(party_id, &ticket);
-    let msg = ServerMessage::PartyMatchmakerTicket {
-        party_id: party_id.to_string(),
-        ticket: ticket.clone(),
-    };
-    for s in ctx.parties.member_sessions(party_id) {
-        if s != sid {
-            ctx.hub.send_to_session(s, msg.clone());
-        }
+/// Run a party command here if this node is the party's home, otherwise forward it over the bus
+/// (the reply arrives asynchronously from the home node).
+fn party_dispatch(ctx: &Ctx<'_>, party_id: &str, cmd: PartyCmd) -> Option<ServerMessage> {
+    if super::party::home_of(party_id).is_none() {
+        return Some(ServerMessage::error(&Error::NotFound("party".into())));
     }
-    ctx.fanout.mm_add(&ticket);
-    super::matchmaking::process_and_deliver(
-        ctx.hub,
-        ctx.parties,
-        ctx.relayed,
-        ctx.matchmaker,
-        ctx.fanout,
-    );
-    Ok(msg)
+    if ctx.parties.is_home(party_id) {
+        return super::party::exec(
+            ctx.parties,
+            ctx.fanout,
+            ctx.matchmaker,
+            ctx.presence,
+            party_id,
+            cmd,
+        );
+    }
+    ctx.fanout.party_cmd(PartyCmdEnv {
+        party_id: party_id.to_string(),
+        me: ctx.presence.clone(),
+        cmd,
+    });
+    None
 }

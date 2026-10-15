@@ -61,7 +61,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let tournaments = TournamentService::new(db.clone());
     let hub = Arc::new(Hub::new());
     let matchmaker = Arc::new(Matchmaker::default());
-    let parties = Arc::new(PartyRegistry::new());
     let relayed = Arc::new(RelayedRegistry::new());
     let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
         fuel: cfg.runtime.fuel,
@@ -85,6 +84,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         &cfg.http.listen.to_string(),
     ));
     cluster.start().await?;
+    let parties = Arc::new(PartyRegistry::new(cluster.node_id().0));
     let matches = Arc::new(MatchRegistry::new(Some(db.clone()), cluster.node_id().0));
     let wasm_mods = matches.register_wasm(&runtime);
     if !wasm_mods.is_empty() {
