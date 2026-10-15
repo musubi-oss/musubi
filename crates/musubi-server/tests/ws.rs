@@ -129,10 +129,14 @@ async fn token(router: &axum::Router) -> (String, String) {
         .body(Body::from(body))
         .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
+    let status = res.status();
     let v: Value =
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     (
-        v["access_token"].as_str().unwrap().into(),
+        v["access_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("device auth failed: {status} {v}"))
+            .into(),
         v["account_id"].as_str().unwrap().into(),
     )
 }

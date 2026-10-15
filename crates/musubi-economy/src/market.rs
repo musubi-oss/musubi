@@ -624,6 +624,9 @@ impl EconomyService {
         }
         let now = OffsetDateTime::now_utc();
         if l.status != "open" || l.expires_at <= now {
+            // Release the row lock now: a lazily dropped transaction would make the settler skip
+            // this listing (`for update skip locked`).
+            tx.rollback().await.map_err(Error::internal)?;
             return Err(Error::Conflict(format!("listing is {}", l.status)));
         }
         if l.seller_id == buyer {
@@ -665,6 +668,9 @@ impl EconomyService {
         let l = Self::lock_listing_tx(&mut tx, id).await?;
         let now = OffsetDateTime::now_utc();
         if l.status != "open" || l.expires_at <= now {
+            // Release the row lock now: a lazily dropped transaction would make the settler skip
+            // this listing (`for update skip locked`).
+            tx.rollback().await.map_err(Error::internal)?;
             return Err(Error::Conflict(format!("listing is {}", l.status)));
         }
         if l.seller_id == bidder {
