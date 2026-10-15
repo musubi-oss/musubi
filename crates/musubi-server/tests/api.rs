@@ -89,6 +89,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         hub,
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         db,
@@ -4742,4 +4743,74 @@ async fn openapi_schemas_match_real_responses() {
     let (st, friends) = call(&app, "GET", "/v1/friends", Some(&tok), None).await;
     assert_eq!(st, StatusCode::OK, "{friends}");
     assert_required(&doc, "FriendList", &friends);
+}
+
+/// Issued keys carry a role: `server` keys reach /v1/server but not /v1/admin; revocation is
+/// immediate; the config key stays the bootstrap admin.
+#[tokio::test]
+async fn server_keys_are_scoped_and_revocable() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/keys",
+        "defaultkey",
+        Some(json!({"name": unique("ci-"), "role": "server"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let srv = v["secret"].as_str().unwrap().to_string();
+    let srv_id = v["id"].as_str().unwrap().to_string();
+    assert!(srv.starts_with("msk_"), "{srv}");
+    let (st, _) = call_server(&app, "GET", "/v1/server/events", &srv, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, e) = call_server(&app, "GET", "/v1/admin/keys", &srv, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/keys",
+        "defaultkey",
+        Some(json!({"name": unique("ops-"), "role": "admin"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let adm = v["secret"].as_str().unwrap().to_string();
+    let (st, list) = call_server(&app, "GET", "/v1/admin/keys", &adm, None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    assert!(list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k["id"] == srv_id && k["revoked_at"].is_null()));
+    assert!(
+        list.to_string().find("msk_").is_none(),
+        "secrets must not be listed"
+    );
+
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/keys/{srv_id}"),
+        &adm,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "GET", "/v1/server/events", &srv, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "revoked key must be rejected");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/keys/{srv_id}"),
+        &adm,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "GET", "/v1/server/events", "nope", None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
 }

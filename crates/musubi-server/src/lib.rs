@@ -7,6 +7,7 @@ pub mod db;
 pub mod events;
 pub mod fanout;
 pub mod http;
+pub mod keys;
 pub mod limits;
 pub mod metrics;
 pub mod modules;

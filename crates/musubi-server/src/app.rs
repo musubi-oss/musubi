@@ -57,6 +57,7 @@ pub struct AppState {
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
+    pub keys: Arc<crate::keys::ServerKeys>,
     /// Set on SIGTERM: `/readyz` answers 503 so load balancers stop routing here.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
     /// Fired by `POST /v1/admin/cluster/nodes/{id}/drain`: same path as SIGTERM.
@@ -321,6 +322,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cfg: Arc::new(cfg),
         events: Arc::new(crate::events::Events::new(db.clone())),
         banned: Arc::new(crate::bans::Bans::default()),
+        keys: Arc::new(crate::keys::ServerKeys::default()),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         db,
@@ -367,6 +369,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     crate::http::admin::start_drain_listener(state.clone());
     state.worlds.set_events(state.events.clone());
     crate::events::start_cluster_events(state.clone());
+    match state.keys.load(&state.db).await {
+        Ok(n) => info!(keys = n, "server keys loaded"),
+        Err(e) => tracing::warn!(error = %e, "server keys load failed"),
+    }
+    if let Some(c) = &state.cluster {
+        state.keys.start(c, state.db.clone());
+    }
     match state.banned.load(&state.db).await {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),

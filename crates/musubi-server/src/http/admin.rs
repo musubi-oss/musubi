@@ -30,6 +30,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/cluster/matches", get(cluster_matches))
         .route("/v1/admin/cluster/worlds", get(cluster_worlds))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
+        .route("/v1/admin/keys", get(keys_list).post(keys_issue))
+        .route("/v1/admin/keys/{id}", delete(keys_revoke))
         .route("/v1/admin/accounts", get(accounts))
         .route(
             "/v1/admin/accounts/{id}",
@@ -451,4 +453,45 @@ pub fn start_drain_listener(s: AppState) {
             }
         }
     });
+}
+
+#[derive(Deserialize)]
+struct IssueKey {
+    name: String,
+    role: crate::keys::Role,
+}
+
+async fn keys_list(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "keys": crate::keys::ServerKeys::list(&s.db).await? }),
+    ))
+}
+
+/// The secret is returned only here; store it on the caller's side.
+async fn keys_issue(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Json(b): Json<IssueKey>,
+) -> Result<Json<Value>, ApiError> {
+    let (caller, secret) = s.keys.issue(&s.db, &b.name, b.role).await?;
+    if let Some(c) = &s.cluster {
+        let _ = c.publish(crate::keys::KEYS_TOPIC, &caller.id).await;
+    }
+    Ok(Json(
+        json!({ "id": caller.id, "name": caller.name, "role": caller.role, "secret": secret }),
+    ))
+}
+
+async fn keys_revoke(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    if !s.keys.revoke(&s.db, id).await? {
+        return Err(Error::NotFound("key".into()).into());
+    }
+    if let Some(c) = &s.cluster {
+        let _ = c.publish(crate::keys::KEYS_TOPIC, &id).await;
+    }
+    Ok(Json(json!({ "revoked": id })))
 }

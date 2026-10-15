@@ -112,6 +112,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         cfg: Arc::new(cfg),
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         db,

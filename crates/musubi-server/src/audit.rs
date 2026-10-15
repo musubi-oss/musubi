@@ -62,8 +62,16 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
         .get("x-musubi-actor")
         .and_then(|v| v.to_str().ok())
         .filter(|a| !a.is_empty())
-        .unwrap_or("server-key")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            // issued keys are audited under their name; the config key stays `server-key`
+            req.headers()
+                .get("x-musubi-server-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|k| s.keys.lookup(k))
+                .map(|c| format!("key:{}", c.name))
+                .unwrap_or_else(|| "server-key".to_string())
+        });
     let ip = {
         let h = |n: &str| {
             req.headers()

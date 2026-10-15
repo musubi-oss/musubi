@@ -42,16 +42,26 @@ impl FromRequestParts<AppState> for ServerKey {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        check_server_key(state, &parts.headers)?;
+        let caller = check_server_key(state, &parts.headers)?;
+        if parts.uri.path().starts_with("/v1/admin/") && caller.role != crate::keys::Role::Admin {
+            return Err(Error::PermissionDenied(format!(
+                "key '{}' has role {}, admin required",
+                caller.name,
+                caller.role.as_str()
+            ))
+            .into());
+        }
+        parts.extensions.insert(caller);
         Ok(ServerKey)
     }
 }
 
-/// Constant-time comparison of `X-Musubi-Server-Key` against `http.server_key`.
+/// `X-Musubi-Server-Key`: the config key (constant-time compare, bootstrap admin) or a key issued
+/// through `/v1/admin/keys` with its role.
 pub fn check_server_key(
     state: &AppState,
     headers: &axum::http::HeaderMap,
-) -> musubi_core::Result<()> {
+) -> musubi_core::Result<crate::keys::Caller> {
     let given = headers
         .get("x-musubi-server-key")
         .and_then(|v| v.to_str().ok())
@@ -63,10 +73,14 @@ pub fn check_server_key(
             .zip(expected)
             .fold(0u8, |acc, (a, b)| acc | (a ^ b))
             == 0;
-    if !ok {
-        return Err(Error::Unauthenticated("bad server key".into()));
+    if ok {
+        return Ok(crate::keys::Caller::bootstrap());
     }
-    Ok(())
+    if let Some(c) = state.keys.lookup(given) {
+        state.keys.touch(Some(state.db.clone()), c.id);
+        return Ok(c);
+    }
+    Err(Error::Unauthenticated("bad server key".into()))
 }
 
 /// Best-effort client address: first `X-Forwarded-For` hop, then `X-Real-IP`, then the peer
