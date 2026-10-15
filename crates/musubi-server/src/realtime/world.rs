@@ -251,7 +251,7 @@ impl WorldRegistry {
     pub fn events(&self, name: &str, sim: Uuid) -> Result<Vec<Value>> {
         let w = self.get(name)?;
         let mut st = w.lock();
-        Ok(st.sim_events.entry(sim).or_default().drain(..).collect())
+        Ok(std::mem::take(st.sim_events.entry(sim).or_default()))
     }
 
     pub fn handover_ack(&self, name: &str, sim: Uuid, entity: &str) -> Result<Value> {
@@ -310,9 +310,8 @@ impl WorldRegistry {
         let w = self.get(name)?;
         let mut st = w.lock();
         let ev = json!({"type": "input", "entity": id, "session": sid, "input": input});
-        match st.world.route_input(id, ev.clone()).map_err(mesh_err)? {
-            Some(sim) => push_event(&mut st, sim, ev),
-            None => {}
+        if let Some(sim) = st.world.route_input(id, ev.clone()).map_err(mesh_err)? {
+            push_event(&mut st, sim, ev);
         }
         Ok(())
     }

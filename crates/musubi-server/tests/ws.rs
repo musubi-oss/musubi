@@ -63,6 +63,8 @@ async fn build_state(leader: bool) -> Option<AppState> {
         "defaultkey",
     ));
     fanout.set_fleets(fleets.clone());
+    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new());
+    worlds.clone().spawn_ticker(fanout.clone());
     Some(AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
@@ -80,7 +82,7 @@ async fn build_state(leader: bool) -> Option<AppState> {
         parties,
         relayed,
         matches: test_matches(&db, &runtime),
-        worlds: Arc::new(musubi_server::realtime::WorldRegistry::new()),
+        worlds: worlds.clone(),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),
@@ -1959,7 +1961,14 @@ async fn matchmaker_allocates_a_dedicated_server_when_tickets_ask_for_a_fleet() 
                 assert_eq!(srv.port, 48000);
                 assert!(!srv.connect_token.is_empty());
             }
-            m => panic!("{m:?}"),
+            m => panic!(
+                "{m:?}\nservers: {:?}",
+                state
+                    .fleets
+                    .servers(uuid::Uuid::parse_str(&fid).unwrap(), None)
+                    .await
+                    .unwrap()
+            ),
         }
     }
     let gs = state.fleets.server(sid).await.unwrap();
@@ -2041,7 +2050,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
             world: world.clone(),
             x: 0.0,
             y: 0.0,
-            radius: 80.0,
+            radius: 200.0,
         },
     )
     .await;

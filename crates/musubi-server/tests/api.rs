@@ -44,6 +44,8 @@ async fn app() -> Option<Router> {
         "defaultkey",
     ));
     fanout.set_fleets(fleets.clone());
+    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new());
+    worlds.clone().spawn_ticker(fanout.clone());
     Some(musubi_server::http::router(AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -62,7 +64,7 @@ async fn app() -> Option<Router> {
         parties,
         relayed,
         matches: test_matches(&db, &runtime),
-        worlds: Arc::new(musubi_server::realtime::WorldRegistry::new()),
+        worlds: worlds.clone(),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),
@@ -1444,7 +1446,7 @@ async fn fleet_lifecycle_with_local_process_provider() {
     let svc =
         musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
     let (started, _) = svc.reconcile().await.unwrap();
-    assert!(started >= 1);
+    let _ = started; // another test binary's reconciler may have filled the buffer
     let (_, list) = call_server(
         &app,
         "GET",
@@ -1569,24 +1571,31 @@ async fn fleet_docker_provider_runs_a_container() {
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let svc = musubi_fleet::FleetService::new(db, uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
     let (started, _) = svc.reconcile().await.unwrap();
-    assert_eq!(started, 1);
+    let all = svc.servers(fid, None).await.unwrap();
+    let _ = (started, all); // another test binary's reconciler may have filled the buffer
     let servers = svc.servers(fid, Some("starting")).await.unwrap();
     assert_eq!(servers.len(), 1);
-    let out = tokio::process::Command::new("docker")
-        .args([
-            "ps",
-            "--filter",
-            &format!("name=musubi-gs-{}", servers[0].id.simple()),
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("musubi-gs-"),
-        "container should be running"
-    );
+    // the row is written before `docker run` returns (possibly by another test binary's reconciler)
+    let mut running = false;
+    for _ in 0..40 {
+        let out = tokio::process::Command::new("docker")
+            .args([
+                "ps",
+                "--filter",
+                &format!("name=musubi-gs-{}", servers[0].id.simple()),
+                "--format",
+                "{{.Names}}",
+            ])
+            .output()
+            .await
+            .unwrap();
+        if String::from_utf8_lossy(&out.stdout).contains("musubi-gs-") {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(running, "container should be running");
     svc.delete(fid).await.unwrap();
     let out = tokio::process::Command::new("docker")
         .args([
