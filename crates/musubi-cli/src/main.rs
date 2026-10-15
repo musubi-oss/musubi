@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+mod bench;
+
 use clap::{Parser, Subcommand};
 use musubi_core::config::Config;
 
@@ -33,6 +35,20 @@ enum Cmd {
         #[arg(long, default_value = "toml")]
         format: String,
     },
+    /// Load-test a running server: device auth per client, then http | storage | ws | all loops;
+    /// prints p50/p95/p99 latencies, throughput and errors.
+    Bench {
+        #[arg(long, default_value = "http://127.0.0.1:7350")]
+        url: String,
+        #[arg(long, default_value_t = 50)]
+        clients: usize,
+        #[arg(long, default_value_t = 10)]
+        duration_secs: u64,
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -59,6 +75,22 @@ async fn main() -> anyhow::Result<()> {
             musubi_server::init_tracing(&cfg);
             let pool = musubi_server::db::connect(&cfg.database).await?;
             musubi_server::db::migrate(&pool).await
+        }
+        Cmd::Bench {
+            url,
+            clients,
+            duration_secs,
+            scenario,
+            json,
+        } => {
+            bench::run(bench::Opts {
+                url,
+                clients,
+                duration: std::time::Duration::from_secs(duration_secs),
+                scenario,
+                json,
+            })
+            .await
         }
         Cmd::Config { format } => {
             let out = match format.as_str() {
