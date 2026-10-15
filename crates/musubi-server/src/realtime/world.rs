@@ -283,9 +283,11 @@ impl WorldRegistry {
         .await
         .map_err(Error::internal)?;
         let mut out = Vec::new();
-        for (name, cfg, ctl) in rows {
+        // adopt concurrently: each world costs a snapshot + journal read and a Raft directory
+        // write, and a dead node may have owned many
+        let adopted = futures::future::join_all(rows.into_iter().map(|(name, cfg, ctl)| async move {
             if self.worlds.contains_key(&name) {
-                continue;
+                return Ok(None);
             }
             let cfg: WorldConfig = serde_json::from_value(cfg)?;
             let ctl: ControllerConfig = serde_json::from_value(ctl)?;
@@ -343,7 +345,13 @@ impl WorldRegistry {
                 )
                 .await;
             }
-            out.push(name);
+            Ok::<Option<String>, Error>(Some(name))
+        }))
+        .await;
+        for r in adopted {
+            if let Some(name) = r? {
+                out.push(name);
+            }
         }
         Ok(out)
     }

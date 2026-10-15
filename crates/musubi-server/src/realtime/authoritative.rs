@@ -194,7 +194,11 @@ impl MatchRegistry {
         .await
         .map_err(Error::internal)?;
         let mut out = Vec::new();
-        for (id, module, label, params, state, tick) in rows {
+        // adopt concurrently: journal reads and module launches are independent per match
+        let hub_ref = &hub;
+        let adopted = futures::future::join_all(rows.into_iter().map(
+            |(id, module, label, params, state, tick)| async move {
+                let hub = hub_ref.clone();
             let journal: Vec<(serde_json::Value,)> = sqlx::query_as(
                 "select entries from musubi.match_journal where match_id = $1 and tick_to > $2 order by tick_from",
             )
@@ -223,9 +227,19 @@ impl MatchRegistry {
             match self.launch(hub.clone(), &module, params, Some(MatchId(id)), Some(snap)) {
                 Ok(h) => {
                     self.emit("match.resumed", serde_json::json!({ "match_id": h.id, "module": module, "node_id": self.node_id }));
-                    out.push(h.id.to_string())
+                    Ok(Some(h.id.to_string()))
                 }
-                Err(e) => tracing::warn!(match_id = %id, error = %e, "could not resume match"),
+                Err(e) => {
+                    tracing::warn!(match_id = %id, error = %e, "could not resume match");
+                    Ok::<Option<String>, Error>(None)
+                }
+            }
+        },
+        ))
+        .await;
+        for r in adopted {
+            if let Some(id) = r? {
+                out.push(id);
             }
         }
         Ok(out)
