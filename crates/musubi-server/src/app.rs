@@ -353,6 +353,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     };
     crate::runtime_host::install(&state);
     if let Some(c) = state.cluster.clone() {
+        state.limits.start_gossip(c);
+    }
+    if let Some(c) = state.cluster.clone() {
         let ev = state.events.clone();
         let lease = c.lease("webhooks", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {

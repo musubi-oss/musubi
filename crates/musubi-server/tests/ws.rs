@@ -3422,3 +3422,58 @@ async fn admin_kick_closes_realtime_sessions() {
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(v["realtime_sessions"], 0, "socket closed and left the hub");
 }
+
+/// Consumption gossip makes a rate-limit budget cluster-wide: an account that spends its burst on
+/// node 1 is refused on node 2 once the usage has travelled over the bus.
+#[tokio::test]
+async fn rate_limits_are_cluster_wide_over_the_bus() {
+    let group = test_group();
+    let Some(mut n1) = build_state(false, &group).await else {
+        return;
+    };
+    let Some(mut n2) = build_state(false, &group).await else {
+        return;
+    };
+    let cfg = musubi_core::config::LimitsConfig {
+        enabled: true,
+        http_per_second_per_account: 1,
+        http_burst: 10,
+        cluster_wide: true,
+        ..Default::default()
+    };
+    for n in [&mut n1, &mut n2] {
+        n.limits = Arc::new(musubi_server::limits::RateLimiter::new(&cfg));
+        n.limits.start_gossip(n.cluster.clone().unwrap());
+    }
+    // let the two buses discover each other
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let alive = n1.cluster.as_ref().unwrap().nodes().await.unwrap().len();
+        if alive >= 2 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "peers never met");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let id = musubi_core::AccountId(uuid::Uuid::now_v7());
+    for _ in 0..10 {
+        n1.limits.account(id).unwrap();
+    }
+    assert!(n1.limits.account(id).is_err());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if n2.limits.account(id).is_err() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2 never learned node 1's consumption"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    // an unrelated account on node 2 is unaffected
+    assert!(n2
+        .limits
+        .account(musubi_core::AccountId(uuid::Uuid::now_v7()))
+        .is_ok());
+}

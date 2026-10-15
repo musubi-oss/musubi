@@ -245,6 +245,8 @@ pub struct LimitsConfig {
     /// Inbound realtime messages per account.
     pub socket_per_second: u32,
     pub socket_burst: u32,
+    /// Share consumption between nodes over the bus so a budget is cluster-wide, not per node.
+    pub cluster_wide: bool,
 }
 
 impl Default for LimitsConfig {
@@ -258,6 +260,7 @@ impl Default for LimitsConfig {
             rpc_burst: 40,
             socket_per_second: 60,
             socket_burst: 120,
+            cluster_wide: true,
         }
     }
 }
