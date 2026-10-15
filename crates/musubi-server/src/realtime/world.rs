@@ -24,6 +24,8 @@ use crate::fanout::Fanout;
 
 pub const TICK_HZ: u64 = 30;
 pub const MAX_SIM_EVENTS: usize = 4096;
+/// Persistent entities are snapshotted this often (ticks); 30 Hz → every 5 s.
+const SNAPSHOT_EVERY: u64 = 150;
 /// Controller pass every N ticks (1 s at 30 Hz).
 pub const CONTROL_EVERY: u64 = 30;
 
@@ -139,6 +141,86 @@ impl WorldRegistry {
         if let Err(e) = c.directory_write(op).await {
             tracing::warn!(world = name, error = %e, "world directory write failed");
         }
+    }
+
+    async fn write_snapshot(
+        db: &PgPool,
+        name: &str,
+        entities: Vec<musubi_mesh::Entity>,
+        tick: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into musubi.world_snapshots (name, entities, tick, updated_at) values ($1, $2, $3, now())
+             on conflict (name) do update set entities = excluded.entities, tick = excluded.tick, updated_at = now()",
+        )
+        .bind(name)
+        .bind(serde_json::to_value(&entities)?)
+        .bind(tick as i64)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Write the world's persistent entities to the snapshot store now (the ticker also does it
+    /// every `SNAPSHOT_EVERY` ticks).
+    pub async fn snapshot_now(&self, name: &str) -> Result<()> {
+        let Some(db) = &self.db else { return Ok(()) };
+        let (entities, tick) = {
+            let w = self.get(name)?;
+            let st = w.lock();
+            (st.world.snapshot_persistent(), st.world.tick)
+        };
+        Self::write_snapshot(db, name, entities, tick).await
+    }
+
+    /// Adopt worlds whose home node is dead (or gone from the node table): claim the directory row
+    /// atomically, rebuild the world from its config and the last snapshot. Returns adopted names.
+    pub async fn recover(&self, dead_nodes: &[Uuid]) -> Result<Vec<String>> {
+        let Some(db) = &self.db else {
+            return Ok(vec![]);
+        };
+        let rows: Vec<(String, Value, Value)> = sqlx::query_as(
+            "update musubi.worlds w set node_id = $2
+             where w.node_id <> $2
+               and (w.node_id = any($1) or not exists (select 1 from musubi.nodes n where n.id = w.node_id))
+             returning name, config, controller",
+        )
+        .bind(dead_nodes)
+        .bind(self.node_id)
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
+        let mut out = Vec::new();
+        for (name, cfg, ctl) in rows {
+            let cfg: WorldConfig = serde_json::from_value(cfg)?;
+            let ctl: ControllerConfig = serde_json::from_value(ctl)?;
+            let snap: Option<(Value, i64)> =
+                sqlx::query_as("select entities, tick from musubi.world_snapshots where name = $1")
+                    .bind(&name)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(Error::internal)?;
+            let mut world = World::new(cfg);
+            if let Some((ents, tick)) = snap {
+                let ents: Vec<musubi_mesh::Entity> = serde_json::from_value(ents)?;
+                world.restore(ents);
+                world.tick = tick as u64;
+            }
+            self.worlds.insert(
+                name.clone(),
+                Arc::new(Mutex::new(WorldState {
+                    world,
+                    controller: Controller::new(ctl),
+                    subs: HashMap::new(),
+                    sim_events: HashMap::new(),
+                })),
+            );
+            self.homes.insert(name.clone(), self.node_id);
+            self.publish_home(&name, Some(self.node_id)).await;
+            out.push(name);
+        }
+        Ok(out)
     }
 
     pub fn node_id(&self) -> Uuid {
@@ -511,6 +593,17 @@ impl WorldRegistry {
             let st = &mut *st;
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
+            if st.world.tick % SNAPSHOT_EVERY == 0 {
+                if let Some(db) = self.db.clone() {
+                    let (entities, tick, n) =
+                        (st.world.snapshot_persistent(), st.world.tick, name.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::write_snapshot(&db, &n, entities, tick).await {
+                            tracing::warn!(world = %n, error = %e, "world snapshot failed");
+                        }
+                    });
+                }
+            }
             if st.world.tick % CONTROL_EVERY == 0 {
                 let moves = st.controller.reconcile(&mut st.world);
                 for a in &moves {

@@ -3305,3 +3305,75 @@ async fn iap_apple_and_google_receipts_redeem_once() {
         "already revoked receipts are skipped"
     );
 }
+
+/// Persistent entities survive the home node: registry 2 adopts the world from the snapshot,
+/// becomes its home and keeps only what was marked persistent.
+#[tokio::test]
+async fn world_snapshots_persist_and_recover_on_another_node() {
+    let Some(url) = std::env::var("MUSUBI_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    migrate_once(&db).await;
+    let (n1, n2) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone()));
+    let name = format!("w-{}", n1.simple());
+    r1.create(
+        &name,
+        musubi_mesh::WorldConfig::default(),
+        musubi_mesh::controller::ControllerConfig::default(),
+    )
+    .await
+    .unwrap();
+    let sim = uuid::Uuid::now_v7();
+    r1.register_sim(&name, sim, 8).unwrap();
+    let keep = r1
+        .spawn(
+            &name,
+            sim,
+            musubi_mesh::Pos { x: 1.0, y: 1.0 },
+            json!({"hp": 10}),
+            true,
+        )
+        .unwrap();
+    r1.spawn(
+        &name,
+        sim,
+        musubi_mesh::Pos { x: 2.0, y: 2.0 },
+        json!({}),
+        false,
+    )
+    .unwrap();
+    assert_eq!(r1.info(&name).unwrap().entities, 2);
+    r1.snapshot_now(&name).await.unwrap();
+
+    let r2 = musubi_server::realtime::WorldRegistry::new(n2, Some(db.clone()));
+    // n1 never heartbeated into musubi.nodes, so the world counts as orphaned even without an
+    // explicit dead list (full-cluster restart case)
+    let adopted = r2.recover(&[]).await.unwrap();
+    assert_eq!(adopted, vec![name.clone()]);
+    assert!(r2.recover(&[n1]).await.unwrap().is_empty(), "already ours");
+    assert_eq!(r2.home_of(&name).await.unwrap(), Some(n2));
+    let info = r2.info(&name).unwrap();
+    assert_eq!(info.entities, 1, "only the persistent entity is restored");
+    let cell = musubi_mesh::CellId { x: 0, y: 0 };
+    let view = r2.view(&name, cell).unwrap();
+    let s = view.to_string();
+    assert!(s.contains(&keep.id), "{s}");
+    assert!(s.contains("\"hp\""), "{s}");
+    // n2 is a live node now, so a third registry has nothing left to claim
+    sqlx::query("insert into musubi.nodes (id, name, cluster_group) values ($1, 'n2', $2)")
+        .bind(n2)
+        .bind(name.clone())
+        .execute(&db)
+        .await
+        .unwrap();
+    let r3 = musubi_server::realtime::WorldRegistry::new(uuid::Uuid::now_v7(), Some(db.clone()));
+    assert!(r3.recover(&[n1]).await.unwrap().is_empty());
+    r2.delete(&name).await.unwrap();
+    sqlx::query("delete from musubi.nodes where id = $1")
+        .bind(n2)
+        .execute(&db)
+        .await
+        .unwrap();
+}

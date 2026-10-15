@@ -185,6 +185,38 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(db.clone()),
     ));
     worlds.set_cluster(cluster.clone());
+    let adopted = worlds.recover(&[]).await?;
+    if !adopted.is_empty() {
+        tracing::info!(count = adopted.len(), "adopted orphaned worlds");
+    }
+    // World failover: adopt worlds whose home node died (one adopter at a time).
+    {
+        let (cluster, worlds) = (cluster.clone(), worlds.clone());
+        let lease = cluster.lease("world-failover", musubi_cluster::DEAD_AFTER);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
+            loop {
+                tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
+                let dead: Vec<uuid::Uuid> = match cluster.nodes().await {
+                    Ok(nodes) => nodes.iter().filter(|n| !n.alive).map(|n| n.id.0).collect(),
+                    Err(_) => continue,
+                };
+                if dead.is_empty() {
+                    continue;
+                }
+                match worlds.recover(&dead).await {
+                    Ok(names) if !names.is_empty() => {
+                        tracing::info!(?names, ?dead, "adopted worlds from dead nodes")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "world failover failed"),
+                }
+            }
+        });
+    }
     fanout.set_worlds(worlds.clone());
     let liveops = cfg.zanshin.url.as_deref().map(|u| {
         let c = ZanshinClient::new(u, &cfg.zanshin.server_key);
