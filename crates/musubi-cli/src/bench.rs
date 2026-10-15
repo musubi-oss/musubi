@@ -47,7 +47,16 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-fn ws_url(http: &str) -> String {
+/// Serialised `ping` envelope, shared with `musubi soak`.
+pub(crate) fn ping_text() -> String {
+    serde_json::to_string(&Envelope {
+        cid: None,
+        msg: ClientMessage::Ping,
+    })
+    .unwrap()
+}
+
+pub(crate) fn ws_url(http: &str) -> String {
     let base = http.trim_end_matches('/');
     let ws = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -59,7 +68,7 @@ fn ws_url(http: &str) -> String {
     format!("{ws}/ws")
 }
 
-async fn auth(http: &reqwest::Client, url: &str, id: &str) -> anyhow::Result<String> {
+pub(crate) async fn auth(http: &reqwest::Client, url: &str, id: &str) -> anyhow::Result<String> {
     let v: Value = http
         .post(format!("{url}/v1/auth/device"))
         .json(&json!({ "id": id }))
@@ -143,11 +152,7 @@ async fn ws_loop(url: String, token: String, deadline: Instant, tx: mpsc::Unboun
         return;
     };
     let throttled_code = musubi_core::Error::ResourceExhausted(String::new()).code();
-    let ping = serde_json::to_string(&Envelope {
-        cid: None,
-        msg: ClientMessage::Ping,
-    })
-    .unwrap();
+    let ping = ping_text();
     while Instant::now() < deadline {
         let t = Instant::now();
         if ws

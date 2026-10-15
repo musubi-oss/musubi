@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 mod bench;
 mod doctor;
+mod soak;
 mod transfer;
 
 use clap::{Parser, Subcommand};
@@ -69,6 +70,33 @@ enum Cmd {
         duration_secs: u64,
         #[arg(long, default_value = "all")]
         scenario: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Chaos/soak stand: spawn a local cluster of `musubi-server` processes on one Postgres, put
+    /// WS + storage clients on it, SIGKILL or drain random nodes every `kill_every_secs` and
+    /// restart them; reports failover and world re-home times, client errors, reconnects and lost
+    /// writes.
+    Soak {
+        /// Postgres the spawned nodes share (needs an empty-ish database you do not care about).
+        #[arg(long, env = "MUSUBI_SOAK_DATABASE_URL")]
+        database_url: String,
+        /// Path to the `musubi-server` binary (default: next to this executable).
+        #[arg(long)]
+        server_bin: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 3)]
+        nodes: usize,
+        #[arg(long, default_value_t = 24)]
+        clients: usize,
+        #[arg(long, default_value_t = 6)]
+        worlds: usize,
+        #[arg(long, default_value_t = 60)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 10)]
+        kill_every_secs: u64,
+        /// kill | drain | mixed
+        #[arg(long, default_value = "mixed")]
+        mode: String,
         #[arg(long)]
         json: bool,
     },
@@ -154,6 +182,30 @@ async fn main() -> anyhow::Result<()> {
                 clients,
                 duration: std::time::Duration::from_secs(duration_secs),
                 scenario,
+                json,
+            })
+            .await
+        }
+        Cmd::Soak {
+            database_url,
+            server_bin,
+            nodes,
+            clients,
+            worlds,
+            duration_secs,
+            kill_every_secs,
+            mode,
+            json,
+        } => {
+            soak::run(soak::Opts {
+                database_url,
+                server_bin,
+                nodes,
+                clients,
+                worlds,
+                duration: std::time::Duration::from_secs(duration_secs),
+                kill_every: std::time::Duration::from_secs(kill_every_secs),
+                mode,
                 json,
             })
             .await
