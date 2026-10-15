@@ -20,7 +20,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
-    cfg.database.max_connections = 4;
+    cfg.database.max_connections = 3;
     cfg.market.anti_snipe_secs = 0;
     tweak(&mut cfg);
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
@@ -4386,7 +4386,7 @@ async fn modules_hot_load_over_admin_api() {
     // a node starting later picks the module up from the database
     let mut cfg = Config::default();
     cfg.database.url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
-    cfg.database.max_connections = 2;
+    cfg.database.max_connections = 3;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     let fresh = Arc::new(musubi_runtime::Runtime::new(musubi_runtime::Limits::default()).unwrap());
     let m = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
@@ -4614,7 +4614,7 @@ async fn match_failover_replays_the_journal() {
     };
     let mut cfg = Config::default();
     cfg.database.url = url;
-    cfg.database.max_connections = 2;
+    cfg.database.max_connections = 3;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let node_a = uuid::Uuid::now_v7();
@@ -5400,8 +5400,14 @@ async fn trace_id_is_returned_on_errors() {
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    let sub = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+    let sub = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+    );
+    // Other tests in this binary may have hit the request-span callsite under the no-op
+    // subscriber while our dispatcher was being registered, caching it as disabled; force a
+    // recomputation so the scoped subscriber definitely sees the span.
+    tracing::callsite::rebuild_interest_cache();
     let (st, v) = call(&app, "GET", "/v1/account", Some("not-a-token"), None)
         .with_subscriber(sub)
         .await;
