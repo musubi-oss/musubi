@@ -40,6 +40,9 @@ struct ListQuery {
     limit: i64,
     #[serde(default)]
     cursor: Option<String>,
+    /// JSON object; only objects whose value contains it are listed (`value @> where`).
+    #[serde(default, rename = "where")]
+    filter: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -93,14 +96,21 @@ async fn list(
     Path(collection): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListResp>, ApiError> {
+    let filter = q
+        .filter
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|e| musubi_core::Error::InvalidArgument(format!("where: {e}")))?;
     let (objects, cursor) = s
         .storage
-        .list(
+        .list_where(
             Caller::User(me.account_id),
             &collection,
             q.owner_id,
             q.limit,
             q.cursor.as_deref(),
+            filter.as_ref(),
         )
         .await?;
     Ok(Json(ListResp { objects, cursor }))

@@ -141,7 +141,27 @@ impl StorageService {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<(Vec<Object>, Option<String>)> {
+        self.list_where(caller, collection, owner_id, limit, cursor, None)
+            .await
+    }
+
+    /// `list` with an optional JSONB containment filter: only objects whose `value` contains
+    /// `filter` (`value @> filter`, served by the GIN index) are returned.
+    pub async fn list_where(
+        &self,
+        caller: Caller,
+        collection: &str,
+        owner_id: Option<Uuid>,
+        limit: i64,
+        cursor: Option<&str>,
+        filter: Option<&serde_json::Value>,
+    ) -> Result<(Vec<Object>, Option<String>)> {
         validate_name(collection, "collection")?;
+        if let Some(f) = filter {
+            if !f.is_object() {
+                return Err(Error::InvalidArgument("where must be a JSON object".into()));
+            }
+        }
         let limit = limit.clamp(1, 100);
         let after_key = cursor.map(decode_cursor).transpose()?;
         // Users list their own objects by default; another owner's collection shows public objects only.
@@ -155,6 +175,7 @@ impl StorageService {
             "select {COLS} from musubi.storage_objects
              where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
                and ($4::text is null or (owner_id, key) > ($5::uuid, $4))
+               and ($7::jsonb is null or value @> $7)
              order by owner_id, key limit $6"
         ))
         .bind(collection)
@@ -163,6 +184,7 @@ impl StorageService {
         .bind(after_key.as_ref().map(|c| c.1.as_str()))
         .bind(after_key.as_ref().map(|c| c.0).unwrap_or(SYSTEM_OWNER))
         .bind(limit + 1)
+        .bind(filter)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;

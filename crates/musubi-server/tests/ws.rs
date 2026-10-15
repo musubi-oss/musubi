@@ -3331,9 +3331,10 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
         return;
     };
     let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let group = test_group();
     migrate_once(&db).await;
     let (n1, n2) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone()));
+    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone())).with_group(&group);
     let name = format!("w-{}", n1.simple());
     r1.create(
         &name,
@@ -3364,7 +3365,7 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
     assert_eq!(r1.info(&name).unwrap().entities, 2);
     r1.snapshot_now(&name).await.unwrap();
 
-    let r2 = musubi_server::realtime::WorldRegistry::new(n2, Some(db.clone()));
+    let r2 = musubi_server::realtime::WorldRegistry::new(n2, Some(db.clone())).with_group(&group);
     // n1 never heartbeated into musubi.nodes, so the world counts as orphaned even without an
     // explicit dead list (full-cluster restart case)
     let adopted = r2.recover(&[]).await.unwrap();
@@ -3385,7 +3386,8 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
         .execute(&db)
         .await
         .unwrap();
-    let r3 = musubi_server::realtime::WorldRegistry::new(uuid::Uuid::now_v7(), Some(db.clone()));
+    let r3 = musubi_server::realtime::WorldRegistry::new(uuid::Uuid::now_v7(), Some(db.clone()))
+        .with_group(&group);
     assert!(r3.recover(&[n1]).await.unwrap().is_empty());
     r2.delete(&name).await.unwrap();
     sqlx::query("delete from musubi.nodes where id = $1")
@@ -3683,9 +3685,10 @@ async fn world_journal_is_replayed_on_rehome() {
         return;
     };
     let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let group = test_group();
     migrate_once(&db).await;
     let n1 = uuid::Uuid::now_v7();
-    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone()));
+    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone())).with_group(&group);
     let name = format!("wj-{}", n1.simple());
     r1.create(
         &name,
@@ -3736,7 +3739,8 @@ async fn world_journal_is_replayed_on_rehome() {
         .unwrap();
     assert_eq!(rows, 1);
 
-    let r2 = musubi_server::realtime::WorldRegistry::new(uuid::Uuid::now_v7(), Some(db.clone()));
+    let r2 = musubi_server::realtime::WorldRegistry::new(uuid::Uuid::now_v7(), Some(db.clone()))
+        .with_group(&group);
     assert_eq!(r2.recover(&[]).await.unwrap(), vec![name.clone()]);
     assert_eq!(r2.info(&name).unwrap().entities, 2, "keep + late, not gone");
     let view = r2

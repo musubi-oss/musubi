@@ -4862,3 +4862,65 @@ async fn retention_purges_old_rows_only() {
             .unwrap();
     assert_eq!(kinds, vec![format!("{tag}.new")]);
 }
+
+/// `?where=` lists only objects whose value contains the given JSON (served by a GIN index).
+#[tokio::test]
+async fn storage_list_where_filters_by_value() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("sw-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let col = unique("inv");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&tok),
+        Some(json!({"objects": [
+            {"collection": col, "key": "sword", "value": {"kind": "weapon", "level": 5, "tags": ["fire"]}},
+            {"collection": col, "key": "shield", "value": {"kind": "armor", "level": 5}},
+            {"collection": col, "key": "potion", "value": {"kind": "consumable", "level": 1}}
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let q = |w: &str| format!("/v1/storage/{col}?where={}", urlencoding(w));
+    let (st, v) = call(&app, "GET", &q(r#"{"level":5}"#), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let keys: Vec<&str> = v["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["shield", "sword"], "{v}");
+    let (st, v) = call(&app, "GET", &q(r#"{"tags":["fire"]}"#), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["objects"].as_array().unwrap().len(), 1);
+    let (st, _) = call(&app, "GET", &q("[1,2]"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(&app, "GET", &q("not json"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+fn urlencoding(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
