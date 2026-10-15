@@ -4,9 +4,9 @@
 //! Provide `LogStore`, which is a in-memory implementation of `RaftLogStore` for demonstration
 //! purpose only.
 
+use redb::ReadableTable;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::Write;
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,8 +42,20 @@ pub struct LogStoreInner<C: RaftTypeConfig> {
 
     /// The current granted vote.
     vote: Option<Vote<C::NodeId>>,
-    /// Durable copy (`meta.json` + `log.jsonl`); `None` = memory only.
-    dir: Option<PathBuf>,
+    /// Durable copy (`log.redb`: `log` table index → entry JSON, `meta` table vote/committed/purged);
+    /// `None` = memory only.
+    db: Option<redb::Database>,
+}
+
+const LOG: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("log");
+const META: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("meta");
+
+fn rdb(e: impl Into<redb::Error>) -> std::io::Error {
+    std::io::Error::other(e.into())
+}
+
+fn bad(e: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,16 +64,6 @@ struct Meta<N: openraft::NodeId> {
     vote: Option<Vote<N>>,
     committed: Option<LogId<N>>,
     purged: Option<LogId<N>>,
-}
-
-fn write_atomic(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_data()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 impl<C: RaftTypeConfig> LogStore<C>
@@ -74,21 +76,32 @@ where
         let mut inner = LogStoreInner::<C>::default();
         if let Some(dir) = dir {
             std::fs::create_dir_all(&dir)?;
-            if let Ok(bytes) = std::fs::read(dir.join("meta.json")) {
-                let m: Meta<C::NodeId> = serde_json::from_slice(&bytes)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                inner.vote = m.vote;
-                inner.committed = m.committed;
-                inner.last_purged_log_id = m.purged;
+            let db = redb::Database::create(dir.join("log.redb")).map_err(rdb)?;
+            {
+                let w = db.begin_write().map_err(rdb)?;
+                w.open_table(LOG).map_err(rdb)?;
+                w.open_table(META).map_err(rdb)?;
+                w.commit().map_err(rdb)?;
             }
-            if let Ok(text) = std::fs::read_to_string(dir.join("log.jsonl")) {
-                for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    let e: C::Entry = serde_json::from_str(line)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    inner.log.insert(e.get_log_id().index, e);
+            let r = db.begin_read().map_err(rdb)?;
+            {
+                let meta = r.open_table(META).map_err(rdb)?;
+                if let Some(m) = meta.get("meta").map_err(rdb)? {
+                    let m: Meta<C::NodeId> = serde_json::from_slice(m.value()).map_err(bad)?;
+                    inner.vote = m.vote;
+                    inner.committed = m.committed;
+                    inner.last_purged_log_id = m.purged;
+                }
+                let log = r.open_table(LOG).map_err(rdb)?;
+                for item in log.iter().map_err(rdb)? {
+                    let (k, v) = item.map_err(rdb)?;
+                    let e: C::Entry = serde_json::from_slice(v.value()).map_err(bad)?;
+                    inner.log.insert(k.value(), e);
                 }
             }
-            inner.dir = Some(dir);
+            drop(r);
+            inner.db = Some(db);
+            inner.import_legacy(&dir)?;
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -104,46 +117,95 @@ where
         openraft::StorageIOError::write_logs(&e).into()
     }
 
+    /// One-time import of the pre-redb layout (`meta.json` + `log.jsonl`) into an empty database;
+    /// the old files are renamed `*.migrated` afterwards.
+    fn import_legacy(&mut self, dir: &std::path::Path) -> std::io::Result<()>
+    where
+        C::Entry: DeserializeOwned,
+    {
+        let (meta_p, log_p) = (dir.join("meta.json"), dir.join("log.jsonl"));
+        if !meta_p.exists() && !log_p.exists() {
+            return Ok(());
+        }
+        if self.log.is_empty() && self.vote.is_none() {
+            if let Ok(bytes) = std::fs::read(&meta_p) {
+                let m: Meta<C::NodeId> = serde_json::from_slice(&bytes).map_err(bad)?;
+                self.vote = m.vote;
+                self.committed = m.committed;
+                self.last_purged_log_id = m.purged;
+            }
+            if let Ok(text) = std::fs::read_to_string(&log_p) {
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    let e: C::Entry = serde_json::from_str(line).map_err(bad)?;
+                    self.log.insert(e.get_log_id().index, e);
+                }
+            }
+            let all: Vec<&C::Entry> = self.log.values().collect();
+            self.append_disk(&all).map_err(std::io::Error::other)?;
+            self.persist_meta().map_err(std::io::Error::other)?;
+            tracing::info!(
+                entries = all.len(),
+                "raft log imported from jsonl into redb"
+            );
+        }
+        for p in [meta_p, log_p] {
+            if p.exists() {
+                let mut moved = p.clone().into_os_string();
+                moved.push(".migrated");
+                let _ = std::fs::rename(&p, moved);
+            }
+        }
+        Ok(())
+    }
+
     fn persist_meta(&self) -> Result<(), StorageError<C::NodeId>> {
-        let Some(dir) = &self.dir else { return Ok(()) };
+        let Some(db) = &self.db else { return Ok(()) };
         let m = Meta::<C::NodeId> {
             vote: self.vote.clone(),
             committed: self.committed.clone(),
             purged: self.last_purged_log_id.clone(),
         };
-        let bytes = serde_json::to_vec(&m)
-            .map_err(|e| Self::io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        write_atomic(&dir.join("meta.json"), &bytes).map_err(Self::io_err)
+        let bytes = serde_json::to_vec(&m).map_err(|e| Self::io_err(bad(e)))?;
+        let w = db.begin_write().map_err(|e| Self::io_err(rdb(e)))?;
+        w.open_table(META)
+            .map_err(|e| Self::io_err(rdb(e)))?
+            .insert("meta", bytes.as_slice())
+            .map_err(|e| Self::io_err(rdb(e)))?;
+        w.commit().map_err(|e| Self::io_err(rdb(e)))
     }
 
     fn append_disk(&self, entries: &[&C::Entry]) -> Result<(), StorageError<C::NodeId>> {
-        let Some(dir) = &self.dir else { return Ok(()) };
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("log.jsonl"))
-            .map_err(Self::io_err)?;
-        for e in entries {
-            let line = serde_json::to_vec(e).map_err(|e| {
-                Self::io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })?;
-            f.write_all(&line).map_err(Self::io_err)?;
-            f.write_all(b"\n").map_err(Self::io_err)?;
+        let Some(db) = &self.db else { return Ok(()) };
+        let w = db.begin_write().map_err(|e| Self::io_err(rdb(e)))?;
+        {
+            let mut t = w.open_table(LOG).map_err(|e| Self::io_err(rdb(e)))?;
+            for e in entries {
+                let bytes = serde_json::to_vec(e).map_err(|e| Self::io_err(bad(e)))?;
+                t.insert(e.get_log_id().index, bytes.as_slice())
+                    .map_err(|e| Self::io_err(rdb(e)))?;
+            }
         }
-        f.sync_data().map_err(Self::io_err)
+        w.commit().map_err(|e| Self::io_err(rdb(e)))
     }
 
-    /// Rewrite `log.jsonl` from memory (after truncate/purge).
-    fn rewrite_disk(&self) -> Result<(), StorageError<C::NodeId>> {
-        let Some(dir) = &self.dir else { return Ok(()) };
-        let mut buf = Vec::new();
-        for e in self.log.values() {
-            serde_json::to_writer(&mut buf, e).map_err(|e| {
-                Self::io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })?;
-            buf.push(b'\n');
+    /// Delete a range of indexes on disk (truncate = `from..`, purge = `..=upto`): one
+    /// transaction, no rewrite of the whole log.
+    fn remove_disk(
+        &self,
+        range: impl std::ops::RangeBounds<u64>,
+    ) -> Result<(), StorageError<C::NodeId>> {
+        let Some(db) = &self.db else { return Ok(()) };
+        let w = db.begin_write().map_err(|e| Self::io_err(rdb(e)))?;
+        {
+            let mut t = w.open_table(LOG).map_err(|e| Self::io_err(rdb(e)))?;
+            let drained = t
+                .extract_from_if(range, |_, _| true)
+                .map_err(|e| Self::io_err(rdb(e)))?;
+            for item in drained {
+                item.map_err(|e| Self::io_err(rdb(e)))?;
+            }
         }
-        write_atomic(&dir.join("log.jsonl"), &buf).map_err(Self::io_err)
+        w.commit().map_err(|e| Self::io_err(rdb(e)))
     }
 }
 
@@ -154,7 +216,7 @@ impl<C: RaftTypeConfig> Default for LogStoreInner<C> {
             log: BTreeMap::new(),
             committed: None,
             vote: None,
-            dir: None,
+            db: None,
         }
     }
 }
@@ -256,7 +318,7 @@ where
             self.log.remove(&key);
         }
 
-        self.rewrite_disk()
+        self.remove_disk(log_id.index..)
     }
 
     async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
@@ -277,7 +339,7 @@ where
             }
         }
 
-        self.rewrite_disk()?;
+        self.remove_disk(..=log_id.index)?;
         self.persist_meta()
     }
 }
@@ -420,6 +482,47 @@ mod tests {
         let got = store.try_get_log_entries(2..=4).await.unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].log_id.index, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A data_dir written by the JSONL layout is imported into redb on first open and the old
+    /// files are set aside.
+    #[tokio::test]
+    async fn legacy_jsonl_layout_is_imported() {
+        let dir = std::env::temp_dir().join(format!("musubi-raft-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = Meta::<u64> {
+            vote: Some(Vote::new(2, 9)),
+            committed: Some(log_id(2, 9, 2)),
+            purged: None,
+        };
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let mut lines = String::new();
+        for i in 1..=3u64 {
+            let e: Entry<TypeConfig> = Entry {
+                log_id: log_id(2, 9, i),
+                payload: EntryPayload::Normal(DirectoryOp::Set {
+                    key: format!("k{i}"),
+                    value: serde_json::json!(i),
+                }),
+            };
+            lines.push_str(&serde_json::to_string(&e).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(dir.join("log.jsonl"), lines).unwrap();
+
+        let mut store = LogStore::<TypeConfig>::open(Some(dir.clone())).unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(2, 9)));
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(log_id(2, 9, 3))
+        );
+        assert!(dir.join("log.redb").exists());
+        assert!(!dir.join("log.jsonl").exists() && dir.join("log.jsonl.migrated").exists());
+        drop(store);
+        // second open reads redb only
+        let mut store = LogStore::<TypeConfig>::open(Some(dir.clone())).unwrap();
+        assert_eq!(store.try_get_log_entries(1..=3).await.unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
