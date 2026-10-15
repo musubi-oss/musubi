@@ -3480,3 +3480,57 @@ async fn rate_limits_are_cluster_wide_over_the_bus() {
         .account(musubi_core::AccountId(uuid::Uuid::now_v7()))
         .is_ok());
 }
+
+/// `/readyz` reflects the real state: ready once the database, migrations and Raft leader are in
+/// place; 503 with `draining=true` once the node starts draining.
+#[tokio::test]
+async fn readyz_reports_db_migrations_raft_and_draining() {
+    let group = test_group();
+    let Some(state) = build_state(false, &group).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let probe = |router: axum::Router| async move {
+        let res = router
+            .oneshot(
+                axum::http::Request::get("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let body: serde_json::Value = serde_json::from_slice(
+            &http_body_util::BodyExt::collect(res.into_body())
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        (status, body)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    let body = loop {
+        let (status, body) = probe(router.clone()).await;
+        assert_eq!(body["checks"]["db"], true, "{body}");
+        assert_eq!(body["checks"]["migrations"], true, "{body}");
+        assert_eq!(body["checks"]["draining"], false, "{body}");
+        if status == 200 {
+            break body;
+        }
+        assert_eq!(body["checks"]["raft"], false, "only raft may lag: {body}");
+        assert!(std::time::Instant::now() < deadline, "never ready: {body}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    };
+    assert_eq!(body["status"], "ok");
+    // null = Raft not enabled on this node; true = leader known
+    let raft = &body["checks"]["raft"];
+    assert!(raft.is_null() || *raft == true, "{body}");
+    state
+        .draining
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (status, body) = probe(router).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["checks"]["draining"], true);
+    assert_eq!(body["status"], "unavailable");
+}

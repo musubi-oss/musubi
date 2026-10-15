@@ -70,17 +70,51 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// Readiness for load balancers / Kubernetes: 200 only when the database answers, every embedded
+/// migration is applied, the Raft group (when enabled) has a leader, and the node is not draining.
 async fn readyz(State(s): State<AppState>) -> Response {
-    if s.draining.load(std::sync::atomic::Ordering::Relaxed) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
-    }
-    match sqlx::query_scalar::<_, i32>("select 1")
-        .fetch_one(&s.db)
+    let draining = s.draining.load(std::sync::atomic::Ordering::Relaxed);
+    let db_timeout = std::time::Duration::from_secs(2);
+    let db = tokio::time::timeout(
+        db_timeout,
+        sqlx::query_scalar::<_, i32>("select 1").fetch_one(&s.db),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    let migrations = if db {
+        tokio::time::timeout(
+            db_timeout,
+            sqlx::query_scalar::<_, i64>("select count(*) from _sqlx_migrations where success")
+                .fetch_one(&s.db),
+        )
         .await
-    {
-        Ok(_) => (StatusCode::OK, "ok").into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("db: {e}")).into_response(),
-    }
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|n| n as usize >= crate::db::MIGRATOR.migrations.len())
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    // `None` = Raft not enabled on this node (no bus); only a leaderless group is a failure.
+    let raft = match &s.cluster {
+        Some(c) if c.raft_id() != 0 => Some(c.raft_leader().is_some()),
+        _ => None,
+    };
+    let ready = !draining && db && migrations && raft.unwrap_or(true);
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "status": if ready { "ok" } else { "unavailable" },
+            "checks": { "db": db, "migrations": migrations, "raft": raft, "draining": draining },
+        })),
+    )
+        .into_response()
 }
 
 async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
