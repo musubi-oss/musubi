@@ -4,6 +4,7 @@ mod chat;
 mod cluster;
 mod error;
 mod extract;
+mod fleets;
 mod friends;
 mod groups;
 mod leaderboards;
@@ -43,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .merge(rpc::routes())
         .merge(cluster::routes())
         .merge(matches::routes())
+        .merge(fleets::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

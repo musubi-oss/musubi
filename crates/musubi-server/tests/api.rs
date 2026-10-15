@@ -57,6 +57,12 @@ async fn app() -> Option<Router> {
         matches: test_matches(&db, &runtime),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
+        fleets: Arc::new(musubi_fleet::FleetService::new(
+            db.clone(),
+            cluster.as_ref().unwrap().node_id().0,
+            "http://127.0.0.1:0",
+            "defaultkey",
+        )),
         fanout,
         hub,
         db,
@@ -1387,4 +1393,135 @@ fn test_matches(
     let m = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
     assert_eq!(m.register_wasm(runtime), vec!["demo"]);
     Arc::new(m)
+}
+
+#[tokio::test]
+async fn fleet_lifecycle_with_local_process_provider() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("fleet");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "local", "buffer": 1, "max_servers": 2,
+            "port_start": 47000, "port_end": 47100,
+            "spec": {"command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({"name": name, "provider": "local", "max_servers": 1, "spec": {"command": ["sleep", "1"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // no ready server yet
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    // reconcile is normally the background task; run a pass through the service used by the router
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let node: Option<uuid::Uuid> = None;
+    let _ = node;
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let (started, _) = svc.reconcile().await.unwrap();
+    assert!(started >= 1);
+    let (_, list) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let servers = list["servers"].as_array().unwrap();
+    let mine: Vec<&Value> = servers
+        .iter()
+        .filter(|s| s["state"] == "starting")
+        .collect();
+    assert_eq!(mine.len(), 1, "{list}");
+    let sid = mine[0]["id"].as_str().unwrap().to_string();
+    assert!(mine[0]["pid"].as_i64().is_some());
+    // the game server reports ready through the SDK surface
+    let req = Request::post("/v1/gameserver/ready")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let (st, a) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({"payload": {"match": "m1"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["server_id"], sid);
+    assert_eq!(a["port"], 47000);
+    let tok = a["connect_token"].as_str().unwrap().to_string();
+    // the game server validates the one-time connect token
+    let req = Request::post("/v1/gameserver/connect")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"token": tok}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["payload"]["match"], "m1");
+    let req = Request::post("/v1/gameserver/connect")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"token": tok}).to_string()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let (_, gs) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(gs["state"], "in_game");
+    // shutdown kills the process (via the service that owns it) and marks it terminated
+    svc.sdk_shutdown(uuid::Uuid::parse_str(&sid).unwrap())
+        .await
+        .unwrap();
+    let (_, gs) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(gs["state"], "terminated");
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
 }

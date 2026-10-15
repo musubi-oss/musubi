@@ -1740,6 +1740,21 @@ name = "musubi-edge"
 version = "0.1.0"
 
 [[package]]
+name = "musubi-fleet"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "musubi-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "musubi-leaderboard"
 version = "0.1.0"
 dependencies = [
@@ -1808,6 +1823,7 @@ dependencies = [
  "musubi-chat",
  "musubi-cluster",
  "musubi-core",
+ "musubi-fleet",
  "musubi-leaderboard",
  "musubi-matchmaker",
  "musubi-proto",

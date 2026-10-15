@@ -5,6 +5,7 @@ use musubi_auth::AuthService;
 use musubi_chat::ChatService;
 use musubi_cluster::Cluster;
 use musubi_core::config::Config;
+use musubi_fleet::FleetService;
 use musubi_leaderboard::{LeaderboardService, TournamentService};
 use musubi_matchmaker::Matchmaker;
 use musubi_runtime::Runtime;
@@ -40,6 +41,7 @@ pub struct AppState {
     pub matches: Arc<MatchRegistry>,
     pub runtime: Arc<Runtime>,
     pub cluster: Option<Arc<Cluster>>,
+    pub fleets: Arc<FleetService>,
     pub fanout: Fanout,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
@@ -84,6 +86,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     ));
     cluster.start().await?;
     let parties = Arc::new(PartyRegistry::new(cluster.node_id().0));
+    let fleets = Arc::new(FleetService::new(
+        db.clone(),
+        cluster.node_id().0,
+        &format!("http://{}", cfg.http.listen),
+        &cfg.http.server_key,
+    ));
+    fleets
+        .clone()
+        .spawn_reconciler(std::time::Duration::from_secs(5));
     let relayed = Arc::new(RelayedRegistry::new(cluster.node_id().0));
     let matches = Arc::new(MatchRegistry::new(Some(db.clone()), cluster.node_id().0));
     let wasm_mods = matches.register_wasm(&runtime);
@@ -159,6 +170,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         matches,
         runtime,
         cluster: Some(cluster),
+        fleets,
         fanout,
         hub,
         started_at: std::time::Instant::now(),

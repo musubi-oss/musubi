@@ -75,6 +75,12 @@ async fn build_state(leader: bool) -> Option<AppState> {
         matches: test_matches(&db, &runtime),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
+        fleets: Arc::new(musubi_fleet::FleetService::new(
+            db.clone(),
+            cluster.as_ref().unwrap().node_id().0,
+            "http://127.0.0.1:0",
+            "defaultkey",
+        )),
         fanout,
         hub,
         cfg: Arc::new(cfg),
