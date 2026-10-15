@@ -67,14 +67,17 @@ worlds, 7 incidents in total:
 
 | incident | survivors drop the node | worlds homed elsewhere | restarted node back |
 |---|---|---|---|
-| SIGKILL (follower or leader) | 5.6 – 6.6 s | 11 – 12 s | ~1.1 s |
+| SIGKILL (follower or leader) | 4.8 – 8.7 s | 5.7 – 9.3 s | 1.1 – 2.0 s |
 | drain via admin API | 0.1 s | 3 – 5 s | 0.2 – 1.2 s |
 
 Storage: 33 287 verified writes, 0 errors, 0 lost writes. WS: 17 445 pings answered, 17 sessions
 cut by a kill or drain and reconnected fresh (a session parked for resume dies with its process, so
-`resumed` is 0 by construction here). The SIGKILL numbers are SWIM's suspect timeout plus the
-failover tick; a drained node announces its departure, so its worlds move an order of magnitude
-faster.
+`resumed` is 0 by construction here). The SIGKILL numbers are SWIM's suspect timeout plus one
+failover round, which now starts the moment the death verdict lands (it used to wait for the next
+15 s tick, making it 11 – 12 s); a drained node announces its departure, so its worlds move an order
+of magnitude faster. Open item: in two of roughly twenty kills on this VM the re-home did not settle
+within the 60 s budget; the stand now dumps Raft/world/member state of the survivors when that
+happens so it can be chased down.
 
 The stand already paid for itself: its first runs showed that a node restarted with the same identity
 after a crash was never seen alive again by the survivors (a SWIM "dead" verdict was terminal per node

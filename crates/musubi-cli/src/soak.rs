@@ -600,6 +600,21 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             }
             if t0.elapsed() > budget {
                 timed_out = true;
+                for (i, n) in nodes.iter().enumerate() {
+                    if i == victim {
+                        continue;
+                    }
+                    let raft = get(&client, &n.url(), "/v1/server/cluster/raft").await;
+                    let ws = get(&client, &n.url(), "/v1/admin/cluster/worlds").await;
+                    let mems = get(&client, &n.url(), "/v1/server/cluster/nodes").await;
+                    eprintln!(
+                        "[soak] diag {}: raft={} worlds={} nodes={}",
+                        n.name,
+                        raft.unwrap_or(Value::Null),
+                        ws.unwrap_or(Value::Null),
+                        mems.unwrap_or(Value::Null)
+                    );
+                }
                 break f64::NAN;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

@@ -196,8 +196,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
             let mut leaves = cluster.subscribe();
+            let mut members = cluster.member_events();
             loop {
-                wait_failover_round(&mut tick, &mut leaves).await;
+                wait_failover_round(&mut tick, &mut leaves, &mut members).await;
                 if !await_lease(&lease).await {
                     continue;
                 }
@@ -274,8 +275,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
             let mut leaves = cluster.subscribe();
+            let mut members = cluster.member_events();
             loop {
-                wait_failover_round(&mut tick, &mut leaves).await;
+                wait_failover_round(&mut tick, &mut leaves, &mut members).await;
                 if !await_lease(&lease).await {
                     continue;
                 }
@@ -532,13 +534,24 @@ async fn await_lease(lease: &musubi_cluster::Lease) -> bool {
 }
 
 /// Next failover round: the periodic tick, or immediately when a node announces it is leaving.
+/// A failover round runs on the periodic tick, right after a peer announces it is leaving, or as
+/// soon as SWIM declares a peer dead (so a crash is handled at detection time, not at the next tick).
 async fn wait_failover_round(
     tick: &mut tokio::time::Interval,
     leaves: &mut tokio::sync::broadcast::Receiver<musubi_cluster::BusMessage>,
+    members: &mut tokio::sync::broadcast::Receiver<musubi_cluster::MemberEvent>,
 ) {
     loop {
         tokio::select! {
             _ = tick.tick() => return,
+            m = members.recv() => match m {
+                Ok(m) if m.state == "dead" => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => {
+                    tick.tick().await;
+                    return;
+                }
+            },
             m = leaves.recv() => match m {
                 Ok(m) if m.topic == musubi_cluster::LEAVE_TOPIC => {
                     // let the leaver finish disowning its matches/worlds

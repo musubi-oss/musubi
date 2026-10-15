@@ -512,6 +512,35 @@ async fn killed_node_rejoins_with_same_identity() {
             .and_then(|n| n["state"].as_str().map(str::to_string))
     };
 
+    // a world homed on the victim: its re-home must follow the death verdict, not the 15 s tick
+    let world = format!("w-{}", uuid::Uuid::now_v7().simple());
+    let res = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/server/worlds",
+            nodes[victim].http
+        ))
+        .header("x-musubi-server-key", KEY)
+        .json(&serde_json::json!({ "name": world, "config": {}, "controller": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let key = format!("world:{world}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let v = get(
+            &client,
+            &nodes[other],
+            &format!("/v1/server/cluster/directory/{key}"),
+        )
+        .await;
+        if v.as_ref().and_then(|v| v["value"]["node_id"].as_str()) == Some(ids[victim].as_str()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "directory not replicated: {v:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
     let mut child = nodes[victim].child.take().unwrap();
     child.kill().await.unwrap();
     let _ = child.wait().await;
@@ -530,6 +559,24 @@ async fn killed_node_rejoins_with_same_identity() {
             "victim never declared dead: {v:?}"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let declared_dead = Instant::now();
+    loop {
+        let v = get(
+            &client,
+            &nodes[other],
+            &format!("/v1/server/cluster/directory/{key}"),
+        )
+        .await;
+        match v.as_ref().and_then(|v| v["value"]["node_id"].as_str()) {
+            Some(h) if h != ids[victim] => break,
+            _ => {}
+        }
+        assert!(
+            declared_dead.elapsed() < Duration::from_secs(8),
+            "world not re-homed within 8 s of the death verdict: {v:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     spawn(&mut nodes[victim], &db, &group, &format!("n{victim}"));
