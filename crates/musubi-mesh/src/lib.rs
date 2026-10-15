@@ -562,6 +562,58 @@ impl World {
         out
     }
 
+    /// Handovers into cells that have no simulator here but are hosted on another node (see
+    /// `remote_host`): the entity is marked in transit towards that node and returned so the
+    /// caller can ship its state; `handover_ack`/`expire_handovers` apply as for local ones.
+    pub fn detect_remote_handovers(
+        &mut self,
+        remote_host: impl Fn(CellId) -> Option<SimId>,
+    ) -> Vec<(EntityId, CellId, SimId)> {
+        let mut out = Vec::new();
+        let ids: Vec<EntityId> = self.entities.keys().copied().collect();
+        for id in ids {
+            let (cell, pos, in_transit) = {
+                let e = &self.entities[&id];
+                (e.cell, e.pos, e.transit.is_some())
+            };
+            if in_transit {
+                continue;
+            }
+            let target = self.cell_of(pos);
+            if target == cell || -self.border_distance(cell, pos) < self.cfg.hysteresis {
+                continue;
+            }
+            if self.owner(target).is_some() {
+                continue;
+            }
+            let Some(from) = self.owner(cell) else {
+                continue;
+            };
+            let Some(host) = remote_host(target) else {
+                continue;
+            };
+            let e = self.entities.get_mut(&id).unwrap();
+            e.transit = Some(Transit {
+                from,
+                to: host,
+                to_cell: target,
+                requested_tick: self.tick,
+            });
+            out.push((id, target, host));
+        }
+        out
+    }
+
+    /// Inputs buffered while `id` was in transit.
+    pub fn take_buffered_inputs(&mut self, id: EntityId) -> Vec<serde_json::Value> {
+        self.buffered_inputs.remove(&id).unwrap_or_default()
+    }
+
+    /// Abort a handover in progress; the entity stays with its current owner.
+    pub fn cancel_handover(&mut self, id: EntityId) -> Option<Transit> {
+        self.entities.get_mut(&id).and_then(|e| e.transit.take())
+    }
+
     fn move_cell(&mut self, id: EntityId, target: CellId) {
         let e = self.entities.get_mut(&id).unwrap();
         let old = e.cell;

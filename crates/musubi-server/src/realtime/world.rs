@@ -11,7 +11,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use musubi_core::{Error, Result, SessionId};
 use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo};
-use musubi_mesh::{CellId, Delta, Entity, HandoverOutcome, Pos, World, WorldConfig};
+use musubi_mesh::{CellId, Delta, Entity, EntityId, HandoverOutcome, Pos, World, WorldConfig};
 use musubi_proto::realtime::{WorldComponent, WorldEntity};
 use musubi_proto::ServerMessage;
 use parking_lot::Mutex;
@@ -863,6 +863,92 @@ impl WorldRegistry {
             .insert(cell, (std::time::Instant::now(), entities));
     }
 
+    /// An entity handed over from another node into a cell hosted here. Taken when a local
+    /// simulator owns the cell (it gets a `handover_arrived` event with the state and the inputs
+    /// buffered so far); refused otherwise. Nodes that do not host the cell stay silent.
+    pub fn accept_handover(
+        &self,
+        name: &str,
+        entity: Entity,
+        from_node: Uuid,
+        inputs: Vec<Value>,
+        fanout: &Fanout,
+    ) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let cell = {
+            let st = w.lock();
+            st.world.cell_of(entity.pos)
+        };
+        if !self
+            .cell_hosts
+            .get(&(name.to_string(), cell))
+            .is_some_and(|h| *h == self.node_id)
+        {
+            return;
+        }
+        let mut st = w.lock();
+        let st = &mut *st;
+        let id = entity.id;
+        let Some(owner) = st.world.owner(cell) else {
+            fanout.world_handover_ack(name, id, from_node, false);
+            return;
+        };
+        st.world.restore(vec![entity]);
+        let state = st.world.get(id).map(to_wire);
+        push_event(
+            st,
+            owner,
+            json!({"type": "handover_arrived", "entity": id, "from_node": from_node, "state": state, "buffered_inputs": inputs}),
+        );
+        fanout.world_handover_ack(name, id, from_node, true);
+    }
+
+    /// The other node answered our handover: on success the entity leaves this shard (inputs
+    /// buffered meanwhile follow it over the bus), on refusal it stays with its owner.
+    pub fn handover_acked(&self, name: &str, id: EntityId, accepted: bool, fanout: &Fanout) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        let Some(t) = st.world.get(id).and_then(|e| e.transit.clone()) else {
+            return;
+        };
+        if accepted {
+            let inputs = st.world.take_buffered_inputs(id);
+            st.world.despawn(id);
+            for i in inputs {
+                fanout.world_input(name, id, i);
+            }
+            push_event(
+                st,
+                t.from,
+                json!({"type": "handover_completed", "entity": id, "to": t.to, "node": t.to}),
+            );
+        } else {
+            st.world.cancel_handover(id);
+            push_event(
+                st,
+                t.from,
+                json!({"type": "handover_cancelled", "entity": id, "reason": format!("node {} refused: no simulator owns the cell", t.to)}),
+            );
+        }
+    }
+
+    /// Input forwarded from another node; dropped unless the entity lives here.
+    pub fn accept_remote_input(&self, name: &str, id: EntityId, input: Value) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        if let Ok(Some(sim)) = st.world.route_input(id, input.clone()) {
+            push_event(st, sim, input);
+        }
+    }
+
     /// Are the cells of `name` spread over several nodes? Any explicit cell assignment means
     /// so: the home node sees the foreign hosts, an assigned node sees at least its own entry.
     fn is_split(&self, name: &str) -> bool {
@@ -964,6 +1050,28 @@ impl WorldRegistry {
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
             if self.is_split(&name) {
+                let remote = st.world.detect_remote_handovers(|c| {
+                    self.cell_hosts
+                        .get(&(name.clone(), c))
+                        .map(|h| *h)
+                        .filter(|h| *h != self.node_id)
+                });
+                for (id, _, host) in remote {
+                    if let Some(e) = st.world.get(id).cloned() {
+                        let inputs = st.world.take_buffered_inputs(id);
+                        let from = e.transit.as_ref().map(|t| t.from);
+                        let mut shipped = e;
+                        shipped.transit = None;
+                        fanout.world_handover(&name, shipped, self.node_id, inputs);
+                        if let Some(from) = from {
+                            push_event(
+                                st,
+                                from,
+                                json!({"type": "handover_started", "entity": id, "to": host, "node": host}),
+                            );
+                        }
+                    }
+                }
                 for (cell, _) in st.world.leased_cells() {
                     let border: Vec<Entity> = st
                         .world

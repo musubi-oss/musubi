@@ -4861,3 +4861,150 @@ async fn world_ghosts_cross_nodes() {
     }
     assert!(ok, "ghosts did not cross the node border");
 }
+
+/// An entity that crosses into a cell hosted on another node is handed over there: it leaves the
+/// first node's shard and shows up as owned on the second.
+#[tokio::test]
+async fn world_handover_cross_nodes() {
+    let group = format!("xhand-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(
+            serde_json::json!({"name": name, "config": {"cell_size": 100.0, "ghost_margin": 20.0}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (sim_a, sim_b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    for (router, sim, cell) in [(&router1, sim_a, (0, 0)), (&router2, sim_b, (1, 0))] {
+        let (st, l) = http_json(
+            router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/lease"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "cells": [{"x": cell.0, "y": cell.1}]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{l}");
+    }
+    let (st, e) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_a, "x": 95.0, "y": 50.0, "components": {"hp": 7}, "persistent": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let id = e["id"].as_str().unwrap().to_string();
+    let (st, a) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_a, "entity": id, "x": 130.0, "y": 50.0})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    let owned_ids = |v: &Value| -> Vec<String> {
+        v["owned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|g| g["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let mut ok = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, va) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, vb) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        if owned_ids(&va).is_empty() && owned_ids(&vb) == vec![id.clone()] {
+            let e = &vb["owned"][0];
+            let hp = e["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "hp")
+                .map(|c| c["value"].clone());
+            assert_eq!(
+                hp,
+                Some(serde_json::json!(7)),
+                "state travels with the entity: {e}"
+            );
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "entity was not handed over to the other node");
+}

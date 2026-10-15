@@ -61,6 +61,27 @@ enum Wire {
         tick: u64,
         entities: Vec<musubi_mesh::Entity>,
     },
+    /// Cell host → host of `entity.cell`: the entity crossed into a cell that lives on another
+    /// node; full state plus inputs buffered so far.
+    WorldHandover {
+        world: String,
+        entity: musubi_mesh::Entity,
+        from_node: uuid::Uuid,
+        inputs: Vec<serde_json::Value>,
+    },
+    /// Receiving host → `from_node`: handover taken (or refused: no simulator owns the cell).
+    WorldHandoverAck {
+        world: String,
+        entity: musubi_mesh::EntityId,
+        from_node: uuid::Uuid,
+        accepted: bool,
+    },
+    /// Input for an entity that lives on another node (e.g. buffered during a handover).
+    WorldInput {
+        world: String,
+        entity: musubi_mesh::EntityId,
+        input: serde_json::Value,
+    },
     /// Coordinator → cluster: `node` now hosts `cell` of `world` (cells of one world may spread).
     WorldCellAssign {
         world: String,
@@ -288,6 +309,52 @@ impl Fanout {
         });
     }
 
+    /// Ship an entity to the node hosting its new cell.
+    pub fn world_handover(
+        &self,
+        world: &str,
+        entity: musubi_mesh::Entity,
+        from_node: uuid::Uuid,
+        inputs: Vec<serde_json::Value>,
+    ) {
+        self.publish(Wire::WorldHandover {
+            world: world.to_string(),
+            entity,
+            from_node,
+            inputs,
+        });
+    }
+
+    /// Answer a cross-node handover.
+    pub fn world_handover_ack(
+        &self,
+        world: &str,
+        entity: musubi_mesh::EntityId,
+        from_node: uuid::Uuid,
+        accepted: bool,
+    ) {
+        self.publish(Wire::WorldHandoverAck {
+            world: world.to_string(),
+            entity,
+            from_node,
+            accepted,
+        });
+    }
+
+    /// Forward an input to whichever node owns the entity.
+    pub fn world_input(
+        &self,
+        world: &str,
+        entity: musubi_mesh::EntityId,
+        input: serde_json::Value,
+    ) {
+        self.publish(Wire::WorldInput {
+            world: world.to_string(),
+            entity,
+            input,
+        });
+    }
+
     /// Announce that `node` hosts `cell` of `world`.
     pub fn cell_assign(&self, world: &str, cell: musubi_mesh::CellId, node: uuid::Uuid) {
         self.publish(Wire::WorldCellAssign {
@@ -454,6 +521,37 @@ impl Fanout {
             }) => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_ghosts(&world, cell, tick, entities);
+                }
+            }
+            Ok(Wire::WorldHandover {
+                world,
+                entity,
+                from_node,
+                inputs,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_handover(&world, entity, from_node, inputs, self);
+                }
+            }
+            Ok(Wire::WorldHandoverAck {
+                world,
+                entity,
+                from_node,
+                accepted,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    if from_node == w.node_id() {
+                        w.handover_acked(&world, entity, accepted, self);
+                    }
+                }
+            }
+            Ok(Wire::WorldInput {
+                world,
+                entity,
+                input,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_remote_input(&world, entity, input);
                 }
             }
             Ok(Wire::WorldCellAssign { world, cell, node }) => {
