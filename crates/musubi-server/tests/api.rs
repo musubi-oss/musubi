@@ -5690,3 +5690,68 @@ async fn push_tokens_receive_offline_notifications() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["removed"], true);
 }
+
+/// Objects written with `ttl_secs` vanish from reads and lists once expired and are purged by retention.
+#[tokio::test]
+async fn storage_objects_expire() {
+    let Some(app) = app().await else { return };
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dev")})),
+    )
+    .await;
+    let tok = a["access_token"].as_str().unwrap().to_string();
+    let col = unique("ttl");
+    let (st, w) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&tok),
+        Some(json!({"objects": [
+            {"collection": col, "key": "short", "value": {"n": 1}, "ttl_secs": 1},
+            {"collection": col, "key": "long", "value": {"n": 2}, "ttl_secs": 3600},
+            {"collection": col, "key": "forever", "value": {"n": 3}}
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+    let (st, l) = call(&app, "GET", &format!("/v1/storage/{col}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["objects"].as_array().unwrap().len(), 3, "{l}");
+    let long = l["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["key"] == "long")
+        .unwrap();
+    assert!(long["expires_at"].is_string(), "{long}");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (st, l) = call(&app, "GET", &format!("/v1/storage/{col}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let keys: Vec<&str> = l["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert!(!keys.contains(&"short") && keys.len() == 2, "{keys:?}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/storage/read",
+        Some(&tok),
+        Some(json!({"objects": [{"collection": col, "key": "short"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(r["objects"].as_array().unwrap().is_empty(), "{r}");
+    let (st, v) = call_server(&app, "POST", "/v1/admin/retention/run", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["removed"]["storage_objects"].as_u64().unwrap() >= 1,
+        "{v}"
+    );
+}

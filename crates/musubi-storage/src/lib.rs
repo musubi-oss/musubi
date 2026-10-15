@@ -28,6 +28,13 @@ pub struct Object {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Set when the object was written with `ttl_secs`; expired objects are never returned.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +49,9 @@ pub struct WriteOp {
     pub read_permission: i16,
     #[serde(default = "one")]
     pub write_permission: i16,
+    /// Time to live in seconds; the object disappears from reads and is purged after it elapses.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,9 +100,10 @@ type Row = (
     i16,
     OffsetDateTime,
     OffsetDateTime,
+    Option<OffsetDateTime>,
 );
 
-const COLS: &str = "collection, key, owner_id, value, version, read_permission, write_permission, created_at, updated_at";
+const COLS: &str = "collection, key, owner_id, value, version, read_permission, write_permission, created_at, updated_at, expires_at";
 
 impl StorageService {
     pub fn new(db: PgPool) -> Self {
@@ -115,7 +126,7 @@ impl StorageService {
                 (None, Caller::Server) => SYSTEM_OWNER,
             };
             let row = sqlx::query_as::<_, Row>(&format!(
-                "select {COLS} from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3"
+                "select {COLS} from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 and (expires_at is null or expires_at > now())"
             ))
             .bind(&r.collection)
             .bind(&r.key)
@@ -174,6 +185,7 @@ impl StorageService {
         let rows = sqlx::query_as::<_, Row>(&format!(
             "select {COLS} from musubi.storage_objects
              where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
+               and (expires_at is null or expires_at > now())
                and ($4::text is null or (owner_id, key) > ($5::uuid, $4))
                and ($7::jsonb is null or value @> $7)
              order by owner_id, key limit $6"
@@ -274,13 +286,17 @@ impl StorageService {
                 )));
             }
 
+            let expires = op.ttl_secs.map(|t| {
+                OffsetDateTime::now_utc()
+                    + time::Duration::seconds(t.min(100 * 365 * 86_400) as i64)
+            });
             sqlx::query(
-                "insert into musubi.storage_objects (collection, key, owner_id, value, version, read_permission, write_permission)
-                 values ($1, $2, $3, $4, $5, $6, $7)
+                "insert into musubi.storage_objects (collection, key, owner_id, value, version, read_permission, write_permission, expires_at)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8)
                  on conflict (collection, key, owner_id) do update set
                    value = excluded.value, version = excluded.version,
                    read_permission = excluded.read_permission, write_permission = excluded.write_permission,
-                   updated_at = now()",
+                   expires_at = excluded.expires_at, updated_at = now()",
             )
             .bind(&op.collection)
             .bind(&op.key)
@@ -289,6 +305,7 @@ impl StorageService {
             .bind(&new_version)
             .bind(op.read_permission)
             .bind(op.write_permission)
+            .bind(expires)
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?;
@@ -381,6 +398,7 @@ fn to_object(r: Row) -> Object {
         write_permission: r.6,
         created_at: r.7,
         updated_at: r.8,
+        expires_at: r.9,
     }
 }
 

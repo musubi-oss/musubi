@@ -88,6 +88,7 @@ impl ServerHost {
                                 .map(String::from),
                             read_permission: req["read_permission"].as_i64().unwrap_or(1) as i16,
                             write_permission: req["write_permission"].as_i64().unwrap_or(0) as i16,
+                            ttl_secs: None,
                         }],
                     )
                     .await?;

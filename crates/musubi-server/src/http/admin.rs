@@ -284,6 +284,7 @@ async fn storage_put(
                 version: b.version,
                 read_permission: b.read_permission,
                 write_permission: b.write_permission,
+                ttl_secs: None,
             }],
         )
         .await?;

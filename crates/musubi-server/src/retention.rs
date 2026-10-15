@@ -59,6 +59,11 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     )
     .await?;
     let idempotency = purge(db, "musubi.idempotency", &age("created_at"), 1).await?;
+    let storage = sqlx::query("delete from musubi.storage_objects where expires_at <= now()")
+        .execute(db)
+        .await
+        .map_err(musubi_core::Error::internal)?
+        .rows_affected();
     let sessions = purge(
         db,
         "musubi.sessions",
@@ -85,7 +90,7 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     .rows_affected();
     Ok(json!({
         "events": events, "webhook_deliveries": deliveries, "audit_log": audit,
-        "notifications": notifications, "chat_messages": chat, "sessions": sessions, "idempotency": idempotency,
+        "notifications": notifications, "chat_messages": chat, "sessions": sessions, "idempotency": idempotency, "storage_objects": storage,
         "match_journal": match_journal, "world_journal": world_journal,
     }))
 }
