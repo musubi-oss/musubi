@@ -1,8 +1,8 @@
 //! Dedicated-server orchestration v0: fleets describe what to run; the reconciler keeps `buffer`
 //! servers ready (≤ `max_servers`) through a `Provider`; game servers talk back with an Agones-like
-//! SDK surface (ready / health / allocate / shutdown / labels). Only the `local` provider (child
-//! processes on this node) and `docker` (containers via the Docker CLI) exist today;
-//! containerd/kubernetes/agones/edgegap/gamelift plug into the same trait.
+//! SDK surface (ready / health / allocate / shutdown / labels). Providers: `local` (child processes on this
+//! node), `docker` (containers via the Docker CLI), `kubernetes` (pods) and `agones`
+//! (GameServer CRs); edgegap/gamelift plug into the same trait.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod docker;
+pub mod kubernetes;
 
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -100,6 +101,7 @@ pub struct Allocation {
     pub connect_token: String,
 }
 
+#[derive(Debug)]
 pub struct Started {
     pub address: String,
     pub port: i32,
@@ -288,6 +290,14 @@ impl FleetService {
             api_url: api_url.to_string(),
             server_key: server_key.to_string(),
         }
+    }
+
+    /// Register an extra provider under `name` (e.g. `kubernetes` / `agones` when configured).
+    pub fn with_provider(mut self, name: &str, provider: Arc<dyn Provider>) -> Self {
+        let mut m: HashMap<String, Arc<dyn Provider>> = (*self.providers).clone();
+        m.insert(name.to_string(), provider);
+        self.providers = Arc::new(m);
+        self
     }
 
     pub fn providers(&self) -> Vec<&'static str> {

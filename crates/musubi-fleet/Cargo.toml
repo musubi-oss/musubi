@@ -16,3 +16,8 @@ tracing.workspace = true
 uuid.workspace = true
 time.workspace = true
 dashmap = "6"
+reqwest.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+

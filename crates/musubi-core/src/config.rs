@@ -40,6 +40,7 @@ pub struct Config {
     pub aurix: AurixConfig,
     pub iap: IapConfig,
     pub market: MarketConfig,
+    pub fleet: FleetConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +228,28 @@ pub struct ZanshinConfig {
     pub server_key: String,
     /// Seconds between analytics event flushes.
     pub flush_secs: u64,
+}
+
+/// Dedicated-server orchestration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FleetConfig {
+    pub kubernetes: KubernetesConfig,
+}
+
+/// Kubernetes / Agones fleet providers. With no `url` the node uses the in-cluster service account
+/// when it runs in a pod; otherwise the providers are not registered.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct KubernetesConfig {
+    pub url: Option<String>,
+    pub token: Option<String>,
+    pub token_path: Option<String>,
+    pub ca_cert_path: Option<String>,
+    pub namespace: Option<String>,
+    pub insecure: bool,
+    /// Also register the `agones` provider (GameServer CRs).
+    pub agones: bool,
 }
 
 /// Player market / trades.

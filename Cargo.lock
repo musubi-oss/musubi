@@ -2056,8 +2056,10 @@ version = "0.1.0"
 name = "musubi-fleet"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "dashmap",
  "musubi-core",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",

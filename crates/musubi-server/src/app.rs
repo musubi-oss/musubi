@@ -109,12 +109,30 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let cluster = Arc::new(cluster);
     cluster.start().await?;
     let parties = Arc::new(PartyRegistry::new(cluster.node_id().0));
-    let fleets = Arc::new(FleetService::new(
+    let mut fleets = FleetService::new(
         db.clone(),
         cluster.node_id().0,
         &format!("http://{}", cfg.http.listen),
         &cfg.http.server_key,
-    ));
+    );
+    if let Some(kube) = kube_config(&cfg.fleet.kubernetes) {
+        use musubi_fleet::kubernetes::{KubernetesProvider, Mode};
+        let modes: &[(&str, Mode)] = if cfg.fleet.kubernetes.agones {
+            &[("kubernetes", Mode::Pods), ("agones", Mode::Agones)]
+        } else {
+            &[("kubernetes", Mode::Pods)]
+        };
+        for (name, mode) in modes {
+            match KubernetesProvider::new(kube.clone(), *mode) {
+                Ok(p) => {
+                    tracing::info!(provider = name, url = %kube.url, namespace = %kube.namespace, "fleet provider registered");
+                    fleets = fleets.with_provider(name, Arc::new(p));
+                }
+                Err(e) => tracing::warn!(provider = name, error = %e, "fleet provider disabled"),
+            }
+        }
+    }
+    let fleets = Arc::new(fleets);
     fleets
         .clone()
         .spawn_reconciler(std::time::Duration::from_secs(5), {
@@ -393,4 +411,35 @@ fn iap_client<T>(
             None
         }
     }
+}
+
+/// `[fleet.kubernetes]` → client config; falls back to the in-cluster service account.
+fn kube_config(
+    k: &musubi_core::config::KubernetesConfig,
+) -> Option<musubi_fleet::kubernetes::KubeConfig> {
+    let mut cfg = match &k.url {
+        Some(url) => musubi_fleet::kubernetes::KubeConfig {
+            url: url.clone(),
+            token: None,
+            namespace: "default".into(),
+            ca_cert_pem: None,
+            insecure: k.insecure,
+        },
+        None => musubi_fleet::kubernetes::KubeConfig::in_cluster()?,
+    };
+    if let Some(t) = &k.token {
+        cfg.token = Some(t.clone());
+    } else if let Some(p) = &k.token_path {
+        cfg.token = std::fs::read_to_string(p)
+            .ok()
+            .map(|t| t.trim().to_string());
+    }
+    if let Some(p) = &k.ca_cert_path {
+        cfg.ca_cert_pem = std::fs::read(p).ok();
+    }
+    if let Some(ns) = &k.namespace {
+        cfg.namespace = ns.clone();
+    }
+    cfg.insecure |= k.insecure;
+    Some(cfg)
 }
