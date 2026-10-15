@@ -44,6 +44,42 @@ WebSocket ping p50 0.4 ms / p99 2.6 ms — bounded by the default per-account `[
 the server. Run it against your own deployment; numbers from a release build on real hardware are
 the ones that matter.
 
+### Chaos stand (`musubi soak`)
+
+Failover claims are measured the same way latency is. `musubi soak` spawns a real local cluster of
+`musubi-server` processes on one Postgres, homes persistent worlds across them, puts resumable WS
+sessions and write-then-read-back storage clients on it, then SIGKILLs or drains a random node every
+few seconds and restarts it:
+
+```sh
+musubi soak --database-url postgres://musubi:musubi@localhost:5433/musubi_soak \
+  --nodes 3 --clients 12 --worlds 6 --duration-secs 75 --kill-every-secs 12 --mode mixed
+```
+
+It reports, per incident, how long the survivors took to drop the node, how long until every world it
+owned was homed elsewhere and how long the restarted process took to rejoin, plus client errors,
+reconnects and lost writes (a write acknowledged by one node but not readable from another). The
+command exits non-zero on any lost write or incident that did not settle within 60 s. Set
+`MUSUBI_SOAK_NODE_LOG_DIR` (and `MUSUBI_SOAK_NODE_LOG_LEVEL`) to keep the nodes' logs.
+
+Measured on the same debug build / VM as the numbers above, two 75 s runs, 3 nodes, 12 clients, 6
+worlds, 7 incidents in total:
+
+| incident | survivors drop the node | worlds homed elsewhere | restarted node back |
+|---|---|---|---|
+| SIGKILL (follower or leader) | 5.6 – 6.6 s | 11 – 12 s | ~1.1 s |
+| drain via admin API | 0.1 s | 3 – 5 s | 0.2 – 1.2 s |
+
+Storage: 33 287 verified writes, 0 errors, 0 lost writes. WS: 17 445 pings answered, 17 sessions
+cut by a kill or drain and reconnected fresh (a session parked for resume dies with its process, so
+`resumed` is 0 by construction here). The SIGKILL numbers are SWIM's suspect timeout plus the
+failover tick; a drained node announces its departure, so its worlds move an order of magnitude
+faster.
+
+The stand already paid for itself: its first runs showed that a node restarted with the same identity
+after a crash was never seen alive again by the survivors (a SWIM "dead" verdict was terminal per node
+id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.
+
 ## HTTP API (so far)
 
 | route | auth | purpose |
