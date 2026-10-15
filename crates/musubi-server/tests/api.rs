@@ -1990,3 +1990,190 @@ async fn rewards_tables_rolls_pity_and_audit() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn progression_xp_levels_energy_and_streaks() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("pg")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gems = unique("gems");
+    let bonus = unique("bonus");
+    let track = unique("xp");
+    let stamina = unique("stamina");
+    let daily = unique("daily");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gems})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": bonus, "kind": "guaranteed", "entries": [{"currency": gems, "amount": 50}]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    // XP track: level 1 at 100 xp (with reward), level 2 at 250
+    let (st, b) = call_server(&app, "POST", "/v1/server/progression/tracks", k, Some(json!({"id": track, "name": "Player XP", "levels": [{"xp": 100, "rewards": bonus}, {"xp": 250}]}))).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/tracks",
+        k,
+        Some(json!({"id": unique("bad"), "levels": [{"xp": 100}, {"xp": 50}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": acc, "track_id": track, "delta": 120, "reason": "match"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["previous_level"], 0);
+    assert_eq!(r["level_ups"], json!([1]));
+    assert_eq!(r["progress"]["level"], 1);
+    assert_eq!(r["progress"]["next_level_xp"], 250);
+    assert_eq!(r["rewards"][0]["amount"], 50);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], 50, "level reward granted");
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": acc, "track_id": track, "delta": 200})),
+    )
+    .await;
+    assert_eq!(r["level_ups"], json!([2]));
+    assert!(r["progress"]["next_level_xp"].is_null());
+    let (_, p) = call(&app, "GET", "/v1/progression", Some(&tok), None).await;
+    let mine = p["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["track_id"] == track)
+        .unwrap();
+    assert_eq!(mine["xp"], 320);
+    assert_eq!(mine["level"], 2);
+    // energy: max 5, 1 unit per second
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/energy",
+        k,
+        Some(json!({"id": stamina, "max": 5, "regen_seconds": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, e) = call(&app, "GET", "/v1/energy", Some(&tok), None).await;
+    let mine = e["energy"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["energy_id"] == stamina)
+        .unwrap();
+    assert_eq!(mine["amount"], 5, "starts full by default");
+    let (st, e) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{stamina}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    assert_eq!(e["amount"], 2);
+    let (st, e) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{stamina}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 3})),
+    )
+    .await;
+    assert!(st.is_client_error(), "{e}");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (_, e) = call(&app, "GET", "/v1/energy", Some(&tok), None).await;
+    let mine = e["energy"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["energy_id"] == stamina)
+        .unwrap();
+    assert!(mine["amount"].as_i64().unwrap() >= 3, "{mine}");
+    let (st, e) = call_server(
+        &app,
+        "POST",
+        "/v1/server/energy/grant",
+        k,
+        Some(json!({"account_id": acc, "energy_id": stamina, "amount": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(e["amount"], 5, "grant is capped at max");
+    assert!(e["next_in_seconds"].is_null());
+    // streak: first claim hits the count-1 milestone, second claim in the same period is a conflict
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streaks",
+        k,
+        Some(json!({"id": daily, "milestones": [{"count": 1, "rewards": bonus}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, s) = call(&app, "GET", "/v1/streaks", Some(&tok), None).await;
+    let mine = s["streaks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["streak_id"] == daily)
+        .unwrap();
+    assert_eq!(mine["claimable"], true);
+    assert_eq!(mine["count"], 0);
+    let (st, c) = call(
+        &app,
+        "POST",
+        &format!("/v1/streaks/{daily}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["count"], 1);
+    assert_eq!(c["rewards"][0]["amount"], 50);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/streaks/{daily}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], 100);
+    let (_, s) = call(&app, "GET", "/v1/streaks", Some(&tok), None).await;
+    let mine = s["streaks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["streak_id"] == daily)
+        .unwrap();
+    assert_eq!(mine["claimable"], false);
+    assert_eq!(mine["count"], 1);
+}

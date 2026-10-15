@@ -4,9 +4,10 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
-use musubi_economy::{CreateItem, CreateStoreItem, RewardTable};
+use musubi_economy::{CreateItem, CreateStoreItem, EnergyDef, RewardTable, StreakDef, Track};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::app::AppState;
@@ -29,6 +30,19 @@ pub fn routes() -> Router<AppState> {
             get(reward_tables_all).post(upsert_reward_table),
         )
         .route("/v1/server/rewards/grant", post(reward_grant))
+        .route("/v1/progression", get(progression))
+        .route("/v1/energy", get(energy))
+        .route("/v1/energy/{id}/spend", post(energy_spend))
+        .route("/v1/streaks", get(streaks))
+        .route("/v1/streaks/{id}/claim", post(streak_claim))
+        .route(
+            "/v1/server/progression/tracks",
+            get(tracks).post(upsert_track),
+        )
+        .route("/v1/server/progression/xp", post(add_xp))
+        .route("/v1/server/energy", get(energies).post(upsert_energy))
+        .route("/v1/server/energy/grant", post(energy_grant))
+        .route("/v1/server/streaks", get(streak_defs).post(upsert_streak))
         .route(
             "/v1/server/currencies",
             get(currencies).post(upsert_currency),
@@ -342,4 +356,161 @@ async fn reward_grant(
         .grant_table(account(&r.account_id)?, &r.table_id, &r.reference)
         .await?;
     Ok(Json(json!({ "rewards": rewards })))
+}
+
+// ----- progression -----
+
+async fn progression(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "tracks": s.economy.progress(me.account_id).await? }),
+    ))
+}
+
+async fn energy(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "energy": s.economy.energy(me.account_id, OffsetDateTime::now_utc()).await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AmountReq {
+    #[serde(default = "one_i32")]
+    amount: i32,
+}
+
+fn one_i32() -> i32 {
+    1
+}
+
+async fn energy_spend(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(r): Json<AmountReq>,
+) -> Result<Json<Value>, ApiError> {
+    if r.amount <= 0 {
+        return Err(Error::InvalidArgument("amount must be positive".into()).into());
+    }
+    let st = s
+        .economy
+        .adjust_energy(me.account_id, &id, -r.amount, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(serde_json::to_value(st).map_err(Error::internal)?))
+}
+
+async fn streaks(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "streaks": s.economy.streak_states(me.account_id, OffsetDateTime::now_utc()).await? }),
+    ))
+}
+
+async fn streak_claim(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let c = s
+        .economy
+        .claim_streak(me.account_id, &id, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(serde_json::to_value(c).map_err(Error::internal)?))
+}
+
+async fn tracks(State(s): State<AppState>, ServerKey: ServerKey) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "tracks": s.economy.tracks().await? })))
+}
+
+async fn upsert_track(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(t): Json<Track>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_track(t).await?).map_err(Error::internal)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct XpReq {
+    account_id: String,
+    track_id: String,
+    delta: i64,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn add_xp(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<XpReq>,
+) -> Result<Json<Value>, ApiError> {
+    let res = s
+        .economy
+        .add_xp(account(&r.account_id)?, &r.track_id, r.delta, &r.reason)
+        .await?;
+    Ok(Json(serde_json::to_value(res).map_err(Error::internal)?))
+}
+
+async fn energies(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "energies": s.economy.energies().await? })))
+}
+
+async fn upsert_energy(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(d): Json<EnergyDef>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_energy(d).await?).map_err(Error::internal)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct EnergyGrantReq {
+    account_id: String,
+    energy_id: String,
+    amount: i32,
+}
+
+async fn energy_grant(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<EnergyGrantReq>,
+) -> Result<Json<Value>, ApiError> {
+    if r.amount <= 0 {
+        return Err(Error::InvalidArgument("amount must be positive".into()).into());
+    }
+    let st = s
+        .economy
+        .adjust_energy(
+            account(&r.account_id)?,
+            &r.energy_id,
+            r.amount,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(serde_json::to_value(st).map_err(Error::internal)?))
+}
+
+async fn streak_defs(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "streaks": s.economy.streaks().await? })))
+}
+
+async fn upsert_streak(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(d): Json<StreakDef>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_streak(d).await?).map_err(Error::internal)?,
+    ))
 }

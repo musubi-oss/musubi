@@ -394,7 +394,21 @@ impl EconomyService {
         Ok(t.entries)
     }
 
-    async fn apply_rewards(
+    pub(crate) async fn load_table(
+        tx: &mut Transaction<'_, Postgres>,
+        id: &str,
+    ) -> Result<Option<RewardTable>> {
+        let row: Option<TableRow> = sqlx::query_as(&format!(
+            "select {TABLE_COLS} from musubi.reward_tables where id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.map(table))
+    }
+
+    pub(crate) async fn apply_rewards(
         tx: &mut Transaction<'_, Postgres>,
         account: AccountId,
         rewards: &[RewardEntry],

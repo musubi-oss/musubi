@@ -9,7 +9,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod progression;
 pub mod rewards;
+pub use progression::{EnergyDef, Level, StreakDef, Track};
 pub use rewards::{Pity, RewardEntry, RewardTable, Roll};
 
 pub const MAX_LEDGER_PAGE: i64 = 100;
