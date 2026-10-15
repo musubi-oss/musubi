@@ -59,6 +59,8 @@ pub struct AppState {
     pub banned: Arc<crate::bans::Bans>,
     /// Set on SIGTERM: `/readyz` answers 503 so load balancers stop routing here.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Fired by `POST /v1/admin/cluster/nodes/{id}/drain`: same path as SIGTERM.
+    pub shutdown: Arc<tokio::sync::Notify>,
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -320,6 +322,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         events: Arc::new(crate::events::Events::new(db.clone())),
         banned: Arc::new(crate::bans::Bans::default()),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
         db,
         auth,
         storage,
@@ -361,6 +364,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     crate::modules::start_sync(state.clone());
     state.matches.set_events(state.events.clone());
+    crate::http::admin::start_drain_listener(state.clone());
     match state.banned.load(&state.db).await {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),
@@ -418,7 +422,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         http::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        shutdown().await;
+        shutdown(draining.shutdown.clone()).await;
         drain(&draining).await;
     })
     .await?;
@@ -514,10 +518,11 @@ async fn drain(state: &AppState) {
     }
 }
 
-async fn shutdown() {
+async fn shutdown(requested: Arc<tokio::sync::Notify>) {
     let ctrl_c = async {
         signal::ctrl_c().await.ok();
     };
+    let api = requested.notified();
     #[cfg(unix)]
     let term = async {
         if let Ok(mut s) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
@@ -526,7 +531,7 @@ async fn shutdown() {
     };
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
-    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    tokio::select! { _ = ctrl_c => {}, _ = term => {}, _ = api => {} }
     info!("shutdown signal received");
 }
 

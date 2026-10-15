@@ -13,6 +13,8 @@ use super::{ApiError, ServerKey};
 use crate::app::AppState;
 
 pub const KICK_TOPIC: &str = "admin.kick";
+/// Payload: node uuid. The addressed node drains and exits as on SIGTERM.
+pub const DRAIN_TOPIC: &str = "admin.drain";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -25,6 +27,9 @@ pub fn routes() -> Router<AppState> {
                     crate::modules::MAX_MODULE_BYTES,
                 )),
         )
+        .route("/v1/admin/cluster/matches", get(cluster_matches))
+        .route("/v1/admin/cluster/worlds", get(cluster_worlds))
+        .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/accounts", get(accounts))
         .route(
             "/v1/admin/accounts/{id}",
@@ -352,4 +357,98 @@ async fn module_delete(
         return Err(Error::NotFound(format!("module {name}")).into());
     }
     Ok(Json(json!({ "deleted": name })))
+}
+
+/// Every match of this cluster with its current home (from the snapshot store), newest first.
+async fn cluster_matches(
+    _k: ServerKey,
+    State(s): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let rows: Vec<(
+        Uuid,
+        String,
+        String,
+        i64,
+        Option<Uuid>,
+        time::OffsetDateTime,
+    )> = sqlx::query_as(
+        "select match_id, module, label, tick, node_id, updated_at from musubi.match_snapshots
+         where cluster_group = $1 order by updated_at desc limit 1000",
+    )
+    .bind(&s.cfg.node.cluster_group)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let matches: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, module, label, tick, node, at)| {
+            json!({ "match_id": id, "module": module, "label": label, "tick": tick, "node_id": node, "updated_at": at.unix_timestamp() })
+        })
+        .collect();
+    Ok(Json(
+        json!({ "matches": matches, "local": s.matches.count() }),
+    ))
+}
+
+/// Every world of this cluster with its home node.
+async fn cluster_worlds(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let rows: Vec<(String, Option<Uuid>, time::OffsetDateTime)> = sqlx::query_as(
+        "select name, node_id, created_at from musubi.worlds where cluster_group = $1 order by name",
+    )
+    .bind(&s.cfg.node.cluster_group)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let worlds: Vec<Value> = rows
+        .into_iter()
+        .map(|(name, node, at)| json!({ "name": name, "node_id": node, "created_at": at.unix_timestamp() }))
+        .collect();
+    Ok(Json(json!({ "worlds": worlds, "local": s.worlds.list() })))
+}
+
+/// Drain a node through the API: the local node starts its SIGTERM path, another node is told
+/// over the bus. The process exits when the drain completes; the orchestrator restarts it.
+async fn drain_node(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let me = s.cluster.as_ref().map(|c| c.node_id().0);
+    if me == Some(id) || (me.is_none() && id.is_nil()) {
+        s.shutdown.notify_one();
+        return Ok(Json(json!({ "draining": id, "local": true })));
+    }
+    let Some(c) = &s.cluster else {
+        return Err(Error::NotFound("single node: use the nil uuid for self".into()).into());
+    };
+    let known = c.nodes().await?.iter().any(|n| n.id.0 == id && n.alive);
+    if !known {
+        return Err(Error::NotFound(format!("node {id} is not alive")).into());
+    }
+    c.publish(DRAIN_TOPIC, &id).await?;
+    Ok(Json(json!({ "draining": id, "local": false })))
+}
+
+/// React to `admin.drain` addressed to this node.
+pub fn start_drain_listener(s: AppState) {
+    let Some(c) = s.cluster.clone() else {
+        return;
+    };
+    let mut rx = c.subscribe();
+    let me = c.node_id().0;
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(m) if m.topic == DRAIN_TOPIC => {
+                    if serde_json::from_value::<Uuid>(m.payload).ok() == Some(me) {
+                        tracing::warn!("drain requested through the admin api");
+                        s.shutdown.notify_one();
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+    });
 }

@@ -90,6 +90,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),

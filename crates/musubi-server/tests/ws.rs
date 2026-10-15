@@ -113,6 +113,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),
@@ -3533,4 +3534,93 @@ async fn readyz_reports_db_migrations_raft_and_draining() {
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["checks"]["draining"], true);
     assert_eq!(body["status"], "unavailable");
+}
+
+/// Admin drain: the local node's shutdown fires directly; another node in the group is reached
+/// over the bus. Cluster-wide match/world views come from the database.
+#[tokio::test]
+async fn admin_drain_reaches_local_and_remote_nodes() {
+    let group = test_group();
+    let Some(n1) = build_state(false, &group).await else {
+        return;
+    };
+    let Some(n2) = build_state(false, &group).await else {
+        return;
+    };
+    musubi_server::http::admin::start_drain_listener(n2.clone());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if n1
+            .cluster
+            .as_ref()
+            .unwrap()
+            .nodes()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|n| n.alive)
+            .count()
+            >= 2
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "peers never met");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let router = musubi_server::http::router(n1.clone());
+    let post = |router: axum::Router, id: uuid::Uuid| async move {
+        let res = router
+            .oneshot(
+                axum::http::Request::post(format!("/v1/admin/cluster/nodes/{id}/drain"))
+                    .header("x-musubi-server-key", "defaultkey")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st = res.status().as_u16();
+        let v: serde_json::Value = serde_json::from_slice(
+            &http_body_util::BodyExt::collect(res.into_body())
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap_or_default();
+        (st, v)
+    };
+    let (st, v) = post(router.clone(), uuid::Uuid::now_v7()).await;
+    assert_eq!(st, 404, "{v}");
+
+    let n2_id = n2.cluster.as_ref().unwrap().node_id().0;
+    let notified = n2.shutdown.clone();
+    let waiter = tokio::spawn(async move { notified.notified().await });
+    let (st, v) = post(router.clone(), n2_id).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["local"], false);
+    tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+        .await
+        .expect("remote node receives the drain")
+        .unwrap();
+
+    let n1_id = n1.cluster.as_ref().unwrap().node_id().0;
+    let notified = n1.shutdown.clone();
+    let waiter = tokio::spawn(async move { notified.notified().await });
+    let (st, v) = post(router.clone(), n1_id).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["local"], true);
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let res = router
+        .oneshot(
+            axum::http::Request::get("/v1/admin/cluster/worlds")
+                .header("x-musubi-server-key", "defaultkey")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
 }
