@@ -42,6 +42,8 @@ pub struct WorldRegistry {
     worlds: DashMap<String, Arc<Mutex<WorldState>>>,
     /// world → home node (cache of `musubi.worlds`)
     homes: DashMap<String, Uuid>,
+    /// Raft directory (`world:<name>` → home) when the cluster runs the QUIC bus.
+    cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +110,34 @@ impl WorldRegistry {
             db,
             worlds: DashMap::new(),
             homes: DashMap::new(),
+            cluster: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn set_cluster(&self, cluster: Arc<musubi_cluster::Cluster>) {
+        let _ = self.cluster.set(cluster);
+    }
+
+    fn directory_key(name: &str) -> String {
+        format!("world:{name}")
+    }
+
+    /// Publish the world's home to the replicated directory (best effort; Postgres stays truth).
+    async fn publish_home(&self, name: &str, home: Option<Uuid>) {
+        let Some(c) = self.cluster.get() else { return };
+        if c.raft_id() == 0 {
+            return;
+        }
+        let key = Self::directory_key(name);
+        let op = match home {
+            Some(h) => musubi_cluster::DirectoryOp::Set {
+                key,
+                value: serde_json::json!({ "node_id": h }),
+            },
+            None => musubi_cluster::DirectoryOp::Delete { key },
+        };
+        if let Err(e) = c.directory_write(op).await {
+            tracing::warn!(world = name, error = %e, "world directory write failed");
         }
     }
 
@@ -122,6 +152,14 @@ impl WorldRegistry {
         }
         if let Some(h) = self.homes.get(name) {
             return Ok(Some(*h));
+        }
+        if let Some(c) = self.cluster.get() {
+            if let Some(v) = c.directory_get(&Self::directory_key(name)).await {
+                if let Some(h) = v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()) {
+                    self.homes.insert(name.to_string(), h);
+                    return Ok(Some(h));
+                }
+            }
         }
         let Some(db) = &self.db else { return Ok(None) };
         let row: Option<Uuid> =
@@ -198,6 +236,7 @@ impl WorldRegistry {
                 sim_events: HashMap::new(),
             })),
         );
+        self.publish_home(name, Some(self.node_id)).await;
         self.info(name)
     }
 
@@ -215,6 +254,7 @@ impl WorldRegistry {
                 .await
                 .map_err(Error::internal)?;
         }
+        self.publish_home(name, None).await;
         Ok(())
     }
 

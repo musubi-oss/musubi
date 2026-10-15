@@ -92,6 +92,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .collect(),
         &cfg.http.listen.to_string(),
     );
+    cluster = cluster.with_group(&cfg.node.cluster_group);
     if !cfg.node.bus_listen.is_empty() {
         let listen: std::net::SocketAddr = cfg
             .node
@@ -180,6 +181,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cluster.node_id().0,
         Some(db.clone()),
     ));
+    worlds.set_cluster(cluster.clone());
     fanout.set_worlds(worlds.clone());
     let liveops = cfg.zanshin.url.as_deref().map(|u| {
         let c = ZanshinClient::new(u, &cfg.zanshin.server_key);

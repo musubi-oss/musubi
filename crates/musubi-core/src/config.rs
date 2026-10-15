@@ -53,6 +53,8 @@ pub struct NodeConfig {
     pub bus_listen: String,
     /// Address other nodes dial for the bus; defaults to the bound address.
     pub bus_advertise: String,
+    /// Cluster group: independent clusters can share one Postgres.
+    pub cluster_group: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +99,7 @@ impl Default for NodeConfig {
             region: "local".into(),
             bus_listen: String::new(),
             bus_advertise: String::new(),
+            cluster_group: "default".into(),
             data_dir: "./data".into(),
         }
     }

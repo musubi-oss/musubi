@@ -2634,20 +2634,18 @@ async fn quic_bus_delivers_large_messages_and_keeps_postgres_fallback() {
         .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
         .await
         .unwrap();
+    let group = unique("g");
     let bus = |name: &str| {
         musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+            .with_group(&group)
             .with_bus("127.0.0.1:0".parse().unwrap(), None)
             .unwrap()
     };
     let a = Arc::new(bus("qa"));
     let b = Arc::new(bus("qb"));
-    let c = Arc::new(musubi_cluster::Cluster::new(
-        db.clone(),
-        "qc",
-        "local",
-        vec![],
-        "",
-    ));
+    let c = Arc::new(
+        musubi_cluster::Cluster::new(db.clone(), "qc", "local", vec![], "").with_group(&group),
+    );
     assert!(a.bus_addr().is_some() && c.bus_addr().is_none());
     a.start().await.unwrap();
     b.start().await.unwrap();
@@ -2716,9 +2714,11 @@ async fn swim_detects_dead_bus_peer_within_seconds() {
         .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
         .await
         .unwrap();
+    let group = unique("g");
     let bus = |name: &str| {
         Arc::new(
             musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+                .with_group(&group)
                 .with_bus("127.0.0.1:0".parse().unwrap(), None)
                 .unwrap(),
         )
@@ -2797,9 +2797,11 @@ async fn raft_directory_replicates_and_survives_leader_loss() {
         .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
         .await
         .unwrap();
+    let group = unique("g");
     let bus = |name: &str| {
         Arc::new(
             musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+                .with_group(&group)
                 .with_bus("127.0.0.1:0".parse().unwrap(), None)
                 .unwrap(),
         )
@@ -2914,4 +2916,81 @@ async fn raft_directory_replicates_and_survives_leader_loss() {
     for n in &nodes {
         n.stop().await;
     }
+}
+
+#[tokio::test]
+async fn raft_leader_owns_leases_and_world_directory() {
+    use std::time::{Duration, Instant};
+    let Some(_app) = app().await else { return };
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let group = unique("g");
+    let bus = |name: &str| {
+        Arc::new(
+            musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+                .with_group(&group)
+                .with_bus("127.0.0.1:0".parse().unwrap(), None)
+                .unwrap(),
+        )
+    };
+    let (a, b) = (bus("la"), bus("lb"));
+    a.start().await.unwrap();
+    b.start().await.unwrap();
+    a.refresh_peers().await.unwrap();
+    b.refresh_peers().await.unwrap();
+    let t0 = Instant::now();
+    while !(a.raft_leader().is_some()
+        && a.raft_leader() == b.raft_leader()
+        && a.raft_voters().len() == 2)
+    {
+        assert!(t0.elapsed() < Duration::from_secs(30), "raft not formed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // duties follow the raft leader, not the Postgres CAS lease
+    let name = unique("duty");
+    let (la, lb) = (
+        a.lease(&name, Duration::from_secs(2)),
+        b.lease(&name, Duration::from_secs(2)),
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_ne!(la.held(), lb.held(), "exactly one holder");
+    assert_eq!(la.held(), a.is_raft_leader());
+    assert_eq!(lb.held(), b.is_raft_leader());
+    // a world created on a is resolvable on b through the directory alone (no DB on b's registry)
+    let wa = musubi_server::realtime::WorldRegistry::new(a.node_id().0, Some(db.clone()));
+    wa.set_cluster(a.clone());
+    let wb = musubi_server::realtime::WorldRegistry::new(b.node_id().0, None);
+    wb.set_cluster(b.clone());
+    let world = unique("w");
+    wa.create(&world, Default::default(), Default::default())
+        .await
+        .unwrap();
+    let t1 = Instant::now();
+    loop {
+        if wb.home_of(&world).await.unwrap() == Some(a.node_id().0) {
+            break;
+        }
+        assert!(
+            t1.elapsed() < Duration::from_secs(10),
+            "world home not replicated"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    wa.delete(&world).await.unwrap();
+    let t2 = Instant::now();
+    loop {
+        if b.directory_get(&format!("world:{world}")).await.is_none() {
+            break;
+        }
+        assert!(
+            t2.elapsed() < Duration::from_secs(10),
+            "world home not removed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    a.stop().await;
+    b.stop().await;
 }

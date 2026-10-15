@@ -52,6 +52,13 @@ pub struct NodeInfo {
     /// Raft node id (0 = not raft-capable, i.e. no QUIC bus).
     #[serde(default)]
     pub raft_id: u64,
+    /// Independent clusters sharing one Postgres are separated by group.
+    #[serde(default = "default_group")]
+    pub group: String,
+}
+
+fn default_group() -> String {
+    "default".into()
 }
 
 type NodeRow = (
@@ -66,6 +73,7 @@ type NodeRow = (
     String,
     String,
     i64,
+    String,
 );
 
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
@@ -107,6 +115,8 @@ pub struct BusMessage {
     /// Non-empty: only these nodes should accept the Postgres copy (targeted redelivery).
     #[serde(default)]
     pub only: Vec<NodeId>,
+    #[serde(default = "default_group")]
+    pub group: String,
 }
 
 impl Cluster {
@@ -129,6 +139,7 @@ impl Cluster {
                 bus_cert: String::new(),
                 state: "alive".into(),
                 raft_id: 0,
+                group: default_group(),
             },
             bus_tx,
             peers: Arc::new(RwLock::new(Vec::new())),
@@ -137,6 +148,12 @@ impl Cluster {
             incarnation: Arc::new(AtomicU64::new(0)),
             raft: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Membership scope: nodes only see, gossip with and replicate to their own group.
+    pub fn with_group(mut self, group: &str) -> Self {
+        self.me.group = group.to_string();
+        self
     }
 
     /// Enable the direct QUIC node-to-node bus on `listen`. Peers discover the address and the
@@ -210,7 +227,7 @@ impl Cluster {
     /// Insert our row, then keep heartbeating and relaying bus notifications until dropped.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         sqlx::query(
-            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10)",
+            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11)",
         )
         .bind(self.me.id.0)
         .bind(&self.me.name)
@@ -222,6 +239,7 @@ impl Cluster {
         .bind(&self.me.bus_addr)
         .bind(&self.me.bus_cert)
         .bind(self.me.raft_id as i64)
+        .bind(&self.me.group)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -346,7 +364,7 @@ impl Cluster {
     }
 
     fn accepts_notify(&self, msg: &BusMessage) -> bool {
-        if msg.origin == self.me.id {
+        if msg.origin == self.me.id || msg.group != self.me.group {
             return false;
         }
         if !msg.only.is_empty() {
@@ -367,8 +385,9 @@ impl Cluster {
 
     pub async fn nodes(&self) -> Result<Vec<NodeInfo>> {
         let rows = sqlx::query_as::<_, NodeRow>(
-            "select id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id from musubi.nodes order by started_at",
+            "select id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group from musubi.nodes where cluster_group = $1 order by started_at",
         )
+        .bind(&self.me.group)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -399,6 +418,7 @@ impl Cluster {
                     bus_cert: r.9,
                     state: state.into(),
                     raft_id: r.10 as u64,
+                    group: r.11,
                 }
             })
             .collect())
@@ -416,6 +436,7 @@ impl Cluster {
             payload: serde_json::to_value(payload)?,
             via_quic: false,
             only: Vec::new(),
+            group: self.me.group.clone(),
         };
         let Some(bus) = &self.bus else {
             return self.notify(&msg).await;
@@ -548,11 +569,17 @@ impl Cluster {
             let mut tick = tokio::time::interval(ttl / 3);
             loop {
                 tick.tick().await;
-                let held = match c.try_lease(&l.name, ttl).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(lease = %l.name, error = %e, "lease renewal failed");
-                        false
+                // With Raft running, the elected leader owns every duty; the Postgres CAS lease
+                // is only the fallback for clusters without the QUIC bus.
+                let held = if c.raft.get().is_some() {
+                    c.is_raft_leader()
+                } else {
+                    match c.try_lease(&l.name, ttl).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(lease = %l.name, error = %e, "lease renewal failed");
+                            false
+                        }
                     }
                 };
                 if l.held.swap(held, Ordering::Relaxed) != held {
