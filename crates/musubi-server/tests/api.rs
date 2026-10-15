@@ -5383,3 +5383,47 @@ async fn jwt_keys_rotate_and_publish_jwks() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "already retired");
 }
+
+/// With a tracer installed, every response carries `X-Trace-Id` and error bodies a `trace_id`
+/// that matches the exported span, so a client-side bug report points at one trace.
+#[tokio::test]
+async fn trace_id_is_returned_on_errors() {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+    let Some(app) = app().await else {
+        return;
+    };
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let sub = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+    let (st, v) = call(&app, "GET", "/v1/account", Some("not-a-token"), None)
+        .with_subscriber(sub)
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let trace_id = v["trace_id"]
+        .as_str()
+        .expect("trace_id in error body")
+        .to_string();
+    assert_eq!(trace_id.len(), 32, "{trace_id}");
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.span_context.trace_id().to_string() == trace_id
+                && s.name.contains("/v1/account")),
+        "exported spans: {:?}",
+        spans
+            .iter()
+            .map(|s| (&s.name, s.span_context.trace_id().to_string()))
+            .collect::<Vec<_>>()
+    );
+    // without a tracer the field is simply absent
+    let (st, v) = call(&app, "GET", "/v1/account", Some("not-a-token"), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert!(v.get("trace_id").is_none(), "{v}");
+}

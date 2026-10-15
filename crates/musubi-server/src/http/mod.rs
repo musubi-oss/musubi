@@ -59,7 +59,8 @@ pub fn router(state: AppState) -> Router {
         .merge(economy::routes())
         .merge(storage::routes())
         .merge(ws::routes())
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(crate::telemetry::trace_id_header))
+        .layer(TraceLayer::new_for_http().make_span_with(crate::telemetry::make_span))
         .layer(axum::middleware::from_fn(crate::metrics::track_http))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

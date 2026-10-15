@@ -18,6 +18,7 @@ pub mod openapi;
 pub mod realtime;
 pub mod retention;
 pub mod runtime_host;
+pub mod telemetry;
 
 pub use app::run;
 pub use musubi_core::config::Config;
@@ -29,8 +30,16 @@ pub fn init_tracing(cfg: &Config) {
         .unwrap_or_else(|_| EnvFilter::new(cfg.log.filter.clone()));
     let reg = tracing_subscriber::registry().with(filter);
     if cfg.log.json {
-        reg.with(fmt::layer().json()).init();
+        let reg = reg.with(fmt::layer().json());
+        match crate::telemetry::otlp_layer(&cfg.tracing) {
+            Some((otel, _provider)) => reg.with(otel).init(),
+            None => reg.init(),
+        }
     } else {
-        reg.with(fmt::layer()).init();
+        let reg = reg.with(fmt::layer());
+        match crate::telemetry::otlp_layer(&cfg.tracing) {
+            Some((otel, _provider)) => reg.with(otel).init(),
+            None => reg.init(),
+        }
     }
 }

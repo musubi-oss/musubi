@@ -47,6 +47,7 @@ pub struct Config {
     pub retention: RetentionConfig,
     pub matchmaker: MatchmakerConfig,
     pub social: SocialConfig,
+    pub tracing: TracingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,6 +736,27 @@ impl SocialConfig {
             jwks_url: "https://appleid.apple.com/auth/keys".into(),
             issuers: vec!["https://appleid.apple.com".into()],
             client_ids: vec![],
+        }
+    }
+}
+
+/// Distributed tracing export (OpenTelemetry). Empty endpoint = spans stay local.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TracingConfig {
+    /// OTLP/HTTP collector base URL, e.g. `http://otel-collector:4318`.
+    pub otlp_endpoint: String,
+    /// Head sampling ratio for root spans (0.0..=1.0); children follow their parent.
+    pub sample_ratio: f64,
+    pub service_name: String,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: String::new(),
+            sample_ratio: 1.0,
+            service_name: "musubi".into(),
         }
     }
 }

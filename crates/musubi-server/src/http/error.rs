@@ -24,11 +24,11 @@ impl IntoResponse for ApiError {
             Error::Internal(_) => "internal error".to_string(),
             other => other.to_string(),
         };
-        let mut res = (
-            status,
-            Json(json!({ "code": self.0.code(), "message": message })),
-        )
-            .into_response();
+        let mut body = json!({ "code": self.0.code(), "message": message });
+        if let Some(id) = crate::telemetry::current_trace_id() {
+            body["trace_id"] = json!(id);
+        }
+        let mut res = (status, Json(body)).into_response();
         if let Error::ResourceExhausted(m) = &self.0 {
             if let Some(secs) = retry_after_secs(m) {
                 if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
