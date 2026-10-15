@@ -27,6 +27,7 @@ pub struct ConnectParams {
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
     pub matches: Arc<MatchRegistry>,
+    pub worlds: Arc<super::WorldRegistry>,
     pub runtime: Arc<Runtime>,
     pub fanout: Fanout,
 }
@@ -43,6 +44,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         parties,
         relayed,
         matches,
+        worlds,
         runtime,
         fanout,
     } = params;
@@ -61,6 +63,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         parties: &parties,
         relayed: &relayed,
         matches: &matches,
+        worlds: &worlds,
         runtime: &runtime,
         fanout: &fanout,
         presence: &presence,
@@ -75,6 +78,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         fanout.mm_remove(&t);
     }
     relayed.leave_all(&fanout, sid);
+    worlds.unsubscribe_all(sid);
     matches.leave_all(sid);
     hub.leave(sid);
     conn.close().await;
@@ -91,6 +95,7 @@ struct Ctx<'a> {
     parties: &'a PartyRegistry,
     relayed: &'a RelayedRegistry,
     matches: &'a MatchRegistry,
+    worlds: &'a super::WorldRegistry,
     runtime: &'a Arc<Runtime>,
     fanout: &'a Fanout,
     presence: &'a UserPresence,
@@ -299,6 +304,30 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                 .create(ctx.presence, name)
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
+        ClientMessage::WorldSubscribe {
+            world,
+            x,
+            y,
+            radius,
+        } => ctx
+            .worlds
+            .subscribe(&world, sid, musubi_mesh::Pos { x, y }, radius)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
+        ClientMessage::WorldUnsubscribe { world } => ctx
+            .worlds
+            .unsubscribe(&world, sid)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
+        ClientMessage::WorldInput {
+            world,
+            entity,
+            input,
+        } => ctx
+            .worlds
+            .input(&world, sid, &entity, input)
+            .err()
+            .map(|e| ServerMessage::error(&e)),
         ClientMessage::MatchJoin {
             match_id,
             token,

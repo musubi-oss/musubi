@@ -1836,6 +1836,7 @@ dependencies = [
  "musubi-fleet",
  "musubi-leaderboard",
  "musubi-matchmaker",
+ "musubi-mesh",
  "musubi-proto",
  "musubi-runtime",
  "musubi-social",

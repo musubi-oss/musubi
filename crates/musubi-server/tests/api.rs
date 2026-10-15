@@ -62,6 +62,7 @@ async fn app() -> Option<Router> {
         parties,
         relayed,
         matches: test_matches(&db, &runtime),
+        worlds: Arc::new(musubi_server::realtime::WorldRegistry::new()),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),

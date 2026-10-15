@@ -39,6 +39,7 @@ pub struct AppState {
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
     pub matches: Arc<MatchRegistry>,
+    pub worlds: Arc<crate::realtime::WorldRegistry>,
     pub runtime: Arc<Runtime>,
     pub cluster: Option<Arc<Cluster>>,
     pub fleets: Arc<FleetService>,
@@ -150,6 +151,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         std::time::Duration::from_secs(1),
     );
     fanout.set_fleets(fleets.clone());
+    let worlds = Arc::new(crate::realtime::WorldRegistry::new());
+    worlds.clone().spawn_ticker(fanout.clone());
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {
         cfg: Arc::new(cfg),
@@ -167,6 +170,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         parties,
         relayed,
         matches,
+        worlds,
         runtime,
         cluster: Some(cluster),
         fleets,

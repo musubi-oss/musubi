@@ -13,6 +13,7 @@ mod notifications;
 mod rpc;
 mod storage;
 mod tournaments;
+mod worlds;
 mod ws;
 
 use axum::extract::State;
@@ -45,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .merge(cluster::routes())
         .merge(matches::routes())
         .merge(fleets::routes())
+        .merge(worlds::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

@@ -80,6 +80,7 @@ async fn build_state(leader: bool) -> Option<AppState> {
         parties,
         relayed,
         matches: test_matches(&db, &runtime),
+        worlds: Arc::new(musubi_server::realtime::WorldRegistry::new()),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),
@@ -1968,4 +1969,233 @@ async fn matchmaker_allocates_a_dedicated_server_when_tickets_ask_for_a_fleet() 
         .delete(uuid::Uuid::parse_str(&fid).unwrap())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn world_meshing_sim_api_and_client_deltas() {
+    let Some(state) = build_state(true).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let k = "defaultkey";
+    let world = format!("w{}", uuid::Uuid::now_v7().simple());
+    let post = |path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::post(&path)
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, _) = post("/v1/server/worlds".into(), json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 5.0, "lease_ttl_ticks": 600, "handover_timeout_ticks": 30}})).await;
+    assert_eq!(st, 200);
+    let s1 = uuid::Uuid::now_v7();
+    let s2 = uuid::Uuid::now_v7();
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/lease"),
+        json!({"sim": s1, "cells": [{"x": 0, "y": 0}]}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/lease"),
+        json!({"sim": s2, "cells": [{"x": 0, "y": 0}]}),
+    )
+    .await;
+    assert_eq!(st, 409, "cell already leased");
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/lease"),
+        json!({"sim": s2, "cells": [{"x": 1, "y": 0}]}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    // s2 cannot spawn in s1's cell
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/spawn"),
+        json!({"sim": s2, "x": 50.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 403);
+
+    // client subscribes before anything exists
+    let f = "json";
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 0.0,
+            y: 0.0,
+            radius: 80.0,
+        },
+    )
+    .await;
+
+    let (st, e) = post(
+        format!("/v1/server/worlds/{world}/spawn"),
+        json!({"sim": s1, "x": 50.0, "y": 50.0, "components": {"hp": 100}}),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let eid = e["id"].as_str().unwrap().to_string();
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { spawned, .. } => {
+            assert_eq!(spawned.len(), 1);
+            assert_eq!(spawned[0].id, eid);
+            assert_eq!(spawned[0].components[0].name, "hp");
+        }
+        m => panic!("{m:?}"),
+    }
+    // authoritative update → delta with the changed component only
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s1, "entity": eid, "x": 60.0, "y": 50.0, "components": {"hp": 90}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { updated, .. } => {
+            assert_eq!(updated.len(), 1);
+            assert_eq!(updated[0].x, 60.0);
+            assert_eq!(updated[0].components.len(), 1);
+            assert_eq!(updated[0].components[0].version, 2);
+        }
+        m => panic!("{m:?}"),
+    }
+    // player input is routed to the owner's event queue
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::WorldInput {
+            world: world.clone(),
+            entity: eid.clone(),
+            input: json!({"move": [1, 0]}),
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (_, ev) = post(
+        format!("/v1/server/worlds/{world}/events?sim={s1}"),
+        json!({}),
+    )
+    .await;
+    let _ = ev;
+    let req = Request::get(format!("/v1/server/worlds/{world}/events?sim={s1}"))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let ev: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "input" && e["entity"] == eid),
+        "{ev}"
+    );
+    // ghost: entity near the border is visible to s2's view of cell (1,0)
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s1, "entity": eid, "x": 95.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let req = Request::get(format!("/v1/server/worlds/{world}/view/1/0"))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["ghosts"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["owned"].as_array().unwrap().len(), 0);
+    // handover: cross the border past hysteresis → s2 gets a request, acks, owns it
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s1, "entity": eid, "x": 110.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let mut got = false;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let req = Request::get(format!("/v1/server/worlds/{world}/events?sim={s2}"))
+            .header("x-musubi-server-key", k)
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let ev: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        if ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "handover_request" && e["entity"] == eid)
+        {
+            got = true;
+            break;
+        }
+    }
+    assert!(got, "s2 never got the handover request");
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s2, "entity": eid, "x": 111.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 403, "no authority before ack");
+    let (st, a) = post(
+        format!("/v1/server/worlds/{world}/handover/ack"),
+        json!({"sim": s2, "entity": eid}),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s2, "entity": eid, "x": 120.0, "y": 50.0, "components": {"hp": 80}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s1, "entity": eid, "x": 1.0, "y": 1.0}),
+    )
+    .await;
+    assert_eq!(st, 403, "old owner lost authority");
+    // the client saw only deltas, never the ownership change
+    let mut saw_update = false;
+    for _ in 0..10 {
+        match recv(&mut c).await.msg {
+            ServerMessage::WorldDelta {
+                updated, despawned, ..
+            } => {
+                if updated.iter().any(|u| u.id == eid && u.x == 120.0) {
+                    saw_update = true;
+                    break;
+                }
+                if despawned.contains(&eid) {
+                    break;
+                }
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    assert!(saw_update);
 }

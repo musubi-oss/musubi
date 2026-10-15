@@ -145,6 +145,22 @@ pub enum ClientMessage {
     },
     /// Send to everyone in the match (or only `presences` when given). `reliable=false` lets
     /// transports drop under pressure.
+    /// Server meshing: stream entity deltas around a point of interest in a world.
+    WorldSubscribe {
+        world: String,
+        x: f64,
+        y: f64,
+        radius: f64,
+    },
+    WorldUnsubscribe {
+        world: String,
+    },
+    /// Player input for an entity; the replication layer routes it to the current owner.
+    WorldInput {
+        world: String,
+        entity: String,
+        input: serde_json::Value,
+    },
     MatchDataSend {
         match_id: String,
         op_code: i64,
@@ -292,6 +308,14 @@ pub enum ServerMessage {
         #[serde(rename = "self")]
         me: UserPresence,
     },
+    /// Server meshing: what changed inside the client's interest since the last delta.
+    WorldDelta {
+        world: String,
+        tick: u64,
+        spawned: Vec<WorldEntity>,
+        updated: Vec<WorldEntity>,
+        despawned: Vec<String>,
+    },
     MatchData {
         match_id: String,
         presence: Option<UserPresence>,
@@ -304,6 +328,22 @@ pub enum ServerMessage {
         joins: Vec<UserPresence>,
         leaves: Vec<UserPresence>,
     },
+}
+
+/// Entity as seen by a client: position plus (changed) components with their versions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorldEntity {
+    pub id: String,
+    pub x: f64,
+    pub y: f64,
+    pub components: Vec<WorldComponent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorldComponent {
+    pub name: String,
+    pub value: serde_json::Value,
+    pub version: u64,
 }
 
 /// Where to connect when the matchmaker allocated a dedicated server.

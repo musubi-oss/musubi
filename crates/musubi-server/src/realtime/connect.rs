@@ -55,6 +55,7 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         parties: s.parties.clone(),
         relayed: s.relayed.clone(),
         matches: s.matches.clone(),
+        worlds: s.worlds.clone(),
         runtime: s.runtime.clone(),
         fanout: s.fanout.clone(),
     }
