@@ -36,6 +36,7 @@ pub fn routes() -> Router<AppState> {
             get(storage_get).put(storage_put).delete(storage_delete),
         )
         .route("/v1/admin/config", get(config))
+        .route("/v1/admin/audit", get(crate::audit::list))
 }
 
 #[derive(Deserialize)]

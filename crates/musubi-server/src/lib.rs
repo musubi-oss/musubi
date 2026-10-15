@@ -1,6 +1,7 @@
 //! Musubi node: wires config, database, services and HTTP/realtime listeners together.
 
 pub mod app;
+pub mod audit;
 pub mod db;
 pub mod fanout;
 pub mod http;

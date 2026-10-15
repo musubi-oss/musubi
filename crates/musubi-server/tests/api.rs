@@ -3812,3 +3812,134 @@ async fn rpc_host_api_reaches_storage_and_accounts() {
     .await;
     assert!(v["ok"].is_null(), "{v}");
 }
+
+#[tokio::test]
+async fn audit_log_records_admin_and_server_mutations_with_redaction() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let srv = |req: axum::http::request::Builder| req.header("x-musubi-server-key", "defaultkey");
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/auth/device")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"id": unique("audit-dev-")}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sess: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let actor = unique("ops-");
+    // admin mutation with an operator identity and a body carrying a secret-looking field
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::put(format!("/v1/admin/storage/auditcol/{acc}")))
+                .header("x-musubi-actor", &actor)
+                .header("x-forwarded-for", "203.0.113.7, 10.0.0.1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"owner_id": acc, "value": {"password": "hunter2", "level": 3}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    // server mutation without an actor header → server-key; a 4xx is recorded too
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::post(format!(
+                "/v1/admin/accounts/{}/ban",
+                uuid::Uuid::now_v7()
+            )))
+            .header("x-musubi-actor", &actor)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    // reads are not audited
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!("/v1/admin/accounts/{acc}")))
+                .header("x-musubi-actor", &actor)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!("/v1/admin/audit?actor={actor}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{v}");
+    let ban = &entries[0];
+    assert_eq!(ban["route"], "/v1/admin/accounts/{id}/ban");
+    assert_eq!(ban["status"], 404);
+    assert_eq!(ban["method"], "POST");
+    let put = &entries[1];
+    assert_eq!(put["route"], "/v1/admin/storage/{collection}/{key}");
+    assert_eq!(put["ip"], "203.0.113.7");
+    assert_eq!(put["body"]["value"]["password"], "***");
+    assert_eq!(put["body"]["value"]["level"], 3);
+    assert_eq!(put["body"]["owner_id"], acc, "ids are not redacted");
+    // pagination by cursor
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!(
+                "/v1/admin/audit?actor={actor}&limit=1"
+            )))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["entries"].as_array().unwrap().len(), 1);
+    let cursor = v["cursor"].as_str().unwrap().to_string();
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!(
+                "/v1/admin/audit?actor={actor}&limit=1&cursor={cursor}"
+            )))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        v["entries"][0]["route"],
+        "/v1/admin/storage/{collection}/{key}"
+    );
+    // the audit endpoint itself is read-only and server-key gated
+    let res = app
+        .clone()
+        .oneshot(Request::get("/v1/admin/audit").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+}
