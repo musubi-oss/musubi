@@ -17,13 +17,23 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
 
+/// Each test gets its own cluster group so concurrently running tests do not share a bus
+/// (otherwise every node is a matchmaker leader and replicated tickets get matched twice).
+fn test_group() -> String {
+    format!("t-{}", uuid::Uuid::now_v7().simple())
+}
+
 async fn start() -> Option<(String, axum::Router)> {
-    start_with(true).await
+    start_with(true, &test_group()).await
+}
+
+async fn start_in(group: &str) -> Option<(String, axum::Router)> {
+    start_with(true, group).await
 }
 
 /// `leader=false` builds a node that replicates tickets but never runs matchmaker passes.
-async fn start_with(leader: bool) -> Option<(String, axum::Router)> {
-    let state = build_state(leader).await?;
+async fn start_with(leader: bool, group: &str) -> Option<(String, axum::Router)> {
+    let state = build_state(leader, group).await?;
     let router = musubi_server::http::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -32,7 +42,7 @@ async fn start_with(leader: bool) -> Option<(String, axum::Router)> {
     Some((format!("127.0.0.1:{}", addr.port()), router))
 }
 
-async fn build_state(leader: bool) -> Option<AppState> {
+async fn build_state(leader: bool, group: &str) -> Option<AppState> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
@@ -40,7 +50,7 @@ async fn build_state(leader: bool) -> Option<AppState> {
     migrate_once(&db).await;
     let hub = Arc::new(Hub::new());
     let runtime = test_runtime();
-    let cluster = test_cluster(&db).await;
+    let cluster = test_cluster(&db, group).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
     let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
@@ -1137,14 +1147,17 @@ async fn rpc_over_socket() {
     ));
 }
 
-async fn test_cluster(db: &sqlx::PgPool) -> Option<Arc<musubi_cluster::Cluster>> {
-    let c = Arc::new(musubi_cluster::Cluster::new(
-        db.clone(),
-        "test-node",
-        "local",
-        vec!["all".into()],
-        "127.0.0.1:0",
-    ));
+async fn test_cluster(db: &sqlx::PgPool, group: &str) -> Option<Arc<musubi_cluster::Cluster>> {
+    let c = Arc::new(
+        musubi_cluster::Cluster::new(
+            db.clone(),
+            "test-node",
+            "local",
+            vec!["all".into()],
+            "127.0.0.1:0",
+        )
+        .with_group(group),
+    );
     c.start().await.unwrap();
     Some(c)
 }
@@ -1153,10 +1166,11 @@ async fn test_cluster(db: &sqlx::PgPool) -> Option<Arc<musubi_cluster::Cluster>>
 /// session on node 2, and so does a notification.
 #[tokio::test]
 async fn cross_node_chat_and_notification_fanout() {
-    let Some((addr1, router1)) = start().await else {
+    let group = test_group();
+    let Some((addr1, router1)) = start_in(&group).await else {
         return;
     };
-    let Some((addr2, _router2)) = start().await else {
+    let Some((addr2, _router2)) = start_in(&group).await else {
         return;
     };
     let f = "json";
@@ -1445,10 +1459,11 @@ async fn match_snapshots_persist_and_resume_on_another_registry() {
 
 #[tokio::test]
 async fn cross_node_presence_follow() {
-    let Some((addr1, router1)) = start().await else {
+    let group = test_group();
+    let Some((addr1, router1)) = start_in(&group).await else {
         return;
     };
-    let Some((addr2, _)) = start().await else {
+    let Some((addr2, _)) = start_in(&group).await else {
         return;
     };
     let f = "json";
@@ -1551,10 +1566,11 @@ async fn wasm_match_module_runs_as_authoritative_match() {
 
 #[tokio::test]
 async fn cross_node_matchmaking() {
-    let Some((addr1, router1)) = start_with(true).await else {
+    let group = test_group();
+    let Some((addr1, router1)) = start_with(true, &group).await else {
         return;
     };
-    let Some((addr2, _)) = start_with(false).await else {
+    let Some((addr2, _)) = start_with(false, &group).await else {
         return;
     };
     let f = "json";
@@ -1603,7 +1619,7 @@ async fn cross_node_matchmaking() {
 
 #[tokio::test]
 async fn quic_transport_ping_and_rpc() {
-    let Some(state) = build_state(true).await else {
+    let Some(state) = build_state(true, &test_group()).await else {
         return;
     };
     let router = musubi_server::http::router(state.clone());
@@ -1677,10 +1693,11 @@ async fn quic_transport_ping_and_rpc() {
 
 #[tokio::test]
 async fn cross_node_party() {
-    let Some((addr1, router1)) = start().await else {
+    let group = test_group();
+    let Some((addr1, router1)) = start_in(&group).await else {
         return;
     };
-    let Some((addr2, _)) = start().await else {
+    let Some((addr2, _)) = start_in(&group).await else {
         return;
     };
     let f = "json";
@@ -1760,7 +1777,7 @@ async fn cross_node_party() {
 
 #[tokio::test]
 async fn quic_unreliable_match_data_uses_datagrams() {
-    let Some(state) = build_state(true).await else {
+    let Some(state) = build_state(true, &test_group()).await else {
         return;
     };
     let router = musubi_server::http::router(state.clone());
@@ -1840,10 +1857,11 @@ async fn quic_unreliable_match_data_uses_datagrams() {
 
 #[tokio::test]
 async fn cross_node_relayed_match() {
-    let Some((addr1, router1)) = start().await else {
+    let group = test_group();
+    let Some((addr1, router1)) = start_in(&group).await else {
         return;
     };
-    let Some((addr2, _)) = start().await else {
+    let Some((addr2, _)) = start_in(&group).await else {
         return;
     };
     let f = "json";
@@ -1910,7 +1928,7 @@ async fn cross_node_relayed_match() {
 
 #[tokio::test]
 async fn matchmaker_allocates_a_dedicated_server_when_tickets_ask_for_a_fleet() {
-    let Some(state) = build_state(true).await else {
+    let Some(state) = build_state(true, &test_group()).await else {
         return;
     };
     let router = musubi_server::http::router(state.clone());
@@ -2002,7 +2020,7 @@ async fn matchmaker_allocates_a_dedicated_server_when_tickets_ask_for_a_fleet() 
 
 #[tokio::test]
 async fn world_meshing_sim_api_and_client_deltas() {
-    let Some(state) = build_state(true).await else {
+    let Some(state) = build_state(true, &test_group()).await else {
         return;
     };
     let router = musubi_server::http::router(state.clone());
@@ -2231,7 +2249,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
 
 #[tokio::test]
 async fn shard_controller_assigns_cells_and_recovers_orphans() {
-    let Some(state) = build_state(true).await else {
+    let Some(state) = build_state(true, &test_group()).await else {
         return;
     };
     let router = musubi_server::http::router(state.clone());
@@ -2400,7 +2418,7 @@ impl musubi_sim_sdk::Simulator for Mover {
 
 #[tokio::test]
 async fn sim_sdk_two_simulators_hand_an_entity_over() {
-    let Some(state) = build_state(true).await else {
+    let Some(state) = build_state(true, &test_group()).await else {
         return;
     };
     let router = musubi_server::http::router(state.clone());
@@ -2478,10 +2496,11 @@ async fn sim_sdk_two_simulators_hand_an_entity_over() {
 
 #[tokio::test]
 async fn cross_node_world_subscription_and_sim_redirect() {
-    let Some((addr1, router1)) = start().await else {
+    let group = test_group();
+    let Some((addr1, router1)) = start_in(&group).await else {
         return;
     };
-    let Some((addr2, router2)) = start().await else {
+    let Some((addr2, router2)) = start_in(&group).await else {
         return;
     };
     let base1 = format!("http://{addr1}");
@@ -2603,7 +2622,7 @@ async fn mock_upstreams() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
 
 #[tokio::test]
 async fn zanshin_and_aurix_integrations() {
-    let Some(mut state) = build_state(true).await else {
+    let Some(mut state) = build_state(true, &test_group()).await else {
         return;
     };
     let (upstream, seen) = mock_upstreams().await;
@@ -2875,7 +2894,7 @@ async fn http_json(
 
 #[tokio::test]
 async fn iap_apple_and_google_receipts_redeem_once() {
-    let Some(mut state) = build_state(true).await else {
+    let Some(mut state) = build_state(true, &test_group()).await else {
         return;
     };
     let suffix = uuid::Uuid::now_v7().simple().to_string();

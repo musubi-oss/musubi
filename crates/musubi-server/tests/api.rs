@@ -22,7 +22,7 @@ async fn app() -> Option<Router> {
     let storage = StorageService::new(db.clone());
     let hub = Arc::new(musubi_server::realtime::Hub::new());
     let runtime = test_runtime();
-    let cluster = test_cluster(&db).await;
+    let cluster = test_cluster(&db, &unique("grp")).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
     let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
@@ -1389,14 +1389,17 @@ async fn rpc_over_http_with_bearer_and_server_key() {
     assert!(l["rpcs"].as_array().unwrap().iter().any(|r| r == "echo"));
 }
 
-async fn test_cluster(db: &sqlx::PgPool) -> Option<Arc<musubi_cluster::Cluster>> {
-    let c = Arc::new(musubi_cluster::Cluster::new(
-        db.clone(),
-        "test-node",
-        "local",
-        vec!["all".into()],
-        "127.0.0.1:0",
-    ));
+async fn test_cluster(db: &sqlx::PgPool, group: &str) -> Option<Arc<musubi_cluster::Cluster>> {
+    let c = Arc::new(
+        musubi_cluster::Cluster::new(
+            db.clone(),
+            "test-node",
+            "local",
+            vec!["all".into()],
+            "127.0.0.1:0",
+        )
+        .with_group(group),
+    );
     c.start().await.unwrap();
     Some(c)
 }
