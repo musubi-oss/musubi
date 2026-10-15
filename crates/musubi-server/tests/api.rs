@@ -83,6 +83,7 @@ async fn app() -> Option<Router> {
         hub,
         db,
         started_at: std::time::Instant::now(),
+        metrics: musubi_server::metrics::install(),
     }))
 }
 
@@ -3446,5 +3447,39 @@ async fn market_listings_bids_buyout_settle_and_direct_trades() {
             .iter()
             .any(|n| n["code"] == 111),
         "{notes}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_prometheus_text() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let res = app
+        .clone()
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(res.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain"));
+    let body =
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(
+        body.contains("musubi_http_requests_total{") && body.contains("route=\"/healthz\""),
+        "{body}"
+    );
+    assert!(body.contains("musubi_realtime_sessions "), "{body}");
+    assert!(
+        body.contains("musubi_http_request_duration_seconds_bucket"),
+        "{body}"
     );
 }

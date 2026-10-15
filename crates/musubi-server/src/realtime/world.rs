@@ -589,6 +589,7 @@ impl WorldRegistry {
     pub fn tick(&self, fanout: &Fanout) {
         for w in self.worlds.iter() {
             let name = w.key().clone();
+            let started = std::time::Instant::now();
             let mut st = w.lock();
             let st = &mut *st;
             let mut outcomes = st.world.advance();
@@ -639,6 +640,10 @@ impl WorldRegistry {
                 }
             }
             let tick = st.world.tick;
+            metrics::histogram!("musubi_world_tick_duration_seconds", "world" => name.clone())
+                .record(started.elapsed().as_secs_f64());
+            metrics::gauge!("musubi_world_entities", "world" => name.clone())
+                .set(st.world.len() as f64);
             let subs: Vec<(SessionId, Uuid)> = st.subs.iter().map(|(s, c)| (*s, *c)).collect();
             for (sid, client) in subs {
                 if let Some(d) = st.world.delta_for(client) {

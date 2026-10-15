@@ -22,3 +22,4 @@ rcgen.workspace = true
 hex.workspace = true
 openraft.workspace = true
 sha2.workspace = true
+metrics = "0.24.6"

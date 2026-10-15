@@ -281,6 +281,8 @@ impl Cluster {
                     Ok(n) => {
                         if let Ok(msg) = serde_json::from_str::<BusMessage>(n.payload()) {
                             if relay.accepts_notify(&msg) {
+                                metrics::counter!("musubi_bus_messages_total", "transport" => "postgres", "dir" => "rx", "ok" => "true").increment(1);
+                                metrics::counter!("musubi_bus_bytes_total", "transport" => "postgres", "dir" => "rx").increment(n.payload().len() as u64);
                                 let _ = relay.bus_tx.send(msg);
                             }
                         }
@@ -310,6 +312,8 @@ impl Cluster {
                                     };
                                     match serde_json::from_slice::<BusMessage>(&buf) {
                                         Ok(msg) if msg.origin != c.me.id => {
+                                            metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "rx", "ok" => "true").increment(1);
+                                            metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "rx").increment(buf.len() as u64);
                                             let _ = c.bus_tx.send(msg);
                                         }
                                         Ok(_) => {}
@@ -461,6 +465,8 @@ impl Cluster {
             set.spawn(async move {
                 let r = tokio::time::timeout(QUIC_SEND_TIMEOUT, bus.send(&p, &bytes)).await;
                 let ok = matches!(r, Ok(Ok(())));
+                metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "tx", "ok" => if ok { "true" } else { "false" }).increment(1);
+                metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "tx").increment(bytes.len() as u64);
                 if !ok {
                     tracing::warn!(peer = %p.id.0, %p.bus_addr, "quic bus delivery failed; falling back to postgres");
                     bus.conns.lock().await.remove(&p.id.0);
@@ -490,6 +496,9 @@ impl Cluster {
 
     async fn notify(&self, msg: &BusMessage) -> Result<()> {
         let text = serde_json::to_string(msg)?;
+        metrics::counter!("musubi_bus_messages_total", "transport" => "postgres", "dir" => "tx", "ok" => "true").increment(1);
+        metrics::counter!("musubi_bus_bytes_total", "transport" => "postgres", "dir" => "tx")
+            .increment(text.len() as u64);
         if text.len() > MAX_BUS_PAYLOAD {
             return Err(Error::ResourceExhausted(format!(
                 "bus message {} exceeds {MAX_BUS_PAYLOAD} bytes",

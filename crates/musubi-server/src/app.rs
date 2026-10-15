@@ -53,6 +53,7 @@ pub struct AppState {
     pub fanout: Fanout,
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
+    pub metrics: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -296,6 +297,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         fanout,
         hub,
         started_at: std::time::Instant::now(),
+        metrics: crate::metrics::install(),
     };
     {
         let st = state.clone();

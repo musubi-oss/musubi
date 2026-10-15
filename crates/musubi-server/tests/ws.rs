@@ -111,6 +111,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         cfg: Arc::new(cfg),
         db,
         started_at: std::time::Instant::now(),
+        metrics: musubi_server::metrics::install(),
     })
 }
 

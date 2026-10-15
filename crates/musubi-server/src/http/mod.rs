@@ -34,6 +34,7 @@ pub use extract::{Bearer, ServerKey};
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(crate::metrics::render))
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
         .merge(auth::routes())
@@ -54,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(crate::metrics::track_http))
         .with_state(state)
 }
 
