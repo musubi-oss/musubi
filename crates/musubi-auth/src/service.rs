@@ -242,6 +242,45 @@ impl AuthService {
             .await
     }
 
+    /// Sign in with a subject already verified by a third party (steam id, OIDC `sub`).
+    pub async fn authenticate_external(
+        &self,
+        provider: &str,
+        subject: &str,
+        opts: AuthOptions,
+    ) -> Result<Session> {
+        if subject.is_empty() || subject.len() > 256 {
+            return Err(Error::InvalidArgument(
+                "subject must be 1..=256 chars".into(),
+            ));
+        }
+        let (account_id, created) = self.find_or_create(provider, subject, None, &opts).await?;
+        self.open_session(
+            account_id,
+            created,
+            opts.vars,
+            Device {
+                device_id: None,
+                user_agent: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn link_external(
+        &self,
+        account_id: AccountId,
+        provider: &str,
+        subject: &str,
+    ) -> Result<IdentityId> {
+        if subject.is_empty() || subject.len() > 256 {
+            return Err(Error::InvalidArgument(
+                "subject must be 1..=256 chars".into(),
+            ));
+        }
+        self.link(account_id, provider, subject, None).await
+    }
+
     /// The account's email identity: (address, verified).
     pub async fn email_of(&self, account_id: AccountId) -> Result<Option<(String, bool)>> {
         sqlx::query_as::<_, (String, bool)>(

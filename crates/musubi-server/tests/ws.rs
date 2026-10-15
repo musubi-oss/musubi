@@ -80,6 +80,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
     ));
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
+    let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
     Some(AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
@@ -113,6 +114,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
+        logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         db,

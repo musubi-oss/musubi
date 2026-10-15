@@ -46,6 +46,7 @@ pub struct Config {
     pub realtime: RealtimeConfig,
     pub retention: RetentionConfig,
     pub matchmaker: MatchmakerConfig,
+    pub social: SocialConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -665,6 +666,75 @@ impl Default for MatchmakerConfig {
         Self {
             min_wait_secs: 15,
             ticket_ttl_secs: 180,
+        }
+    }
+}
+
+/// Third-party sign-in (`POST /v1/auth/steam|google|apple`, `/v1/account/link/...`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SocialConfig {
+    pub steam: SteamLoginConfig,
+    pub google: OidcLoginConfig,
+    pub apple: OidcLoginConfig,
+}
+
+impl Default for SocialConfig {
+    fn default() -> Self {
+        Self {
+            steam: SteamLoginConfig::default(),
+            google: Self::google_defaults(),
+            apple: Self::apple_defaults(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SteamLoginConfig {
+    pub url: String,
+    /// Steamworks Web API key; empty = Steam login disabled.
+    pub web_api_key: String,
+    pub app_id: u32,
+}
+
+impl Default for SteamLoginConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://partner.steam-api.com".into(),
+            web_api_key: String::new(),
+            app_id: 0,
+        }
+    }
+}
+
+/// OpenID Connect ID-token verification against a JWKS. `client_ids` empty = audience not checked
+/// (set it in production).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OidcLoginConfig {
+    pub jwks_url: String,
+    pub issuers: Vec<String>,
+    pub client_ids: Vec<String>,
+}
+
+impl SocialConfig {
+    pub fn google_defaults() -> OidcLoginConfig {
+        OidcLoginConfig {
+            jwks_url: "https://www.googleapis.com/oauth2/v3/certs".into(),
+            issuers: vec![
+                "accounts.google.com".into(),
+                "https://accounts.google.com".into(),
+            ],
+            client_ids: vec![],
+        }
+    }
+
+    pub fn apple_defaults() -> OidcLoginConfig {
+        OidcLoginConfig {
+            jwks_url: "https://appleid.apple.com/auth/keys".into(),
+            issuers: vec!["https://appleid.apple.com".into()],
+            client_ids: vec![],
         }
     }
 }

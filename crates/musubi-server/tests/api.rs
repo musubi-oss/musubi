@@ -57,6 +57,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     ));
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
+    let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
     let state = AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -90,6 +91,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
+        logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         db,
@@ -5073,4 +5075,168 @@ async fn email_verification_and_password_reset() {
         "old refresh sessions must be revoked: {v}"
     );
     let _ = acc;
+}
+
+/// Steam tickets and Google/Apple ID tokens become identities; verified against a mock Steam Web
+/// API and a mock JWKS signed with the RSA test fixture.
+#[tokio::test]
+async fn social_logins_verify_and_link() {
+    use axum::extract::Query as AxQuery;
+    use axum::routing::get as ax_get;
+    let jwks: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/google_test_jwks.json")).unwrap();
+    let mock = Router::new()
+        .route("/jwks", ax_get(move || { let j = jwks.clone(); async move { axum::Json(j) } }))
+        .route(
+            "/ISteamUserAuth/AuthenticateUserTicket/v1/",
+            ax_get(|AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| async move {
+                let id = match q.get("ticket").map(String::as_str) {
+                    Some("0a0a") => "76561198000000001",
+                    Some("0b0b") => "76561198000000002",
+                    Some("0bad") => return axum::Json(json!({"response": {"params": {"result": "OK", "steamid": "76561198000000003", "vacbanned": true}}})),
+                    _ => return axum::Json(json!({"response": {"error": {"errorcode": 101, "errordesc": "Invalid ticket"}}})),
+                };
+                axum::Json(json!({"response": {"params": {"result": "OK", "steamid": id, "ownersteamid": id, "vacbanned": false, "publisherbanned": false}}}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        c.social.steam.url = b.clone();
+        c.social.steam.web_api_key = "k".into();
+        c.social.steam.app_id = 480;
+        c.social.google.jwks_url = format!("{b}/jwks");
+        c.social.google.issuers = vec!["https://accounts.google.com".into()];
+        c.social.google.client_ids = vec!["my-client".into()];
+        c.social.apple.jwks_url = format!("{b}/jwks");
+        c.social.apple.issuers = vec!["https://appleid.apple.com".into()];
+    })
+    .await
+    else {
+        return;
+    };
+    let key =
+        jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!("fixtures/google_test_rsa.pem"))
+            .unwrap();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("t1".into());
+    let exp = time::OffsetDateTime::now_utc().unix_timestamp() + 600;
+    let sign = |iss: &str, aud: &str, sub: &str| {
+        jsonwebtoken::encode(
+            &header,
+            &json!({"iss": iss, "aud": aud, "sub": sub, "exp": exp, "email": "g@example.test"}),
+            &key,
+        )
+        .unwrap()
+    };
+    let gsub = unique("gsub-");
+    let tok = sign("https://accounts.google.com", "my-client", &gsub);
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/google",
+        None,
+        Some(json!({"id_token": tok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/google",
+        None,
+        Some(json!({"id_token": tok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        s1["account_id"], s2["account_id"],
+        "same sub → same account"
+    );
+    let bad_aud = sign("https://accounts.google.com", "other-client", &gsub);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/google",
+        None,
+        Some(json!({"id_token": bad_aud})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let bad_iss = sign("https://evil.example", "my-client", &gsub);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/google",
+        None,
+        Some(json!({"id_token": bad_iss})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let apple = sign(
+        "https://appleid.apple.com",
+        "com.example.game",
+        &unique("asub-"),
+    );
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/apple",
+        None,
+        Some(json!({"id_token": apple})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/steam",
+        None,
+        Some(json!({"ticket": "0a0a"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/steam",
+        None,
+        Some(json!({"ticket": "ffff"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/steam",
+        None,
+        Some(json!({"ticket": "0bad"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "vac banned: {v}");
+
+    // link a steam id to the google account, then sign in with steam lands on the same account
+    let gtok = s1["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/link/steam",
+        Some(&gtok),
+        Some(json!({"ticket": "0b0b"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/steam",
+        None,
+        Some(json!({"ticket": "0b0b"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["account_id"], s1["account_id"]);
 }

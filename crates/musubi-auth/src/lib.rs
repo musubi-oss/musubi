@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 pub mod provider {
     pub const DEVICE: &str = "device";
     pub const EMAIL: &str = "email";
+    pub const STEAM: &str = "steam";
+    pub const GOOGLE: &str = "google";
+    pub const APPLE: &str = "apple";
     pub const CUSTOM: &str = "custom";
 }
 

@@ -9,6 +9,7 @@ pub mod fanout;
 pub mod http;
 pub mod keys;
 pub mod limits;
+pub mod logins;
 pub mod metrics;
 pub mod modules;
 pub mod notify;

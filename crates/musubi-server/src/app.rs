@@ -58,6 +58,7 @@ pub struct AppState {
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
     pub keys: Arc<crate::keys::ServerKeys>,
+    pub logins: Arc<crate::logins::Social>,
     /// Set on SIGTERM: `/readyz` answers 503 so load balancers stop routing here.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
     /// Fired by `POST /v1/admin/cluster/nodes/{id}/drain`: same path as SIGTERM.
@@ -342,11 +343,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     worlds.clone().spawn_ticker(fanout.clone());
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let limits = Arc::new(crate::limits::RateLimiter::new(&cfg.limits));
+    let logins = Arc::new(crate::logins::Social::new(cfg.social.clone()));
     let state = AppState {
         cfg: Arc::new(cfg),
         events: Arc::new(crate::events::Events::new(db.clone())),
         banned: Arc::new(crate::bans::Bans::default()),
         keys: Arc::new(crate::keys::ServerKeys::default()),
+        logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         db,

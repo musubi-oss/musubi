@@ -14,6 +14,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/email", post(email))
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/logout", post(logout))
+        .route("/v1/auth/steam", post(steam))
+        .route("/v1/auth/google", post(google))
+        .route("/v1/auth/apple", post(apple))
         .route("/v1/auth/email/verify/request", post(verify_request))
         .route("/v1/auth/email/verify", post(verify))
         .route("/v1/auth/email/reset/request", post(reset_request))
@@ -299,4 +302,63 @@ async fn reset(
         )
         .await;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SteamReq {
+    ticket: String,
+    #[serde(flatten)]
+    opts: AuthOptions,
+}
+
+#[derive(Deserialize)]
+struct IdTokenReq {
+    id_token: String,
+    #[serde(flatten)]
+    opts: AuthOptions,
+}
+
+async fn steam(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<SteamReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let steam_id = s.logins.steam(&r.ticket).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::STEAM, &steam_id, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::STEAM);
+    Ok(Json(sess))
+}
+
+async fn google(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<IdTokenReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let claims = s.logins.google(&r.id_token).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::GOOGLE, &claims.sub, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::GOOGLE);
+    Ok(Json(sess))
+}
+
+async fn apple(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<IdTokenReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let claims = s.logins.apple(&r.id_token).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::APPLE, &claims.sub, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::APPLE);
+    Ok(Json(sess))
 }

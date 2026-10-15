@@ -19,6 +19,9 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/account/link/device", post(link_device))
         .route("/v1/account/link/email", post(link_email))
+        .route("/v1/account/link/steam", post(link_steam))
+        .route("/v1/account/link/google", post(link_google))
+        .route("/v1/account/link/apple", post(link_apple))
         .route("/v1/account/unlink/device", delete(unlink_device))
         .route("/v1/account/unlink/email", delete(unlink_email))
         .route("/v1/users", get(get_users))
@@ -142,4 +145,50 @@ async fn get_users(
         .collect();
     let users: Vec<User> = s.accounts.get_users(&ids, &names).await?;
     Ok(Json(json!({ "users": users })))
+}
+
+#[derive(Deserialize)]
+struct LinkSteamBody {
+    ticket: String,
+}
+
+#[derive(Deserialize)]
+struct LinkIdTokenBody {
+    id_token: String,
+}
+
+async fn link_steam(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<LinkSteamBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = s.logins.steam(&b.ticket).await?;
+    s.auth
+        .link_external(me.account_id, musubi_auth::provider::STEAM, &id)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn link_google(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<LinkIdTokenBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = s.logins.google(&b.id_token).await?;
+    s.auth
+        .link_external(me.account_id, musubi_auth::provider::GOOGLE, &c.sub)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn link_apple(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<LinkIdTokenBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = s.logins.apple(&b.id_token).await?;
+    s.auth
+        .link_external(me.account_id, musubi_auth::provider::APPLE, &c.sub)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
 }
