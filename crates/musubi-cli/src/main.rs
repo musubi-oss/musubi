@@ -1,9 +1,11 @@
 //! `musubi` — developer CLI.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 mod bench;
 mod doctor;
+mod transfer;
 
 use clap::{Parser, Subcommand};
 use musubi_core::config::Config;
@@ -31,6 +33,23 @@ enum Cmd {
     },
     /// Apply pending database migrations and exit.
     Migrate,
+    /// Dump game data (every `musubi` table except runtime state, or `--tables`) as JSONL.
+    Export {
+        /// Output file (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Comma-separated table names to export instead of the default set.
+        #[arg(long, value_delimiter = ',')]
+        tables: Option<Vec<String>>,
+    },
+    /// Load a JSONL dump produced by `export`; existing rows are kept unless `--replace`.
+    Import {
+        /// Input file (default: stdin).
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        replace: bool,
+    },
     /// Check the configuration and the environment (secrets, TTLs, database, pending migrations,
     /// data dir, ports) and exit 1 if anything would stop the server.
     Doctor,
@@ -77,6 +96,47 @@ async fn main() -> anyhow::Result<()> {
             musubi_server::run(cfg).await
         }
         Cmd::Doctor => doctor::run(&cfg).await,
+        Cmd::Export { out, tables } => {
+            let pool = musubi_server::db::connect(&cfg.database).await?;
+            let counts = match out {
+                Some(p) => {
+                    let mut f = std::io::BufWriter::new(std::fs::File::create(&p)?);
+                    let c = transfer::export(&pool, &mut f, tables.as_deref()).await?;
+                    f.flush()?;
+                    c
+                }
+                None => {
+                    let mut o = std::io::stdout().lock();
+                    transfer::export(&pool, &mut o, tables.as_deref()).await?
+                }
+            };
+            for (t, n) in &counts {
+                eprintln!("{t:<24} {n}");
+            }
+            eprintln!(
+                "exported {} rows from {} tables",
+                counts.values().sum::<u64>(),
+                counts.len()
+            );
+            Ok(())
+        }
+        Cmd::Import { input, replace } => {
+            let pool = musubi_server::db::connect(&cfg.database).await?;
+            let counts = match input {
+                Some(p) => {
+                    let mut r = std::io::BufReader::new(std::fs::File::open(&p)?);
+                    transfer::import(&pool, &mut r, replace).await?
+                }
+                None => {
+                    let mut r = std::io::stdin().lock();
+                    transfer::import(&pool, &mut r, replace).await?
+                }
+            };
+            for (t, (w, s)) in &counts {
+                eprintln!("{t:<24} written {w:<8} kept {s}");
+            }
+            Ok(())
+        }
         Cmd::Migrate => {
             musubi_server::init_tracing(&cfg);
             let pool = musubi_server::db::connect(&cfg.database).await?;
