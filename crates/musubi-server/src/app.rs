@@ -95,6 +95,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         &cfg.http.listen.to_string(),
     );
     cluster = cluster.with_group(&cfg.node.cluster_group);
+    cluster = cluster.with_data_dir(&cfg.node.data_dir)?;
     if !cfg.node.bus_listen.is_empty() {
         let listen: std::net::SocketAddr = cfg
             .node
@@ -126,7 +127,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if !wasm_mods.is_empty() {
         tracing::info!(modules = ?wasm_mods, "wasm match modules registered");
     }
-    let resumed = matches.recover(hub.clone(), &[]).await?;
+    // Our own id too: with a stable node id the matches we ran before a restart are ours again.
+    let resumed = matches.recover(hub.clone(), &[cluster.node_id().0]).await?;
     if !resumed.is_empty() {
         tracing::info!(
             count = resumed.len(),
@@ -213,7 +215,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         });
     }
-    let adopted = worlds.recover(&[]).await?;
+    let adopted = worlds.recover(&[cluster.node_id().0]).await?;
     if !adopted.is_empty() {
         tracing::info!(count = adopted.len(), "adopted orphaned worlds");
     }

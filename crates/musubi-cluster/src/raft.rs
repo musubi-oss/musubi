@@ -74,7 +74,7 @@ pub struct DirectoryData {
     pub data: BTreeMap<String, Value>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StoredSnapshot {
     pub meta: SnapshotMeta<RaftNodeId, BasicNode>,
     pub data: Vec<u8>,
@@ -85,6 +85,63 @@ pub struct StateMachineStore {
     pub state: RwLock<DirectoryData>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
+    /// Durable copy (`sm.json`, `snapshot.json`); `None` = memory only.
+    dir: Option<std::path::PathBuf>,
+}
+
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_data()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+impl StateMachineStore {
+    /// Open the state machine rooted at `dir`, restoring the applied state and the last snapshot
+    /// a previous process wrote there. `None` = in-memory.
+    pub fn open(dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
+        let mut me = Self::default();
+        if let Some(dir) = dir {
+            std::fs::create_dir_all(&dir)?;
+            if let Ok(bytes) = std::fs::read(dir.join("sm.json")) {
+                let st: DirectoryData = serde_json::from_slice(&bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                me.state = RwLock::new(st);
+            }
+            if let Ok(bytes) = std::fs::read(dir.join("snapshot.json")) {
+                let snap: StoredSnapshot = serde_json::from_slice(&bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                me.current_snapshot = RwLock::new(Some(snap));
+            }
+            me.dir = Some(dir);
+        }
+        Ok(me)
+    }
+
+    fn persist_state(
+        &self,
+        st: &DirectoryData,
+    ) -> std::result::Result<(), StorageError<RaftNodeId>> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let bytes = serde_json::to_vec(st).map_err(|e| StorageIOError::write_state_machine(&e))?;
+        write_atomic(&dir.join("sm.json"), &bytes)
+            .map_err(|e| StorageIOError::write_state_machine(&e).into())
+    }
+
+    fn persist_snapshot(
+        &self,
+        snap: &StoredSnapshot,
+    ) -> std::result::Result<(), StorageError<RaftNodeId>> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let bytes = serde_json::to_vec(snap)
+            .map_err(|e| StorageIOError::write_snapshot(Some(snap.meta.signature()), &e))?;
+        write_atomic(&dir.join("snapshot.json"), &bytes)
+            .map_err(|e| StorageIOError::write_snapshot(Some(snap.meta.signature()), &e).into())
+    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
@@ -107,10 +164,12 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             last_membership,
             snapshot_id,
         };
-        *self.current_snapshot.write().await = Some(StoredSnapshot {
+        let stored = StoredSnapshot {
             meta: meta.clone(),
             data: data.clone(),
-        });
+        };
+        self.persist_snapshot(&stored)?;
+        *self.current_snapshot.write().await = Some(stored);
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),
@@ -165,6 +224,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                 }
             }
         }
+        self.persist_state(&sm)?;
         Ok(res)
     }
 
@@ -188,11 +248,14 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         };
         let data: BTreeMap<String, Value> = serde_json::from_slice(&new.data)
             .map_err(|e| StorageIOError::read_snapshot(Some(new.meta.signature()), &e))?;
-        *self.state.write().await = DirectoryData {
+        let st = DirectoryData {
             last_applied_log: meta.last_log_id,
             last_membership: meta.last_membership.clone(),
             data,
         };
+        self.persist_state(&st)?;
+        self.persist_snapshot(&new)?;
+        *self.state.write().await = st;
         *self.current_snapshot.write().await = Some(new);
         Ok(())
     }
@@ -339,14 +402,22 @@ impl Cluster {
             ..Default::default()
         };
         let config = Arc::new(config.validate().map_err(Error::internal)?);
-        let sm = Arc::new(StateMachineStore::default());
+        let dir = self
+            .data_dir
+            .as_ref()
+            .map(|d| d.join("raft").join(&self.me.group));
+        if let Some(d) = &dir {
+            tracing::info!(dir = %d.display(), raft_id = self.me.raft_id, "raft storage on disk");
+        }
+        let sm = Arc::new(StateMachineStore::open(dir.clone()).map_err(Error::internal)?);
+        let log = LogStore::open(dir).map_err(Error::internal)?;
         let raft = Raft::new(
             self.me.raft_id,
             config,
             RaftNet {
                 cluster: self.clone(),
             },
-            LogStore::default(),
+            log,
             sm.clone(),
         )
         .await

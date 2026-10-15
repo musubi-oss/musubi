@@ -182,8 +182,8 @@ impl WorldRegistry {
         };
         let rows: Vec<(String, Value, Value)> = sqlx::query_as(
             "update musubi.worlds w set node_id = $2
-             where w.node_id <> $2
-               and (w.node_id = any($1) or not exists (select 1 from musubi.nodes n where n.id = w.node_id))
+             where (w.node_id = any($1) or not exists (select 1 from musubi.nodes n where n.id = w.node_id))
+               and not (w.node_id = $2 and $2 <> all($1))
              returning name, config, controller",
         )
         .bind(dead_nodes)
@@ -193,6 +193,9 @@ impl WorldRegistry {
         .map_err(Error::internal)?;
         let mut out = Vec::new();
         for (name, cfg, ctl) in rows {
+            if self.worlds.contains_key(&name) {
+                continue;
+            }
             let cfg: WorldConfig = serde_json::from_value(cfg)?;
             let ctl: ControllerConfig = serde_json::from_value(ctl)?;
             let snap: Option<(Value, i64)> =

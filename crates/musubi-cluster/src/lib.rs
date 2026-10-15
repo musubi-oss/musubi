@@ -101,6 +101,8 @@ pub struct Cluster {
     pub(crate) members: Arc<RwLock<HashMap<Uuid, swim::Member>>>,
     pub(crate) incarnation: Arc<AtomicU64>,
     pub(crate) raft: Arc<std::sync::OnceLock<raft::RaftState>>,
+    /// Node data directory: stable node id + Raft storage. `None` = ephemeral node.
+    pub(crate) data_dir: Option<std::path::PathBuf>,
 }
 
 /// A message from another node. `topic` routes it; `payload` is topic-specific JSON.
@@ -147,6 +149,7 @@ impl Cluster {
             members: Arc::new(RwLock::new(HashMap::new())),
             incarnation: Arc::new(AtomicU64::new(0)),
             raft: Arc::new(std::sync::OnceLock::new()),
+            data_dir: None,
         }
     }
 
@@ -224,10 +227,33 @@ impl Cluster {
         self.me.id
     }
 
+    /// Give the node a home on disk: its id is read from (or written to) `<dir>/node_id`, so the
+    /// same identity — and Raft membership, worlds, matches — survives a restart. Raft log and
+    /// state machine live under `<dir>/raft/<group>/`.
+    pub fn with_data_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Result<Self> {
+        let dir: std::path::PathBuf = dir.into();
+        std::fs::create_dir_all(&dir).map_err(Error::internal)?;
+        let id_path = dir.join("node_id");
+        let id = match std::fs::read_to_string(&id_path) {
+            Ok(text) => Uuid::parse_str(text.trim())
+                .map_err(|_| Error::Internal(format!("{} is not a uuid", id_path.display())))?,
+            Err(_) => {
+                std::fs::write(&id_path, self.me.id.0.to_string()).map_err(Error::internal)?;
+                self.me.id.0
+            }
+        };
+        self.me.id = NodeId(id);
+        if self.bus.is_some() {
+            self.me.raft_id = raft::raft_id(id);
+        }
+        self.data_dir = Some(dir);
+        Ok(self)
+    }
+
     /// Insert our row, then keep heartbeating and relaying bus notifications until dropped.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         sqlx::query(
-            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11)",
+            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11) on conflict (id) do update set name = excluded.name, region = excluded.region, roles = excluded.roles, version = excluded.version, advertise = excluded.advertise, started_at = excluded.started_at, heartbeat_at = now(), bus_addr = excluded.bus_addr, bus_cert = excluded.bus_cert, raft_id = excluded.raft_id, cluster_group = excluded.cluster_group",
         )
         .bind(self.me.id.0)
         .bind(&self.me.name)
