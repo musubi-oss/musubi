@@ -28,6 +28,10 @@ pub struct ResumeRecord {
     pub presence: UserPresence,
     pub channels: Vec<ClientMessage>,
     pub matches: Vec<ClientMessage>,
+    /// world name → the subscribe that produced it
+    pub worlds: Vec<ClientMessage>,
+    /// party id → the join that produced it (parties created by the session are not re-created)
+    pub parties: Vec<ClientMessage>,
     pub follows: Vec<AccountId>,
 }
 
@@ -37,6 +41,8 @@ struct State {
     channels: HashMap<String, ClientMessage>,
     /// match id → the join that produced it
     matches: HashMap<String, ClientMessage>,
+    worlds: HashMap<String, ClientMessage>,
+    parties: HashMap<String, ClientMessage>,
     follows: Vec<AccountId>,
 }
 
@@ -100,6 +106,34 @@ impl ResumeTracker {
         self.touch();
     }
 
+    pub async fn subscribed_world(self: &Arc<Self>, world: &str, sub: ClientMessage) {
+        self.state
+            .lock()
+            .await
+            .worlds
+            .insert(world.to_string(), sub);
+        self.touch();
+    }
+
+    pub async fn unsubscribed_world(self: &Arc<Self>, world: &str) {
+        self.state.lock().await.worlds.remove(world);
+        self.touch();
+    }
+
+    pub async fn joined_party(self: &Arc<Self>, party_id: &str, join: ClientMessage) {
+        self.state
+            .lock()
+            .await
+            .parties
+            .insert(party_id.to_string(), join);
+        self.touch();
+    }
+
+    pub async fn left_party(self: &Arc<Self>, party_id: &str) {
+        self.state.lock().await.parties.remove(party_id);
+        self.touch();
+    }
+
     pub async fn followed(self: &Arc<Self>, ids: &[AccountId]) {
         let mut st = self.state.lock().await;
         for id in ids {
@@ -129,22 +163,25 @@ impl ResumeTracker {
     async fn save(&self) -> Result<()> {
         let _guard = self.save_lock.lock().await;
         let parked = self.parked.load(std::sync::atomic::Ordering::Relaxed);
-        let (channels, matches, follows) = {
+        let (channels, matches, worlds, parties, follows) = {
             let st = self.state.lock().await;
             (
                 serde_json::to_value(st.channels.values().collect::<Vec<_>>())?,
                 serde_json::to_value(st.matches.values().collect::<Vec<_>>())?,
+                serde_json::to_value(st.worlds.values().collect::<Vec<_>>())?,
+                serde_json::to_value(st.parties.values().collect::<Vec<_>>())?,
                 serde_json::to_value(&st.follows)?,
             )
         };
         sqlx::query(
             "insert into musubi.resumable_sessions
                (token_hash, session_id, account_id, username, status, node_id, cluster_group,
-                channels, matches, follows, expires_at, updated_at, parked)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now() + make_interval(secs => $11), now(), $12)
+                channels, matches, follows, expires_at, updated_at, parked, worlds, parties)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now() + make_interval(secs => $11), now(), $12, $13, $14)
              on conflict (token_hash) do update set
                node_id = excluded.node_id, parked = excluded.parked, status = excluded.status, channels = excluded.channels,
-               matches = excluded.matches, follows = excluded.follows,
+               matches = excluded.matches, follows = excluded.follows, worlds = excluded.worlds,
+               parties = excluded.parties,
                expires_at = excluded.expires_at, updated_at = now()",
         )
         .bind(&self.token_hash)
@@ -159,6 +196,8 @@ impl ResumeTracker {
         .bind(follows)
         .bind(self.store.ttl.as_secs_f64())
         .bind(parked)
+        .bind(worlds)
+        .bind(parties)
         .execute(&self.store.db)
         .await
         .map_err(Error::internal)?;
@@ -200,7 +239,7 @@ impl ResumeTracker {
     }
 }
 
-/// session_id, account_id, username, status, node_id, channels, matches, follows, parked
+/// session_id, account_id, username, status, node_id, channels, matches, follows, parked, worlds, parties
 type Row = (
     uuid::Uuid,
     uuid::Uuid,
@@ -211,6 +250,8 @@ type Row = (
     serde_json::Value,
     serde_json::Value,
     bool,
+    serde_json::Value,
+    serde_json::Value,
 );
 
 impl ResumeStore {
@@ -218,7 +259,8 @@ impl ResumeStore {
     /// whether the session was parked there.
     pub async fn load(&self, token: &str) -> Result<Option<(ResumeRecord, uuid::Uuid, bool)>> {
         let row: Option<Row> = sqlx::query_as(
-            "select session_id, account_id, username, status, node_id, channels, matches, follows, parked
+            "select session_id, account_id, username, status, node_id, channels, matches, follows, parked,
+                    worlds, parties
              from musubi.resumable_sessions
              where token_hash = $1 and cluster_group = $2 and expires_at > now()",
         )
@@ -227,7 +269,19 @@ impl ResumeStore {
         .fetch_optional(&self.db)
         .await
         .map_err(Error::internal)?;
-        let Some((sid, acc, username, status, node, channels, matches, follows, parked)) = row
+        let Some((
+            sid,
+            acc,
+            username,
+            status,
+            node,
+            channels,
+            matches,
+            follows,
+            parked,
+            worlds,
+            parties,
+        )) = row
         else {
             return Ok(None);
         };
@@ -241,6 +295,8 @@ impl ResumeStore {
                 },
                 channels: serde_json::from_value(channels).unwrap_or_default(),
                 matches: serde_json::from_value(matches).unwrap_or_default(),
+                worlds: serde_json::from_value(worlds).unwrap_or_default(),
+                parties: serde_json::from_value(parties).unwrap_or_default(),
                 follows: serde_json::from_value(follows).unwrap_or_default(),
             },
             node,

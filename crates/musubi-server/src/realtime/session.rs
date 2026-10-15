@@ -124,6 +124,8 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         }
         let mut replay = rec.channels;
         replay.extend(rec.matches);
+        replay.extend(rec.worlds);
+        replay.extend(rec.parties);
         if !rec.follows.is_empty() {
             replay.push(ClientMessage::StatusFollow {
                 account_ids: rec.follows,
@@ -362,7 +364,10 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
         return handle_inner(ctx, msg).await;
     };
     let join = match &msg {
-        ClientMessage::ChannelJoin { .. } | ClientMessage::MatchJoin { .. } => Some(msg.clone()),
+        ClientMessage::ChannelJoin { .. }
+        | ClientMessage::MatchJoin { .. }
+        | ClientMessage::WorldSubscribe { .. }
+        | ClientMessage::PartyJoin { .. } => Some(msg.clone()),
         _ => None,
     };
     let track: Option<(u8, Vec<AccountId>, Option<String>)> = match &msg {
@@ -370,6 +375,8 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
         ClientMessage::MatchLeave { match_id } => Some((2, vec![], Some(match_id.clone()))),
         ClientMessage::StatusFollow { account_ids } => Some((3, account_ids.clone(), None)),
         ClientMessage::StatusUnfollow { account_ids } => Some((4, account_ids.clone(), None)),
+        ClientMessage::WorldUnsubscribe { world } => Some((5, vec![], Some(world.clone()))),
+        ClientMessage::PartyLeave { party_id } => Some((6, vec![], Some(party_id.clone()))),
         _ => None,
     };
     let reply = handle_inner(ctx, msg).await;
@@ -377,18 +384,30 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
         return reply;
     }
     if let Some(join) = join {
-        let id = reply
-            .as_ref()
-            .and_then(|r| serde_json::to_value(r).ok())
-            .and_then(|v| {
-                v.get("channel_id")
-                    .or_else(|| v.get("match_id"))
-                    .and_then(|x| x.as_str().map(str::to_string))
-            });
-        if let Some(id) = id {
-            match join {
-                ClientMessage::ChannelJoin { .. } => tr.joined_channel(&id, join).await,
-                _ => tr.joined_match(&id, join).await,
+        match &join {
+            ClientMessage::WorldSubscribe { world, .. } => {
+                let world = world.clone();
+                tr.subscribed_world(&world, join).await;
+            }
+            ClientMessage::PartyJoin { party_id } => {
+                let party_id = party_id.clone();
+                tr.joined_party(&party_id, join).await;
+            }
+            _ => {
+                let id = reply
+                    .as_ref()
+                    .and_then(|r| serde_json::to_value(r).ok())
+                    .and_then(|v| {
+                        v.get("channel_id")
+                            .or_else(|| v.get("match_id"))
+                            .and_then(|x| x.as_str().map(str::to_string))
+                    });
+                if let Some(id) = id {
+                    match join {
+                        ClientMessage::ChannelJoin { .. } => tr.joined_channel(&id, join).await,
+                        _ => tr.joined_match(&id, join).await,
+                    }
+                }
             }
         }
     }
@@ -397,6 +416,8 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
         Some((2, _, Some(id))) => tr.left_match(&id).await,
         Some((3, ids, _)) => tr.followed(&ids).await,
         Some((4, ids, _)) => tr.unfollowed(&ids).await,
+        Some((5, _, Some(world))) => tr.unsubscribed_world(&world).await,
+        Some((6, _, Some(party))) => tr.left_party(&party).await,
         _ => {}
     }
     reply
