@@ -51,7 +51,7 @@ async fn app() -> Option<Router> {
     ));
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
-    Some(musubi_server::http::router(AppState {
+    let state = AppState {
         cfg: Arc::new(cfg),
         auth,
         storage,
@@ -84,7 +84,9 @@ async fn app() -> Option<Router> {
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),
-    }))
+    };
+    musubi_server::runtime_host::install(&state);
+    Some(musubi_server::http::router(state))
 }
 
 async fn call(
@@ -3714,4 +3716,93 @@ async fn admin_ban_unban_storage_export_purge_and_config_redaction() {
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_ne!(sess["account_id"], acc);
     assert_eq!(sess["created"], true);
+}
+
+#[tokio::test]
+async fn rpc_host_api_reaches_storage_and_accounts() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/auth/device")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"id": unique("host-dev-")}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sess: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let (tok, acc) = (
+        sess["access_token"].as_str().unwrap().to_string(),
+        sess["account_id"].as_str().unwrap().to_string(),
+    );
+    let rpc = |body: Value| {
+        Request::post("/v1/rpc/host")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let run = |req: Request<Body>| {
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), 200);
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            v
+        }
+    };
+    let v = run(rpc(
+        json!({"op": "storage.write", "collection": "rt", "key": "k1", "value": {"a": 1}}),
+    ))
+    .await;
+    assert!(v["ok"].is_array(), "{v}");
+    // owner defaults to the calling account, so the player can read it back through the API
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/storage/read")
+                .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"objects": [{"collection": "rt", "key": "k1"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let v = run(rpc(
+        json!({"op": "storage.read", "collection": "rt", "key": "k1"}),
+    ))
+    .await;
+    assert_eq!(v["ok"]["value"]["a"], 1, "{v}");
+    assert_eq!(v["ok"]["owner_id"], acc);
+    let v = run(rpc(json!({"op": "account.get"}))).await;
+    assert_eq!(v["ok"]["id"], acc, "{v}");
+    let v = run(rpc(
+        json!({"op": "notify.send", "subject": "hi", "code": 7}),
+    ))
+    .await;
+    assert_eq!(v["ok"]["sent"], true, "{v}");
+    let v = run(rpc(json!({"op": "nope"}))).await;
+    assert!(
+        v["error"].as_str().unwrap().contains("unknown host op"),
+        "{v}"
+    );
+    let v = run(rpc(
+        json!({"op": "storage.delete", "collection": "rt", "key": "k1"}),
+    ))
+    .await;
+    assert_eq!(v["ok"]["deleted"], true);
+    let v = run(rpc(
+        json!({"op": "storage.read", "collection": "rt", "key": "k1"}),
+    ))
+    .await;
+    assert!(v["ok"].is_null(), "{v}");
 }

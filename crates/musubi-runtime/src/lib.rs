@@ -28,6 +28,7 @@ use std::time::Duration;
 use musubi_core::{AccountId, Error, Result, SessionId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use wasmtime::{
     Caller, Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits,
     StoreLimitsBuilder, Val,
@@ -88,6 +89,8 @@ package musubi:runtime@0.1.0;
 interface host {
     /// level: 0 error, 1 warn, 2 info, 3 debug
     log: func(level: u8, msg: string);
+    /// JSON request `{"op": "storage.read", ...}` → JSON answer, or an error message.
+    call: func(request: string) -> result<string, string>;
 }
 
 interface guest-api {
@@ -107,6 +110,7 @@ package musubi:runtime@0.1.0;
 
 interface host {
     log: func(level: u8, msg: string);
+    call: func(request: string) -> result<string, string>;
 }
 
 interface guest-api {
@@ -124,6 +128,16 @@ world guest {
 }
 
 impl wit::musubi::runtime::host::Host for State {
+    fn call(&mut self, request: String) -> std::result::Result<String, String> {
+        match serde_json::from_str::<Value>(&request)
+            .map_err(|e| Error::InvalidArgument(format!("host request is not json: {e}")))
+            .and_then(|req| self.host.call(&self.ctx, req))
+        {
+            Ok(v) => Ok(v.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     fn log(&mut self, level: u8, msg: String) {
         let module = self.module.clone();
         match level {
@@ -135,10 +149,39 @@ impl wit::musubi::runtime::host::Host for State {
     }
 }
 
+/// What guests may ask the server to do (`musubi.host_call` / `host.call`): a JSON request with
+/// an `op` and op-specific fields, answered with JSON. The server installs its implementation;
+/// without one every call fails with `Unavailable`.
+pub trait HostApi: Send + Sync {
+    fn call(&self, ctx: &CallContext, request: Value) -> Result<Value>;
+}
+
+struct NoHost;
+
+impl HostApi for NoHost {
+    fn call(&self, _ctx: &CallContext, _request: Value) -> Result<Value> {
+        Err(Error::Unavailable("runtime host api not installed".into()))
+    }
+}
+
 struct State {
     limits: StoreLimits,
     error: Option<String>,
     module: String,
+    ctx: CallContext,
+    host: Arc<dyn HostApi>,
+}
+
+/// Run a host request and encode the answer the way guests expect.
+fn host_call(state: &State, request: &[u8]) -> Vec<u8> {
+    let out = serde_json::from_slice::<Value>(request)
+        .map_err(|e| Error::InvalidArgument(format!("host request is not json: {e}")))
+        .and_then(|req| state.host.call(&state.ctx, req));
+    let v = match out {
+        Ok(v) => serde_json::json!({ "ok": v }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    };
+    serde_json::to_vec(&v).unwrap_or_default()
 }
 
 impl ResourceLimiter for State {
@@ -164,6 +207,7 @@ pub struct Runtime {
     engine: Engine,
     linker: Linker<State>,
     component_linker: wasmtime::component::Linker<State>,
+    host: RwLock<Arc<dyn HostApi>>,
     limits: Limits,
     /// rpc id → module exporting it
     rpcs: RwLock<HashMap<String, Arc<Loaded>>>,
@@ -209,6 +253,33 @@ impl Runtime {
                 },
             )
             .map_err(Error::internal)?;
+        linker
+            .func_wrap(
+                "musubi",
+                "host_call",
+                |mut caller: Caller<'_, State>, ptr: i32, len: i32| -> wasmtime::Result<i64> {
+                    let req = read_bytes(&mut caller, ptr, len)?;
+                    let out = host_call(caller.data(), &req);
+                    let memory = caller
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .ok_or_else(|| wasmtime::Error::msg("no memory"))?;
+                    let alloc = caller
+                        .get_export("alloc")
+                        .and_then(|e| e.into_func())
+                        .ok_or_else(|| wasmtime::Error::msg("no alloc"))?
+                        .typed::<i32, i32>(&caller)?;
+                    let out_ptr = alloc.call(&mut caller, out.len() as i32)?;
+                    let needed = out_ptr as usize + out.len();
+                    let have = memory.data_size(&caller);
+                    if needed > have {
+                        memory.grow(&mut caller, (needed - have).div_ceil(65536) as u64)?;
+                    }
+                    memory.write(&mut caller, out_ptr as usize, &out)?;
+                    Ok(((out_ptr as u64) << 32 | out.len() as u64) as i64)
+                },
+            )
+            .map_err(Error::internal)?;
         // Epoch ticker: one tick = 10 ms; deadlines are set per call.
         let ticker = engine.clone();
         std::thread::Builder::new()
@@ -225,12 +296,18 @@ impl Runtime {
             engine,
             linker,
             component_linker,
+            host: RwLock::new(Arc::new(NoHost)),
             limits,
             rpcs: RwLock::new(HashMap::new()),
             hooks: RwLock::new(HashMap::new()),
             exports: RwLock::new(HashMap::new()),
             modules: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Install the server side of `musubi.host_call` / `host.call`.
+    pub fn set_host(&self, host: Arc<dyn HostApi>) {
+        *self.host.write() = host;
     }
 
     /// Compile and register a module (`.wasm` or `.wat`). Re-loading a name replaces its RPCs (hot reload).
@@ -445,7 +522,7 @@ impl Runtime {
             .map_err(Error::internal)?
     }
 
-    fn new_store(&self, module: &str) -> Result<Store<State>> {
+    fn new_store(&self, module: &str, ctx: &CallContext) -> Result<Store<State>> {
         let state = State {
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.limits.max_memory_bytes)
@@ -453,6 +530,8 @@ impl Runtime {
                 .build(),
             error: None,
             module: module.to_string(),
+            ctx: ctx.clone(),
+            host: self.host.read().clone(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| s);
@@ -485,7 +564,7 @@ impl Runtime {
         name: &str,
         component: &wasmtime::component::Component,
     ) -> Result<Vec<String>> {
-        let mut store = self.new_store(name)?;
+        let mut store = self.new_store(name, &CallContext::default())?;
         let guest = wit::Guest::instantiate(&mut store, component, &self.component_linker)
             .map_err(|e| Error::InvalidArgument(format!("component {name}: {e}")))?;
         guest
@@ -502,7 +581,7 @@ impl Runtime {
         ctx: &CallContext,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
-        let mut store = self.new_store(&loaded.name)?;
+        let mut store = self.new_store(&loaded.name, ctx)?;
         let guest = wit::Guest::instantiate(&mut store, component, &self.component_linker)
             .map_err(|e| Error::Internal(format!("instantiate {}: {e}", loaded.name)))?;
         let ctx_json = serde_json::to_string(ctx)?;
@@ -531,7 +610,7 @@ impl Runtime {
             Kind::Module(m) => m,
         };
         let id = export;
-        let mut store = self.new_store(&loaded.name)?;
+        let mut store = self.new_store(&loaded.name, ctx)?;
         let instance = self
             .linker
             .instantiate(&mut store, module)
@@ -616,6 +695,20 @@ fn write_guest(
     Ok(ptr)
 }
 
+fn read_bytes(caller: &mut Caller<'_, State>, ptr: i32, len: i32) -> wasmtime::Result<Vec<u8>> {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| wasmtime::Error::msg("no memory"))?;
+    let data = memory.data(caller);
+    let (ptr, len) = (ptr as usize, len as usize);
+    let end = ptr
+        .checked_add(len)
+        .filter(|e| *e <= data.len())
+        .ok_or_else(|| wasmtime::Error::msg("host_call: out-of-bounds request"))?;
+    Ok(data[ptr..end].to_vec())
+}
+
 fn read_string(caller: &mut Caller<'_, State>, ptr: i32, len: i32) -> Result<String> {
     let memory = caller
         .get_export("memory")
@@ -635,6 +728,7 @@ pub const EXAMPLE_WAT: &str = r#"
 (module
   (import "musubi" "error" (func $error (param i32 i32)))
   (import "musubi" "log" (func $log (param i32 i32 i32)))
+  (import "musubi" "host_call" (func $host_call (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (global $heap (mut i32) (i32.const 1024))
   (func (export "alloc") (param $n i32) (result i32)
@@ -651,6 +745,9 @@ pub const EXAMPLE_WAT: &str = r#"
     i32.const 2 local.get 2 local.get 3 call $log
     local.get 2 i64.extend_i32_u i64.const 32 i64.shl
     local.get 3 i64.extend_i32_u i64.or)
+  ;; host: forward the payload to the server as a host request and return its answer
+  (func (export "rpc_host") (param i32 i32 i32 i32) (result i64)
+    local.get 2 local.get 3 call $host_call)
   ;; whoami: return the context JSON
   (func (export "rpc_whoami") (param i32 i32 i32 i32) (result i64)
     local.get 0 i64.extend_i32_u i64.const 32 i64.shl
@@ -709,7 +806,7 @@ mod tests {
             .unwrap(),
         );
         let ids = rt.load_bytes("example", EXAMPLE_WAT.as_bytes()).unwrap();
-        assert_eq!(ids, vec!["echo", "whoami", "echo2", "fail", "spin"]);
+        assert_eq!(ids, vec!["echo", "host", "whoami", "echo2", "fail", "spin"]);
         let hooked = rt
             .call("echo2", CallContext::default(), b"ignored".to_vec())
             .await

@@ -7,6 +7,7 @@ pub mod http;
 pub mod metrics;
 pub mod notify;
 pub mod realtime;
+pub mod runtime_host;
 
 pub use app::run;
 pub use musubi_core::config::Config;

@@ -346,6 +346,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         started_at: std::time::Instant::now(),
         metrics: crate::metrics::install(),
     };
+    crate::runtime_host::install(&state);
     {
         let st = state.clone();
         tokio::spawn(async move {
