@@ -90,6 +90,9 @@ enum Cmd {
         clients: usize,
         #[arg(long, default_value_t = 6)]
         worlds: usize,
+        /// authoritative "echo" matches spread across the nodes (a third of the clients play them)
+        #[arg(long, default_value_t = 6)]
+        matches: usize,
         #[arg(long, default_value_t = 60)]
         duration_secs: u64,
         #[arg(long, default_value_t = 10)]
@@ -192,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
             nodes,
             clients,
             worlds,
+            matches,
             duration_secs,
             kill_every_secs,
             mode,
@@ -203,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
                 nodes,
                 clients,
                 worlds,
+                matches,
                 duration: std::time::Duration::from_secs(duration_secs),
                 kill_every: std::time::Duration::from_secs(kill_every_secs),
                 mode,

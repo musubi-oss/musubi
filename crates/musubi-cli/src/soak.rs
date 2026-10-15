@@ -29,6 +29,7 @@ pub struct Opts {
     pub nodes: usize,
     pub clients: usize,
     pub worlds: usize,
+    pub matches: usize,
     pub duration: Duration,
     pub kill_every: Duration,
     pub mode: String,
@@ -59,6 +60,9 @@ struct Counters {
     st_ok: AtomicU64,
     st_err: AtomicU64,
     st_lost: AtomicU64,
+    mt_sent: AtomicU64,
+    mt_echo: AtomicU64,
+    mt_err: AtomicU64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -67,10 +71,15 @@ struct Incident {
     action: &'static str,
     was_leader: bool,
     worlds: usize,
+    matches: usize,
     /// Survivors no longer list the node.
     detected_ms: f64,
     /// Every world the node owned is homed on a survivor.
     rehomed_ms: f64,
+    /// Every authoritative match the node owned runs on a survivor again (NaN when it owned none).
+    matches_rehomed_ms: f64,
+    /// Matches that came back with a tick far below the one seen before the kill (journal lost).
+    matches_reset: usize,
     /// The restarted process answers and is back in the member list.
     rejoined_ms: f64,
     timed_out: bool,
@@ -204,6 +213,135 @@ async fn world_home(client: &reqwest::Client, n: &Node, world: &str) -> Option<S
     )
     .await?;
     v["value"]["node_id"].as_str().map(str::to_string)
+}
+
+/// match id → (home node id, snapshot tick) as the cluster sees it.
+async fn cluster_matches(
+    client: &reqwest::Client,
+    n: &Node,
+) -> Option<HashMap<String, (String, u64)>> {
+    let v = get(client, &n.url(), "/v1/admin/cluster/matches").await?;
+    Some(
+        v["matches"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| {
+                Some((
+                    m["match_id"].as_str()?.to_string(),
+                    (
+                        m["node_id"].as_str().unwrap_or("").to_string(),
+                        m["tick"].as_u64().unwrap_or(0),
+                    ),
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// Live tick of a match from the node that hosts it.
+async fn match_tick(client: &reqwest::Client, url: &str, id: &str) -> Option<u64> {
+    get(client, url, &format!("/v1/server/matches/{id}")).await?["tick"].as_u64()
+}
+
+/// Shared handles every match client needs.
+struct MatchClientEnv {
+    http: reqwest::Client,
+    alive: Alive,
+    node_urls: Arc<HashMap<String, String>>,
+    c: Arc<Counters>,
+    stop: Arc<AtomicBool>,
+}
+
+async fn match_client(env: MatchClientEnv, token: String, match_id: String, deadline: Instant) {
+    let MatchClientEnv {
+        http,
+        alive,
+        node_urls,
+        c,
+        stop,
+    } = env;
+    let mut rng = Rng::new();
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+        // connect to whichever node hosts the match right now
+        let Some(probe) = pick_alive(&alive, &mut rng).await else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+        let home = match get(&http, &probe, "/v1/admin/cluster/matches").await {
+            Some(v) => v["matches"]
+                .as_array()
+                .and_then(|a| a.iter().find(|m| m["match_id"] == match_id.as_str()))
+                .and_then(|m| m["node_id"].as_str())
+                .and_then(|id| node_urls.get(id).cloned()),
+            None => None,
+        };
+        let home = match home {
+            Some(h) if alive.read().await.contains(&h) => h,
+            _ => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+        };
+        let target = format!("{}?token={token}&format=json", ws_url(&home));
+        let Ok(Ok((mut ws, _))) = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio_tungstenite::connect_async(&target),
+        )
+        .await
+        else {
+            c.mt_err.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+        let join = json!({"cid": "j", "msg": {"match_join": {"match_id": match_id}}});
+        if ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                join.to_string(),
+            ))
+            .await
+            .is_err()
+        {
+            c.mt_err.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let mut n: u64 = 0;
+        loop {
+            if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
+                let _ = ws.close(None).await;
+                return;
+            }
+            n += 1;
+            let data = json!({"cid": null, "msg": {"match_data_send": {
+                "match_id": match_id, "op_code": 1, "data": n.to_le_bytes().to_vec()}}});
+            if ws
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    data.to_string(),
+                ))
+                .await
+                .is_err()
+            {
+                c.mt_err.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            c.mt_sent.fetch_add(1, Ordering::Relaxed);
+            match tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt)))) => {
+                    if txt.contains("\"error\"") {
+                        c.mt_err.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    c.mt_echo.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Some(Ok(_))) => {}
+                _ => {
+                    c.mt_err.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// Tiny xorshift so the stand needs no extra dependency; seeded from the clock.
@@ -512,6 +650,29 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
+    // authoritative matches, round-robin across nodes
+    let mut matches: Vec<String> = Vec::new();
+    for m in 0..o.matches {
+        let n = &nodes[m % nodes.len()];
+        let res: Value = client
+            .post(format!("{}/v1/server/matches", n.url()))
+            .header("x-musubi-server-key", KEY)
+            .json(&json!({ "module": "echo", "params": { "tick_rate": 10, "empty_ticks": 1_000_000, "label": "soak" } }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        matches.push(
+            res["match_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("match create: {res}"))?
+                .to_string(),
+        );
+    }
+    let node_urls: Arc<HashMap<String, String>> =
+        Arc::new(nodes.iter().map(|n| (n.id.clone(), n.url())).collect());
+
     // clients
     let alive: Alive = Arc::new(RwLock::new(nodes.iter().map(Node::url).collect()));
     let counters = Arc::new(Counters::default());
@@ -522,7 +683,20 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let url = nodes[i % nodes.len()].url();
         let token = auth(&client, &url, &format!("soak-{group}-{i}")).await?;
         let (alive, c, stop) = (alive.clone(), counters.clone(), stop.clone());
-        if i % 2 == 0 {
+        if !matches.is_empty() && i % 3 == 2 {
+            tasks.push(tokio::spawn(match_client(
+                MatchClientEnv {
+                    http: client.clone(),
+                    alive,
+                    node_urls: node_urls.clone(),
+                    c,
+                    stop,
+                },
+                token,
+                matches[i % matches.len()].clone(),
+                run_deadline,
+            )));
+        } else if i % 2 == 0 {
             tasks.push(tokio::spawn(ws_client(alive, token, run_deadline, c, stop)));
         } else {
             tasks.push(tokio::spawn(storage_client(
@@ -569,6 +743,18 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         for w in &worlds {
             if world_home(&client, &nodes[victim], w).await.as_deref() == Some(vid.as_str()) {
                 owned.push(w.clone());
+            }
+        }
+        // matches the victim hosts and the tick each had reached
+        let mut owned_matches: Vec<(String, u64)> = Vec::new();
+        if let Some(cm) = cluster_matches(&client, &nodes[victim]).await {
+            for (id, (home, snap_tick)) in cm {
+                if home == vid {
+                    let tick = match_tick(&client, &nodes[victim].url(), &id)
+                        .await
+                        .unwrap_or(snap_tick);
+                    owned_matches.push((id, tick));
+                }
             }
         }
         alive.write().await.retain(|u| *u != nodes[victim].url());
@@ -647,6 +833,44 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
+        let mut matches_reset = 0usize;
+        let matches_rehomed_ms = if owned_matches.is_empty() {
+            f64::NAN
+        } else {
+            loop {
+                let cm = cluster_matches(&client, &nodes[survivor])
+                    .await
+                    .unwrap_or_default();
+                let moved: Vec<(&String, &u64, String)> = owned_matches
+                    .iter()
+                    .filter_map(|(id, t)| {
+                        cm.get(id)
+                            .filter(|(home, _)| *home != vid)
+                            .map(|(home, _)| (id, t, home.clone()))
+                    })
+                    .collect();
+                if moved.len() == owned_matches.len() {
+                    for (id, before, home) in moved {
+                        let now_tick = match node_urls.get(&home) {
+                            Some(u) => match_tick(&client, u, id).await.unwrap_or(0),
+                            None => 0,
+                        };
+                        if now_tick == 0 || now_tick + 10 < *before {
+                            eprintln!(
+                                "[soak] match {id} came back at tick {now_tick}, was {before} before the kill"
+                            );
+                            matches_reset += 1;
+                        }
+                    }
+                    break t0.elapsed().as_secs_f64() * 1e3;
+                }
+                if t0.elapsed() > budget {
+                    timed_out = true;
+                    break f64::NAN;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
         // restart on the same ports/data dir
         let t1 = Instant::now();
         spawn(&bin, &mut nodes[victim], &o.database_url, &group)?;
@@ -678,19 +902,24 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             action,
             was_leader,
             worlds: owned.len(),
+            matches: owned_matches.len(),
             detected_ms,
             rehomed_ms,
+            matches_rehomed_ms,
+            matches_reset,
             rejoined_ms,
             timed_out,
         };
         eprintln!(
-            "[soak] {} {} (leader={}, worlds={}): detected {:.0} ms, rehomed {:.0} ms, rejoined {:.0} ms{}",
+            "[soak] {} {} (leader={}, worlds={}, matches={}): detected {:.0} ms, rehomed {:.0} ms, matches {:.0} ms, rejoined {:.0} ms{}",
             inc.action,
             inc.node,
             inc.was_leader,
             inc.worlds,
+            inc.matches,
             inc.detected_ms,
             inc.rehomed_ms,
+            inc.matches_rehomed_ms,
             inc.rejoined_ms,
             if inc.timed_out { " TIMEOUT" } else { "" }
         );
@@ -729,6 +958,13 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         "incidents": incidents,
         "detected_ms": stats(|i| i.detected_ms),
         "rehomed_ms": stats(|i| i.rehomed_ms),
+        "matches_rehomed_ms": stats(|i| i.matches_rehomed_ms),
+        "matches_reset": incidents.iter().map(|i| i.matches_reset).sum::<usize>(),
+        "match_clients": {
+            "sent": c.mt_sent.load(Ordering::Relaxed),
+            "echoed": c.mt_echo.load(Ordering::Relaxed),
+            "errors": c.mt_err.load(Ordering::Relaxed),
+        },
         "rejoined_ms": stats(|i| i.rejoined_ms),
         "ws": {
             "pings_ok": c.ws_ok.load(Ordering::Relaxed),
@@ -753,7 +989,12 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             o.duration.as_secs(),
             report["incidents"].as_array().map(|a| a.len()).unwrap_or(0)
         );
-        for k in ["detected_ms", "rehomed_ms", "rejoined_ms"] {
+        for k in [
+            "detected_ms",
+            "rehomed_ms",
+            "matches_rehomed_ms",
+            "rejoined_ms",
+        ] {
             let s = &report[k];
             println!(
                 "  {k:<12} p50 {:>8.0}  p99 {:>8.0}  max {:>8.0}",
@@ -778,9 +1019,19 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     }
     let lost = c.st_lost.load(Ordering::Relaxed);
     let timeouts = incidents.iter().filter(|i| i.timed_out).count();
+    let reset: usize = incidents.iter().map(|i| i.matches_reset).sum();
+    if !o.json {
+        println!(
+            "  matches: sent {}  echoed {}  errors {}  reset after failover {}",
+            report["match_clients"]["sent"],
+            report["match_clients"]["echoed"],
+            report["match_clients"]["errors"],
+            reset
+        );
+    }
     anyhow::ensure!(
-        lost == 0 && timeouts == 0,
-        "soak failed: {lost} lost writes, {timeouts} incidents timed out"
+        lost == 0 && timeouts == 0 && reset == 0,
+        "soak failed: {lost} lost writes, {timeouts} incidents timed out, {reset} matches reset"
     );
     Ok(())
 }
