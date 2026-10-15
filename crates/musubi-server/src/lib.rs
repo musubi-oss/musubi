@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod modules;
 pub mod notify;
 pub mod openapi;
+pub mod push;
 pub mod realtime;
 pub mod retention;
 pub mod runtime_host;

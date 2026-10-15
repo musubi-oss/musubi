@@ -107,8 +107,14 @@ impl Fanout {
     }
 
     pub fn account(&self, account_id: AccountId, msg: ServerMessage) {
-        self.hub.send_to_account(account_id, msg.clone());
+        self.account_live(account_id, msg);
+    }
+
+    /// Like `account`, returning how many local sessions took the message (0 = not online here).
+    pub fn account_live(&self, account_id: AccountId, msg: ServerMessage) -> usize {
+        let n = self.hub.send_to_account(account_id, msg.clone());
         self.publish(Wire::Account { account_id, msg });
+        n
     }
 
     pub fn channel(&self, channel_id: &str, msg: ServerMessage) {

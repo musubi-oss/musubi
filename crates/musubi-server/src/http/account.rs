@@ -22,6 +22,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/account/link/steam", post(link_steam))
         .route("/v1/account/link/google", post(link_google))
         .route("/v1/account/link/apple", post(link_apple))
+        .route(
+            "/v1/account/push_tokens",
+            get(push_tokens).post(push_register).delete(push_unregister),
+        )
         .route("/v1/account/unlink/device", delete(unlink_device))
         .route("/v1/account/unlink/email", delete(unlink_email))
         .route("/v1/users", get(get_users))
@@ -191,4 +195,51 @@ async fn link_apple(
         .link_external(me.account_id, musubi_auth::provider::APPLE, &c.sub)
         .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct PushTokenBody {
+    platform: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct PushTokenRef {
+    token: String,
+}
+
+fn push_of(s: &AppState) -> Result<&std::sync::Arc<crate::push::Push>, ApiError> {
+    s.notify.push().ok_or_else(|| {
+        musubi_core::Error::Unavailable("push is not available on this node".into()).into()
+    })
+}
+
+async fn push_tokens(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        json!({ "tokens": push_of(&s)?.list(me.account_id).await? }),
+    ))
+}
+
+/// Register a device token (`fcm` or `apns`) for the caller; re-registering moves it over.
+async fn push_register(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<PushTokenBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    push_of(&s)?
+        .register(me.account_id, &b.platform, &b.token)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn push_unregister(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<PushTokenRef>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let removed = push_of(&s)?.unregister(me.account_id, &b.token).await?;
+    Ok(Json(json!({ "ok": true, "removed": removed })))
 }

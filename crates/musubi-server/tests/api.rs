@@ -58,6 +58,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
+    let push = Arc::new(musubi_server::push::Push::new(cfg.push.clone(), db.clone()));
     let state = AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -68,7 +69,8 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         notify: musubi_server::notify::Notifier::new(
             musubi_social::NotificationService::new(db.clone()),
             fanout.clone(),
-        ),
+        )
+        .with_push(push.clone()),
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
@@ -5498,4 +5500,187 @@ async fn idempotency_key_replays_mutations() {
     // errors are stored too (a 4xx replays), server errors are not
     let (st, _, _) = call_h(&app, &tok, &unique("bad"), json!({"objects": "nope"})).await;
     assert!(st.is_client_error(), "{st}");
+}
+
+/// A notification for an account with no live session is pushed to its FCM and APNs tokens;
+/// a token the provider reports as gone is removed.
+#[tokio::test]
+async fn push_tokens_receive_offline_notifications() {
+    use axum::extract::Path as AxPath;
+    use axum::routing::post as ax_post;
+    let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (s1, s2) = (seen.clone(), seen.clone());
+    let mock = Router::new()
+        .route(
+            "/token",
+            ax_post(|| async {
+                axum::Json(json!({"access_token": "fcm-access", "expires_in": 3600}))
+            }),
+        )
+        .route(
+            "/v1/projects/proj/messages:send",
+            ax_post(
+                move |headers: axum::http::HeaderMap, axum::Json(b): axum::Json<Value>| {
+                    let s1 = s1.clone();
+                    async move {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer fcm-access");
+                        s1.lock().unwrap().push(json!({"kind": "fcm", "msg": b}));
+                        axum::Json(json!({"name": "projects/proj/messages/1"}))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/3/device/{tok}",
+            ax_post(
+                move |AxPath(tok): AxPath<String>,
+                      headers: axum::http::HeaderMap,
+                      axum::Json(b): axum::Json<Value>| {
+                    let s2 = s2.clone();
+                    async move {
+                        assert!(headers
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .starts_with("bearer "));
+                        assert_eq!(headers.get("apns-topic").unwrap(), "com.example.game");
+                        if tok == "dead" {
+                            return (
+                                StatusCode::GONE,
+                                axum::Json(json!({"reason": "Unregistered"})),
+                            );
+                        }
+                        s2.lock()
+                            .unwrap()
+                            .push(json!({"kind": "apns", "token": tok, "msg": b}));
+                        (StatusCode::OK, axum::Json(json!({})))
+                    }
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        c.push.fcm.project_id = "proj".into();
+        c.push.fcm.client_email = "svc@proj.iam.gserviceaccount.com".into();
+        c.push.fcm.private_key_pem = include_str!("fixtures/google_test_rsa.pem").into();
+        c.push.fcm.token_url = format!("{b}/token");
+        c.push.fcm.base_url = b.clone();
+        c.push.apns.team_id = "TEAM".into();
+        c.push.apns.key_id = "KEY1".into();
+        c.push.apns.private_key_pem = include_str!("fixtures/apple_test_ec.pem").into();
+        c.push.apns.bundle_id = "com.example.game".into();
+        c.push.apns.base_url = b.clone();
+    })
+    .await
+    else {
+        return;
+    };
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("push-a")})),
+    )
+    .await;
+    let (_, bb) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("push-b")})),
+    )
+    .await;
+    let (ta, tb) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        bb["access_token"].as_str().unwrap().to_string(),
+    );
+    for (p, t) in [("fcm", "fcm-1"), ("apns", "apns-1"), ("apns", "dead")] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/account/push_tokens",
+            Some(&tb),
+            Some(json!({"platform": p, "token": t})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/push_tokens",
+        Some(&tb),
+        Some(json!({"platform": "sms", "token": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // B has no socket: a friend request from A becomes pushes
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&ta),
+        Some(json!({"ids": [bb["account_id"]]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let got = seen.lock().unwrap().clone();
+        if got.iter().any(|g| g["kind"] == "fcm") && got.iter().any(|g| g["kind"] == "apns") {
+            let fcm = got.iter().find(|g| g["kind"] == "fcm").unwrap();
+            assert_eq!(fcm["msg"]["message"]["token"], "fcm-1");
+            assert!(
+                fcm["msg"]["message"]["notification"]["title"]
+                    .as_str()
+                    .unwrap()
+                    .contains("friend"),
+                "{fcm}"
+            );
+            assert!(fcm["msg"]["message"]["data"]["code"].is_string());
+            let apns = got.iter().find(|g| g["kind"] == "apns").unwrap();
+            assert_eq!(apns["token"], "apns-1");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pushes not delivered: {got:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (st, v) = call(&app, "GET", "/v1/account/push_tokens", Some(&tb), None).await;
+        assert_eq!(st, StatusCode::OK);
+        let toks: Vec<&str> = v["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["token"].as_str().unwrap())
+            .collect();
+        if !toks.contains(&"dead") {
+            assert_eq!(toks.len(), 2, "{v}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dead token not removed: {v}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (st, v) = call(
+        &app,
+        "DELETE",
+        "/v1/account/push_tokens",
+        Some(&tb),
+        Some(json!({"token": "fcm-1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], true);
 }

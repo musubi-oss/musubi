@@ -48,6 +48,7 @@ pub struct Config {
     pub matchmaker: MatchmakerConfig,
     pub social: SocialConfig,
     pub tracing: TracingConfig,
+    pub push: PushConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -757,6 +758,63 @@ impl Default for TracingConfig {
             otlp_endpoint: String::new(),
             sample_ratio: 1.0,
             service_name: "musubi".into(),
+        }
+    }
+}
+
+/// Mobile push delivery for notifications that reach no live session.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PushConfig {
+    pub fcm: FcmConfig,
+    pub apns: ApnsConfig,
+}
+
+/// Firebase Cloud Messaging HTTP v1 with a service account; empty project_id = off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FcmConfig {
+    pub project_id: String,
+    pub client_email: String,
+    /// RSA private key of the service account (PEM).
+    pub private_key_pem: String,
+    pub token_url: String,
+    pub base_url: String,
+}
+
+impl Default for FcmConfig {
+    fn default() -> Self {
+        Self {
+            project_id: String::new(),
+            client_email: String::new(),
+            private_key_pem: String::new(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+            base_url: "https://fcm.googleapis.com".into(),
+        }
+    }
+}
+
+/// Apple Push Notification service with token (JWT) auth; empty key_id = off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApnsConfig {
+    pub team_id: String,
+    pub key_id: String,
+    /// The .p8 signing key (PEM).
+    pub private_key_pem: String,
+    pub bundle_id: String,
+    /// `https://api.push.apple.com` or `https://api.sandbox.push.apple.com`.
+    pub base_url: String,
+}
+
+impl Default for ApnsConfig {
+    fn default() -> Self {
+        Self {
+            team_id: String::new(),
+            key_id: String::new(),
+            private_key_pem: String::new(),
+            bundle_id: String::new(),
+            base_url: "https://api.push.apple.com".into(),
         }
     }
 }

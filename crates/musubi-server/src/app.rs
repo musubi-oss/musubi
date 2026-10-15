@@ -341,7 +341,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         )
     });
     worlds.clone().spawn_ticker(fanout.clone());
-    let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
+    let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone()).with_push(
+        Arc::new(crate::push::Push::new(cfg.push.clone(), db.clone())),
+    );
     let limits = Arc::new(crate::limits::RateLimiter::new(&cfg.limits));
     let logins = Arc::new(crate::logins::Social::new(cfg.social.clone()));
     let state = AppState {
