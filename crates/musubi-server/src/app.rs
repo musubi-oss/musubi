@@ -396,6 +396,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     crate::http::admin::start_drain_listener(state.clone());
     state.worlds.set_events(state.events.clone());
     crate::events::start_cluster_events(state.clone());
+    match crate::jwt::load(&state.db, state.auth.signer()).await {
+        Ok(n) if n > 0 => {
+            info!(keys = n, active = ?state.auth.signer().active_kid(), "jwt keys loaded")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "jwt keys load failed"),
+    }
+    if let Some(c) = &state.cluster {
+        crate::jwt::start(c, state.db.clone(), state.auth.clone());
+    }
     match state.keys.load(&state.db).await {
         Ok(n) => info!(keys = n, "server keys loaded"),
         Err(e) => tracing::warn!(error = %e, "server keys load failed"),

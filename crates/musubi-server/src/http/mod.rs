@@ -35,6 +35,7 @@ pub use extract::{Bearer, ClientIp, ServerKey};
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/.well-known/jwks.json", get(jwks))
         .route("/metrics", get(crate::metrics::render))
         .route("/openapi.json", get(openapi))
         .route("/readyz", get(readyz))
@@ -135,4 +136,9 @@ async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
 
 async fn openapi() -> Json<serde_json::Value> {
     Json(crate::openapi::document(env!("CARGO_PKG_VERSION")))
+}
+
+/// Public keys of the managed JWT signing keys (RFC 7517), for verifying access tokens elsewhere.
+async fn jwks(State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(s.auth.signer().jwks())
 }

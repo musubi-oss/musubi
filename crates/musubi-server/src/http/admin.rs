@@ -31,6 +31,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/cluster/worlds", get(cluster_worlds))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/retention/run", post(retention_run))
+        .route("/v1/admin/jwt/keys", get(jwt_keys).post(jwt_rotate))
+        .route("/v1/admin/jwt/rotate", post(jwt_rotate))
+        .route("/v1/admin/jwt/keys/{kid}", delete(jwt_retire))
         .route("/v1/admin/keys", get(keys_list).post(keys_issue))
         .route("/v1/admin/keys/{id}", delete(keys_revoke))
         .route("/v1/admin/accounts", get(accounts))
@@ -502,4 +505,39 @@ async fn retention_run(_k: ServerKey, State(s): State<AppState>) -> Result<Json<
     Ok(Json(
         json!({ "removed": crate::retention::run(&s.db, &s.cfg.retention).await? }),
     ))
+}
+
+async fn jwt_keys(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::jwt::list(&s.db, &s.auth).await?))
+}
+
+/// Generate a new ES256 key; it signs from now on everywhere, older keys keep verifying.
+async fn jwt_rotate(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let kid = crate::jwt::rotate(&s.db, &s.auth).await?;
+    if let Some(c) = &s.cluster {
+        let _ = c
+            .publish(crate::jwt::JWT_TOPIC, &json!({ "kid": kid }))
+            .await;
+    }
+    Ok(Json(json!({ "kid": kid })))
+}
+
+/// Stop signing with a key; tokens it signed stay valid until they expire, then it is pruned.
+async fn jwt_retire(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(kid): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !crate::jwt::retire(&s.db, &s.auth, &kid).await? {
+        return Err(musubi_core::Error::NotFound("jwt key".into()).into());
+    }
+    if let Some(c) = &s.cluster {
+        let _ = c
+            .publish(
+                crate::jwt::JWT_TOPIC,
+                &json!({ "kid": kid, "retired": true }),
+            )
+            .await;
+    }
+    Ok(Json(json!({ "ok": true })))
 }

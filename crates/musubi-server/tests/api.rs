@@ -5267,3 +5267,119 @@ async fn social_logins_verify_and_link() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["account_id"], s1["account_id"]);
 }
+
+/// Rotating the signing key does not log anyone out, new tokens carry the kid, the public key is
+/// published for third parties, and a retired key stops signing but keeps verifying.
+#[tokio::test]
+async fn jwt_keys_rotate_and_publish_jwks() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (st, s0) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("jwt-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s0}");
+    let t0 = s0["access_token"].as_str().unwrap().to_string();
+    assert!(
+        jsonwebtoken::decode_header(&t0).unwrap().kid.is_none(),
+        "legacy token has no kid"
+    );
+
+    let (st, v) = call_server(&app, "POST", "/v1/admin/jwt/rotate", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let kid1 = v["kid"].as_str().unwrap().to_string();
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("jwt-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let t1 = s1["access_token"].as_str().unwrap().to_string();
+    let h = jsonwebtoken::decode_header(&t1).unwrap();
+    assert_eq!(h.kid.as_deref(), Some(kid1.as_str()));
+    assert_eq!(h.alg, jsonwebtoken::Algorithm::ES256);
+    let (st, jwks) = call(&app, "GET", "/.well-known/jwks.json", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let set: jsonwebtoken::jwk::JwkSet = serde_json::from_value(jwks.clone()).unwrap();
+    let jwk = set.find(&kid1).expect("kid published");
+    let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+    val.validate_aud = false;
+    val.set_required_spec_claims(&["exp", "sub"]);
+    let claims = jsonwebtoken::decode::<serde_json::Value>(
+        &t1,
+        &jsonwebtoken::DecodingKey::from_jwk(jwk).unwrap(),
+        &val,
+    )
+    .unwrap()
+    .claims;
+    assert_eq!(claims["sub"], s1["account_id"]);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&t0), None).await;
+    assert_eq!(st, StatusCode::OK, "legacy token still accepted");
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&t1), None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, v) = call_server(&app, "POST", "/v1/admin/jwt/rotate", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let kid2 = v["kid"].as_str().unwrap().to_string();
+    let (st, list) = call_server(&app, "GET", "/v1/admin/jwt/keys", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    assert_eq!(list["active"], kid2);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&t1), None).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "tokens of the previous key still verify"
+    );
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("jwt-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        jsonwebtoken::decode_header(s2["access_token"].as_str().unwrap())
+            .unwrap()
+            .kid
+            .as_deref(),
+        Some(kid2.as_str())
+    );
+
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/jwt/keys/{kid1}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&t1), None).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "retired key still verifies until pruned"
+    );
+    let (st, jwks) = call(&app, "GET", "/.well-known/jwks.json", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(jwks["keys"].as_array().unwrap().len() >= 2, "{jwks}");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/jwt/keys/{kid1}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "already retired");
+}

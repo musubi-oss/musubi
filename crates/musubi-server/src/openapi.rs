@@ -11,6 +11,7 @@ use serde_json::{json, Map, Value};
 /// (method, path, tag). Generated from the `.route(...)` declarations; keep sorted by path.
 pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/healthz", "system"),
+    ("GET", "/.well-known/jwks.json", "auth"),
     ("GET", "/metrics", "system"),
     ("GET", "/openapi.json", "system"),
     ("GET", "/readyz", "system"),
@@ -48,6 +49,10 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/admin/keys", "admin"),
     ("DELETE", "/v1/admin/keys/{id}", "admin"),
     ("POST", "/v1/admin/retention/run", "admin"),
+    ("GET", "/v1/admin/jwt/keys", "admin"),
+    ("POST", "/v1/admin/jwt/keys", "admin"),
+    ("POST", "/v1/admin/jwt/rotate", "admin"),
+    ("DELETE", "/v1/admin/jwt/keys/{kid}", "admin"),
     ("GET", "/v1/admin/runtime/modules", "admin"),
     ("DELETE", "/v1/admin/runtime/modules/{name}", "admin"),
     ("PUT", "/v1/admin/runtime/modules/{name}", "admin"),
@@ -709,6 +714,7 @@ pub fn security_for(path: &str) -> Option<&'static str> {
         Some("serverKey")
     } else if path.starts_with("/v1/auth/")
         || path == "/healthz"
+        || path == "/.well-known/jwks.json"
         || path == "/readyz"
         || path == "/metrics"
         || path == "/openapi.json"

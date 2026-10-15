@@ -1962,6 +1962,7 @@ dependencies = [
  "jsonwebtoken",
  "musubi-core",
  "rand 0.8.8",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

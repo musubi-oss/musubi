@@ -7,7 +7,7 @@
 
 mod password;
 mod service;
-mod token;
+pub mod token;
 
 pub use service::{AuthService, Authenticated, Session};
 pub use token::{Claims, TokenSigner};
