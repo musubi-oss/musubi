@@ -2,9 +2,11 @@
 //! Cluster-wide presence arrives with `musubi-cluster`; the Hub API is already shaped for it.
 
 pub mod authoritative;
+pub mod connect;
 mod hub;
 pub mod matchmaking;
 pub mod party;
+pub mod quic;
 pub mod relayed;
 mod session;
 pub mod wasm_match;

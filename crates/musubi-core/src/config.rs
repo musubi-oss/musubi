@@ -35,6 +35,7 @@ pub struct Config {
     pub session: SessionConfig,
     pub log: LogConfig,
     pub runtime: RuntimeConfig,
+    pub quic: QuicConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,4 +193,15 @@ impl Default for RuntimeConfig {
             max_payload_kb: 1024,
         }
     }
+}
+
+/// QUIC realtime transport (same envelopes as WebSocket).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QuicConfig {
+    /// UDP listen address; unset = QUIC disabled.
+    pub listen: Option<SocketAddr>,
+    /// PEM cert chain + key. Unset = self-signed `localhost` cert (development only).
+    pub cert_pem: Option<std::path::PathBuf>,
+    pub key_pem: Option<std::path::PathBuf>,
 }

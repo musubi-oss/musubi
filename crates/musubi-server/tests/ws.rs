@@ -23,6 +23,16 @@ async fn start() -> Option<(String, axum::Router)> {
 
 /// `leader=false` builds a node that replicates tickets but never runs matchmaker passes.
 async fn start_with(leader: bool) -> Option<(String, axum::Router)> {
+    let state = build_state(leader).await?;
+    let router = musubi_server::http::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    Some((format!("127.0.0.1:{}", addr.port()), router))
+}
+
+async fn build_state(leader: bool) -> Option<AppState> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
@@ -42,7 +52,7 @@ async fn start_with(leader: bool) -> Option<(String, axum::Router)> {
         relayed.clone(),
     );
     fanout.set_leader(leader);
-    let state = AppState {
+    Some(AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
         accounts: musubi_account::AccountService::new(db.clone()),
@@ -66,13 +76,7 @@ async fn start_with(leader: bool) -> Option<(String, axum::Router)> {
         cfg: Arc::new(cfg),
         db,
         started_at: std::time::Instant::now(),
-    };
-    let router = musubi_server::http::router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let r = router.clone();
-    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
-    Some((format!("127.0.0.1:{}", addr.port()), router))
+    })
 }
 
 async fn token(router: &axum::Router) -> (String, String) {
@@ -1569,4 +1573,78 @@ async fn cross_node_matchmaking() {
         }
         m => panic!("{m:?}"),
     }
+}
+
+#[tokio::test]
+async fn quic_transport_ping_and_rpc() {
+    let Some(state) = build_state(true).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (cfg, der) = musubi_transport::quic::dev_self_signed().unwrap();
+    let addr =
+        musubi_server::realtime::quic::start_with(state, "127.0.0.1:0".parse().unwrap(), cfg)
+            .await
+            .unwrap();
+    let (ta, acc) = token(&router).await;
+
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(musubi_transport::quic::client_config(&[der]).unwrap());
+    let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+    use musubi_transport::quic::QuicConnection as Q;
+    use musubi_transport::Frame;
+    Q::write_frame(
+        &mut tx,
+        Frame::Text(json!({"token": ta, "format": "json"}).to_string()),
+    )
+    .await
+    .unwrap();
+    let env = |cid: &str, msg: ClientMessage| {
+        Frame::Text(
+            serde_json::to_string(&Envelope {
+                cid: Some(cid.into()),
+                msg,
+            })
+            .unwrap(),
+        )
+    };
+    Q::write_frame(&mut tx, env("1", ClientMessage::Ping))
+        .await
+        .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert_eq!(r.cid.as_deref(), Some("1"));
+    assert!(matches!(r.msg, ServerMessage::Pong));
+    Q::write_frame(
+        &mut tx,
+        env(
+            "2",
+            ClientMessage::Rpc {
+                id: "whoami".into(),
+                payload: json!({}),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert!(matches!(r.msg, ServerMessage::Rpc { payload, .. } if payload["account_id"] == acc));
+
+    // bad token is rejected with an error frame
+    let conn2 = ep.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut tx2, mut rx2) = conn2.open_bi().await.unwrap();
+    Q::write_frame(&mut tx2, Frame::Text(json!({"token": "nope"}).to_string()))
+        .await
+        .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx2, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert!(matches!(r.msg, ServerMessage::Error { .. }));
 }

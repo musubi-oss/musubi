@@ -165,6 +165,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     };
     let listener = tokio::net::TcpListener::bind(state.cfg.http.listen).await?;
     info!(addr = %state.cfg.http.listen, "http listening");
+    if let Some(listen) = state.cfg.quic.listen {
+        crate::realtime::quic::start(state.clone(), listen).await?;
+    }
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown(shutdown())
         .await?;

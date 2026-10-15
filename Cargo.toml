@@ -47,9 +47,11 @@ rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 tokio-tungstenite = "0.24"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+rcgen = "0.13"
 openraft = "0.9"
 moka = { version = "0.12", features = ["future"] }
 dashmap = "6"

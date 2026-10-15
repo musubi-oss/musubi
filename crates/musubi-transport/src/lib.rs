@@ -2,7 +2,7 @@
 //!
 //! A [`Connection`] moves opaque [`Frame`]s in both directions; the realtime layer above
 //! decodes them with the negotiated [`Encoding`]. WebSocket is the first implementation,
-//! QUIC/WebTransport plug into the same trait.
+//! QUIC (`quic`) shares it; WebTransport is next.
 
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 pub use musubi_proto::Encoding;
 
+pub mod quic;
 pub mod ws;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,7 @@ pub enum TransportError {
     Closed,
     Io(String),
     Timeout,
+    TooLarge(usize),
 }
 
 impl std::fmt::Display for TransportError {
@@ -50,6 +52,7 @@ impl std::fmt::Display for TransportError {
             TransportError::Closed => f.write_str("connection closed"),
             TransportError::Io(e) => write!(f, "io: {e}"),
             TransportError::Timeout => f.write_str("timeout"),
+            TransportError::TooLarge(n) => write!(f, "frame of {n} bytes exceeds the limit"),
         }
     }
 }
