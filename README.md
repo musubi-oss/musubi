@@ -71,8 +71,11 @@ worlds, 7 incidents in total:
 | drain via admin API | 0.1 s | 3 – 5 s | 0.2 – 1.2 s |
 
 Storage: 33 287 verified writes, 0 errors, 0 lost writes. WS: 17 445 pings answered, 17 sessions
-cut by a kill or drain and reconnected fresh (a session parked for resume dies with its process, so
-`resumed` is 0 by construction here). The SIGKILL numbers are SWIM's suspect timeout plus one
+cut by a kill or drain. Since resumable sessions keep a record in Postgres, a cut session is rebuilt
+on whichever node the client reaches next (same session id and token, joins and follows replayed):
+in a later 60 s mixed run all 6 cut sessions resumed, none reconnected fresh — the client has to
+retry for a few seconds after a kill, because the cluster hands a session over only once SWIM has
+declared its node dead (`MUSUBI_SOAK_DEBUG=1` prints each rejected attempt). The SIGKILL numbers are SWIM's suspect timeout plus one
 failover round, which now starts the moment the death verdict lands (it used to wait for the next
 15 s tick, making it 11 – 12 s); a drained node announces its departure, so its worlds move an order
 of magnitude faster. Open item: in two of roughly twenty kills on this VM the re-home did not settle

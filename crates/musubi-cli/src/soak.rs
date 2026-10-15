@@ -287,6 +287,9 @@ async fn ws_client(
         .map_err(|_| ())
         .and_then(|r| r.map_err(|_| ())) else {
             if resumed {
+                if std::env::var_os("MUSUBI_SOAK_DEBUG").is_some() {
+                    eprintln!("[soak] resume connect failed (attempt {resume_attempts}) to {url}");
+                }
                 if resume_attempts < RESUME_RETRIES {
                     resume_attempts += 1;
                     resume = pending.map(|(_, t)| (url.clone(), t));
@@ -307,6 +310,9 @@ async fn ws_client(
         {
             if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                 if find_str(&v, "code").is_some() && resumed {
+                    if std::env::var_os("MUSUBI_SOAK_DEBUG").is_some() {
+                        eprintln!("[soak] resume rejected (attempt {resume_attempts}): {txt}");
+                    }
                     // rejected: the holder may not be declared dead yet, retry before giving up
                     if resume_attempts < RESUME_RETRIES {
                         resume_attempts += 1;
@@ -356,6 +362,9 @@ async fn ws_client(
             let any = pick_alive(&alive, &mut rng).await.unwrap_or(session_node);
             resume = Some((any, t));
         } else {
+            if std::env::var_os("MUSUBI_SOAK_DEBUG").is_some() {
+                eprintln!("[soak] socket lost without a resume token (hello not seen)");
+            }
             c.ws_fresh.fetch_add(1, Ordering::Relaxed);
         }
     }
