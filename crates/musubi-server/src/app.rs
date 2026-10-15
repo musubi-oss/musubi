@@ -98,7 +98,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let economy = musubi_economy::EconomyService::new(db.clone());
     let tournaments = TournamentService::new(db.clone());
     let hub = Arc::new(Hub::new());
-    let matchmaker = Arc::new(Matchmaker::default());
+    let matchmaker = Arc::new(
+        Matchmaker::new(std::time::Duration::from_secs(cfg.matchmaker.min_wait_secs)).with_ttl(
+            std::time::Duration::from_secs(cfg.matchmaker.ticket_ttl_secs),
+        ),
+    );
     let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
         fuel: cfg.runtime.fuel,
         max_memory_bytes: cfg.runtime.max_memory_mb << 20,
@@ -222,6 +226,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         fanout.clone(),
         Some(cluster.clone()),
         std::time::Duration::from_secs(1),
+        hub.clone(),
+        parties.clone(),
     );
     fanout.set_fleets(fleets.clone());
     let worlds = Arc::new(

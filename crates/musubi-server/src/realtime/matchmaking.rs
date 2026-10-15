@@ -42,6 +42,27 @@ pub fn deliver(
     }
 }
 
+/// Tell the local member sessions of expired tickets; party tickets are also cleared in the party.
+pub fn deliver_expired(
+    hub: &Hub,
+    parties: &PartyRegistry,
+    expired: Vec<musubi_matchmaker::Ticket>,
+) {
+    for t in expired {
+        if let Some(pid) = &t.party_id {
+            parties.ticket_consumed(pid, &t.id);
+        }
+        for member in &t.members {
+            hub.send_to_session(
+                member.presence.session_id,
+                ServerMessage::MatchmakerExpired {
+                    ticket: t.id.clone(),
+                },
+            );
+        }
+    }
+}
+
 /// Leader-only: form groups, deliver locally and announce them to the other nodes.
 pub fn process_and_deliver(relayed: &RelayedRegistry, mm: &Matchmaker, fanout: &Fanout) {
     if !fanout.is_leader() {
@@ -62,6 +83,8 @@ pub fn spawn_ticker(
     fanout: Fanout,
     cluster: Option<Arc<Cluster>>,
     every: Duration,
+    hub: Arc<Hub>,
+    parties: Arc<PartyRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
@@ -72,6 +95,8 @@ pub fn spawn_ticker(
         loop {
             tick.tick().await;
             fanout.set_leader(lease.as_ref().is_none_or(|l| l.held()));
+            // every node expires its own view of the pool and tells its local sessions
+            deliver_expired(&hub, &parties, mm.expire());
             process_and_deliver(&relayed, &mm, &fanout);
         }
     })

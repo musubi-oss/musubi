@@ -168,7 +168,11 @@ pub struct Matchmaker {
     pool: Mutex<Pool>,
     /// How long a seed waits for `max_count` before settling for `min_count`.
     min_wait: Duration,
+    /// Tickets older than this are dropped by `expire` (the client gets `MatchmakerExpired`).
+    ttl: Duration,
 }
+
+pub const DEFAULT_TICKET_TTL: Duration = Duration::from_secs(180);
 
 impl Default for Matchmaker {
     fn default() -> Self {
@@ -181,7 +185,36 @@ impl Matchmaker {
         Self {
             pool: Mutex::new(Pool::default()),
             min_wait,
+            ttl: DEFAULT_TICKET_TTL,
         }
+    }
+
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Drop tickets that waited longer than the TTL and return them so their members can be told.
+    /// Replicated tickets carry their age, so every node expires the same tickets.
+    pub fn expire(&self) -> Vec<Ticket> {
+        self.expire_older_than(self.ttl)
+    }
+
+    pub fn expire_older_than(&self, ttl: Duration) -> Vec<Ticket> {
+        let now = Instant::now();
+        let mut pool = self.pool.lock();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < pool.tickets.len() {
+            if now.duration_since(pool.tickets[i].created) >= ttl {
+                let t = pool.tickets.remove(i);
+                unindex(&mut pool, &t);
+                out.push(t);
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 
     pub fn ticket_count(&self) -> usize {

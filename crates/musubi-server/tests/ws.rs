@@ -3981,3 +3981,46 @@ async fn quic_read(rx: &mut quinn::RecvStream) -> ServerMessage {
         .unwrap()
         .msg
 }
+
+/// A ticket past the TTL is dropped and its owner told, so clients can re-queue or widen criteria.
+#[tokio::test]
+async fn matchmaker_ticket_expires_with_notice() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let addr = router_addr(&state).await;
+    let (ta, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, "json").await;
+    send(
+        &mut a,
+        "json",
+        Some("t"),
+        ClientMessage::MatchmakerAdd {
+            min_count: 2,
+            max_count: 2,
+            query: "*".into(),
+            string_properties: Default::default(),
+            numeric_properties: Default::default(),
+            count_multiple: 1,
+        },
+    )
+    .await;
+    let ServerMessage::MatchmakerTicket { ticket } = recv(&mut a).await.msg else {
+        panic!("expected ticket")
+    };
+    let (hub, parties, mm) = (
+        state.hub.clone(),
+        state.parties.clone(),
+        state.matchmaker.clone(),
+    );
+    let expired = mm.expire_older_than(std::time::Duration::ZERO);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].id, ticket);
+    musubi_server::realtime::matchmaking::deliver_expired(&hub, &parties, expired);
+    assert_eq!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchmakerExpired { ticket }
+    );
+    assert_eq!(mm.ticket_count(), 0);
+}

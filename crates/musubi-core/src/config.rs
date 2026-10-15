@@ -45,6 +45,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub realtime: RealtimeConfig,
     pub retention: RetentionConfig,
+    pub matchmaker: MatchmakerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -646,6 +647,24 @@ impl Default for RetentionConfig {
             notifications_days: 30,
             chat_days: 0,
             sessions_days: 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MatchmakerConfig {
+    /// A seed waits this long for `max_count` before settling for `min_count`.
+    pub min_wait_secs: u64,
+    /// Tickets older than this are dropped with `MatchmakerExpired`.
+    pub ticket_ttl_secs: u64,
+}
+
+impl Default for MatchmakerConfig {
+    fn default() -> Self {
+        Self {
+            min_wait_secs: 15,
+            ticket_ttl_secs: 180,
         }
     }
 }

@@ -254,6 +254,10 @@ pub enum ServerMessage {
     MatchmakerTicket {
         ticket: String,
     },
+    /// The ticket waited longer than the server's TTL and was dropped; add again to keep searching.
+    MatchmakerExpired {
+        ticket: String,
+    },
     /// A group was formed. `token` is presented when joining the resulting match.
     MatchmakerMatched {
         ticket: String,
