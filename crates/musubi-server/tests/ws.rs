@@ -1952,24 +1952,34 @@ async fn matchmaker_allocates_a_dedicated_server_when_tickets_ask_for_a_fleet() 
         recv(&mut b).await.msg,
         ServerMessage::MatchmakerTicket { .. }
     ));
+    // every test state is a matchmaker leader on the shared Postgres bus, so another leader may
+    // deliver the same group first (without a server); wait for the delivery that carries ours
     for ws in [&mut a, &mut b] {
-        match recv(ws).await.msg {
-            ServerMessage::MatchmakerMatched {
-                server: Some(srv), ..
-            } => {
-                assert_eq!(srv.server_id, sid.to_string());
-                assert_eq!(srv.port, 48000);
-                assert!(!srv.connect_token.is_empty());
+        let mut ok = false;
+        for _ in 0..4 {
+            match recv(ws).await.msg {
+                ServerMessage::MatchmakerMatched {
+                    server: Some(srv), ..
+                } => {
+                    assert_eq!(srv.server_id, sid.to_string());
+                    assert_eq!(srv.port, 48000);
+                    assert!(!srv.connect_token.is_empty());
+                    ok = true;
+                    break;
+                }
+                ServerMessage::MatchmakerMatched { server: None, .. } => continue,
+                m => panic!("{m:?}"),
             }
-            m => panic!(
-                "{m:?}\nservers: {:?}",
-                state
-                    .fleets
-                    .servers(uuid::Uuid::parse_str(&fid).unwrap(), None)
-                    .await
-                    .unwrap()
-            ),
         }
+        assert!(
+            ok,
+            "no matched delivery with a server; servers: {:?}",
+            state
+                .fleets
+                .servers(uuid::Uuid::parse_str(&fid).unwrap(), None)
+                .await
+                .unwrap()
+        );
     }
     let gs = state.fleets.server(sid).await.unwrap();
     assert_eq!(gs.state, "allocated");
