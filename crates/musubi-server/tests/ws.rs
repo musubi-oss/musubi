@@ -4722,3 +4722,142 @@ async fn world_cell_hosted_on_another_node() {
     .await;
     assert_eq!(st, 200, "other cells stay on the home node");
 }
+
+/// Cells of one world on two nodes: entities near the shared border show up as ghosts in the view
+/// of the neighbouring cell on the other node (published over the bus every tick).
+#[tokio::test]
+async fn world_ghosts_cross_nodes() {
+    let group = format!("xghost-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(
+            serde_json::json!({"name": name, "config": {"cell_size": 100.0, "ghost_margin": 20.0}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (sim_a, sim_b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    for (router, sim, cell) in [(&router1, sim_a, (0, 0)), (&router2, sim_b, (1, 0))] {
+        let (st, l) = http_json(
+            router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/lease"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "cells": [{"x": cell.0, "y": cell.1}]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{l}");
+    }
+    // A hosts (0,0): one entity at the border (x=95), one deep inside (x=10).
+    // B hosts (1,0): one entity at the border (x=110).
+    let mut ids = Vec::new();
+    for (router, sim, x) in [
+        (&router1, sim_a, 95.0),
+        (&router1, sim_a, 10.0),
+        (&router2, sim_b, 110.0),
+    ] {
+        let (st, e) = http_json(
+            router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/spawn"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "x": x, "y": 50.0, "components": {}, "persistent": false})),
+        )
+        .await;
+        assert_eq!(st, 200, "{e}");
+        ids.push(
+            e["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no id: {e}"))
+                .to_string(),
+        );
+    }
+    let ghost_ids = |v: &Value| -> Vec<String> {
+        v["ghosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|g| g["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let mut ok = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, va) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, vb) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        if ghost_ids(&va) == vec![ids[2].clone()] && ghost_ids(&vb) == vec![ids[0].clone()] {
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "ghosts did not cross the node border");
+}

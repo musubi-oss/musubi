@@ -439,10 +439,15 @@ impl World {
         })
     }
 
-    /// Entities in cells adjacent to `cell` that lie within `ghost_margin` of its border.
-    pub fn ghosts_for(&self, cell: CellId) -> Vec<&Entity> {
+    /// `pos` lies within `ghost_margin` of `cell` (inside it or just outside its border).
+    fn within_margin(&self, cell: CellId, pos: Pos) -> bool {
         let (lo, hi) = self.cell_bounds(cell);
         let m = self.cfg.ghost_margin;
+        pos.x >= lo.x - m && pos.x <= hi.x + m && pos.y >= lo.y - m && pos.y <= hi.y + m
+    }
+
+    /// Entities in cells adjacent to `cell` that lie within `ghost_margin` of its border.
+    pub fn ghosts_for(&self, cell: CellId) -> Vec<&Entity> {
         let mut out = Vec::new();
         for n in Self::neighbours(cell) {
             let Some(ids) = self.by_cell.get(&n) else {
@@ -450,17 +455,49 @@ impl World {
             };
             for id in ids {
                 let e = &self.entities[id];
-                let inside_margin = e.pos.x >= lo.x - m
-                    && e.pos.x <= hi.x + m
-                    && e.pos.y >= lo.y - m
-                    && e.pos.y <= hi.y + m;
-                if inside_margin {
+                if self.within_margin(cell, e.pos) {
                     out.push(e);
                 }
             }
         }
         out.sort_by_key(|e| e.id);
         out
+    }
+
+    /// Entities of `cell` within `ghost_margin` of its own border: what the hosts of the
+    /// neighbouring cells need as ghosts (sent over the bus when those cells live elsewhere).
+    pub fn border_entities(&self, cell: CellId) -> Vec<&Entity> {
+        let (lo, hi) = self.cell_bounds(cell);
+        let m = self.cfg.ghost_margin;
+        let mut out: Vec<&Entity> = self
+            .by_cell
+            .get(&cell)
+            .map(|ids| {
+                ids.iter()
+                    .map(|i| &self.entities[i])
+                    .filter(|e| {
+                        e.pos.x < lo.x + m
+                            || e.pos.x > hi.x - m
+                            || e.pos.y < lo.y + m
+                            || e.pos.y > hi.y - m
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by_key(|e| e.id);
+        out
+    }
+
+    /// Of `candidates` (entities of a neighbouring cell, possibly received from another node),
+    /// those that are ghosts of `cell`.
+    pub fn ghosts_among<'a>(
+        &self,
+        cell: CellId,
+        candidates: impl Iterator<Item = &'a Entity>,
+    ) -> Vec<&'a Entity> {
+        candidates
+            .filter(|e| e.cell != cell && self.within_margin(cell, e.pos))
+            .collect()
     }
 
     /// Everything a simulator needs for one tick of one cell.

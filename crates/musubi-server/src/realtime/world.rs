@@ -38,7 +38,12 @@ struct WorldState {
     sim_events: HashMap<Uuid, Vec<Value>>,
     /// Persistent-entity ops since the last journal flush (see `musubi.world_journal`).
     journal: Vec<WorldOp>,
+    /// Border entities of cells hosted on other nodes, as last received over the bus.
+    remote_ghosts: HashMap<CellId, (std::time::Instant, Vec<Entity>)>,
 }
+
+/// Remote ghosts older than this are stale (their host stopped publishing or moved).
+const REMOTE_GHOST_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 const JOURNAL_EVERY: u64 = 5;
 
@@ -282,6 +287,7 @@ impl WorldRegistry {
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
+                    remote_ghosts: HashMap::new(),
                 }))
             });
         }
@@ -433,6 +439,7 @@ impl WorldRegistry {
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
+                remote_ghosts: HashMap::new(),
                 })),
             );
             self.homes.insert(name.clone(), self.node_id);
@@ -576,6 +583,7 @@ impl WorldRegistry {
                 subs: HashMap::new(),
                 sim_events: HashMap::new(),
                 journal: Vec::new(),
+                remote_ghosts: HashMap::new(),
             })),
         );
         self.publish_home(name, Some(self.node_id)).await;
@@ -811,13 +819,54 @@ impl WorldRegistry {
     pub fn view(&self, name: &str, cell: CellId) -> Result<Value> {
         let w = self.get(name)?;
         let st = w.lock();
-        let v = st.world.view(cell);
+        let mut v = st.world.view(cell);
+        for n in World::neighbours(cell) {
+            let Some((at, es)) = st.remote_ghosts.get(&n) else {
+                continue;
+            };
+            if at.elapsed() > REMOTE_GHOST_TTL {
+                continue;
+            }
+            for g in st.world.ghosts_among(cell, es.iter()) {
+                if !v.ghosts.iter().any(|e| e.id == g.id) {
+                    v.ghosts.push(g.clone());
+                }
+            }
+        }
+        v.ghosts.sort_by_key(|e| e.id);
         Ok(json!({
             "tick": st.world.tick,
             "owner": st.world.owner(cell),
             "owned": v.owned.iter().map(to_wire).collect::<Vec<_>>(),
             "ghosts": v.ghosts.iter().map(to_wire).collect::<Vec<_>>(),
         }))
+    }
+
+    /// Ghosts from another node: border entities of `cell`, which lives there, not here.
+    pub fn accept_ghosts(&self, name: &str, cell: CellId, tick: u64, entities: Vec<Entity>) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        if self
+            .cell_hosts
+            .get(&(name.to_string(), cell))
+            .is_some_and(|h| *h == self.node_id)
+        {
+            return;
+        }
+        let mut st = w.lock();
+        if st.world.owner(cell).is_some() {
+            return;
+        }
+        let _ = tick;
+        st.remote_ghosts
+            .insert(cell, (std::time::Instant::now(), entities));
+    }
+
+    /// Are the cells of `name` spread over several nodes? Any explicit cell assignment means
+    /// so: the home node sees the foreign hosts, an assigned node sees at least its own entry.
+    fn is_split(&self, name: &str) -> bool {
+        self.cell_hosts.iter().any(|e| e.key().0 == name)
     }
 
     /// Drain pending events for a simulator (handover requests/results, routed inputs).
@@ -914,6 +963,19 @@ impl WorldRegistry {
             let st = &mut *st;
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
+            if self.is_split(&name) {
+                for (cell, _) in st.world.leased_cells() {
+                    let border: Vec<Entity> = st
+                        .world
+                        .border_entities(cell)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    fanout.world_ghosts(&name, cell, st.world.tick, border);
+                }
+                st.remote_ghosts
+                    .retain(|_, (at, _)| at.elapsed() <= REMOTE_GHOST_TTL);
+            }
             if st.world.tick % JOURNAL_EVERY == 0 && !st.journal.is_empty() {
                 if let Some(db) = self.db.clone() {
                     let (ops, tick, n) =

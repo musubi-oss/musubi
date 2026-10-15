@@ -53,6 +53,14 @@ enum Wire {
     },
     RelayedCmd(RelayedCmdEnv),
     WorldCmd(WorldCmdEnv),
+    /// Cell host → cluster, every tick: entities of `cell` near its border, ghosts for the hosts
+    /// of the neighbouring cells.
+    WorldGhosts {
+        world: String,
+        cell: musubi_mesh::CellId,
+        tick: u64,
+        entities: Vec<musubi_mesh::Entity>,
+    },
     /// Coordinator → cluster: `node` now hosts `cell` of `world` (cells of one world may spread).
     WorldCellAssign {
         world: String,
@@ -264,6 +272,22 @@ impl Fanout {
         self.publish(Wire::WorldCmd(env));
     }
 
+    /// Publish the border entities of a locally hosted cell as ghosts for neighbour-cell hosts.
+    pub fn world_ghosts(
+        &self,
+        world: &str,
+        cell: musubi_mesh::CellId,
+        tick: u64,
+        entities: Vec<musubi_mesh::Entity>,
+    ) {
+        self.publish(Wire::WorldGhosts {
+            world: world.to_string(),
+            cell,
+            tick,
+            entities,
+        });
+    }
+
     /// Announce that `node` hosts `cell` of `world`.
     pub fn cell_assign(&self, world: &str, cell: musubi_mesh::CellId, node: uuid::Uuid) {
         self.publish(Wire::WorldCellAssign {
@@ -420,6 +444,16 @@ impl Fanout {
                 self.relayed.leave_all(self, sid);
                 if let Some(w) = self.worlds.get() {
                     w.unsubscribe_all(sid);
+                }
+            }
+            Ok(Wire::WorldGhosts {
+                world,
+                cell,
+                tick,
+                entities,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_ghosts(&world, cell, tick, entities);
                 }
             }
             Ok(Wire::WorldCellAssign { world, cell, node }) => {
