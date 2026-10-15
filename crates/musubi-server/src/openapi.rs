@@ -281,6 +281,48 @@ pub const BODIES: &[(&str, &str, &str, &str)] = &[
     ("PATCH", "/v1/groups/{id}", "", "Group"),
     ("GET", "/v1/leaderboards/{id}", "", "Leaderboard"),
     ("GET", "/v1/leaderboards/{id}/records", "", "RecordList"),
+    ("GET", "/v1/wallet", "", "Wallet"),
+    ("GET", "/v1/wallet/ledger", "", "Ledger"),
+    ("GET", "/v1/inventory", "", "Inventory"),
+    (
+        "POST",
+        "/v1/inventory/consume",
+        "ConsumeRequest",
+        "ConsumeResponse",
+    ),
+    ("GET", "/v1/store", "", "Store"),
+    ("POST", "/v1/store/buy", "BuyRequest", "Purchase"),
+    ("GET", "/v1/market/listings", "", "ListingPage"),
+    (
+        "POST",
+        "/v1/market/listings",
+        "CreateListingRequest",
+        "Listing",
+    ),
+    ("GET", "/v1/market/listings/mine", "", "ListingList"),
+    ("GET", "/v1/market/listings/{id}", "", "Listing"),
+    ("POST", "/v1/market/listings/{id}/buy", "", "Sale"),
+    ("POST", "/v1/market/listings/{id}/bid", "", "Listing"),
+    ("POST", "/v1/market/listings/{id}/cancel", "", "Listing"),
+    ("GET", "/v1/market/sales", "", "SaleList"),
+    ("GET", "/v1/server/fleets", "", "FleetList"),
+    ("POST", "/v1/server/fleets", "CreateFleetRequest", "Fleet"),
+    ("GET", "/v1/server/fleets/{id}", "", "Fleet"),
+    ("POST", "/v1/server/fleets/{id}/scale", "ScaleRequest", ""),
+    (
+        "POST",
+        "/v1/server/fleets/{id}/allocate",
+        "AllocateRequest",
+        "Allocation",
+    ),
+    (
+        "GET",
+        "/v1/server/fleets/{id}/servers",
+        "",
+        "GameServerList",
+    ),
+    ("GET", "/v1/server/worlds", "", "WorldList"),
+    ("POST", "/v1/server/worlds", "CreateWorldRequest", ""),
     (
         "POST",
         "/v1/leaderboards/{id}/records",
@@ -468,6 +510,196 @@ pub fn schemas() -> Map<String, Value> {
     m.insert(
         "WriteRecordRequest".into(),
         obj(json!({ "score": s("integer"), "subscore": { "type": "integer", "default": 0 }, "metadata": opt(s("object")), "operator": opt(operator) }), &["score"]),
+    );
+    // economy
+    m.insert(
+        "Balance".into(),
+        obj(
+            json!({ "currency": s("string"), "balance": s("integer") }),
+            &["currency", "balance"],
+        ),
+    );
+    m.insert(
+        "Wallet".into(),
+        obj(json!({ "balances": arr(r("Balance")) }), &["balances"]),
+    );
+    m.insert(
+        "LedgerEntry".into(),
+        obj(
+            json!({ "id": uuid(), "currency": s("string"), "delta": s("integer"), "balance_after": s("integer"), "reason": s("string"), "reference": s("string"), "idempotency_key": opt(s("string")), "metadata": s("object"), "created_at": ts() }),
+            &["id", "currency", "delta", "balance_after", "reason", "reference", "metadata", "created_at"],
+        ),
+    );
+    m.insert(
+        "Ledger".into(),
+        obj(json!({ "entries": arr(r("LedgerEntry")) }), &["entries"]),
+    );
+    m.insert(
+        "InventoryEntry".into(),
+        obj(json!({ "id": uuid(), "item_id": s("string"), "quantity": s("integer"), "instance": s("object") }), &["id", "item_id", "quantity", "instance"]),
+    );
+    m.insert(
+        "Inventory".into(),
+        obj(json!({ "items": arr(r("InventoryEntry")) }), &["items"]),
+    );
+    m.insert(
+        "ConsumeRequest".into(),
+        obj(
+            json!({ "id": uuid(), "quantity": { "type": "integer", "default": 1 } }),
+            &["id"],
+        ),
+    );
+    m.insert(
+        "ConsumeResponse".into(),
+        obj(json!({ "remaining": s("integer") }), &["remaining"]),
+    );
+    m.insert(
+        "StoreItem".into(),
+        obj(
+            json!({ "id": s("string"), "item_id": s("string"), "quantity": s("integer"), "prices": { "type": "object", "additionalProperties": s("integer"), "description": "currency code → price" }, "enabled": s("boolean"), "max_per_account": opt(s("integer")) }),
+            &["id", "item_id", "quantity", "prices", "enabled"],
+        ),
+    );
+    m.insert(
+        "Store".into(),
+        obj(json!({ "items": arr(r("StoreItem")) }), &["items"]),
+    );
+    m.insert("BuyRequest".into(), obj(json!({ "store_item_id": s("string"), "currency": s("string"), "idempotency_key": opt(s("string")) }), &["store_item_id", "currency"]));
+    m.insert(
+        "Purchase".into(),
+        obj(
+            json!({ "id": uuid(), "store_item_id": s("string"), "currency": s("string"), "amount": s("integer"), "balance": s("integer"), "granted": r("InventoryEntry"), "replayed": s("boolean") }),
+            &["id", "store_item_id", "currency", "amount", "balance", "granted", "replayed"],
+        ),
+    );
+    m.insert(
+        "Listing".into(),
+        obj(
+            json!({ "id": uuid(), "seller_id": uuid(), "item_id": s("string"), "quantity": s("integer"), "instance": s("object"), "currency": s("string"), "buyout": opt(s("integer")), "min_bid": s("integer"), "bid": opt(s("integer")), "bidder_id": opt(uuid()), "status": { "type": "string", "enum": ["open", "sold", "cancelled", "expired"] }, "created_at": ts(), "expires_at": ts() }),
+            &["id", "seller_id", "item_id", "quantity", "instance", "currency", "min_bid", "status", "created_at", "expires_at"],
+        ),
+    );
+    m.insert(
+        "ListingPage".into(),
+        obj(
+            json!({ "listings": arr(r("Listing")), "cursor": opt(uuid()) }),
+            &["listings"],
+        ),
+    );
+    m.insert(
+        "ListingList".into(),
+        obj(json!({ "listings": arr(r("Listing")) }), &["listings"]),
+    );
+    m.insert(
+        "CreateListingRequest".into(),
+        obj(
+            json!({ "inventory_id": uuid(), "quantity": s("integer"), "currency": s("string"), "buyout": opt(s("integer")), "min_bid": opt(s("integer")), "duration_secs": opt(s("integer")) }),
+            &["inventory_id", "quantity", "currency"],
+        ),
+    );
+    m.insert(
+        "Sale".into(),
+        obj(
+            json!({ "id": uuid(), "listing_id": uuid(), "seller_id": uuid(), "buyer_id": uuid(), "item_id": s("string"), "quantity": s("integer"), "currency": s("string"), "price": s("integer"), "fee": s("integer"), "kind": s("string"), "created_at": ts() }),
+            &["id", "listing_id", "seller_id", "buyer_id", "item_id", "quantity", "currency", "price", "fee", "kind", "created_at"],
+        ),
+    );
+    m.insert(
+        "SaleList".into(),
+        obj(json!({ "sales": arr(r("Sale")) }), &["sales"]),
+    );
+    // fleets
+    m.insert(
+        "FleetSpec".into(),
+        obj(json!({ "command": arr(s("string")), "image": opt(s("string")), "env": { "type": "object", "additionalProperties": s("string") }, "working_dir": opt(s("string")) }), &["command", "env"]),
+    );
+    let fleet_fields = json!({ "name": s("string"), "provider": { "type": "string", "enum": ["local", "docker", "kubernetes", "agones"] }, "region": s("string"), "spec": r("FleetSpec"), "buffer": s("integer"), "max_servers": s("integer"), "port_start": s("integer"), "port_end": s("integer") });
+    let mut fleet = fleet_fields.as_object().unwrap().clone();
+    fleet.insert("id".into(), uuid());
+    fleet.insert("created_at".into(), ts());
+    m.insert(
+        "Fleet".into(),
+        obj(
+            Value::Object(fleet),
+            &[
+                "id",
+                "name",
+                "provider",
+                "region",
+                "spec",
+                "buffer",
+                "max_servers",
+                "port_start",
+                "port_end",
+                "created_at",
+            ],
+        ),
+    );
+    m.insert(
+        "CreateFleetRequest".into(),
+        obj(
+            fleet_fields,
+            &[
+                "name",
+                "provider",
+                "region",
+                "spec",
+                "buffer",
+                "max_servers",
+                "port_start",
+                "port_end",
+            ],
+        ),
+    );
+    m.insert(
+        "FleetList".into(),
+        obj(
+            json!({ "fleets": arr(r("Fleet")), "providers": arr(s("string")) }),
+            &["fleets", "providers"],
+        ),
+    );
+    m.insert(
+        "ScaleRequest".into(),
+        obj(
+            json!({ "buffer": opt(s("integer")), "max_servers": opt(s("integer")) }),
+            &[],
+        ),
+    );
+    m.insert(
+        "AllocateRequest".into(),
+        obj(json!({ "payload": s("object") }), &["payload"]),
+    );
+    m.insert(
+        "GameServer".into(),
+        obj(
+            json!({ "id": uuid(), "fleet_id": uuid(), "state": { "type": "string", "enum": ["starting", "ready", "allocated", "shutdown", "failed"] }, "node_id": opt(uuid()), "address": s("string"), "port": s("integer"), "pid": opt(s("integer")), "labels": s("object"), "allocation": opt(s("object")), "last_health": ts(), "created_at": ts() }),
+            &["id", "fleet_id", "state", "address", "port", "labels", "last_health", "created_at"],
+        ),
+    );
+    m.insert(
+        "GameServerList".into(),
+        obj(json!({ "servers": arr(r("GameServer")) }), &["servers"]),
+    );
+    m.insert(
+        "Allocation".into(),
+        obj(json!({ "server_id": uuid(), "fleet_id": uuid(), "address": s("string"), "port": s("integer"), "connect_token": s("string") }), &["server_id", "fleet_id", "address", "port", "connect_token"]),
+    );
+    // worlds
+    m.insert(
+        "WorldConfig".into(),
+        obj(json!({ "cell_size": s("number"), "ghost_margin": s("number"), "hysteresis": s("number"), "lease_ttl_ticks": s("integer"), "handover_timeout_ticks": s("integer") }), &[]),
+    );
+    m.insert(
+        "ControllerConfig".into(),
+        obj(
+            json!({ "split_cost": s("number"), "sim_timeout_ticks": s("integer") }),
+            &[],
+        ),
+    );
+    m.insert("CreateWorldRequest".into(), obj(json!({ "name": s("string"), "config": r("WorldConfig"), "controller": r("ControllerConfig") }), &["name"]));
+    m.insert(
+        "WorldList".into(),
+        obj(json!({ "worlds": arr(s("string")) }), &["worlds"]),
     );
     m
 }

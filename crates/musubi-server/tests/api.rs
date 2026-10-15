@@ -4745,6 +4745,33 @@ async fn openapi_schemas_match_real_responses() {
     let (st, friends) = call(&app, "GET", "/v1/friends", Some(&tok), None).await;
     assert_eq!(st, StatusCode::OK, "{friends}");
     assert_required(&doc, "FriendList", &friends);
+    let (st, v) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_required(&doc, "Wallet", &v);
+    let (st, v) = call(&app, "GET", "/v1/wallet/ledger", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_required(&doc, "Ledger", &v);
+    let (st, v) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_required(&doc, "Inventory", &v);
+    let (st, v) = call(&app, "GET", "/v1/store", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_required(&doc, "Store", &v);
+    for it in v["items"].as_array().unwrap() {
+        assert_required(&doc, "StoreItem", it);
+    }
+    let (st, v) = call(&app, "GET", "/v1/market/listings", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_required(&doc, "ListingPage", &v);
+    let (st, v) = call_server(&app, "GET", "/v1/server/fleets", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_required(&doc, "FleetList", &v);
+    for f in v["fleets"].as_array().unwrap() {
+        assert_required(&doc, "Fleet", f);
+    }
+    let (st, v) = call_server(&app, "GET", "/v1/server/worlds", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_required(&doc, "WorldList", &v);
 }
 
 /// Issued keys carry a role: `server` keys reach /v1/server but not /v1/admin; revocation is
