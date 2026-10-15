@@ -5,8 +5,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use musubi_economy::{
-    Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, ReceiptInput, RewardTable,
-    SendMail, StreakDef, Track,
+    Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, Quest, ReceiptInput,
+    RewardTable, Season, SendMail, StreakDef, Track,
 };
 use musubi_integrations::StoreTransaction;
 use musubi_social::notifications::NewNotification;
@@ -56,6 +56,14 @@ pub fn routes() -> Router<AppState> {
             get(iap_products).post(upsert_iap_product),
         )
         .route("/v1/server/iap/receipts", get(iap_receipts_of))
+        .route("/v1/quests", get(quests_mine))
+        .route("/v1/quests/{id}/claim", post(quest_claim))
+        .route("/v1/seasons/current", get(season_current))
+        .route("/v1/seasons/{id}/claim", post(season_claim))
+        .route("/v1/server/quests", get(quests_all).post(upsert_quest))
+        .route("/v1/server/quests/event", post(quest_event))
+        .route("/v1/server/seasons", get(seasons_all).post(upsert_season))
+        .route("/v1/server/seasons/{id}/premium", post(season_premium))
         .route("/v1/mail", get(mail_list))
         .route("/v1/mail/{id}", axum::routing::delete(mail_delete))
         .route("/v1/mail/{id}/read", post(mail_read))
@@ -783,4 +791,144 @@ async fn achievement_progress(
         )
         .await?;
     Ok(Json(serde_json::to_value(u).map_err(Error::internal)?))
+}
+
+// ----- quests -----
+
+async fn quests_mine(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "quests": s.economy.quest_views(me.account_id, OffsetDateTime::now_utc()).await? }),
+    ))
+}
+
+async fn quest_claim(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let rewards = s
+        .economy
+        .claim_quest(me.account_id, &id, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(json!({ "rewards": rewards })))
+}
+
+async fn quests_all(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "quests": s.economy.quests().await? })))
+}
+
+async fn upsert_quest(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(q): Json<Quest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_quest(q).await?).map_err(Error::internal)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct QuestEventReq {
+    account_id: String,
+    event: String,
+    #[serde(default = "one")]
+    delta: i64,
+}
+
+async fn quest_event(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<QuestEventReq>,
+) -> Result<Json<Value>, ApiError> {
+    let res = s
+        .economy
+        .quest_event(
+            account(&r.account_id)?,
+            &r.event,
+            r.delta,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(serde_json::to_value(res).map_err(Error::internal)?))
+}
+
+// ----- seasons / battle pass -----
+
+async fn season_current(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "current": s.economy.current_season(me.account_id, OffsetDateTime::now_utc()).await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SeasonClaimReq {
+    level: i32,
+    #[serde(default = "free")]
+    tier: String,
+}
+
+fn free() -> String {
+    "free".into()
+}
+
+async fn season_claim(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(r): Json<SeasonClaimReq>,
+) -> Result<Json<Value>, ApiError> {
+    let rewards = s
+        .economy
+        .claim_season(
+            me.account_id,
+            &id,
+            r.level,
+            &r.tier,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(json!({ "rewards": rewards })))
+}
+
+async fn seasons_all(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "seasons": s.economy.seasons().await? })))
+}
+
+async fn upsert_season(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(q): Json<Season>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_season(q).await?).map_err(Error::internal)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct AccountReq {
+    account_id: String,
+}
+
+async fn season_premium(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(r): Json<AccountReq>,
+) -> Result<Json<Value>, ApiError> {
+    s.economy
+        .grant_premium(account(&r.account_id)?, &id)
+        .await?;
+    Ok(Json(json!({})))
 }

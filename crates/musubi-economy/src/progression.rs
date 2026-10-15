@@ -111,7 +111,7 @@ pub struct StreakClaim {
     pub next_claim_at: OffsetDateTime,
 }
 
-fn level_for(levels: &[Level], xp: i64) -> i32 {
+pub(crate) fn level_for(levels: &[Level], xp: i64) -> i32 {
     levels.iter().filter(|l| l.xp <= xp).count() as i32
 }
 

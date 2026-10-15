@@ -2362,3 +2362,232 @@ async fn mailbox_claim_expire_and_achievements() {
     assert_eq!(h["unlocked"], true);
     assert!(h["unlocked_at"].is_string());
 }
+
+#[tokio::test]
+async fn quests_by_events_and_battle_pass_tiers() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("qs")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gems = unique("gems");
+    let bonus = unique("bonus");
+    let daily = unique("daily");
+    let once = unique("once");
+    let track = unique("sxp");
+    let season = unique("s1");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gems})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": bonus, "kind": "guaranteed", "entries": [{"currency": gems, "amount": 50}]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    // quests: a daily needing two wins, a one-off needing one
+    let (st, b) = call_server(&app, "POST", "/v1/server/quests", k, Some(json!({"id": daily, "name": "Win twice", "kind": "daily", "objectives": [{"event": "match_won", "target": 2}], "rewards": bonus}))).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, _) = call_server(&app, "POST", "/v1/server/quests", k, Some(json!({"id": once, "kind": "one_off", "objectives": [{"event": "match_won", "target": 1}], "rewards": bonus}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/quests", k, Some(json!({"id": unique("bad"), "kind": "monthly", "objectives": [{"event": "x", "target": 1}]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/quests/event",
+        k,
+        Some(json!({"account_id": acc, "event": "match_won"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(r["updated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|q| q == &json!(daily)));
+    assert_eq!(r["completed"], json!([once]));
+    let (_, q) = call(&app, "GET", "/v1/quests", Some(&tok), None).await;
+    let d = q["quests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["quest_id"] == daily)
+        .unwrap();
+    assert_eq!(d["progress"]["match_won"], 1);
+    assert_eq!(d["completed"], false);
+    assert!(d["resets_at"].is_string());
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{daily}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "not completed yet");
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/quests/event",
+        k,
+        Some(json!({"account_id": acc, "event": "match_won", "delta": 5})),
+    )
+    .await;
+    assert_eq!(r["completed"], json!([daily]));
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{daily}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["rewards"][0]["amount"], 50);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{daily}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{once}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, q) = call(&app, "GET", "/v1/quests", Some(&tok), None).await;
+    let d = q["quests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["quest_id"] == daily)
+        .unwrap();
+    assert_eq!(d["progress"]["match_won"], 2, "capped at target");
+    assert_eq!(d["claimed"], true);
+    // battle pass on its own XP track
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/tracks",
+        k,
+        Some(json!({"id": track, "levels": [{"xp": 100}, {"xp": 200}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let now = time::OffsetDateTime::now_utc();
+    let fmt = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let (st, b) = call_server(&app, "POST", "/v1/server/seasons", k, Some(json!({
+        "id": season, "name": "Season 1", "track_id": track,
+        "starts_at": fmt(now - time::Duration::hours(1)), "ends_at": fmt(now + time::Duration::hours(1)),
+        "levels": [{"level": 1, "free": bonus, "premium": bonus}, {"level": 2, "premium": bonus}]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, c) = call(&app, "GET", "/v1/seasons/current", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(c["current"]["season"]["id"], season);
+    assert_eq!(c["current"]["level"], 0);
+    assert_eq!(c["current"]["premium"], false);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/seasons/{season}/claim"),
+        Some(&tok),
+        Some(json!({"level": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "level not reached");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": acc, "track_id": track, "delta": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/seasons/{season}/claim"),
+        Some(&tok),
+        Some(json!({"level": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["rewards"][0]["amount"], 50);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/seasons/{season}/claim"),
+        Some(&tok),
+        Some(json!({"level": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/seasons/{season}/claim"),
+        Some(&tok),
+        Some(json!({"level": 1, "tier": "premium"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "premium pass required");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/seasons/{season}/premium"),
+        k,
+        Some(json!({"account_id": acc})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/seasons/{season}/claim"),
+        Some(&tok),
+        Some(json!({"level": 1, "tier": "premium"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/seasons/{season}/claim"),
+        Some(&tok),
+        Some(json!({"level": 2, "tier": "free"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "no free reward at level 2");
+    let (_, c) = call(&app, "GET", "/v1/seasons/current", Some(&tok), None).await;
+    assert_eq!(c["current"]["level"], 1);
+    assert_eq!(c["current"]["premium"], true);
+    assert_eq!(c["current"]["claimed"], json!(["free:1", "premium:1"]));
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(
+        w["balances"][0]["balance"], 200,
+        "daily + one-off + free + premium"
+    );
+}
