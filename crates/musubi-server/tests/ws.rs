@@ -87,6 +87,8 @@ async fn build_state(leader: bool) -> Option<AppState> {
         relayed,
         matches: test_matches(&db, &runtime),
         worlds: worlds.clone(),
+        liveops: None,
+        voice: None,
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),
@@ -2565,4 +2567,104 @@ async fn cross_node_world_subscription_and_sim_redirect() {
         recv(&mut c).await.msg,
         ServerMessage::Error { .. }
     ));
+}
+
+/// Fake Zanshin + Aurix: records events, answers flags and tokens.
+async fn mock_upstreams() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+    use axum::routing::{get, post};
+    use axum::Json;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let s2 = seen.clone();
+    let app = axum::Router::new()
+        .route("/server/v1/events", post(move |Json(b): Json<Value>| {
+            let s2 = s2.clone();
+            async move {
+                let n = b["events"].as_array().map(|a| a.len()).unwrap_or(0);
+                s2.lock().unwrap().push(b);
+                Json(json!({"accepted": n, "rejected": 0}))
+            }
+        }))
+        .route("/server/v1/flags", get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+            Json(json!({"flags": [{"key": "new_map", "value": true, "external_id": q.get("external_id")}]}))
+        }))
+        .route("/v1/tokens", post(|Json(b): Json<Value>| async move {
+            Json(json!({"token": format!("aurix-{}", b["external_id"].as_str().unwrap_or("")), "user_id": "u1", "expires_at": "2030-01-01T00:00:00Z",
+                "channels": [{"channel_id": "chan-1", "name": b["channels"][0]["ad_hoc"]["name"]}], "endpoint": {"ws": "ws://voice/ws"}}))
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, seen)
+}
+
+#[tokio::test]
+async fn zanshin_and_aurix_integrations() {
+    let Some(mut state) = build_state(true).await else {
+        return;
+    };
+    let (upstream, seen) = mock_upstreams().await;
+    let liveops = musubi_integrations::ZanshinClient::new(&upstream, "zk_s_test");
+    state.liveops = Some(liveops.clone());
+    state.voice = Some(musubi_integrations::AurixClient::new(&upstream, "ak_test"));
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    // authentication is tracked as an analytics event
+    let (ta, acc) = token(&router).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(liveops.flush().await, 1);
+    let ev = seen.lock().unwrap().clone();
+    assert_eq!(ev[0]["external_id"], acc.to_string());
+    assert_eq!(ev[0]["events"][0]["name"], "musubi.authenticated");
+    // flags are evaluated for the caller's identity
+    let req = Request::get("/v1/liveops/flags?names=new_map")
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["flags"][0]["key"], "new_map");
+    assert_eq!(v["flags"][0]["external_id"], acc.to_string());
+    // voice token only for members: create a party over the socket, then ask for its channel
+    let f = "json";
+    let mut a = connect(&addr, &ta, f).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyCreate {
+            open: true,
+            max_size: 4,
+        },
+    )
+    .await;
+    let pid = match recv(&mut a).await.msg {
+        ServerMessage::Party { party_id, .. } => party_id,
+        m => panic!("{m:?}"),
+    };
+    let body =
+        |pid: &str| Body::from(json!({"party_id": pid, "display_name": "Alice"}).to_string());
+    let req = Request::post("/v1/voice/token")
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body(&pid))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["token"], format!("aurix-{acc}"));
+    assert_eq!(v["channel_id"], "chan-1");
+    // a stranger is refused
+    let (tb, _) = token(&router).await;
+    let req = Request::post("/v1/voice/token")
+        .header(header::AUTHORIZATION, format!("Bearer {tb}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body(&pid))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 403);
 }

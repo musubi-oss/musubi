@@ -36,6 +36,8 @@ pub struct Config {
     pub log: LogConfig,
     pub runtime: RuntimeConfig,
     pub quic: QuicConfig,
+    pub zanshin: ZanshinConfig,
+    pub aurix: AurixConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,4 +206,25 @@ pub struct QuicConfig {
     /// PEM cert chain + key. Unset = self-signed `localhost` cert (development only).
     pub cert_pem: Option<std::path::PathBuf>,
     pub key_pem: Option<std::path::PathBuf>,
+}
+
+/// Zanshin LiveOps (flags, experiments, analytics). Unset `url` = disabled.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ZanshinConfig {
+    pub url: Option<String>,
+    pub server_key: String,
+    /// Seconds between analytics event flushes.
+    pub flush_secs: u64,
+}
+
+/// Aurix voice. Unset `url` = disabled.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AurixConfig {
+    pub url: Option<String>,
+    pub api_key: String,
+    /// Aurix channel type for party / match channels.
+    pub party_channel_type: String,
+    pub match_channel_type: String,
 }

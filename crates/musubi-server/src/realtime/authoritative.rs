@@ -181,6 +181,12 @@ impl MatchRegistry {
         self.launch(hub, module, params, None, None)
     }
 
+    pub fn is_member(&self, session: musubi_core::SessionId, match_id: &str) -> bool {
+        self.by_session
+            .get(&session)
+            .is_some_and(|v| v.iter().any(|m| m == match_id))
+    }
+
     pub fn get(&self, match_id: &str) -> Option<MatchHandle> {
         self.matches
             .get(match_id)

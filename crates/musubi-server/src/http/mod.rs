@@ -7,6 +7,7 @@ mod extract;
 mod fleets;
 mod friends;
 mod groups;
+mod integrations;
 mod leaderboards;
 mod matches;
 mod notifications;
@@ -47,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .merge(matches::routes())
         .merge(fleets::routes())
         .merge(worlds::routes())
+        .merge(integrations::routes())
         .merge(storage::routes())
         .merge(ws::routes())
         .layer(TraceLayer::new_for_http())

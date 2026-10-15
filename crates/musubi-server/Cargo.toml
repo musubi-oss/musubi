@@ -24,6 +24,7 @@ musubi-cluster.workspace = true
 musubi-actor.workspace = true
 musubi-fleet.workspace = true
 musubi-mesh.workspace = true
+musubi-integrations.workspace = true
 parking_lot = "0.12"
 base64.workspace = true
 musubi-proto.workspace = true

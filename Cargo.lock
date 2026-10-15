@@ -1793,6 +1793,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "musubi-integrations"
+version = "0.1.0"
+dependencies = [
+ "musubi-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "musubi-leaderboard"
 version = "0.1.0"
 dependencies = [
@@ -1872,6 +1884,7 @@ dependencies = [
  "musubi-cluster",
  "musubi-core",
  "musubi-fleet",
+ "musubi-integrations",
  "musubi-leaderboard",
  "musubi-matchmaker",
  "musubi-mesh",

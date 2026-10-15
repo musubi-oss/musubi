@@ -6,6 +6,7 @@ use musubi_chat::ChatService;
 use musubi_cluster::Cluster;
 use musubi_core::config::Config;
 use musubi_fleet::FleetService;
+use musubi_integrations::{AurixClient, ZanshinClient};
 use musubi_leaderboard::{LeaderboardService, TournamentService};
 use musubi_matchmaker::Matchmaker;
 use musubi_runtime::Runtime;
@@ -40,6 +41,8 @@ pub struct AppState {
     pub relayed: Arc<RelayedRegistry>,
     pub matches: Arc<MatchRegistry>,
     pub worlds: Arc<crate::realtime::WorldRegistry>,
+    pub liveops: Option<Arc<ZanshinClient>>,
+    pub voice: Option<Arc<AurixClient>>,
     pub runtime: Arc<Runtime>,
     pub cluster: Option<Arc<Cluster>>,
     pub fleets: Arc<FleetService>,
@@ -156,6 +159,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(db.clone()),
     ));
     fanout.set_worlds(worlds.clone());
+    let liveops = cfg.zanshin.url.as_deref().map(|u| {
+        let c = ZanshinClient::new(u, &cfg.zanshin.server_key);
+        c.clone().spawn_flusher(std::time::Duration::from_secs(
+            cfg.zanshin.flush_secs.max(1),
+        ));
+        c
+    });
+    let voice = cfg
+        .aurix
+        .url
+        .as_deref()
+        .map(|u| AurixClient::new(u, &cfg.aurix.api_key));
     worlds.clone().spawn_ticker(fanout.clone());
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {
@@ -175,6 +190,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         relayed,
         matches,
         worlds,
+        liveops,
+        voice,
         runtime,
         cluster: Some(cluster),
         fleets,

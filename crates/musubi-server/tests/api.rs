@@ -69,6 +69,8 @@ async fn app() -> Option<Router> {
         relayed,
         matches: test_matches(&db, &runtime),
         worlds: worlds.clone(),
+        liveops: None,
+        voice: None,
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),
