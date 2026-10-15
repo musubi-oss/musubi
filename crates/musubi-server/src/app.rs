@@ -66,6 +66,24 @@ pub struct AppState {
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     info!(node = %cfg.node.name, roles = ?cfg.node.roles, "starting");
+    let problems = cfg.validate();
+    for p in &problems {
+        match p.severity {
+            musubi_core::config::Severity::Error => tracing::error!(key = %p.key, "{}", p.message),
+            musubi_core::config::Severity::Warning => tracing::warn!(key = %p.key, "{}", p.message),
+        }
+    }
+    let errors: Vec<_> = problems
+        .iter()
+        .filter(|p| p.severity == musubi_core::config::Severity::Error)
+        .map(|p| format!("{}: {}", p.key, p.message))
+        .collect();
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "refusing to start: {} (set node.allow_insecure_defaults = true only for local development; `musubi doctor` lists everything)",
+            errors.join("; ")
+        );
+    }
     let db = db::connect(&cfg.database).await?;
     if cfg.database.run_migrations {
         db::migrate(&db).await?;

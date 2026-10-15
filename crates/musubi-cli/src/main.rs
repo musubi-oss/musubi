@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 mod bench;
+mod doctor;
 
 use clap::{Parser, Subcommand};
 use musubi_core::config::Config;
@@ -30,6 +31,9 @@ enum Cmd {
     },
     /// Apply pending database migrations and exit.
     Migrate,
+    /// Check the configuration and the environment (secrets, TTLs, database, pending migrations,
+    /// data dir, ports) and exit 1 if anything would stop the server.
+    Doctor,
     /// Print the effective configuration.
     Config {
         #[arg(long, default_value = "toml")]
@@ -65,12 +69,14 @@ async fn main() -> anyhow::Result<()> {
             }
             cfg.http.listen = listen.parse()?;
             cfg.database.run_migrations = true;
+            cfg.node.allow_insecure_defaults = true;
             if cfg.log.filter == "info" {
                 cfg.log.filter = "info,musubi=debug,tower_http=debug".into();
             }
             musubi_server::init_tracing(&cfg);
             musubi_server::run(cfg).await
         }
+        Cmd::Doctor => doctor::run(&cfg).await,
         Cmd::Migrate => {
             musubi_server::init_tracing(&cfg);
             let pool = musubi_server::db::connect(&cfg.database).await?;

@@ -63,6 +63,9 @@ pub struct NodeConfig {
     pub cluster_group: String,
     /// Upper bound for the SIGTERM drain (hand off matches/worlds, leave the cluster, close sessions).
     pub drain_timeout_secs: u64,
+    /// Let the server start with the built-in `server_key` / JWT secret. `musubi dev` sets it;
+    /// deployments must set their own secrets instead (see `Config::validate`).
+    pub allow_insecure_defaults: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +112,7 @@ impl Default for NodeConfig {
             bus_advertise: String::new(),
             cluster_group: "default".into(),
             drain_timeout_secs: 20,
+            allow_insecure_defaults: false,
             data_dir: "./data".into(),
         }
     }
@@ -154,7 +158,169 @@ impl Default for LogConfig {
     }
 }
 
+/// Built-in secrets that must not reach a deployment.
+pub const DEFAULT_SERVER_KEY: &str = "defaultkey";
+pub const DEFAULT_SESSION_SECRET: &str = "dev-only-change-me";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// The server refuses to start.
+    Error,
+    /// Logged at startup, listed by `musubi doctor`.
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Problem {
+    pub severity: Severity,
+    pub key: String,
+    pub message: String,
+}
+
 impl Config {
+    /// Static sanity checks (secrets, TTLs, addresses). Errors stop `musubi-server`; warnings are
+    /// logged. Runtime checks (database, ports, data dir) live in `musubi doctor`.
+    pub fn validate(&self) -> Vec<Problem> {
+        let mut out = Vec::new();
+        let mut push = |severity: Severity, key: &str, message: String| {
+            out.push(Problem {
+                severity,
+                key: key.to_string(),
+                message,
+            })
+        };
+        let insecure = |s: Severity| {
+            if self.node.allow_insecure_defaults {
+                Severity::Warning
+            } else {
+                s
+            }
+        };
+        if self.http.server_key == DEFAULT_SERVER_KEY {
+            push(
+                insecure(Severity::Error),
+                "http.server_key",
+                "built-in server key; set your own or issue keys via /v1/admin/keys".into(),
+            );
+        } else if self.http.server_key.len() < 16 {
+            push(
+                Severity::Warning,
+                "http.server_key",
+                "shorter than 16 characters".into(),
+            );
+        }
+        if self.session.signing_key_pem.is_none() {
+            if self.session.secret == DEFAULT_SESSION_SECRET {
+                push(
+                    insecure(Severity::Error),
+                    "session.secret",
+                    "built-in HS256 secret; set session.signing_key_pem (ES256) or a long random secret".into(),
+                );
+            } else if self.session.secret.len() < 32 {
+                push(
+                    Severity::Warning,
+                    "session.secret",
+                    "HS256 secret shorter than 32 characters".into(),
+                );
+            } else {
+                push(
+                    Severity::Warning,
+                    "session.signing_key_pem",
+                    "HS256 in use; ES256 (signing_key_pem) lets other services verify tokens without the secret".into(),
+                );
+            }
+        }
+        if self.session.access_ttl_secs == 0 || self.session.refresh_ttl_secs == 0 {
+            push(
+                Severity::Error,
+                "session",
+                "access_ttl_secs and refresh_ttl_secs must be > 0".into(),
+            );
+        } else if self.session.access_ttl_secs >= self.session.refresh_ttl_secs {
+            push(
+                Severity::Error,
+                "session",
+                "access_ttl_secs must be shorter than refresh_ttl_secs".into(),
+            );
+        } else if self.session.access_ttl_secs > 24 * 3600 {
+            push(
+                Severity::Warning,
+                "session.access_ttl_secs",
+                "access tokens live longer than a day; bans take that long to bite on cached JWTs"
+                    .into(),
+            );
+        }
+        if self.database.url.is_empty() {
+            push(Severity::Error, "database.url", "empty".into());
+        }
+        if self.database.max_connections == 0 {
+            push(
+                Severity::Error,
+                "database.max_connections",
+                "must be > 0".into(),
+            );
+        }
+        if !self.node.bus_listen.is_empty() && self.node.bus_listen.parse::<SocketAddr>().is_err() {
+            push(
+                Severity::Error,
+                "node.bus_listen",
+                format!("not a socket address: {}", self.node.bus_listen),
+            );
+        }
+        if !self.node.bus_advertise.is_empty()
+            && self.node.bus_advertise.parse::<SocketAddr>().is_err()
+        {
+            push(
+                Severity::Error,
+                "node.bus_advertise",
+                format!("not a socket address: {}", self.node.bus_advertise),
+            );
+        }
+        if !self.node.bus_listen.is_empty() && self.node.data_dir.is_empty() {
+            push(
+                Severity::Warning,
+                "node.data_dir",
+                "empty: node identity and the Raft log will not survive a restart".into(),
+            );
+        }
+        if self.node.drain_timeout_secs == 0 {
+            push(
+                Severity::Warning,
+                "node.drain_timeout_secs",
+                "0: SIGTERM drops matches and worlds without hand-off".into(),
+            );
+        }
+        if self.metrics.enabled
+            && !self.metrics.require_server_key
+            && self.metrics.allow_ips.is_empty()
+        {
+            push(Severity::Warning, "metrics", "/metrics is open to anyone who can reach the port; set require_server_key or allow_ips".into());
+        }
+        if !self.limits.enabled {
+            push(
+                Severity::Warning,
+                "limits.enabled",
+                "rate limits are off".into(),
+            );
+        }
+        if self.retention.interval_secs < 5 {
+            push(
+                Severity::Warning,
+                "retention.interval_secs",
+                "clamped to 5 seconds".into(),
+            );
+        }
+        if self.realtime.resume_ttl_secs > 600 {
+            push(
+                Severity::Warning,
+                "realtime.resume_ttl_secs",
+                "parked sessions hold matches/parties for over 10 minutes".into(),
+            );
+        }
+        out
+    }
+
     /// Layered: defaults ← optional TOML/YAML file ← `MUSUBI__SECTION__KEY` env vars.
     pub fn load(path: Option<&Path>) -> Result<Self, config::ConfigError> {
         let mut b = config::Config::builder();
@@ -494,5 +660,30 @@ impl MetricsConfig {
                     ip == a
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_refused_unless_allowed() {
+        let mut cfg = Config::default();
+        let errs = |c: &Config| {
+            c.validate()
+                .into_iter()
+                .filter(|p| p.severity == Severity::Error)
+                .count()
+        };
+        assert!(errs(&cfg) >= 2, "{:?}", cfg.validate());
+        cfg.node.allow_insecure_defaults = true;
+        assert_eq!(errs(&cfg), 0);
+        cfg.node.allow_insecure_defaults = false;
+        cfg.http.server_key = "a-much-longer-real-server-key".into();
+        cfg.session.secret = "0123456789abcdef0123456789abcdef-really-random".into();
+        assert_eq!(errs(&cfg), 0, "{:?}", cfg.validate());
+        cfg.session.access_ttl_secs = cfg.session.refresh_ttl_secs;
+        assert_eq!(errs(&cfg), 1);
     }
 }

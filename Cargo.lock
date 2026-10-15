@@ -1997,6 +1997,7 @@ dependencies = [
  "musubi-server",
  "reqwest",
  "serde_json",
+ "sqlx",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "toml",

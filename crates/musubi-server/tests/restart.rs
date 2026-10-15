@@ -38,6 +38,7 @@ fn spawn(n: &mut Node, db: &str, group: &str, name: &str) {
         .env("MUSUBI__DATABASE__URL", db)
         .env("MUSUBI__DATABASE__RUN_MIGRATIONS", "true")
         .env("MUSUBI__DATABASE__MAX_CONNECTIONS", "4")
+        .env("MUSUBI__NODE__ALLOW_INSECURE_DEFAULTS", "true")
         .env("MUSUBI__NODE__NAME", name)
         .env("MUSUBI__NODE__DATA_DIR", &n.dir)
         .env("MUSUBI__NODE__CLUSTER_GROUP", group)

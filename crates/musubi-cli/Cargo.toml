@@ -23,3 +23,4 @@ reqwest.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true
 uuid.workspace = true
+sqlx.workspace = true
