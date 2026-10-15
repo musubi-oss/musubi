@@ -682,12 +682,15 @@ pub struct MatchmakerConfig {
     pub min_wait_secs: u64,
     /// Tickets older than this are dropped with `MatchmakerExpired`.
     pub ticket_ttl_secs: u64,
+    /// Formed matches with free slots accept compatible later tickets (backfill) for this long; 0 = off.
+    pub backfill_secs: u64,
 }
 
 impl Default for MatchmakerConfig {
     fn default() -> Self {
         Self {
             min_wait_secs: 15,
+            backfill_secs: 60,
             ticket_ttl_secs: 180,
         }
     }

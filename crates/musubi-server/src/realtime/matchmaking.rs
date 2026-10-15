@@ -70,6 +70,10 @@ pub fn process_and_deliver(relayed: &RelayedRegistry, mm: &Matchmaker, fanout: &
     }
     for m in mm.process() {
         let match_id = relayed.new_match_id();
+        mm.register_open(&match_id, &m);
+        fanout.deliver_matched(m, match_id);
+    }
+    for (m, match_id) in mm.process_backfill() {
         fanout.deliver_matched(m, match_id);
     }
 }

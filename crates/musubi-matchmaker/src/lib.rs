@@ -158,9 +158,22 @@ pub struct AddTicket {
     pub count_multiple: usize,
 }
 
+/// A matchmaker-formed match that still has room: later tickets compatible with everyone already in
+/// it are sent there instead of waiting for a brand-new group.
+#[derive(Debug, Clone)]
+struct OpenMatch {
+    match_id: String,
+    token: String,
+    tickets: Vec<Ticket>,
+    size: usize,
+    max: usize,
+    created: Instant,
+}
+
 #[derive(Default)]
 struct Pool {
     tickets: Vec<Ticket>,
+    open: Vec<OpenMatch>,
     by_session: HashMap<SessionId, Vec<String>>,
 }
 
@@ -170,6 +183,8 @@ pub struct Matchmaker {
     min_wait: Duration,
     /// Tickets older than this are dropped by `expire` (the client gets `MatchmakerExpired`).
     ttl: Duration,
+    /// Formed matches stay open for backfill this long (`None` = off).
+    backfill_ttl: Option<Duration>,
 }
 
 pub const DEFAULT_TICKET_TTL: Duration = Duration::from_secs(180);
@@ -185,6 +200,7 @@ impl Matchmaker {
         Self {
             pool: Mutex::new(Pool::default()),
             min_wait,
+            backfill_ttl: None,
             ttl: DEFAULT_TICKET_TTL,
         }
     }
@@ -213,6 +229,86 @@ impl Matchmaker {
             } else {
                 i += 1;
             }
+        }
+        out
+    }
+
+    /// Keep formed matches open for `ttl` so later compatible tickets join them (backfill).
+    pub fn with_backfill(mut self, ttl: Option<Duration>) -> Self {
+        self.backfill_ttl = ttl.filter(|d| !d.is_zero());
+        self
+    }
+
+    /// Remember a just-formed match as open for backfill when its tickets allow more players.
+    pub fn register_open(&self, match_id: &str, m: &Matched) {
+        if self.backfill_ttl.is_none() || m.tickets.is_empty() {
+            return;
+        }
+        let size: usize = m.tickets.iter().map(|t| t.members.len()).sum();
+        let max = m.tickets.iter().map(|t| t.max_count).min().unwrap_or(0);
+        if size >= max {
+            return;
+        }
+        self.pool.lock().open.push(OpenMatch {
+            match_id: match_id.to_string(),
+            token: m.token.clone(),
+            tickets: m.tickets.clone(),
+            size,
+            max,
+            created: Instant::now(),
+        });
+    }
+
+    pub fn open_count(&self) -> usize {
+        self.pool.lock().open.len()
+    }
+
+    /// Send waiting tickets into open matches they are compatible with (every member already there
+    /// must accept them and vice versa, the size must stay within everyone's limits and multiple).
+    /// Returns each backfilled group with the id of the match it joins (same token as the original).
+    pub fn process_backfill(&self) -> Vec<(Matched, String)> {
+        let Some(ttl) = self.backfill_ttl else {
+            return vec![];
+        };
+        let now = Instant::now();
+        let mut pool = self.pool.lock();
+        pool.open
+            .retain(|o| o.size < o.max && now.duration_since(o.created) < ttl);
+        if pool.open.is_empty() {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < pool.tickets.len() {
+            let t = pool.tickets[i].clone();
+            let n = t.members.len();
+            let slot = pool.open.iter().position(|o| {
+                o.size + n <= o.max
+                    && (o.size + n) % t.count_multiple == 0
+                    && o.size + n >= t.min_count
+                    && o.size + n <= t.max_count
+                    && o.tickets.iter().all(|e| {
+                        compatible(e, &t)
+                            && o.size + n <= e.max_count
+                            && (o.size + n) % e.count_multiple == 0
+                    })
+            });
+            let Some(k) = slot else {
+                i += 1;
+                continue;
+            };
+            let t = pool.tickets.remove(i);
+            unindex(&mut pool, &t);
+            let o = &mut pool.open[k];
+            o.size += n;
+            o.tickets.push(t.clone());
+            out.push((
+                Matched {
+                    token: o.token.clone(),
+                    tickets: vec![t],
+                },
+                o.match_id.clone(),
+            ));
         }
         out
     }
@@ -525,6 +621,41 @@ mod tests {
             max_count: max,
             count_multiple: 1,
         }
+    }
+
+    #[test]
+    fn backfills_open_match_until_full() {
+        let mm =
+            Matchmaker::new(Duration::from_millis(0)).with_backfill(Some(Duration::from_secs(60)));
+        mm.add(ticket(vec![cand("eu", 10.0)], "+region:eu", 2, 3))
+            .unwrap();
+        mm.add(ticket(vec![cand("eu", 11.0)], "+region:eu", 2, 3))
+            .unwrap();
+        let m = mm.process();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].users().len(), 2);
+        mm.register_open("match-1", &m[0]);
+        assert_eq!(mm.open_count(), 1);
+        // an incompatible ticket is left waiting, a compatible one joins the open match
+        mm.add(ticket(vec![cand("us", 10.0)], "+region:us", 2, 3))
+            .unwrap();
+        mm.add(ticket(vec![cand("eu", 12.0)], "+region:eu", 2, 3))
+            .unwrap();
+        let b = mm.process_backfill();
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!(b[0].1, "match-1");
+        assert_eq!(b[0].0.token, m[0].token);
+        assert_eq!(b[0].0.users().len(), 1);
+        assert_eq!(mm.ticket_count(), 1, "the us ticket stays");
+        // the match is full now: another eu ticket waits for a new group
+        mm.add(ticket(vec![cand("eu", 13.0)], "+region:eu", 2, 3))
+            .unwrap();
+        assert!(mm.process_backfill().is_empty());
+        assert_eq!(mm.open_count(), 0, "full matches are dropped");
+
+        let off = Matchmaker::new(Duration::from_millis(0));
+        off.register_open("x", &m[0]);
+        assert_eq!(off.open_count(), 0);
     }
 
     #[test]

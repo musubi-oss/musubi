@@ -101,9 +101,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let tournaments = TournamentService::new(db.clone());
     let hub = Arc::new(Hub::new());
     let matchmaker = Arc::new(
-        Matchmaker::new(std::time::Duration::from_secs(cfg.matchmaker.min_wait_secs)).with_ttl(
-            std::time::Duration::from_secs(cfg.matchmaker.ticket_ttl_secs),
-        ),
+        Matchmaker::new(std::time::Duration::from_secs(cfg.matchmaker.min_wait_secs))
+            .with_backfill(Some(std::time::Duration::from_secs(
+                cfg.matchmaker.backfill_secs,
+            )))
+            .with_ttl(std::time::Duration::from_secs(
+                cfg.matchmaker.ticket_ttl_secs,
+            )),
     );
     let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
         fuel: cfg.runtime.fuel,
