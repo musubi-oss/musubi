@@ -4662,3 +4662,84 @@ async fn match_failover_replays_the_journal() {
     );
     assert!(after >= 10, "{after}");
 }
+
+fn assert_required(doc: &Value, schema: &str, v: &Value) {
+    let req = doc["components"]["schemas"][schema]["required"]
+        .as_array()
+        .unwrap();
+    for k in req {
+        assert!(
+            v.get(k.as_str().unwrap()).is_some(),
+            "{schema}.{k} missing in {v}"
+        );
+    }
+}
+
+/// Typed OpenAPI schemas describe what the server actually returns.
+#[tokio::test]
+async fn openapi_schemas_match_real_responses() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (st, doc) = call(&app, "GET", "/openapi.json", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(doc["openapi"], "3.1.0");
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("oa-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    assert_required(&doc, "Session", &sess);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let (st, acc) = call(&app, "GET", "/v1/account", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{acc}");
+    assert_required(&doc, "Account", &acc);
+    let lb = unique("oa-lb-");
+    let (st, board) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        "defaultkey",
+        Some(json!({"id": lb, "sort_order": "desc", "operator": "best"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{board}");
+    assert_required(&doc, "Leaderboard", &board);
+    let (st, rec) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&tok),
+        Some(json!({"score": 7})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rec}");
+    assert_required(&doc, "Record", &rec);
+    let (st, list) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    assert_required(&doc, "RecordList", &list);
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(&tok),
+        Some(json!({"name": unique("oa-g-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_required(&doc, "Group", &g);
+    let (st, friends) = call(&app, "GET", "/v1/friends", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{friends}");
+    assert_required(&doc, "FriendList", &friends);
+}
