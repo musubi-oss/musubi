@@ -94,7 +94,15 @@ async fn create(
     Bearer(me): Bearer,
     Json(c): Json<CreateGroup>,
 ) -> Result<Json<Group>, ApiError> {
-    Ok(Json(groups(&s).create(me.account_id, c).await?))
+    let g = groups(&s).create(me.account_id, c).await?;
+    s.events
+        .emit(
+            "group.created",
+            Some(me.account_id),
+            json!({ "group_id": g.id, "name": g.name }),
+        )
+        .await;
+    Ok(Json(g))
 }
 
 async fn get_one(
@@ -134,6 +142,13 @@ async fn join(
     Path(id): Path<GroupId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let state = groups(&s).join(me.account_id, id).await?;
+    s.events
+        .emit(
+            "group.joined",
+            Some(me.account_id),
+            json!({ "group_id": id, "state": state }),
+        )
+        .await;
     Ok(Json(json!({ "state": state })))
 }
 
@@ -143,6 +158,9 @@ async fn leave(
     Path(id): Path<GroupId>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     groups(&s).leave(me.account_id, id).await?;
+    s.events
+        .emit("group.left", Some(me.account_id), json!({ "group_id": id }))
+        .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -155,6 +173,13 @@ macro_rules! moderation {
             Json(u): Json<Users>,
         ) -> Result<Json<serde_json::Value>, ApiError> {
             groups(&s).$name(me.account_id, id, &u.ids).await?;
+            s.events
+                .emit(
+                    concat!("group.", stringify!($name)),
+                    Some(me.account_id),
+                    json!({ "group_id": id, "ids": u.ids }),
+                )
+                .await;
             Ok(Json(json!({ "ok": true })))
         }
     };

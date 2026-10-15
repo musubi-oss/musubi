@@ -4427,3 +4427,118 @@ async fn modules_hot_load_over_admin_api() {
         "{list}"
     );
 }
+
+/// Social graph, groups and leaderboard writes leave events in the outbox.
+#[tokio::test]
+async fn social_and_leaderboard_events_reach_the_outbox() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let auth = |app: Router, tag: &'static str| async move {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(tag)})),
+        )
+        .await;
+        (
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        )
+    };
+    let (ta, _) = auth(app.clone(), "ev-a-").await;
+    let (_, b_id) = auth(app.clone(), "ev-b-").await;
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&ta),
+        Some(json!({"ids": [b_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "DELETE",
+        "/v1/friends",
+        Some(&ta),
+        Some(json!({"ids": [b_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(&ta),
+        Some(json!({"name": unique("ev-group-"), "description": "", "open": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/leave"),
+        Some(&ta),
+        Some(json!({})),
+    )
+    .await;
+    assert!(
+        st == StatusCode::OK || st == StatusCode::BAD_REQUEST || st == StatusCode::CONFLICT,
+        "{v}"
+    );
+    let lb = unique("ev-lb-");
+    let (st, b) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        "defaultkey",
+        Some(json!({"id": lb, "sort_order": "desc", "operator": "best"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{lb}/records"),
+        Some(&ta),
+        Some(json!({"score": 42})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=friend.added,friend.removed,group.created,leaderboard.record&limit=200",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    let kinds: Vec<&str> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+    for k in [
+        "friend.added",
+        "friend.removed",
+        "group.created",
+        "leaderboard.record",
+    ] {
+        assert!(kinds.contains(&k), "missing {k}: {kinds:?}");
+    }
+    let lb_ev = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "leaderboard.record" && e["payload"]["leaderboard_id"] == lb)
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(lb_ev["payload"]["record"]["score"], 42, "{lb_ev}");
+}

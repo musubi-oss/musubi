@@ -43,6 +43,13 @@ async fn add(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ids = resolve(&s, b).await?;
     let outcomes = s.social.add(me.account_id, &ids).await?;
+    s.events
+        .emit(
+            "friend.added",
+            Some(me.account_id),
+            json!({ "ids": ids, "outcomes": outcomes }),
+        )
+        .await;
     if !outcomes.is_empty() {
         let username = s
             .accounts
@@ -82,6 +89,9 @@ async fn remove(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ids = resolve(&s, b).await?;
     s.social.delete(me.account_id, &ids).await?;
+    s.events
+        .emit("friend.removed", Some(me.account_id), json!({ "ids": ids }))
+        .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -92,6 +102,9 @@ async fn block(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ids = resolve(&s, b).await?;
     s.social.block(me.account_id, &ids).await?;
+    s.events
+        .emit("friend.blocked", Some(me.account_id), json!({ "ids": ids }))
+        .await;
     Ok(Json(json!({ "ok": true })))
 }
 

@@ -23,6 +23,8 @@ pub struct MatchRegistry {
     node_id: Uuid,
     /// `node.cluster_group`: failover only adopts snapshots of our own cluster.
     group: String,
+    /// Outbox for `match.ended`.
+    events: std::sync::OnceLock<Arc<crate::events::Events>>,
     /// Periodic snapshot interval in ticks (membership changes and end always snapshot).
     pub snapshot_every: u64,
 }
@@ -42,6 +44,7 @@ impl MatchRegistry {
             db,
             node_id,
             group: "default".into(),
+            events: std::sync::OnceLock::new(),
             snapshot_every: 50,
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
@@ -51,6 +54,10 @@ impl MatchRegistry {
     pub fn with_group(mut self, group: &str) -> Self {
         self.group = group.to_string();
         self
+    }
+
+    pub fn set_events(&self, events: Arc<crate::events::Events>) {
+        let _ = self.events.set(events);
     }
 
     fn deliver(hub: Arc<Hub>) -> musubi_actor::Deliver {
@@ -65,9 +72,19 @@ impl MatchRegistry {
         let db = self.db.clone()?;
         let node = self.node_id;
         let group = self.group.clone();
+        let events = self.events.get().cloned();
         Some(Arc::new(move |id: MatchId, snap: Option<Snapshot>| {
             let db = db.clone();
             let group = group.clone();
+            let events = events.clone();
+            if snap.is_none() {
+                if let Some(ev) = events {
+                    tokio::spawn(async move {
+                        ev.emit("match.ended", None, serde_json::json!({ "match_id": id }))
+                            .await;
+                    });
+                }
+            }
             tokio::spawn(async move {
                 let res = match snap {
                     Some(s) => sqlx::query(

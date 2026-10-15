@@ -360,6 +360,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "stored runtime modules failed to load"),
     }
     crate::modules::start_sync(state.clone());
+    state.matches.set_events(state.events.clone());
     match state.banned.load(&state.db).await {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),

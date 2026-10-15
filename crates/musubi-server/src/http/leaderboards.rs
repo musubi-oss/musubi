@@ -118,11 +118,18 @@ async fn write(
         .await?
         .pop()
         .map(|u| u.username);
-    Ok(Json(
-        s.leaderboards
-            .write(&id, me.account_id, username.as_deref(), w, false)
-            .await?,
-    ))
+    let r = s
+        .leaderboards
+        .write(&id, me.account_id, username.as_deref(), w, false)
+        .await?;
+    s.events
+        .emit(
+            "leaderboard.record",
+            Some(me.account_id),
+            json!({ "leaderboard_id": id, "record": r }),
+        )
+        .await;
+    Ok(Json(r))
 }
 
 async fn delete_own(
@@ -165,11 +172,18 @@ async fn write_as(
         .await?
         .pop()
         .map(|u| u.username);
-    Ok(Json(
-        s.leaderboards
-            .write(&id, owner, username.as_deref(), w, true)
-            .await?,
-    ))
+    let r = s
+        .leaderboards
+        .write(&id, owner, username.as_deref(), w, true)
+        .await?;
+    s.events
+        .emit(
+            "leaderboard.record",
+            Some(owner),
+            json!({ "leaderboard_id": id, "record": r, "server": true }),
+        )
+        .await;
+    Ok(Json(r))
 }
 
 async fn delete_as(
