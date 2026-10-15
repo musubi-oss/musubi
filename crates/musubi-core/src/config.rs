@@ -258,11 +258,13 @@ impl Config {
         if self.database.url.is_empty() {
             push(Severity::Error, "database.url", "empty".into());
         }
-        if self.database.max_connections == 0 {
+        if self.database.max_connections < 3 {
             push(
                 Severity::Error,
                 "database.max_connections",
-                "must be > 0".into(),
+                "must be >= 3 (cluster listener holds one connection; a request may hold a \
+                 transaction while a nested call takes another)"
+                    .into(),
             );
         }
         if !self.node.bus_listen.is_empty() && self.node.bus_listen.parse::<SocketAddr>().is_err() {

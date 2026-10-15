@@ -126,7 +126,7 @@ async fn list(
     State(s): State<AppState>,
     Bearer(me): Bearer,
     Query(q): Query<ListQuery>,
-) -> Result<Json<FriendList>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let state = match q.state {
         None => None,
         Some(0) => Some(FriendState::Friend),
@@ -137,9 +137,19 @@ async fn list(
             return Err(musubi_core::Error::InvalidArgument("state must be 0..=3".into()).into())
         }
     };
-    Ok(Json(
-        s.social
-            .list(me.account_id, state, q.limit, q.cursor.as_deref())
-            .await?,
-    ))
+    let list: FriendList = s
+        .social
+        .list(me.account_id, state, q.limit, q.cursor.as_deref())
+        .await?;
+    let mut v = serde_json::to_value(list).map_err(musubi_core::Error::internal)?;
+    if let Some(friends) = v["friends"].as_array_mut() {
+        for f in friends {
+            let online = f["user"]["id"]
+                .as_str()
+                .and_then(|id| id.parse::<uuid::Uuid>().ok())
+                .is_some_and(|id| s.fanout.is_online_anywhere(musubi_core::AccountId(id)));
+            f["online"] = serde_json::Value::Bool(online);
+        }
+    }
+    Ok(Json(v))
 }

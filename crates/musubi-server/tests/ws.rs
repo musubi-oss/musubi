@@ -4170,3 +4170,37 @@ async fn chat_moderation_mutes_and_bans() {
         ServerMessage::Error { .. }
     ));
 }
+
+/// A node that leaves the cluster takes its sessions out of the cluster-wide online set.
+#[tokio::test]
+async fn presence_purged_when_node_leaves() {
+    let group = test_group();
+    let Some(state1) = build_state(true, &group).await else {
+        return;
+    };
+    let Some(state2) = build_state(false, &group).await else {
+        return;
+    };
+    let router1 = musubi_server::http::router(state1.clone());
+    let addr2 = router_addr(&state2).await;
+    let (tb, acc_b) = token(&router1).await;
+    let acc = musubi_core::AccountId(acc_b.parse().unwrap());
+    let _b = connect(&addr2, &tb, "json").await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !state1.fanout.is_online_anywhere(acc) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 never saw the session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    state2.cluster.as_ref().unwrap().leave().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state1.fanout.is_online_anywhere(acc) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 kept the left node's sessions"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

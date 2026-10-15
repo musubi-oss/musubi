@@ -107,6 +107,35 @@ impl Fanout {
                     leaves,
                 });
             }));
+            let mut members = c.member_events();
+            let mut leaves = c.subscribe();
+            let me = f.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        m = members.recv() => match m {
+                            Ok(m) if m.state == "dead" => me.purge_node(m.id),
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(_) => break,
+                        },
+                        b = leaves.recv() => match b {
+                            Ok(b) if b.topic == musubi_cluster::LEAVE_TOPIC => {
+                                let id = b
+                                    .payload
+                                    .as_str()
+                                    .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                                    .or_else(|| serde_json::from_value(b.payload.clone()).ok());
+                                match id {
+                                    Some(id) => me.purge_node(id),
+                                    None => me.purge_node(b.origin.0),
+                                }
+                            }
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(_) => break,
+                        },
+                    }
+                }
+            });
             let mut rx = c.subscribe();
             let me = f.clone();
             tokio::spawn(async move {
@@ -133,6 +162,19 @@ impl Fanout {
         for p in self.hub.presences_of(account) {
             self.hub.leave_channel(channel_id, p.session_id);
         }
+    }
+
+    /// Number of sessions of the account on this node.
+    pub fn hub_presences(&self, account_id: AccountId) -> usize {
+        self.hub.presences_of(account_id).len()
+    }
+
+    /// Forget every session a node reported: it died or left, so its accounts are offline there.
+    pub fn purge_node(&self, node: uuid::Uuid) {
+        self.online_remote.retain(|_, per_node| {
+            per_node.remove(&node);
+            !per_node.is_empty()
+        });
     }
 
     /// Online on this node or, as far as the bus has told us, on any other node.
