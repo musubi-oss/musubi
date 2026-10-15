@@ -40,6 +40,7 @@ pub struct Receipt {
     pub purchased_at_ms: i64,
     pub created_at: OffsetDateTime,
     pub replayed: bool,
+    pub revoked: bool,
 }
 
 type ReceiptRow = (
@@ -52,6 +53,7 @@ type ReceiptRow = (
     String,
     i64,
     OffsetDateTime,
+    Option<OffsetDateTime>,
 );
 
 fn receipt(r: ReceiptRow, replayed: bool) -> Receipt {
@@ -67,10 +69,11 @@ fn receipt(r: ReceiptRow, replayed: bool) -> Receipt {
         purchased_at_ms: r.7,
         created_at: r.8,
         replayed,
+        revoked: r.9.is_some(),
     }
 }
 
-const COLS: &str = "id, account_id, provider, transaction_id, product_id, store_item_id, environment, purchased_at_ms, created_at";
+const COLS: &str = "id, account_id, provider, transaction_id, product_id, store_item_id, environment, purchased_at_ms, created_at, revoked_at";
 
 impl EconomyService {
     pub async fn upsert_iap_product(&self, p: IapProduct) -> Result<IapProduct> {
@@ -214,6 +217,83 @@ impl EconomyService {
             purchased_at_ms: input.purchased_at_ms,
             created_at,
             replayed: false,
+            revoked: false,
         })
+    }
+
+    /// Store-side refund/revocation: mark the receipt and take back the granted items (clamped at
+    /// what the player still holds). `reference` is the provider transaction id or purchase token.
+    pub async fn revoke_receipt(
+        &self,
+        provider: &str,
+        reference: &str,
+        reason: &str,
+    ) -> Result<Option<Receipt>> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let row: Option<ReceiptRow> = sqlx::query_as(&format!(
+            "select {COLS} from musubi.iap_receipts
+             where provider = $1 and (transaction_id = $2 or raw->>'purchaseToken' = $2) for update"
+        ))
+        .bind(provider)
+        .bind(reference)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let Some(r) = row else { return Ok(None) };
+        let (units,): (i64,) = sqlx::query_as(
+            "select coalesce((raw->>'quantity')::bigint, 1) from musubi.iap_receipts where id = $1",
+        )
+        .bind(r.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if r.9.is_some() {
+            return Ok(Some(receipt(r, true)));
+        }
+        let account = r.1;
+        let store: Option<(String, i64)> =
+            sqlx::query_as("select item_id, quantity from musubi.store_items where id = $1")
+                .bind(&r.5)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+        if let Some((item_id, per_unit)) = store {
+            let mut left = per_unit.max(1) * units.max(1);
+            let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+                "select id, quantity from musubi.inventory where account_id = $1 and item_id = $2 order by quantity desc for update",
+            )
+            .bind(account)
+            .bind(&item_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            for (id, have) in rows {
+                if left <= 0 {
+                    break;
+                }
+                let take = have.min(left);
+                left -= take;
+                if take >= have {
+                    sqlx::query("delete from musubi.inventory where id = $1").bind(id)
+                } else {
+                    sqlx::query("update musubi.inventory set quantity = quantity - $2, updated_at = now() where id = $1")
+                        .bind(id)
+                        .bind(take)
+                }
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+            }
+        }
+        let row: ReceiptRow = sqlx::query_as(&format!(
+            "update musubi.iap_receipts set revoked_at = now(), raw = raw || jsonb_build_object('revocation_reason', $2::text) where id = $1 returning {COLS}"
+        ))
+        .bind(r.0)
+        .bind(reason)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(Some(receipt(row, false)))
     }
 }

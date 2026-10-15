@@ -2747,12 +2747,12 @@ impl TestChain {
     }
 }
 
-async fn mock_stores(bundle_id: &str, item_product: &str) -> (String, Vec<u8>) {
+async fn mock_stores(bundle_id: &str, item_product: &str) -> (String, Arc<TestChain>) {
     use axum::extract::Path;
     use axum::routing::{get, post};
     use axum::Json;
     let ch = Arc::new(TestChain::generate());
-    let root_der = ch.root.clone();
+    let chain = ch.clone();
     let b = bundle_id.to_string();
     let prod = item_product.to_string();
     let app = axum::Router::new()
@@ -2798,7 +2798,7 @@ async fn mock_stores(bundle_id: &str, item_product: &str) -> (String, Vec<u8>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (base, root_der)
+    (base, chain)
 }
 
 async fn http_json(
@@ -2840,7 +2840,7 @@ async fn iap_apple_and_google_receipts_redeem_once() {
         format!("gems-{suffix}"),
         format!("com.musubi.gems100.{suffix}"),
     );
-    let (upstream, apple_root) = mock_stores("com.musubi.test", &product).await;
+    let (upstream, apple_chain) = mock_stores("com.musubi.test", &product).await;
     let apple_pem = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/apple_test_ec.pem"
@@ -2858,17 +2858,18 @@ async fn iap_apple_and_google_receipts_redeem_once() {
             "KEYID",
             "com.musubi.test",
             &apple_pem,
-            &apple_root,
+            &apple_chain.root,
         )
         .unwrap(),
     );
     state.google_iap = Some(
-        musubi_integrations::GooglePlayClient::new(
+        musubi_integrations::GooglePlayClient::new_with_notifications(
             &upstream,
             &format!("{upstream}/token"),
             "com.musubi.test",
             "sa@test.iam",
             &google_pem,
+            "notify-secret",
         )
         .unwrap(),
     );
@@ -3078,4 +3079,77 @@ async fn iap_apple_and_google_receipts_redeem_once() {
     )
     .await;
     assert_eq!(st, 404);
+    // store-side refund: Apple notification revokes the receipt and takes the item back
+    let tx_payload =
+        json!({"transactionId": format!("tx-{suffix}"), "bundleId": "com.musubi.test"});
+    let note = json!({"notificationType": "REFUND", "data": {"signedTransactionInfo": apple_chain.sign(&tx_payload, "ok")}});
+    let signed = apple_chain.sign(&note, "ok");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple/notifications",
+        None,
+        false,
+        Some(json!({"signedPayload": signed})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["revoked"]["transaction_id"], format!("tx-{suffix}"));
+    assert_eq!(r["revoked"]["revoked"], true);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple/notifications",
+        None,
+        false,
+        Some(json!({"signedPayload": signed})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(r["revoked"]["revoked"], true, "idempotent");
+    let forged = apple_chain.sign(&note, "badchain");
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple/notifications",
+        None,
+        false,
+        Some(json!({"signedPayload": forged})),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (_, list) = http_json(&router, "GET", "/v1/iap/receipts", Some(&ta), false, None).await;
+    assert!(list["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["transaction_id"] == format!("tx-{suffix}") && x["revoked"] == true));
+    // Google RTDN (Pub/Sub push) voided purchase
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(
+        json!({"voidedPurchaseNotification": {"purchaseToken": format!("ok-{suffix}")}})
+            .to_string(),
+    );
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/google/notifications?token=wrong",
+        None,
+        false,
+        Some(json!({"message": {"data": data}})),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/google/notifications?token=notify-secret",
+        None,
+        false,
+        Some(json!({"message": {"data": data}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["revoked"]["revoked"], true);
+    assert_eq!(r["revoked"]["provider"], "google");
 }

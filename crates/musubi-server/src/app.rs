@@ -205,12 +205,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         )
     });
     let google_iap = iap_client("google", &cfg.iap.google.private_key_pem_path, |pem| {
-        musubi_integrations::GooglePlayClient::new(
+        musubi_integrations::GooglePlayClient::new_with_notifications(
             &cfg.iap.google.url,
             &cfg.iap.google.token_url,
             &cfg.iap.google.package_name,
             &cfg.iap.google.client_email,
             pem,
+            &cfg.iap.google.notifications_token,
         )
     });
     worlds.clone().spawn_ticker(fanout.clone());

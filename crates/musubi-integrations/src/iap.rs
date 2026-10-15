@@ -72,6 +72,11 @@ impl AppleStoreClient {
         )
     }
 
+    /// Verify any App Store signed payload (transactions, server notifications) with our anchor.
+    pub fn verify_payload(&self, jws: &str) -> Result<Value> {
+        verify_apple_jws(jws, &self.root, OffsetDateTime::now_utc())
+    }
+
     /// Like [`Self::new`] with an explicit trust anchor (DER) for the `x5c` chain; tests use it.
     pub fn new_with_root(
         url: &str,
@@ -166,6 +171,7 @@ pub struct GooglePlayClient {
     client_email: String,
     key: EncodingKey,
     token: Mutex<Option<(String, Instant)>>,
+    notifications_token: String,
 }
 
 impl GooglePlayClient {
@@ -176,9 +182,29 @@ impl GooglePlayClient {
         client_email: &str,
         private_key_pem: &str,
     ) -> Result<Arc<Self>> {
+        Self::new_with_notifications(
+            url,
+            token_url,
+            package_name,
+            client_email,
+            private_key_pem,
+            "",
+        )
+    }
+
+    /// `notifications_token` guards the Pub/Sub push endpoint for real-time developer notifications.
+    pub fn new_with_notifications(
+        url: &str,
+        token_url: &str,
+        package_name: &str,
+        client_email: &str,
+        private_key_pem: &str,
+        notifications_token: &str,
+    ) -> Result<Arc<Self>> {
         let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
             .map_err(|e| Error::InvalidArgument(format!("google private key: {e}")))?;
         Ok(Arc::new(Self {
+            notifications_token: notifications_token.into(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -190,6 +216,10 @@ impl GooglePlayClient {
             key,
             token: Mutex::new(None),
         }))
+    }
+
+    pub fn notifications_token(&self) -> &str {
+        &self.notifications_token
     }
 
     async fn access_token(&self) -> Result<String> {
@@ -283,7 +313,11 @@ impl GooglePlayClient {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             quantity: v["quantity"].as_i64().unwrap_or(1).max(1),
-            raw: v,
+            raw: {
+                let mut v = v;
+                v["purchaseToken"] = json!(purchase_token);
+                v
+            },
         })
     }
 }

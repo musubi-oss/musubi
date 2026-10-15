@@ -282,6 +282,8 @@ pub struct GoogleIapConfig {
     pub client_email: String,
     /// PKCS#8 PEM of the service-account private key (RS256).
     pub private_key_pem_path: String,
+    /// Shared secret expected as `?token=` on the Pub/Sub push endpoint for RTDN.
+    pub notifications_token: String,
 }
 
 impl Default for GoogleIapConfig {
@@ -292,6 +294,7 @@ impl Default for GoogleIapConfig {
             package_name: String::new(),
             client_email: String::new(),
             private_key_pem_path: String::new(),
+            notifications_token: String::new(),
         }
     }
 }

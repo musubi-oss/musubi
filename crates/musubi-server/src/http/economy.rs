@@ -51,6 +51,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/iap/apple", post(iap_apple))
         .route("/v1/iap/google", post(iap_google))
         .route("/v1/iap/receipts", get(iap_receipts))
+        .route("/v1/iap/apple/notifications", post(iap_apple_notifications))
+        .route(
+            "/v1/iap/google/notifications",
+            post(iap_google_notifications),
+        )
         .route(
             "/v1/server/iap/products",
             get(iap_products).post(upsert_iap_product),
@@ -931,4 +936,92 @@ async fn season_premium(
         .grant_premium(account(&r.account_id)?, &id)
         .await?;
     Ok(Json(json!({})))
+}
+
+// ----- store notifications (refunds / revocations) -----
+
+#[derive(Deserialize)]
+struct AppleNotification {
+    #[serde(rename = "signedPayload")]
+    signed_payload: String,
+}
+
+/// App Store Server Notifications v2: REFUND / REVOKE take the granted items back.
+async fn iap_apple_notifications(
+    State(s): State<AppState>,
+    Json(n): Json<AppleNotification>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(c) = &s.apple_iap else {
+        return Err(Error::NotFound("apple iap is not configured".into()).into());
+    };
+    let p = c.verify_payload(&n.signed_payload)?;
+    let kind = p["notificationType"].as_str().unwrap_or("").to_string();
+    let mut revoked = None;
+    if matches!(kind.as_str(), "REFUND" | "REVOKE") {
+        if let Some(jws) = p["data"]["signedTransactionInfo"].as_str() {
+            let t = c.verify_payload(jws)?;
+            if let Some(id) = t["transactionId"].as_str() {
+                revoked = s
+                    .economy
+                    .revoke_receipt("apple", id, &format!("apple.{}", kind.to_lowercase()))
+                    .await?;
+            }
+        }
+    }
+    Ok(Json(
+        json!({ "notification_type": kind, "revoked": revoked }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct TokenQ {
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PubSubPush {
+    message: PubSubMessage,
+}
+
+#[derive(Deserialize)]
+struct PubSubMessage {
+    data: String,
+}
+
+/// Google Play real-time developer notifications (Pub/Sub push): voided purchases and canceled
+/// one-time products take the granted items back.
+async fn iap_google_notifications(
+    State(s): State<AppState>,
+    Query(q): Query<TokenQ>,
+    Json(m): Json<PubSubPush>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(c) = &s.google_iap else {
+        return Err(Error::NotFound("google iap is not configured".into()).into());
+    };
+    let expected = c.notifications_token();
+    if expected.is_empty() || q.token.as_deref() != Some(expected) {
+        return Err(Error::PermissionDenied("bad notifications token".into()).into());
+    }
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(m.message.data.trim())
+        .map_err(|_| Error::InvalidArgument("message.data must be base64".into()))?;
+    let v: Value = serde_json::from_slice(&raw)
+        .map_err(|_| Error::InvalidArgument("message.data must be JSON".into()))?;
+    let (token, reason) = if let Some(t) = v["voidedPurchaseNotification"]["purchaseToken"].as_str()
+    {
+        (Some(t), "google.voided")
+    } else if v["oneTimeProductNotification"]["notificationType"].as_i64() == Some(2) {
+        (
+            v["oneTimeProductNotification"]["purchaseToken"].as_str(),
+            "google.canceled",
+        )
+    } else {
+        (None, "")
+    };
+    let mut revoked = None;
+    if let Some(t) = token {
+        revoked = s.economy.revoke_receipt("google", t, reason).await?;
+    }
+    Ok(Json(json!({ "revoked": revoked })))
 }
