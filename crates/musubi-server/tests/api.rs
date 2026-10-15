@@ -4814,3 +4814,51 @@ async fn server_keys_are_scoped_and_revocable() {
     let (st, _) = call_server(&app, "GET", "/v1/server/events", "nope", None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Retention removes rows older than the configured windows (and orphan journals) but keeps
+/// recent ones and tables whose window is 0.
+#[tokio::test]
+async fn retention_purges_old_rows_only() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let Ok(url) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let tag = unique("ret-");
+    for (kind, age) in [("old", "40 days"), ("new", "1 day")] {
+        sqlx::query(&format!(
+            "insert into musubi.events (id, kind, account_id, payload, created_at) values ($1, $2, null, '{{}}', now() - interval '{age}')"
+        ))
+        .bind(uuid::Uuid::now_v7())
+        .bind(format!("{tag}.{kind}"))
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    sqlx::query("insert into musubi.match_journal (match_id, tick_from, tick_to, entries) values ($1, 1, 5, '[]')")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into musubi.audit_log (id, actor, method, route, path, status, ip, body, duration_ms, at) values ($1, 't', 'POST', '/x', '/x', 200, '1.1.1.1', '{}', 1, now() - interval '100 days')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .execute(&db)
+    .await
+    .unwrap();
+    let (st, v) = call_server(&app, "POST", "/v1/admin/retention/run", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["removed"]["events"].as_u64().unwrap() >= 1, "{v}");
+    assert!(v["removed"]["match_journal"].as_u64().unwrap() >= 1, "{v}");
+    assert!(v["removed"]["audit_log"].as_u64().unwrap() >= 1, "{v}");
+    let kinds: Vec<String> =
+        sqlx::query_scalar("select kind from musubi.events where kind like $1")
+            .bind(format!("{tag}.%"))
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(kinds, vec![format!("{tag}.new")]);
+}

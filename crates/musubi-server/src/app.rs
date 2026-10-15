@@ -403,6 +403,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         });
     }
+    if let Some(c) = state.cluster.clone() {
+        let st = state.clone();
+        let lease = c.lease("retention", musubi_cluster::DEAD_AFTER);
+        tokio::spawn(async move {
+            let every = std::time::Duration::from_secs(st.cfg.retention.interval_secs.max(5));
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
+                match crate::retention::run(&st.db, &st.cfg.retention).await {
+                    Ok(v) => tracing::info!(removed = %v, "retention pass"),
+                    Err(e) => tracing::warn!(error = %e, "retention pass failed"),
+                }
+            }
+        });
+    }
     {
         let st = state.clone();
         tokio::spawn(async move {

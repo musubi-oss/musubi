@@ -44,6 +44,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub metrics: MetricsConfig,
     pub realtime: RealtimeConfig,
+    pub retention: RetentionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +451,35 @@ impl Default for RealtimeConfig {
     fn default() -> Self {
         Self {
             resume_ttl_secs: 30,
+        }
+    }
+}
+
+/// Retention windows in days for time-series tables (0 = keep forever); see `retention.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    pub interval_secs: u64,
+    pub events_days: u64,
+    /// Delivered or dead webhook deliveries.
+    pub deliveries_days: u64,
+    pub audit_days: u64,
+    pub notifications_days: u64,
+    pub chat_days: u64,
+    /// Expired or revoked refresh sessions.
+    pub sessions_days: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 600,
+            events_days: 30,
+            deliveries_days: 7,
+            audit_days: 90,
+            notifications_days: 30,
+            chat_days: 0,
+            sessions_days: 7,
         }
     }
 }

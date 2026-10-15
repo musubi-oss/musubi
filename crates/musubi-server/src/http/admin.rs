@@ -30,6 +30,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/cluster/matches", get(cluster_matches))
         .route("/v1/admin/cluster/worlds", get(cluster_worlds))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
+        .route("/v1/admin/retention/run", post(retention_run))
         .route("/v1/admin/keys", get(keys_list).post(keys_issue))
         .route("/v1/admin/keys/{id}", delete(keys_revoke))
         .route("/v1/admin/accounts", get(accounts))
@@ -494,4 +495,11 @@ async fn keys_revoke(
         let _ = c.publish(crate::keys::KEYS_TOPIC, &id).await;
     }
     Ok(Json(json!({ "revoked": id })))
+}
+
+/// Force a retention pass now (the leader also runs one every `retention.interval_secs`).
+async fn retention_run(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "removed": crate::retention::run(&s.db, &s.cfg.retention).await? }),
+    ))
 }
