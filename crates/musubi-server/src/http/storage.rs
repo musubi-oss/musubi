@@ -43,6 +43,9 @@ struct ListQuery {
     /// JSON object; only objects whose value contains it are listed (`value @> where`).
     #[serde(default, rename = "where")]
     filter: Option<String>,
+    /// Only keys starting with this prefix (literal match, `%`/`_` are escaped).
+    #[serde(default)]
+    prefix: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -109,8 +112,11 @@ async fn list(
             &collection,
             q.owner_id,
             q.limit,
-            q.cursor.as_deref(),
-            filter.as_ref(),
+            musubi_storage::ListFilter {
+                cursor: q.cursor.as_deref(),
+                filter: filter.as_ref(),
+                key_prefix: q.prefix.as_deref(),
+            },
         )
         .await?;
     Ok(Json(ListResp { objects, cursor }))

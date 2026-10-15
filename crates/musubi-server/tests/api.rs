@@ -6111,3 +6111,64 @@ async fn runtime_schedules_status_and_forced_run() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// `GET /v1/storage/{collection}?prefix=` lists only keys starting with the prefix; wildcards are
+/// literal.
+#[tokio::test]
+async fn storage_list_by_key_prefix() {
+    let Some(app) = app().await else { return };
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dev")})),
+    )
+    .await;
+    let tok = a["access_token"].as_str().unwrap().to_string();
+    let col = unique("pfx");
+    call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&tok),
+        Some(json!({"objects": [
+            {"collection": col, "key": "save:1", "value": {}},
+            {"collection": col, "key": "save:2", "value": {}},
+            {"collection": col, "key": "save_x", "value": {}},
+            {"collection": col, "key": "settings", "value": {}},
+        ]})),
+    )
+    .await;
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}?prefix=save%3A"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let keys: Vec<&str> = v["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["save:1", "save:2"], "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}?prefix=save_"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    let keys: Vec<&str> = v["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["save_x"], "underscore is literal: {v}");
+}

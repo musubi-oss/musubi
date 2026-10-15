@@ -105,6 +105,17 @@ type Row = (
 
 const COLS: &str = "collection, key, owner_id, value, version, read_permission, write_permission, created_at, updated_at, expires_at";
 
+/// Optional narrowing for `StorageService::list_where`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ListFilter<'a> {
+    /// Opaque cursor from a previous page.
+    pub cursor: Option<&'a str>,
+    /// JSONB containment filter (`value @> filter`).
+    pub filter: Option<&'a serde_json::Value>,
+    /// Only keys starting with this prefix (literal match).
+    pub key_prefix: Option<&'a str>,
+}
+
 impl StorageService {
     pub fn new(db: PgPool) -> Self {
         Self { db }
@@ -152,8 +163,17 @@ impl StorageService {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<(Vec<Object>, Option<String>)> {
-        self.list_where(caller, collection, owner_id, limit, cursor, None)
-            .await
+        self.list_where(
+            caller,
+            collection,
+            owner_id,
+            limit,
+            ListFilter {
+                cursor,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// `list` with an optional JSONB containment filter: only objects whose `value` contains
@@ -164,9 +184,13 @@ impl StorageService {
         collection: &str,
         owner_id: Option<Uuid>,
         limit: i64,
-        cursor: Option<&str>,
-        filter: Option<&serde_json::Value>,
+        f: ListFilter<'_>,
     ) -> Result<(Vec<Object>, Option<String>)> {
+        let ListFilter {
+            cursor,
+            filter,
+            key_prefix,
+        } = f;
         validate_name(collection, "collection")?;
         if let Some(f) = filter {
             if !f.is_object() {
@@ -175,6 +199,14 @@ impl StorageService {
         }
         let limit = limit.clamp(1, 100);
         let after_key = cursor.map(decode_cursor).transpose()?;
+        let prefix_like = key_prefix.filter(|p| !p.is_empty()).map(|p| {
+            format!(
+                "{}%",
+                p.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
         // Users list their own objects by default; another owner's collection shows public objects only.
         let (owner_id, min_read): (Option<Uuid>, i16) = match (caller, owner_id) {
             (Caller::Server, o) => (o, 0),
@@ -188,6 +220,7 @@ impl StorageService {
                and (expires_at is null or expires_at > now())
                and ($4::text is null or (owner_id, key) > ($5::uuid, $4))
                and ($7::jsonb is null or value @> $7)
+               and ($8::text is null or key like $8)
              order by owner_id, key limit $6"
         ))
         .bind(collection)
@@ -197,6 +230,7 @@ impl StorageService {
         .bind(after_key.as_ref().map(|c| c.0).unwrap_or(SYSTEM_OWNER))
         .bind(limit + 1)
         .bind(filter)
+        .bind(prefix_like)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
