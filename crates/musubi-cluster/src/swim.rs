@@ -106,11 +106,18 @@ impl Cluster {
                     }
                     continue;
                 }
+                let fresh = !m.contains_key(&u.id);
                 let e = m.entry(u.id).or_insert(Member {
                     state: u.state,
                     incarnation: u.incarnation,
                     since: Instant::now(),
                 });
+                if fresh {
+                    let _ = self.member_tx.send(crate::MemberEvent {
+                        id: u.id,
+                        state: u.state.as_str(),
+                    });
+                }
                 let apply = match (e.state, u.state) {
                     (State::Dead, _) => false,
                     (_, State::Dead) => true,
@@ -119,6 +126,12 @@ impl Cluster {
                 };
                 if apply && (e.state != u.state || e.incarnation != u.incarnation) {
                     tracing::info!(node = %u.id, state = ?u.state, incarnation = u.incarnation, "swim: gossip applied");
+                    if e.state != u.state {
+                        let _ = self.member_tx.send(crate::MemberEvent {
+                            id: u.id,
+                            state: u.state.as_str(),
+                        });
+                    }
                     e.state = u.state;
                     e.incarnation = u.incarnation;
                     e.since = Instant::now();
@@ -133,15 +146,26 @@ impl Cluster {
 
     pub(crate) async fn set_state(&self, id: Uuid, state: State) {
         let mut m = self.members.write().await;
+        let fresh = !m.contains_key(&id);
         let e = m.entry(id).or_insert(Member {
             state: State::Alive,
             incarnation: 0,
             since: Instant::now(),
         });
+        if fresh {
+            let _ = self.member_tx.send(crate::MemberEvent {
+                id,
+                state: State::Alive.as_str(),
+            });
+        }
         if e.state != state && e.state != State::Dead {
             tracing::info!(node = %id, from = ?e.state, to = ?state, "swim: state changed");
             e.state = state;
             e.since = Instant::now();
+            let _ = self.member_tx.send(crate::MemberEvent {
+                id,
+                state: state.as_str(),
+            });
         }
     }
 
@@ -207,6 +231,10 @@ impl Cluster {
             for (id, e) in m.iter_mut() {
                 if e.state == State::Suspect && e.since.elapsed() > SUSPECT_TIMEOUT {
                     tracing::warn!(node = %id, "swim: suspect timed out, declared dead");
+                    let _ = self.member_tx.send(crate::MemberEvent {
+                        id: *id,
+                        state: State::Dead.as_str(),
+                    });
                     e.state = State::Dead;
                     e.since = Instant::now();
                 }

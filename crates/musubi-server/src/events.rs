@@ -391,3 +391,40 @@ async fn dispatch_now(_k: ServerKey, State(s): State<AppState>) -> Result<Json<V
     let (ok, failed) = s.events.dispatch_once().await?;
     Ok(Json(json!({ "delivered": ok, "failed": failed })))
 }
+
+/// `node.joined` / `node.dead` from SWIM membership and `node.left` from voluntary departures go
+/// to the outbox so ops webhooks see cluster incidents (bus clusters only).
+pub fn start_cluster_events(state: crate::app::AppState) {
+    let Some(c) = state.cluster.clone() else {
+        return;
+    };
+    // node.joined / node.dead from SWIM, node.left from voluntary departures
+    let ev = state.events.clone();
+    let mut members = c.member_events();
+    let mut bus = c.subscribe();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                m = members.recv() => match m {
+                    Ok(m) => {
+                        let kind = match m.state {
+                            "alive" => "node.joined",
+                            "dead" => "node.dead",
+                            _ => continue,
+                        };
+                        ev.emit(kind, None, serde_json::json!({ "node_id": m.id })).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                },
+                b = bus.recv() => match b {
+                    Ok(b) if b.topic == musubi_cluster::LEAVE_TOPIC => {
+                        ev.emit("node.left", None, serde_json::json!({ "node_id": b.payload })).await;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                },
+            }
+        }
+    });
+}

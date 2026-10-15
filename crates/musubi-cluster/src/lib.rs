@@ -107,6 +107,14 @@ pub struct Cluster {
     pub(crate) data_dir: Option<std::path::PathBuf>,
     /// Set by `leave()`: stop heartbeating so the deleted row does not come back.
     left: Arc<AtomicBool>,
+    pub(crate) member_tx: broadcast::Sender<MemberEvent>,
+}
+
+/// SWIM membership change: `state` is `alive` (new member), `suspect` or `dead`.
+#[derive(Debug, Clone)]
+pub struct MemberEvent {
+    pub id: Uuid,
+    pub state: &'static str,
 }
 
 /// A message from another node. `topic` routes it; `payload` is topic-specific JSON.
@@ -155,6 +163,7 @@ impl Cluster {
             raft: Arc::new(std::sync::OnceLock::new()),
             data_dir: None,
             left: Arc::new(AtomicBool::new(false)),
+            member_tx: broadcast::channel(256).0,
         }
     }
 
@@ -213,7 +222,17 @@ impl Cluster {
             .write()
             .await
             .retain(|id, _| nodes.iter().any(|n| n.id.0 == *id));
-        *self.peers.write().await = nodes;
+        let mut peers = self.peers.write().await;
+        // a node seen for the first time (new row in `musubi.nodes`) is a join
+        for n in nodes.iter().filter(|n| n.alive && n.id != self.me.id) {
+            if !peers.iter().any(|p| p.id == n.id) {
+                let _ = self.member_tx.send(MemberEvent {
+                    id: n.id.0,
+                    state: swim::State::Alive.as_str(),
+                });
+            }
+        }
+        *peers = nodes;
         Ok(())
     }
 
@@ -575,6 +594,11 @@ impl Cluster {
             .await
             .map_err(Error::internal)?;
         Ok(())
+    }
+
+    /// Membership changes seen by SWIM (bus clusters only).
+    pub fn member_events(&self) -> broadcast::Receiver<MemberEvent> {
+        self.member_tx.subscribe()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusMessage> {

@@ -365,6 +365,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     crate::modules::start_sync(state.clone());
     state.matches.set_events(state.events.clone());
     crate::http::admin::start_drain_listener(state.clone());
+    state.worlds.set_events(state.events.clone());
+    crate::events::start_cluster_events(state.clone());
     match state.banned.load(&state.db).await {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),

@@ -151,10 +151,15 @@ async fn create(
     ServerKey: ServerKey,
     Json(r): Json<CreateReq>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        serde_json::to_value(s.worlds.create(&r.name, r.config, r.controller).await?)
-            .map_err(Error::internal)?,
-    ))
+    let info = s.worlds.create(&r.name, r.config, r.controller).await?;
+    s.events
+        .emit(
+            "world.created",
+            None,
+            json!({ "name": r.name, "node_id": s.worlds.node_id() }),
+        )
+        .await;
+    Ok(Json(serde_json::to_value(info).map_err(Error::internal)?))
 }
 
 async fn info(
@@ -182,6 +187,9 @@ async fn delete(
     ensure_home(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         s.worlds.delete(&w).await?;
+        s.events
+            .emit("world.deleted", None, serde_json::json!({ "name": w }))
+            .await;
         Ok(Json(json!({ "ok": true })))
     }
     .await;

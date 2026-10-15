@@ -65,6 +65,14 @@ impl MatchRegistry {
         let _ = self.events.set(events);
     }
 
+    fn emit(&self, kind: &'static str, payload: serde_json::Value) {
+        if let Some(ev) = self.events.get().cloned() {
+            tokio::spawn(async move {
+                ev.emit(kind, None, payload).await;
+            });
+        }
+    }
+
     fn deliver(hub: Arc<Hub>) -> musubi_actor::Deliver {
         Arc::new(move |to, msg: ServerMessage| {
             for s in to {
@@ -213,7 +221,10 @@ impl MatchRegistry {
                 replay,
             };
             match self.launch(hub.clone(), &module, params, Some(MatchId(id)), Some(snap)) {
-                Ok(h) => out.push(h.id.to_string()),
+                Ok(h) => {
+                    self.emit("match.resumed", serde_json::json!({ "match_id": h.id, "module": module, "node_id": self.node_id }));
+                    out.push(h.id.to_string())
+                }
                 Err(e) => tracing::warn!(match_id = %id, error = %e, "could not resume match"),
             }
         }
@@ -294,7 +305,12 @@ impl MatchRegistry {
         module: &str,
         params: serde_json::Value,
     ) -> Result<MatchHandle> {
-        self.launch(hub, module, params, None, None)
+        let h = self.launch(hub, module, params.clone(), None, None)?;
+        self.emit(
+            "match.started",
+            serde_json::json!({ "match_id": h.id, "module": module, "params": params }),
+        );
+        Ok(h)
     }
 
     pub fn is_member(&self, session: musubi_core::SessionId, match_id: &str) -> bool {

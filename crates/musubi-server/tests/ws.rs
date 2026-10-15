@@ -3624,3 +3624,53 @@ async fn admin_drain_reaches_local_and_remote_nodes() {
         .unwrap();
     assert_eq!(res.status(), 200);
 }
+
+/// SWIM membership changes become outbox events: a second node joining the group shows up as
+/// `node.joined` for the first one.
+#[tokio::test]
+async fn cluster_membership_changes_reach_the_outbox() {
+    let group = test_group();
+    let Some(n1) = build_state(false, &group).await else {
+        return;
+    };
+    musubi_server::events::start_cluster_events(n1.clone());
+    let Some(n2) = build_state(false, &group).await else {
+        return;
+    };
+    let n2_id = n2.cluster.as_ref().unwrap().node_id().0.to_string();
+    let router = musubi_server::http::router(n1.clone());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    loop {
+        let res = router
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/v1/server/events?kinds=node.joined&limit=200")
+                    .header("x-musubi-server-key", "defaultkey")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let v: serde_json::Value = serde_json::from_slice(
+            &http_body_util::BodyExt::collect(res.into_body())
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        let seen = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["payload"]["node_id"] == n2_id);
+        if seen {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no node.joined for n2: {v}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}

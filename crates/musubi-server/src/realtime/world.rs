@@ -48,6 +48,8 @@ pub struct WorldRegistry {
     homes: DashMap<String, Uuid>,
     /// Raft directory (`world:<name>` → home) when the cluster runs the QUIC bus.
     cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
+    /// Outbox for `world.rehomed`.
+    events: std::sync::OnceLock<Arc<crate::events::Events>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +118,12 @@ impl WorldRegistry {
             worlds: DashMap::new(),
             homes: DashMap::new(),
             cluster: std::sync::OnceLock::new(),
+            events: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn set_events(&self, events: Arc<crate::events::Events>) {
+        let _ = self.events.set(events);
     }
 
     pub fn with_group(mut self, group: &str) -> Self {
@@ -232,6 +239,14 @@ impl WorldRegistry {
             );
             self.homes.insert(name.clone(), self.node_id);
             self.publish_home(&name, Some(self.node_id)).await;
+            if let Some(ev) = self.events.get() {
+                ev.emit(
+                    "world.rehomed",
+                    None,
+                    serde_json::json!({ "name": name, "node_id": self.node_id }),
+                )
+                .await;
+            }
             out.push(name);
         }
         Ok(out)
