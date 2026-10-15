@@ -1,7 +1,7 @@
 //! Admin API: the backend of the operator console. Server-key only.
 
 use axum::extract::{Path, Query, State};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use musubi_storage::{Caller, DeleteOp, Object, WriteOp};
@@ -16,6 +16,15 @@ pub const KICK_TOPIC: &str = "admin.kick";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/v1/admin/runtime/modules", get(modules_list))
+        .route(
+            "/v1/admin/runtime/modules/{name}",
+            put(module_put)
+                .delete(module_delete)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::modules::MAX_MODULE_BYTES,
+                )),
+        )
         .route("/v1/admin/accounts", get(accounts))
         .route(
             "/v1/admin/accounts/{id}",
@@ -317,4 +326,30 @@ fn is_secret_key(k: &str) -> bool {
         && !k.ends_with("_path")
         && !k.ends_with("_url")
         && k != "key_id"
+}
+
+async fn modules_list(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::modules::list(&s).await?))
+}
+
+/// Upload a module (`.wasm` binary, WAT text or a component) under `name`; it goes live on every
+/// node without a restart. Re-uploading replaces the previous version.
+async fn module_put(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::modules::put(&s, &name, &body).await?))
+}
+
+async fn module_delete(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !crate::modules::delete(&s, &name).await? {
+        return Err(Error::NotFound(format!("module {name}")).into());
+    }
+    Ok(Json(json!({ "deleted": name })))
 }

@@ -82,24 +82,35 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
             })
             .unwrap_or_default()
     };
+    // Binary uploads (WASM modules) are not buffered: only their size is recorded.
+    let binary = path.starts_with("/v1/admin/runtime/modules/");
+    let content_length = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
-        Ok(b) => b,
-        Err(_) => {
-            return axum::response::IntoResponse::into_response((
-                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                "audited request body exceeds 64 KiB",
-            ))
+    let (body, mut body_json) = if binary {
+        (body, Some(serde_json::json!({ "bytes": content_length })))
+    } else {
+        match axum::body::to_bytes(body, MAX_BODY).await {
+            Ok(b) => {
+                let parsed = serde_json::from_slice::<Value>(&b).ok();
+                (Body::from(b), parsed)
+            }
+            Err(_) => {
+                return axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "audited request body exceeds 64 KiB",
+                ))
+            }
         }
     };
-    let mut body_json = serde_json::from_slice::<Value>(&bytes).ok();
     if let Some(b) = &mut body_json {
         redact(b);
     }
     let started = Instant::now();
-    let res = next
-        .run(Request::from_parts(parts, Body::from(bytes)))
-        .await;
+    let res = next.run(Request::from_parts(parts, body)).await;
     let status = res.status().as_u16() as i32;
     let duration_ms = started.elapsed().as_millis() as i32;
     let db = s.db.clone();

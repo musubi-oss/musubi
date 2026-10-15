@@ -354,6 +354,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(c) = state.cluster.clone() {
         state.limits.start_gossip(c);
     }
+    match crate::modules::load_all(&state.db, &state.runtime, &state.matches).await {
+        Ok(n) if n > 0 => tracing::info!(modules = n, "stored runtime modules loaded"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "stored runtime modules failed to load"),
+    }
+    crate::modules::start_sync(state.clone());
     match state.banned.load(&state.db).await {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),

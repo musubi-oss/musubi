@@ -4325,3 +4325,105 @@ async fn metrics_endpoint_can_be_locked_down() {
     let off = app_with(|c| c.metrics.enabled = false).await.unwrap();
     assert_eq!(scrape(off, Some("defaultkey"), "10.0.0.1").await, 404);
 }
+
+/// WASM modules uploaded through the admin API go live immediately, persist in the database for
+/// nodes that start later, and can be removed again.
+#[tokio::test]
+async fn modules_hot_load_over_admin_api() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let put = |app: Router, name: &str, bytes: &'static [u8]| {
+        let req = Request::put(format!("/v1/admin/runtime/modules/{name}"))
+            .header("x-musubi-server-key", "defaultkey")
+            .header(header::CONTENT_TYPE, "application/wasm")
+            .body(Body::from(bytes))
+            .unwrap();
+        async move {
+            let res = app.oneshot(req).await.unwrap();
+            let st = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, v) = put(app.clone(), "hot", musubi_runtime::EXAMPLE_WAT.as_bytes()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["rpcs"].as_array().unwrap().iter().any(|r| r == "echo"),
+        "{v}"
+    );
+    assert_eq!(v["size"], musubi_runtime::EXAMPLE_WAT.len());
+    let (st, v) = put(app.clone(), "bad.name", b"(module)").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = put(app.clone(), "broken", b"(module (func))").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "needs memory+alloc: {v}");
+
+    let (st, list) =
+        call_server(&app, "GET", "/v1/admin/runtime/modules", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    let hot = list["stored"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "hot")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(hot["loaded"], true, "{list}");
+    assert!(list["loaded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m == "hot"));
+
+    // a node starting later picks the module up from the database
+    let mut cfg = Config::default();
+    cfg.database.url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    cfg.database.max_connections = 2;
+    let db = musubi_server::db::connect(&cfg.database).await.unwrap();
+    let fresh = Arc::new(musubi_runtime::Runtime::new(musubi_runtime::Limits::default()).unwrap());
+    let m = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
+    assert!(!fresh.has_rpc("echo"));
+    let n = musubi_server::modules::load_all(&db, &fresh, &m)
+        .await
+        .unwrap();
+    assert!(n >= 1, "{n}");
+    assert!(fresh.has_rpc("echo"));
+
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/hot",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/hot",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, list) = call_server(&app, "GET", "/v1/admin/runtime/modules", "defaultkey", None).await;
+    assert!(
+        !list["loaded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "hot"),
+        "{list}"
+    );
+    assert!(
+        !list["stored"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "hot"),
+        "{list}"
+    );
+}

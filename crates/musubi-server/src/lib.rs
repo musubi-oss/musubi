@@ -9,6 +9,7 @@ pub mod fanout;
 pub mod http;
 pub mod limits;
 pub mod metrics;
+pub mod modules;
 pub mod notify;
 pub mod realtime;
 pub mod runtime_host;

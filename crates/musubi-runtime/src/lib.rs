@@ -565,6 +565,22 @@ impl Runtime {
         Ok((modules, rpcs))
     }
 
+    /// Drop a module and every RPC/hook/export it provided. Returns whether it was loaded.
+    pub fn unload(&self, name: &str) -> bool {
+        let mut rpcs = self.rpcs.write();
+        let mut hooks_map = self.hooks.write();
+        let mut exports_map = self.exports.write();
+        let mut modules = self.modules.write();
+        let Some(old) = modules.remove(name) else {
+            return false;
+        };
+        rpcs.retain(|_, m| !Arc::ptr_eq(m, &old));
+        hooks_map.retain(|_, m| !Arc::ptr_eq(m, &old));
+        exports_map.retain(|_, m| !Arc::ptr_eq(m, &old));
+        tracing::info!(module = name, "runtime module unloaded");
+        true
+    }
+
     pub fn rpc_ids(&self) -> Vec<String> {
         let mut v: Vec<String> = self.rpcs.read().keys().cloned().collect();
         v.sort();
