@@ -45,7 +45,7 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 | `GET /v1/server/cluster/nodes` | server key | cluster v0: node registry with heartbeats + Postgres LISTEN/NOTIFY bus; chat, notifications, status/presence events and matchmaker tickets are replicated across nodes (the lowest live node id runs matchmaking passes); parties live on their home node and members on any node reach them over the bus (gossip/Raft/QUIC bus replace this behind the same API) |
 | `POST /v1/storage/{read,write,delete}`, `GET /v1/storage/{collection}` | bearer | legacy KV storage, Nakama permission codes, CAS versions |
 | `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
-| QUIC `quic.listen` (UDP) | access JWT in the first frame `{token, format, status}` | same envelopes/encodings as WebSocket over one bidirectional quinn stream (`type:u8 \| len:u32be \| payload`), ALPN `musubi-rt/1`, PEM cert or self-signed dev cert; datagrams next |
+| QUIC `quic.listen` (UDP) | access JWT in the first frame `{token, format, status}` | same envelopes/encodings as WebSocket over one bidirectional quinn stream (`type:u8 \| len:u32be \| payload`), ALPN `musubi-rt/1`, PEM cert or self-signed dev cert; `match_data` with `reliable=false` travels as QUIC datagrams (clients may send datagrams too) |
 
 ## Layout
 

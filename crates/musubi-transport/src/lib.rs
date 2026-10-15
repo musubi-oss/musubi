@@ -60,6 +60,11 @@ impl std::error::Error for TransportError {}
 
 pub trait Connection: Send {
     fn send(&mut self, frame: Frame) -> BoxFuture<'_, Result<(), TransportError>>;
+    /// Best-effort delivery (QUIC datagrams). Transports without an unreliable channel, or frames
+    /// too large for one datagram, fall back to `send`.
+    fn send_unreliable(&mut self, frame: Frame) -> BoxFuture<'_, Result<(), TransportError>> {
+        self.send(frame)
+    }
     fn recv(&mut self) -> BoxFuture<'_, Result<Frame, TransportError>>;
     fn close(&mut self) -> BoxFuture<'_, ()>;
     fn kind(&self) -> &'static str;

@@ -110,8 +110,14 @@ async fn run_loop(
         tokio::select! {
             out = rx.recv() => {
                 let Some(msg) = out else { return Ok(()) };
+                let unreliable = matches!(&msg, ServerMessage::MatchData { reliable: false, .. });
                 let bytes = encoding.encode(&Envelope { cid: None, msg })?;
-                conn.send(Frame::encoded(encoding, bytes)).await?;
+                let frame = Frame::encoded(encoding, bytes);
+                if unreliable {
+                    conn.send_unreliable(frame).await?;
+                } else {
+                    conn.send(frame).await?;
+                }
             }
             inc = conn.recv() => {
                 let frame = inc?;

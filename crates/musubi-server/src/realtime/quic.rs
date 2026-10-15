@@ -89,7 +89,12 @@ async fn handle(state: AppState, conn: quinn::Connection) {
     };
     let params = connect::params(&state, presence, encoding);
     let hub: Arc<_> = state.hub.clone();
-    crate::realtime::serve(hub, Box::new(QuicConnection::new(send, recv, max)), params).await;
+    crate::realtime::serve(
+        hub,
+        Box::new(QuicConnection::new(conn.clone(), send, recv, max)),
+        params,
+    )
+    .await;
     // Give the peer a moment to drain the final frames, then close.
     let _ = tokio::time::timeout(Duration::from_millis(500), conn.closed()).await;
     conn.close(0u32.into(), b"bye");

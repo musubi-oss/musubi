@@ -1,6 +1,7 @@
 //! QUIC transport (quinn). One bidirectional stream per realtime session carries the same
 //! envelopes as WebSocket, framed as `type:u8 | len:u32be | payload` where type is
-//! 0 = text (JSON), 1 = binary (postcard), 2 = close. Unreliable datagrams come next.
+//! 0 = text (JSON), 1 = binary (postcard), 2 = close. Unreliable frames travel as QUIC datagrams
+//! with the same 1-byte type prefix (no length); oversized ones fall back to the stream.
 
 use std::sync::Arc;
 
@@ -14,17 +15,50 @@ use crate::{Connection, Frame, TransportError};
 pub const ALPN: &[u8] = b"musubi-rt/1";
 
 pub struct QuicConnection {
+    conn: quinn::Connection,
     send: SendStream,
     recv: RecvStream,
     max_frame: usize,
 }
 
 impl QuicConnection {
-    pub fn new(send: SendStream, recv: RecvStream, max_frame: usize) -> Self {
+    pub fn new(
+        conn: quinn::Connection,
+        send: SendStream,
+        recv: RecvStream,
+        max_frame: usize,
+    ) -> Self {
         Self {
+            conn,
             send,
             recv,
             max_frame,
+        }
+    }
+
+    pub fn encode_datagram(frame: &Frame) -> Bytes {
+        let (t, body): (u8, &[u8]) = match frame {
+            Frame::Text(s) => (0, s.as_bytes()),
+            Frame::Binary(b) => (1, b),
+            Frame::Close => (2, &[]),
+        };
+        let mut v = Vec::with_capacity(1 + body.len());
+        v.push(t);
+        v.extend_from_slice(body);
+        Bytes::from(v)
+    }
+
+    pub fn decode_datagram(d: Bytes) -> Result<Frame, TransportError> {
+        let Some((&t, body)) = d.split_first() else {
+            return Err(TransportError::Io("empty datagram".into()));
+        };
+        match t {
+            0 => String::from_utf8(body.to_vec())
+                .map(Frame::Text)
+                .map_err(|_| TransportError::Io("invalid utf-8 datagram".into())),
+            1 => Ok(Frame::Binary(Bytes::copy_from_slice(body))),
+            2 => Ok(Frame::Close),
+            t => Err(TransportError::Io(format!("unknown datagram type {t}"))),
         }
     }
 
@@ -77,8 +111,35 @@ impl Connection for QuicConnection {
         Box::pin(async move { Self::write_frame(&mut self.send, frame).await })
     }
 
+    fn send_unreliable(&mut self, frame: Frame) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            let d = Self::encode_datagram(&frame);
+            let fits = self.conn.max_datagram_size().is_some_and(|m| d.len() <= m);
+            if fits {
+                match self.conn.send_datagram(d) {
+                    Ok(()) => return Ok(()),
+                    Err(
+                        quinn::SendDatagramError::UnsupportedByPeer
+                        | quinn::SendDatagramError::Disabled,
+                    ) => {}
+                    Err(quinn::SendDatagramError::TooLarge) => {}
+                    Err(e) => return Err(TransportError::Io(e.to_string())),
+                }
+            }
+            Self::write_frame(&mut self.send, frame).await
+        })
+    }
+
     fn recv(&mut self) -> BoxFuture<'_, Result<Frame, TransportError>> {
-        Box::pin(async move { Self::read_frame(&mut self.recv, self.max_frame).await })
+        Box::pin(async move {
+            tokio::select! {
+                f = Self::read_frame(&mut self.recv, self.max_frame) => f,
+                d = self.conn.read_datagram() => match d {
+                    Ok(d) => Self::decode_datagram(d),
+                    Err(e) => Err(TransportError::Io(e.to_string())),
+                },
+            }
+        })
     }
 
     fn close(&mut self) -> BoxFuture<'_, ()> {

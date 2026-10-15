@@ -1733,3 +1733,83 @@ async fn cross_node_party() {
         matches!(recv(&mut a).await.msg, ServerMessage::PartyPresenceEvent { leaves, .. } if leaves.len() == 1)
     );
 }
+
+#[tokio::test]
+async fn quic_unreliable_match_data_uses_datagrams() {
+    let Some(state) = build_state(true).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (cfg, der) = musubi_transport::quic::dev_self_signed().unwrap();
+    let addr =
+        musubi_server::realtime::quic::start_with(state, "127.0.0.1:0".parse().unwrap(), cfg)
+            .await
+            .unwrap();
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"module": "echo", "params": {"tick_rate": 30, "empty_ticks": 1000}}).to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+
+    let (ta, _) = token(&router).await;
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(musubi_transport::quic::client_config(&[der]).unwrap());
+    let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+    use musubi_transport::quic::QuicConnection as Q;
+    use musubi_transport::Frame;
+    Q::write_frame(
+        &mut tx,
+        Frame::Text(json!({"token": ta, "format": "json"}).to_string()),
+    )
+    .await
+    .unwrap();
+    let env = |msg: ClientMessage| {
+        Frame::Text(serde_json::to_string(&Envelope { cid: None, msg }).unwrap())
+    };
+    Q::write_frame(
+        &mut tx,
+        env(ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        }),
+    )
+    .await
+    .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    assert!(matches!(
+        serde_json::from_str::<Envelope<ServerMessage>>(&t)
+            .unwrap()
+            .msg,
+        ServerMessage::Match { .. }
+    ));
+    // client may also send on a datagram; the echo match relays it unreliably → arrives as a datagram
+    conn.send_datagram(Q::encode_datagram(&env(ClientMessage::MatchDataSend {
+        match_id: mid.clone(),
+        op_code: 3,
+        data: vec![4, 2],
+        presences: vec![],
+        reliable: false,
+    })))
+    .unwrap();
+    let d = tokio::time::timeout(std::time::Duration::from_secs(3), conn.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    let Frame::Text(t) = Q::decode_datagram(d).unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert!(
+        matches!(r.msg, ServerMessage::MatchData { op_code: 3, reliable: false, data, .. } if data == vec![4, 2])
+    );
+}
