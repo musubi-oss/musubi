@@ -12,8 +12,13 @@ use uuid::Uuid;
 pub mod achievements;
 pub mod iap;
 pub mod mailbox;
+pub mod market;
 pub use achievements::Achievement;
 pub use mailbox::{Mail, SendMail};
+pub use market::{
+    EscrowItem, Listing, ListingFilter, MarketRules, NewListing, NewTrade, OfferItem, Sale,
+    Settled, Trade, TradeSide, WantItem,
+};
 pub mod progression;
 pub mod quests;
 pub mod seasons;
@@ -279,7 +284,7 @@ impl EconomyService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn adjust_tx(
+    pub(crate) async fn adjust_tx(
         tx: &mut Transaction<'_, Postgres>,
         account: AccountId,
         currency: &str,
@@ -454,7 +459,7 @@ impl EconomyService {
         Ok(e)
     }
 
-    async fn grant_item_tx(
+    pub(crate) async fn grant_item_tx(
         tx: &mut Transaction<'_, Postgres>,
         account: AccountId,
         item_id: &str,

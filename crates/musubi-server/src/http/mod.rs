@@ -2,7 +2,7 @@ mod account;
 mod auth;
 mod chat;
 mod cluster;
-mod economy;
+pub mod economy;
 mod error;
 mod extract;
 mod fleets;

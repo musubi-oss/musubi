@@ -5,8 +5,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use musubi_economy::{
-    Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, Quest, ReceiptInput,
-    RewardTable, Season, SendMail, StreakDef, Track,
+    Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, ListingFilter, MarketRules,
+    NewListing, NewTrade, Quest, ReceiptInput, RewardTable, Season, SendMail, StreakDef, Track,
 };
 use musubi_integrations::StoreTransaction;
 use musubi_social::notifications::NewNotification;
@@ -72,6 +72,22 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/iap/steam/init", post(iap_steam_init))
         .route("/v1/iap/steam/finalize", post(iap_steam_finalize))
         .route("/v1/server/iap/steam/reconcile", post(iap_steam_reconcile))
+        .route(
+            "/v1/market/listings",
+            get(market_listings).post(market_list),
+        )
+        .route("/v1/market/listings/mine", get(market_my_listings))
+        .route("/v1/market/listings/{id}", get(market_listing))
+        .route("/v1/market/listings/{id}/buy", post(market_buy))
+        .route("/v1/market/listings/{id}/bid", post(market_bid))
+        .route("/v1/market/listings/{id}/cancel", post(market_cancel))
+        .route("/v1/market/sales", get(market_sales))
+        .route("/v1/server/market/settle", post(market_settle))
+        .route("/v1/trades", get(trades).post(trade_propose))
+        .route("/v1/trades/{id}", get(trade_get))
+        .route("/v1/trades/{id}/accept", post(trade_accept))
+        .route("/v1/trades/{id}/decline", post(trade_close))
+        .route("/v1/trades/{id}/cancel", post(trade_close))
         .route("/v1/mail", get(mail_list))
         .route("/v1/mail/{id}", axum::routing::delete(mail_delete))
         .route("/v1/mail/{id}/read", post(mail_read))
@@ -1194,4 +1210,302 @@ async fn iap_steam_reconcile(
         }
     }
     Ok(Json(json!({ "checked": orders.len(), "revoked": revoked })))
+}
+
+// ----- player market -----
+
+pub const NOTIFY_MARKET: i32 = 110;
+pub const NOTIFY_TRADE: i32 = 111;
+
+pub fn market_rules(cfg: &musubi_core::config::Config) -> MarketRules {
+    MarketRules {
+        fee_bps: cfg.market.fee_bps,
+        max_listing_secs: cfg.market.max_listing_secs,
+        default_listing_secs: cfg.market.default_listing_secs,
+        trade_ttl_secs: cfg.market.trade_ttl_secs,
+        anti_snipe_secs: cfg.market.anti_snipe_secs,
+    }
+}
+
+async fn notify_one(s: &AppState, to: AccountId, code: i32, subject: &str, content: Value) {
+    let n = NewNotification {
+        user_id: to,
+        sender_id: None,
+        subject: subject.into(),
+        content,
+        code,
+        persistent: true,
+    };
+    if let Err(e) = s.notify.send(vec![n]).await {
+        tracing::warn!(error = %e, "notification failed");
+    }
+}
+
+async fn market_listings(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+    Query(f): Query<ListingFilter>,
+) -> Result<Json<Value>, ApiError> {
+    let l = s.economy.listings(&f).await?;
+    Ok(Json(
+        json!({ "listings": l, "cursor": l.last().map(|x| x.id) }),
+    ))
+}
+
+async fn market_list(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(n): Json<NewListing>,
+) -> Result<Json<Value>, ApiError> {
+    let l = s
+        .economy
+        .list_item(me.account_id, n, &market_rules(&s.cfg))
+        .await?;
+    Ok(Json(serde_json::to_value(l).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct MarketQ {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    pending: Option<bool>,
+}
+
+async fn market_my_listings(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<MarketQ>,
+) -> Result<Json<Value>, ApiError> {
+    let l = s
+        .economy
+        .my_listings(me.account_id, q.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(json!({ "listings": l })))
+}
+
+async fn market_listing(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let l = s.economy.listing(id).await?;
+    Ok(Json(serde_json::to_value(l).map_err(Error::internal)?))
+}
+
+async fn market_buy(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let sale = s
+        .economy
+        .buyout(me.account_id, id, &market_rules(&s.cfg))
+        .await?;
+    notify_one(
+        &s,
+        sale.seller_id,
+        NOTIFY_MARKET,
+        "Your listing sold",
+        json!({ "kind": "market.sold", "listing_id": id, "sale_id": sale.id, "price": sale.price, "fee": sale.fee }),
+    )
+    .await;
+    Ok(Json(serde_json::to_value(sale).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct BidReq {
+    amount: i64,
+}
+
+async fn market_bid(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(r): Json<BidReq>,
+) -> Result<Json<Value>, ApiError> {
+    let before = s.economy.listing(id).await?;
+    let l = s
+        .economy
+        .bid(me.account_id, id, r.amount, &market_rules(&s.cfg))
+        .await?;
+    if let Some(prev) = before.bidder_id.filter(|p| *p != me.account_id) {
+        notify_one(
+            &s,
+            prev,
+            NOTIFY_MARKET,
+            "You were outbid",
+            json!({ "kind": "market.outbid", "listing_id": id, "bid": l.bid }),
+        )
+        .await;
+    }
+    Ok(Json(serde_json::to_value(l).map_err(Error::internal)?))
+}
+
+async fn market_cancel(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let l = s.economy.cancel_listing(me.account_id, id).await?;
+    Ok(Json(serde_json::to_value(l).map_err(Error::internal)?))
+}
+
+async fn market_sales(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<MarketQ>,
+) -> Result<Json<Value>, ApiError> {
+    let l = s
+        .economy
+        .sales(me.account_id, q.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(json!({ "sales": l })))
+}
+
+/// Close due listings and trades now (the leader node also does this every few seconds).
+async fn market_settle(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    let (listings, trades) = settle_market(&s).await?;
+    Ok(Json(json!({ "listings": listings, "trades": trades })))
+}
+
+pub async fn settle_market(s: &AppState) -> Result<(usize, usize), Error> {
+    let now = OffsetDateTime::now_utc();
+    let settled = s
+        .economy
+        .settle_listings(&market_rules(&s.cfg), now, 500)
+        .await?;
+    for st in &settled {
+        match &st.sale {
+            Some(sale) => {
+                notify_one(
+                    s,
+                    sale.seller_id,
+                    NOTIFY_MARKET,
+                    "Your auction sold",
+                    json!({ "kind": "market.sold", "listing_id": st.listing.id, "sale_id": sale.id, "price": sale.price, "fee": sale.fee }),
+                )
+                .await;
+                notify_one(
+                    s,
+                    sale.buyer_id,
+                    NOTIFY_MARKET,
+                    "You won an auction",
+                    json!({ "kind": "market.won", "listing_id": st.listing.id, "sale_id": sale.id, "price": sale.price }),
+                )
+                .await;
+            }
+            None => {
+                notify_one(
+                    s,
+                    st.listing.seller_id,
+                    NOTIFY_MARKET,
+                    "Your listing expired",
+                    json!({ "kind": "market.expired", "listing_id": st.listing.id }),
+                )
+                .await;
+            }
+        }
+    }
+    let expired = s.economy.expire_trades(now, 500).await?;
+    for t in &expired {
+        notify_one(
+            s,
+            t.from_id,
+            NOTIFY_TRADE,
+            "Trade offer expired",
+            json!({ "kind": "trade.expired", "trade_id": t.id }),
+        )
+        .await;
+    }
+    Ok((settled.len(), expired.len()))
+}
+
+// ----- direct trades -----
+
+async fn trades(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<MarketQ>,
+) -> Result<Json<Value>, ApiError> {
+    let t = s
+        .economy
+        .trades(
+            me.account_id,
+            q.pending.unwrap_or(true),
+            q.limit.unwrap_or(50),
+        )
+        .await?;
+    Ok(Json(json!({ "trades": t })))
+}
+
+async fn trade_propose(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(n): Json<NewTrade>,
+) -> Result<Json<Value>, ApiError> {
+    let t = s
+        .economy
+        .propose_trade(me.account_id, n, &market_rules(&s.cfg))
+        .await?;
+    notify_one(
+        &s,
+        t.to_id,
+        NOTIFY_TRADE,
+        "Trade offer",
+        json!({ "kind": "trade.offer", "trade_id": t.id, "from": t.from_id }),
+    )
+    .await;
+    Ok(Json(serde_json::to_value(t).map_err(Error::internal)?))
+}
+
+async fn trade_get(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let t = s.economy.trade(me.account_id, id).await?;
+    Ok(Json(serde_json::to_value(t).map_err(Error::internal)?))
+}
+
+async fn trade_accept(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let t = s.economy.accept_trade(me.account_id, id).await?;
+    notify_one(
+        &s,
+        t.from_id,
+        NOTIFY_TRADE,
+        "Trade accepted",
+        json!({ "kind": "trade.accepted", "trade_id": t.id }),
+    )
+    .await;
+    Ok(Json(serde_json::to_value(t).map_err(Error::internal)?))
+}
+
+async fn trade_close(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let t = s.economy.close_trade(me.account_id, id).await?;
+    let other = if t.from_id == me.account_id {
+        t.to_id
+    } else {
+        t.from_id
+    };
+    notify_one(
+        &s,
+        other,
+        NOTIFY_TRADE,
+        "Trade closed",
+        json!({ "kind": format!("trade.{}", t.status), "trade_id": t.id }),
+    )
+    .await;
+    Ok(Json(serde_json::to_value(t).map_err(Error::internal)?))
 }

@@ -39,6 +39,7 @@ pub struct Config {
     pub zanshin: ZanshinConfig,
     pub aurix: AurixConfig,
     pub iap: IapConfig,
+    pub market: MarketConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +227,34 @@ pub struct ZanshinConfig {
     pub server_key: String,
     /// Seconds between analytics event flushes.
     pub flush_secs: u64,
+}
+
+/// Player market / trades.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MarketConfig {
+    /// Seller fee in basis points (100 = 1%), taken from every sale.
+    pub fee_bps: i64,
+    /// Longest a listing may stay open, seconds.
+    pub max_listing_secs: i64,
+    /// Default listing duration when the seller gives none, seconds.
+    pub default_listing_secs: i64,
+    /// How long a direct trade offer waits for an answer, seconds.
+    pub trade_ttl_secs: i64,
+    /// Bids in the last `anti_snipe_secs` push the deadline out to that many seconds.
+    pub anti_snipe_secs: i64,
+}
+
+impl Default for MarketConfig {
+    fn default() -> Self {
+        Self {
+            fee_bps: 500,
+            max_listing_secs: 7 * 24 * 3600,
+            default_listing_secs: 24 * 3600,
+            trade_ttl_secs: 24 * 3600,
+            anti_snipe_secs: 60,
+        }
+    }
 }
 
 /// Aurix voice. Unset `url` = disabled.

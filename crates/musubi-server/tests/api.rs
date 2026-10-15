@@ -16,6 +16,7 @@ async fn app() -> Option<Router> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
+    cfg.market.anti_snipe_secs = 0;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
@@ -2997,4 +2998,453 @@ async fn raft_leader_owns_leases_and_world_directory() {
     }
     a.stop().await;
     b.stop().await;
+}
+
+#[tokio::test]
+async fn market_listings_bids_buyout_settle_and_direct_trades() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut users = Vec::new();
+    for _ in 0..3 {
+        let (st, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("mkt")})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        users.push((
+            sess["access_token"].as_str().unwrap().to_string(),
+            sess["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (seller, seller_id) = users[0].clone();
+    let (buyer, buyer_id) = users[1].clone();
+    let (other, other_id) = users[2].clone();
+    let gold = unique("gold");
+    let sword = unique("sword");
+    let ore = unique("ore");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for (id, stackable) in [(&sword, false), (&ore, true)] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/items",
+            k,
+            Some(json!({"id": id, "name": id, "stackable": stackable, "max_stack": 99})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    for (acc, amount) in [(&buyer_id, 1000), (&other_id, 1000)] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/wallet/adjust",
+            k,
+            Some(json!({"account_id": acc, "currency": gold, "delta": amount})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let (st, g) = call_server(&app, "POST", "/v1/server/inventory/grant", k, Some(json!({"account_id": seller_id, "item_id": sword, "quantity": 1, "instance": {"enchant": 3}}))).await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let sword_entry = g["id"].as_str().unwrap().to_string();
+    let (st, g) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": seller_id, "item_id": ore, "quantity": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let ore_entry = g["id"].as_str().unwrap().to_string();
+
+    // list the sword with a buyout; it leaves the seller's inventory immediately
+    let (st, l1) = call(
+        &app,
+        "POST",
+        "/v1/market/listings",
+        Some(&seller),
+        Some(json!({"inventory_id": sword_entry, "currency": gold, "buyout": 300})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l1}");
+    let l1id = l1["id"].as_str().unwrap().to_string();
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&seller), None).await;
+    assert!(
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["item_id"] != sword),
+        "{inv}"
+    );
+    // seller cannot buy own listing; a bid below buyout on a buyout-only listing is rejected
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l1id}/buy"),
+        Some(&seller),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l1id}/bid"),
+        Some(&buyer),
+        Some(json!({"amount": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // search shows it; buyout pays the seller minus the 5% fee and delivers the exact instance
+    let (_, found) = call(
+        &app,
+        "GET",
+        &format!("/v1/market/listings?item_id={sword}"),
+        Some(&buyer),
+        None,
+    )
+    .await;
+    assert_eq!(found["listings"].as_array().unwrap().len(), 1);
+    let (st, sale) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l1id}/buy"),
+        Some(&buyer),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sale}");
+    assert_eq!(sale["price"], 300);
+    assert_eq!(sale["fee"], 15);
+    let (st, again) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l1id}/buy"),
+        Some(&buyer),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "replay returns the same sale");
+    assert_eq!(again["id"], sale["id"]);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l1id}/buy"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&buyer), None).await;
+    assert_eq!(w["balances"][0]["balance"], 700);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&seller), None).await;
+    assert_eq!(w["balances"][0]["balance"], 285);
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&buyer), None).await;
+    let got = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["item_id"] == sword)
+        .unwrap();
+    assert_eq!(got["instance"]["enchant"], 3);
+    let (_, notes) = call(&app, "GET", "/v1/notifications", Some(&seller), None).await;
+    assert!(
+        notes["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == 110),
+        "{notes}"
+    );
+
+    // auction: 5 ore, min bid 10, 1 second; bids escrow money and refund the outbid player
+    let (st, l2) = call(&app, "POST", "/v1/market/listings", Some(&seller), Some(json!({"inventory_id": ore_entry, "quantity": 5, "currency": gold, "min_bid": 10, "duration_secs": 1}))).await;
+    assert_eq!(st, StatusCode::OK, "{l2}");
+    let l2id = l2["id"].as_str().unwrap().to_string();
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&seller), None).await;
+    assert_eq!(
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["item_id"] == ore)
+            .unwrap()["quantity"],
+        5
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l2id}/bid"),
+        Some(&buyer),
+        Some(json!({"amount": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "below min bid");
+    let (st, b) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l2id}/bid"),
+        Some(&buyer),
+        Some(json!({"amount": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&buyer), None).await;
+    assert_eq!(w["balances"][0]["balance"], 690, "bid escrowed");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l2id}/bid"),
+        Some(&other),
+        Some(json!({"amount": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "must beat current bid");
+    let (st, b) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l2id}/bid"),
+        Some(&other),
+        Some(json!({"amount": 40})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["bidder_id"], other_id);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&buyer), None).await;
+    assert_eq!(w["balances"][0]["balance"], 700, "outbid refunded");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&other), None).await;
+    assert_eq!(w["balances"][0]["balance"], 960);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l2id}/cancel"),
+        Some(&seller),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "cannot cancel with bids");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{l2id}/bid"),
+        Some(&buyer),
+        Some(json!({"amount": 50})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "expired");
+    let (st, settled) = call_server(&app, "POST", "/v1/server/market/settle", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{settled}");
+    assert!(settled["listings"].as_i64().unwrap() >= 1);
+    let (_, l2) = call(
+        &app,
+        "GET",
+        &format!("/v1/market/listings/{l2id}"),
+        Some(&seller),
+        None,
+    )
+    .await;
+    assert_eq!(l2["status"], "sold");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&other), None).await;
+    assert_eq!(
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["item_id"] == ore)
+            .unwrap()["quantity"],
+        5
+    );
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&seller), None).await;
+    assert_eq!(w["balances"][0]["balance"], 285 + 38, "40 minus 5% fee");
+    let (_, sales) = call(&app, "GET", "/v1/market/sales", Some(&seller), None).await;
+    assert_eq!(sales["sales"].as_array().unwrap().len(), 2);
+    // a listing without bids expires back into the inventory
+    let (st, l3) = call(&app, "POST", "/v1/market/listings", Some(&seller), Some(json!({"inventory_id": ore_entry, "quantity": 2, "currency": gold, "buyout": 1, "duration_secs": 1}))).await;
+    assert_eq!(st, StatusCode::OK, "{l3}");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (st, _) = call_server(&app, "POST", "/v1/server/market/settle", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, l3) = call(
+        &app,
+        "GET",
+        &format!("/v1/market/listings/{}", l3["id"].as_str().unwrap()),
+        Some(&seller),
+        None,
+    )
+    .await;
+    assert_eq!(l3["status"], "expired");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&seller), None).await;
+    assert_eq!(
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["item_id"] == ore)
+            .unwrap()["quantity"],
+        5
+    );
+    // cancel an open listing without bids
+    let (st, l4) = call(
+        &app,
+        "POST",
+        "/v1/market/listings",
+        Some(&seller),
+        Some(json!({"inventory_id": ore_entry, "quantity": 1, "currency": gold, "buyout": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l4}");
+    let (st, l4) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/listings/{}/cancel", l4["id"].as_str().unwrap()),
+        Some(&seller),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l4}");
+    assert_eq!(l4["status"], "cancelled");
+
+    // direct trade: buyer offers the sword + 100 gold for 3 ore; the offer is escrowed at once
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&buyer), None).await;
+    let sword_now = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["item_id"] == sword)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, t) = call(
+        &app,
+        "POST",
+        "/v1/trades",
+        Some(&buyer),
+        Some(json!({
+            "to_account": seller_id,
+            "offer_items": [{"inventory_id": sword_now}],
+            "offer_currency": {gold.clone(): 100},
+            "want_items": [{"item_id": ore, "quantity": 3}],
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let tid = t["id"].as_str().unwrap().to_string();
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&buyer), None).await;
+    assert_eq!(w["balances"][0]["balance"], 600, "offered gold escrowed");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&buyer), None).await;
+    assert!(inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["item_id"] != sword));
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{tid}/accept"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "only the recipient accepts");
+    let (_, pending) = call(&app, "GET", "/v1/trades", Some(&seller), None).await;
+    assert_eq!(pending["trades"].as_array().unwrap().len(), 1);
+    let (st, t) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{tid}/accept"),
+        Some(&seller),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["status"], "accepted");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&seller), None).await;
+    assert_eq!(w["balances"][0]["balance"], 285 + 38 + 100);
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&seller), None).await;
+    let items = inv["items"].as_array().unwrap();
+    assert_eq!(
+        items.iter().find(|e| e["item_id"] == ore).unwrap()["quantity"],
+        2
+    );
+    assert_eq!(
+        items.iter().find(|e| e["item_id"] == sword).unwrap()["instance"]["enchant"],
+        3
+    );
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&buyer), None).await;
+    assert_eq!(
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["item_id"] == ore)
+            .unwrap()["quantity"],
+        3
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{tid}/accept"),
+        Some(&seller),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "no double accept");
+    // a declined offer refunds the escrow; accepting without the wanted goods fails atomically
+    let (st, t2) = call(&app, "POST", "/v1/trades", Some(&buyer), Some(json!({
+        "to_account": other_id, "offer_currency": {gold.clone(): 50}, "want_items": [{"item_id": sword, "quantity": 1}],
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{t2}");
+    let t2id = t2["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{t2id}/accept"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "other has no sword");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&buyer), None).await;
+    assert_eq!(
+        w["balances"][0]["balance"], 550,
+        "still escrowed after failed accept"
+    );
+    let (st, t2) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{t2id}/decline"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t2}");
+    assert_eq!(t2["status"], "declined");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&buyer), None).await;
+    assert_eq!(w["balances"][0]["balance"], 600, "refunded");
+    let (_, notes) = call(&app, "GET", "/v1/notifications", Some(&seller), None).await;
+    assert!(
+        notes["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == 111),
+        "{notes}"
+    );
 }

@@ -132,6 +132,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             "resumed authoritative matches from snapshots"
         );
     }
+    // Market: close due auctions / expire trade offers; one node at a time.
+    let market_lease = cluster.lease("market", musubi_cluster::DEAD_AFTER);
     // Failover: adopt matches whose node stopped heartbeating.
     {
         let (cluster, matches, hub) = (cluster.clone(), matches.clone(), hub.clone());
@@ -263,6 +265,25 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         hub,
         started_at: std::time::Instant::now(),
     };
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if !market_lease.held() {
+                    continue;
+                }
+                match crate::http::economy::settle_market(&st).await {
+                    Ok((l, t)) if l + t > 0 => {
+                        tracing::info!(listings = l, trades = t, "market settled")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "market settle failed"),
+                }
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(state.cfg.http.listen).await?;
     info!(addr = %state.cfg.http.listen, "http listening");
     if let Some(listen) = state.cfg.quic.listen {
