@@ -6,6 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
+use musubi_mesh::controller::ControllerConfig;
 use musubi_mesh::{CellId, Pos, WorldConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -18,6 +19,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/server/worlds", get(list).post(create))
         .route("/v1/server/worlds/{w}", get(info).delete(delete))
+        .route(
+            "/v1/server/worlds/{w}/sims",
+            post(register_sim).delete(unregister_sim),
+        )
         .route("/v1/server/worlds/{w}/lease", post(lease))
         .route("/v1/server/worlds/{w}/renew", post(renew))
         .route("/v1/server/worlds/{w}/spawn", post(spawn))
@@ -33,6 +38,19 @@ struct CreateReq {
     name: String,
     #[serde(default)]
     config: WorldConfig,
+    #[serde(default)]
+    controller: ControllerConfig,
+}
+
+#[derive(Deserialize)]
+struct RegisterSimReq {
+    sim: Uuid,
+    #[serde(default = "one")]
+    capacity: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -83,7 +101,8 @@ async fn create(
     Json(r): Json<CreateReq>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        serde_json::to_value(s.worlds.create(&r.name, r.config)?).map_err(Error::internal)?,
+        serde_json::to_value(s.worlds.create(&r.name, r.config, r.controller)?)
+            .map_err(Error::internal)?,
     ))
 }
 
@@ -103,6 +122,27 @@ async fn delete(
     Path(w): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     s.worlds.delete(&w)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn register_sim(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<RegisterSimReq>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "sims": s.worlds.register_sim(&w, r.sim, r.capacity)? }),
+    ))
+}
+
+async fn unregister_sim(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<SimQuery>,
+) -> Result<Json<Value>, ApiError> {
+    s.worlds.unregister_sim(&w, r.sim)?;
     Ok(Json(json!({ "ok": true })))
 }
 

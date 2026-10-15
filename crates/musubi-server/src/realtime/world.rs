@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use musubi_core::{Error, Result, SessionId};
+use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo};
 use musubi_mesh::{CellId, Delta, Entity, HandoverOutcome, Pos, World, WorldConfig};
 use musubi_proto::realtime::{WorldComponent, WorldEntity};
 use musubi_proto::ServerMessage;
@@ -21,9 +22,12 @@ use crate::fanout::Fanout;
 
 pub const TICK_HZ: u64 = 30;
 pub const MAX_SIM_EVENTS: usize = 4096;
+/// Controller pass every N ticks (1 s at 30 Hz).
+pub const CONTROL_EVERY: u64 = 30;
 
 struct WorldState {
     world: World,
+    controller: Controller,
     /// session → interest client id
     subs: HashMap<SessionId, Uuid>,
     /// simulator → pending events (handover requests, inputs, …)
@@ -43,6 +47,7 @@ pub struct WorldInfo {
     pub subscribers: usize,
     pub cells: Vec<(CellId, Uuid)>,
     pub orphaned: Vec<CellId>,
+    pub sims: Vec<SimInfo>,
     pub config: WorldConfig,
 }
 
@@ -89,7 +94,7 @@ impl WorldRegistry {
             .ok_or_else(|| Error::NotFound(format!("world {name}")))
     }
 
-    pub fn create(&self, name: &str, cfg: WorldConfig) -> Result<WorldInfo> {
+    pub fn create(&self, name: &str, cfg: WorldConfig, ctl: ControllerConfig) -> Result<WorldInfo> {
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidArgument("world name 1..=64 chars".into()));
         }
@@ -103,6 +108,7 @@ impl WorldRegistry {
             name.to_string(),
             Arc::new(Mutex::new(WorldState {
                 world: World::new(cfg),
+                controller: Controller::new(ctl),
                 subs: HashMap::new(),
                 sim_events: HashMap::new(),
             })),
@@ -120,18 +126,7 @@ impl WorldRegistry {
     pub fn info(&self, name: &str) -> Result<WorldInfo> {
         let w = self.get(name)?;
         let st = w.lock();
-        let mut cells: Vec<(CellId, Uuid)> = Vec::new();
-        for c in st.world.orphaned_cells() {
-            let _ = c;
-        }
-        // leases are exposed through cells_of per sim; collect by scanning known sims
-        let mut sims: Vec<Uuid> = st.sim_events.keys().copied().collect();
-        sims.sort();
-        for s in sims {
-            for c in st.world.cells_of(s) {
-                cells.push((c, s));
-            }
-        }
+        let cells = st.world.leased_cells();
         Ok(WorldInfo {
             name: name.to_string(),
             tick: st.world.tick,
@@ -139,6 +134,7 @@ impl WorldRegistry {
             subscribers: st.subs.len(),
             cells,
             orphaned: st.world.orphaned_cells(),
+            sims: st.controller.sims(),
             config: st.world.cfg.clone(),
         })
     }
@@ -154,6 +150,7 @@ impl WorldRegistry {
     pub fn lease(&self, name: &str, sim: Uuid, cells: &[CellId]) -> Result<Vec<CellId>> {
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         for c in cells {
             if let Some(owner) = st.world.owner(*c) {
                 if owner != sim {
@@ -166,10 +163,38 @@ impl WorldRegistry {
         Ok(st.world.cells_of(sim))
     }
 
+    /// A simulator announces itself (and its capacity); the controller may then lease it cells.
+    pub fn register_sim(&self, name: &str, sim: Uuid, capacity: u32) -> Result<Vec<SimInfo>> {
+        if capacity == 0 {
+            return Err(Error::InvalidArgument("capacity >= 1".into()));
+        }
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        let tick = st.world.tick;
+        st.controller.register(sim, capacity, tick);
+        st.sim_events.entry(sim).or_default();
+        Ok(st.controller.sims())
+    }
+
+    pub fn unregister_sim(&self, name: &str, sim: Uuid) -> Result<()> {
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        st.controller.unregister(sim);
+        for c in st.world.cells_of(sim) {
+            st.world.revoke_lease(c);
+        }
+        Ok(())
+    }
+
     pub fn renew(&self, name: &str, sim: Uuid) -> Result<Vec<CellId>> {
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         st.world.renew_leases(sim);
+        let tick = st.world.tick;
+        st.controller.seen(sim, tick);
         Ok(st.world.cells_of(sim))
     }
 
@@ -187,7 +212,16 @@ impl WorldRegistry {
             .unwrap_or_default();
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         let cell = st.world.cell_of(pos);
+        if st.world.owner(cell).is_none() {
+            if let Some(a) = st
+                .controller
+                .ensure_leased(&mut st.world, cell, Some(sim), "spawn")
+            {
+                announce(st, &a);
+            }
+        }
         match st.world.owner(cell) {
             Some(o) if o == sim => {}
             Some(o) => {
@@ -205,6 +239,7 @@ impl WorldRegistry {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         let cell = st
             .world
             .get(id)
@@ -232,6 +267,7 @@ impl WorldRegistry {
             .unwrap_or_default();
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         st.world.apply(sim, id, pos, comps).map_err(mesh_err)
     }
 
@@ -251,6 +287,7 @@ impl WorldRegistry {
     pub fn events(&self, name: &str, sim: Uuid) -> Result<Vec<Value>> {
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         Ok(std::mem::take(st.sim_events.entry(sim).or_default()))
     }
 
@@ -258,6 +295,7 @@ impl WorldRegistry {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         let from = st
             .world
             .get(id)
@@ -265,7 +303,7 @@ impl WorldRegistry {
         let (outcome, inputs) = st.world.handover_ack(sim, id).map_err(mesh_err)?;
         if let Some(from) = from {
             push_event(
-                &mut st,
+                st,
                 from,
                 json!({"type": "handover_completed", "entity": id, "to": sim}),
             );
@@ -281,14 +319,24 @@ impl WorldRegistry {
         }
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         let client = *st.subs.entry(sid).or_insert_with(Uuid::now_v7);
         st.world.subscribe(client, pos, radius);
+        for c in st.world.cells_in_radius(pos, radius) {
+            if let Some(a) = st
+                .controller
+                .ensure_leased(&mut st.world, c, None, "interest")
+            {
+                announce(st, &a);
+            }
+        }
         Ok(())
     }
 
     pub fn unsubscribe(&self, name: &str, sid: SessionId) -> Result<()> {
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         if let Some(c) = st.subs.remove(&sid) {
             st.world.unsubscribe(c);
         }
@@ -298,6 +346,7 @@ impl WorldRegistry {
     pub fn unsubscribe_all(&self, sid: SessionId) {
         for w in self.worlds.iter() {
             let mut st = w.lock();
+            let st = &mut *st;
             if let Some(c) = st.subs.remove(&sid) {
                 st.world.unsubscribe(c);
             }
@@ -309,9 +358,10 @@ impl WorldRegistry {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let mut st = w.lock();
+        let st = &mut *st;
         let ev = json!({"type": "input", "entity": id, "session": sid, "input": input});
         if let Some(sim) = st.world.route_input(id, ev.clone()).map_err(mesh_err)? {
-            push_event(&mut st, sim, ev);
+            push_event(st, sim, ev);
         }
         Ok(())
     }
@@ -323,19 +373,26 @@ impl WorldRegistry {
         for w in self.worlds.iter() {
             let name = w.key().clone();
             let mut st = w.lock();
+            let st = &mut *st;
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
+            if st.world.tick % CONTROL_EVERY == 0 {
+                let moves = st.controller.reconcile(&mut st.world);
+                for a in &moves {
+                    announce(st, a);
+                }
+            }
             for o in outcomes {
                 match o {
                     HandoverOutcome::Started { entity, from, to } => {
                         let full = st.world.get(entity).map(to_wire);
                         push_event(
-                            &mut st,
+                            st,
                             to,
                             json!({"type": "handover_request", "entity": entity, "from": from, "state": full}),
                         );
                         push_event(
-                            &mut st,
+                            st,
                             from,
                             json!({"type": "handover_started", "entity": entity, "to": to}),
                         );
@@ -345,7 +402,7 @@ impl WorldRegistry {
                         let sims: Vec<Uuid> = st.sim_events.keys().copied().collect();
                         for s in sims {
                             push_event(
-                                &mut st,
+                                st,
                                 s,
                                 json!({"type": "handover_cancelled", "entity": entity, "reason": reason}),
                             );
@@ -375,6 +432,21 @@ impl WorldRegistry {
             }
         })
     }
+}
+
+fn announce(st: &mut WorldState, a: &Assignment) {
+    if let Some(from) = a.from {
+        push_event(
+            st,
+            from,
+            json!({"type": "cell_revoked", "cell": a.cell, "to": a.to, "reason": a.reason}),
+        );
+    }
+    push_event(
+        st,
+        a.to,
+        json!({"type": "cell_assigned", "cell": a.cell, "from": a.from, "reason": a.reason}),
+    );
 }
 
 fn push_event(st: &mut WorldState, sim: Uuid, ev: Value) {

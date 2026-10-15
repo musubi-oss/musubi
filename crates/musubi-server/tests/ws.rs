@@ -2208,3 +2208,153 @@ async fn world_meshing_sim_api_and_client_deltas() {
     }
     assert!(saw_update);
 }
+
+#[tokio::test]
+async fn shard_controller_assigns_cells_and_recovers_orphans() {
+    let Some(state) = build_state(true).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let k = "defaultkey";
+    let world = format!("sc{}", uuid::Uuid::now_v7().simple());
+    let call = |method: &'static str, path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    // leases last 15 ticks (0.5 s); the controller runs every 30 ticks
+    let (st, _) = call("POST", "/v1/server/worlds".into(), json!({"name": world, "config": {"cell_size": 100.0, "lease_ttl_ticks": 15}, "controller": {"sim_timeout_ticks": 15}})).await;
+    assert_eq!(st, 200);
+    let s1 = uuid::Uuid::now_v7();
+    let s2 = uuid::Uuid::now_v7();
+    let (st, _) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/sims"),
+        json!({"sim": s1, "capacity": 4}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/sims"),
+        json!({"sim": s2, "capacity": 4}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    // a client looks at an unowned cell → the controller leases it to a simulator
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, "json").await;
+    // simulators heartbeat (auth above may have taken longer than sim_timeout_ticks)
+    for sim in [s1, s2] {
+        call(
+            "POST",
+            format!("/v1/server/worlds/{world}/renew"),
+            json!({"sim": sim}),
+        )
+        .await;
+    }
+    send(
+        &mut c,
+        "json",
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 50.0,
+            y: 50.0,
+            radius: 10.0,
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (_, info) = call("GET", format!("/v1/server/worlds/{world}"), json!({})).await;
+    let cells = info["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 1, "{info}");
+    let owner = uuid::Uuid::parse_str(cells[0][1].as_str().unwrap()).unwrap();
+    assert!(owner == s1 || owner == s2);
+    let (_, ev) = call(
+        "GET",
+        format!("/v1/server/worlds/{world}/events?sim={owner}"),
+        json!({}),
+    )
+    .await;
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "cell_assigned" && e["reason"] == "interest"),
+        "{ev}"
+    );
+    // a simulator spawning into a free cell gets that cell
+    let other = if owner == s1 { s2 } else { s1 };
+    call(
+        "POST",
+        format!("/v1/server/worlds/{world}/renew"),
+        json!({"sim": other}),
+    )
+    .await;
+    let (st, _) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/spawn"),
+        json!({"sim": other, "x": 550.0, "y": 50.0}),
+    )
+    .await;
+    let (_, dbg) = call("GET", format!("/v1/server/worlds/{world}"), json!({})).await;
+    assert_eq!(st, 200, "{dbg}");
+    let (_, info) = call("GET", format!("/v1/server/worlds/{world}"), json!({})).await;
+    assert_eq!(info["cells"].as_array().unwrap().len(), 2, "{info}");
+    // `owner` dies (never renews); `other` keeps renewing → the orphaned cell moves to `other`
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut moved = false;
+    while tokio::time::Instant::now() < deadline {
+        call(
+            "POST",
+            format!("/v1/server/worlds/{world}/renew"),
+            json!({"sim": other}),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, info) = call("GET", format!("/v1/server/worlds/{world}"), json!({})).await;
+        let cells = info["cells"].as_array().unwrap();
+        if cells.len() == 2
+            && cells
+                .iter()
+                .all(|c| c[1].as_str().unwrap() == other.to_string())
+        {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "orphaned cell was not re-leased");
+    let (_, ev) = call(
+        "GET",
+        format!("/v1/server/worlds/{world}/events?sim={other}"),
+        json!({}),
+    )
+    .await;
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "cell_assigned" && e["from"] == owner.to_string()),
+        "{ev}"
+    );
+}

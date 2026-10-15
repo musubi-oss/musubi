@@ -7,6 +7,8 @@
 //!
 //! Space is 2D here (x, y); 3D/octree and non-spatial partition keys plug into `CellId` later.
 
+pub mod controller;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +68,7 @@ pub struct Lease {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WorldConfig {
     pub cell_size: f64,
     /// Entities this close to a border are ghosted to the neighbour.
@@ -212,6 +215,76 @@ impl World {
         }
     }
 
+    pub fn revoke_lease(&mut self, cell: CellId) -> Option<SimId> {
+        self.leases.remove(&cell).map(|l| l.sim)
+    }
+
+    /// Last holder even if the lease lapsed (None once revoked).
+    pub fn lease_holder(&self, cell: CellId) -> Option<SimId> {
+        self.leases.get(&cell).map(|l| l.sim)
+    }
+
+    pub fn leased_cells(&self) -> Vec<(CellId, SimId)> {
+        let mut v: Vec<(CellId, SimId)> = self
+            .leases
+            .iter()
+            .filter(|(_, l)| l.expires_tick > self.tick)
+            .map(|(c, l)| (*c, l.sim))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Remove leases that lapsed (dead simulators). Returns what was dropped.
+    pub fn drop_lapsed_leases(&mut self) -> Vec<(CellId, SimId)> {
+        let tick = self.tick;
+        let lapsed: Vec<(CellId, SimId)> = self
+            .leases
+            .iter()
+            .filter(|(_, l)| l.expires_tick <= tick)
+            .map(|(c, l)| (*c, l.sim))
+            .collect();
+        for (c, _) in &lapsed {
+            self.leases.remove(c);
+        }
+        lapsed
+    }
+
+    /// Cells any subscribed client is looking at.
+    pub fn interest_cells(&self) -> Vec<CellId> {
+        let mut v: Vec<CellId> = self
+            .interests
+            .values()
+            .flat_map(|i| self.cells_in_radius(i.pos, i.radius))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    pub fn entities_in(&self, cell: CellId) -> usize {
+        self.by_cell.get(&cell).map_or(0, |s| s.len())
+    }
+
+    /// Cells a circle of interest touches (bounding box).
+    pub fn cells_in_radius(&self, p: Pos, radius: f64) -> Vec<CellId> {
+        let lo = self.cell_of(Pos {
+            x: p.x - radius,
+            y: p.y - radius,
+        });
+        let hi = self.cell_of(Pos {
+            x: p.x + radius,
+            y: p.y + radius,
+        });
+        let mut v = Vec::new();
+        for x in lo.x..=hi.x {
+            for y in lo.y..=hi.y {
+                v.push(CellId { x, y });
+            }
+        }
+        v
+    }
+
     pub fn owner(&self, cell: CellId) -> Option<SimId> {
         self.leases
             .get(&cell)
@@ -335,7 +408,7 @@ impl World {
 
     // ----- ghosts & views -----
 
-    fn neighbours(c: CellId) -> impl Iterator<Item = CellId> {
+    pub fn neighbours(c: CellId) -> impl Iterator<Item = CellId> {
         (-1..=1).flat_map(move |dx| {
             (-1..=1).filter_map(move |dy| {
                 (dx != 0 || dy != 0).then_some(CellId {
