@@ -408,3 +408,150 @@ pub fn verify_apple_jws(jws: &str, root_der: &[u8], now: OffsetDateTime) -> Resu
         .map_err(|_| denied("bad payload encoding"))?;
     serde_json::from_slice(&payload).map_err(|_| denied("bad payload"))
 }
+
+// ----- Steam microtransactions (ISteamMicroTxn) -----
+
+#[derive(Debug, Clone)]
+pub struct SteamInitTxn {
+    pub order_id: i64,
+    pub steam_id: String,
+    pub item_id: String,
+    pub quantity: i64,
+    pub amount_cents: i64,
+    pub description: String,
+    pub language: String,
+    pub currency: String,
+}
+
+/// Steamworks Web API microtransactions: InitTxn → (user authorizes in the overlay) →
+/// FinalizeTxn captures funds; QueryTxn reports refunds/chargebacks for reconciliation.
+pub struct SteamClient {
+    http: reqwest::Client,
+    url: String,
+    key: String,
+    app_id: u32,
+    sandbox: bool,
+}
+
+impl SteamClient {
+    pub fn new(url: &str, key: &str, app_id: u32, sandbox: bool) -> Result<Arc<Self>> {
+        if key.is_empty() {
+            return Err(Error::InvalidArgument("steam web api key".into()));
+        }
+        Ok(Arc::new(Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(Error::internal)?,
+            url: url.trim_end_matches('/').to_string(),
+            key: key.into(),
+            app_id,
+            sandbox,
+        }))
+    }
+
+    pub fn sandbox(&self) -> bool {
+        self.sandbox
+    }
+
+    fn endpoint(&self, method: &str, version: u8) -> String {
+        let iface = if self.sandbox {
+            "ISteamMicroTxnSandbox"
+        } else {
+            "ISteamMicroTxn"
+        };
+        format!("{}/{iface}/{method}/v{version}/", self.url)
+    }
+
+    fn params(v: Value) -> Result<Value> {
+        let r = &v["response"];
+        if r["result"].as_str() != Some("OK") {
+            let desc = r["error"]["errordesc"]
+                .as_str()
+                .or(r["params"]["error"]["errordesc"].as_str())
+                .unwrap_or("steam: request failed");
+            return Err(Error::PermissionDenied(format!("steam: {desc}")));
+        }
+        Ok(r["params"].clone())
+    }
+
+    async fn post(&self, method: &str, version: u8, form: &[(&str, String)]) -> Result<Value> {
+        let res = self
+            .http
+            .post(self.endpoint(method, version))
+            .form(form)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("steam: {e}")))?;
+        if !res.status().is_success() {
+            return Err(Error::Unavailable(format!(
+                "steam: status {}",
+                res.status()
+            )));
+        }
+        Self::params(res.json().await.map_err(Error::internal)?)
+    }
+
+    /// Starts an order; returns Steam's transaction id. The user must then authorize it.
+    pub async fn init_txn(&self, t: &SteamInitTxn) -> Result<String> {
+        let p = self
+            .post(
+                "InitTxn",
+                3,
+                &[
+                    ("key", self.key.clone()),
+                    ("orderid", t.order_id.to_string()),
+                    ("steamid", t.steam_id.clone()),
+                    ("appid", self.app_id.to_string()),
+                    ("itemcount", "1".into()),
+                    ("language", t.language.clone()),
+                    ("currency", t.currency.clone()),
+                    ("itemid[0]", t.item_id.clone()),
+                    ("qty[0]", t.quantity.to_string()),
+                    ("amount[0]", (t.amount_cents * t.quantity).to_string()),
+                    ("description[0]", t.description.chars().take(128).collect()),
+                ],
+            )
+            .await?;
+        p["transid"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::Internal("steam: no transid".into()))
+    }
+
+    /// Captures funds for an authorized order; a success means the items may be granted.
+    pub async fn finalize_txn(&self, order_id: i64) -> Result<Value> {
+        self.post(
+            "FinalizeTxn",
+            2,
+            &[
+                ("key", self.key.clone()),
+                ("orderid", order_id.to_string()),
+                ("appid", self.app_id.to_string()),
+            ],
+        )
+        .await
+    }
+
+    /// Order status (`Succeeded`, `Refunded`, `Chargedback`, `PartialRefund`, ...).
+    pub async fn query_txn(&self, order_id: i64) -> Result<Value> {
+        let res = self
+            .http
+            .get(self.endpoint("QueryTxn", 3))
+            .query(&[
+                ("key", self.key.clone()),
+                ("appid", self.app_id.to_string()),
+                ("orderid", order_id.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("steam: {e}")))?;
+        if !res.status().is_success() {
+            return Err(Error::Unavailable(format!(
+                "steam: status {}",
+                res.status()
+            )));
+        }
+        Self::params(res.json().await.map_err(Error::internal)?)
+    }
+}

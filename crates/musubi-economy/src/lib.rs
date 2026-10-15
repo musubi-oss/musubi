@@ -17,7 +17,7 @@ pub use mailbox::{Mail, SendMail};
 pub mod progression;
 pub mod quests;
 pub mod seasons;
-pub use iap::{IapProduct, Receipt, ReceiptInput};
+pub use iap::{IapProduct, Receipt, ReceiptInput, SteamOrder};
 pub use quests::Quest;
 pub use seasons::Season;
 pub mod rewards;

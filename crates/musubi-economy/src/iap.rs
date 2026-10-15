@@ -3,6 +3,7 @@
 use musubi_core::{AccountId, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -13,6 +14,11 @@ pub struct IapProduct {
     pub provider: String,
     pub product_id: String,
     pub store_item_id: String,
+    /// Steam only: price charged by InitTxn, in minor units of the order currency.
+    #[serde(default)]
+    pub amount_cents: i64,
+    #[serde(default)]
+    pub description: String,
 }
 
 /// A provider-validated transaction, ready to be redeemed.
@@ -77,8 +83,10 @@ const COLS: &str = "id, account_id, provider, transaction_id, product_id, store_
 
 impl EconomyService {
     pub async fn upsert_iap_product(&self, p: IapProduct) -> Result<IapProduct> {
-        if !matches!(p.provider.as_str(), "apple" | "google") {
-            return Err(Error::InvalidArgument("provider: apple|google".into()));
+        if !matches!(p.provider.as_str(), "apple" | "google" | "steam") {
+            return Err(Error::InvalidArgument(
+                "provider: apple|google|steam".into(),
+            ));
         }
         if p.product_id.is_empty() || p.product_id.len() > 128 {
             return Err(Error::InvalidArgument("product_id".into()));
@@ -93,12 +101,14 @@ impl EconomyService {
             return Err(Error::NotFound(format!("store item {}", p.store_item_id)));
         }
         sqlx::query(
-            "insert into musubi.iap_products (provider, product_id, store_item_id) values ($1, $2, $3)
-             on conflict (provider, product_id) do update set store_item_id = excluded.store_item_id",
+            "insert into musubi.iap_products (provider, product_id, store_item_id, amount_cents, description) values ($1, $2, $3, $4, $5)
+             on conflict (provider, product_id) do update set store_item_id = excluded.store_item_id, amount_cents = excluded.amount_cents, description = excluded.description",
         )
         .bind(&p.provider)
         .bind(&p.product_id)
         .bind(&p.store_item_id)
+        .bind(p.amount_cents)
+        .bind(&p.description)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -117,6 +127,8 @@ impl EconomyService {
                 provider: r.0,
                 product_id: r.1,
                 store_item_id: r.2,
+                amount_cents: 0,
+                description: String::new(),
             })
             .collect())
     }
@@ -296,4 +308,114 @@ impl EconomyService {
         tx.commit().await.map_err(Error::internal)?;
         Ok(Some(receipt(row, false)))
     }
+
+    // ----- steam orders -----
+
+    pub async fn steam_product(&self, store_item_id: &str) -> Result<Option<IapProduct>> {
+        let row: Option<(String, String, String, i64, String)> = sqlx::query_as(
+            "select provider, product_id, store_item_id, amount_cents, description from musubi.iap_products where provider = 'steam' and store_item_id = $1",
+        )
+        .bind(store_item_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.map(|r| IapProduct {
+            provider: r.0,
+            product_id: r.1,
+            store_item_id: r.2,
+            amount_cents: r.3,
+            description: r.4,
+        }))
+    }
+
+    /// Records a pending Steam order and returns its 63-bit order id.
+    pub async fn create_steam_order(
+        &self,
+        account: AccountId,
+        product: &IapProduct,
+        quantity: i64,
+        steam_id: &str,
+        currency: &str,
+    ) -> Result<i64> {
+        let order_id = (u64::from_be_bytes(
+            sha2::Sha256::digest(Uuid::now_v7().as_bytes())[..8]
+                .try_into()
+                .expect("8 bytes"),
+        ) >> 1) as i64;
+        sqlx::query(
+            "insert into musubi.iap_orders (order_id, account_id, store_item_id, product_id, quantity, steam_id, currency) values ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(order_id)
+        .bind(account.0)
+        .bind(&product.store_item_id)
+        .bind(&product.product_id)
+        .bind(quantity)
+        .bind(steam_id)
+        .bind(currency)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(order_id)
+    }
+
+    pub async fn steam_order(&self, order_id: i64) -> Result<Option<SteamOrder>> {
+        let row: Option<SteamOrderRow> = sqlx::query_as(
+            "select account_id, store_item_id, product_id, quantity, steam_id, currency, finalized_at from musubi.iap_orders where order_id = $1",
+        )
+        .bind(order_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.map(|r| SteamOrder {
+            order_id,
+            account_id: AccountId(r.0),
+            store_item_id: r.1,
+            product_id: r.2,
+            quantity: r.3,
+            steam_id: r.4,
+            currency: r.5,
+            finalized: r.6.is_some(),
+        }))
+    }
+
+    pub async fn finalize_steam_order(&self, order_id: i64) -> Result<()> {
+        sqlx::query("update musubi.iap_orders set finalized_at = now() where order_id = $1")
+            .bind(order_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Live (not revoked) Steam receipts as `(transaction_id, order_id)` for refund reconciliation.
+    pub async fn steam_receipt_orders(&self) -> Result<Vec<(String, i64)>> {
+        sqlx::query_as(
+            "select transaction_id, (raw->>'orderid')::bigint from musubi.iap_receipts where provider = 'steam' and revoked_at is null and raw->>'orderid' is not null",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+}
+
+type SteamOrderRow = (
+    Uuid,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<OffsetDateTime>,
+);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SteamOrder {
+    pub order_id: i64,
+    pub account_id: AccountId,
+    pub store_item_id: String,
+    pub product_id: String,
+    pub quantity: i64,
+    pub steam_id: String,
+    pub currency: String,
+    pub finalized: bool,
 }

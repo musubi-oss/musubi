@@ -245,6 +245,30 @@ pub struct AurixConfig {
 pub struct IapConfig {
     pub apple: AppleIapConfig,
     pub google: GoogleIapConfig,
+    pub steam: SteamIapConfig,
+}
+
+/// Steamworks Web API microtransactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SteamIapConfig {
+    pub url: String,
+    /// Publisher Web API key with microtransaction permissions; empty = disabled.
+    pub key: String,
+    pub app_id: u32,
+    /// Use ISteamMicroTxnSandbox.
+    pub sandbox: bool,
+}
+
+impl Default for SteamIapConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://partner.steam-api.com".into(),
+            key: String::new(),
+            app_id: 0,
+            sandbox: false,
+        }
+    }
 }
 
 /// Apple App Store Server API (StoreKit 2 transaction ids).

@@ -74,6 +74,7 @@ async fn app() -> Option<Router> {
         voice: None,
         apple_iap: None,
         google_iap: None,
+        steam_iap: None,
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),

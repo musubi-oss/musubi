@@ -92,6 +92,7 @@ async fn build_state(leader: bool) -> Option<AppState> {
         voice: None,
         apple_iap: None,
         google_iap: None,
+        steam_iap: None,
         runtime: runtime.clone(),
         cluster: cluster.clone(),
         fleets: fleets.clone(),
@@ -2753,9 +2754,52 @@ async fn mock_stores(bundle_id: &str, item_product: &str) -> (String, Arc<TestCh
     use axum::Json;
     let ch = Arc::new(TestChain::generate());
     let chain = ch.clone();
+    let refunded: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Default::default();
+    let (rf1, rf2) = (refunded.clone(), refunded.clone());
     let b = bundle_id.to_string();
     let prod = item_product.to_string();
     let app = axum::Router::new()
+        .route(
+            "/ISteamMicroTxnSandbox/InitTxn/v3/",
+            post(|axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+                if f.get("key").map(String::as_str) != Some("STEAMKEY") || f.get("appid").map(String::as_str) != Some("480") {
+                    return Json(json!({"response": {"result": "Failure", "error": {"errorcode": 3, "errordesc": "bad key"}}}));
+                }
+                let oid = f.get("orderid").cloned().unwrap_or_default();
+                if f.get("amount[0]").map(String::as_str) != Some("398") || f.get("qty[0]").map(String::as_str) != Some("2") {
+                    return Json(json!({"response": {"result": "Failure", "error": {"errorcode": 7, "errordesc": "bad amount"}}}));
+                }
+                Json(json!({"response": {"result": "OK", "params": {"orderid": oid, "transid": format!("T{oid}"), "steamurl": ""}}}))
+            }),
+        )
+        .route(
+            "/ISteamMicroTxnSandbox/FinalizeTxn/v2/",
+            post(|axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+                let oid = f.get("orderid").cloned().unwrap_or_default();
+                Json(json!({"response": {"result": "OK", "params": {"orderid": oid, "transid": format!("T{oid}")}}}))
+            }),
+        )
+        .route(
+            "/ISteamMicroTxnSandbox/QueryTxn/v3/",
+            get(move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| {
+                let rf = rf1.clone();
+                async move {
+                    let oid = q.get("orderid").cloned().unwrap_or_default();
+                    let status = if rf.lock().unwrap().contains(&oid) { "Refunded" } else { "Succeeded" };
+                    Json(json!({"response": {"result": "OK", "params": {"orderid": oid, "transid": format!("T{oid}"), "status": status}}}))
+                }
+            }),
+        )
+        .route(
+            "/mock/steam/refund/{oid}",
+            post(move |Path(oid): Path<String>| {
+                let rf = rf2.clone();
+                async move {
+                    rf.lock().unwrap().insert(oid);
+                    Json(json!({}))
+                }
+            }),
+        )
         .route(
             "/inApps/v1/transactions/{id}",
             get(move |Path(id): Path<String>, headers: axum::http::HeaderMap| {
@@ -2862,6 +2906,8 @@ async fn iap_apple_and_google_receipts_redeem_once() {
         )
         .unwrap(),
     );
+    state.steam_iap =
+        Some(musubi_integrations::SteamClient::new(&upstream, "STEAMKEY", 480, true).unwrap());
     state.google_iap = Some(
         musubi_integrations::GooglePlayClient::new_with_notifications(
             &upstream,
@@ -3152,4 +3198,91 @@ async fn iap_apple_and_google_receipts_redeem_once() {
     assert_eq!(st, 200, "{r}");
     assert_eq!(r["revoked"]["revoked"], true);
     assert_eq!(r["revoked"]["provider"], "google");
+    // Steam: server-initiated order → overlay → finalize grants; refunds found by reconciliation
+    let (st, _) = http_json(&router, "POST", "/v1/server/iap/products", None, true, Some(json!({"provider": "steam", "product_id": "7001", "store_item_id": gem_pack, "amount_cents": 199, "description": "Gem pack"}))).await;
+    assert_eq!(st, 200);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/steam/init",
+        Some(&ta),
+        false,
+        Some(json!({"steam_id": "76561197960287930", "store_item_id": gem_pack, "quantity": 2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let order_id = r["order_id"].as_str().unwrap().to_string();
+    assert_eq!(r["transaction_id"], format!("T{order_id}"));
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/steam/init",
+        Some(&ta),
+        false,
+        Some(json!({"steam_id": "1", "store_item_id": "nope", "quantity": 1})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/steam/finalize",
+        Some(&ta),
+        false,
+        Some(json!({"order_id": order_id})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["provider"], "steam");
+    assert_eq!(r["transaction_id"], format!("T{order_id}"));
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/steam/finalize",
+        Some(&ta),
+        false,
+        Some(json!({"order_id": order_id})),
+    )
+    .await;
+    assert_eq!(st, 409);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/iap/steam/reconcile",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["revoked"], json!([]));
+    reqwest::Client::new()
+        .post(format!("{upstream}/mock/steam/refund/{order_id}"))
+        .send()
+        .await
+        .unwrap();
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/iap/steam/reconcile",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(r["revoked"], json!([format!("T{order_id}")]));
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/iap/steam/reconcile",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(
+        r["revoked"],
+        json!([]),
+        "already revoked receipts are skipped"
+    );
 }

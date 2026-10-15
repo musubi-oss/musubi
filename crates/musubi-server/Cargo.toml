@@ -58,3 +58,4 @@ tokio-tungstenite.workspace = true
 musubi-proto.workspace = true
 jsonwebtoken.workspace = true
 rcgen.workspace = true
+reqwest.workspace = true

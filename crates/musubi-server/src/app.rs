@@ -46,6 +46,7 @@ pub struct AppState {
     pub voice: Option<Arc<AurixClient>>,
     pub apple_iap: Option<Arc<musubi_integrations::AppleStoreClient>>,
     pub google_iap: Option<Arc<musubi_integrations::GooglePlayClient>>,
+    pub steam_iap: Option<Arc<musubi_integrations::SteamClient>>,
     pub runtime: Arc<Runtime>,
     pub cluster: Option<Arc<Cluster>>,
     pub fleets: Arc<FleetService>,
@@ -204,6 +205,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             pem,
         )
     });
+    let steam_iap = if cfg.iap.steam.key.is_empty() {
+        None
+    } else {
+        match musubi_integrations::SteamClient::new(
+            &cfg.iap.steam.url,
+            &cfg.iap.steam.key,
+            cfg.iap.steam.app_id,
+            cfg.iap.steam.sandbox,
+        ) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(provider = "steam", error = %e, "iap provider disabled");
+                None
+            }
+        }
+    };
     let google_iap = iap_client("google", &cfg.iap.google.private_key_pem_path, |pem| {
         musubi_integrations::GooglePlayClient::new_with_notifications(
             &cfg.iap.google.url,
@@ -238,6 +255,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         voice,
         apple_iap,
         google_iap,
+        steam_iap,
         runtime,
         cluster: Some(cluster),
         fleets,

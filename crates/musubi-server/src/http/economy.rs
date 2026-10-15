@@ -69,6 +69,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/quests/event", post(quest_event))
         .route("/v1/server/seasons", get(seasons_all).post(upsert_season))
         .route("/v1/server/seasons/{id}/premium", post(season_premium))
+        .route("/v1/iap/steam/init", post(iap_steam_init))
+        .route("/v1/iap/steam/finalize", post(iap_steam_finalize))
+        .route("/v1/server/iap/steam/reconcile", post(iap_steam_reconcile))
         .route("/v1/mail", get(mail_list))
         .route("/v1/mail/{id}", axum::routing::delete(mail_delete))
         .route("/v1/mail/{id}/read", post(mail_read))
@@ -1024,4 +1027,171 @@ async fn iap_google_notifications(
         revoked = s.economy.revoke_receipt("google", t, reason).await?;
     }
     Ok(Json(json!({ "revoked": revoked })))
+}
+
+// ----- steam microtransactions -----
+
+#[derive(Deserialize)]
+struct SteamInitReq {
+    steam_id: String,
+    store_item_id: String,
+    #[serde(default = "one")]
+    quantity: i64,
+    #[serde(default = "en")]
+    language: String,
+    #[serde(default = "usd")]
+    currency: String,
+}
+
+fn en() -> String {
+    "en".into()
+}
+
+fn usd() -> String {
+    "USD".into()
+}
+
+/// Starts a Steam order for a store listing mapped to a Steam item id; the client then shows the
+/// Steam overlay and calls `finalize` once the user authorized it.
+async fn iap_steam_init(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<SteamInitReq>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(c) = &s.steam_iap else {
+        return Err(Error::NotFound("steam iap is not configured".into()).into());
+    };
+    if r.quantity <= 0 || r.quantity > 100 || r.steam_id.is_empty() {
+        return Err(Error::InvalidArgument("steam_id and quantity 1..=100".into()).into());
+    }
+    let Some(product) = s.economy.steam_product(&r.store_item_id).await? else {
+        return Err(Error::NotFound("store item is not sold on steam".into()).into());
+    };
+    let order_id = s
+        .economy
+        .create_steam_order(
+            me.account_id,
+            &product,
+            r.quantity,
+            &r.steam_id,
+            &r.currency,
+        )
+        .await?;
+    let description = if product.description.is_empty() {
+        product.store_item_id.clone()
+    } else {
+        product.description.clone()
+    };
+    let transid = c
+        .init_txn(&musubi_integrations::SteamInitTxn {
+            order_id,
+            steam_id: r.steam_id,
+            item_id: product.product_id.clone(),
+            quantity: r.quantity,
+            amount_cents: product.amount_cents,
+            description,
+            language: r.language,
+            currency: r.currency,
+        })
+        .await?;
+    Ok(Json(
+        json!({ "order_id": order_id.to_string(), "transaction_id": transid }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SteamFinalizeReq {
+    order_id: String,
+}
+
+/// Captures the authorized order and grants the mapped store item.
+async fn iap_steam_finalize(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<SteamFinalizeReq>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(c) = &s.steam_iap else {
+        return Err(Error::NotFound("steam iap is not configured".into()).into());
+    };
+    let order_id: i64 = r
+        .order_id
+        .parse()
+        .map_err(|_| Error::InvalidArgument("order_id".into()))?;
+    let Some(order) = s.economy.steam_order(order_id).await? else {
+        return Err(Error::NotFound("steam order".into()).into());
+    };
+    if order.account_id != me.account_id {
+        return Err(Error::PermissionDenied("not your order".into()).into());
+    }
+    if order.finalized {
+        return Err(Error::Conflict("order already finalized".into()).into());
+    }
+    let p = c.finalize_txn(order_id).await?;
+    let transid = p["transid"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("order-{order_id}"));
+    let mut raw = p.clone();
+    raw["orderid"] = json!(order_id.to_string());
+    raw["quantity"] = json!(order.quantity);
+    let environment = if c.sandbox() { "Sandbox" } else { "Production" };
+    let rc = s
+        .economy
+        .redeem(
+            me.account_id,
+            ReceiptInput {
+                provider: "steam".into(),
+                transaction_id: transid,
+                product_id: order.product_id.clone(),
+                environment: environment.into(),
+                purchased_at_ms: OffsetDateTime::now_utc().unix_timestamp() * 1000,
+                quantity: order.quantity,
+                raw,
+            },
+        )
+        .await?;
+    s.economy.finalize_steam_order(order_id).await?;
+    Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
+}
+
+/// Steam has no refund push: poll QueryTxn for every live Steam receipt and revoke refunded ones.
+async fn iap_steam_reconcile(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    let Some(c) = &s.steam_iap else {
+        return Err(Error::NotFound("steam iap is not configured".into()).into());
+    };
+    let mut revoked = Vec::new();
+    let orders = s.economy.steam_receipt_orders().await?;
+    for (transid, order_id) in &orders {
+        let status = match c.query_txn(*order_id).await {
+            Ok(p) => p["status"].as_str().unwrap_or("").to_string(),
+            Err(e) => {
+                tracing::warn!(order_id, error = %e, "steam QueryTxn failed");
+                continue;
+            }
+        };
+        if matches!(
+            status.as_str(),
+            "Refunded"
+                | "PartialRefund"
+                | "Chargedback"
+                | "RefundedSuspectedFraud"
+                | "RefundedFriendlyFraud"
+        ) {
+            if let Some(r) = s
+                .economy
+                .revoke_receipt(
+                    "steam",
+                    transid,
+                    &format!("steam.{}", status.to_lowercase()),
+                )
+                .await?
+            {
+                revoked.push(r.transaction_id);
+            }
+        }
+    }
+    Ok(Json(json!({ "checked": orders.len(), "revoked": revoked })))
 }

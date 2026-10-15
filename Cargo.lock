@@ -2065,6 +2065,7 @@ dependencies = [
  "parking_lot",
  "quinn",
  "rcgen",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
