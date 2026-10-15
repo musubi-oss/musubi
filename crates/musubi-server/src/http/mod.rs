@@ -36,6 +36,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(crate::metrics::render))
+        .route("/openapi.json", get(openapi))
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
         .merge(admin::routes())
@@ -130,4 +131,8 @@ async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "parties": s.parties.party_count(),
         "matchmaker_tickets": s.matchmaker.ticket_count(),
     }))
+}
+
+async fn openapi() -> Json<serde_json::Value> {
+    Json(crate::openapi::document(env!("CARGO_PKG_VERSION")))
 }

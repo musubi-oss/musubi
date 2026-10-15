@@ -11,6 +11,7 @@ pub mod limits;
 pub mod metrics;
 pub mod modules;
 pub mod notify;
+pub mod openapi;
 pub mod realtime;
 pub mod runtime_host;
 
