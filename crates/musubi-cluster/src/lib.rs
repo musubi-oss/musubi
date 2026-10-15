@@ -13,7 +13,10 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
+pub mod log_store;
+pub mod raft;
 pub mod swim;
+pub use raft::{DirectoryOp, DirectoryResp, RaftNodeId};
 pub use swim::{MemberUpdate, State};
 
 use musubi_core::{Error, NodeId, Result};
@@ -46,6 +49,9 @@ pub struct NodeInfo {
     /// SWIM view: `alive` | `suspect` | `dead`.
     #[serde(default)]
     pub state: String,
+    /// Raft node id (0 = not raft-capable, i.e. no QUIC bus).
+    #[serde(default)]
+    pub raft_id: u64,
 }
 
 type NodeRow = (
@@ -59,6 +65,7 @@ type NodeRow = (
     OffsetDateTime,
     String,
     String,
+    i64,
 );
 
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
@@ -85,6 +92,7 @@ pub struct Cluster {
     pub(crate) bus: Option<Arc<QuicBus>>,
     pub(crate) members: Arc<RwLock<HashMap<Uuid, swim::Member>>>,
     pub(crate) incarnation: Arc<AtomicU64>,
+    pub(crate) raft: Arc<std::sync::OnceLock<raft::RaftState>>,
 }
 
 /// A message from another node. `topic` routes it; `payload` is topic-specific JSON.
@@ -120,12 +128,14 @@ impl Cluster {
                 bus_addr: String::new(),
                 bus_cert: String::new(),
                 state: "alive".into(),
+                raft_id: 0,
             },
             bus_tx,
             peers: Arc::new(RwLock::new(Vec::new())),
             bus: None,
             members: Arc::new(RwLock::new(HashMap::new())),
             incarnation: Arc::new(AtomicU64::new(0)),
+            raft: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -157,6 +167,7 @@ impl Cluster {
             None => local.to_string(),
         };
         self.me.bus_cert = hex::encode(der.as_ref());
+        self.me.raft_id = raft::raft_id(self.me.id.0);
         self.bus = Some(Arc::new(QuicBus {
             endpoint,
             conns: Mutex::new(HashMap::new()),
@@ -199,7 +210,7 @@ impl Cluster {
     /// Insert our row, then keep heartbeating and relaying bus notifications until dropped.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         sqlx::query(
-            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)",
+            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10)",
         )
         .bind(self.me.id.0)
         .bind(&self.me.name)
@@ -210,6 +221,7 @@ impl Cluster {
         .bind(self.me.started_at)
         .bind(&self.me.bus_addr)
         .bind(&self.me.bus_cert)
+        .bind(self.me.raft_id as i64)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -291,18 +303,27 @@ impl Cluster {
                         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                             let c = cl.clone();
                             tokio::spawn(async move {
-                                let Ok(buf) = recv.read_to_end(swim::MAX_SWIM_FRAME).await else {
+                                let Ok(buf) = recv.read_to_end(raft::MAX_RAFT_FRAME).await else {
                                     return;
                                 };
-                                let Ok(msg) = serde_json::from_slice::<swim::Msg>(&buf) else {
-                                    return;
+                                let resp = match buf.split_first() {
+                                    Some((&raft::TAG_SWIM, body)) => {
+                                        let Ok(msg) = serde_json::from_slice::<swim::Msg>(body)
+                                        else {
+                                            return;
+                                        };
+                                        serde_json::to_vec(&c.handle_swim(msg).await)
+                                            .unwrap_or_default()
+                                    }
+                                    Some((&raft::TAG_RAFT, body)) => c.handle_raft(body).await,
+                                    Some((&raft::TAG_WRITE, body)) => {
+                                        c.handle_forwarded_write(body).await
+                                    }
+                                    _ => return,
                                 };
-                                let resp = c.handle_swim(msg).await;
-                                if let Ok(b) = serde_json::to_vec(&resp) {
-                                    let _ = send.write_all(&b).await;
-                                    let _ = send.finish();
-                                    let _ = send.stopped().await;
-                                }
+                                let _ = send.write_all(&resp).await;
+                                let _ = send.finish();
+                                let _ = send.stopped().await;
                             });
                         }
                     });
@@ -318,6 +339,7 @@ impl Cluster {
                     n = n.wrapping_add(1);
                 }
             });
+            self.start_raft().await?;
         }
         self.refresh_peers().await?;
         Ok(())
@@ -345,7 +367,7 @@ impl Cluster {
 
     pub async fn nodes(&self) -> Result<Vec<NodeInfo>> {
         let rows = sqlx::query_as::<_, NodeRow>(
-            "select id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert from musubi.nodes order by started_at",
+            "select id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id from musubi.nodes order by started_at",
         )
         .fetch_all(&self.db)
         .await
@@ -376,6 +398,7 @@ impl Cluster {
                     bus_addr: r.8,
                     bus_cert: r.9,
                     state: state.into(),
+                    raft_id: r.10 as u64,
                 }
             })
             .collect())
@@ -544,6 +567,40 @@ impl Cluster {
 impl BusMessage {
     pub fn decode<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_value(self.payload.clone()).map_err(Into::into)
+    }
+}
+
+impl Cluster {
+    /// Tagged request/response on a QUIC bi-stream (SWIM, Raft RPC, forwarded writes).
+    pub(crate) async fn bus_request(
+        &self,
+        peer: &NodeInfo,
+        tag: u8,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let bus = self
+            .bus
+            .as_ref()
+            .ok_or_else(|| Error::Internal("bus disabled".into()))?;
+        let r = tokio::time::timeout(timeout, async {
+            let conn = bus.connection(peer).await?;
+            let (mut send, mut recv) = conn.open_bi().await.map_err(Error::internal)?;
+            let mut frame = Vec::with_capacity(body.len() + 1);
+            frame.push(tag);
+            frame.extend_from_slice(body);
+            send.write_all(&frame).await.map_err(Error::internal)?;
+            send.finish().map_err(Error::internal)?;
+            recv.read_to_end(raft::MAX_RAFT_FRAME)
+                .await
+                .map_err(Error::internal)
+        })
+        .await
+        .map_err(|_| Error::Internal("bus request timeout".into()))?;
+        if r.is_err() {
+            bus.conns.lock().await.remove(&peer.id.0);
+        }
+        r
     }
 }
 

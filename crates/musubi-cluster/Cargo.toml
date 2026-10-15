@@ -20,3 +20,5 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 rcgen.workspace = true
 hex.workspace = true
+openraft.workspace = true
+sha2.workspace = true

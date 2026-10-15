@@ -1,0 +1,548 @@
+//! Raft control plane (openraft) over the QUIC bus: a replicated directory (world → home node,
+//! generic key/value) and a single elected control-plane leader. Membership follows the live
+//! bus peers automatically (bootstrap guarded by a Postgres lease, dead peers removed by the
+//! leader). The log is in memory: on a full-cluster restart the directory is rebuilt from Postgres.
+#![allow(clippy::result_large_err)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use musubi_core::{Error, Result};
+use openraft::error::{
+    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
+};
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
+use openraft::storage::{RaftStateMachine, Snapshot};
+use openraft::{
+    BasicNode, Entry, EntryPayload, LogId, RaftSnapshotBuilder, RaftTypeConfig, SnapshotMeta,
+    StorageError, StorageIOError, StoredMembership,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use crate::{Cluster, NodeInfo};
+
+pub type RaftNodeId = u64;
+
+openraft::declare_raft_types!(pub TypeConfig: D = DirectoryOp, R = DirectoryResp);
+
+pub type LogStore = crate::log_store::LogStore<TypeConfig>;
+pub type Raft = openraft::Raft<TypeConfig>;
+
+pub(crate) const TAG_SWIM: u8 = 1;
+pub(crate) const TAG_RAFT: u8 = 2;
+pub(crate) const TAG_WRITE: u8 = 3;
+pub(crate) const MAX_RAFT_FRAME: usize = 64 * 1024 * 1024;
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+const MEMBERSHIP_SYNC: Duration = Duration::from_secs(2);
+const INIT_LEASE_TTL: Duration = Duration::from_secs(10);
+
+/// Raft node id derived from the cluster node uuid.
+pub fn raft_id(id: Uuid) -> RaftNodeId {
+    let h = Sha256::digest(id.as_bytes());
+    u64::from_be_bytes(h[..8].try_into().expect("8 bytes"))
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum DirectoryOp {
+    Set { key: String, value: Value },
+    Delete { key: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct DirectoryResp {
+    pub value: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct DirectoryData {
+    pub last_applied_log: Option<LogId<RaftNodeId>>,
+    pub last_membership: StoredMembership<RaftNodeId, BasicNode>,
+    pub data: BTreeMap<String, Value>,
+}
+
+#[derive(Debug)]
+pub struct StoredSnapshot {
+    pub meta: SnapshotMeta<RaftNodeId, BasicNode>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+pub struct StateMachineStore {
+    pub state: RwLock<DirectoryData>,
+    snapshot_idx: AtomicU64,
+    current_snapshot: RwLock<Option<StoredSnapshot>>,
+}
+
+impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
+    async fn build_snapshot(
+        &mut self,
+    ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<RaftNodeId>> {
+        let sm = self.state.read().await;
+        let data =
+            serde_json::to_vec(&sm.data).map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let last_applied_log = sm.last_applied_log;
+        let last_membership = sm.last_membership.clone();
+        drop(sm);
+        let idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
+        let snapshot_id = match last_applied_log {
+            Some(last) => format!("{}-{}-{}", last.leader_id, last.index, idx),
+            None => format!("--{idx}"),
+        };
+        let meta = SnapshotMeta {
+            last_log_id: last_applied_log,
+            last_membership,
+            snapshot_id,
+        };
+        *self.current_snapshot.write().await = Some(StoredSnapshot {
+            meta: meta.clone(),
+            data: data.clone(),
+        });
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(data)),
+        })
+    }
+}
+
+impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
+    type SnapshotBuilder = Self;
+
+    async fn applied_state(
+        &mut self,
+    ) -> std::result::Result<
+        (
+            Option<LogId<RaftNodeId>>,
+            StoredMembership<RaftNodeId, BasicNode>,
+        ),
+        StorageError<RaftNodeId>,
+    > {
+        let sm = self.state.read().await;
+        Ok((sm.last_applied_log, sm.last_membership.clone()))
+    }
+
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> std::result::Result<Vec<DirectoryResp>, StorageError<RaftNodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+    {
+        let mut res = Vec::new();
+        let mut sm = self.state.write().await;
+        for entry in entries {
+            sm.last_applied_log = Some(entry.log_id);
+            match entry.payload {
+                EntryPayload::Blank => res.push(DirectoryResp::default()),
+                EntryPayload::Normal(ref op) => match op {
+                    DirectoryOp::Set { key, value } => {
+                        sm.data.insert(key.clone(), value.clone());
+                        res.push(DirectoryResp {
+                            value: Some(value.clone()),
+                        });
+                    }
+                    DirectoryOp::Delete { key } => {
+                        let old = sm.data.remove(key);
+                        res.push(DirectoryResp { value: old });
+                    }
+                },
+                EntryPayload::Membership(ref mem) => {
+                    sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                    res.push(DirectoryResp::default());
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> std::result::Result<
+        Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
+        StorageError<RaftNodeId>,
+    > {
+        Ok(Box::new(Cursor::new(Vec::new())))
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<RaftNodeId, BasicNode>,
+        snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
+    ) -> std::result::Result<(), StorageError<RaftNodeId>> {
+        let new = StoredSnapshot {
+            meta: meta.clone(),
+            data: snapshot.into_inner(),
+        };
+        let data: BTreeMap<String, Value> = serde_json::from_slice(&new.data)
+            .map_err(|e| StorageIOError::read_snapshot(Some(new.meta.signature()), &e))?;
+        *self.state.write().await = DirectoryData {
+            last_applied_log: meta.last_log_id,
+            last_membership: meta.last_membership.clone(),
+            data,
+        };
+        *self.current_snapshot.write().await = Some(new);
+        Ok(())
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> std::result::Result<Option<Snapshot<TypeConfig>>, StorageError<RaftNodeId>> {
+        Ok(self
+            .current_snapshot
+            .read()
+            .await
+            .as_ref()
+            .map(|s| Snapshot {
+                meta: s.meta.clone(),
+                snapshot: Box::new(Cursor::new(s.data.clone())),
+            }))
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        self.clone()
+    }
+}
+
+/// Raft RPCs carried on QUIC bi-streams tagged `TAG_RAFT`.
+#[derive(Serialize, Deserialize, Debug)]
+pub(crate) enum RaftRpc {
+    Append(AppendEntriesRequest<TypeConfig>),
+    Vote(VoteRequest<RaftNodeId>),
+    Snapshot(InstallSnapshotRequest<TypeConfig>),
+}
+
+pub(crate) struct RaftState {
+    pub raft: Raft,
+    pub sm: Arc<StateMachineStore>,
+}
+
+pub(crate) struct RaftNet {
+    cluster: Cluster,
+}
+
+pub(crate) struct RaftConn {
+    cluster: Cluster,
+    target: RaftNodeId,
+}
+
+impl RaftNetworkFactory<TypeConfig> for RaftNet {
+    type Network = RaftConn;
+
+    async fn new_client(&mut self, target: RaftNodeId, _node: &BasicNode) -> Self::Network {
+        RaftConn {
+            cluster: self.cluster.clone(),
+            target,
+        }
+    }
+}
+
+impl RaftConn {
+    async fn call<Resp, E>(
+        &self,
+        rpc: RaftRpc,
+    ) -> std::result::Result<Resp, RPCError<RaftNodeId, BasicNode, E>>
+    where
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
+        let peer = self
+            .cluster
+            .peer_by_raft_id(self.target)
+            .await
+            .ok_or_else(|| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                    "raft peer {} unknown",
+                    self.target
+                ))))
+            })?;
+        let body =
+            serde_json::to_vec(&rpc).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let resp = self
+            .cluster
+            .bus_request(&peer, TAG_RAFT, &body, RPC_TIMEOUT)
+            .await
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
+            })?;
+        let res: std::result::Result<Resp, E> =
+            serde_json::from_slice(&resp).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        res.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+    }
+}
+
+impl RaftNetwork<TypeConfig> for RaftConn {
+    async fn append_entries(
+        &mut self,
+        req: AppendEntriesRequest<TypeConfig>,
+        _o: RPCOption,
+    ) -> std::result::Result<
+        AppendEntriesResponse<RaftNodeId>,
+        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
+    > {
+        self.call(RaftRpc::Append(req)).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        req: InstallSnapshotRequest<TypeConfig>,
+        _o: RPCOption,
+    ) -> std::result::Result<
+        InstallSnapshotResponse<RaftNodeId>,
+        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, InstallSnapshotError>>,
+    > {
+        self.call(RaftRpc::Snapshot(req)).await
+    }
+
+    async fn vote(
+        &mut self,
+        req: VoteRequest<RaftNodeId>,
+        _o: RPCOption,
+    ) -> std::result::Result<
+        VoteResponse<RaftNodeId>,
+        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
+    > {
+        self.call(RaftRpc::Vote(req)).await
+    }
+}
+
+impl Cluster {
+    pub(crate) async fn peer_by_raft_id(&self, id: RaftNodeId) -> Option<NodeInfo> {
+        self.peers
+            .read()
+            .await
+            .iter()
+            .find(|p| p.raft_id == id)
+            .cloned()
+    }
+
+    pub(crate) async fn start_raft(&self) -> Result<()> {
+        if self.bus.is_none() {
+            return Ok(());
+        }
+        let config = openraft::Config {
+            heartbeat_interval: 300,
+            election_timeout_min: 1000,
+            election_timeout_max: 2000,
+            ..Default::default()
+        };
+        let config = Arc::new(config.validate().map_err(Error::internal)?);
+        let sm = Arc::new(StateMachineStore::default());
+        let raft = Raft::new(
+            self.me.raft_id,
+            config,
+            RaftNet {
+                cluster: self.clone(),
+            },
+            LogStore::default(),
+            sm.clone(),
+        )
+        .await
+        .map_err(Error::internal)?;
+        if self.raft.set(RaftState { raft, sm }).is_err() {
+            return Err(Error::Internal("raft already started".into()));
+        }
+        let c = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(MEMBERSHIP_SYNC);
+            loop {
+                tick.tick().await;
+                c.raft_control_round().await;
+            }
+        });
+        Ok(())
+    }
+
+    fn raft_state(&self) -> Option<&RaftState> {
+        self.raft.get()
+    }
+
+    /// Our raft id (0 when the QUIC bus is disabled).
+    pub fn raft_id(&self) -> RaftNodeId {
+        self.me.raft_id
+    }
+
+    pub fn raft_leader(&self) -> Option<RaftNodeId> {
+        self.raft_state()
+            .and_then(|r| r.raft.metrics().borrow().current_leader)
+    }
+
+    pub fn is_raft_leader(&self) -> bool {
+        self.raft_leader().is_some_and(|l| l == self.me.raft_id)
+    }
+
+    pub fn raft_voters(&self) -> BTreeSet<RaftNodeId> {
+        self.raft_state()
+            .map(|r| {
+                r.raft
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Local, possibly slightly stale read of the replicated directory.
+    pub async fn directory_get(&self, key: &str) -> Option<Value> {
+        let r = self.raft_state()?;
+        r.sm.state.read().await.data.get(key).cloned()
+    }
+
+    pub async fn directory_prefix(&self, prefix: &str) -> Vec<(String, Value)> {
+        let Some(r) = self.raft_state() else {
+            return Vec::new();
+        };
+        r.sm.state
+            .read()
+            .await
+            .data
+            .range(prefix.to_string()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Replicated write: applied by the leader, forwarded over the bus when we are a follower.
+    pub async fn directory_write(&self, op: DirectoryOp) -> Result<DirectoryResp> {
+        let r = self
+            .raft_state()
+            .ok_or_else(|| Error::Internal("raft not running (bus disabled)".into()))?;
+        if self.is_raft_leader() {
+            return match r.raft.client_write(op).await {
+                Ok(resp) => Ok(resp.data),
+                Err(e) => Err(Error::Internal(format!("raft write: {e}"))),
+            };
+        }
+        let leader = self
+            .raft_leader()
+            .ok_or_else(|| Error::Conflict("raft has no leader yet".into()))?;
+        let peer = self
+            .peer_by_raft_id(leader)
+            .await
+            .ok_or_else(|| Error::Conflict(format!("raft leader {leader} unknown")))?;
+        let body = serde_json::to_vec(&op)?;
+        let resp = self
+            .bus_request(&peer, TAG_WRITE, &body, RPC_TIMEOUT)
+            .await?;
+        let res: std::result::Result<DirectoryResp, String> = serde_json::from_slice(&resp)?;
+        res.map_err(Error::Internal)
+    }
+
+    pub(crate) async fn handle_raft(&self, body: &[u8]) -> Vec<u8> {
+        let Some(r) = self.raft_state() else {
+            return b"null".to_vec();
+        };
+        let Ok(rpc) = serde_json::from_slice::<RaftRpc>(body) else {
+            return b"null".to_vec();
+        };
+        match rpc {
+            RaftRpc::Append(req) => serde_json::to_vec(&r.raft.append_entries(req).await),
+            RaftRpc::Vote(req) => serde_json::to_vec(&r.raft.vote(req).await),
+            RaftRpc::Snapshot(req) => serde_json::to_vec(&r.raft.install_snapshot(req).await),
+        }
+        .unwrap_or_else(|_| b"null".to_vec())
+    }
+
+    pub(crate) async fn handle_forwarded_write(&self, body: &[u8]) -> Vec<u8> {
+        let res: std::result::Result<DirectoryResp, String> =
+            match serde_json::from_slice::<DirectoryOp>(body) {
+                Ok(op) if self.is_raft_leader() => match self.raft_state() {
+                    Some(r) => r
+                        .raft
+                        .client_write(op)
+                        .await
+                        .map(|x| x.data)
+                        .map_err(|e| format!("raft write: {e}")),
+                    None => Err("raft not running".into()),
+                },
+                Ok(_) => Err("not the raft leader".into()),
+                Err(e) => Err(format!("bad write: {e}")),
+            };
+        serde_json::to_vec(&res).unwrap_or_else(|_| b"null".to_vec())
+    }
+
+    /// Bootstrap or, as leader, reconcile raft membership with the live bus peers.
+    async fn raft_control_round(&self) {
+        let Some(r) = self.raft_state() else { return };
+        let (initialized, leader) = {
+            let metrics = r.raft.metrics();
+            let m = metrics.borrow();
+            let initialized = m.membership_config.membership().nodes().next().is_some();
+            let leader = m.current_leader;
+            (initialized, leader)
+        };
+        let peers: Vec<NodeInfo> = self
+            .peers
+            .read()
+            .await
+            .iter()
+            .filter(|p| p.id != self.me.id && p.raft_id != 0 && p.alive)
+            .cloned()
+            .collect();
+        if !initialized {
+            // The oldest live raft-capable node bootstraps; the lease makes it exactly one.
+            let older = peers.iter().any(|p| p.started_at < self.me.started_at);
+            if older {
+                return;
+            }
+            match self.try_lease("raft-init", INIT_LEASE_TTL).await {
+                Ok(true) => {
+                    let mut members = BTreeMap::new();
+                    members.insert(self.me.raft_id, BasicNode::new(self.me.bus_addr.clone()));
+                    match r.raft.initialize(members).await {
+                        Ok(()) => {
+                            tracing::info!(raft_id = self.me.raft_id, "raft cluster bootstrapped")
+                        }
+                        Err(e) => tracing::debug!(error = %e, "raft initialize"),
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "raft-init lease failed"),
+            }
+            return;
+        }
+        if leader != Some(self.me.raft_id) {
+            return;
+        }
+        let mut desired: BTreeSet<RaftNodeId> = peers.iter().map(|p| p.raft_id).collect();
+        desired.insert(self.me.raft_id);
+        let current: BTreeSet<RaftNodeId> = r
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
+        if desired == current {
+            return;
+        }
+        for p in peers.iter().filter(|p| !current.contains(&p.raft_id)) {
+            if let Err(e) = r
+                .raft
+                .add_learner(p.raft_id, BasicNode::new(p.bus_addr.clone()), true)
+                .await
+            {
+                tracing::debug!(raft_id = p.raft_id, error = %e, "raft add_learner");
+                return;
+            }
+        }
+        match r.raft.change_membership(desired.clone(), false).await {
+            Ok(_) => tracing::info!(?desired, "raft membership updated"),
+            Err(e) => tracing::debug!(error = %e, "raft change_membership"),
+        }
+    }
+}

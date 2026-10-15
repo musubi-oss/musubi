@@ -11,14 +11,13 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::{Cluster, NodeInfo, QuicBus};
+use crate::{Cluster, NodeInfo};
 
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 pub const PING_TIMEOUT: Duration = Duration::from_millis(500);
 pub const INDIRECT_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const SUSPECT_TIMEOUT: Duration = Duration::from_secs(3);
 const INDIRECT_PROBES: usize = 2;
-pub(crate) const MAX_SWIM_FRAME: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,38 +175,24 @@ impl Cluster {
     }
 
     async fn roundtrip(
-        bus: &QuicBus,
+        cluster: &Cluster,
         peer: &NodeInfo,
         msg: &Msg,
         timeout: Duration,
     ) -> Result<Msg> {
-        tokio::time::timeout(timeout, async {
-            let conn = bus.connection(peer).await?;
-            let (mut send, mut recv) = conn.open_bi().await.map_err(Error::internal)?;
-            send.write_all(&serde_json::to_vec(msg)?)
-                .await
-                .map_err(Error::internal)?;
-            send.finish().map_err(Error::internal)?;
-            let buf = recv
-                .read_to_end(MAX_SWIM_FRAME)
-                .await
-                .map_err(Error::internal)?;
-            serde_json::from_slice::<Msg>(&buf).map_err(Into::into)
-        })
-        .await
-        .map_err(|_| Error::Internal("swim timeout".into()))?
+        let body = serde_json::to_vec(msg)?;
+        let resp = cluster
+            .bus_request(peer, crate::raft::TAG_SWIM, &body, timeout)
+            .await?;
+        serde_json::from_slice::<Msg>(&resp).map_err(Into::into)
     }
 
     async fn ping(&self, target: &NodeInfo) -> Result<Vec<MemberUpdate>> {
-        let bus = self
-            .bus
-            .as_ref()
-            .ok_or_else(|| Error::Internal("no bus".into()))?;
         let msg = Msg::Ping {
             from: self.me.id.0,
             gossip: self.gossip().await,
         };
-        match Self::roundtrip(bus, target, &msg, PING_TIMEOUT).await? {
+        match Self::roundtrip(self, target, &msg, PING_TIMEOUT).await? {
             Msg::Ack { gossip, .. } => Ok(gossip),
             _ => Err(Error::Internal("nack".into())),
         }
@@ -257,15 +242,15 @@ impl Cluster {
             .filter(|p| p.id != target.id)
             .take(INDIRECT_PROBES)
         {
-            let (bus, h, target, me) = (
-                bus.clone(),
+            let (cl, h, target, me) = (
+                self.clone(),
                 h.clone(),
                 Box::new(target.clone()),
                 self.me.id.0,
             );
             set.spawn(async move {
                 Self::roundtrip(
-                    &bus,
+                    &cl,
                     &h,
                     &Msg::PingReq { from: me, target },
                     INDIRECT_TIMEOUT,

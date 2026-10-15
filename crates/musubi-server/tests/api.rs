@@ -2787,3 +2787,131 @@ async fn swim_detects_dead_bus_peer_within_seconds() {
     b.stop().await;
     c.stop().await;
 }
+
+#[tokio::test]
+async fn raft_directory_replicates_and_survives_leader_loss() {
+    use std::time::{Duration, Instant};
+    let Some(_app) = app().await else { return };
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let bus = |name: &str| {
+        Arc::new(
+            musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+                .with_bus("127.0.0.1:0".parse().unwrap(), None)
+                .unwrap(),
+        )
+    };
+    let nodes = [bus("ra"), bus("rb"), bus("rc")];
+    for n in &nodes {
+        n.start().await.unwrap();
+    }
+    for n in &nodes {
+        n.refresh_peers().await.unwrap();
+    }
+    // bootstrap + membership growth to 3 voters with one leader everyone agrees on
+    let t0 = Instant::now();
+    let leader = loop {
+        let leaders: Vec<_> = nodes.iter().map(|n| n.raft_leader()).collect();
+        let voters: Vec<_> = nodes.iter().map(|n| n.raft_voters().len()).collect();
+        if leaders.iter().all(|l| l.is_some() && *l == leaders[0]) && voters.iter().all(|v| *v == 3)
+        {
+            break leaders[0].unwrap();
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "no stable 3-node raft: leaders={leaders:?} voters={voters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    tracing::info!(elapsed = ?t0.elapsed(), leader, "raft formed");
+    let follower = nodes.iter().find(|n| n.raft_id() != leader).unwrap();
+    let key = unique("world:");
+    // write through a follower (forwarded to the leader) and read everywhere
+    follower
+        .directory_write(musubi_cluster::DirectoryOp::Set {
+            key: key.clone(),
+            value: json!({"home": "n1"}),
+        })
+        .await
+        .unwrap();
+    let t1 = Instant::now();
+    loop {
+        let all = futures::future::join_all(nodes.iter().map(|n| n.directory_get(&key))).await;
+        if all
+            .iter()
+            .all(|v| v.as_ref().is_some_and(|v| v["home"] == "n1"))
+        {
+            break;
+        }
+        assert!(
+            t1.elapsed() < Duration::from_secs(10),
+            "directory not replicated: {all:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        follower
+            .directory_prefix("world:")
+            .await
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .count(),
+        1
+    );
+    // leader's network dies: survivors elect a new leader, drop the dead voter and keep writing
+    let dead = nodes.iter().find(|n| n.raft_id() == leader).unwrap();
+    dead.close_bus();
+    let survivors: Vec<_> = nodes.iter().filter(|n| n.raft_id() != leader).collect();
+    let t2 = Instant::now();
+    let new_leader = loop {
+        let leaders: Vec<_> = survivors.iter().map(|n| n.raft_leader()).collect();
+        let voters: Vec<_> = survivors.iter().map(|n| n.raft_voters()).collect();
+        if leaders
+            .iter()
+            .all(|l| l.is_some_and(|l| l != leader) && *l == leaders[0])
+            && voters.iter().all(|v| v.len() == 2)
+        {
+            break leaders[0].unwrap();
+        }
+        assert!(
+            t2.elapsed() < Duration::from_secs(40),
+            "no re-election: leaders={leaders:?} voters={voters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    tracing::info!(elapsed = ?t2.elapsed(), new_leader, "re-elected");
+    let key2 = unique("world:");
+    survivors[0]
+        .directory_write(musubi_cluster::DirectoryOp::Set {
+            key: key2.clone(),
+            value: json!({"home": "n2"}),
+        })
+        .await
+        .unwrap();
+    let t3 = Instant::now();
+    loop {
+        let all = futures::future::join_all(survivors.iter().map(|n| n.directory_get(&key2))).await;
+        if all
+            .iter()
+            .all(|v| v.as_ref().is_some_and(|v| v["home"] == "n2"))
+        {
+            break;
+        }
+        assert!(
+            t3.elapsed() < Duration::from_secs(10),
+            "post-failover write not replicated: {all:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let r = survivors[1]
+        .directory_write(musubi_cluster::DirectoryOp::Delete { key: key.clone() })
+        .await
+        .unwrap();
+    assert_eq!(r.value.unwrap()["home"], "n1");
+    for n in &nodes {
+        n.stop().await;
+    }
+}
