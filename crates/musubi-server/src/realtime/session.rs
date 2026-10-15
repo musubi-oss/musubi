@@ -596,6 +596,9 @@ async fn channel_join(
     let me = ctx.presence.account_id;
     let channel = resolve_channel(me, target, kind)?;
     ctx.chat.authorize(me, &channel).await?;
+    if ctx.chat.restriction(&channel, me).await?.as_deref() == Some("ban") {
+        return Err(Error::PermissionDenied("banned from this channel".into()));
+    }
     let id = channel.id();
     let presences = ctx.hub.join_channel(&id, ctx.presence.session_id, hidden);
     Ok(ServerMessage::Channel {
@@ -604,6 +607,34 @@ async fn channel_join(
         presences,
         me: ctx.presence.clone(),
     })
+}
+
+/// Run the optional `before_chat_message` hook: it may reject the message (error) or replace
+/// `content` by returning `{"content": ...}` (anything else returned keeps the original).
+async fn before_chat_message(
+    ctx: &Ctx<'_>,
+    channel_id: &str,
+    content: serde_json::Value,
+) -> musubi_core::Result<serde_json::Value> {
+    let payload = serde_json::json!({ "channel_id": channel_id, "content": content });
+    let call = CallContext {
+        account_id: Some(ctx.presence.account_id),
+        session_id: Some(ctx.presence.session_id),
+        username: Some(ctx.presence.username.clone()),
+        ..Default::default()
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(Error::internal)?;
+    match ctx.runtime.hook("before_chat_message", call, bytes).await {
+        None => Ok(payload["content"].clone()),
+        Some(Err(e)) => Err(e),
+        Some(Ok(out)) => {
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+            Ok(match v.get("content") {
+                Some(c) => c.clone(),
+                None => payload["content"].clone(),
+            })
+        }
+    }
 }
 
 fn joined_channel(ctx: &Ctx<'_>, channel_id: &str) -> musubi_core::Result<Channel> {
@@ -620,6 +651,11 @@ async fn channel_send(
     content: serde_json::Value,
 ) -> musubi_core::Result<ServerMessage> {
     let channel = joined_channel(ctx, channel_id)?;
+    let me = ctx.presence.account_id;
+    if let Some(kind) = ctx.chat.restriction(&channel, me).await? {
+        return Err(Error::PermissionDenied(format!("{kind}d in this channel")));
+    }
+    let content = before_chat_message(ctx, channel_id, content).await?;
     let persistent = !matches!(channel, Channel::Room(_));
     let msg = ctx
         .chat

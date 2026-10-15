@@ -508,6 +508,7 @@ impl Runtime {
             } else if n.starts_with("before_rpc_")
                 || n.starts_with("after_rpc_")
                 || n.starts_with("hook_")
+                || n == "before_chat_message"
             {
                 hooks.push(n.clone());
             }

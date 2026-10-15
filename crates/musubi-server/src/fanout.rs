@@ -128,6 +128,13 @@ impl Fanout {
         self.account_live(account_id, msg);
     }
 
+    /// Drop every local session of `account` from a channel (moderation ban).
+    pub fn leave_channel_everywhere(&self, channel_id: &str, account: AccountId) {
+        for p in self.hub.presences_of(account) {
+            self.hub.leave_channel(channel_id, p.session_id);
+        }
+    }
+
     /// Online on this node or, as far as the bus has told us, on any other node.
     pub fn is_online_anywhere(&self, account_id: AccountId) -> bool {
         !self.hub.presences_of(account_id).is_empty()

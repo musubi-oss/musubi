@@ -346,3 +346,132 @@ mod tests {
         assert_eq!(d.direct_peer(a), Some(b));
     }
 }
+
+/// A mute (cannot send) or ban (cannot join or send) on a channel.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Moderation {
+    pub channel_id: String,
+    pub account_id: AccountId,
+    pub kind: String,
+    pub reason: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+    pub until: Option<i64>,
+}
+
+impl ChatService {
+    /// Mute or ban `account` on `channel`; `until_secs` = None for indefinite. Replaces any existing entry.
+    pub async fn moderate(
+        &self,
+        channel: &Channel,
+        account: AccountId,
+        kind: &str,
+        reason: Option<&str>,
+        by: Option<&str>,
+        until_secs: Option<u64>,
+    ) -> Result<()> {
+        if !matches!(kind, "mute" | "ban") {
+            return Err(Error::InvalidArgument("kind must be mute or ban".into()));
+        }
+        let until = until_secs.map(|s| {
+            time::OffsetDateTime::now_utc()
+                + time::Duration::seconds(s.min(10 * 365 * 86_400) as i64)
+        });
+        sqlx::query(
+            "insert into musubi.chat_moderation (channel_id, account_id, kind, reason, created_by, until)
+             values ($1, $2, $3, $4, $5, $6)
+             on conflict (channel_id, account_id) do update
+               set kind = excluded.kind, reason = excluded.reason, created_by = excluded.created_by,
+                   created_at = now(), until = excluded.until",
+        )
+        .bind(channel.id())
+        .bind(account.0)
+        .bind(kind)
+        .bind(reason)
+        .bind(by)
+        .bind(until)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    pub async fn unmoderate(&self, channel: &Channel, account: AccountId) -> Result<bool> {
+        let n = sqlx::query(
+            "delete from musubi.chat_moderation where channel_id = $1 and account_id = $2",
+        )
+        .bind(channel.id())
+        .bind(account.0)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub async fn moderations(&self, channel: &Channel) -> Result<Vec<Moderation>> {
+        type Row = (
+            String,
+            uuid::Uuid,
+            String,
+            Option<String>,
+            Option<String>,
+            time::OffsetDateTime,
+            Option<time::OffsetDateTime>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "select channel_id, account_id, kind, reason, created_by, created_at, until
+             from musubi.chat_moderation
+             where channel_id = $1 and (until is null or until > now()) order by created_at",
+        )
+        .bind(channel.id())
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(c, a, k, r, b, ca, u)| Moderation {
+                channel_id: c,
+                account_id: AccountId(a),
+                kind: k,
+                reason: r,
+                created_by: b,
+                created_at: ca.unix_timestamp(),
+                until: u.map(|u| u.unix_timestamp()),
+            })
+            .collect())
+    }
+
+    /// Active moderation entry of `account` on `channel` (`mute` / `ban`), if any.
+    pub async fn restriction(
+        &self,
+        channel: &Channel,
+        account: AccountId,
+    ) -> Result<Option<String>> {
+        sqlx::query_scalar(
+            "select kind from musubi.chat_moderation
+             where channel_id = $1 and account_id = $2 and (until is null or until > now())",
+        )
+        .bind(channel.id())
+        .bind(account.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
+    /// Delete any message on behalf of a moderator (no sender check); true if it existed.
+    pub async fn remove_as_moderator(
+        &self,
+        channel: &Channel,
+        message_id: uuid::Uuid,
+    ) -> Result<bool> {
+        let n = sqlx::query("delete from musubi.chat_messages where channel_id = $1 and id = $2")
+            .bind(channel.id())
+            .bind(message_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+        Ok(n > 0)
+    }
+}

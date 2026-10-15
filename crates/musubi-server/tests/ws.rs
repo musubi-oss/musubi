@@ -4068,3 +4068,105 @@ async fn presence_is_known_cluster_wide() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// Send a room message; true if accepted (ack + broadcast arrive), false if rejected with an error.
+async fn say(a: &mut Ws, f: &str, room_id: &str, text: &str) -> bool {
+    send(
+        a,
+        f,
+        Some("m"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.to_string(),
+            content: serde_json::json!({"text": text}),
+        },
+    )
+    .await;
+    if matches!(recv(a).await.msg, ServerMessage::Error { .. }) {
+        return false;
+    }
+    assert!(!matches!(recv(a).await.msg, ServerMessage::Error { .. }));
+    true
+}
+
+/// Muted accounts cannot send (but stay in the channel), banned accounts cannot join; lifting
+/// the restriction restores both.
+#[tokio::test]
+async fn chat_moderation_mutes_and_bans() {
+    let group = test_group();
+    let Some(state) = build_state(true, &group).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let addr = router_addr(&state).await;
+    let (tok, acc) = token(&router).await;
+    let acc = musubi_core::AccountId(acc.parse().unwrap());
+    let f = "json";
+    let mut a = connect(&addr, &tok, f).await;
+    let room = format!("mod-{}", uuid::Uuid::now_v7().simple());
+    send(
+        &mut a,
+        f,
+        Some("j"),
+        ClientMessage::ChannelJoin {
+            target: room.clone(),
+            kind: ChannelKind::Room,
+            persistence: false,
+            hidden: false,
+        },
+    )
+    .await;
+    let room_id = match recv(&mut a).await.msg {
+        ServerMessage::Channel { id, .. } => id,
+        m => panic!("{m:?}"),
+    };
+    let channel = musubi_chat::Channel::parse(&room_id).unwrap();
+    let mut a2 = a;
+    assert!(say(&mut a2, f, &room_id, "hello").await);
+    state
+        .chat
+        .moderate(&channel, acc, "mute", Some("spam"), Some("test"), None)
+        .await
+        .unwrap();
+    assert!(!say(&mut a2, f, &room_id, "muted?").await);
+    let mods = state.chat.moderations(&channel).await.unwrap();
+    assert_eq!(mods.len(), 1);
+    assert_eq!(mods[0].kind, "mute");
+    assert!(state.chat.unmoderate(&channel, acc).await.unwrap());
+    assert!(say(&mut a2, f, &room_id, "free again").await);
+    // An expired timed mute does not restrict.
+    state
+        .chat
+        .moderate(&channel, acc, "mute", None, None, Some(0))
+        .await
+        .unwrap();
+    assert!(state
+        .chat
+        .restriction(&channel, acc)
+        .await
+        .unwrap()
+        .is_none());
+    // Ban: kicked out of the channel, cannot rejoin.
+    state
+        .chat
+        .moderate(&channel, acc, "ban", None, None, None)
+        .await
+        .unwrap();
+    state.fanout.leave_channel_everywhere(&room_id, acc);
+    assert!(!say(&mut a2, f, &room_id, "banned?").await);
+    send(
+        &mut a2,
+        f,
+        Some("j2"),
+        ClientMessage::ChannelJoin {
+            target: room.clone(),
+            kind: ChannelKind::Room,
+            persistence: false,
+            hidden: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a2).await.msg,
+        ServerMessage::Error { .. }
+    ));
+}
