@@ -45,8 +45,10 @@ struct LogoutReq {
 
 async fn device(
     State(s): State<AppState>,
+    ip: super::ClientIp,
     Json(r): Json<DeviceReq>,
 ) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
     let sess = s.auth.authenticate_device(&r.id, r.opts).await?;
     authenticated(&s, &sess, musubi_auth::provider::DEVICE);
     Ok(Json(sess))
@@ -76,8 +78,10 @@ fn authenticated(s: &AppState, sess: &Session, provider: &'static str) {
 
 async fn email(
     State(s): State<AppState>,
+    ip: super::ClientIp,
     Json(r): Json<EmailReq>,
 ) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
     let sess = s
         .auth
         .authenticate_email(&r.email, &r.password, r.opts)
@@ -88,8 +92,10 @@ async fn email(
 
 async fn refresh(
     State(s): State<AppState>,
+    ip: super::ClientIp,
     Json(r): Json<RefreshReq>,
 ) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
     Ok(Json(s.auth.refresh(&r.refresh_token).await?))
 }
 

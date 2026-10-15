@@ -41,6 +41,7 @@ pub struct Config {
     pub iap: IapConfig,
     pub market: MarketConfig,
     pub fleet: FleetConfig,
+    pub limits: LimitsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +229,37 @@ pub struct ZanshinConfig {
     pub server_key: String,
     /// Seconds between analytics event flushes.
     pub flush_secs: u64,
+}
+
+/// Rate limits (token buckets, per node). `enabled = false` turns every check off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    pub enabled: bool,
+    /// Login/refresh attempts per client IP (`X-Forwarded-For` first hop, else the peer address).
+    pub auth_per_minute_per_ip: u32,
+    pub http_per_second_per_account: u32,
+    pub http_burst: u32,
+    pub rpc_per_second_per_account: u32,
+    pub rpc_burst: u32,
+    /// Inbound realtime messages per account.
+    pub socket_per_second: u32,
+    pub socket_burst: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auth_per_minute_per_ip: 30,
+            http_per_second_per_account: 50,
+            http_burst: 100,
+            rpc_per_second_per_account: 20,
+            rpc_burst: 40,
+            socket_per_second: 60,
+            socket_burst: 120,
+        }
+    }
 }
 
 /// Dedicated-server orchestration.

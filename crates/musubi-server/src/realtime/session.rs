@@ -31,6 +31,7 @@ pub struct ConnectParams {
     pub worlds: Arc<super::WorldRegistry>,
     pub runtime: Arc<Runtime>,
     pub fanout: Fanout,
+    pub rate: Arc<crate::limits::RateLimiter>,
 }
 
 /// Drive one realtime connection until it closes. Registers with the hub on entry and
@@ -48,6 +49,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         worlds,
         runtime,
         fanout,
+        rate,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -70,6 +72,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         runtime: &runtime,
         fanout: &fanout,
         presence: &presence,
+        rate: &rate,
     };
     let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx, &kick).await;
     for t in parties.leave_all(&fanout, sid) {
@@ -102,6 +105,7 @@ struct Ctx<'a> {
     runtime: &'a Arc<Runtime>,
     fanout: &'a Fanout,
     presence: &'a UserPresence,
+    rate: &'a crate::limits::RateLimiter,
 }
 
 async fn run_loop(
@@ -144,6 +148,11 @@ async fn run_loop(
                         continue;
                     }
                 };
+                if let Err(e) = ctx.rate.socket(ctx.presence.account_id) {
+                    let bytes = encoding.encode(&Envelope { cid: env.cid, msg: ServerMessage::error(&e) })?;
+                    conn.send(Frame::encoded(encoding, bytes)).await?;
+                    continue;
+                }
                 if let Some(reply) = handle(ctx, env.msg).await {
                     let bytes = encoding.encode(&Envelope { cid: env.cid, msg: reply })?;
                     conn.send(Frame::encoded(encoding, bytes)).await?;

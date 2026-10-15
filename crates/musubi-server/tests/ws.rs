@@ -112,6 +112,12 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),
+        limits: Arc::new(musubi_server::limits::RateLimiter::new(
+            &musubi_core::config::LimitsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )),
     })
 }
 

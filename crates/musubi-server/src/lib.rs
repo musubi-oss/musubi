@@ -4,6 +4,7 @@ pub mod app;
 pub mod db;
 pub mod fanout;
 pub mod http;
+pub mod limits;
 pub mod metrics;
 pub mod notify;
 pub mod realtime;

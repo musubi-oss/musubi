@@ -25,7 +25,9 @@ impl FromRequestParts<AppState> for Bearer {
             .strip_prefix("Bearer ")
             .or_else(|| header.strip_prefix("bearer "))
             .ok_or_else(|| Error::Unauthenticated("malformed authorization header".into()))?;
-        Ok(Bearer(state.auth.verify_access(token)?))
+        let auth = state.auth.verify_access(token)?;
+        state.limits.account(auth.account_id)?;
+        Ok(Bearer(auth))
     }
 }
 
@@ -55,5 +57,35 @@ impl FromRequestParts<AppState> for ServerKey {
             return Err(Error::Unauthenticated("bad server key".into()).into());
         }
         Ok(ServerKey)
+    }
+}
+
+/// Best-effort client address: first `X-Forwarded-For` hop, then `X-Real-IP`, then the peer
+/// address (when served with connect info), else `"unknown"`. Infallible.
+pub struct ClientIp(pub String);
+
+impl<S: Sync> FromRequestParts<S> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let header = |n: &str| {
+            parts
+                .headers
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let ip = header("x-forwarded-for")
+            .or_else(|| header("x-real-ip"))
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|c| c.0.ip().to_string())
+            })
+            .unwrap_or_else(|| "unknown".into());
+        Ok(ClientIp(ip))
     }
 }

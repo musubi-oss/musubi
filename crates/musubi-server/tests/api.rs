@@ -84,6 +84,12 @@ async fn app() -> Option<Router> {
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),
+        limits: Arc::new(musubi_server::limits::RateLimiter::new(
+            &musubi_core::config::LimitsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )),
     };
     musubi_server::runtime_host::install(&state);
     Some(musubi_server::http::router(state))

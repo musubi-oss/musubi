@@ -54,6 +54,7 @@ pub struct AppState {
     pub hub: Arc<Hub>,
     pub started_at: std::time::Instant,
     pub metrics: metrics_exporter_prometheus::PrometheusHandle,
+    pub limits: Arc<crate::limits::RateLimiter>,
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -315,6 +316,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     });
     worlds.clone().spawn_ticker(fanout.clone());
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
+    let limits = Arc::new(crate::limits::RateLimiter::new(&cfg.limits));
     let state = AppState {
         cfg: Arc::new(cfg),
         db,
@@ -345,6 +347,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         hub,
         started_at: std::time::Instant::now(),
         metrics: crate::metrics::install(),
+        limits,
     };
     crate::runtime_host::install(&state);
     {
@@ -371,9 +374,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(listen) = state.cfg.quic.listen {
         crate::realtime::quic::start(state.clone(), listen).await?;
     }
-    axum::serve(listener, http::router(state))
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    axum::serve(
+        listener,
+        http::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     info!("stopped");
     Ok(())
 }

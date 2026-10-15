@@ -64,6 +64,9 @@ async fn call(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let ctx = context(&s, &headers).await?;
+    if let Some(acc) = ctx.account_id {
+        s.limits.rpc(acc)?;
+    }
     let out = s.runtime.call(&id, ctx, body.to_vec()).await?;
     let ct = headers
         .get(CONTENT_TYPE)

@@ -30,7 +30,7 @@ use tower_http::trace::TraceLayer;
 use crate::app::AppState;
 
 pub use error::ApiError;
-pub use extract::{Bearer, ServerKey};
+pub use extract::{Bearer, ClientIp, ServerKey};
 
 pub fn router(state: AppState) -> Router {
     Router::new()

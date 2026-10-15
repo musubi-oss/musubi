@@ -50,6 +50,7 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         presence,
         encoding,
         limits: Limits::default(),
+        rate: s.limits.clone(),
         chat: s.chat.clone(),
         matchmaker: s.matchmaker.clone(),
         parties: s.parties.clone(),
