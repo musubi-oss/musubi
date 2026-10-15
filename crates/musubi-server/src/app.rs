@@ -81,7 +81,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let (m, r) = runtime.load_dir(dir)?;
         tracing::info!(modules = m, rpcs = r, dir = %dir.display(), "runtime modules loaded");
     }
-    let cluster = Arc::new(Cluster::new(
+    let mut cluster = Cluster::new(
         db.clone(),
         &cfg.node.name,
         &cfg.node.region,
@@ -91,7 +91,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .map(|r| format!("{r:?}").to_lowercase())
             .collect(),
         &cfg.http.listen.to_string(),
-    ));
+    );
+    if !cfg.node.bus_listen.is_empty() {
+        let listen: std::net::SocketAddr = cfg
+            .node
+            .bus_listen
+            .parse()
+            .map_err(|_| musubi_core::Error::InvalidArgument("node.bus_listen".into()))?;
+        let adv = (!cfg.node.bus_advertise.is_empty()).then_some(cfg.node.bus_advertise.as_str());
+        cluster = cluster.with_bus(listen, adv)?;
+        tracing::info!(addr = ?cluster.bus_addr(), "quic node bus enabled");
+    }
+    let cluster = Arc::new(cluster);
     cluster.start().await?;
     let parties = Arc::new(PartyRegistry::new(cluster.node_id().0));
     let fleets = Arc::new(FleetService::new(

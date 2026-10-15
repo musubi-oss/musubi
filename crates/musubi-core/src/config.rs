@@ -49,6 +49,10 @@ pub struct NodeConfig {
     pub roles: Vec<Role>,
     pub region: String,
     pub data_dir: String,
+    /// QUIC node bus listen address (e.g. `0.0.0.0:7447`); empty = Postgres bus only.
+    pub bus_listen: String,
+    /// Address other nodes dial for the bus; defaults to the bound address.
+    pub bus_advertise: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +95,8 @@ impl Default for NodeConfig {
             name: hostname(),
             roles: Role::ALL.to_vec(),
             region: "local".into(),
+            bus_listen: String::new(),
+            bus_advertise: String::new(),
             data_dir: "./data".into(),
         }
     }

@@ -2624,3 +2624,85 @@ async fn cluster_lease_has_single_holder_and_moves_on_release() {
     b.release_lease(&name).await.unwrap();
     b.release_lease(&short).await.unwrap();
 }
+
+#[tokio::test]
+async fn quic_bus_delivers_large_messages_and_keeps_postgres_fallback() {
+    use std::time::Duration;
+    let Some(_app) = app().await else { return };
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let bus = |name: &str| {
+        musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+            .with_bus("127.0.0.1:0".parse().unwrap(), None)
+            .unwrap()
+    };
+    let a = Arc::new(bus("qa"));
+    let b = Arc::new(bus("qb"));
+    let c = Arc::new(musubi_cluster::Cluster::new(
+        db.clone(),
+        "qc",
+        "local",
+        vec![],
+        "",
+    ));
+    assert!(a.bus_addr().is_some() && c.bus_addr().is_none());
+    a.start().await.unwrap();
+    b.start().await.unwrap();
+    c.start().await.unwrap();
+    a.refresh_peers().await.unwrap();
+    b.refresh_peers().await.unwrap();
+    c.refresh_peers().await.unwrap();
+    let mut ra = a.subscribe();
+    let mut rb = b.subscribe();
+    let mut rc = c.subscribe();
+    async fn next(
+        rx: &mut tokio::sync::broadcast::Receiver<musubi_cluster::BusMessage>,
+        topic: &str,
+    ) -> musubi_cluster::BusMessage {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let m = rx.recv().await.unwrap();
+                if m.topic == topic {
+                    return m;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {topic} message"))
+    }
+    // 50 KiB is far above the 8000-byte NOTIFY cap: only the QUIC path can carry it.
+    let big = unique("big");
+    a.publish(&big, &json!({"data": "x".repeat(50_000)}))
+        .await
+        .unwrap();
+    let m = next(&mut rb, &big).await;
+    assert_eq!(m.origin, a.node_id());
+    assert_eq!(m.payload["data"].as_str().unwrap().len(), 50_000);
+    // small messages reach QUIC peers once and legacy (Postgres-only) peers via NOTIFY
+    let small = unique("small");
+    a.publish(&small, &json!({"n": 1})).await.unwrap();
+    assert_eq!(next(&mut rb, &small).await.payload["n"], 1);
+    assert_eq!(next(&mut rc, &small).await.payload["n"], 1);
+    // b → a over QUIC, c → a over Postgres
+    let t1 = unique("ba");
+    b.publish(&t1, &json!({"from": "b"})).await.unwrap();
+    assert_eq!(next(&mut ra, &t1).await.origin, b.node_id());
+    let t2 = unique("ca");
+    c.publish(&t2, &json!({"from": "c"})).await.unwrap();
+    assert_eq!(next(&mut ra, &t2).await.origin, c.node_id());
+    // no duplicates: b must not also see the Postgres copy of `small`
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut dup = 0;
+    while let Ok(m) = rb.try_recv() {
+        if m.topic == small {
+            dup += 1;
+        }
+    }
+    assert_eq!(dup, 0, "quic peer received the postgres copy too");
+    a.stop().await;
+    b.stop().await;
+    c.stop().await;
+}

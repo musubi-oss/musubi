@@ -1750,7 +1750,12 @@ dependencies = [
 name = "musubi-cluster"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "musubi-core",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sqlx",
