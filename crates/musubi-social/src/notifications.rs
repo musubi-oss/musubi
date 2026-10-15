@@ -26,6 +26,13 @@ pub struct Notification {
     #[serde(with = "time::serde::rfc3339")]
     pub create_time: OffsetDateTime,
     pub persistent: bool,
+    /// When the recipient marked it read; absent while unread.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub read_time: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +49,8 @@ pub struct NewNotification {
 pub struct NotificationList {
     pub notifications: Vec<Notification>,
     pub cursor: Option<String>,
+    /// Unread notifications of the recipient (all of them, not just this page).
+    pub unread_count: i64,
 }
 
 pub const MAX_BATCH: usize = 100;
@@ -58,6 +67,7 @@ type Row = (
     i32,
     Option<Uuid>,
     OffsetDateTime,
+    Option<OffsetDateTime>,
 );
 
 impl NotificationService {
@@ -111,6 +121,7 @@ impl NotificationService {
                     sender_id: n.sender_id,
                     create_time: created,
                     persistent: n.persistent,
+                    read_time: None,
                 },
             ));
         }
@@ -124,6 +135,7 @@ impl NotificationService {
         user: AccountId,
         limit: usize,
         cursor: Option<&str>,
+        unread_only: bool,
     ) -> Result<NotificationList> {
         let limit = limit.clamp(1, 100) as i64;
         let before: Option<Uuid> = match cursor {
@@ -134,12 +146,14 @@ impl NotificationService {
             None => None,
         };
         let rows = sqlx::query_as::<_, Row>(
-            "select id, subject, content, code, sender_id, created_at from musubi.notifications
-             where user_id = $1 and ($2::uuid is null or id < $2) order by id desc limit $3",
+            "select id, subject, content, code, sender_id, created_at, read_at from musubi.notifications
+             where user_id = $1 and ($2::uuid is null or id < $2) and (not $4 or read_at is null)
+             order by id desc limit $3",
         )
         .bind(user.0)
         .bind(before)
         .bind(limit + 1)
+        .bind(unread_only)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -155,15 +169,53 @@ impl NotificationService {
                 sender_id: r.4.map(AccountId),
                 create_time: r.5,
                 persistent: true,
+                read_time: r.6,
             })
             .collect();
         let cursor = more
             .then(|| notifications.last().map(|n| n.id.to_string()))
             .flatten();
+        let unread_count: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.notifications where user_id = $1 and read_at is null",
+        )
+        .bind(user.0)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
         Ok(NotificationList {
             notifications,
             cursor,
+            unread_count,
         })
+    }
+
+    /// Mark notifications read; `None` = everything unread. Returns how many changed.
+    pub async fn mark_read(&self, user: AccountId, ids: Option<&[Uuid]>) -> Result<u64> {
+        let r = match ids {
+            Some(ids) => {
+                if ids.is_empty() || ids.len() > MAX_BATCH {
+                    return Err(Error::InvalidArgument(format!("1..={MAX_BATCH} ids")));
+                }
+                sqlx::query(
+                    "update musubi.notifications set read_at = now()
+                     where user_id = $1 and id = any($2) and read_at is null",
+                )
+                .bind(user.0)
+                .bind(ids)
+                .execute(&self.db)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "update musubi.notifications set read_at = now() where user_id = $1 and read_at is null",
+                )
+                .bind(user.0)
+                .execute(&self.db)
+                .await
+            }
+        }
+        .map_err(Error::internal)?;
+        Ok(r.rows_affected())
     }
 
     pub async fn delete(&self, user: AccountId, ids: &[Uuid]) -> Result<u64> {

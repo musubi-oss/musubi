@@ -158,6 +158,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/node", "system"),
     ("DELETE", "/v1/notifications", "notifications"),
     ("GET", "/v1/notifications", "notifications"),
+    ("POST", "/v1/notifications/read", "notifications"),
+    ("POST", "/v1/server/notifications", "notifications"),
     ("GET", "/v1/progression", "economy"),
     ("GET", "/v1/quests", "economy"),
     ("POST", "/v1/quests/{id}/claim", "economy"),

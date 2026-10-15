@@ -5855,3 +5855,78 @@ async fn email_login_lockout() {
     .await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "ghost: {v}");
 }
+
+/// Notifications carry read state: `?unread=true` filters, `unread_count` counts, `POST /read`
+/// marks a batch or everything.
+#[tokio::test]
+async fn notifications_read_state() {
+    let Some(app) = app().await else { return };
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dev")})),
+    )
+    .await;
+    let tok = a["access_token"].as_str().unwrap().to_string();
+    let acc = a["account_id"].as_str().unwrap().to_string();
+    for i in 0..3 {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/notifications",
+            "defaultkey",
+            Some(json!({"user_id": acc, "subject": format!("n{i}"), "content": {}, "code": 1})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, l) = call(&app, "GET", "/v1/notifications", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["unread_count"], 3, "{l}");
+    assert!(l["notifications"][0].get("read_time").is_none(), "{l}");
+    let first = l["notifications"][0]["id"].as_str().unwrap().to_string();
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/notifications/read",
+        Some(&tok),
+        Some(json!({"ids": [first]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["read"], 1);
+    let (_, l) = call(
+        &app,
+        "GET",
+        "/v1/notifications?unread=true",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(l["unread_count"], 2, "{l}");
+    assert_eq!(l["notifications"].as_array().unwrap().len(), 2, "{l}");
+    let (_, l) = call(&app, "GET", "/v1/notifications", Some(&tok), None).await;
+    assert_eq!(l["notifications"].as_array().unwrap().len(), 3, "{l}");
+    assert!(l["notifications"][0]["read_time"].is_string(), "{l}");
+    let (_, r) = call(
+        &app,
+        "POST",
+        "/v1/notifications/read",
+        Some(&tok),
+        Some(json!({"all": true})),
+    )
+    .await;
+    assert_eq!(r["read"], 2, "{r}");
+    let (_, l) = call(
+        &app,
+        "GET",
+        "/v1/notifications?unread=true",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(l["unread_count"], 0, "{l}");
+    assert!(l["notifications"].as_array().unwrap().is_empty(), "{l}");
+}
