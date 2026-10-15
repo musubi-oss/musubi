@@ -99,13 +99,17 @@ impl TicketWire {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MatchedWire {
     pub token: String,
+    /// Relayed match id minted by the leader (homed on it) so every node maps token → match.
+    #[serde(default)]
+    pub match_id: String,
     pub tickets: Vec<TicketWire>,
 }
 
 impl Matched {
-    pub fn to_wire(&self) -> MatchedWire {
+    pub fn to_wire(&self, match_id: &str) -> MatchedWire {
         MatchedWire {
             token: self.token.clone(),
+            match_id: match_id.to_string(),
             tickets: self.tickets.iter().map(TicketWire::from).collect(),
         }
     }

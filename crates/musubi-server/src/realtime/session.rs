@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use super::hub::SessionHandle;
 use super::party::{PartyCmd, PartyCmdEnv};
+use super::relayed::{RelayedCmd, RelayedCmdEnv};
 use super::{Hub, MatchRegistry, PartyRegistry, RelayedRegistry};
 
 pub struct ConnectParams {
@@ -73,7 +74,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     for t in matchmaker.remove_session(sid) {
         fanout.mm_remove(&t);
     }
-    relayed.leave_all(&hub, sid);
+    relayed.leave_all(&fanout, sid);
     matches.leave_all(sid);
     hub.leave(sid);
     conn.close().await;
@@ -316,11 +317,23 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                         .unwrap_or_else(|e| ServerMessage::error(&e)),
                 );
             }
-            Some(
-                ctx.relayed
-                    .join(hub, ctx.presence, match_id.as_deref(), token.as_deref())
-                    .unwrap_or_else(|e| ServerMessage::error(&e)),
-            )
+            let id = match (match_id, token) {
+                (Some(id), _) => id,
+                (None, Some(t)) => match ctx.relayed.token_match(&t) {
+                    Some(id) => id,
+                    None => {
+                        return Some(ServerMessage::error(&Error::NotFound(
+                            "unknown match token".into(),
+                        )))
+                    }
+                },
+                (None, None) => {
+                    return Some(ServerMessage::error(&Error::InvalidArgument(
+                        "match_id or token required".into(),
+                    )))
+                }
+            };
+            relayed_dispatch(ctx, &id, RelayedCmd::Join)
         }
         ClientMessage::MatchLeave { match_id } => {
             if ctx.matches.get(&match_id).is_some() {
@@ -330,10 +343,7 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                     .err()
                     .map(|e| ServerMessage::error(&e));
             }
-            ctx.relayed
-                .leave(hub, sid, &match_id)
-                .err()
-                .map(|e| ServerMessage::error(&e))
+            relayed_dispatch(ctx, &match_id, RelayedCmd::Leave)
         }
         ClientMessage::MatchDataSend {
             match_id,
@@ -353,18 +363,16 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                     .err()
                     .map(|e| ServerMessage::error(&e));
             }
-            ctx.relayed
-                .send(
-                    hub,
-                    ctx.presence,
-                    &match_id,
+            relayed_dispatch(
+                ctx,
+                &match_id,
+                RelayedCmd::Data {
                     op_code,
                     data,
-                    &presences,
+                    only: presences,
                     reliable,
-                )
-                .err()
-                .map(|e| ServerMessage::error(&e))
+                },
+            )
         }
         ClientMessage::Ping => Some(ServerMessage::Pong),
         ClientMessage::StatusUpdate { status } => {
@@ -508,6 +516,22 @@ fn ack_of(m: &musubi_proto::realtime::ChannelMessage) -> ServerMessage {
         update_time: m.update_time,
         persistent: m.persistent,
     }
+}
+
+/// Relayed-match twin of `party_dispatch`.
+fn relayed_dispatch(ctx: &Ctx<'_>, match_id: &str, cmd: RelayedCmd) -> Option<ServerMessage> {
+    if super::party::home_of(match_id).is_none() {
+        return Some(ServerMessage::error(&Error::NotFound("match".into())));
+    }
+    if ctx.relayed.is_home(match_id) {
+        return super::relayed::exec(ctx.relayed, ctx.fanout, ctx.presence, match_id, cmd);
+    }
+    ctx.fanout.relayed_cmd(RelayedCmdEnv {
+        match_id: match_id.to_string(),
+        me: ctx.presence.clone(),
+        cmd,
+    });
+    None
 }
 
 /// Run a party command here if this node is the party's home, otherwise forward it over the bus

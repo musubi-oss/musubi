@@ -27,7 +27,9 @@ async fn app() -> Option<Router> {
     let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
     ));
-    let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new());
+    let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new(
+        cluster.as_ref().unwrap().node_id().0,
+    ));
     let fanout = musubi_server::fanout::Fanout::new(
         hub.clone(),
         cluster.clone(),

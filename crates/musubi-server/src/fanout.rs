@@ -11,6 +11,7 @@ use musubi_proto::{ServerMessage, UserPresence};
 use serde::{Deserialize, Serialize};
 
 use crate::realtime::party::PartyCmdEnv;
+use crate::realtime::relayed::RelayedCmdEnv;
 use crate::realtime::{Hub, PartyRegistry, RelayedRegistry};
 
 #[derive(Serialize, Deserialize)]
@@ -37,6 +38,7 @@ enum Wire {
     },
     PartyCmd(PartyCmdEnv),
     SessionGone(SessionId),
+    RelayedCmd(RelayedCmdEnv),
 }
 
 const TOPIC: &str = "realtime";
@@ -155,8 +157,12 @@ impl Fanout {
         self.publish(Wire::MmRemove(ticket.to_string()));
     }
 
-    pub fn mm_matched(&self, m: &Matched) {
-        self.publish(Wire::MmMatched(m.to_wire()));
+    pub fn mm_matched(&self, m: &Matched, match_id: &str) {
+        self.publish(Wire::MmMatched(m.to_wire(match_id)));
+    }
+
+    pub fn relayed_cmd(&self, env: RelayedCmdEnv) {
+        self.publish(Wire::RelayedCmd(env));
     }
 
     fn apply(&self, m: &BusMessage) {
@@ -185,20 +191,24 @@ impl Fanout {
             Ok(Wire::MmRemove(id)) => {
                 self.mm.cancel(&id);
             }
-            Ok(Wire::MmMatched(w)) => match Matched::from_wire(w) {
-                Ok(matched) => {
-                    for t in &matched.tickets {
-                        self.mm.cancel(&t.id);
+            Ok(Wire::MmMatched(w)) => {
+                let match_id = w.match_id.clone();
+                match Matched::from_wire(w) {
+                    Ok(matched) => {
+                        for t in &matched.tickets {
+                            self.mm.cancel(&t.id);
+                        }
+                        crate::realtime::matchmaking::deliver(
+                            &self.hub,
+                            &self.parties,
+                            &self.relayed,
+                            &matched,
+                            &match_id,
+                        );
                     }
-                    crate::realtime::matchmaking::deliver(
-                        &self.hub,
-                        &self.parties,
-                        &self.relayed,
-                        &matched,
-                    );
+                    Err(e) => tracing::warn!(error = %e, "bad matched message"),
                 }
-                Err(e) => tracing::warn!(error = %e, "bad matched message"),
-            },
+            }
             Ok(Wire::Session { session_id, msg }) => {
                 self.hub.send_to_session(session_id, msg);
             }
@@ -220,6 +230,20 @@ impl Fanout {
                 for t in self.parties.leave_all(self, sid) {
                     self.mm.cancel(&t);
                     self.mm_remove(&t);
+                }
+                self.relayed.leave_all(self, sid);
+            }
+            Ok(Wire::RelayedCmd(env)) => {
+                if self.relayed.is_home(&env.match_id) {
+                    if let Some(reply) = crate::realtime::relayed::exec(
+                        &self.relayed,
+                        self,
+                        &env.me,
+                        &env.match_id,
+                        env.cmd,
+                    ) {
+                        self.session(env.me.session_id, reply);
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "bad fanout message"),

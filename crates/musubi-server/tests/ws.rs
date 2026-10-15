@@ -45,7 +45,9 @@ async fn build_state(leader: bool) -> Option<AppState> {
     let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
     ));
-    let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new());
+    let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new(
+        cluster.as_ref().unwrap().node_id().0,
+    ));
     let fanout = musubi_server::fanout::Fanout::new(
         hub.clone(),
         cluster.clone(),
@@ -1811,5 +1813,75 @@ async fn quic_unreliable_match_data_uses_datagrams() {
     let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
     assert!(
         matches!(r.msg, ServerMessage::MatchData { op_code: 3, reliable: false, data, .. } if data == vec![4, 2])
+    );
+}
+
+#[tokio::test]
+async fn cross_node_relayed_match() {
+    let Some((addr1, router1)) = start().await else {
+        return;
+    };
+    let Some((addr2, _)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _) = token(&router1).await;
+    let (tb, _) = token(&router1).await;
+    let mut a = connect(&addr1, &ta, f).await;
+    let mut b = connect(&addr2, &tb, f).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchCreate {
+            name: Some("xn".into()),
+        },
+    )
+    .await;
+    let mid = match recv(&mut a).await.msg {
+        ServerMessage::Match {
+            match_id,
+            authoritative: false,
+            ..
+        } => match_id,
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Match { size: 2, .. }
+    ));
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::MatchPresenceEvent { joins, .. } if joins.len() == 1)
+    );
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 11,
+            data: vec![5],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::MatchData { op_code: 11, data, .. } if data == vec![5])
+    );
+    b.close(None).await.unwrap();
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::MatchPresenceEvent { leaves, .. } if leaves.len() == 1)
     );
 }

@@ -1,11 +1,15 @@
 //! Relayed (client-hosted) matches: the server fans data out between members and tracks presence,
-//! nothing more. Authoritative matches live in the actor runtime.
+//! nothing more. Authoritative matches live in the actor runtime. Like parties, a relayed match is
+//! homed on one node (`<uuid>.<node>`); members elsewhere reach it over the bus (`RelayedCmd`).
 
 use dashmap::DashMap;
 use musubi_core::{Error, MatchId, Result, SessionId};
 use musubi_proto::{ServerMessage, UserPresence};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use super::Hub;
+use super::party::home_of;
+use crate::fanout::Fanout;
 
 pub const MAX_RELAYED_SIZE: usize = 64;
 pub const MAX_DATA_BYTES: usize = 16 * 1024;
@@ -34,16 +38,34 @@ impl Relayed {
 }
 
 /// Matches formed by the matchmaker: `token` → match id, created lazily on first join.
-#[derive(Default)]
 pub struct RelayedRegistry {
+    node_id: Uuid,
     matches: DashMap<String, Relayed>,
     by_token: DashMap<String, String>,
     by_session: DashMap<SessionId, Vec<String>>,
 }
 
 impl RelayedRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(node_id: Uuid) -> Self {
+        Self {
+            node_id,
+            matches: DashMap::new(),
+            by_token: DashMap::new(),
+            by_session: DashMap::new(),
+        }
+    }
+
+    pub fn is_home(&self, match_id: &str) -> bool {
+        home_of(match_id) == Some(self.node_id)
+    }
+
+    /// A fresh id homed on this node (the matchmaker leader mints one per formed group).
+    pub fn new_match_id(&self) -> String {
+        format!("{}.{}", MatchId::new(), self.node_id)
+    }
+
+    pub fn token_match(&self, token: &str) -> Option<String> {
+        self.by_token.get(token).map(|v| v.clone())
     }
 
     pub fn match_count(&self) -> usize {
@@ -51,24 +73,25 @@ impl RelayedRegistry {
     }
 
     /// Called by matchmaking when a group forms so the token can be redeemed by any member.
-    pub fn register_token(&self, token: &str) {
-        let id = MatchId::new().to_string();
-        self.by_token.insert(token.to_string(), id.clone());
-        self.matches.insert(
-            id.clone(),
-            Relayed {
-                id,
-                label: None,
-                members: vec![],
-            },
-        );
+    pub fn register_token(&self, token: &str, match_id: &str) {
+        self.by_token
+            .insert(token.to_string(), match_id.to_string());
+        if self.is_home(match_id) {
+            self.matches
+                .entry(match_id.to_string())
+                .or_insert_with(|| Relayed {
+                    id: match_id.to_string(),
+                    label: None,
+                    members: vec![],
+                });
+        }
     }
 
     pub fn create(&self, me: &UserPresence, name: Option<String>) -> Result<ServerMessage> {
         if name.as_ref().is_some_and(|n| n.chars().count() > 64) {
             return Err(Error::InvalidArgument("match name ≤ 64 chars".into()));
         }
-        let id = MatchId::new().to_string();
+        let id = self.new_match_id();
         let m = Relayed {
             id: id.clone(),
             label: name,
@@ -85,7 +108,7 @@ impl RelayedRegistry {
 
     pub fn join(
         &self,
-        hub: &Hub,
+        fanout: &Fanout,
         me: &UserPresence,
         match_id: Option<&str>,
         token: Option<&str>,
@@ -123,12 +146,12 @@ impl RelayedRegistry {
             leaves: vec![],
         };
         for s in others {
-            hub.send_to_session(s, ev.clone());
+            fanout.session(s, ev.clone());
         }
         Ok(m.snapshot(me))
     }
 
-    pub fn leave(&self, hub: &Hub, me: SessionId, match_id: &str) -> Result<()> {
+    pub fn leave(&self, fanout: &Fanout, me: SessionId, match_id: &str) -> Result<()> {
         let mut m = self
             .matches
             .get_mut(match_id)
@@ -147,7 +170,7 @@ impl RelayedRegistry {
             leaves: vec![gone],
         };
         for s in m.sessions() {
-            hub.send_to_session(s, ev.clone());
+            fanout.session(s, ev.clone());
         }
         drop(m);
         if empty {
@@ -157,19 +180,19 @@ impl RelayedRegistry {
         Ok(())
     }
 
-    pub fn leave_all(&self, hub: &Hub, me: SessionId) {
+    pub fn leave_all(&self, fanout: &Fanout, me: SessionId) {
         let Some((_, ids)) = self.by_session.remove(&me) else {
             return;
         };
         for id in ids {
-            let _ = self.leave(hub, me, &id);
+            let _ = self.leave(fanout, me, &id);
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn send(
         &self,
-        hub: &Hub,
+        fanout: &Fanout,
         me: &UserPresence,
         match_id: &str,
         op_code: i64,
@@ -208,8 +231,53 @@ impl RelayedRegistry {
                 .collect()
         };
         for s in targets {
-            hub.send_to_session(s, msg.clone());
+            fanout.session(s, msg.clone());
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RelayedCmd {
+    Join,
+    Leave,
+    Data {
+        op_code: i64,
+        data: Vec<u8>,
+        only: Vec<UserPresence>,
+        reliable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayedCmdEnv {
+    pub match_id: String,
+    pub me: UserPresence,
+    pub cmd: RelayedCmd,
+}
+
+/// Execute on the home node; the reply (if any) goes back to `me`'s session.
+pub fn exec(
+    relayed: &RelayedRegistry,
+    fanout: &Fanout,
+    me: &UserPresence,
+    match_id: &str,
+    cmd: RelayedCmd,
+) -> Option<ServerMessage> {
+    let res: Result<Option<ServerMessage>> = match cmd {
+        RelayedCmd::Join => relayed.join(fanout, me, Some(match_id), None).map(Some),
+        RelayedCmd::Leave => relayed.leave(fanout, me.session_id, match_id).map(|_| None),
+        RelayedCmd::Data {
+            op_code,
+            data,
+            only,
+            reliable,
+        } => relayed
+            .send(fanout, me, match_id, op_code, data, &only, reliable)
+            .map(|_| None),
+    };
+    match res {
+        Ok(r) => r,
+        Err(e) => Some(ServerMessage::error(&e)),
     }
 }

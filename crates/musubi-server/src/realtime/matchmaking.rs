@@ -12,8 +12,14 @@ use musubi_proto::ServerMessage;
 use super::{Hub, PartyRegistry, RelayedRegistry};
 
 /// Deliver a formed group to every member session.
-pub fn deliver(hub: &Hub, parties: &PartyRegistry, relayed: &RelayedRegistry, m: &Matched) {
-    relayed.register_token(&m.token);
+pub fn deliver(
+    hub: &Hub,
+    parties: &PartyRegistry,
+    relayed: &RelayedRegistry,
+    m: &Matched,
+    match_id: &str,
+) {
+    relayed.register_token(&m.token, match_id);
     let users = m.users();
     for t in &m.tickets {
         if let Some(pid) = &t.party_id {
@@ -45,8 +51,9 @@ pub fn process_and_deliver(
         return;
     }
     for m in mm.process() {
-        deliver(hub, parties, relayed, &m);
-        fanout.mm_matched(&m);
+        let match_id = relayed.new_match_id();
+        deliver(hub, parties, relayed, &m, &match_id);
+        fanout.mm_matched(&m, &match_id);
     }
 }
 
