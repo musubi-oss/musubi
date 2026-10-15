@@ -172,7 +172,7 @@ async fn store(State(s): State<AppState>, Bearer(_me): Bearer) -> Result<Json<Va
     Ok(Json(json!({ "items": s.economy.store(false).await? })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct BuyReq {
     store_item_id: String,
     currency: String,
@@ -194,6 +194,13 @@ async fn buy(
             r.idempotency_key.as_deref(),
         )
         .await?;
+    s.events
+        .emit(
+            "store.purchase",
+            Some(me.account_id),
+            json!({ "request": &r }),
+        )
+        .await;
     Ok(Json(serde_json::to_value(p).map_err(Error::internal)?))
 }
 
@@ -603,6 +610,13 @@ async fn iap_apple(
     };
     let t = c.transaction(&r.transaction_id).await?;
     let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
+    s.events
+        .emit(
+            "iap.redeemed",
+            Some(me.account_id),
+            json!({ "provider": "apple" }),
+        )
+        .await;
     Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
 }
 
@@ -622,6 +636,13 @@ async fn iap_google(
     };
     let t = c.product_purchase(&r.product_id, &r.purchase_token).await?;
     let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
+    s.events
+        .emit(
+            "iap.redeemed",
+            Some(me.account_id),
+            json!({ "provider": "google" }),
+        )
+        .await;
     Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
 }
 
@@ -837,6 +858,13 @@ async fn quest_claim(
         .economy
         .claim_quest(me.account_id, &id, OffsetDateTime::now_utc())
         .await?;
+    s.events
+        .emit(
+            "quest.claimed",
+            Some(me.account_id),
+            json!({ "quest_id": id, "rewards": rewards }),
+        )
+        .await;
     Ok(Json(json!({ "rewards": rewards })))
 }
 
@@ -920,6 +948,13 @@ async fn season_claim(
             OffsetDateTime::now_utc(),
         )
         .await?;
+    s.events
+        .emit(
+            "season.claimed",
+            Some(me.account_id),
+            json!({ "season_id": id, "rewards": rewards }),
+        )
+        .await;
     Ok(Json(json!({ "rewards": rewards })))
 }
 
@@ -1167,6 +1202,13 @@ async fn iap_steam_finalize(
         )
         .await?;
     s.economy.finalize_steam_order(order_id).await?;
+    s.events
+        .emit(
+            "iap.redeemed",
+            Some(me.account_id),
+            json!({ "provider": "steam" }),
+        )
+        .await;
     Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
 }
 
@@ -1310,6 +1352,13 @@ async fn market_buy(
         json!({ "kind": "market.sold", "listing_id": id, "sale_id": sale.id, "price": sale.price, "fee": sale.fee }),
     )
     .await;
+    s.events
+        .emit(
+            "market.sale",
+            Some(me.account_id),
+            serde_json::to_value(&sale).unwrap_or_default(),
+        )
+        .await;
     Ok(Json(serde_json::to_value(sale).map_err(Error::internal)?))
 }
 
@@ -1485,6 +1534,13 @@ async fn trade_accept(
         json!({ "kind": "trade.accepted", "trade_id": t.id }),
     )
     .await;
+    s.events
+        .emit(
+            "trade.accepted",
+            Some(me.account_id),
+            serde_json::to_value(&t).unwrap_or_default(),
+        )
+        .await;
     Ok(Json(serde_json::to_value(t).map_err(Error::internal)?))
 }
 
