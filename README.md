@@ -79,6 +79,10 @@ of magnitude faster. Open item: in two of roughly twenty kills on this VM the re
 within the 60 s budget; the stand now dumps Raft/world/member state of the survivors when that
 happens so it can be chased down.
 
+The stand runs nightly in GitHub Actions (`.github/workflows/soak.yml`, also on demand with a
+chosen duration and mode); the JSON report and the nodes' logs are kept as the run's artifact, and
+the job fails on any lost write or unsettled incident.
+
 The stand already paid for itself: its first runs showed that a node restarted with the same identity
 after a crash was never seen alive again by the survivors (a SWIM "dead" verdict was terminal per node
 id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.

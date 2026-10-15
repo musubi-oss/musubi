@@ -1,0 +1,56 @@
+name: soak
+# Nightly chaos stand: a real 3-node cluster on one Postgres, clients on it, SIGKILL/drain every
+# 12 s. Fails on any lost write or an incident that does not settle within 60 s, so failover
+# regressions show up here before anyone's players find them. Also runnable by hand.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: "how long the stand runs"
+        default: "120"
+      mode:
+        description: "kill | drain | mixed"
+        default: "mixed"
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: musubi
+          POSTGRES_PASSWORD: musubi
+          POSTGRES_DB: musubi_soak
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U musubi" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p musubi-cli -p musubi-server
+      - name: soak
+        env:
+          MUSUBI_SOAK_NODE_LOG_DIR: ${{ github.workspace }}/soak-logs
+          MUSUBI_SOAK_NODE_LOG_LEVEL: info
+        run: |
+          mkdir -p soak-logs
+          ./target/release/musubi soak \
+            --database-url postgres://musubi:musubi@localhost:5432/musubi_soak \
+            --server-bin ./target/release/musubi-server \
+            --nodes 3 --clients 12 --worlds 6 \
+            --duration-secs "${{ github.event.inputs.duration_secs || '120' }}" \
+            --kill-every-secs 12 \
+            --mode "${{ github.event.inputs.mode || 'mixed' }}" \
+            --json | tee soak-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ github.run_number }}
+          path: |
+            soak-report.json
+            soak-logs/
+          retention-days: 14
