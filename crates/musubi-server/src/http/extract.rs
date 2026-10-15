@@ -42,23 +42,31 @@ impl FromRequestParts<AppState> for ServerKey {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let given = parts
-            .headers
-            .get("x-musubi-server-key")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Key".into()))?;
-        let expected = state.cfg.http.server_key.as_bytes();
-        let ok = given.len() == expected.len()
-            && given
-                .bytes()
-                .zip(expected)
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
-        if !ok {
-            return Err(Error::Unauthenticated("bad server key".into()).into());
-        }
+        check_server_key(state, &parts.headers)?;
         Ok(ServerKey)
     }
+}
+
+/// Constant-time comparison of `X-Musubi-Server-Key` against `http.server_key`.
+pub fn check_server_key(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> musubi_core::Result<()> {
+    let given = headers
+        .get("x-musubi-server-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Key".into()))?;
+    let expected = state.cfg.http.server_key.as_bytes();
+    let ok = given.len() == expected.len()
+        && given
+            .bytes()
+            .zip(expected)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if !ok {
+        return Err(Error::Unauthenticated("bad server key".into()));
+    }
+    Ok(())
 }
 
 /// Best-effort client address: first `X-Forwarded-For` hop, then `X-Real-IP`, then the peer

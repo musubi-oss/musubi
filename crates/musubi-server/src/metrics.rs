@@ -54,7 +54,27 @@ pub async fn track_http(req: Request, next: Next) -> Response {
     res
 }
 
-pub async fn render(State(s): State<AppState>) -> Response {
+pub async fn render(
+    State(s): State<AppState>,
+    crate::http::extract::ClientIp(ip): crate::http::extract::ClientIp,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let m = &s.cfg.metrics;
+    if !m.enabled {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+    if !m.ip_allowed(&ip) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "metrics: address not allowed",
+        )
+            .into_response();
+    }
+    if m.require_server_key {
+        if let Err(e) = crate::http::extract::check_server_key(&s, &headers) {
+            return crate::http::error::ApiError(e).into_response();
+        }
+    }
     gauge!("musubi_uptime_seconds").set(s.started_at.elapsed().as_secs_f64());
     gauge!("musubi_realtime_sessions").set(s.hub.session_count() as f64);
     gauge!("musubi_authoritative_matches").set(s.matches.count() as f64);

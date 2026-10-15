@@ -13,10 +13,15 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 async fn app() -> Option<Router> {
+    app_with(|_| {}).await
+}
+
+async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
     cfg.market.anti_snipe_secs = 0;
+    tweak(&mut cfg);
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
@@ -4276,4 +4281,45 @@ async fn ban_takes_effect_on_the_next_request_despite_valid_jwt() {
         .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(me(app.clone(), tok).await, 200);
+}
+
+#[tokio::test]
+async fn metrics_endpoint_can_be_locked_down() {
+    let Some(open) = app().await else {
+        return;
+    };
+    let scrape = |app: Router, key: Option<&str>, ip: &str| {
+        let mut req = Request::get("/metrics").header("x-forwarded-for", ip);
+        if let Some(k) = key {
+            req = req.header("x-musubi-server-key", k);
+        }
+        let req = req.body(Body::empty()).unwrap();
+        async move { app.oneshot(req).await.unwrap().status().as_u16() }
+    };
+    assert_eq!(
+        scrape(open.clone(), None, "1.2.3.4").await,
+        200,
+        "open by default"
+    );
+
+    let keyed = app_with(|c| c.metrics.require_server_key = true)
+        .await
+        .unwrap();
+    assert_eq!(scrape(keyed.clone(), None, "1.2.3.4").await, 401);
+    assert_eq!(scrape(keyed.clone(), Some("nope"), "1.2.3.4").await, 401);
+    assert_eq!(
+        scrape(keyed.clone(), Some("defaultkey"), "1.2.3.4").await,
+        200
+    );
+
+    let ranged = app_with(|c| c.metrics.allow_ips = vec!["10.".into(), "192.168.1.7".into()])
+        .await
+        .unwrap();
+    assert_eq!(scrape(ranged.clone(), None, "10.4.5.6").await, 200);
+    assert_eq!(scrape(ranged.clone(), None, "192.168.1.7").await, 200);
+    assert_eq!(scrape(ranged.clone(), None, "192.168.1.70").await, 403);
+    assert_eq!(scrape(ranged.clone(), None, "1.2.3.4").await, 403);
+
+    let off = app_with(|c| c.metrics.enabled = false).await.unwrap();
+    assert_eq!(scrape(off, Some("defaultkey"), "10.0.0.1").await, 404);
 }

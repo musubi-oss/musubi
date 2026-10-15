@@ -42,6 +42,7 @@ pub struct Config {
     pub market: MarketConfig,
     pub fleet: FleetConfig,
     pub limits: LimitsConfig,
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,5 +408,40 @@ impl Default for GoogleIapConfig {
             private_key_pem_path: String::new(),
             notifications_token: String::new(),
         }
+    }
+}
+
+/// Who may scrape `GET /metrics`. By default it is open like `/healthz` (close it at the ingress);
+/// `require_server_key` demands `X-Musubi-Server-Key`, `allow_ips` restricts callers to exact IPs
+/// or prefixes ending in `.`/`:` (e.g. `10.`, `fd00:`), judged by the same client-IP rules as
+/// rate limits (X-Forwarded-For → X-Real-IP → peer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub require_server_key: bool,
+    pub allow_ips: Vec<String>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_server_key: false,
+            allow_ips: vec![],
+        }
+    }
+}
+
+impl MetricsConfig {
+    pub fn ip_allowed(&self, ip: &str) -> bool {
+        self.allow_ips.is_empty()
+            || self.allow_ips.iter().any(|a| {
+                if a.ends_with('.') || a.ends_with(':') {
+                    ip.starts_with(a.as_str())
+                } else {
+                    ip == a
+                }
+            })
     }
 }
