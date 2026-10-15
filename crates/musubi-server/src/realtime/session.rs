@@ -51,9 +51,11 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
+    let kick = std::sync::Arc::new(tokio::sync::Notify::new());
     hub.join(SessionHandle {
         presence: presence.clone(),
         tx: tx.clone(),
+        kick: kick.clone(),
     });
     info!(session = %sid, account = %presence.account_id, transport = conn.kind(), "realtime connected");
 
@@ -69,7 +71,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         fanout: &fanout,
         presence: &presence,
     };
-    let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx).await;
+    let result = run_loop(&ctx, conn.as_mut(), encoding, limits, tx, &mut rx, &kick).await;
     for t in parties.leave_all(&fanout, sid) {
         matchmaker.cancel(&t);
         fanout.mm_remove(&t);
@@ -109,6 +111,7 @@ async fn run_loop(
     limits: Limits,
     tx: mpsc::Sender<ServerMessage>,
     rx: &mut mpsc::Receiver<ServerMessage>,
+    kick: &tokio::sync::Notify,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sid = ctx.presence.session_id;
     let mut idle = tokio::time::interval(limits.idle_timeout);
@@ -145,6 +148,11 @@ async fn run_loop(
                     let bytes = encoding.encode(&Envelope { cid: env.cid, msg: reply })?;
                     conn.send(Frame::encoded(encoding, bytes)).await?;
                 }
+            }
+            _ = kick.notified() => {
+                warn!(session = %sid, "kicked by admin");
+                send(conn, encoding, None, ServerMessage::error(&Error::PermissionDenied("kicked".into()))).await?;
+                return Ok(());
             }
             _ = idle.tick() => {
                 warn!(session = %sid, "idle timeout");

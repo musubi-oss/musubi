@@ -11,6 +11,8 @@ pub type RemoteHook = Box<dyn Fn(AccountId, Vec<UserPresence>, Vec<UserPresence>
 pub struct SessionHandle {
     pub presence: UserPresence,
     pub tx: mpsc::Sender<ServerMessage>,
+    /// Fired by `Hub::kick_account`; the session loop closes the socket.
+    pub kick: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// Process-local registry of live realtime sessions.
@@ -32,6 +34,23 @@ pub struct Hub {
 impl Hub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Close every live session of the account on this node. Returns how many were kicked.
+    pub fn kick_account(&self, account_id: AccountId) -> usize {
+        let sids: Vec<SessionId> = self
+            .by_account
+            .get(&account_id)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let mut n = 0;
+        for sid in sids {
+            if let Some(h) = self.sessions.get(&sid) {
+                h.kick.notify_one();
+                n += 1;
+            }
+        }
+        n
     }
 
     pub fn session_count(&self) -> usize {
@@ -303,7 +322,14 @@ mod tests {
             username: "u".into(),
             status: None,
         };
-        (SessionHandle { presence, tx }, rx)
+        (
+            SessionHandle {
+                presence,
+                tx,
+                kick: Default::default(),
+            },
+            rx,
+        )
     }
 
     #[tokio::test]

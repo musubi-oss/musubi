@@ -3483,3 +3483,235 @@ async fn metrics_endpoint_exposes_prometheus_text() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn admin_ban_unban_storage_export_purge_and_config_redaction() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let srv = |req: axum::http::request::Builder| req.header("x-musubi-server-key", "defaultkey");
+    let device = unique("admin-dev-");
+    let auth = |body: Value| {
+        Request::post("/v1/auth/device")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let res = app
+        .clone()
+        .oneshot(auth(json!({"id": device})))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let sess: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let refresh = sess["refresh_token"].as_str().unwrap().to_string();
+
+    // search finds it by id
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!("/v1/admin/accounts?q={acc}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["accounts"][0]["id"], acc);
+    // no server key → 401
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/admin/accounts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+
+    // admin writes a storage object owned by the player, lists and reads it back
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::put("/v1/admin/storage/admincol/k1"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"owner_id": acc, "value": {"gold": 5}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!(
+                "/v1/admin/storage/admincol?owner_id={acc}"
+            )))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["objects"][0]["value"]["gold"], 5);
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!(
+                "/v1/admin/storage/admincol/k1?owner_id={acc}"
+            )))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // ban: refresh and re-auth are refused, status shows disabled_at
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::post(format!("/v1/admin/accounts/{acc}/ban")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/auth/refresh")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"refresh_token": refresh}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401, "refresh sessions revoked on ban");
+    let res = app
+        .clone()
+        .oneshot(auth(json!({"id": device})))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403, "banned account cannot log in");
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!("/v1/admin/accounts/{acc}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(v["status"]["disabled_at"].is_string(), "{v}");
+    // unban → login works again
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::post(format!("/v1/admin/accounts/{acc}/unban")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = app
+        .clone()
+        .oneshot(auth(json!({"id": device})))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // export contains the account, its identity (no secret) and the storage object
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!("/v1/admin/accounts/{acc}/export")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["account"]["id"], acc);
+    assert_eq!(v["tables"]["identities"][0]["subject"], device);
+    assert!(v["tables"]["identities"][0].get("secret_hash").is_none());
+    assert_eq!(v["tables"]["storage_objects"][0]["key"], "k1");
+    assert!(v["tables"]["sessions"].as_array().unwrap().len() >= 2);
+
+    // config dump redacts secrets
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get("/v1/admin/config"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["http"]["server_key"], "***");
+    assert_eq!(v["session"]["secret"], "***");
+    assert!(v["http"]["listen"].is_string());
+
+    // purge: account and every row about it are gone
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::delete(format!("/v1/admin/accounts/{acc}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!("/v1/admin/accounts/{acc}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    let res = app
+        .clone()
+        .oneshot(
+            srv(Request::get(format!(
+                "/v1/admin/storage/admincol?owner_id={acc}"
+            )))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["objects"].as_array().unwrap().len(), 0);
+    // the device is free again: logging in creates a fresh account
+    let res = app
+        .clone()
+        .oneshot(auth(json!({"id": device})))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let sess: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_ne!(sess["account_id"], acc);
+    assert_eq!(sess["created"], true);
+}

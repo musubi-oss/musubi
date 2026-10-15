@@ -186,6 +186,33 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(db.clone()),
     ));
     worlds.set_cluster(cluster.clone());
+    // Admin kicks fan out to every node: each hub closes the account's local sockets.
+    {
+        let (cluster, hub) = (cluster.clone(), hub.clone());
+        let mut rx = cluster.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(m)
+                        if m.topic == crate::http::admin::KICK_TOPIC
+                            && m.origin != cluster.node_id() =>
+                    {
+                        if let Some(id) = m
+                            .payload
+                            .get("account_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+                        {
+                            hub.kick_account(musubi_core::AccountId(id));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
     let adopted = worlds.recover(&[]).await?;
     if !adopted.is_empty() {
         tracing::info!(count = adopted.len(), "adopted orphaned worlds");

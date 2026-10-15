@@ -364,6 +364,20 @@ impl AuthService {
         vars: serde_json::Map<String, serde_json::Value>,
         dev: Device<'_>,
     ) -> Result<Session> {
+        let row: Option<(Option<OffsetDateTime>,)> = sqlx::query_as(
+            "select disabled_at from musubi.accounts where id = $1 and deleted_at is null",
+        )
+        .bind(account_id.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        match row {
+            None => return Err(Error::NotFound("account".into())),
+            Some((Some(_),)) => {
+                return Err(Error::PermissionDenied("account disabled".into()));
+            }
+            Some((None,)) => {}
+        }
         let session_id = SessionId::new();
         let family = family.unwrap_or_else(Uuid::now_v7);
         let refresh = new_refresh_token();

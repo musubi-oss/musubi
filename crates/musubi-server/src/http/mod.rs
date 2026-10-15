@@ -1,4 +1,5 @@
 mod account;
+pub mod admin;
 mod auth;
 mod chat;
 mod cluster;
@@ -37,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(crate::metrics::render))
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
+        .merge(admin::routes())
         .merge(auth::routes())
         .merge(account::routes())
         .merge(friends::routes())

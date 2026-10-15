@@ -256,3 +256,189 @@ mod tests {
         assert_eq!(mask_subject("steam", "76561198000000000"), "765611…");
     }
 }
+
+/// Every table that stores rows about an account, with the column that names it. Used by the
+/// admin export and the GDPR purge; `identities` and `sessions` cascade from `accounts`.
+pub const ACCOUNT_TABLES: &[(&str, &str)] = &[
+    ("identities", "account_id"),
+    ("sessions", "account_id"),
+    ("storage_objects", "owner_id"),
+    ("friends", "user_id"),
+    ("group_members", "user_id"),
+    ("notifications", "user_id"),
+    ("chat_messages", "sender_id"),
+    ("leaderboard_records", "owner_id"),
+    ("wallets", "account_id"),
+    ("wallet_ledger", "account_id"),
+    ("inventory", "account_id"),
+    ("purchases", "account_id"),
+    ("iap_receipts", "account_id"),
+    ("iap_orders", "account_id"),
+    ("reward_rolls", "account_id"),
+    ("reward_pity", "account_id"),
+    ("progress", "account_id"),
+    ("energy_state", "account_id"),
+    ("streak_state", "account_id"),
+    ("mail", "account_id"),
+    ("achievement_progress", "account_id"),
+    ("quest_progress", "account_id"),
+    ("season_state", "account_id"),
+    ("market_listings", "seller_id"),
+    ("market_sales", "seller_id"),
+    ("market_sales", "buyer_id"),
+    ("trades", "from_id"),
+    ("trades", "to_id"),
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountSummary {
+    pub id: AccountId,
+    pub username: String,
+    pub display_name: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub disabled_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub deleted_at: Option<OffsetDateTime>,
+}
+
+impl AccountService {
+    /// Admin search: `q` matches a username prefix (case-insensitive) or an exact id.
+    pub async fn search(
+        &self,
+        q: Option<&str>,
+        include_deleted: bool,
+        limit: i64,
+        cursor: Option<Uuid>,
+    ) -> Result<Vec<AccountSummary>> {
+        let limit = limit.clamp(1, 200);
+        let q = q.unwrap_or("").trim();
+        let by_id = Uuid::parse_str(q).ok();
+        let pattern = format!(
+            "{}%",
+            q.to_lowercase().replace('%', "\\%").replace('_', "\\_")
+        );
+        let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, OffsetDateTime, Option<OffsetDateTime>, Option<OffsetDateTime>)>(
+            "select id, username, display_name, created_at, disabled_at, deleted_at from musubi.accounts
+             where ($1 = '' or lower(username) like $2 or id = $3)
+               and ($4 or deleted_at is null)
+               and ($5::uuid is null or id > $5)
+             order by id limit $6",
+        )
+        .bind(q)
+        .bind(&pattern)
+        .bind(by_id)
+        .bind(include_deleted)
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, username, display_name, created_at, disabled_at, deleted_at)| {
+                    AccountSummary {
+                        id: AccountId(id),
+                        username,
+                        display_name,
+                        created_at,
+                        disabled_at,
+                        deleted_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    pub async fn status(&self, id: AccountId) -> Result<AccountSummary> {
+        self.search(Some(&id.0.to_string()), true, 1, None)
+            .await?
+            .into_iter()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound("account".into()))
+    }
+
+    /// Ban (`disabled = true`) or unban. Banning revokes every refresh session so the player
+    /// cannot mint new access tokens; live sockets are kicked by the caller.
+    pub async fn set_disabled(&self, id: AccountId, disabled: bool) -> Result<()> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let r = if disabled {
+            sqlx::query("update musubi.accounts set disabled_at = coalesce(disabled_at, now()), updated_at = now() where id = $1 and deleted_at is null")
+        } else {
+            sqlx::query("update musubi.accounts set disabled_at = null, updated_at = now() where id = $1 and deleted_at is null")
+        }
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if r.rows_affected() == 0 {
+            return Err(Error::NotFound("account".into()));
+        }
+        if disabled {
+            sqlx::query("update musubi.sessions set revoked_at = now() where account_id = $1 and revoked_at is null")
+                .bind(id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+        }
+        tx.commit().await.map_err(Error::internal)
+    }
+
+    /// Everything stored about the account, table by table (secrets stripped). GDPR access
+    /// request / support tooling.
+    pub async fn export(&self, id: AccountId) -> Result<serde_json::Value> {
+        let account: Option<serde_json::Value> =
+            sqlx::query_scalar("select to_jsonb(a) from musubi.accounts a where id = $1")
+                .bind(id.0)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        let Some(account) = account else {
+            return Err(Error::NotFound("account".into()));
+        };
+        let mut tables = serde_json::Map::new();
+        for (table, col) in ACCOUNT_TABLES {
+            let rows: serde_json::Value = sqlx::query_scalar(&format!(
+                "select coalesce(jsonb_agg(to_jsonb(t) - 'secret_hash' - 'refresh_hash'), '[]'::jsonb) from musubi.{table} t where t.{col} = $1"
+            ))
+            .bind(id.0)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::internal)?;
+            let entry = tables
+                .entry(table.to_string())
+                .or_insert_with(|| serde_json::Value::Array(vec![]));
+            if let (Some(dst), Some(src)) = (entry.as_array_mut(), rows.as_array()) {
+                dst.extend(src.iter().cloned());
+            }
+        }
+        Ok(serde_json::json!({ "account": account, "tables": tables }))
+    }
+
+    /// Hard delete: the account row and every row in `ACCOUNT_TABLES` (GDPR erasure). Rows that
+    /// only reference the account as a counter-party (sales, trades) go too.
+    pub async fn purge(&self, id: AccountId) -> Result<u64> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let mut removed = 0u64;
+        for (table, col) in ACCOUNT_TABLES {
+            let r = sqlx::query(&format!("delete from musubi.{table} where {col} = $1"))
+                .bind(id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+            removed += r.rows_affected();
+        }
+        let r = sqlx::query("delete from musubi.accounts where id = $1")
+            .bind(id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        if r.rows_affected() == 0 {
+            return Err(Error::NotFound("account".into()));
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(removed + 1)
+    }
+}

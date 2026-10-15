@@ -3378,3 +3378,36 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
         .await
         .unwrap();
 }
+
+/// Admin kick closes the player's live sockets with a `kicked` error.
+#[tokio::test]
+async fn admin_kick_closes_realtime_sessions() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let (ta, acc) = token(&router).await;
+    let mut a = connect(&addr, &ta, "json").await;
+    send(&mut a, "json", None, ClientMessage::Ping).await;
+    recv(&mut a).await;
+    let req = Request::post(format!("/v1/admin/accounts/{acc}/kick"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["kicked_local"], 1);
+    let env = recv(&mut a).await;
+    assert!(
+        matches!(&env.msg, ServerMessage::Error { message, .. } if message.contains("kicked")),
+        "{:?}",
+        env.msg
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let req = Request::get("/v1/node").body(Body::empty()).unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["realtime_sessions"], 0, "socket closed and left the hub");
+}
