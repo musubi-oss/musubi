@@ -143,14 +143,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         relayed.clone(),
     );
     crate::realtime::matchmaking::spawn_ticker(
-        hub.clone(),
-        parties.clone(),
         relayed.clone(),
         matchmaker.clone(),
         fanout.clone(),
         Some(cluster.clone()),
         std::time::Duration::from_secs(1),
     );
+    fanout.set_fleets(fleets.clone());
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {
         cfg: Arc::new(cfg),

@@ -239,6 +239,9 @@ pub enum ServerMessage {
         users: Vec<MatchmakerUser>,
         #[serde(rename = "self")]
         me: MatchmakerUser,
+        /// Dedicated server allocated for the group (tickets carried `fleet=<name>`).
+        #[serde(default)]
+        server: Option<MatchmakerServer>,
     },
     /// Reply to create/join/accept: the party as the receiver sees it.
     Party {
@@ -301,6 +304,17 @@ pub enum ServerMessage {
         joins: Vec<UserPresence>,
         leaves: Vec<UserPresence>,
     },
+}
+
+/// Where to connect when the matchmaker allocated a dedicated server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchmakerServer {
+    pub server_id: String,
+    pub fleet_id: String,
+    pub address: String,
+    pub port: u16,
+    /// Shared by the group; the game server validates it via `/v1/gameserver/connect`.
+    pub connect_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

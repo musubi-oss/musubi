@@ -56,6 +56,13 @@ async fn build_state(leader: bool) -> Option<AppState> {
         relayed.clone(),
     );
     fanout.set_leader(leader);
+    let fleets = Arc::new(musubi_fleet::FleetService::new(
+        db.clone(),
+        cluster.as_ref().unwrap().node_id().0,
+        "http://127.0.0.1:0",
+        "defaultkey",
+    ));
+    fanout.set_fleets(fleets.clone());
     Some(AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()),
@@ -75,12 +82,7 @@ async fn build_state(leader: bool) -> Option<AppState> {
         matches: test_matches(&db, &runtime),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
-        fleets: Arc::new(musubi_fleet::FleetService::new(
-            db.clone(),
-            cluster.as_ref().unwrap().node_id().0,
-            "http://127.0.0.1:0",
-            "defaultkey",
-        )),
+        fleets: fleets.clone(),
         fanout,
         hub,
         cfg: Arc::new(cfg),
@@ -524,6 +526,7 @@ async fn matchmaker_pairs_two_players_and_remove_works() {
             token,
             users,
             me,
+            ..
         } => {
             assert_eq!(ticket, ticket_a);
             assert_eq!(users.len(), 2);
@@ -1890,4 +1893,79 @@ async fn cross_node_relayed_match() {
     assert!(
         matches!(recv(&mut a).await.msg, ServerMessage::MatchPresenceEvent { leaves, .. } if leaves.len() == 1)
     );
+}
+
+#[tokio::test]
+async fn matchmaker_allocates_a_dedicated_server_when_tickets_ask_for_a_fleet() {
+    let Some(state) = build_state(true).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let k = "defaultkey";
+    let name = format!("mmfleet-{}", uuid::Uuid::now_v7().simple());
+    let req = Request::post("/v1/server/fleets")
+        .header("x-musubi-server-key", k)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"name": name, "buffer": 1, "max_servers": 1, "port_start": 48000, "port_end": 48100, "spec": {"command": ["sleep", "60"]}}).to_string()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let fleet: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let fid = fleet["id"].as_str().unwrap().to_string();
+    state.fleets.reconcile().await.unwrap();
+    let servers = state
+        .fleets
+        .servers(uuid::Uuid::parse_str(&fid).unwrap(), None)
+        .await
+        .unwrap();
+    let sid = servers[0].id;
+    state.fleets.sdk_ready(sid).await.unwrap();
+
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let add = || ClientMessage::MatchmakerAdd {
+        query: "+properties.fleet:".to_string() + &name,
+        min_count: 2,
+        max_count: 2,
+        count_multiple: 1,
+        string_properties: [("fleet".to_string(), name.clone())].into_iter().collect(),
+        numeric_properties: Default::default(),
+    };
+    send(&mut a, f, None, add()).await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    send(&mut b, f, None, add()).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::MatchmakerMatched {
+                server: Some(srv), ..
+            } => {
+                assert_eq!(srv.server_id, sid.to_string());
+                assert_eq!(srv.port, 48000);
+                assert!(!srv.connect_token.is_empty());
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    let gs = state.fleets.server(sid).await.unwrap();
+    assert_eq!(gs.state, "allocated");
+    state
+        .fleets
+        .delete(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
 }

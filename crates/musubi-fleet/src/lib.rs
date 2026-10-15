@@ -94,7 +94,7 @@ pub struct Allocation {
     pub fleet_id: Uuid,
     pub address: String,
     pub port: i32,
-    /// One-time token the game server validates through `/v1/gameserver/connect`.
+    /// Token the game server validates through `/v1/gameserver/connect` (shared by the group).
     pub connect_token: String,
 }
 
@@ -354,6 +354,18 @@ impl FleetService {
         .ok_or_else(|| Error::NotFound("fleet".into()))
     }
 
+    pub async fn get_by_name(&self, name: &str) -> Result<Fleet> {
+        sqlx::query_as(&format!(
+            "select {FLEET_COLS} from musubi.fleets where name = $1"
+        ))
+        .bind(name)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .map(row_to_fleet)
+        .ok_or_else(|| Error::NotFound(format!("fleet {name}")))
+    }
+
     /// Change buffer / max_servers; the reconciler follows.
     pub async fn scale(
         &self,
@@ -478,11 +490,12 @@ impl FleetService {
         self.server(id).await
     }
 
-    /// Validate and burn a one-time connect token (the game server calls this when a client arrives).
+    /// Validate the allocation's connect token (shared by the whole group; the game server calls
+    /// this when a client arrives). The first valid connect moves the server to `in_game`.
     pub async fn sdk_connect(&self, id: Uuid, token: &str) -> Result<serde_json::Value> {
         let r: Option<Option<serde_json::Value>> = sqlx::query_scalar(
-            "update musubi.game_servers set connect_token = null, state = case when state = 'allocated' then 'in_game' else state end, updated_at = now()
-             where id = $1 and connect_token = $2 returning allocation",
+            "update musubi.game_servers set state = case when state = 'allocated' then 'in_game' else state end, updated_at = now()
+             where id = $1 and connect_token = $2 and state in ('allocated', 'in_game') returning allocation",
         )
         .bind(id)
         .bind(token)

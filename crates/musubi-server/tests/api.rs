@@ -37,6 +37,13 @@ async fn app() -> Option<Router> {
         parties.clone(),
         relayed.clone(),
     );
+    let fleets = Arc::new(musubi_fleet::FleetService::new(
+        db.clone(),
+        cluster.as_ref().unwrap().node_id().0,
+        "http://127.0.0.1:0",
+        "defaultkey",
+    ));
+    fanout.set_fleets(fleets.clone());
     Some(musubi_server::http::router(AppState {
         cfg: Arc::new(cfg),
         auth,
@@ -57,12 +64,7 @@ async fn app() -> Option<Router> {
         matches: test_matches(&db, &runtime),
         runtime: runtime.clone(),
         cluster: cluster.clone(),
-        fleets: Arc::new(musubi_fleet::FleetService::new(
-            db.clone(),
-            cluster.as_ref().unwrap().node_id().0,
-            "http://127.0.0.1:0",
-            "defaultkey",
-        )),
+        fleets: fleets.clone(),
         fanout,
         hub,
         db,
@@ -1495,6 +1497,17 @@ async fn fleet_lifecycle_with_local_process_provider() {
         .header("x-musubi-server-id", &sid)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({"token": tok}).to_string()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "token is shared by the group"
+    );
+    let req = Request::post("/v1/gameserver/connect")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"token": "wrong"}).to_string()))
         .unwrap();
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),

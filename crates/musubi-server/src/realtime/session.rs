@@ -230,8 +230,6 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
                 Ok(ticket) => {
                     ctx.fanout.mm_add(&ticket);
                     super::matchmaking::process_and_deliver(
-                        hub,
-                        ctx.parties,
                         ctx.relayed,
                         ctx.matchmaker,
                         ctx.fanout,

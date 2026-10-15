@@ -4,6 +4,10 @@ use std::sync::Arc;
 
 use musubi_cluster::{BusMessage, Cluster};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+use musubi_fleet::FleetService;
+use musubi_proto::realtime::MatchmakerServer;
 
 use musubi_core::{AccountId, SessionId};
 use musubi_matchmaker::{Matched, MatchedWire, Matchmaker, TicketWire};
@@ -52,6 +56,7 @@ pub struct Fanout {
     relayed: Arc<RelayedRegistry>,
     /// Only the leader runs matchmaker passes; tickets are replicated to every node.
     leader: Arc<AtomicBool>,
+    fleets: Arc<OnceLock<Arc<FleetService>>>,
 }
 
 impl Fanout {
@@ -69,6 +74,7 @@ impl Fanout {
             parties,
             relayed,
             leader: Arc::new(AtomicBool::new(true)),
+            fleets: Arc::new(OnceLock::new()),
         };
         if let Some(c) = &f.cluster {
             let publisher = f.clone();
@@ -128,13 +134,7 @@ impl Fanout {
 
     /// Run a matchmaker pass right now (leader only; no-op elsewhere).
     pub fn matchmake_now(&self) {
-        crate::realtime::matchmaking::process_and_deliver(
-            &self.hub,
-            &self.parties,
-            &self.relayed,
-            &self.mm,
-            self,
-        );
+        crate::realtime::matchmaking::process_and_deliver(&self.relayed, &self.mm, self);
     }
 
     pub fn is_leader(&self) -> bool {
@@ -157,8 +157,58 @@ impl Fanout {
         self.publish(Wire::MmRemove(ticket.to_string()));
     }
 
-    pub fn mm_matched(&self, m: &Matched, match_id: &str) {
-        self.publish(Wire::MmMatched(m.to_wire(match_id)));
+    pub fn set_fleets(&self, fleets: Arc<FleetService>) {
+        let _ = self.fleets.set(fleets);
+    }
+
+    fn mm_matched(&self, m: &Matched, match_id: &str, server: Option<MatchmakerServer>) {
+        self.publish(Wire::MmMatched(m.to_wire(match_id, server)));
+    }
+
+    /// Leader side: hand a formed group to its members everywhere. When every ticket asked for a
+    /// `fleet`, a dedicated server is allocated first (asynchronously) and travels with the result.
+    pub fn deliver_matched(&self, m: Matched, match_id: String) {
+        let fleet = m.fleet();
+        let me = self.clone();
+        tokio::spawn(async move {
+            let server = match (fleet, me.fleets.get()) {
+                (Some(name), Some(fleets)) => match fleets.get_by_name(&name).await {
+                    Ok(f) => match fleets
+                        .allocate(
+                            f.id,
+                            serde_json::json!({ "token": m.token, "users": m.users() }),
+                        )
+                        .await
+                    {
+                        Ok(a) => Some(MatchmakerServer {
+                            server_id: a.server_id.to_string(),
+                            fleet_id: a.fleet_id.to_string(),
+                            address: a.address,
+                            port: a.port as u16,
+                            connect_token: a.connect_token,
+                        }),
+                        Err(e) => {
+                            tracing::warn!(fleet = %name, error = %e, "no server for matched group; delivering without one");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(fleet = %name, error = %e, "matched group asked for an unknown fleet");
+                        None
+                    }
+                },
+                _ => None,
+            };
+            crate::realtime::matchmaking::deliver(
+                &me.hub,
+                &me.parties,
+                &me.relayed,
+                &m,
+                &match_id,
+                server.as_ref(),
+            );
+            me.mm_matched(&m, &match_id, server);
+        });
     }
 
     pub fn relayed_cmd(&self, env: RelayedCmdEnv) {
@@ -193,6 +243,7 @@ impl Fanout {
             }
             Ok(Wire::MmMatched(w)) => {
                 let match_id = w.match_id.clone();
+                let server = w.server.clone();
                 match Matched::from_wire(w) {
                     Ok(matched) => {
                         for t in &matched.tickets {
@@ -204,6 +255,7 @@ impl Fanout {
                             &self.relayed,
                             &matched,
                             &match_id,
+                            server.as_ref(),
                         );
                     }
                     Err(e) => tracing::warn!(error = %e, "bad matched message"),

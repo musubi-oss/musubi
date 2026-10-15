@@ -102,14 +102,37 @@ pub struct MatchedWire {
     /// Relayed match id minted by the leader (homed on it) so every node maps token → match.
     #[serde(default)]
     pub match_id: String,
+    #[serde(default)]
+    pub server: Option<musubi_proto::realtime::MatchmakerServer>,
     pub tickets: Vec<TicketWire>,
 }
 
 impl Matched {
-    pub fn to_wire(&self, match_id: &str) -> MatchedWire {
+    /// Fleet every member asked for via the `fleet` string property (None if absent or mixed).
+    pub fn fleet(&self) -> Option<String> {
+        let mut out: Option<String> = None;
+        for t in &self.tickets {
+            for m in &t.members {
+                let f = m.string_properties.get("fleet")?;
+                match &out {
+                    None => out = Some(f.clone()),
+                    Some(x) if x == f => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        out
+    }
+
+    pub fn to_wire(
+        &self,
+        match_id: &str,
+        server: Option<musubi_proto::realtime::MatchmakerServer>,
+    ) -> MatchedWire {
         MatchedWire {
             token: self.token.clone(),
             match_id: match_id.to_string(),
+            server,
             tickets: self.tickets.iter().map(TicketWire::from).collect(),
         }
     }

@@ -7,6 +7,7 @@ use musubi_cluster::Cluster;
 use musubi_matchmaker::{Matched, Matchmaker};
 
 use crate::fanout::Fanout;
+use musubi_proto::realtime::MatchmakerServer;
 use musubi_proto::ServerMessage;
 
 use super::{Hub, PartyRegistry, RelayedRegistry};
@@ -18,6 +19,7 @@ pub fn deliver(
     relayed: &RelayedRegistry,
     m: &Matched,
     match_id: &str,
+    server: Option<&MatchmakerServer>,
 ) {
     relayed.register_token(&m.token, match_id);
     let users = m.users();
@@ -33,6 +35,7 @@ pub fn deliver(
                     token: m.token.clone(),
                     users: users.clone(),
                     me: member.clone(),
+                    server: server.cloned(),
                 },
             );
         }
@@ -40,27 +43,18 @@ pub fn deliver(
 }
 
 /// Leader-only: form groups, deliver locally and announce them to the other nodes.
-pub fn process_and_deliver(
-    hub: &Hub,
-    parties: &PartyRegistry,
-    relayed: &RelayedRegistry,
-    mm: &Matchmaker,
-    fanout: &Fanout,
-) {
+pub fn process_and_deliver(relayed: &RelayedRegistry, mm: &Matchmaker, fanout: &Fanout) {
     if !fanout.is_leader() {
         return;
     }
     for m in mm.process() {
         let match_id = relayed.new_match_id();
-        deliver(hub, parties, relayed, &m, &match_id);
-        fanout.mm_matched(&m, &match_id);
+        fanout.deliver_matched(m, match_id);
     }
 }
 
 /// Background pass so tickets that waited out `min_wait` still get matched without new arrivals.
 pub fn spawn_ticker(
-    hub: Arc<Hub>,
-    parties: Arc<PartyRegistry>,
     relayed: Arc<RelayedRegistry>,
     mm: Arc<Matchmaker>,
     fanout: Fanout,
@@ -87,7 +81,7 @@ pub fn spawn_ticker(
                 }
                 n += 1;
             }
-            process_and_deliver(&hub, &parties, &relayed, &mm, &fanout);
+            process_and_deliver(&relayed, &mm, &fanout);
         }
     })
 }
