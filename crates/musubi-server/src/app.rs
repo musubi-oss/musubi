@@ -151,7 +151,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         std::time::Duration::from_secs(1),
     );
     fanout.set_fleets(fleets.clone());
-    let worlds = Arc::new(crate::realtime::WorldRegistry::new());
+    let worlds = Arc::new(crate::realtime::WorldRegistry::new(
+        cluster.node_id().0,
+        Some(db.clone()),
+    ));
+    fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone());
     let state = AppState {

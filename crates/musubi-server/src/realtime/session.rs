@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 use super::hub::SessionHandle;
 use super::party::{PartyCmd, PartyCmdEnv};
 use super::relayed::{RelayedCmd, RelayedCmdEnv};
+use super::world::{WorldCmd, WorldCmdEnv};
 use super::{Hub, MatchRegistry, PartyRegistry, RelayedRegistry};
 
 pub struct ConnectParams {
@@ -309,25 +310,15 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
             x,
             y,
             radius,
-        } => ctx
-            .worlds
-            .subscribe(&world, sid, musubi_mesh::Pos { x, y }, radius)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
-        ClientMessage::WorldUnsubscribe { world } => ctx
-            .worlds
-            .unsubscribe(&world, sid)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
+        } => world_dispatch(ctx, &world, WorldCmd::Subscribe { x, y, radius }).await,
+        ClientMessage::WorldUnsubscribe { world } => {
+            world_dispatch(ctx, &world, WorldCmd::Unsubscribe).await
+        }
         ClientMessage::WorldInput {
             world,
             entity,
             input,
-        } => ctx
-            .worlds
-            .input(&world, sid, &entity, input)
-            .err()
-            .map(|e| ServerMessage::error(&e)),
+        } => world_dispatch(ctx, &world, WorldCmd::Input { entity, input }).await,
         ClientMessage::MatchJoin {
             match_id,
             token,
@@ -542,6 +533,27 @@ fn ack_of(m: &musubi_proto::realtime::ChannelMessage) -> ServerMessage {
         create_time: m.create_time,
         update_time: m.update_time,
         persistent: m.persistent,
+    }
+}
+
+/// Worlds live on a home node: run locally or forward over the bus (deltas come back via
+/// `Fanout::session`, which already routes to remote sessions).
+async fn world_dispatch(ctx: &Ctx<'_>, world: &str, cmd: WorldCmd) -> Option<ServerMessage> {
+    let env = WorldCmdEnv {
+        world: world.to_string(),
+        session_id: ctx.presence.session_id,
+        cmd,
+    };
+    match ctx.worlds.home_of(world).await {
+        Err(e) => Some(ServerMessage::error(&e)),
+        Ok(None) => Some(ServerMessage::error(&Error::NotFound(format!(
+            "world {world}"
+        )))),
+        Ok(Some(h)) if h == ctx.worlds.node_id() => ctx.worlds.exec(env),
+        Ok(Some(_)) => {
+            ctx.fanout.world_cmd(env);
+            None
+        }
     }
 }
 

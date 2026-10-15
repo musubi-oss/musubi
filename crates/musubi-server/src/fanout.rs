@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::realtime::party::PartyCmdEnv;
 use crate::realtime::relayed::RelayedCmdEnv;
+use crate::realtime::world::{WorldCmdEnv, WorldRegistry};
 use crate::realtime::{Hub, PartyRegistry, RelayedRegistry};
 
 #[derive(Serialize, Deserialize)]
@@ -43,6 +44,7 @@ enum Wire {
     PartyCmd(PartyCmdEnv),
     SessionGone(SessionId),
     RelayedCmd(RelayedCmdEnv),
+    WorldCmd(WorldCmdEnv),
 }
 
 const TOPIC: &str = "realtime";
@@ -57,6 +59,7 @@ pub struct Fanout {
     /// Only the leader runs matchmaker passes; tickets are replicated to every node.
     leader: Arc<AtomicBool>,
     fleets: Arc<OnceLock<Arc<FleetService>>>,
+    worlds: Arc<OnceLock<Arc<WorldRegistry>>>,
 }
 
 impl Fanout {
@@ -75,6 +78,7 @@ impl Fanout {
             relayed,
             leader: Arc::new(AtomicBool::new(true)),
             fleets: Arc::new(OnceLock::new()),
+            worlds: Arc::new(OnceLock::new()),
         };
         if let Some(c) = &f.cluster {
             let publisher = f.clone();
@@ -159,6 +163,14 @@ impl Fanout {
 
     pub fn set_fleets(&self, fleets: Arc<FleetService>) {
         let _ = self.fleets.set(fleets);
+    }
+
+    pub fn set_worlds(&self, worlds: Arc<WorldRegistry>) {
+        let _ = self.worlds.set(worlds);
+    }
+
+    pub fn world_cmd(&self, env: WorldCmdEnv) {
+        self.publish(Wire::WorldCmd(env));
     }
 
     fn mm_matched(&self, m: &Matched, match_id: &str, server: Option<MatchmakerServer>) {
@@ -284,6 +296,19 @@ impl Fanout {
                     self.mm_remove(&t);
                 }
                 self.relayed.leave_all(self, sid);
+                if let Some(w) = self.worlds.get() {
+                    w.unsubscribe_all(sid);
+                }
+            }
+            Ok(Wire::WorldCmd(env)) => {
+                if let Some(w) = self.worlds.get() {
+                    if w.is_home(&env.world) {
+                        let sid = env.session_id;
+                        if let Some(reply) = w.exec(env) {
+                            self.session(sid, reply);
+                        }
+                    }
+                }
             }
             Ok(Wire::RelayedCmd(env)) => {
                 if self.relayed.is_home(&env.match_id) {

@@ -44,7 +44,11 @@ async fn app() -> Option<Router> {
         "defaultkey",
     ));
     fanout.set_fleets(fleets.clone());
-    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new());
+    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new(
+        cluster.as_ref().unwrap().node_id().0,
+        Some(db.clone()),
+    ));
+    fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     Some(musubi_server::http::router(AppState {
         cfg: Arc::new(cfg),

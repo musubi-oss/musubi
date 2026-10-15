@@ -1,7 +1,8 @@
 //! Worlds: one `musubi_mesh::World` per named world on this node, ticked at 30 Hz. Simulators
 //! drive it through the server-key HTTP API (lease, spawn, apply, view, events, handover ack);
-//! clients subscribe by interest over the socket and receive `WorldDelta`s. v0 is node-local; the
-//! shard controller / cross-node replication layer comes next.
+//! clients subscribe by interest over the socket and receive `WorldDelta`s. A world lives on one
+//! home node (directory: `musubi.worlds`); clients on other nodes reach it over the bus
+//! (`WorldCmd`), simulators are redirected to the home node's HTTP address.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use musubi_proto::ServerMessage;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::fanout::Fanout;
@@ -34,9 +36,26 @@ struct WorldState {
     sim_events: HashMap<Uuid, Vec<Value>>,
 }
 
-#[derive(Default)]
 pub struct WorldRegistry {
+    node_id: Uuid,
+    db: Option<PgPool>,
     worlds: DashMap<String, Arc<Mutex<WorldState>>>,
+    /// world → home node (cache of `musubi.worlds`)
+    homes: DashMap<String, Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorldCmd {
+    Subscribe { x: f64, y: f64, radius: f64 },
+    Unsubscribe,
+    Input { entity: String, input: Value },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldCmdEnv {
+    pub world: String,
+    pub session_id: SessionId,
+    pub cmd: WorldCmd,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,8 +102,56 @@ fn mesh_err(e: musubi_mesh::MeshError) -> Error {
 }
 
 impl WorldRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(node_id: Uuid, db: Option<PgPool>) -> Self {
+        Self {
+            node_id,
+            db,
+            worlds: DashMap::new(),
+            homes: DashMap::new(),
+        }
+    }
+
+    pub fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
+    /// Home node of a world: local registry first, then the directory. `None` = unknown world.
+    pub async fn home_of(&self, name: &str) -> Result<Option<Uuid>> {
+        if self.worlds.contains_key(name) {
+            return Ok(Some(self.node_id));
+        }
+        if let Some(h) = self.homes.get(name) {
+            return Ok(Some(*h));
+        }
+        let Some(db) = &self.db else { return Ok(None) };
+        let row: Option<Uuid> =
+            sqlx::query_scalar("select node_id from musubi.worlds where name = $1")
+                .bind(name)
+                .fetch_optional(db)
+                .await
+                .map_err(Error::internal)?;
+        if let Some(h) = row {
+            self.homes.insert(name.to_string(), h);
+        }
+        Ok(row)
+    }
+
+    pub fn is_home(&self, name: &str) -> bool {
+        self.worlds.contains_key(name)
+    }
+
+    /// Run a client command on the home node; errors go back to the session as messages.
+    pub fn exec(&self, env: WorldCmdEnv) -> Option<ServerMessage> {
+        let r = match env.cmd {
+            WorldCmd::Subscribe { x, y, radius } => {
+                self.subscribe(&env.world, env.session_id, Pos { x, y }, radius)
+            }
+            WorldCmd::Unsubscribe => self.unsubscribe(&env.world, env.session_id),
+            WorldCmd::Input { entity, input } => {
+                self.input(&env.world, env.session_id, &entity, input)
+            }
+        };
+        r.err().map(|e| ServerMessage::error(&e))
     }
 
     fn get(&self, name: &str) -> Result<Arc<Mutex<WorldState>>> {
@@ -94,7 +161,12 @@ impl WorldRegistry {
             .ok_or_else(|| Error::NotFound(format!("world {name}")))
     }
 
-    pub fn create(&self, name: &str, cfg: WorldConfig, ctl: ControllerConfig) -> Result<WorldInfo> {
+    pub async fn create(
+        &self,
+        name: &str,
+        cfg: WorldConfig,
+        ctl: ControllerConfig,
+    ) -> Result<WorldInfo> {
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidArgument("world name 1..=64 chars".into()));
         }
@@ -103,6 +175,19 @@ impl WorldRegistry {
         }
         if self.worlds.contains_key(name) {
             return Err(Error::Conflict("world exists".into()));
+        }
+        if let Some(db) = &self.db {
+            sqlx::query("insert into musubi.worlds (name, node_id, config, controller) values ($1, $2, $3, $4)")
+                .bind(name)
+                .bind(self.node_id)
+                .bind(serde_json::to_value(&cfg)?)
+                .bind(serde_json::to_value(&ctl)?)
+                .execute(db)
+                .await
+                .map_err(|e| match e {
+                    sqlx::Error::Database(d) if d.is_unique_violation() => Error::Conflict("world exists on another node".into()),
+                    e => Error::internal(e),
+                })?;
         }
         self.worlds.insert(
             name.to_string(),
@@ -116,11 +201,21 @@ impl WorldRegistry {
         self.info(name)
     }
 
-    pub fn delete(&self, name: &str) -> Result<()> {
+    pub async fn delete(&self, name: &str) -> Result<()> {
         self.worlds
             .remove(name)
             .map(|_| ())
-            .ok_or_else(|| Error::NotFound(format!("world {name}")))
+            .ok_or_else(|| Error::NotFound(format!("world {name}")))?;
+        self.homes.remove(name);
+        if let Some(db) = &self.db {
+            sqlx::query("delete from musubi.worlds where name = $1 and node_id = $2")
+                .bind(name)
+                .bind(self.node_id)
+                .execute(db)
+                .await
+                .map_err(Error::internal)?;
+        }
+        Ok(())
     }
 
     pub fn info(&self, name: &str) -> Result<WorldInfo> {

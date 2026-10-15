@@ -63,7 +63,11 @@ async fn build_state(leader: bool) -> Option<AppState> {
         "defaultkey",
     ));
     fanout.set_fleets(fleets.clone());
-    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new());
+    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new(
+        cluster.as_ref().unwrap().node_id().0,
+        Some(db.clone()),
+    ));
+    fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     Some(AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
@@ -2464,4 +2468,101 @@ async fn sim_sdk_two_simulators_hand_an_entity_over() {
         "entity never continued moving under s2: {:?}",
         client.info().await.unwrap()
     );
+}
+
+#[tokio::test]
+async fn cross_node_world_subscription_and_sim_redirect() {
+    let Some((addr1, router1)) = start().await else {
+        return;
+    };
+    let Some((addr2, router2)) = start().await else {
+        return;
+    };
+    let base1 = format!("http://{addr1}");
+    let world = format!("xw{}", uuid::Uuid::now_v7().simple());
+    let c1 = musubi_sim_sdk::WorldClient::new(&base1, "defaultkey", &world);
+    c1.create_world(json!({"cell_size": 100.0}), json!({}))
+        .await
+        .unwrap();
+    let sim = uuid::Uuid::now_v7();
+    c1.register(sim, 100).await.unwrap();
+    // simulator talking to the wrong node is told where the world lives (no advertise in tests → 409)
+    let c2 = musubi_sim_sdk::WorldClient::new(&format!("http://{addr2}"), "defaultkey", &world);
+    match c2.register(sim, 100).await {
+        Err(musubi_sim_sdk::SdkError::Server { status: 409, body }) => {
+            assert!(body.contains("lives on node"), "{body}")
+        }
+        r => panic!("{r:?}"),
+    }
+    let _ = router2;
+    // a client on node 2 subscribes to the world homed on node 1 and receives deltas
+    let (tc, _) = token(&router1).await;
+    let mut c = connect(&addr2, &tc, "json").await;
+    send(
+        &mut c,
+        "json",
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 0.0,
+            y: 0.0,
+            radius: 500.0,
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let e = c1
+        .spawn(sim, 50.0, 50.0, json!({"hp": 1}), false)
+        .await
+        .unwrap();
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { spawned, .. } => assert_eq!(spawned[0].id, e.id),
+        m => panic!("{m:?}"),
+    }
+    send(
+        &mut c,
+        "json",
+        None,
+        ClientMessage::WorldInput {
+            world: world.clone(),
+            entity: e.id.clone(),
+            input: json!({"fire": true}),
+        },
+    )
+    .await;
+    let mut got = false;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if c1
+            .events(sim)
+            .await
+            .unwrap()
+            .iter()
+            .any(|ev| ev["type"] == "input" && ev["entity"] == e.id)
+        {
+            got = true;
+            break;
+        }
+    }
+    assert!(
+        got,
+        "input from node 2 never reached the simulator on node 1"
+    );
+    // unknown world → error reply
+    send(
+        &mut c,
+        "json",
+        Some("q"),
+        ClientMessage::WorldSubscribe {
+            world: "nope".into(),
+            x: 0.0,
+            y: 0.0,
+            radius: 1.0,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error { .. }
+    ));
 }

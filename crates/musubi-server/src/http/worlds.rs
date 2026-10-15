@@ -2,7 +2,12 @@
 //! authoritative state, read their view (owned + ghosts), drain events (handover requests,
 //! routed inputs) and ack handovers.
 
-use axum::extract::{Path, Query, State};
+// Handlers return a ready `Response` (redirect) on the error path; axum's Response is large.
+#![allow(clippy::result_large_err)]
+
+use axum::extract::{OriginalUri, Path, Query, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
@@ -14,6 +19,52 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
+
+/// Simulator calls must hit the world's home node: redirect (307, same method+body) when the home
+/// advertises an HTTP address, otherwise explain which node to talk to.
+async fn ensure_home(s: &AppState, world: &str, uri: &OriginalUri) -> Result<(), Response> {
+    let home = match s.worlds.home_of(world).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return Err(ApiError::from(Error::NotFound(format!("world {world}"))).into_response())
+        }
+        Err(e) => return Err(ApiError::from(e).into_response()),
+    };
+    if home == s.worlds.node_id() {
+        return Ok(());
+    }
+    let advertise = match &s.cluster {
+        Some(c) => c
+            .nodes()
+            .await
+            .ok()
+            .and_then(|ns| ns.into_iter().find(|n| n.id.0 == home))
+            .map(|n| n.advertise)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    let usable = advertise
+        .trim_start_matches("http://")
+        .parse::<std::net::SocketAddr>()
+        .map(|a| a.port() != 0)
+        .unwrap_or(!advertise.is_empty());
+    if !usable {
+        return Err(ApiError::from(Error::Conflict(format!(
+            "world {world} lives on node {home}"
+        )))
+        .into_response());
+    }
+    let location = format!(
+        "http://{}{}",
+        advertise.trim_start_matches("http://"),
+        uri.0
+    );
+    let mut res = StatusCode::TEMPORARY_REDIRECT.into_response();
+    if let Ok(v) = HeaderValue::from_str(&location) {
+        res.headers_mut().insert(header::LOCATION, v);
+    }
+    Err(res)
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -101,134 +152,198 @@ async fn create(
     Json(r): Json<CreateReq>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        serde_json::to_value(s.worlds.create(&r.name, r.config, r.controller)?)
+        serde_json::to_value(s.worlds.create(&r.name, r.config, r.controller).await?)
             .map_err(Error::internal)?,
     ))
 }
 
 async fn info(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        serde_json::to_value(s.worlds.info(&w)?).map_err(Error::internal)?,
-    ))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        Ok(Json(
+            serde_json::to_value(s.worlds.info(&w)?).map_err(Error::internal)?,
+        ))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn delete(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    s.worlds.delete(&w)?;
-    Ok(Json(json!({ "ok": true })))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        s.worlds.delete(&w).await?;
+        Ok(Json(json!({ "ok": true })))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn register_sim(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<RegisterSimReq>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({ "sims": s.worlds.register_sim(&w, r.sim, r.capacity)? }),
-    ))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        Ok(Json(
+            json!({ "sims": s.worlds.register_sim(&w, r.sim, r.capacity)? }),
+        ))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn unregister_sim(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<SimQuery>,
-) -> Result<Json<Value>, ApiError> {
-    s.worlds.unregister_sim(&w, r.sim)?;
-    Ok(Json(json!({ "ok": true })))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        s.worlds.unregister_sim(&w, r.sim)?;
+        Ok(Json(json!({ "ok": true })))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn lease(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<LeaseReq>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({ "cells": s.worlds.lease(&w, r.sim, &r.cells)? }),
-    ))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        Ok(Json(
+            json!({ "cells": s.worlds.lease(&w, r.sim, &r.cells)? }),
+        ))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn renew(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<SimQuery>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "cells": s.worlds.renew(&w, r.sim)? })))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> =
+        async { Ok(Json(json!({ "cells": s.worlds.renew(&w, r.sim)? }))) }.await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn spawn(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<SpawnReq>,
-) -> Result<Json<Value>, ApiError> {
-    let e = s.worlds.spawn(
-        &w,
-        r.sim,
-        Pos { x: r.x, y: r.y },
-        r.components,
-        r.persistent,
-    )?;
-    Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        let e = s.worlds.spawn(
+            &w,
+            r.sim,
+            Pos { x: r.x, y: r.y },
+            r.components,
+            r.persistent,
+        )?;
+        Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn despawn(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<EntityReq>,
-) -> Result<Json<Value>, ApiError> {
-    s.worlds.despawn(&w, r.sim, &r.entity)?;
-    Ok(Json(json!({ "ok": true })))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        s.worlds.despawn(&w, r.sim, &r.entity)?;
+        Ok(Json(json!({ "ok": true })))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn apply(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<ApplyReq>,
-) -> Result<Json<Value>, ApiError> {
-    let pos = match (r.x, r.y) {
-        (Some(x), Some(y)) => Some(Pos { x, y }),
-        (None, None) => None,
-        _ => return Err(Error::InvalidArgument("x and y go together".into()).into()),
-    };
-    s.worlds.apply(&w, r.sim, &r.entity, pos, r.components)?;
-    Ok(Json(json!({ "ok": true })))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        let pos = match (r.x, r.y) {
+            (Some(x), Some(y)) => Some(Pos { x, y }),
+            (None, None) => None,
+            _ => return Err(Error::InvalidArgument("x and y go together".into()).into()),
+        };
+        s.worlds.apply(&w, r.sim, &r.entity, pos, r.components)?;
+        Ok(Json(json!({ "ok": true })))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn view(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path((w, x, y)): Path<(String, i32, i32)>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(s.worlds.view(&w, CellId { x, y })?))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> =
+        async { Ok(Json(s.worlds.view(&w, CellId { x, y })?)) }.await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn events(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Query(q): Query<SimQuery>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "events": s.worlds.events(&w, q.sim)? })))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> =
+        async { Ok(Json(json!({ "events": s.worlds.events(&w, q.sim)? }))) }.await;
+    r.map_err(IntoResponse::into_response)
 }
 
 async fn handover_ack(
     State(s): State<AppState>,
+    uri: OriginalUri,
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<EntityReq>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(s.worlds.handover_ack(&w, r.sim, &r.entity)?))
+) -> Result<Json<Value>, Response> {
+    ensure_home(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> =
+        async { Ok(Json(s.worlds.handover_ack(&w, r.sim, &r.entity)?)) }.await;
+    r.map_err(IntoResponse::into_response)
 }
