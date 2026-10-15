@@ -56,6 +56,17 @@ async fn device(
 
 /// Fire the `authenticated` runtime event without delaying the response.
 fn authenticated(s: &AppState, sess: &Session, provider: &'static str) {
+    {
+        let (ev, acc, created) = (s.events.clone(), sess.account_id, sess.created);
+        tokio::spawn(async move {
+            ev.emit(
+                "account.authenticated",
+                Some(acc),
+                serde_json::json!({ "provider": provider, "created": created }),
+            )
+            .await;
+        });
+    }
     if let Some(l) = &s.liveops {
         l.track(
             &sess.account_id.to_string(),

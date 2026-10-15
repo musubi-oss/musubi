@@ -109,6 +109,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         fanout,
         hub,
         cfg: Arc::new(cfg),
+        events: Arc::new(musubi_server::events::Events::new(db.clone())),
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),

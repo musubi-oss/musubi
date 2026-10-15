@@ -3,6 +3,7 @@
 pub mod app;
 pub mod audit;
 pub mod db;
+pub mod events;
 pub mod fanout;
 pub mod http;
 pub mod limits;

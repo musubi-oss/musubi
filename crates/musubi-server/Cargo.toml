@@ -49,6 +49,10 @@ clap.workspace = true
 http-body-util = "0.1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+hmac = "0.12"
+sha2.workspace = true
+reqwest.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 musubi-sim-sdk.workspace = true

@@ -55,6 +55,7 @@ pub struct AppState {
     pub started_at: std::time::Instant,
     pub metrics: metrics_exporter_prometheus::PrometheusHandle,
     pub limits: Arc<crate::limits::RateLimiter>,
+    pub events: Arc<crate::events::Events>,
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -319,6 +320,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let limits = Arc::new(crate::limits::RateLimiter::new(&cfg.limits));
     let state = AppState {
         cfg: Arc::new(cfg),
+        events: Arc::new(crate::events::Events::new(db.clone())),
         db,
         auth,
         storage,
@@ -350,6 +352,26 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         limits,
     };
     crate::runtime_host::install(&state);
+    if let Some(c) = state.cluster.clone() {
+        let ev = state.events.clone();
+        let lease = c.lease("webhooks", musubi_cluster::DEAD_AFTER);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
+                match ev.dispatch_once().await {
+                    Ok((ok, failed)) if ok + failed > 0 => {
+                        tracing::info!(delivered = ok, failed, "webhooks dispatched")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "webhook dispatch failed"),
+                }
+            }
+        });
+    }
     {
         let st = state.clone();
         tokio::spawn(async move {

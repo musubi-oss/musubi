@@ -81,6 +81,7 @@ async fn app() -> Option<Router> {
         fleets: fleets.clone(),
         fanout,
         hub,
+        events: Arc::new(musubi_server::events::Events::new(db.clone())),
         db,
         started_at: std::time::Instant::now(),
         metrics: musubi_server::metrics::install(),
@@ -3942,4 +3943,276 @@ async fn audit_log_records_admin_and_server_mutations_with_redaction() {
         .await
         .unwrap();
     assert_eq!(res.status(), 401);
+}
+
+#[tokio::test]
+async fn webhooks_deliver_signed_events_with_backoff_and_pull() {
+    let Some(app) = app().await else {
+        return;
+    };
+    // receiver: /ok records, /bad answers 500
+    #[derive(Default)]
+    struct Recv {
+        hits: std::sync::Mutex<Vec<(axum::http::HeaderMap, String)>>,
+    }
+    let recv = Arc::new(Recv::default());
+    let r2 = recv.clone();
+    let hook = Router::new()
+        .route(
+            "/ok",
+            axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                let r = r2.clone();
+                async move {
+                    r.hits.lock().unwrap().push((headers, body));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        )
+        .route(
+            "/bad",
+            axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, hook).await.unwrap() });
+
+    let srv = |req: axum::http::request::Builder| req.header("x-musubi-server-key", "defaultkey");
+    let post = |path: String, body: Value| {
+        srv(Request::post(path))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let read = |res: axum::response::Response| async move {
+        let st = res.status();
+        let v: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap_or(Value::Null);
+        (st, v)
+    };
+    let secret = "whsec_0123456789abcdef";
+    let (st, v) = read(app.clone().oneshot(post("/v1/admin/webhooks".into(), json!({"name": "ok", "url": format!("http://{addr}/ok"), "secret": secret, "kinds": ["account.banned"]}))).await.unwrap()).await;
+    assert_eq!(st, 200, "{v}");
+    let good = v["id"].as_str().unwrap().to_string();
+    let (st, v) = read(
+        app.clone()
+            .oneshot(post(
+                "/v1/admin/webhooks".into(),
+                json!({"name": "bad", "url": format!("http://{addr}/bad"), "secret": secret}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let bad = v["id"].as_str().unwrap().to_string();
+    let (st, _) = read(
+        app.clone()
+            .oneshot(post(
+                "/v1/admin/webhooks".into(),
+                json!({"name": "x", "url": "ftp://nope", "secret": secret}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 400);
+
+    // an account gets banned → account.banned event fans out to both hooks
+    let (_, sess) = read(
+        app.clone()
+            .oneshot(
+                Request::post("/v1/auth/device")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"id": unique("wh-dev-")}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let (st, _) = read(
+        app.clone()
+            .oneshot(
+                srv(Request::post(format!("/v1/admin/accounts/{acc}/ban")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, v) = read(
+        app.clone()
+            .oneshot(post("/v1/server/webhooks/dispatch".into(), json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(
+        v["delivered"].as_u64().unwrap() >= 1 && v["failed"].as_u64().unwrap() >= 1,
+        "{v}"
+    );
+
+    // the good receiver got a correctly signed body
+    let hits = recv.hits.lock().unwrap().clone();
+    let (headers, body) = hits
+        .iter()
+        .find(|(h, _)| {
+            h.get("x-musubi-event")
+                .map(|v| v == "account.banned")
+                .unwrap_or(false)
+        })
+        .expect("delivered");
+    let ev: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(ev["kind"], "account.banned");
+    assert_eq!(ev["account_id"], acc);
+    let sig = headers["x-musubi-signature"].to_str().unwrap();
+    let ts: i64 = sig
+        .split(',')
+        .next()
+        .unwrap()
+        .trim_start_matches("t=")
+        .parse()
+        .unwrap();
+    assert_eq!(sig, musubi_server::events::sign(secret, ts, body));
+    assert_eq!(
+        headers["x-musubi-event-id"].to_str().unwrap(),
+        ev["id"].as_str().unwrap()
+    );
+
+    // delivery bookkeeping: good delivered, bad retried with backoff
+    let (_, v) = read(
+        app.clone()
+            .oneshot(
+                srv(Request::get(format!(
+                    "/v1/admin/webhooks/{good}/deliveries"
+                )))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let d = v["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["kind"] == "account.banned")
+        .unwrap()
+        .clone();
+    assert!(d["delivered_at"].is_string(), "{d}");
+    assert_eq!(d["last_status"], 204);
+    let (_, v) = read(
+        app.clone()
+            .oneshot(
+                srv(Request::get(format!("/v1/admin/webhooks/{bad}/deliveries")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let d = v["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["kind"] == "account.banned")
+        .unwrap()
+        .clone();
+    assert!(d["delivered_at"].is_null());
+    assert_eq!(d["attempts"], 1);
+    assert_eq!(d["last_status"], 500);
+    assert_eq!(d["dead"], false);
+    // not due again yet → a second dispatch does nothing for it
+    let (_, v) = read(
+        app.clone()
+            .oneshot(post("/v1/server/webhooks/dispatch".into(), json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["failed"], 0, "{v}");
+
+    // listing hides secrets; test endpoint delivers immediately; pull returns the event
+    let (_, v) = read(
+        app.clone()
+            .oneshot(
+                srv(Request::get("/v1/admin/webhooks"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(v["webhooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|w| w.get("secret").is_none()));
+    let (st, v) = read(
+        app.clone()
+            .oneshot(post(format!("/v1/admin/webhooks/{good}/test"), json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(v["delivered"], 1, "{v}");
+    let (_, v) = read(
+        app.clone()
+            .oneshot(
+                srv(Request::get(
+                    "/v1/server/events?kinds=account.banned&limit=1000",
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["account_id"] == acc),
+        "{v}"
+    );
+    let cursor = v["cursor"].as_str().unwrap().to_string();
+    let (_, v) = read(
+        app.clone()
+            .oneshot(
+                srv(Request::get(format!(
+                    "/v1/server/events?after={cursor}&kinds=account.banned"
+                )))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["events"].as_array().unwrap().len(), 0);
+    // cleanup
+    for id in [good, bad] {
+        let (st, _) = read(
+            app.clone()
+                .oneshot(
+                    srv(Request::delete(format!("/v1/admin/webhooks/{id}")))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
 }

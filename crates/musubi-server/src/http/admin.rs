@@ -100,6 +100,7 @@ async fn ban(
 ) -> Result<Json<Value>, ApiError> {
     let id = AccountId(id);
     s.accounts.set_disabled(id, true).await?;
+    s.events.emit("account.banned", Some(id), json!({})).await;
     let kicked = kick_everywhere(&s, id).await;
     Ok(Json(json!({ "banned": true, "kicked_local": kicked })))
 }
@@ -110,6 +111,9 @@ async fn unban(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     s.accounts.set_disabled(AccountId(id), false).await?;
+    s.events
+        .emit("account.unbanned", Some(AccountId(id)), json!({}))
+        .await;
     Ok(Json(json!({ "banned": false })))
 }
 
@@ -138,6 +142,9 @@ async fn purge_account(
     let id = AccountId(id);
     kick_everywhere(&s, id).await;
     let removed = s.accounts.purge(id).await?;
+    s.events
+        .emit("account.purged", Some(id), json!({ "rows": removed }))
+        .await;
     Ok(Json(json!({ "purged": true, "rows": removed })))
 }
 
