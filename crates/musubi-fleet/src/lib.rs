@@ -1,8 +1,8 @@
 //! Dedicated-server orchestration v0: fleets describe what to run; the reconciler keeps `buffer`
 //! servers ready (≤ `max_servers`) through a `Provider`; game servers talk back with an Agones-like
 //! SDK surface (ready / health / allocate / shutdown / labels). Only the `local` provider (child
-//! processes on this node) exists today; docker/containerd/kubernetes/agones/edgegap/gamelift plug
-//! into the same trait.
+//! processes on this node) and `docker` (containers via the Docker CLI) exist today;
+//! containerd/kubernetes/agones/edgegap/gamelift plug into the same trait.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+pub mod docker;
 
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -278,6 +280,7 @@ impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         providers.insert("local".into(), Arc::new(LocalProcessProvider::default()));
+        providers.insert("docker".into(), Arc::new(docker::DockerProvider));
         Self {
             db,
             node_id,

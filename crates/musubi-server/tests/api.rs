@@ -1538,3 +1538,69 @@ async fn fleet_lifecycle_with_local_process_provider() {
     let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     assert_eq!(st, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn fleet_docker_provider_runs_a_container() {
+    let Some(app) = app().await else { return };
+    if !musubi_fleet::docker::available().await {
+        eprintln!("docker not available; skipping");
+        return;
+    }
+    let k = "defaultkey";
+    let name = unique("dockerfleet");
+    // random high range so leftovers from other runs never collide
+    let port = 50000 + (uuid::Uuid::now_v7().as_u128() % 10000) as i32;
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "docker", "buffer": 1, "max_servers": 1,
+            "port_start": port, "port_end": port + 20,
+            "spec": {"image": "alpine:3.20", "command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = uuid::Uuid::parse_str(f["id"].as_str().unwrap()).unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc = musubi_fleet::FleetService::new(db, uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let (started, _) = svc.reconcile().await.unwrap();
+    assert_eq!(started, 1);
+    let servers = svc.servers(fid, Some("starting")).await.unwrap();
+    assert_eq!(servers.len(), 1);
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            &format!("name=musubi-gs-{}", servers[0].id.simple()),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("musubi-gs-"),
+        "container should be running"
+    );
+    svc.delete(fid).await.unwrap();
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name=musubi-gs-{}", servers[0].id.simple()),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "container removed on delete"
+    );
+}
