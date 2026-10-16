@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use musubi_core::{Error, Result, SessionId};
 use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo};
 use musubi_mesh::{CellId, Delta, Entity, EntityId, HandoverOutcome, Pos, World, WorldConfig};
@@ -42,7 +42,14 @@ struct WorldState {
     remote_ghosts: HashMap<CellId, (std::time::Instant, Vec<Entity>)>,
     /// This shard exists only for cells assigned to this node (it is not the world's home).
     hosted_only: bool,
+    /// The world's home node as of shard creation: cells without an explicit host live there.
+    home_node: Option<Uuid>,
+    /// Cross-node handovers in flight: entity → (target node, attempts so far).
+    remote_transit: HashMap<EntityId, (Uuid, u32)>,
 }
+
+/// A cross-node handover is re-sent this many times before it is given up.
+const REMOTE_HANDOVER_RETRIES: u32 = 5;
 
 /// Remote ghosts older than this are stale (their host stopped publishing or moved).
 const REMOTE_GHOST_TTL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -126,6 +133,9 @@ pub struct WorldRegistry {
     events: std::sync::OnceLock<Arc<crate::events::Events>>,
     /// (world, cell) → host node, cached from the directory.
     cell_hosts: DashMap<(String, CellId), Uuid>,
+    /// (world, cell, previous host) shards already merged after a hand-back, so a later
+    /// reconciliation round does not resurrect entities despawned since.
+    adopted_from: DashSet<(String, CellId, Uuid)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +204,7 @@ impl WorldRegistry {
             worlds: DashMap::new(),
             homes: DashMap::new(),
             cell_hosts: DashMap::new(),
+            adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
             events: std::sync::OnceLock::new(),
         }
@@ -222,7 +233,40 @@ impl WorldRegistry {
     }
 
     /// Record (or clear) which node hosts `cell` of `name`.
-    pub async fn publish_cell_host(&self, name: &str, cell: CellId, host: Option<Uuid>) {
+    /// The directory (Raft) is the fence: without a successful write nothing changes locally,
+    /// so a node cut off from the quorum cannot take cells for itself.
+    pub async fn publish_cell_host(
+        &self,
+        name: &str,
+        cell: CellId,
+        host: Option<Uuid>,
+    ) -> Result<()> {
+        if let Some(c) = self.cluster.get() {
+            if c.raft_id() != 0 {
+                let key = Self::cell_key(name, cell);
+                let op = match host {
+                    Some(h) => musubi_cluster::DirectoryOp::Set {
+                        key,
+                        value: serde_json::json!({ "node_id": h }),
+                    },
+                    None => musubi_cluster::DirectoryOp::Delete { key },
+                };
+                // without a Raft leader a write would wait indefinitely; failover must not hang on it
+                match tokio::time::timeout(Duration::from_secs(5), c.directory_write(op)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        return Err(Error::Unavailable(format!(
+                            "cell directory write failed: {e}"
+                        )))
+                    }
+                    Err(_) => {
+                        return Err(Error::Unavailable(
+                            "cell directory write timed out (no raft leader?)".into(),
+                        ))
+                    }
+                }
+            }
+        }
         match host {
             Some(h) => {
                 self.cell_hosts.insert((name.to_string(), cell), h);
@@ -231,21 +275,40 @@ impl WorldRegistry {
                 self.cell_hosts.remove(&(name.to_string(), cell));
             }
         }
-        let Some(c) = self.cluster.get() else { return };
-        if c.raft_id() == 0 {
-            return;
-        }
-        let key = Self::cell_key(name, cell);
-        let op = match host {
-            Some(h) => musubi_cluster::DirectoryOp::Set {
-                key,
-                value: serde_json::json!({ "node_id": h }),
-            },
-            None => musubi_cluster::DirectoryOp::Delete { key },
+        Ok(())
+    }
+
+    /// `cell` now belongs to `node`: if this node still holds entities of it (the cell was moved
+    /// away, or we were wrongly declared dead), ship them to the new host and drop the local
+    /// simulator's lease on the cell. Returns how many entities left.
+    pub fn release_cell(&self, name: &str, cell: CellId, node: Uuid, fanout: &Fanout) -> usize {
+        let Some(w) = self.worlds.get(name) else {
+            return 0;
         };
-        if let Err(e) = c.directory_write(op).await {
-            tracing::warn!(world = name, ?cell, error = %e, "cell directory write failed");
+        let mut st = w.lock();
+        let st = &mut *st;
+        let owned = st.world.view(cell).owned;
+        let n = owned.len();
+        for mut e in owned {
+            let id = e.id;
+            tracing::debug!(world = name, %id, %node, "release: entity shipped");
+            let inputs = st.world.take_buffered_inputs(id);
+            st.world.forget_for_clients(id);
+            st.world.despawn(id);
+            e.transit = None;
+            fanout.world_handover(name, e, self.node_id, inputs, true);
         }
+        if let Some(sim) = st.world.revoke_lease(cell) {
+            push_event(
+                st,
+                sim,
+                json!({"type": "cell_released", "cell": cell, "node": node, "entities": n}),
+            );
+        }
+        if n > 0 {
+            tracing::info!(world = name, ?cell, %node, entities = n, "cell released to its new host");
+        }
+        n
     }
 
     /// Cell containing `pos` under this world's grid (needs a local copy of the world).
@@ -263,6 +326,7 @@ impl WorldRegistry {
     /// This node takes `cell` of `name`: make sure a local shard of the world exists (config from
     /// `musubi.worlds`, defaults without a database); simulators lease the cell here as usual.
     pub async fn host_cell(&self, name: &str, cell: CellId) -> Result<Vec<CellId>> {
+        let home = self.home_of(name).await?;
         if !self.worlds.contains_key(name) {
             let (cfg, ctl) = match &self.db {
                 Some(db) => {
@@ -291,6 +355,8 @@ impl WorldRegistry {
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
                     hosted_only: true,
+                    home_node: home,
+                    remote_transit: HashMap::new(),
                 }))
             });
         }
@@ -299,18 +365,184 @@ impl WorldRegistry {
         Ok(vec![cell])
     }
 
-    /// Node hosting `cell`: an explicit assignment wins, otherwise the world's home node.
-    pub async fn cell_host_of(&self, name: &str, cell: CellId) -> Result<Option<Uuid>> {
-        if let Some(h) = self.cell_hosts.get(&(name.to_string(), cell)) {
-            return Ok(Some(*h));
+    /// Boot: cells the directory still assigns to this node (we restarted before the home
+    /// re-homed them) go back to their home, which merges our persisted shard from the database.
+    /// Resuming them from memory would race the home's dead-host recovery into two live owners.
+    pub async fn recover_hosted(&self, fanout: &Fanout) -> Result<Vec<(String, CellId)>> {
+        let Some(c) = self.cluster.get() else {
+            return Ok(vec![]);
+        };
+        let mut out = Vec::new();
+        for (key, v) in c.directory_prefix("world:").await {
+            let Some((name, rest)) = key
+                .strip_prefix("world:")
+                .and_then(|k| k.split_once(":cell:"))
+            else {
+                continue;
+            };
+            let Some((x, y)) = rest.split_once(',') else {
+                continue;
+            };
+            let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) else {
+                continue;
+            };
+            if v["node_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) != Some(self.node_id) {
+                continue;
+            }
+            let cell = CellId { x, y };
+            let home = match self.home_of(name).await {
+                Ok(Some(h)) => h,
+                _ => continue,
+            };
+            let target = (home != self.node_id).then_some(home);
+            if let Err(e) = self.publish_cell_host(name, cell, target).await {
+                tracing::warn!(world = name, ?cell, error = %e, "boot: hosted cell not handed back");
+                continue;
+            }
+            if let Some(h) = target {
+                fanout.cell_assign(name, cell, h);
+            } else {
+                self.cell_hosts.remove(&(name.to_string(), cell));
+            }
+            tracing::info!(world = name, ?cell, home = %home, "boot: hosted cell handed back");
+            out.push((name.to_string(), cell));
         }
-        if let Some(c) = self.cluster.get() {
-            if let Some(v) = c.directory_get(&Self::cell_key(name, cell)).await {
-                if let Some(h) = v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()) {
-                    self.cell_hosts.insert((name.to_string(), cell), h);
-                    return Ok(Some(h));
+        Ok(out)
+    }
+
+    /// Cached host of `cell` (no directory lookup).
+    pub fn cell_host_cached(&self, name: &str, cell: CellId) -> Option<Uuid> {
+        self.cell_hosts.get(&(name.to_string(), cell)).map(|h| *h)
+    }
+
+    /// A cell just moved to us from `prev`: its persisted state (snapshot + journal of that
+    /// node's shard) merges into our copy — the forced handovers over the bus are the fast path,
+    /// this is the one that cannot drop entities.
+    pub async fn adopt_cell_from(&self, name: &str, cell: CellId, prev: Uuid) -> Result<usize> {
+        let Some(db) = self.db.clone() else {
+            return Ok(0);
+        };
+        let w = self.get(name)?;
+        let cfg = w.lock().world.config().clone();
+        let mut tmp = World::new(cfg);
+        let replayed = Self::load_shards(&db, name, &[prev], true, &mut tmp).await?;
+        let ents = tmp.snapshot_persistent();
+        let mut st = w.lock();
+        let ents: Vec<_> = ents
+            .into_iter()
+            .filter(|e| st.world.cell_of(e.pos) == cell && st.world.get(e.id).is_none())
+            .collect();
+        let n = ents.len();
+        st.world.restore(ents);
+        drop(st);
+        self.adopted_from.insert((name.to_string(), cell, prev));
+        if n > 0 || replayed > 0 {
+            tracing::info!(world = name, ?cell, %prev, entities = n, ops = replayed, "cell adopted from previous host");
+        }
+        Ok(n)
+    }
+
+    /// The cell left us: a future hand-back from the same node must merge again.
+    pub fn forget_adoptions(&self, name: &str, cell: CellId) {
+        self.adopted_from
+            .retain(|(n, c, _)| !(n == name && *c == cell));
+    }
+
+    /// Re-read the directory home of every world we only host cells of (the home moves on
+    /// failover and our handovers into unassigned cells must follow it).
+    pub async fn refresh_homes(&self) {
+        let hosted: Vec<String> = self
+            .worlds
+            .iter()
+            .filter(|w| w.value().lock().hosted_only)
+            .map(|w| w.key().clone())
+            .collect();
+        for name in hosted {
+            let _ = self.home_of(&name).await;
+        }
+    }
+
+    /// Home side of a hand-back that did not reach us over the bus: every cell the directory
+    /// assigns to us on a home world merges the persisted shard of any node that is not hosting
+    /// this world any more (once per hand-back).
+    pub async fn reconcile_handed_back(&self) -> Result<usize> {
+        let Some(db) = self.db.clone() else {
+            return Ok(0);
+        };
+        let mine: Vec<(String, CellId)> = self
+            .cell_hosts
+            .iter()
+            .filter(|e| *e.value() == self.node_id)
+            .map(|e| e.key().clone())
+            .collect();
+        let mut merged = 0;
+        for (name, cell) in mine {
+            let is_home = self
+                .worlds
+                .get(&name)
+                .is_some_and(|w| !w.lock().hosted_only);
+            if !is_home {
+                continue;
+            }
+            let rows: Vec<(Uuid,)> = sqlx::query_as(
+                "select node_id from musubi.world_snapshots where name = $1 and node_id <> $2",
+            )
+            .bind(&name)
+            .bind(self.node_id)
+            .fetch_all(&db)
+            .await
+            .map_err(Error::internal)?;
+            for (prev,) in rows {
+                let still_hosts = self
+                    .cell_hosts
+                    .iter()
+                    .any(|e| e.key().0 == name && *e.value() == prev);
+                if still_hosts || self.adopted_from.contains(&(name.clone(), cell, prev)) {
+                    continue;
+                }
+                match self.adopt_cell_from(&name, cell, prev).await {
+                    Ok(n) => merged += n,
+                    Err(e) => {
+                        tracing::warn!(world = %name, ?cell, %prev, error = %e, "hand-back not merged")
+                    }
                 }
             }
+        }
+        Ok(merged)
+    }
+
+    /// Node hosting `cell`: an explicit assignment wins, otherwise the world's home node.
+    pub async fn cell_host_of(&self, name: &str, cell: CellId) -> Result<Option<Uuid>> {
+        let key = (name.to_string(), cell);
+        if let Some(c) = self.cluster.get() {
+            if c.raft_id() != 0 {
+                // the replicated directory is the truth; the cache only mirrors it (a bus
+                // announcement can be lost, an unassignment is never announced)
+                let h = c
+                    .directory_get(&Self::cell_key(name, cell))
+                    .await
+                    .and_then(|v| v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()));
+                return match h {
+                    Some(h) => {
+                        self.cell_hosts.insert(key, h);
+                        Ok(Some(h))
+                    }
+                    None => {
+                        // our own fresh assignment may not have reached this replica yet
+                        if self
+                            .cell_hosts
+                            .get(&key)
+                            .is_some_and(|h| *h != self.node_id)
+                        {
+                            self.cell_hosts.remove(&key);
+                        }
+                        self.home_of(name).await
+                    }
+                };
+            }
+        }
+        if let Some(h) = self.cell_hosts.get(&key) {
+            return Ok(Some(*h));
         }
         self.home_of(name).await
     }
@@ -420,7 +652,10 @@ impl WorldRegistry {
             }
         }
         let mut replayed = 0;
-        for (node, ops) in by_node {
+        for (node, mut ops) in by_node {
+            // chunks arrive in tick order, ops inside a chunk may not: a Despawn replayed after
+            // the Spawn that came back later would erase the entity
+            ops.sort_by_key(|o| o.tick);
             let from = since.get(&node).copied().unwrap_or(0);
             replayed += replay(world, &ops, from);
         }
@@ -451,6 +686,9 @@ impl WorldRegistry {
                and (w.node_id is null or w.node_id = any($1)
                     or not exists (select 1 from musubi.nodes n where n.id = w.node_id))
                and (w.node_id is null or not (w.node_id = $2 and $2 <> all($1)))
+               and (w.node_id is null or w.node_id = $2 or not exists
+                    (select 1 from musubi.nodes n where n.id = w.node_id
+                       and n.heartbeat_at > now() - interval '10 seconds'))
              returning name, config, controller",
         )
         .bind(dead_nodes)
@@ -459,23 +697,83 @@ impl WorldRegistry {
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
+        // shards of hosts that left the cluster are persisted, not live: load them too
+        let alive: Option<std::collections::HashSet<Uuid>> = match self.cluster.get() {
+            Some(c) => c
+                .nodes()
+                .await
+                .ok()
+                .map(|ns| ns.iter().filter(|n| n.alive).map(|n| n.id.0).collect()),
+            None => None,
+        };
+        let alive = &alive;
+        // which nodes host cells of each world, by the replicated directory (the local cache
+        // can lag or hold an assignment the host has since given up)
+        let mut assigned: HashMap<String, Vec<Uuid>> = HashMap::new();
+        if let Some(c) = self.cluster.get() {
+            for (key, v) in c.directory_prefix("world:").await {
+                if let Some((n, _)) = key
+                    .strip_prefix("world:")
+                    .and_then(|k| k.split_once(":cell:"))
+                {
+                    if let Some(h) = v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()) {
+                        assigned.entry(n.to_string()).or_default().push(h);
+                    }
+                }
+            }
+        }
+        let assigned = &assigned;
         let mut out = Vec::new();
         // adopt concurrently: each world costs a snapshot + journal read and a Raft directory
         // write, and a dead node may have owned many
         let adopted = futures::future::join_all(rows.into_iter().map(|(name, cfg, ctl)| async move {
-            if self.worlds.contains_key(&name) {
-                return Ok(None);
+            let is_live = |h: &Uuid| match alive {
+                Some(a) => a.contains(h),
+                None => true,
+            };
+            if let Some(w) = self.worlds.get(&name) {
+                if !w.lock().hosted_only {
+                    return Ok(None);
+                }
+                // we host some of its cells: promote the shard to home — the dead home's
+                // (and other dead hosts') persisted cells merge into it, ours stay live
+                let cfg: WorldConfig = serde_json::from_value(cfg)?;
+                let mut live: Vec<Uuid> = assigned.get(&name).cloned().unwrap_or_default().into_iter().filter(|h| !dead_nodes.contains(h) && is_live(h)).collect();
+                if !dead_nodes.contains(&self.node_id) {
+                    live.push(self.node_id);
+                }
+                let mut tmp = World::new(cfg);
+                let replayed = Self::load_shards(db, &name, &live, false, &mut tmp).await?;
+                let (ents, tick) = (tmp.snapshot_persistent(), tmp.tick);
+                {
+                    let mut st = w.lock();
+                    let ents: Vec<_> = ents
+                        .into_iter()
+                        .filter(|e| st.world.get(e.id).is_none())
+                        .collect();
+                    let n = ents.len();
+                    st.world.restore(ents);
+                    st.hosted_only = false;
+                    st.home_node = None;
+                    tracing::info!(world = %name, merged = n, ops = replayed, home_tick = tick, "hosted shard promoted to home");
+                }
+                self.homes.insert(name.clone(), self.node_id);
+                self.publish_home(&name, Some(self.node_id)).await;
+                if let Some(ev) = self.events.get() {
+                    ev.emit(
+                        "world.rehomed",
+                        None,
+                        serde_json::json!({ "name": name, "node_id": self.node_id }),
+                    )
+                    .await;
+                }
+                return Ok(Some(name));
             }
             let cfg: WorldConfig = serde_json::from_value(cfg)?;
             let ctl: ControllerConfig = serde_json::from_value(ctl)?;
             let mut world = World::new(cfg);
             // shards of cell hosts that are still alive keep living there
-            let live: Vec<Uuid> = self
-                .cell_hosts
-                .iter()
-                .filter(|e| e.key().0 == name && !dead_nodes.contains(e.value()))
-                .map(|e| *e.value())
-                .collect();
+            let live: Vec<Uuid> = assigned.get(&name).cloned().unwrap_or_default().into_iter().filter(|h| !dead_nodes.contains(h) && is_live(h)).collect();
             let replayed = Self::load_shards(db, &name, &live, false, &mut world).await?;
             if replayed > 0 {
                 tracing::info!(world = %name, ops = replayed, tick = world.tick, "world journal replayed");
@@ -490,6 +788,8 @@ impl WorldRegistry {
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                     hosted_only: false,
+                    home_node: None,
+                    remote_transit: HashMap::new(),
                 })),
             );
             self.homes.insert(name.clone(), self.node_id);
@@ -511,6 +811,52 @@ impl WorldRegistry {
             }
         }
         Ok(out)
+    }
+
+    /// Drain: cells this node hosts go back to their worlds' homes — directory first, then the
+    /// entities (forced handover; the home takes them even without a simulator on the cell).
+    pub async fn release_hosted(&self, fanout: &Fanout) -> Vec<(String, CellId)> {
+        let mine: Vec<(String, CellId)> = self
+            .cell_hosts
+            .iter()
+            .filter(|e| *e.value() == self.node_id)
+            .map(|e| e.key().clone())
+            .collect();
+        let mut out = Vec::new();
+        for (name, cell) in mine {
+            let home = match self.worlds.get(&name).and_then(|w| w.lock().home_node) {
+                Some(h) if h != self.node_id => h,
+                _ => match self.home_of(&name).await {
+                    Ok(Some(h)) if h != self.node_id => h,
+                    _ => {
+                        // we are its home as well (promoted shard): the assignment goes away and
+                        // the full home snapshot carries the cell to the next home
+                        if let Err(e) = self.publish_cell_host(&name, cell, None).await {
+                            tracing::warn!(world = %name, ?cell, error = %e, "drain: cell not unassigned");
+                            continue;
+                        }
+                        self.cell_hosts.remove(&(name.clone(), cell));
+                        out.push((name, cell));
+                        continue;
+                    }
+                },
+            };
+            if let Err(e) = self.snapshot_now(&name).await {
+                tracing::warn!(world = %name, error = %e, "drain: shard snapshot failed");
+            }
+            if let Err(e) = self.publish_cell_host(&name, cell, Some(home)).await {
+                tracing::warn!(world = %name, ?cell, error = %e, "drain: cell not handed back");
+                continue;
+            }
+            fanout.cell_assign(&name, cell, home);
+            self.release_cell(&name, cell, home, fanout);
+            out.push((name, cell));
+        }
+        if !out.is_empty() {
+            // give the bus a moment to deliver the handovers before the node leaves
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        out
     }
 
     /// Drain: snapshot every world we host and disown it so the failover leader re-homes it.
@@ -544,16 +890,29 @@ impl WorldRegistry {
 
     /// Home node of a world: local registry first, then the directory. `None` = unknown world.
     pub async fn home_of(&self, name: &str) -> Result<Option<Uuid>> {
-        if self.worlds.contains_key(name) {
-            return Ok(Some(self.node_id));
+        // a local shard makes us the home only if it is not merely hosting assigned cells
+        if let Some(w) = self.worlds.get(name) {
+            let st = w.lock();
+            if !st.hosted_only {
+                return Ok(Some(self.node_id));
+            }
+            if let Some(h) = st.home_node {
+                return Ok(Some(h));
+            }
         }
         if let Some(h) = self.homes.get(name) {
             return Ok(Some(*h));
         }
         if let Some(c) = self.cluster.get() {
-            if let Some(v) = c.directory_get(&Self::directory_key(name)).await {
+            if let Some(v) = c.directory_get_fresh(&Self::directory_key(name)).await {
                 if let Some(h) = v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()) {
                     self.homes.insert(name.to_string(), h);
+                    if let Some(w) = self.worlds.get(name) {
+                        let mut st = w.lock();
+                        if st.hosted_only && h != self.node_id {
+                            st.home_node = Some(h);
+                        }
+                    }
                     return Ok(Some(h));
                 }
             }
@@ -567,6 +926,12 @@ impl WorldRegistry {
                 .map_err(Error::internal)?;
         if let Some(h) = row {
             self.homes.insert(name.to_string(), h);
+            if let Some(w) = self.worlds.get(name) {
+                let mut st = w.lock();
+                if st.hosted_only && h != self.node_id {
+                    st.home_node = Some(h);
+                }
+            }
         }
         Ok(row)
     }
@@ -622,17 +987,26 @@ impl WorldRegistry {
             if self.home_of(&name).await? != Some(self.node_id) {
                 continue;
             }
-            self.publish_cell_host(&name, cell, Some(self.node_id))
-                .await;
+            if let Err(e) = self
+                .publish_cell_host(&name, cell, Some(self.node_id))
+                .await
+            {
+                tracing::warn!(world = %name, ?cell, error = %e, "cell not re-homed: no directory quorum");
+                continue;
+            }
             fanout.cell_assign(&name, cell, self.node_id);
             if !restored.contains(&(name.clone(), dead)) {
                 if let (Some(db), Ok(w)) = (&self.db, self.get(&name)) {
                     let cfg = w.lock().world.cfg.clone();
                     let mut shard = World::new(cfg);
                     let n = Self::load_shards(db, &name, &[dead], true, &mut shard).await?;
-                    let ents = shard.snapshot_persistent();
+                    let mut ents = shard.snapshot_persistent();
+                    tracing::info!(world = %name, node = %dead, tick = shard.tick, entities = ents.len(), "dead host shard loaded");
                     {
                         let mut st = w.lock();
+                        // an entity that already lives here (handed over before the host died, or
+                        // journaled on both sides) keeps its live copy
+                        ents.retain(|e| st.world.get(e.id).is_none());
                         st.world.restore(ents);
                     }
                     tracing::info!(world = %name, node = %dead, replayed = n, "dead cell host's shard restored");
@@ -698,6 +1072,8 @@ impl WorldRegistry {
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                 hosted_only: false,
+                home_node: None,
+                remote_transit: HashMap::new(),
             })),
         );
         self.publish_home(name, Some(self.node_id)).await;
@@ -924,7 +1300,7 @@ impl WorldRegistry {
         let from = ops.first().map(|o| o.tick).unwrap_or(tick);
         sqlx::query(
             "insert into musubi.world_journal (name, tick_from, tick_to, entries, node_id) values ($1, $2, $3, $4, $5)
-             on conflict (name, tick_from) do update set tick_to = excluded.tick_to, entries = excluded.entries",
+             on conflict (name, node_id, tick_from) do update set tick_to = greatest(musubi.world_journal.tick_to, excluded.tick_to), entries = musubi.world_journal.entries || excluded.entries",
         )
         .bind(name)
         .bind(from as i64)
@@ -993,37 +1369,69 @@ impl WorldRegistry {
         entity: Entity,
         from_node: Uuid,
         inputs: Vec<Value>,
+        forced: bool,
         fanout: &Fanout,
-    ) {
+    ) -> bool {
         let Some(w) = self.worlds.get(name) else {
-            return;
+            return false;
         };
-        let cell = {
-            let st = w.lock();
-            st.world.cell_of(entity.pos)
-        };
-        if !self
-            .cell_hosts
-            .get(&(name.to_string(), cell))
-            .is_some_and(|h| *h == self.node_id)
-        {
-            return;
-        }
         let mut st = w.lock();
         let st = &mut *st;
-        let id = entity.id;
-        let Some(owner) = st.world.owner(cell) else {
-            fanout.world_handover_ack(name, id, from_node, false);
-            return;
+        let cell = st.world.cell_of(entity.pos);
+        // ours if assigned to us, or unassigned and we are the home
+        let here = match self.cell_hosts.get(&(name.to_string(), cell)) {
+            Some(h) => *h == self.node_id,
+            None => !st.hosted_only,
         };
+        if !here {
+            return false;
+        }
+        let id = entity.id;
+        if st.world.get(id).is_some() {
+            // already taken earlier; the ack was lost — answer again, keep our copy
+            tracing::warn!(world = name, %id, %from_node, "handover re-acked (duplicate delivery)");
+            fanout.world_handover_ack(name, id, from_node, true);
+            return false;
+        }
+        let owner = st.world.owner(cell);
+        if owner.is_none() && !forced {
+            fanout.world_handover_ack(name, id, from_node, false);
+            return false;
+        }
+        if entity.persistent {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Spawn {
+                    id,
+                    pos: entity.pos,
+                    components: Value::Object(
+                        entity
+                            .components
+                            .iter()
+                            .map(|(k, c)| (k.clone(), c.value.clone()))
+                            .collect(),
+                    ),
+                },
+            });
+        }
+        let durable = entity.persistent;
+        tracing::debug!(world = name, %id, %from_node, forced, "handover: entity arrived");
         st.world.restore(vec![entity]);
-        let state = st.world.get(id).map(to_wire);
-        push_event(
-            st,
-            owner,
-            json!({"type": "handover_arrived", "entity": id, "from_node": from_node, "state": state, "buffered_inputs": inputs}),
-        );
+        if let Some(owner) = owner {
+            let state = st.world.get(id).map(to_wire);
+            push_event(
+                st,
+                owner,
+                json!({"type": "handover_arrived", "entity": id, "from_node": from_node, "state": state, "buffered_inputs": inputs}),
+            );
+        }
+        if durable {
+            // the sender journals our ack as its Despawn: ours must hit the journal first,
+            // or a crash in between loses the entity — the caller flushes, then acks
+            return true;
+        }
         fanout.world_handover_ack(name, id, from_node, true);
+        false
     }
 
     /// The other node answered our handover: on success the entity leaves this shard (inputs
@@ -1037,9 +1445,11 @@ impl WorldRegistry {
         let Some(t) = st.world.get(id).and_then(|e| e.transit.clone()) else {
             return;
         };
+        st.remote_transit.remove(&id);
         if accepted {
             let inputs = st.world.take_buffered_inputs(id);
             let persistent = st.world.get(id).is_some_and(|e| e.persistent);
+            tracing::debug!(world = name, %id, to = %t.to, "handover: entity left");
             st.world.forget_for_clients(id);
             st.world.despawn(id);
             if persistent {
@@ -1188,19 +1598,27 @@ impl WorldRegistry {
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
             if self.is_split(&name) {
+                let (hosted_only, home_node) = (st.hosted_only, st.home_node);
                 let remote = st.world.detect_remote_handovers(|c| {
                     self.cell_hosts
                         .get(&(name.clone(), c))
                         .map(|h| *h)
+                        .or(if hosted_only {
+                            // the home may have moved since this shard was created
+                            self.homes.get(&name).map(|h| *h).or(home_node)
+                        } else {
+                            None
+                        })
                         .filter(|h| *h != self.node_id)
                 });
                 for (id, _, host) in remote {
+                    st.remote_transit.insert(id, (host, 1));
                     if let Some(e) = st.world.get(id).cloned() {
                         let inputs = st.world.take_buffered_inputs(id);
                         let from = e.transit.as_ref().map(|t| t.from);
                         let mut shipped = e;
                         shipped.transit = None;
-                        fanout.world_handover(&name, shipped, self.node_id, inputs);
+                        fanout.world_handover(&name, shipped, self.node_id, inputs, false);
                         if let Some(from) = from {
                             push_event(
                                 st,
@@ -1274,7 +1692,27 @@ impl WorldRegistry {
                         );
                     }
                     HandoverOutcome::Completed { .. } => {}
+                    HandoverOutcome::Cancelled { entity, .. }
+                        if st
+                            .remote_transit
+                            .get(&entity)
+                            .is_some_and(|(_, n)| *n < REMOTE_HANDOVER_RETRIES) =>
+                    {
+                        // no ack from the other node yet: ship it again (the receiver re-acks if it
+                        // already has it) instead of giving up
+                        let Some((host, n)) = st.remote_transit.get(&entity).copied() else {
+                            continue;
+                        };
+                        st.remote_transit.insert(entity, (host, n + 1));
+                        if st.world.begin_remote_handover(entity, host) {
+                            if let Some(mut e) = st.world.get(entity).cloned() {
+                                e.transit = None;
+                                fanout.world_handover(&name, e, self.node_id, Vec::new(), false);
+                            }
+                        }
+                    }
                     HandoverOutcome::Cancelled { entity, reason } => {
+                        st.remote_transit.remove(&entity);
                         let sims: Vec<Uuid> = st.sim_events.keys().copied().collect();
                         for s in sims {
                             push_event(

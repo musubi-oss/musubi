@@ -87,10 +87,14 @@ const BUS_ALPN: &[u8] = b"musubi-bus/1";
 /// Largest message accepted over the QUIC bus.
 pub const MAX_QUIC_BUS_PAYLOAD: usize = 16 * 1024 * 1024;
 const QUIC_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
 pub(crate) struct QuicBus {
     pub(crate) endpoint: quinn::Endpoint,
     pub(crate) conns: Mutex<HashMap<Uuid, quinn::Connection>>,
+    /// peers whose last connect failed: skipped (fast fail → postgres fallback) for CONNECT_BACKOFF
+    conn_backoff: Mutex<HashMap<Uuid, std::time::Instant>>,
 }
 
 #[derive(Clone)]
@@ -212,6 +216,7 @@ impl Cluster {
         self.bus = Some(Arc::new(QuicBus {
             endpoint,
             conns: Mutex::new(HashMap::new()),
+            conn_backoff: Mutex::new(HashMap::new()),
         }));
         Ok(self)
     }
@@ -403,6 +408,9 @@ impl Cluster {
                                     Some((&raft::TAG_WRITE, body)) => {
                                         c.handle_forwarded_write(body).await
                                     }
+                                    Some((&raft::TAG_READ, body)) => {
+                                        c.handle_forwarded_read(body).await
+                                    }
                                     _ => return,
                                 };
                                 let _ = send.write_all(&resp).await;
@@ -557,7 +565,7 @@ impl Cluster {
                 metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "tx", "ok" => if ok { "true" } else { "false" }).increment(1);
                 metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "tx").increment(bytes.len() as u64);
                 if !ok {
-                    tracing::warn!(peer = %p.id.0, %p.bus_addr, "quic bus delivery failed; falling back to postgres");
+                    tracing::warn!(peer = %p.id.0, %p.bus_addr, result = ?r, "quic bus delivery failed; falling back to postgres");
                     bus.conns.lock().await.remove(&p.id.0);
                 }
                 (p.id, ok)
@@ -740,11 +748,21 @@ impl Cluster {
 }
 
 impl QuicBus {
+    /// Cached connection to a peer. The handshake runs outside the cache lock: a dead peer must
+    /// not stall sends to live ones (that starved Raft votes after a kill), and a peer that just
+    /// failed to connect is skipped for CONNECT_BACKOFF so publishers fall back fast.
     pub(crate) async fn connection(&self, peer: &NodeInfo) -> Result<quinn::Connection> {
-        let mut conns = self.conns.lock().await;
-        if let Some(c) = conns.get(&peer.id.0) {
+        if let Some(c) = self.conns.lock().await.get(&peer.id.0) {
             if c.close_reason().is_none() {
                 return Ok(c.clone());
+            }
+        }
+        if let Some(at) = self.conn_backoff.lock().await.get(&peer.id.0) {
+            if at.elapsed() < CONNECT_BACKOFF {
+                return Err(Error::Unavailable(format!(
+                    "bus peer {} unreachable (backoff)",
+                    peer.id.0
+                )));
             }
         }
         let addr: SocketAddr = peer
@@ -761,12 +779,38 @@ impl QuicBus {
         let crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(Error::internal)?;
         let cfg = quinn::ClientConfig::new(Arc::new(crypto));
-        let conn = self
+        let connecting = self
             .endpoint
             .connect_with(cfg, addr, "localhost")
-            .map_err(Error::internal)?
-            .await
             .map_err(Error::internal)?;
+        let conn = match tokio::time::timeout(QUIC_CONNECT_TIMEOUT, connecting).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                self.conn_backoff
+                    .lock()
+                    .await
+                    .insert(peer.id.0, std::time::Instant::now());
+                return Err(Error::internal(e));
+            }
+            Err(_) => {
+                self.conn_backoff
+                    .lock()
+                    .await
+                    .insert(peer.id.0, std::time::Instant::now());
+                return Err(Error::Unavailable(format!(
+                    "bus connect to {} timed out",
+                    peer.bus_addr
+                )));
+            }
+        };
+        self.conn_backoff.lock().await.remove(&peer.id.0);
+        let mut conns = self.conns.lock().await;
+        // another task may have connected meanwhile: keep one connection per peer
+        if let Some(c) = conns.get(&peer.id.0) {
+            if c.close_reason().is_none() {
+                return Ok(c.clone());
+            }
+        }
         conns.insert(peer.id.0, conn.clone());
         Ok(conn)
     }

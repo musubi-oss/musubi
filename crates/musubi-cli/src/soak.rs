@@ -30,6 +30,7 @@ pub struct Opts {
     pub clients: usize,
     pub worlds: usize,
     pub matches: usize,
+    pub mesh_entities: usize,
     pub duration: Duration,
     pub kill_every: Duration,
     pub mode: String,
@@ -63,6 +64,18 @@ struct Counters {
     mt_sent: AtomicU64,
     mt_echo: AtomicU64,
     mt_err: AtomicU64,
+    mesh_moves_ok: AtomicU64,
+    mesh_moves_err: AtomicU64,
+    mesh_lost: AtomicU64,
+}
+
+/// A world whose cell (1,0) is hosted on another node than its home; `entities` live on the border.
+#[derive(Clone)]
+struct MeshWorld {
+    name: String,
+    sim_a: uuid::Uuid,
+    sim_b: uuid::Uuid,
+    entities: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -80,6 +93,8 @@ struct Incident {
     matches_rehomed_ms: f64,
     /// Matches that came back with a tick far below the one seen before the kill (journal lost).
     matches_reset: usize,
+    /// Every entity of every split world is accounted for on a survivor again (NaN without mesh).
+    mesh_recovered_ms: f64,
     /// The restarted process answers and is back in the member list.
     rejoined_ms: f64,
     timed_out: bool,
@@ -625,7 +640,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let res = client
             .post(format!("{}/v1/server/worlds", n.url()))
             .header("x-musubi-server-key", KEY)
-            .json(&json!({ "name": name, "config": {}, "controller": {} }))
+            .json(&json!({ "name": name, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 2.0, "handover_timeout_ticks": 30}, "controller": {} }))
             .send()
             .await?;
         anyhow::ensure!(
@@ -649,6 +664,11 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "worlds never got a home");
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+    let mesh = if o.mesh_entities > 0 {
+        mesh_setup(&client, &nodes, &worlds, o.mesh_entities).await?
+    } else {
+        Vec::new()
+    };
 
     // authoritative matches, round-robin across nodes
     let mut matches: Vec<String> = Vec::new();
@@ -709,6 +729,24 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                 stop,
             )));
         }
+    }
+    for mw in &mesh {
+        let (alive, c, stop) = (alive.clone(), counters.clone(), stop.clone());
+        tasks.push(tokio::spawn(mesh_mover(
+            client.clone(),
+            alive.clone(),
+            mw.clone(),
+            run_deadline,
+            c,
+            stop.clone(),
+        )));
+        tasks.push(tokio::spawn(mesh_leaser(
+            client.clone(),
+            alive,
+            mw.clone(),
+            run_deadline,
+            stop,
+        )));
     }
     eprintln!("[soak] {} clients running for {:?}", o.clients, o.duration);
 
@@ -803,9 +841,11 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         };
         let rehomed_ms = loop {
             let mut moved = 0;
+            // a victim that came back with the same identity may legitimately keep its worlds
+            let back = member_ids(&client, &nodes[victim]).await.is_some();
             for w in &owned {
                 match world_home(&client, &nodes[survivor], w).await {
-                    Some(h) if h != vid => moved += 1,
+                    Some(h) if h != vid || back => moved += 1,
                     _ => {}
                 }
             }
@@ -841,11 +881,12 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                 let cm = cluster_matches(&client, &nodes[survivor])
                     .await
                     .unwrap_or_default();
+                let back = member_ids(&client, &nodes[victim]).await.is_some();
                 let moved: Vec<(&String, &u64, String)> = owned_matches
                     .iter()
                     .filter_map(|(id, t)| {
                         cm.get(id)
-                            .filter(|(home, _)| *home != vid)
+                            .filter(|(home, _)| *home != vid || back)
                             .map(|(home, _)| (id, t, home.clone()))
                     })
                     .collect();
@@ -897,6 +938,65 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                 f64::NAN
             }
         };
+        let mesh_recovered_ms = if mesh.is_empty() {
+            f64::NAN
+        } else {
+            let expected = mesh.len() * o.mesh_entities;
+            loop {
+                let mut total = 0;
+                for mw in &mesh {
+                    total += mesh_count(&client, &alive, mw).await;
+                }
+                if total == expected {
+                    break t0.elapsed().as_secs_f64() * 1e3;
+                }
+                if t0.elapsed() > budget {
+                    timed_out = true;
+                    eprintln!("[soak] mesh: {total} of {expected} entities accounted for after the incident");
+                    for mw in &mesh {
+                        let n = mesh_count(&client, &alive, mw).await;
+                        if n != o.mesh_entities {
+                            eprintln!("[soak] mesh: {} has {n}", mw.name);
+                            eprintln!(
+                                "[soak] mesh detail {}: {}",
+                                mw.name,
+                                mesh_detail(&client, &alive, mw).await
+                            );
+                            let urls: Vec<String> = alive.read().await.clone();
+                            for u in &urls {
+                                for (x, y) in [(0, 0), (1, 0)] {
+                                    let r = client
+                                        .get(format!(
+                                            "{u}/v1/server/worlds/{}/view/{x}/{y}",
+                                            mw.name
+                                        ))
+                                        .header("x-musubi-server-key", KEY)
+                                        .send()
+                                        .await;
+                                    match r {
+                                        Ok(r) => {
+                                            let st = r.status();
+                                            let v: Value = r.json().await.unwrap_or(Value::Null);
+                                            eprintln!(
+                                                "[soak]   {u} view({x},{y}) -> {st} owned={} ghosts={}",
+                                                v["owned"].as_array().map(|a| a.len()).unwrap_or(0),
+                                                v["ghosts"].as_array().map(|a| a.len()).unwrap_or(0)
+                                            );
+                                        }
+                                        Err(e) => eprintln!("[soak]   {u} view({x},{y}) -> {e}"),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    counters
+                        .mesh_lost
+                        .fetch_add(expected.saturating_sub(total) as u64, Ordering::Relaxed);
+                    break f64::NAN;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
         let inc = Incident {
             node: nodes[victim].name.clone(),
             action,
@@ -907,6 +1007,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             rehomed_ms,
             matches_rehomed_ms,
             matches_reset,
+            mesh_recovered_ms,
             rejoined_ms,
             timed_out,
         };
@@ -966,6 +1067,14 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "errors": c.mt_err.load(Ordering::Relaxed),
         },
         "rejoined_ms": stats(|i| i.rejoined_ms),
+        "mesh_recovered_ms": stats(|i| i.mesh_recovered_ms),
+        "mesh": {
+            "worlds": mesh.len(),
+            "entities_per_world": o.mesh_entities,
+            "moves_ok": c.mesh_moves_ok.load(Ordering::Relaxed),
+            "moves_err": c.mesh_moves_err.load(Ordering::Relaxed),
+            "lost_entities": c.mesh_lost.load(Ordering::Relaxed),
+        },
         "ws": {
             "pings_ok": c.ws_ok.load(Ordering::Relaxed),
             "errors": c.ws_err.load(Ordering::Relaxed),
@@ -994,6 +1103,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "rehomed_ms",
             "matches_rehomed_ms",
             "rejoined_ms",
+            "mesh_recovered_ms",
         ] {
             let s = &report[k];
             println!(
@@ -1018,6 +1128,17 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         );
     }
     let lost = c.st_lost.load(Ordering::Relaxed);
+    let mesh_lost = c.mesh_lost.load(Ordering::Relaxed);
+    if !o.json && !mesh.is_empty() {
+        println!(
+            "  mesh: {} worlds x {} entities across two nodes, moves ok {}  errors {}  lost entities {}",
+            mesh.len(),
+            o.mesh_entities,
+            report["mesh"]["moves_ok"],
+            report["mesh"]["moves_err"],
+            mesh_lost
+        );
+    }
     let timeouts = incidents.iter().filter(|i| i.timed_out).count();
     let reset: usize = incidents.iter().map(|i| i.matches_reset).sum();
     if !o.json {
@@ -1030,8 +1151,331 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(
-        lost == 0 && timeouts == 0 && reset == 0,
-        "soak failed: {lost} lost writes, {timeouts} incidents timed out, {reset} matches reset"
+        lost == 0 && timeouts == 0 && reset == 0 && mesh_lost == 0,
+        "soak failed: {lost} lost writes, {timeouts} incidents timed out, {reset} matches reset, {mesh_lost} entities lost"
     );
     Ok(())
+}
+
+/// Split every world across two nodes: cell (1,0) is assigned to the node after the home, one
+/// simulator per side leases its cell, and `n` persistent entities are spawned on the border.
+async fn mesh_setup(
+    client: &reqwest::Client,
+    nodes: &[Node],
+    worlds: &[String],
+    n: usize,
+) -> anyhow::Result<Vec<MeshWorld>> {
+    let mut out = Vec::new();
+    for (i, w) in worlds.iter().enumerate() {
+        let home = &nodes[i % nodes.len()];
+        let host = &nodes[(i + 1) % nodes.len()];
+        let res = client
+            .post(format!("{}/v1/admin/worlds/{w}/cells/1/0/host", home.url()))
+            .header("x-musubi-server-key", KEY)
+            .json(&json!({ "node_id": host.id }))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            res.status().is_success(),
+            "cell assignment failed: {}",
+            res.status()
+        );
+        let (sim_a, sim_b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        for (node, sim, cell) in [(home, sim_a, (0, 0)), (host, sim_b, (1, 0))] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let res = client
+                    .post(format!("{}/v1/server/worlds/{w}/lease", node.url()))
+                    .header("x-musubi-server-key", KEY)
+                    .json(&json!({ "sim": sim, "cells": [{"x": cell.0, "y": cell.1}] }))
+                    .send()
+                    .await;
+                if res.map(|r| r.status().is_success()).unwrap_or(false) {
+                    break;
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "lease of {cell:?} in {w} never succeeded"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        let mut entities = Vec::new();
+        for k in 0..n {
+            let res: Value = client
+                .post(format!("{}/v1/server/worlds/{w}/spawn", home.url()))
+                .header("x-musubi-server-key", KEY)
+                .json(&json!({ "sim": sim_a, "x": 90.0, "y": mesh_y(k), "components": {"k": k}, "persistent": true }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            entities.push(
+                res["id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("spawn without id: {res}"))?
+                    .to_string(),
+            );
+        }
+        out.push(MeshWorld {
+            name: w.clone(),
+            sim_a,
+            sim_b,
+            entities,
+        });
+    }
+    eprintln!(
+        "[soak] {} worlds split across two nodes each, {n} border entities per world",
+        out.len()
+    );
+    Ok(out)
+}
+
+/// Shuttle one entity at a time across the border (x 90 <-> 110): the simulator that owns the
+/// entity's current cell applies the move on whichever node holds that cell, so every successful
+/// move is followed by a handover to the other node.
+async fn mesh_mover(
+    client: reqwest::Client,
+    alive: Alive,
+    mw: MeshWorld,
+    deadline: Instant,
+    c: Arc<Counters>,
+    stop: Arc<AtomicBool>,
+) {
+    let n = mw.entities.len();
+    let mut right = vec![false; n];
+    let mut k = 0usize;
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let i = k % n;
+        k += 1;
+        let target = if right[i] { 90.0 } else { 110.0 };
+        let urls: Vec<String> = alive.read().await.clone();
+        let mut ok = false;
+        'outer: for sim in [mw.sim_a, mw.sim_b] {
+            for u in &urls {
+                let res = client
+                    .post(format!("{u}/v1/server/worlds/{}/apply", mw.name))
+                    .header("x-musubi-server-key", KEY)
+                    .json(&json!({ "sim": sim, "entity": mw.entities[i], "x": target, "y": mesh_y(i) }))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await;
+                if res.map(|r| r.status().is_success()).unwrap_or(false) {
+                    ok = true;
+                    break 'outer;
+                }
+            }
+        }
+        if ok {
+            right[i] = !right[i];
+            c.mesh_moves_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            c.mesh_moves_err.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Keep both simulators' leases alive (and re-take them wherever the cell lives after a failover).
+async fn mesh_leaser(
+    client: reqwest::Client,
+    alive: Alive,
+    mw: MeshWorld,
+    deadline: Instant,
+    stop: Arc<AtomicBool>,
+) {
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let urls: Vec<String> = alive.read().await.clone();
+        for (sim, cell) in [(mw.sim_a, (0, 0)), (mw.sim_b, (1, 0))] {
+            for u in &urls {
+                let res = client
+                    .post(format!("{u}/v1/server/worlds/{}/lease", mw.name))
+                    .header("x-musubi-server-key", KEY)
+                    .json(&json!({ "sim": sim, "cells": [{"x": cell.0, "y": cell.1}] }))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await;
+                if res.map(|r| r.status().is_success()).unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Entities owned in the two border cells, read from whichever alive node serves each cell.
+async fn mesh_count(client: &reqwest::Client, alive: &Alive, mw: &MeshWorld) -> usize {
+    let urls: Vec<String> = alive.read().await.clone();
+    let mut total = 0;
+    for (x, y) in [(0, 0), (1, 0)] {
+        for u in &urls {
+            let res = client
+                .get(format!("{u}/v1/server/worlds/{}/view/{x}/{y}", mw.name))
+                .header("x-musubi-server-key", KEY)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await;
+            if let Ok(r) = res {
+                if r.status().is_success() {
+                    if let Ok(v) = r.json::<Value>().await {
+                        total += v["owned"].as_array().map(|a| a.len()).unwrap_or(0);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Per-node, per-cell view status for a mismatching world (diagnostics only).
+async fn mesh_detail(client: &reqwest::Client, alive: &Alive, mw: &MeshWorld) -> String {
+    let urls: Vec<String> = alive.read().await.clone();
+    let mut parts = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, u) in urls.iter().enumerate() {
+        let mut cells = Vec::new();
+        for (x, y) in [(0, 0), (1, 0)] {
+            let res = client
+                .get(format!("{u}/v1/server/worlds/{}/view/{x}/{y}", mw.name))
+                .header("x-musubi-server-key", KEY)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await;
+            let d = match res {
+                Ok(r) if r.status().is_success() => {
+                    let owner = r.url().port().map(|p| p.to_string()).unwrap_or_default();
+                    match r.json::<Value>().await {
+                        Ok(v) => {
+                            let owned = v["owned"].as_array().cloned().unwrap_or_default();
+                            for e in &owned {
+                                if let Some(id) = e["id"].as_str() {
+                                    seen.insert(id.to_string());
+                                }
+                            }
+                            format!("owned={}@{owner}", owned.len())
+                        }
+                        Err(_) => "badjson".into(),
+                    }
+                }
+                Ok(r) => r.status().as_u16().to_string(),
+                Err(e) => format!(
+                    "err:{}",
+                    if e.is_timeout() {
+                        "timeout"
+                    } else if e.is_redirect() {
+                        "redirect"
+                    } else if e.is_connect() {
+                        "connect"
+                    } else {
+                        "other"
+                    }
+                ),
+            };
+            cells.push(format!("({x},{y})={d}"));
+        }
+        parts.push(format!(
+            "n{i}[{}]: {}",
+            u.rsplit(':').next().unwrap_or(""),
+            cells.join(" ")
+        ));
+    }
+    let missing: Vec<&str> = mw
+        .entities
+        .iter()
+        .filter(|e| !seen.contains(*e))
+        .map(|e| e.as_str())
+        .collect();
+    // redirect chain per node/cell (no auto-follow) + node id → advertise map
+    let raw = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| client.clone());
+    let mut hops = Vec::new();
+    for u in &urls {
+        for (x, y) in [(0, 0), (1, 0)] {
+            let mut url = format!("{u}/v1/server/worlds/{}/view/{x}/{y}", mw.name);
+            let mut chain = Vec::new();
+            for _ in 0..4 {
+                let res = raw
+                    .get(&url)
+                    .header("x-musubi-server-key", KEY)
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await;
+                match res {
+                    Ok(r) => {
+                        let st = r.status().as_u16();
+                        let loc = r
+                            .headers()
+                            .get("location")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        chain.push(format!("{st}@{}", url.rsplit('/').nth(4).unwrap_or("")));
+                        match loc {
+                            Some(l) if (300..400).contains(&st) => url = l,
+                            _ => break,
+                        }
+                    }
+                    Err(e) => {
+                        chain.push(format!("err:{e}").chars().take(40).collect());
+                        break;
+                    }
+                }
+            }
+            hops.push(format!(
+                "{}({x},{y}): {}",
+                u.rsplit(':').next().unwrap_or(""),
+                chain.join(" -> ")
+            ));
+        }
+    }
+    let mut nodes_map = String::new();
+    if let Some(u) = urls.first() {
+        if let Ok(r) = client
+            .get(format!("{u}/v1/server/cluster/nodes"))
+            .header("x-musubi-server-key", KEY)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if let Ok(v) = r.json::<Value>().await {
+                let arr = v["nodes"].as_array().cloned().unwrap_or_default();
+                nodes_map = arr
+                    .iter()
+                    .map(|n| {
+                        format!(
+                            "{}={}{}",
+                            n["id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .chars()
+                                .take(13)
+                                .collect::<String>(),
+                            n["advertise"].as_str().unwrap_or(""),
+                            if n["alive"].as_bool() == Some(false) {
+                                "(dead)"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+    }
+    format!(
+        "{} missing={:?}\n    hops: {}\n    nodes: {nodes_map}",
+        parts.join(" | "),
+        missing,
+        hops.join(" ; ")
+    )
+}
+
+/// Border entities stay inside the first row of cells (cell_size 100).
+fn mesh_y(k: usize) -> f64 {
+    1.0 + (k % 24) as f64 * 4.0
 }

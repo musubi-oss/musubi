@@ -93,6 +93,10 @@ enum Cmd {
         /// authoritative "echo" matches spread across the nodes (a third of the clients play them)
         #[arg(long, default_value_t = 6)]
         matches: usize,
+        /// persistent entities per world shuttled back and forth across a cell border whose two
+        /// cells are hosted on different nodes (0 = plain single-node worlds)
+        #[arg(long, default_value_t = 20)]
+        mesh_entities: usize,
         #[arg(long, default_value_t = 60)]
         duration_secs: u64,
         #[arg(long, default_value_t = 10)]
@@ -196,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
             clients,
             worlds,
             matches,
+            mesh_entities,
             duration_secs,
             kill_every_secs,
             mode,
@@ -208,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
                 clients,
                 worlds,
                 matches,
+                mesh_entities,
                 duration: std::time::Duration::from_secs(duration_secs),
                 kill_every: std::time::Duration::from_secs(kill_every_secs),
                 mode,

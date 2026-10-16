@@ -37,7 +37,7 @@ async fn directory(
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let value = match &s.cluster {
-        Some(c) => c.directory_get(&key).await,
+        Some(c) => c.directory_get_fresh(&key).await,
         None => None,
     };
     Ok(Json(json!({ "key": key, "value": value })))

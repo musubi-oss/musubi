@@ -68,6 +68,8 @@ enum Wire {
         entity: musubi_mesh::Entity,
         from_node: uuid::Uuid,
         inputs: Vec<serde_json::Value>,
+        /// Cell migration: the host takes the entity even without a simulator on the cell.
+        forced: bool,
     },
     /// Receiving host → `from_node`: handover taken (or refused: no simulator owns the cell).
     WorldHandoverAck {
@@ -316,12 +318,14 @@ impl Fanout {
         entity: musubi_mesh::Entity,
         from_node: uuid::Uuid,
         inputs: Vec<serde_json::Value>,
+        forced: bool,
     ) {
         self.publish(Wire::WorldHandover {
             world: world.to_string(),
             entity,
             from_node,
             inputs,
+            forced,
         });
     }
 
@@ -528,9 +532,19 @@ impl Fanout {
                 entity,
                 from_node,
                 inputs,
+                forced,
             }) => {
-                if let Some(w) = self.worlds.get() {
-                    w.accept_handover(&world, entity, from_node, inputs, self);
+                if let Some(w) = self.worlds.get().cloned() {
+                    let id = entity.id;
+                    if w.accept_handover(&world, entity, from_node, inputs, forced, self) {
+                        let me = self.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = w.flush_journal(&world).await {
+                                tracing::warn!(world = %world, error = %e, "handover journal flush failed");
+                            }
+                            me.world_handover_ack(&world, id, from_node, true);
+                        });
+                    }
                 }
             }
             Ok(Wire::WorldHandoverAck {
@@ -556,13 +570,32 @@ impl Fanout {
             }
             Ok(Wire::WorldCellAssign { world, cell, node }) => {
                 if let Some(w) = self.worlds.get().cloned() {
+                    let prev = w.cell_host_cached(&world, cell);
                     if node == w.node_id() {
                         tokio::spawn(async move {
                             if let Err(e) = w.host_cell(&world, cell).await {
                                 tracing::warn!(world = %world, ?cell, error = %e, "cell hosting failed");
+                                return;
+                            }
+                            if let Some(p) = prev.filter(|p| *p != w.node_id()) {
+                                if let Err(e) = w.adopt_cell_from(&world, cell, p).await {
+                                    tracing::warn!(world = %world, ?cell, error = %e, "cell state not adopted");
+                                }
                             }
                         });
+                    } else if prev == Some(w.node_id()) {
+                        let me = self.clone();
+                        tokio::spawn(async move {
+                            // persist first: the new host merges our shard from the database
+                            if let Err(e) = w.snapshot_now(&world).await {
+                                tracing::warn!(world = %world, error = %e, "shard snapshot before release failed");
+                            }
+                            w.release_cell(&world, cell, node, &me);
+                            w.forget_adoptions(&world, cell);
+                            w.note_cell_host(&world, cell, node);
+                        });
                     } else {
+                        w.forget_adoptions(&world, cell);
                         w.note_cell_host(&world, cell, node);
                     }
                 }

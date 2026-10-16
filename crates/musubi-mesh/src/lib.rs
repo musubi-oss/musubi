@@ -604,6 +604,27 @@ impl World {
         out
     }
 
+    /// Mark `id` in transit towards `host` again (a cross-node handover being retried). False if
+    /// the entity is gone or its cell has no owner here.
+    pub fn begin_remote_handover(&mut self, id: EntityId, host: SimId) -> bool {
+        let tick = self.tick;
+        let Some((cell, pos)) = self.entities.get(&id).map(|e| (e.cell, e.pos)) else {
+            return false;
+        };
+        let Some(from) = self.owner(cell) else {
+            return false;
+        };
+        let to_cell = self.cell_of(pos);
+        let e = self.entities.get_mut(&id).unwrap();
+        e.transit = Some(Transit {
+            from,
+            to: host,
+            to_cell,
+            requested_tick: tick,
+        });
+        true
+    }
+
     /// Inputs buffered while `id` was in transit.
     pub fn take_buffered_inputs(&mut self, id: EntityId) -> Vec<serde_json::Value> {
         self.buffered_inputs.remove(&id).unwrap_or_default()
@@ -773,6 +794,10 @@ impl World {
     }
 
     /// Persistent entities only — what survives a restart.
+    pub fn config(&self) -> &WorldConfig {
+        &self.cfg
+    }
+
     pub fn snapshot_persistent(&self) -> Vec<Entity> {
         let mut v: Vec<Entity> = self
             .entities
@@ -786,6 +811,11 @@ impl World {
 
     pub fn restore(&mut self, entities: Vec<Entity>) {
         for mut e in entities {
+            if let Some(old) = self.entities.get(&e.id) {
+                if let Some(set) = self.by_cell.get_mut(&old.cell) {
+                    set.remove(&e.id);
+                }
+            }
             e.transit = None;
             e.cell = self.cell_of(e.pos);
             self.by_cell.entry(e.cell).or_default().insert(e.id);

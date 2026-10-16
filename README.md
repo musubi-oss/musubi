@@ -82,6 +82,19 @@ of magnitude faster. Open item: in two of roughly twenty kills on this VM the re
 within the 60 s budget; the stand now dumps Raft/world/member state of the survivors when that
 happens so it can be chased down.
 
+Split worlds are in the stand too: every world gets cell `(1,0)` hosted on the node after its home,
+one simulator per side leases its cell and 20 persistent entities keep crossing the border
+(`x` 90 ↔ 110); after each incident the stand counts entities through every node's cell views and a
+run fails on a single lost one. Two 110 s runs (3 nodes, 12 clients, 6 worlds × 20 entities, SIGKILL
+of a leader with 2 worlds + a drain, `--kill-every-secs 40`): 0 lost entities in both, worlds re-homed
+in 7.6–7.8 s, matches in 12.5 s, all cell views consistent again 13.6 s after the kill. Getting there
+fixed: journal chunks replayed out of tick order (a late Despawn erased a returned entity), a node
+restarting with the same id resuming its cells from memory while the home re-homed them (two owners),
+cell hosts resolved from a local cache that never learns about an unassignment (redirect loops), and
+an adopter treating a draining node as a live host by stale cache (its fresh snapshot skipped).
+A node now counts as dead only when SWIM says so *and* its database heartbeat is stale, so a fast
+same-identity restart is never mistaken for a death.
+
 The stand runs nightly in GitHub Actions (`.github/workflows/soak.yml`, also on demand with a
 chosen duration and mode); the JSON report and the nodes' logs are kept as the run's artifact, and
 the job fails on any lost write or unsettled incident.

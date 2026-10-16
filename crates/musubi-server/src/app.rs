@@ -273,6 +273,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if !adopted.is_empty() {
         tracing::info!(count = adopted.len(), "adopted orphaned worlds");
     }
+    match worlds.recover_hosted(&fanout).await {
+        Ok(cells) if !cells.is_empty() => {
+            tracing::info!(?cells, "hosted cells handed back on boot")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "hosted cells not restored on boot"),
+    }
     // World failover: adopt worlds whose home node died (one adopter at a time).
     {
         let (cluster, worlds, fanout) = (cluster.clone(), worlds.clone(), fanout.clone());
@@ -283,9 +290,28 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             let mut members = cluster.member_events();
             loop {
                 wait_failover_round(&mut tick, &mut leaves, &mut members).await;
+                // SWIM's verdict comes within seconds, the heartbeat check a few seconds later:
+                // poll until they agree instead of waiting for the next tick
+                for _ in 0..6 {
+                    let (s, d) = (
+                        swim_dead(&cluster).await,
+                        dead_nodes(&cluster).await.map(|d| d.len()).unwrap_or(0),
+                    );
+                    if s <= d {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
                 // cells of our worlds hosted on a dead node come back to us (no lease: each home
                 // node handles its own worlds)
+                worlds.refresh_homes().await;
+                match worlds.reconcile_handed_back().await {
+                    Ok(n) if n > 0 => tracing::info!(entities = n, "handed-back cells reconciled"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "hand-back reconciliation failed"),
+                }
                 if let Some(dead) = dead_nodes(&cluster).await {
+                    tracing::info!(?dead, "world failover round");
                     match worlds.recover_cells(&dead, &fanout).await {
                         Ok(cells) if !cells.is_empty() => {
                             tracing::info!(?cells, ?dead, "re-homed cells of dead hosts")
@@ -304,7 +330,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     Ok(names) if !names.is_empty() => {
                         tracing::info!(?names, ?dead, "adopted worlds from dead nodes")
                     }
-                    Ok(_) => {}
+                    Ok(_) => tracing::info!(?dead, "world failover round: nothing to adopt"),
                     Err(e) => tracing::warn!(error = %e, "world failover failed"),
                 }
             }
@@ -562,11 +588,31 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
 /// Nodes currently considered dead. A failover round is owed when this runs, so a transient
 /// database error (pool contention) is retried a few times instead of losing the round.
+/// Nodes SWIM (or a stale heartbeat) considers gone, before the heartbeat check of `dead_nodes`.
+async fn swim_dead(cluster: &musubi_cluster::Cluster) -> usize {
+    cluster
+        .nodes()
+        .await
+        .map(|nodes| nodes.iter().filter(|n| !n.alive).count())
+        .unwrap_or(0)
+}
+
 async fn dead_nodes(cluster: &musubi_cluster::Cluster) -> Option<Vec<uuid::Uuid>> {
     for attempt in 0..3 {
         match cluster.nodes().await {
             Ok(nodes) => {
-                return Some(nodes.iter().filter(|n| !n.alive).map(|n| n.id.0).collect());
+                // SWIM's verdict alone would also fire for a node that restarted with the same
+                // identity a second ago: it must have stopped heartbeating to the database too
+                let now = time::OffsetDateTime::now_utc();
+                return Some(
+                    nodes
+                        .iter()
+                        .filter(|n| {
+                            !n.alive && now - n.heartbeat_at > musubi_cluster::HEARTBEAT * 2
+                        })
+                        .map(|n| n.id.0)
+                        .collect(),
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, attempt, "node list failed");
@@ -635,6 +681,10 @@ async fn drain(state: &AppState) {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let budget = std::time::Duration::from_secs(state.cfg.node.drain_timeout_secs.max(1));
     let work = async {
+        let cells = state.worlds.release_hosted(&state.fanout).await;
+        if !cells.is_empty() {
+            info!(?cells, "drain: hosted cells handed back");
+        }
         match state.worlds.release_all().await {
             Ok(w) if !w.is_empty() => info!(worlds = ?w, "drain: worlds handed off"),
             Ok(_) => {}

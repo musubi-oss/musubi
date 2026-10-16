@@ -5007,6 +5007,44 @@ async fn world_handover_cross_nodes() {
         }
     }
     assert!(ok, "entity was not handed over to the other node");
+    // and back again: the home's cells have no explicit host entry, the host must still hand over
+    let (st, a) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "entity": id, "x": 70.0, "y": 50.0})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    let mut back = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, va) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, vb) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        if owned_ids(&va) == vec![id.clone()] && owned_ids(&vb).is_empty() {
+            back = true;
+            break;
+        }
+    }
+    assert!(back, "entity did not come back to the home node");
 }
 
 /// The node hosting a cell dies: the home node takes the cell back and restores the dead host's

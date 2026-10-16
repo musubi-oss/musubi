@@ -185,6 +185,9 @@ impl MatchRegistry {
         let rows = sqlx::query_as::<_, (Uuid, String, String, serde_json::Value, Vec<u8>, i64)>(
             "update musubi.match_snapshots set node_id = $2, updated_at = now()
              where cluster_group = $3 and (node_id is null or node_id = any($1))
+               and (node_id is null or node_id = $2 or not exists
+                    (select 1 from musubi.nodes n where n.id = match_snapshots.node_id
+                       and n.heartbeat_at > now() - interval '10 seconds'))
              returning match_id, module, label, params, state, tick",
         )
         .bind(dead_nodes)

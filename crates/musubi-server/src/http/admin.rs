@@ -613,7 +613,9 @@ async fn world_cell_host(
     if s.worlds.home_of(&w).await?.is_none() {
         return Err(Error::NotFound(format!("world {w}")).into());
     }
-    s.worlds.publish_cell_host(&w, cell, Some(r.node_id)).await;
+    s.worlds
+        .publish_cell_host(&w, cell, Some(r.node_id))
+        .await?;
     s.fanout.cell_assign(&w, cell, r.node_id);
     let hosted = if r.node_id == s.worlds.node_id() {
         s.worlds.host_cell(&w, cell).await?
