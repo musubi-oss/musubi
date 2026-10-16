@@ -33,6 +33,7 @@ pub fn routes() -> Router<AppState> {
             "/v1/admin/worlds/{w}/cells/{x}/{y}/host",
             post(world_cell_host),
         )
+        .route("/v1/admin/worlds/{w}/entities", get(world_entities))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/retention/run", post(retention_run))
         .route("/v1/admin/runtime/schedules", get(schedules_status))
@@ -603,6 +604,15 @@ struct CellHostReq {
 
 /// Assign a cell of a world to a node: the cell's entities and simulators move there, the rest of
 /// the world stays where it is. The directory and the bus carry the assignment to every node.
+/// This node's shard of the world: every entity with cell, position and transit state.
+async fn world_entities(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(w): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.worlds.local_entities(&w)?))
+}
+
 async fn world_cell_host(
     _k: ServerKey,
     State(s): State<AppState>,

@@ -902,6 +902,25 @@ impl World {
         &self.cfg
     }
 
+    /// Every entity this shard holds, in transit or not (diagnostics).
+    pub fn entities_all(&self) -> Vec<Entity> {
+        let mut v: Vec<Entity> = self.entities.values().cloned().collect();
+        v.sort_by_key(|e| e.id);
+        v
+    }
+
+    /// Live leases per cell.
+    pub fn leases(&self) -> Vec<(CellId, SimId)> {
+        let mut v: Vec<(CellId, SimId)> = self
+            .leases
+            .iter()
+            .filter(|(_, l)| l.expires_tick >= self.tick)
+            .map(|(c, l)| (*c, l.sim))
+            .collect();
+        v.sort_by_key(|(c, _)| (c.x, c.y));
+        v
+    }
+
     pub fn snapshot_persistent(&self) -> Vec<Entity> {
         let mut v: Vec<Entity> = self
             .entities

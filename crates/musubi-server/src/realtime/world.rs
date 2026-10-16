@@ -1278,6 +1278,33 @@ impl WorldRegistry {
     }
 
     /// A simulator announces itself (and its capacity); the controller may then lease it cells.
+    /// What this node's shard of `name` holds right now (operators: "where is entity X?").
+    pub fn local_entities(&self, name: &str) -> Result<Value> {
+        let w = self.get(name)?;
+        let st = w.lock();
+        let ents: Vec<Value> = st
+            .world
+            .entities_all()
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "id": e.id, "cell": e.cell, "pos": e.pos, "persistent": e.persistent,
+                    "transit": e.transit,
+                    "remote_to": st.remote_transit.get(&e.id).map(|(h, _)| *h),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "world": name,
+            "node_id": self.node_id,
+            "hosted_only": st.hosted_only,
+            "home_node": st.home_node,
+            "tick": st.world.tick,
+            "leases": st.world.leases().into_iter().map(|(c, s)| json!({"cell": c, "sim": s})).collect::<Vec<_>>(),
+            "entities": ents,
+        }))
+    }
+
     pub fn register_sim(&self, name: &str, sim: Uuid, capacity: u32) -> Result<Vec<SimInfo>> {
         if capacity == 0 {
             return Err(Error::InvalidArgument("capacity >= 1".into()));

@@ -56,6 +56,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/admin/runtime/schedules", "admin"),
     ("POST", "/v1/admin/runtime/schedules/{name}/run", "admin"),
     ("POST", "/v1/admin/worlds/{w}/cells/{x}/{y}/host", "admin"),
+    ("GET", "/v1/admin/worlds/{w}/entities", "admin"),
     ("POST", "/v1/admin/retention/run", "admin"),
     ("GET", "/v1/admin/jwt/keys", "admin"),
     ("POST", "/v1/admin/jwt/keys", "admin"),

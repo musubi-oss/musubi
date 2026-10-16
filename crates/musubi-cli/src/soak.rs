@@ -937,33 +937,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        // restart on the same ports/data dir
-        tokio::time::sleep(o.rejoin_delay).await;
-        let t1 = Instant::now();
-        spawn(&bin, &mut nodes[victim], &o.database_url, &group)?;
-        let rejoined_ms = match tokio::time::timeout(budget, async {
-            let id = node_id(&client, &nodes[victim]).await?;
-            loop {
-                if let Some(ids) = member_ids(&client, &nodes[survivor]).await {
-                    if ids.contains(&id) {
-                        return anyhow::Ok(id);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        {
-            Ok(Ok(id)) => {
-                nodes[victim].id = id;
-                alive.write().await.push(nodes[victim].url());
-                t1.elapsed().as_secs_f64() * 1e3
-            }
-            _ => {
-                timed_out = true;
-                f64::NAN
-            }
-        };
+        // the survivors must account for every entity before the victim comes back
         let mesh_recovered_ms = if mesh.is_empty() {
             f64::NAN
         } else {
@@ -1021,6 +995,33 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                     break f64::NAN;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        // restart on the same ports/data dir
+        tokio::time::sleep(o.rejoin_delay).await;
+        let t1 = Instant::now();
+        spawn(&bin, &mut nodes[victim], &o.database_url, &group)?;
+        let rejoined_ms = match tokio::time::timeout(budget, async {
+            let id = node_id(&client, &nodes[victim]).await?;
+            loop {
+                if let Some(ids) = member_ids(&client, &nodes[survivor]).await {
+                    if ids.contains(&id) {
+                        return anyhow::Ok(id);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        {
+            Ok(Ok(id)) => {
+                nodes[victim].id = id;
+                alive.write().await.push(nodes[victim].url());
+                t1.elapsed().as_secs_f64() * 1e3
+            }
+            _ => {
+                timed_out = true;
+                f64::NAN
             }
         };
         let inc = Incident {

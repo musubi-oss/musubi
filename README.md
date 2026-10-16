@@ -162,6 +162,8 @@ Cross-boundary interactions: a simulator that hits a ghost (an entity owned by a
 
 Interest v2: a client's `world_subscribe` carries an optional `budget_bytes` per tick (default `client_budget_bytes` = 16 KB in the world config) and an optional `filter` (component → value every delivered entity must match) on top of the radius. Each tick the entities in range are ranked by `relevance × (1 + age)` — relevance falls with distance, age is the ticks since the client last heard about the entity — and sent in that order until the estimated bytes exceed the budget (at least one always goes); the rest keep their old state and come back later with a higher priority, so a crowded radius degrades to lower update rates for far entities instead of bursts. Despawns are always delivered. Positions are quantized to `pos_quantum` (0.01) and jitter below it is not an update.
 
+Operators: `GET /v1/admin/worlds/{w}/entities` dumps this node's shard of a world — every entity with cell, position, transit state and the live leases (where is entity X right now?); `musubi soak --rejoin-delay-secs N` keeps a killed node down for N seconds so the survivors alone must account for every entity.
+
 ## Integrations (Zanshin LiveOps, Aurix voice)
 
 `[zanshin] url, server_key, flush_secs` and `[aurix] url, api_key, party_channel_type, match_channel_type` in the config (unset `url` = disabled). The Musubi account id is the `external_id` on both sides.
