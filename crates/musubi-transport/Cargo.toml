@@ -18,3 +18,4 @@ quinn.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 rcgen.workspace = true
+wtransport = "0.7"

@@ -11,6 +11,7 @@ pub mod relayed;
 pub mod resume;
 mod session;
 pub mod wasm_match;
+pub mod webtransport;
 pub mod world;
 
 pub use authoritative::MatchRegistry;

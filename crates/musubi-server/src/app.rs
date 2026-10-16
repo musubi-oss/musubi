@@ -603,6 +603,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(listen) = state.cfg.quic.listen {
         crate::realtime::quic::start(state.clone(), listen).await?;
     }
+    if let Some(listen) = state.cfg.webtransport.listen {
+        crate::realtime::webtransport::start(state.clone(), listen).await?;
+    }
     let draining = state.clone();
     axum::serve(
         listener,

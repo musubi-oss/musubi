@@ -36,6 +36,7 @@ pub struct Config {
     pub log: LogConfig,
     pub runtime: RuntimeConfig,
     pub quic: QuicConfig,
+    pub webtransport: WebTransportConfig,
     pub zanshin: ZanshinConfig,
     pub aurix: AurixConfig,
     pub iap: IapConfig,
@@ -414,6 +415,18 @@ pub struct QuicConfig {
     /// UDP listen address; unset = QUIC disabled.
     pub listen: Option<SocketAddr>,
     /// PEM cert chain + key. Unset = self-signed `localhost` cert (development only).
+    pub cert_pem: Option<std::path::PathBuf>,
+    pub key_pem: Option<std::path::PathBuf>,
+}
+
+/// WebTransport realtime transport for browsers (HTTP/3; same envelopes and framing as QUIC).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WebTransportConfig {
+    /// UDP listen address; unset = WebTransport disabled.
+    pub listen: Option<SocketAddr>,
+    /// PEM cert chain + key (browsers require a publicly trusted or hash-pinned certificate).
+    /// Unset = self-signed `localhost` cert (development only).
     pub cert_pem: Option<std::path::PathBuf>,
     pub key_pem: Option<std::path::PathBuf>,
 }

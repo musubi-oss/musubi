@@ -1727,6 +1727,95 @@ async fn quic_transport_ping_and_rpc() {
 }
 
 #[tokio::test]
+async fn webtransport_ping_and_rpc() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (cfg, hash) =
+        musubi_transport::webtransport::dev_self_signed("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = musubi_server::realtime::webtransport::start_with(state, cfg)
+        .await
+        .unwrap();
+    let (ta, acc) = token(&router).await;
+
+    let ccfg = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes([hash.clone()])
+        .build();
+    let conn = wtransport::Endpoint::client(ccfg)
+        .unwrap()
+        .connect(format!("https://127.0.0.1:{}", addr.port()))
+        .await
+        .unwrap();
+    let (mut tx, mut rx) = conn.open_bi().await.unwrap().await.unwrap();
+    use musubi_transport::framing as Q;
+    use musubi_transport::Frame;
+    Q::write_frame(
+        &mut tx,
+        Frame::Text(json!({"token": ta, "format": "json"}).to_string()),
+    )
+    .await
+    .unwrap();
+    let env = |cid: &str, msg: ClientMessage| {
+        Frame::Text(
+            serde_json::to_string(&Envelope {
+                cid: Some(cid.into()),
+                msg,
+            })
+            .unwrap(),
+        )
+    };
+    Q::write_frame(&mut tx, env("1", ClientMessage::Ping))
+        .await
+        .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert_eq!(r.cid.as_deref(), Some("1"));
+    assert!(matches!(r.msg, ServerMessage::Pong));
+    Q::write_frame(
+        &mut tx,
+        env(
+            "2",
+            ClientMessage::Rpc {
+                id: "whoami".into(),
+                payload: json!({}),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert!(matches!(r.msg, ServerMessage::Rpc { payload, .. } if payload["account_id"] == acc));
+
+    // bad token is rejected with an error frame
+    let conn2 = wtransport::Endpoint::client(
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([hash])
+            .build(),
+    )
+    .unwrap()
+    .connect(format!("https://127.0.0.1:{}", addr.port()))
+    .await
+    .unwrap();
+    let (mut tx2, mut rx2) = conn2.open_bi().await.unwrap().await.unwrap();
+    Q::write_frame(&mut tx2, Frame::Text(json!({"token": "nope"}).to_string()))
+        .await
+        .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx2, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert!(matches!(r.msg, ServerMessage::Error { .. }));
+}
+
+#[tokio::test]
 async fn cross_node_party() {
     let group = test_group();
     let Some((addr1, router1)) = start_in(&group).await else {

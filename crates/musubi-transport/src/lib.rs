@@ -10,7 +10,9 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 pub use musubi_proto::Encoding;
 
+pub mod framing;
 pub mod quic;
+pub mod webtransport;
 pub mod ws;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
