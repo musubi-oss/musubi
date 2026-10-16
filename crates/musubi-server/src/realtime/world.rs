@@ -220,6 +220,8 @@ pub struct WorldRegistry {
     /// Fires after every registry tick with the tick number; streaming simulator sessions wake on it.
     ticks: tokio::sync::broadcast::Sender<u64>,
     tick_no: std::sync::atomic::AtomicU64,
+    /// worlds that have a ticker thread (see `ensure_tickers`)
+    ticking: Mutex<std::collections::HashSet<String>>,
     /// Raft directory (`world:<name>` → home) when the cluster runs the QUIC bus.
     cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
     /// `node.region` when set explicitly (`set_region`); otherwise taken from the cluster handle.
@@ -316,6 +318,7 @@ impl WorldRegistry {
             homes: DashMap::new(),
             ticks: tokio::sync::broadcast::channel(16).0,
             tick_no: std::sync::atomic::AtomicU64::new(0),
+            ticking: Mutex::new(Default::default()),
             cell_hosts: DashMap::new(),
             adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
@@ -2609,23 +2612,41 @@ impl WorldRegistry {
         }
     }
 
-    /// Tick all worlds, each on its own blocking thread, and wait for the slowest: a node with
-    /// several worlds uses several cores instead of serializing their fan-outs.
-    async fn tick_parallel(self: &Arc<Self>, fanout: &Fanout) {
-        let names: Vec<String> = self.worlds.iter().map(|w| w.key().clone()).collect();
-        if names.len() <= 1 {
-            self.tick(fanout);
-            return;
-        }
-        let handles: Vec<_> = names
-            .into_iter()
-            .map(|name| {
-                let (this, fanout) = (self.clone(), fanout.clone());
-                tokio::task::spawn_blocking(move || this.tick_world(&name, &fanout))
-            })
-            .collect();
-        for h in handles {
-            let _ = h.await;
+    /// Every world ticks on its own thread with its own clock. One ticker that awaited all
+    /// worlds ran the node at the pace of its slowest world — and with twenty worlds fighting
+    /// the runtime for cores, that pace was a quarter of `TICK_HZ`. A ticker thread exits
+    /// when its world leaves this node.
+    fn ensure_tickers(self: &Arc<Self>, fanout: &Fanout) {
+        let period = Duration::from_millis(1000 / TICK_HZ);
+        // the fan-out spawns onto the runtime; a plain thread has no runtime context of its own
+        let rt = tokio::runtime::Handle::current();
+        for w in self.worlds.iter() {
+            let name = w.key().clone();
+            if !self.ticking.lock().insert(name.clone()) {
+                continue;
+            }
+            let (this, fanout, rt) = (self.clone(), fanout.clone(), rt.clone());
+            let spawned = std::thread::Builder::new()
+                .name(format!("tick-{name}"))
+                .spawn(move || {
+                    let _rt = rt.enter();
+                    let mut next = std::time::Instant::now();
+                    while this.worlds.contains_key(&name) {
+                        this.tick_world(&name, &fanout);
+                        next += period;
+                        let now = std::time::Instant::now();
+                        if next > now {
+                            std::thread::sleep(next - now);
+                        } else {
+                            // behind: do not try to catch up, the next tick is simply now
+                            next = now;
+                        }
+                    }
+                    this.ticking.lock().remove(&name);
+                });
+            if spawned.is_err() {
+                self.ticking.lock().remove(w.key());
+            }
         }
     }
 
@@ -2634,13 +2655,15 @@ impl WorldRegistry {
         self.ticks.subscribe()
     }
 
+    /// Starts a ticker thread for every world on this node (and for worlds that arrive later)
+    /// and publishes the node tick number at `TICK_HZ` for simulator streams.
     pub fn spawn_ticker(self: Arc<Self>, fanout: Fanout) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(1000 / TICK_HZ));
             iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 iv.tick().await;
-                self.tick_parallel(&fanout).await;
+                self.ensure_tickers(&fanout);
                 let t = self
                     .tick_no
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)

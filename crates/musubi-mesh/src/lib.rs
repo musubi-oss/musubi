@@ -1786,8 +1786,28 @@ mod perf {
         let mut total = std::time::Duration::ZERO;
         let mut frames = 0usize;
         let mut ents = 0usize;
+        // MOVE_EVERY=n: viewer i re-subscribes with a short hop every n ticks (the bench's
+        // 200 ms random walk is every 6), which forces the full-view path instead of the log
+        let move_every: u64 = std::env::var("MOVE_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         for step in 0..200u64 {
             lease_all(&mut w);
+            if move_every > 0 {
+                for (i, c) in clients.iter().enumerate() {
+                    if (step + i as u64) % move_every != 0 {
+                        continue;
+                    }
+                    let base = pt(1000 + i as u64);
+                    let h = pt(9000 + step * 131 + i as u64);
+                    let np = Pos {
+                        x: (base.x + (h.x / side - 0.5) * side * 0.1).rem_euclid(side),
+                        y: (base.y + (h.y / side - 0.5) * side * 0.1).rem_euclid(side),
+                    };
+                    w.subscribe_with(*c, np, radius, None, BTreeMap::new(), 1);
+                }
+            }
             for j in 0..17u64 {
                 let i = ((step * 17 + j) % 500) as usize;
                 w.apply(s1, ids[i], Some(pt(5000 + step * 31 + j)), BTreeMap::new())
