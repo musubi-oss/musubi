@@ -733,11 +733,13 @@ impl WorldRegistry {
              where w.cluster_group = $3
                and (w.node_id is null or w.node_id = any($1)
                     or not exists (select 1 from musubi.nodes n where n.id = w.node_id)
-                    or exists (select 1 from musubi.nodes n where n.id = w.node_id and n.epoch > w.node_epoch))
+                    or exists (select 1 from musubi.nodes n where n.id = w.node_id and n.epoch > w.node_epoch
+                                 and n.started_at < now() - interval '10 seconds'))
                and (w.node_id is null or not (w.node_id = $2 and $2 <> all($1) and w.node_epoch = $4))
                and (w.node_id is null or w.node_id = $2 or not exists
                     (select 1 from musubi.nodes n where n.id = w.node_id
-                       and n.heartbeat_at > now() - interval '10 seconds' and n.epoch <= w.node_epoch))
+                       and n.heartbeat_at > now() - interval '10 seconds'
+                       and (n.epoch <= w.node_epoch or n.started_at > now() - interval '10 seconds')))
              returning name, config, controller",
         )
         .bind(dead_nodes)

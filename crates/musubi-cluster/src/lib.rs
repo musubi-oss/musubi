@@ -80,6 +80,8 @@ pub const HEARTBEAT: Duration = Duration::from_secs(5);
 pub const DEAD_AFTER: Duration = Duration::from_secs(15);
 /// Bus topic announcing a voluntary departure (payload: node uuid); peers mark it dead at once.
 pub const LEAVE_TOPIC: &str = "cluster.leave";
+/// Payload: node id asked to start a Raft election (sent by a leaving leader, see `step_down`).
+pub const ELECT_TOPIC: &str = "cluster.elect";
 const BUS_CHANNEL: &str = "musubi_bus";
 /// Postgres NOTIFY payloads are capped at 8000 bytes.
 const MAX_BUS_PAYLOAD: usize = 7900;
@@ -459,6 +461,16 @@ impl Cluster {
             if let Ok(id) = serde_json::from_value::<Uuid>(msg.payload.clone()) {
                 self.set_state(id, swim::State::Dead).await;
             }
+        } else if msg.topic == ELECT_TOPIC {
+            if let Ok(id) = serde_json::from_value::<Uuid>(msg.payload.clone()) {
+                if id == self.me.id.0 {
+                    if let Some(r) = self.raft_state() {
+                        if let Err(e) = r.raft.trigger().elect().await {
+                            tracing::debug!(error = %e, "raft elect on request");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -466,6 +478,7 @@ impl Cluster {
     /// SWIM), drop every lease we hold and our node row, and stop heartbeating. Callers hand off
     /// matches/worlds before this so the failover leader finds them orphaned.
     pub async fn leave(&self) {
+        self.step_down().await;
         self.left.store(true, Ordering::Relaxed);
         let _ = sqlx::query("delete from musubi.leases where holder = $1")
             .bind(self.me.id.0)

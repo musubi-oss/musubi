@@ -34,6 +34,8 @@ pub struct Opts {
     pub duration: Duration,
     pub kill_every: Duration,
     pub mode: String,
+    /// random | leader: which node incidents hit (leader = the current Raft leader).
+    pub victim: String,
     pub json: bool,
 }
 
@@ -759,7 +761,19 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         if Instant::now() >= run_deadline {
             break;
         }
-        let victim = rng.below(nodes.len());
+        let mut victim = rng.below(nodes.len());
+        if o.victim == "leader" {
+            for (i, n) in nodes.iter().enumerate() {
+                let is_leader = get(&client, &n.url(), "/v1/server/cluster/raft")
+                    .await
+                    .map(|v| v["is_leader"] == true)
+                    .unwrap_or(false);
+                if is_leader {
+                    victim = i;
+                    break;
+                }
+            }
+        }
         let action: &'static str = match o.mode.as_str() {
             "kill" => "kill",
             "drain" => "drain",

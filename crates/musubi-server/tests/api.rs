@@ -2822,6 +2822,73 @@ async fn swim_detects_dead_bus_peer_within_seconds() {
 }
 
 #[tokio::test]
+async fn leaving_leader_hands_over_raft_leadership() {
+    use std::time::{Duration, Instant};
+    let Some(_app) = app().await else { return };
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let group = unique("g");
+    let bus = |name: &str| {
+        Arc::new(
+            musubi_cluster::Cluster::new(db.clone(), name, "local", vec![], "")
+                .with_group(&group)
+                .with_bus("127.0.0.1:0".parse().unwrap(), None)
+                .unwrap(),
+        )
+    };
+    let nodes = [bus("la"), bus("lb"), bus("lc")];
+    for n in &nodes {
+        n.start().await.unwrap();
+    }
+    for n in &nodes {
+        n.refresh_peers().await.unwrap();
+    }
+    let t0 = Instant::now();
+    let leader = loop {
+        let leaders: Vec<_> = nodes.iter().map(|n| n.raft_leader()).collect();
+        let voters: Vec<_> = nodes.iter().map(|n| n.raft_voters().len()).collect();
+        if leaders.iter().all(|l| l.is_some() && *l == leaders[0]) && voters.iter().all(|v| *v == 3)
+        {
+            break leaders[0].unwrap();
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(90),
+            "no stable 3-node raft: leaders={leaders:?} voters={voters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    // a leader that leaves voluntarily hands leadership over instead of letting the survivors
+    // sit through an election timeout (3-5 s) while its worlds and matches wait for the catalog
+    let leaving = nodes.iter().find(|n| n.raft_id() == leader).unwrap();
+    let t1 = Instant::now();
+    leaving.leave().await;
+    let left_in = t1.elapsed();
+    let survivors: Vec<_> = nodes.iter().filter(|n| n.raft_id() != leader).collect();
+    let t2 = Instant::now();
+    loop {
+        let leaders: Vec<_> = survivors.iter().map(|n| n.raft_leader()).collect();
+        if leaders
+            .iter()
+            .all(|l| l.is_some_and(|l| l != leader) && *l == leaders[0])
+        {
+            break;
+        }
+        assert!(
+            t2.elapsed() < Duration::from_secs(3),
+            "no new leader after the leader left: old={leader} leaders={leaders:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(left_in < Duration::from_secs(3), "leave took {left_in:?}");
+    for n in survivors {
+        n.leave().await;
+    }
+}
+
+#[tokio::test]
 async fn raft_directory_replicates_and_survives_leader_loss() {
     use std::time::{Duration, Instant};
     let Some(_app) = app().await else { return };

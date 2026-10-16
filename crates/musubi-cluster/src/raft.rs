@@ -398,9 +398,11 @@ impl Cluster {
             return Ok(());
         }
         let config = openraft::Config {
-            heartbeat_interval: 1000,
-            election_timeout_min: 3000,
-            election_timeout_max: 5000,
+            // followers refuse votes while the leader lease (= election_timeout_min since the
+            // last heartbeat) runs, so this also bounds how fast a leaving leader is replaced
+            heartbeat_interval: 500,
+            election_timeout_min: 1500,
+            election_timeout_max: 2500,
             ..Default::default()
         };
         let config = Arc::new(config.validate().map_err(Error::internal)?);
@@ -438,7 +440,7 @@ impl Cluster {
         Ok(())
     }
 
-    fn raft_state(&self) -> Option<&RaftState> {
+    pub(crate) fn raft_state(&self) -> Option<&RaftState> {
         self.raft.get()
     }
 
@@ -450,6 +452,45 @@ impl Cluster {
     pub fn raft_leader(&self) -> Option<RaftNodeId> {
         self.raft_state()
             .and_then(|r| r.raft.metrics().borrow().current_leader)
+    }
+
+    /// Hand Raft leadership to a live voter before leaving: ask one peer to elect itself (its
+    /// higher term makes us step down at once) and wait briefly for the term to move on, so the
+    /// cluster does not sit through an election timeout while the leaving node's cells and
+    /// matches wait for a directory write.
+    pub async fn step_down(&self) {
+        if !self.is_raft_leader() {
+            return;
+        }
+        let Some(r) = self.raft_state() else { return };
+        let voters: Vec<RaftNodeId> = {
+            let metrics = r.raft.metrics();
+            let m = metrics.borrow();
+            m.membership_config.membership().voter_ids().collect()
+        };
+        let target = self
+            .peers
+            .read()
+            .await
+            .iter()
+            .find(|p| p.id != self.me.id && voters.contains(&p.raft_id))
+            .map(|p| p.id);
+        let Some(target) = target else { return };
+        if let Err(e) = self.publish(super::ELECT_TOPIC, &target).await {
+            tracing::debug!(error = %e, "raft step down: elect request not sent");
+            return;
+        }
+        // openraft 0.9 has no leadership transfer: peers reject the candidate's votes while our
+        // lease runs, and every heartbeat renews it, so stop heartbeating and keep asking the
+        // peer to run until the lease has expired
+        if let Err(e) = r.raft.shutdown().await {
+            tracing::debug!(error = %e, "raft shutdown on leave");
+        }
+        for _ in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let _ = self.publish(super::ELECT_TOPIC, &target).await;
+        }
+        tracing::info!(?target, "raft leadership handed over before leaving");
     }
 
     pub fn is_raft_leader(&self) -> bool {

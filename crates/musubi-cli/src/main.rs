@@ -104,6 +104,9 @@ enum Cmd {
         /// kill | drain | mixed
         #[arg(long, default_value = "mixed")]
         mode: String,
+        /// random | leader
+        #[arg(long, default_value = "random")]
+        victim: String,
         #[arg(long)]
         json: bool,
     },
@@ -204,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
             duration_secs,
             kill_every_secs,
             mode,
+            victim,
             json,
         } => {
             soak::run(soak::Opts {
@@ -217,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
                 duration: std::time::Duration::from_secs(duration_secs),
                 kill_every: std::time::Duration::from_secs(kill_every_secs),
                 mode,
+                victim,
                 json,
             })
             .await
