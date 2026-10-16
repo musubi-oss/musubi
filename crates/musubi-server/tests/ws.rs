@@ -2126,6 +2126,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
             radius: 200.0,
             budget_bytes: None,
             filter: None,
+            max_hz: None,
         },
     )
     .await;
@@ -2356,6 +2357,7 @@ async fn shard_controller_assigns_cells_and_recovers_orphans() {
             radius: 10.0,
             budget_bytes: None,
             filter: None,
+            max_hz: None,
         },
     )
     .await;
@@ -2573,6 +2575,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
             radius: 500.0,
             budget_bytes: None,
             filter: None,
+            max_hz: None,
         },
     )
     .await;
@@ -2626,6 +2629,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
             radius: 1.0,
             budget_bytes: None,
             filter: None,
+            max_hz: None,
         },
     )
     .await;
@@ -5367,6 +5371,7 @@ async fn world_interest_across_nodes() {
             radius: 200.0,
             budget_bytes: None,
             filter: None,
+            max_hz: None,
         },
     )
     .await;

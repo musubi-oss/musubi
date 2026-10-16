@@ -160,6 +160,10 @@ pub enum ClientMessage {
         /// Fine filter: object of component name → value every delivered entity must match.
         #[serde(default, with = "crate::json_in_binary")]
         filter: Option<serde_json::Value>,
+        /// Most deltas per second this client wants (default: every tick); the world may cap it
+        /// lower. Skipped ticks are folded into the next delta, nothing is lost.
+        #[serde(default)]
+        max_hz: Option<u32>,
     },
     WorldUnsubscribe {
         world: String,

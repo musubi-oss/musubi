@@ -240,6 +240,8 @@ pub enum WorldCmd {
         y: f64,
         radius: f64,
         #[serde(default)]
+        max_hz: Option<u32>,
+        #[serde(default)]
         budget_bytes: Option<u32>,
         #[serde(default)]
         filter: Option<Value>,
@@ -1320,6 +1322,7 @@ impl WorldRegistry {
                 x,
                 y,
                 radius,
+                max_hz,
                 budget_bytes,
                 filter,
             } => self.subscribe(
@@ -1329,6 +1332,7 @@ impl WorldRegistry {
                 radius,
                 budget_bytes.map(|b| b as usize),
                 filter,
+                max_hz,
             ),
             WorldCmd::Unsubscribe => self.unsubscribe(&env.world, env.session_id),
             WorldCmd::Input { entity, input } => {
@@ -2260,6 +2264,7 @@ impl WorldRegistry {
 
     // ----- client side -----
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe(
         &self,
         name: &str,
@@ -2268,6 +2273,7 @@ impl WorldRegistry {
         radius: f64,
         budget_bytes: Option<usize>,
         filter: Option<Value>,
+        max_hz: Option<u32>,
     ) -> Result<()> {
         if !(0.0..=100_000.0).contains(&radius) {
             return Err(Error::InvalidArgument("radius 0..=100000".into()));
@@ -2281,12 +2287,16 @@ impl WorldRegistry {
                 ))
             }
         };
+        let every = match max_hz {
+            Some(hz) if hz > 0 => TICK_HZ.div_ceil(hz as u64),
+            _ => 1,
+        };
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
         let client = *st.subs.entry(sid).or_insert_with(Uuid::now_v7);
         st.world
-            .subscribe_with(client, pos, radius, budget_bytes, filter);
+            .subscribe_with(client, pos, radius, budget_bytes, filter, every);
         let hosted_only = st.hosted_only;
         for c in st.world.cells_in_radius(pos, radius) {
             // only cells this shard is responsible for get a simulator from here

@@ -21,6 +21,8 @@ pub struct Opts {
     pub worlds: usize,
     pub entities: usize,
     pub radius: f64,
+    /// Cap on deltas per second per world player (`None` = every tick).
+    pub max_hz: Option<u32>,
     /// Wire encoding for the world players: `json` or `binary` (postcard).
     pub wire: String,
     pub json: bool,
@@ -217,6 +219,7 @@ struct Player {
     token: String,
     arena: Arc<Arena>,
     radius: f64,
+    max_hz: Option<u32>,
     seed: u64,
     deadline: Instant,
     tx: mpsc::UnboundedSender<Sample>,
@@ -232,6 +235,7 @@ async fn world_loop(p: Player) {
         token,
         arena,
         radius,
+        max_hz,
         seed,
         deadline,
         tx,
@@ -273,6 +277,7 @@ async fn world_loop(p: Player) {
                 radius,
                 budget_bytes: None,
                 filter: None,
+                max_hz,
             },
         };
         match enc {
@@ -651,6 +656,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let (http, url, tx) = (http.clone(), url.clone(), tx.clone());
         let arena = arenas.get(i % arenas.len().max(1)).cloned();
         let (radius, totals) = (o.radius, totals.clone());
+        let max_hz = o.max_hz;
         let wire = o.wire.clone();
         tasks.push(tokio::spawn(async move {
             match sc {
@@ -663,6 +669,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                         token,
                         arena: arena.unwrap(),
                         radius,
+                        max_hz,
                         seed: i as u64,
                         deadline,
                         tx,

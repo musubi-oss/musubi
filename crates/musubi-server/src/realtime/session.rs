@@ -572,6 +572,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             radius,
             budget_bytes,
             filter,
+            max_hz,
         } => {
             world_dispatch(
                 ctx,
@@ -580,6 +581,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                     x,
                     y,
                     radius,
+                    max_hz,
                     budget_bytes,
                     filter,
                 },

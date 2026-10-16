@@ -113,6 +113,10 @@ pub struct WorldConfig {
     pub handover_timeout_ticks: u64,
     /// Default per-client delta budget per tick (bytes, estimated); a subscription may lower it.
     pub client_budget_bytes: usize,
+    /// Fewest ticks between two deltas to one client (1 = every tick). Raising it caps the
+    /// node's frame egress; a client's own `max_hz` can only make its deltas sparser.
+    #[serde(default = "one_tick")]
+    pub client_min_delta_ticks: u64,
     /// Positions in client deltas are rounded to this step; smaller moves send nothing.
     pub pos_quantum: f64,
     /// Entities a cell accepts by spawn before new spawns into it are refused (0 = unlimited);
@@ -143,6 +147,7 @@ impl Default for WorldConfig {
             lease_ttl_ticks: 60,
             handover_timeout_ticks: 3,
             client_budget_bytes: 16 * 1024,
+            client_min_delta_ticks: 1,
             pos_quantum: 0.01,
             soft_cap: 0,
             tidi_after_ticks: 15,
@@ -208,6 +213,16 @@ struct Interest {
     last_view: Option<(Pos, f64)>,
     #[serde(default)]
     last_filter: BTreeMap<String, serde_json::Value>,
+    /// Deltas go out every `every` ticks, on ticks where `(tick + phase) % every == 0`; the
+    /// phase spreads clients over the ticks so a 10 Hz cap does not bunch every frame on one.
+    #[serde(default = "one_tick")]
+    every: u64,
+    #[serde(default)]
+    phase: u64,
+}
+
+fn one_tick() -> u64 {
+    1
 }
 
 /// Entities per cell plus the tick each cell last changed (membership or any entity in it),
@@ -1114,7 +1129,7 @@ impl World {
     // ----- interest & client deltas -----
 
     pub fn subscribe(&mut self, client: ClientId, pos: Pos, radius: f64) {
-        self.subscribe_with(client, pos, radius, None, BTreeMap::new());
+        self.subscribe_with(client, pos, radius, None, BTreeMap::new(), 1);
     }
 
     /// Subscribe with a per-tick byte budget and a component-equality filter (see `delta_for`).
@@ -1125,24 +1140,35 @@ impl World {
         radius: f64,
         budget_bytes: Option<usize>,
         filter: BTreeMap<String, serde_json::Value>,
+        every: u64,
     ) {
-        let (known, last_sent) = self
-            .interests
-            .get(&client)
-            .map(|i| (i.known.clone(), i.last_sent.clone()))
-            .unwrap_or_default();
+        let every = every.max(self.cfg.client_min_delta_ticks).max(1);
+        let phase = (client.as_u128() % every as u128) as u64;
+        // a moving client re-subscribes several times a second: the view parameters change in
+        // place and what it already knows stays (the next delta rescans against the new view)
+        if let Some(i) = self.interests.get_mut(&client) {
+            i.pos = pos;
+            i.radius = radius;
+            i.budget_bytes = budget_bytes;
+            i.filter = filter;
+            i.every = every;
+            i.phase = phase;
+            return;
+        }
         self.interests.insert(
             client,
             Interest {
                 pos,
                 radius,
-                known,
+                known: HashMap::new(),
                 budget_bytes,
                 filter,
-                last_sent,
+                last_sent: HashMap::new(),
                 last_delta_tick: 0,
                 last_view: None,
                 last_filter: BTreeMap::new(),
+                every,
+                phase,
             },
         );
     }
@@ -1178,6 +1204,9 @@ impl World {
         let out: Vec<(ClientId, Delta)> = interests
             .iter_mut()
             .filter_map(|(client, interest)| {
+                if interest.every > 1 && (world.tick + interest.phase) % interest.every != 0 {
+                    return None;
+                }
                 let d = world.delta_with(interest)?;
                 (d != Delta::default()).then_some((*client, d))
             })
@@ -1628,7 +1657,14 @@ mod tests {
         w.grant_lease(CellId { x: 0, y: 0 }, s1);
         let c = Uuid::now_v7();
         // budget of one byte: exactly one entity per tick, nearest first
-        w.subscribe_with(c, Pos { x: 0.0, y: 0.0 }, 500.0, Some(1), BTreeMap::new());
+        w.subscribe_with(
+            c,
+            Pos { x: 0.0, y: 0.0 },
+            500.0,
+            Some(1),
+            BTreeMap::new(),
+            1,
+        );
         let far = w.spawn(Pos { x: 300.0, y: 0.0 }, BTreeMap::new(), false);
         let mid = w.spawn(Pos { x: 100.0, y: 0.0 }, BTreeMap::new(), false);
         let near = w.spawn(Pos { x: 10.0, y: 0.0 }, BTreeMap::new(), false);
@@ -1669,7 +1705,7 @@ mod tests {
         let c = Uuid::now_v7();
         let mut filter = BTreeMap::new();
         filter.insert("team".to_string(), serde_json::json!("red"));
-        w.subscribe_with(c, Pos { x: 0.0, y: 0.0 }, 500.0, None, filter);
+        w.subscribe_with(c, Pos { x: 0.0, y: 0.0 }, 500.0, None, filter, 1);
         let red = w.spawn(
             Pos { x: 10.0, y: 0.0 },
             comps(serde_json::json!({"team": "red"})),
@@ -1737,7 +1773,7 @@ mod perf {
             .collect();
         let clients: Vec<Uuid> = (0..500).map(|_| Uuid::now_v7()).collect();
         for (i, c) in clients.iter().enumerate() {
-            w.subscribe_with(*c, pt(1000 + i as u64), radius, None, BTreeMap::new());
+            w.subscribe_with(*c, pt(1000 + i as u64), radius, None, BTreeMap::new(), 1);
         }
         let mut total = std::time::Duration::ZERO;
         let mut frames = 0usize;
