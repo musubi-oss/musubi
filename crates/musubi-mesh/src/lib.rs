@@ -46,6 +46,10 @@ pub struct Component {
     /// `value` as JSON text, built on first use and shared by every frame that carries it.
     #[serde(skip)]
     pub json: std::sync::OnceLock<std::sync::Arc<str>>,
+    /// The component's name as shared text (set from its map key on first use), so frames
+    /// for thousands of clients share one allocation instead of cloning a String each.
+    #[serde(skip)]
+    pub name: std::sync::OnceLock<std::sync::Arc<str>>,
 }
 
 impl Component {
@@ -55,7 +59,11 @@ impl Component {
             version,
             changed_rev,
             json: std::sync::OnceLock::new(),
+            name: std::sync::OnceLock::new(),
         }
+    }
+    pub fn name_of(&self, key: &str) -> std::sync::Arc<str> {
+        self.name.get_or_init(|| key.into()).clone()
     }
     pub fn json(&self) -> std::sync::Arc<str> {
         self.json
@@ -193,9 +201,55 @@ pub enum HandoverOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Delta {
-    pub spawned: Vec<Entity>,
-    pub updated: Vec<(EntityId, Pos, BTreeMap<String, Component>)>,
+    pub spawned: Vec<EntityRef>,
+    pub updated: Vec<EntityRef>,
     pub despawned: Vec<EntityId>,
+}
+
+/// A component as a frame carries it: shared text for name and value (no JSON value is
+/// cloned or re-serialized per client).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentRef {
+    pub name: std::sync::Arc<str>,
+    pub json: std::sync::Arc<str>,
+    pub version: u64,
+}
+
+/// An entity (or the changed part of one) in a client's delta.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityRef {
+    pub id: EntityId,
+    pub pos: Pos,
+    pub rev: u64,
+    pub components: Vec<ComponentRef>,
+}
+
+impl EntityRef {
+    pub fn component(&self, name: &str) -> Option<&ComponentRef> {
+        self.components.iter().find(|c| &*c.name == name)
+    }
+}
+
+fn component_ref(key: &str, c: &Component) -> ComponentRef {
+    ComponentRef {
+        name: c.name_of(key),
+        json: c.json(),
+        version: c.version,
+    }
+}
+
+/// The whole entity at `pos` as a client first sees it.
+pub fn entity_ref(e: &Entity, pos: Pos) -> EntityRef {
+    EntityRef {
+        id: e.id,
+        pos,
+        rev: e.rev,
+        components: e
+            .components
+            .iter()
+            .map(|(k, c)| component_ref(k, c))
+            .collect(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1287,9 +1341,8 @@ fn quantize(p: Pos, q: f64) -> Pos {
 }
 
 /// Rough wire size of components in a JSON delta (names, values, version numbers).
-fn estimate_components<'a>(it: impl Iterator<Item = (&'a String, &'a Component)>) -> usize {
-    it.map(|(k, c)| k.len() + c.value.to_string().len() + 24)
-        .sum()
+fn estimate_refs(v: &[ComponentRef]) -> usize {
+    v.iter().map(|c| c.name.len() + c.json.len() + 24).sum()
 }
 
 #[cfg(test)]
@@ -1460,7 +1513,7 @@ mod tests {
             .unwrap();
         let d = w.delta_for(c).unwrap();
         assert_eq!(d.updated.len(), 1);
-        assert_eq!(d.updated[0].2["hp"].version, 2);
+        assert_eq!(d.updated[0].component("hp").unwrap().version, 2);
         w.apply(s1, near, Some(Pos { x: 90.0, y: 0.0 }), BTreeMap::new())
             .unwrap();
         let d = w.delta_for(c).unwrap();
@@ -1508,10 +1561,13 @@ mod tests {
         let d = w.delta_for(c).unwrap();
         assert_eq!(d.updated.len(), 1);
         // both waited the same: the near one wins; next tick the far one (now older) follows
-        assert_eq!(d.updated[0].0, near);
+        assert_eq!(d.updated[0].id, near);
         w.advance();
         let d = w.delta_for(c).unwrap();
-        assert_eq!(d.updated.iter().map(|u| u.0).collect::<Vec<_>>(), vec![far]);
+        assert_eq!(
+            d.updated.iter().map(|u| u.id).collect::<Vec<_>>(),
+            vec![far]
+        );
     }
 
     #[test]
@@ -1551,9 +1607,9 @@ mod tests {
         let d = w.delta_for(c).unwrap();
         assert_eq!(d.updated.len(), 1);
         assert!(
-            (d.updated[0].1.x - 10.3).abs() < 1e-9,
+            (d.updated[0].pos.x - 10.3).abs() < 1e-9,
             "{:?}",
-            d.updated[0].1
+            d.updated[0].pos
         );
     }
 }
@@ -1772,8 +1828,8 @@ impl WorldView {
             id: EntityId,
             pos: Pos,
             rev: u64,
-            spawn: Option<Entity>,
-            update: Option<(EntityId, Pos, BTreeMap<String, Component>)>,
+            spawn: Option<EntityRef>,
+            update: Option<EntityRef>,
         }
         let mut cands: Vec<Cand> = Vec::new();
         // same view as the last scan and the change log reaches back to it: only entities that
@@ -1833,23 +1889,28 @@ impl WorldView {
             let qpos = quantize(e.pos, quantum);
             let (spawn, update, bytes) = match interest.known.get(&e.id) {
                 None => {
-                    let mut s = e.clone();
-                    s.pos = qpos;
-                    let bytes = estimate_components(s.components.iter()) + 64;
+                    let s = entity_ref(e, qpos);
+                    let bytes = estimate_refs(&s.components) + 64;
                     (Some(s), None, bytes)
                 }
                 Some((pos, known_rev)) => {
-                    let changed: BTreeMap<String, Component> = e
+                    let changed: Vec<ComponentRef> = e
                         .components
                         .iter()
                         .filter(|(_, c)| c.changed_rev > *known_rev)
-                        .map(|(k, c)| (k.clone(), c.clone()))
+                        .map(|(k, c)| component_ref(k, c))
                         .collect();
                     if *pos == qpos && changed.is_empty() {
                         continue;
                     }
-                    let bytes = estimate_components(changed.iter()) + 56;
-                    (None, Some((e.id, qpos, changed)), bytes)
+                    let bytes = estimate_refs(&changed) + 56;
+                    let u = EntityRef {
+                        id: e.id,
+                        pos: qpos,
+                        rev: e.rev,
+                        components: changed,
+                    };
+                    (None, Some(u), bytes)
                 }
             };
             let age = tick.saturating_sub(interest.last_sent.get(&e.id).copied().unwrap_or(0));
@@ -1904,7 +1965,7 @@ impl WorldView {
         }
         d.despawned = gone;
         d.spawned.sort_by_key(|e| e.id);
-        d.updated.sort_by_key(|u| u.0);
+        d.updated.sort_by_key(|u| u.id);
         d.despawned.sort();
         interest.last_delta_tick = tick;
         // a budget-deferred entity must be retried next tick even if nothing else changes

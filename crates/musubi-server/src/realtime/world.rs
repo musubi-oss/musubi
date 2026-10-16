@@ -305,6 +305,23 @@ pub fn to_wire(e: &Entity) -> WorldEntity {
     }
 }
 
+fn ref_to_wire(e: musubi_mesh::EntityRef) -> WorldEntity {
+    WorldEntity {
+        id: e.id,
+        x: e.pos.x,
+        y: e.pos.y,
+        components: e
+            .components
+            .into_iter()
+            .map(|c| WorldComponent {
+                name: c.name.to_string(),
+                value: musubi_proto::JsonText(c.json),
+                version: c.version,
+            })
+            .collect(),
+    }
+}
+
 fn parse_entity(id: &str) -> Result<Uuid> {
     Uuid::parse_str(id).map_err(|_| Error::InvalidArgument("bad entity id".into()))
 }
@@ -2941,24 +2958,8 @@ fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta) -> ServerMessage {
         world: world.to_string(),
         tick,
         time_scale: scale,
-        spawned: d.spawned.iter().map(to_wire).collect(),
-        updated: d
-            .updated
-            .into_iter()
-            .map(|(id, pos, comps)| WorldEntity {
-                id,
-                x: pos.x,
-                y: pos.y,
-                components: comps
-                    .into_iter()
-                    .map(|(k, c)| WorldComponent {
-                        name: k,
-                        value: musubi_proto::JsonText(c.json()),
-                        version: c.version,
-                    })
-                    .collect(),
-            })
-            .collect(),
+        spawned: d.spawned.into_iter().map(ref_to_wire).collect(),
+        updated: d.updated.into_iter().map(ref_to_wire).collect(),
         despawned: d.despawned.iter().map(|i| i.to_string()).collect(),
     }
 }
