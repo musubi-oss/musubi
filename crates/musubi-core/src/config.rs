@@ -659,6 +659,8 @@ pub struct RetentionConfig {
     pub chat_days: u64,
     /// Expired or revoked refresh sessions.
     pub sessions_days: u64,
+    /// World history snapshots (the time machine's reach).
+    pub world_history_days: u64,
 }
 
 impl Default for RetentionConfig {
@@ -671,6 +673,7 @@ impl Default for RetentionConfig {
             notifications_days: 30,
             chat_days: 0,
             sessions_days: 7,
+            world_history_days: 7,
         }
     }
 }

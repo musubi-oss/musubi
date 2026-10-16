@@ -726,7 +726,21 @@ impl WorldRegistry {
         .await
         .map_err(Error::internal)?;
         sqlx::query(
-            "delete from musubi.world_journal where name = $1 and (node_id = $2 or node_id is null) and tick_to < $3",
+            "insert into musubi.world_history (name, node_id, tick, entities) values ($1, $2, $3, $4)
+             on conflict (name, node_id, tick) do nothing",
+        )
+        .bind(name)
+        .bind(node)
+        .bind(tick as i64)
+        .bind(serde_json::to_value(&entities)?)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+        // the journal is kept back to the oldest retained history row, so the world can be rebuilt
+        // as of any tick in between (`entities_at`)
+        sqlx::query(
+            "delete from musubi.world_journal where name = $1 and (node_id = $2 or node_id is null)
+             and tick_to < (select coalesce(min(tick), $3) from musubi.world_history where name = $1 and node_id = $2)",
         )
         .bind(name)
         .bind(node)
@@ -735,6 +749,93 @@ impl WorldRegistry {
         .await
         .map_err(Error::internal)?;
         Ok(())
+    }
+
+    /// Plan 4.9 time machine: the world's persistent entities as of the end of `tick`, rebuilt from each
+    /// shard's newest history snapshot at or before it plus the journal ops up to it (a shard whose
+    /// journal was pruned because it left the world contributes its last snapshot only).
+    pub async fn entities_at(&self, name: &str, tick: u64) -> Result<Value> {
+        let Some(db) = &self.db else {
+            return Err(Error::Internal(
+                "no database: world history is not kept".into(),
+            ));
+        };
+        let range: Option<(Option<i64>, Option<i64>)> =
+            sqlx::query_as("select min(tick), max(tick) from musubi.world_history where name = $1")
+                .bind(name)
+                .fetch_optional(db)
+                .await
+                .map_err(Error::internal)?;
+        let (oldest, newest) = match range {
+            Some((Some(a), Some(b))) => (a as u64, b as u64),
+            _ => {
+                return Err(Error::NotFound(format!(
+                    "world {name}: no history snapshots yet"
+                )))
+            }
+        };
+        if tick < oldest {
+            return Err(Error::NotFound(format!(
+                "world {name}: history starts at tick {oldest}, asked for {tick}"
+            )));
+        }
+        let snaps: Vec<(Uuid, Value, i64)> = sqlx::query_as(
+            "select distinct on (node_id) node_id, entities, tick from musubi.world_history
+             where name = $1 and tick <= $2 order by node_id, tick desc",
+        )
+        .bind(name)
+        .bind(tick as i64)
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
+        let cfg = self
+            .worlds
+            .get(name)
+            .map(|w| w.lock().world.cfg.clone())
+            .unwrap_or_default();
+        let mut world = World::new(cfg);
+        let mut since: HashMap<Uuid, u64> = HashMap::new();
+        let mut src: HashMap<musubi_mesh::EntityId, Uuid> = HashMap::new();
+        let mut from = Vec::new();
+        for (node, ents, t) in snaps {
+            let ents: Vec<musubi_mesh::Entity> = serde_json::from_value(ents)?;
+            for e in &ents {
+                src.insert(e.id, node);
+            }
+            world.restore(ents);
+            since.insert(node, t as u64);
+            from.push(json!({"node_id": node, "tick": t}));
+        }
+        let rows: Vec<(Option<Uuid>, Value)> = sqlx::query_as(
+            "select node_id, entries from musubi.world_journal where name = $1 and tick_from <= $2 order by tick_from",
+        )
+        .bind(name)
+        .bind(tick as i64)
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
+        let mut by_node: HashMap<Uuid, Vec<WorldOp>> = HashMap::new();
+        for (node, v) in rows {
+            if let Ok(mut o) = serde_json::from_value::<Vec<WorldOp>>(v) {
+                by_node
+                    .entry(node.unwrap_or(Uuid::nil()))
+                    .or_default()
+                    .append(&mut o);
+            }
+        }
+        let mut replayed = 0;
+        for (node, mut ops) in by_node {
+            ops.retain(|o| o.tick <= tick);
+            ops.sort_by_key(|o| o.tick);
+            let from_tick = since.get(&node).copied().unwrap_or(0);
+            replayed += replay(&mut world, &ops, from_tick, node, &mut src);
+        }
+        Ok(json!({
+            "world": name, "tick": tick,
+            "history": {"oldest_tick": oldest, "newest_tick": newest},
+            "from_snapshots": from, "replayed": replayed,
+            "entities": world.snapshot_persistent(),
+        }))
     }
 
     /// Entities of the shards of `name`: with `only` the shards kept by `nodes` (plus legacy
@@ -852,14 +953,16 @@ impl WorldRegistry {
         out
     }
 
-    pub async fn snapshot_now(&self, name: &str) -> Result<()> {
-        let Some(db) = &self.db else { return Ok(()) };
+    pub async fn snapshot_now(&self, name: &str) -> Result<u64> {
         let (entities, tick) = {
             let w = self.get(name)?;
             let st = w.lock();
             (st.world.snapshot_persistent(), st.world.tick)
         };
-        Self::write_snapshot(db, name, self.node_id, entities, tick).await
+        if let Some(db) = &self.db {
+            Self::write_snapshot(db, name, self.node_id, entities, tick).await?;
+        }
+        Ok(tick)
     }
 
     /// Adopt worlds whose home node is dead (or gone from the node table): claim the directory row

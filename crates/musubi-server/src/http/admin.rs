@@ -34,6 +34,8 @@ pub fn routes() -> Router<AppState> {
             post(world_cell_host),
         )
         .route("/v1/admin/worlds/{w}/entities", get(world_entities))
+        .route("/v1/admin/worlds/{w}/at", get(world_at))
+        .route("/v1/admin/worlds/{w}/snapshot", post(world_snapshot))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/retention/run", post(retention_run))
         .route("/v1/admin/runtime/schedules", get(schedules_status))
@@ -611,6 +613,32 @@ async fn world_entities(
     Path(w): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(s.worlds.local_entities(&w)?))
+}
+
+#[derive(Deserialize)]
+struct AtQuery {
+    tick: u64,
+}
+
+/// Time machine: the world's persistent entities as of `tick` (snapshot at or before it plus
+/// journal up to it); 404 with the oldest retained tick when history does not reach that far.
+async fn world_at(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(w): Path<String>,
+    Query(q): Query<AtQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.worlds.entities_at(&w, q.tick).await?))
+}
+
+/// Snapshot this node's shard of the world now (also a history row for the time machine).
+async fn world_snapshot(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(w): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let tick = s.worlds.snapshot_now(&w).await?;
+    Ok(Json(json!({"world": w, "tick": tick})))
 }
 
 async fn world_cell_host(

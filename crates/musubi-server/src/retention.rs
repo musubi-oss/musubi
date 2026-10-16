@@ -75,6 +75,13 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
         cfg.sessions_days,
     )
     .await?;
+    let world_history = purge(
+        db,
+        "musubi.world_history",
+        &age("taken_at"),
+        cfg.world_history_days,
+    )
+    .await?;
     let match_journal = sqlx::query(
         "delete from musubi.match_journal j where not exists (select 1 from musubi.match_snapshots s where s.match_id = j.match_id)",
     )
@@ -92,6 +99,6 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     Ok(json!({
         "events": events, "webhook_deliveries": deliveries, "audit_log": audit,
         "notifications": notifications, "chat_messages": chat, "sessions": sessions, "idempotency": idempotency, "storage_objects": storage, "resumable_sessions": resumable,
-        "match_journal": match_journal, "world_journal": world_journal,
+        "match_journal": match_journal, "world_journal": world_journal, "world_history": world_history,
     }))
 }

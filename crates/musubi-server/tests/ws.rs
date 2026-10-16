@@ -6219,3 +6219,139 @@ async fn pes_decay_and_hibernation() {
     assert!(v.contains(keep["id"].as_str().unwrap()), "{view}");
     assert!(!v.contains(litter["id"].as_str().unwrap()), "{view}");
 }
+
+/// Plan 4.9 time machine: `POST /admin/worlds/{w}/snapshot` adds a history row; `GET
+/// /admin/worlds/{w}/at?tick=T` rebuilds the persistent entities as of T from the newest history
+/// snapshot at or before T plus the journal up to T; before the first snapshot it is a 404.
+#[tokio::test]
+async fn time_machine_rebuilds_world_at_tick() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let spawn = |router: axum::Router, name: &'static str| {
+        let world = world.clone();
+        async move {
+            let (st, e) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/spawn"),
+                None,
+                true,
+                Some(json!({"sim": sim, "x": 10.0, "y": 10.0, "components": {"name": name}, "persistent": true})),
+            )
+            .await;
+            assert_eq!(st, 200, "{e}");
+            e["id"].as_str().unwrap().to_string()
+        }
+    };
+    let snapshot = |router: axum::Router| {
+        let world = world.clone();
+        async move {
+            let (st, v) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/admin/worlds/{world}/snapshot"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+            v["tick"].as_u64().unwrap()
+        }
+    };
+    let at = |router: axum::Router, tick: u64| {
+        let world = world.clone();
+        async move {
+            http_json(
+                &router,
+                "GET",
+                &format!("/v1/admin/worlds/{world}/at?tick={tick}"),
+                None,
+                true,
+                None,
+            )
+            .await
+        }
+    };
+    let (st, v) = at(router.clone(), 0).await;
+    assert_eq!(st, 404, "no history yet: {v}");
+    let a = spawn(router.clone(), "a").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let t1 = snapshot(router.clone()).await;
+    // `at` is the state at the end of a tick: let the next mutations land in a later one
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/despawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "entity": a})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let b = spawn(router.clone(), "b").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let t2 = snapshot(router.clone()).await;
+    // `at` is the state at the end of a tick: let the next mutations land in a later one
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(t2 > t1);
+    let c = spawn(router.clone(), "c").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let t3 = snapshot(router.clone()).await;
+    assert!(t3 > t2 + 3);
+    let ids = |v: &Value| -> Vec<String> {
+        v["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // as of the first snapshot: only a
+    let (st, v) = at(router.clone(), t1).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(ids(&v), vec![a.clone()], "{v}");
+    assert_eq!(v["history"]["oldest_tick"], json!(t1));
+    assert_eq!(v["history"]["newest_tick"], json!(t3));
+    // as of the second: a is gone, b is there
+    let (st, v) = at(router.clone(), t2).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(ids(&v), vec![b.clone()], "{v}");
+    // between the second and third snapshots: b from the snapshot, c replayed from the journal
+    let (st, v) = at(router.clone(), t3 - 1).await;
+    assert_eq!(st, 200, "{v}");
+    let mut got = ids(&v);
+    got.sort();
+    let mut want = vec![b.clone(), c.clone()];
+    want.sort();
+    assert_eq!(got, want, "{v}");
+    assert_eq!(v["from_snapshots"][0]["tick"], json!(t2), "{v}");
+    assert!(v["replayed"].as_u64().unwrap() >= 1, "{v}");
+    // before history began
+    let (st, v) = at(router.clone(), t1 - 1).await;
+    assert_eq!(st, 404, "{v}");
+}
