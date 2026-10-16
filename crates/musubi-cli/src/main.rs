@@ -79,6 +79,9 @@ enum Cmd {
         /// `world` scenario: client interest radius.
         #[arg(long, default_value_t = 200.0)]
         radius: f64,
+        /// Wire encoding for world players: json or binary.
+        #[arg(long, default_value = "json")]
+        wire: String,
         #[arg(long)]
         json: bool,
     },
@@ -200,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             worlds,
             entities,
             radius,
+            wire,
             json,
         } => {
             bench::run(bench::Opts {
@@ -210,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
                 worlds,
                 entities,
                 radius,
+                wire,
                 json,
             })
             .await

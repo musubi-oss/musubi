@@ -23,7 +23,7 @@ pub enum ClientMessage {
     /// Call a server-side RPC over the socket.
     Rpc {
         id: String,
-        #[serde(default)]
+        #[serde(default, with = "crate::json_in_binary")]
         payload: serde_json::Value,
     },
     /// Join a chat channel. `target` is a room name, a user id (direct) or a group id.
@@ -40,11 +40,13 @@ pub enum ClientMessage {
     },
     ChannelMessageSend {
         channel_id: String,
+        #[serde(with = "crate::json_in_binary")]
         content: serde_json::Value,
     },
     ChannelMessageUpdate {
         channel_id: String,
         message_id: String,
+        #[serde(with = "crate::json_in_binary")]
         content: serde_json::Value,
     },
     ChannelMessageRemove {
@@ -153,10 +155,10 @@ pub enum ClientMessage {
         radius: f64,
         /// Per-tick delta budget in bytes (estimated); default = the world's `client_budget_bytes`.
         /// Entities are ranked by relevance × age and deferred when the budget is spent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         budget_bytes: Option<u32>,
         /// Fine filter: object of component name → value every delivered entity must match.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, with = "crate::json_in_binary")]
         filter: Option<serde_json::Value>,
     },
     WorldUnsubscribe {
@@ -166,6 +168,7 @@ pub enum ClientMessage {
     WorldInput {
         world: String,
         entity: String,
+        #[serde(with = "crate::json_in_binary")]
         input: serde_json::Value,
     },
     MatchDataSend {
@@ -229,11 +232,13 @@ pub enum ServerMessage {
     },
     Rpc {
         id: String,
+        #[serde(with = "crate::json_in_binary")]
         payload: serde_json::Value,
     },
     Notification {
         id: String,
         subject: String,
+        #[serde(with = "crate::json_in_binary")]
         content: serde_json::Value,
         code: i32,
         sender_id: Option<AccountId>,
@@ -339,7 +344,7 @@ pub enum ServerMessage {
         despawned: Vec<String>,
         /// Slowest time scale among the cells around the client (1.0 = real time; EVE-style
         /// time dilation when a simulator cannot keep up). Interpolate against it.
-        #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")]
+        #[serde(default = "one_f64")]
         time_scale: f64,
     },
     MatchData {
@@ -383,6 +388,7 @@ pub struct WorldEntity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldComponent {
     pub name: String,
+    #[serde(with = "crate::json_in_binary")]
     pub value: serde_json::Value,
     pub version: u64,
 }
@@ -462,12 +468,13 @@ pub struct ChannelMessage {
     pub code: i32,
     pub sender_id: Option<AccountId>,
     pub username: String,
+    #[serde(with = "crate::json_in_binary")]
     pub content: serde_json::Value,
     pub create_time: i64,
     pub update_time: i64,
     pub persistent: bool,
     /// Emoji reactions aggregated per emoji (history only; live messages start empty).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub reactions: Vec<Reaction>,
 }
 
@@ -482,8 +489,4 @@ pub struct Reaction {
 
 fn one_f64() -> f64 {
     1.0
-}
-
-fn is_one_f64(v: &f64) -> bool {
-    *v >= 1.0
 }

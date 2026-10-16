@@ -21,6 +21,8 @@ pub struct Opts {
     pub worlds: usize,
     pub entities: usize,
     pub radius: f64,
+    /// Wire encoding for the world players: `json` or `binary` (postcard).
+    pub wire: String,
     pub json: bool,
 }
 
@@ -193,8 +195,12 @@ async fn world_sim(
     }
 }
 
+/// First frames of a world run that are not deltas are printed (encoding/subscription problems).
+static FRAME_DEBUG: AtomicU64 = AtomicU64::new(0);
+
 struct Player {
     url: String,
+    wire: String,
     token: String,
     arena: Arc<Arena>,
     radius: f64,
@@ -209,6 +215,7 @@ struct Player {
 async fn world_loop(p: Player) {
     let Player {
         url,
+        wire,
         token,
         arena,
         radius,
@@ -217,8 +224,9 @@ async fn world_loop(p: Player) {
         tx,
         totals,
     } = p;
+    let enc = musubi_proto::Encoding::parse(&wire).unwrap_or_default();
     let Ok((mut ws, _)) =
-        tokio_tungstenite::connect_async(format!("{}?token={token}&format=json", ws_url(&url)))
+        tokio_tungstenite::connect_async(format!("{}?token={token}&format={wire}", ws_url(&url)))
             .await
     else {
         let _ = tx.send(sample("world", Instant::now(), false, false));
@@ -226,7 +234,7 @@ async fn world_loop(p: Player) {
     };
     let subscribe = |step: u64| {
         let (x, y) = arena_point(arena.side, seed.wrapping_add(step.wrapping_mul(31)));
-        serde_json::to_string(&Envelope {
+        let env = Envelope {
             cid: None,
             msg: ClientMessage::WorldSubscribe {
                 world: arena.name.clone(),
@@ -236,14 +244,17 @@ async fn world_loop(p: Player) {
                 budget_bytes: None,
                 filter: None,
             },
-        })
-        .unwrap()
+        };
+        match enc {
+            musubi_proto::Encoding::Json => {
+                tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&env).unwrap())
+            }
+            _ => {
+                tokio_tungstenite::tungstenite::Message::Binary(enc.encode(&env).unwrap().to_vec())
+            }
+        }
     };
-    if ws
-        .send(tokio_tungstenite::tungstenite::Message::Text(subscribe(0)))
-        .await
-        .is_err()
-    {
+    if ws.send(subscribe(0)).await.is_err() {
         let _ = tx.send(sample("world", Instant::now(), false, false));
         return;
     }
@@ -253,15 +264,29 @@ async fn world_loop(p: Player) {
     while Instant::now() < deadline {
         let wait = next_move.saturating_duration_since(Instant::now());
         match tokio::time::timeout(wait.max(Duration::from_millis(1)), ws.next()).await {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt)))) => {
-                totals.bytes.fetch_add(txt.len() as u64, Ordering::Relaxed);
+            Ok(Some(Ok(m @ tokio_tungstenite::tungstenite::Message::Text(_))))
+            | Ok(Some(Ok(m @ tokio_tungstenite::tungstenite::Message::Binary(_)))) => {
+                let bytes = m.into_data();
+                totals
+                    .bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                let decoded = enc.decode::<Envelope<ServerMessage>>(&bytes);
+                if FRAME_DEBUG.fetch_add(1, Ordering::Relaxed) < 3 {
+                    match &decoded {
+                        Err(e) => eprintln!("world: frame decode failed: {e}"),
+                        Ok(env) if !matches!(env.msg, ServerMessage::WorldDelta { .. }) => {
+                            eprintln!("world: unexpected frame: {:?}", env.msg)
+                        }
+                        _ => {}
+                    }
+                }
                 if let Ok(Envelope {
                     msg:
                         ServerMessage::WorldDelta {
                             spawned, updated, ..
                         },
                     ..
-                }) = serde_json::from_str::<Envelope<ServerMessage>>(&txt)
+                }) = decoded
                 {
                     totals.frames.fetch_add(1, Ordering::Relaxed);
                     totals
@@ -286,13 +311,7 @@ async fn world_loop(p: Player) {
             }
             Err(_) => {
                 next_move = Instant::now() + Duration::from_millis(200);
-                if ws
-                    .send(tokio_tungstenite::tungstenite::Message::Text(subscribe(
-                        step,
-                    )))
-                    .await
-                    .is_err()
-                {
+                if ws.send(subscribe(step)).await.is_err() {
                     let _ = tx.send(sample("world", Instant::now(), false, false));
                     return;
                 }
@@ -591,6 +610,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let (http, url, tx) = (http.clone(), url.clone(), tx.clone());
         let arena = arenas.get(i % arenas.len().max(1)).cloned();
         let (radius, totals) = (o.radius, totals.clone());
+        let wire = o.wire.clone();
         tasks.push(tokio::spawn(async move {
             match sc {
                 "http" => http_loop(http, url, token, deadline, tx).await,
@@ -598,6 +618,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                 "world" => {
                     world_loop(Player {
                         url,
+                        wire,
                         token,
                         arena: arena.unwrap(),
                         radius,

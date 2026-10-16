@@ -15,6 +15,33 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub mod realtime;
 pub use realtime::*;
 
+/// Free-form JSON (`serde_json::Value`) on a binary wire. Postcard is not self-describing and
+/// cannot decode `Value` (it needs `deserialize_any`), so in a non-human-readable encoding the
+/// value travels as its JSON text in a string; JSON encodings pass it through untouched.
+pub mod json_in_binary {
+    use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(v: &T, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            v.serialize(s)
+        } else {
+            let text = serde_json::to_string(v).map_err(serde::ser::Error::custom)?;
+            s.serialize_str(&text)
+        }
+    }
+
+    pub fn deserialize<'de, T: DeserializeOwned, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<T, D::Error> {
+        if d.is_human_readable() {
+            T::deserialize(d)
+        } else {
+            let text = String::deserialize(d)?;
+            serde_json::from_str(&text).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Encoding {
     #[default]
@@ -95,6 +122,50 @@ mod tests {
             let back: Envelope<ClientMessage> = enc.decode(&b).unwrap();
             assert_eq!(back, env);
         }
+    }
+
+    /// Postcard is not self-describing: a field skipped on encode cannot be defaulted on
+    /// decode, so optional fields must always be written (world subscribe used to skip them).
+    #[test]
+    fn postcard_roundtrip_with_absent_optionals() {
+        let env = Envelope {
+            cid: None,
+            msg: ClientMessage::WorldSubscribe {
+                world: "w".into(),
+                x: 1.0,
+                y: 2.0,
+                radius: 50.0,
+                budget_bytes: None,
+                filter: None,
+            },
+        };
+        let b = Encoding::Postcard.encode(&env).unwrap();
+        let back: Envelope<ClientMessage> = Encoding::Postcard.decode(&b).unwrap();
+        assert_eq!(back, env);
+    }
+
+    /// `serde_json::Value` fields ride the binary wire as JSON text (postcard has no
+    /// `deserialize_any`), and stay plain JSON in the JSON encoding.
+    #[test]
+    fn free_form_json_roundtrips_in_both_encodings() {
+        let env = Envelope {
+            cid: None,
+            msg: ClientMessage::WorldSubscribe {
+                world: "w".into(),
+                x: 0.0,
+                y: 0.0,
+                radius: 10.0,
+                budget_bytes: Some(1024),
+                filter: Some(serde_json::json!({"team": "red", "tags": [1, 2.5, null]})),
+            },
+        };
+        for enc in [Encoding::Json, Encoding::Postcard] {
+            let b = enc.encode(&env).unwrap();
+            let back: Envelope<ClientMessage> = enc.decode(&b).unwrap();
+            assert_eq!(back, env);
+        }
+        let text = String::from_utf8(Encoding::Json.encode(&env).unwrap().to_vec()).unwrap();
+        assert!(text.contains(r#""team":"red""#), "{text}");
     }
 
     #[test]
