@@ -164,6 +164,12 @@ pub enum ClientMessage {
         /// lower. Skipped ticks are folded into the next delta, nothing is lost.
         #[serde(default)]
         max_hz: Option<u32>,
+        /// Position-only updates of entities this client already knows go out as unreliable,
+        /// sequenced frames (`WorldDelta.sequenced`; datagrams on QUIC/WebTransport, a lost one is
+        /// superseded by the next move) and are confirmed reliably every `keyframe_ticks`.
+        /// Spawns, despawns and component changes are always reliable.
+        #[serde(default)]
+        unreliable_updates: bool,
     },
     WorldUnsubscribe {
         world: String,
@@ -350,6 +356,10 @@ pub enum ServerMessage {
         /// time dilation when a simulator cannot keep up). Interpolate against it.
         #[serde(default = "one_f64")]
         time_scale: f64,
+        /// Unreliable, sequenced frame (positions only, see `WorldSubscribe.unreliable_updates`):
+        /// apply when `tick` is newer than the last applied; never carries spawns or despawns.
+        #[serde(default)]
+        sequenced: bool,
     },
     MatchData {
         match_id: String,

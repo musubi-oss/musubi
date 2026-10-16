@@ -133,6 +133,9 @@ pub struct WorldConfig {
     /// node's frame egress; a client's own `max_hz` can only make its deltas sparser.
     #[serde(default = "one_tick")]
     pub client_min_delta_ticks: u64,
+    /// Clients on unreliable position updates get the positions they received only unreliably
+    /// confirmed on a reliable frame every this many ticks (heals a lost final datagram).
+    pub keyframe_ticks: u64,
     /// Positions in client deltas are rounded to this step; smaller moves send nothing.
     pub pos_quantum: f64,
     /// Entities a cell accepts by spawn before new spawns into it are refused (0 = unlimited);
@@ -164,6 +167,7 @@ impl Default for WorldConfig {
             handover_timeout_ticks: 3,
             client_budget_bytes: 16 * 1024,
             client_min_delta_ticks: 1,
+            keyframe_ticks: 30,
             pos_quantum: 0.01,
             soft_cap: 0,
             tidi_after_ticks: 15,
@@ -1773,6 +1777,11 @@ impl WorldView {
     }
 
     /// Slowest time scale around a client's interest (1.0 when undilated).
+    /// Current position of an entity in this snapshot.
+    pub fn pos_of(&self, id: EntityId) -> Option<Pos> {
+        self.entities.get(&id).map(|e| e.pos)
+    }
+
     pub fn scale_for(&self, interest: &Interest) -> f64 {
         self.cell_scale
             .iter()

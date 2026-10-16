@@ -34,6 +34,8 @@ struct WorldState {
     controller: Controller,
     /// session → interest client id
     subs: HashMap<SessionId, Uuid>,
+    /// interest client id → delivery options
+    sub_opts: HashMap<Uuid, SubOpts>,
     /// simulator → pending events (handover requests, inputs, …)
     sim_events: HashMap<Uuid, Vec<Value>>,
     /// Persistent-entity ops since the last journal flush (see `musubi.world_journal`).
@@ -216,6 +218,16 @@ struct PendingInterest {
     budget_bytes: Option<usize>,
     filter: std::collections::BTreeMap<String, Value>,
     every: u64,
+    unreliable: bool,
+}
+
+/// Per-client delivery options kept outside the mesh `Interest`.
+#[derive(Default)]
+struct SubOpts {
+    /// Position-only updates as unreliable sequenced frames.
+    unreliable: bool,
+    /// Entities whose latest position went out unreliably; re-sent reliably on the next keyframe.
+    unconfirmed: std::collections::HashSet<musubi_mesh::EntityId>,
 }
 
 pub struct WorldRegistry {
@@ -261,6 +273,8 @@ pub enum WorldCmd {
         budget_bytes: Option<u32>,
         #[serde(default)]
         filter: Option<Value>,
+        #[serde(default)]
+        unreliable: bool,
     },
     Unsubscribe,
     Input {
@@ -531,6 +545,7 @@ impl WorldRegistry {
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
+                    sub_opts: HashMap::new(),
                     hosted_only: true,
                     home_node: home,
                     remote_transit: HashMap::new(),
@@ -1164,6 +1179,7 @@ impl WorldRegistry {
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
+            sub_opts: HashMap::new(),
                     hosted_only: false,
                     home_node: None,
                     remote_transit: HashMap::new(),
@@ -1384,6 +1400,7 @@ impl WorldRegistry {
                 max_hz,
                 budget_bytes,
                 filter,
+                unreliable,
             } => self.subscribe(
                 &env.world,
                 env.session_id,
@@ -1392,6 +1409,7 @@ impl WorldRegistry {
                 budget_bytes.map(|b| b as usize),
                 filter,
                 max_hz,
+                unreliable,
             ),
             WorldCmd::Unsubscribe => self.unsubscribe(&env.world, env.session_id),
             WorldCmd::Input { entity, input } => {
@@ -1597,6 +1615,7 @@ impl WorldRegistry {
                 sim_events: HashMap::new(),
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
+                sub_opts: HashMap::new(),
                 hosted_only: false,
                 home_node: None,
                 remote_transit: HashMap::new(),
@@ -2334,6 +2353,7 @@ impl WorldRegistry {
         budget_bytes: Option<usize>,
         filter: Option<Value>,
         max_hz: Option<u32>,
+        unreliable: bool,
     ) -> Result<()> {
         if !(0.0..=100_000.0).contains(&radius) {
             return Err(Error::InvalidArgument("radius 0..=100000".into()));
@@ -2365,6 +2385,7 @@ impl WorldRegistry {
                 budget_bytes,
                 filter,
                 every,
+                unreliable,
             });
         Ok(())
     }
@@ -2387,8 +2408,10 @@ impl WorldRegistry {
             budget_bytes,
             filter,
             every,
+            unreliable,
         } = p;
         let client = *st.subs.entry(sid).or_insert_with(Uuid::now_v7);
+        st.sub_opts.entry(client).or_default().unreliable = unreliable;
         st.world
             .subscribe_with(client, pos, radius, budget_bytes, filter, every);
         let hosted_only = st.hosted_only;
@@ -2430,6 +2453,7 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         if let Some(c) = st.subs.remove(&sid) {
+            st.sub_opts.remove(&c);
             st.world.unsubscribe(c);
         }
         Ok(())
@@ -2443,6 +2467,7 @@ impl WorldRegistry {
             let mut st = w.lock();
             let st = &mut *st;
             if let Some(c) = st.subs.remove(&sid) {
+                st.sub_opts.remove(&c);
                 st.world.unsubscribe(c);
             }
         }
@@ -2694,19 +2719,58 @@ impl WorldRegistry {
                     Some((sid, scale, d))
                 })
                 .collect();
-            drop(view);
+            let keyframe = tick % view.cfg.keyframe_ticks.max(1) == 0;
+            let mut msgs: Vec<(SessionId, ServerMessage)> = Vec::with_capacity(pending.len());
             {
                 let mut guard = w.lock();
                 let st = &mut *guard;
                 let live: std::collections::HashSet<Uuid> = st.subs.values().copied().collect();
                 st.world.restore_interests(interests, |c| live.contains(c));
+                let mut had_delta = std::collections::HashSet::new();
+                for (sid, scale, d) in pending {
+                    had_delta.insert(sid);
+                    let opts = st.subs.get(&sid).and_then(|c| st.sub_opts.get_mut(c));
+                    match opts {
+                        Some(o) if o.unreliable => {
+                            split_delta(&name, tick, scale, d, o, keyframe, &view, &mut msgs, sid)
+                        }
+                        _ => msgs.push((sid, delta_msg(&name, tick, scale, d, false))),
+                    }
+                }
+                if keyframe {
+                    // clients with nothing new this tick still get their unconfirmed positions
+                    for (sid, client) in &st.subs {
+                        if had_delta.contains(sid) {
+                            continue;
+                        }
+                        let Some(o) = st.sub_opts.get_mut(client) else {
+                            continue;
+                        };
+                        if !o.unreliable || o.unconfirmed.is_empty() {
+                            continue;
+                        }
+                        let refs = keyframe_refs(o, &std::collections::HashSet::new(), &view);
+                        if !refs.is_empty() {
+                            let scale = st.world.scale_for_client(*client);
+                            msgs.push((
+                                *sid,
+                                ServerMessage::WorldDelta {
+                                    world: name.clone(),
+                                    tick,
+                                    time_scale: scale,
+                                    spawned: Vec::new(),
+                                    updated: refs.into_iter().map(ref_to_wire).collect(),
+                                    despawned: Vec::new(),
+                                    sequenced: false,
+                                },
+                            ));
+                        }
+                    }
+                }
             }
+            drop(view);
             let t_deltas = fan_started.elapsed();
-            let frames = pending.len() as u64;
-            let msgs: Vec<(SessionId, ServerMessage)> = pending
-                .into_iter()
-                .map(|(sid, scale, d)| (sid, delta_msg(&name, tick, scale, d)))
-                .collect();
+            let frames = msgs.len() as u64;
             let t_build = fan_started.elapsed();
             for (sid, msg) in msgs {
                 fanout.session(sid, msg);
@@ -2965,7 +3029,7 @@ fn push_event(st: &mut WorldState, sim: Uuid, ev: Value) {
     }
 }
 
-fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta) -> ServerMessage {
+fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta, sequenced: bool) -> ServerMessage {
     ServerMessage::WorldDelta {
         world: world.to_string(),
         tick,
@@ -2973,5 +3037,78 @@ fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta) -> ServerMessage {
         spawned: d.spawned.into_iter().map(ref_to_wire).collect(),
         updated: d.updated.into_iter().map(ref_to_wire).collect(),
         despawned: d.despawned.iter().map(|i| i.to_string()).collect(),
+        sequenced,
+    }
+}
+
+/// A client on unreliable updates gets up to two frames per tick: a reliable one with spawns,
+/// despawns and component changes (plus, on a keyframe, the current positions of entities whose
+/// last position it only got unreliably), and a sequenced unreliable one with position-only
+/// updates. A lost datagram is superseded by the entity's next move or by the keyframe.
+/// Current positions of the entities whose last position the client only got unreliably
+/// (minus the ones moving again this tick); clears the set.
+fn keyframe_refs(
+    o: &mut SubOpts,
+    fresh: &std::collections::HashSet<musubi_mesh::EntityId>,
+    view: &musubi_mesh::WorldView,
+) -> Vec<musubi_mesh::EntityRef> {
+    o.unconfirmed
+        .drain()
+        .filter(|id| !fresh.contains(id))
+        .filter_map(|id| {
+            view.pos_of(id).map(|pos| musubi_mesh::EntityRef {
+                id,
+                pos,
+                rev: 0,
+                components: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_delta(
+    world: &str,
+    tick: u64,
+    scale: f64,
+    mut d: Delta,
+    o: &mut SubOpts,
+    keyframe: bool,
+    view: &musubi_mesh::WorldView,
+    out: &mut Vec<(SessionId, ServerMessage)>,
+    sid: SessionId,
+) {
+    let (reliable, pos_only): (Vec<_>, Vec<_>) = std::mem::take(&mut d.updated)
+        .into_iter()
+        .partition(|e| !e.components.is_empty());
+    for e in &reliable {
+        o.unconfirmed.remove(&e.id);
+    }
+    for id in &d.despawned {
+        o.unconfirmed.remove(id);
+    }
+    let mut reliable = reliable;
+    if keyframe && !o.unconfirmed.is_empty() {
+        let fresh: std::collections::HashSet<_> = pos_only.iter().map(|e| e.id).collect();
+        reliable.extend(keyframe_refs(o, &fresh, view));
+    }
+    if !pos_only.is_empty() {
+        o.unconfirmed.extend(pos_only.iter().map(|e| e.id));
+        out.push((
+            sid,
+            ServerMessage::WorldDelta {
+                world: world.to_string(),
+                tick,
+                time_scale: scale,
+                spawned: Vec::new(),
+                updated: pos_only.into_iter().map(ref_to_wire).collect(),
+                despawned: Vec::new(),
+                sequenced: true,
+            },
+        ));
+    }
+    if !d.spawned.is_empty() || !d.despawned.is_empty() || !reliable.is_empty() {
+        d.updated = reliable;
+        out.push((sid, delta_msg(world, tick, scale, d, false)));
     }
 }

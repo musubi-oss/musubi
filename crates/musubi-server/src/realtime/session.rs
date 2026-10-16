@@ -303,7 +303,11 @@ async fn run_loop_inner(
                 let mut next = Some(first);
                 let mut batch: Vec<Frame> = Vec::new();
                 while let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) {
-                    let unreliable = matches!(&msg, ServerMessage::MatchData { reliable: false, .. });
+                    let unreliable = matches!(
+                        &msg,
+                        ServerMessage::MatchData { reliable: false, .. }
+                            | ServerMessage::WorldDelta { sequenced: true, .. }
+                    );
                     let bytes = encoding.encode(&Envelope { cid: None, msg })?;
                     let frame = Frame::encoded(encoding, bytes);
                     if unreliable {
@@ -588,6 +592,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             budget_bytes,
             filter,
             max_hz,
+            unreliable_updates,
         } => {
             world_dispatch(
                 ctx,
@@ -599,6 +604,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                     max_hz,
                     budget_bytes,
                     filter,
+                    unreliable: unreliable_updates,
                 },
             )
             .await

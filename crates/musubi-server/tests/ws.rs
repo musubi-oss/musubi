@@ -2216,6 +2216,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
             budget_bytes: None,
             filter: None,
             max_hz: None,
+            unreliable_updates: false,
         },
     )
     .await;
@@ -2447,6 +2448,7 @@ async fn shard_controller_assigns_cells_and_recovers_orphans() {
             budget_bytes: None,
             filter: None,
             max_hz: None,
+            unreliable_updates: false,
         },
     )
     .await;
@@ -2665,6 +2667,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
             budget_bytes: None,
             filter: None,
             max_hz: None,
+            unreliable_updates: false,
         },
     )
     .await;
@@ -2719,6 +2722,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
             budget_bytes: None,
             filter: None,
             max_hz: None,
+            unreliable_updates: false,
         },
     )
     .await;
@@ -2874,6 +2878,7 @@ async fn zanshin_and_aurix_integrations() {
             budget_bytes: None,
             filter: None,
             max_hz: None,
+            unreliable_updates: false,
         },
     )
     .await;
@@ -5561,6 +5566,7 @@ async fn world_interest_across_nodes() {
             budget_bytes: None,
             filter: None,
             max_hz: None,
+            unreliable_updates: false,
         },
     )
     .await;
@@ -7197,4 +7203,139 @@ async fn world_asked_for_another_region_is_adopted_there() {
     )
     .await;
     assert_eq!(st, 200, "{e}");
+}
+
+/// Opt-in unreliable updates: a position-only move arrives as a sequenced frame, component
+/// changes stay reliable, and the keyframe re-confirms unreliably delivered positions reliably.
+#[tokio::test]
+async fn world_unreliable_position_updates() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let post = |path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::post(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let world = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = post(
+        "/v1/server/worlds".into(),
+        json!({"name": world, "config": {"cell_size": 100.0, "keyframe_ticks": 5}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/lease"),
+        json!({"sim": sim, "cells": [{"x": 0, "y": 0}]}),
+    )
+    .await;
+    assert_eq!(st, 200);
+
+    let f = "json";
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 0.0,
+            y: 0.0,
+            radius: 200.0,
+            budget_bytes: None,
+            filter: None,
+            max_hz: None,
+            unreliable_updates: true,
+        },
+    )
+    .await;
+    let (st, e) = post(
+        format!("/v1/server/worlds/{world}/spawn"),
+        json!({"sim": sim, "x": 50.0, "y": 50.0, "components": {"hp": 100}}),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let eid: uuid::Uuid = e["id"].as_str().unwrap().parse().unwrap();
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta {
+            spawned, sequenced, ..
+        } => {
+            assert_eq!(spawned[0].id, eid);
+            assert!(!sequenced, "spawns are reliable");
+        }
+        m => panic!("{m:?}"),
+    }
+    // position-only move → sequenced (unreliable) frame
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": sim, "entity": eid, "x": 60.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta {
+            updated, sequenced, ..
+        } => {
+            assert_eq!(updated.len(), 1);
+            assert_eq!(updated[0].x, 60.0);
+            assert!(updated[0].components.is_empty());
+            assert!(sequenced, "position-only update must be sequenced");
+        }
+        m => panic!("{m:?}"),
+    }
+    // the keyframe re-sends that position reliably
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no keyframe within 3s"
+        );
+        let m = tokio::time::timeout(std::time::Duration::from_secs(3), recv(&mut c))
+            .await
+            .expect("frame");
+        if let ServerMessage::WorldDelta {
+            updated,
+            sequenced: false,
+            ..
+        } = m.msg
+        {
+            if updated.iter().any(|u| u.id == eid && u.x == 60.0) {
+                break;
+            }
+        }
+    }
+    // a component change is reliable
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": sim, "entity": eid, "x": 60.0, "y": 50.0, "components": {"hp": 90}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta {
+            updated, sequenced, ..
+        } => {
+            assert_eq!(updated[0].components[0].name, "hp");
+            assert!(!sequenced);
+        }
+        m => panic!("{m:?}"),
+    }
 }

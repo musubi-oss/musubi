@@ -299,6 +299,7 @@ async fn world_loop(p: Player) {
                 budget_bytes: None,
                 filter: None,
                 max_hz,
+                unreliable_updates: false,
             },
         };
         match enc {

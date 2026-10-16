@@ -182,6 +182,7 @@ mod tests {
                 budget_bytes: None,
                 filter: None,
                 max_hz: None,
+                unreliable_updates: false,
             },
         };
         let b = Encoding::Postcard.encode(&env).unwrap();
@@ -203,6 +204,7 @@ mod tests {
                 budget_bytes: Some(1024),
                 filter: Some(serde_json::json!({"team": "red", "tags": [1, 2.5, null]})),
                 max_hz: None,
+                unreliable_updates: false,
             },
         };
         for enc in [Encoding::Json, Encoding::Postcard] {
