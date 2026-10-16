@@ -2554,15 +2554,15 @@ impl WorldRegistry {
             // is measured apart from the simulation step above
             let fan_started = std::time::Instant::now();
             let mut frames = 0u64;
-            let subs: Vec<(SessionId, Uuid)> = st.subs.iter().map(|(s, c)| (*s, *c)).collect();
-            for (sid, client) in subs {
-                if let Some(d) = st.world.delta_for(client) {
-                    if d != Delta::default() {
-                        let scale = st.world.scale_for_client(client);
-                        fanout.session(sid, delta_msg(&name, tick, scale, d));
-                        frames += 1;
-                    }
-                }
+            let by_client: HashMap<Uuid, SessionId> =
+                st.subs.iter().map(|(s, c)| (*c, *s)).collect();
+            for (client, d) in st.world.deltas_all() {
+                let Some(sid) = by_client.get(&client) else {
+                    continue;
+                };
+                let scale = st.world.scale_for_client(client);
+                fanout.session(*sid, delta_msg(&name, tick, scale, d));
+                frames += 1;
             }
             metrics::histogram!("musubi_world_fanout_duration_seconds", "world" => name.clone())
                 .record(fan_started.elapsed().as_secs_f64());

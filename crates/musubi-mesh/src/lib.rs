@@ -1046,16 +1046,40 @@ impl World {
     /// estimated bytes exceed the budget (at least one always goes); the rest keep their old
     /// state and come back next tick with a higher priority. Despawns are always delivered.
     /// Positions are quantized to `pos_quantum`, so jitter below it is not an update.
+    /// Delta for one client (see `delta_with`).
     pub fn delta_for(&mut self, client: ClientId) -> Option<Delta> {
+        let mut interest = self.interests.remove(&client)?;
+        let d = self.delta_with(&mut interest);
+        self.interests.insert(client, interest);
+        d
+    }
+
+    /// Deltas for every client, built in parallel: each client's interest state is independent
+    /// and the world is only read, so the per-player fan-out of a tick scales with cores instead
+    /// of running one player after another. Clients with nothing to send are left out.
+    pub fn deltas_all(&mut self) -> Vec<(ClientId, Delta)> {
+        use rayon::prelude::*;
+        let mut interests = std::mem::take(&mut self.interests);
+        let world: &Self = self;
+        let out: Vec<(ClientId, Delta)> = interests
+            .par_iter_mut()
+            .filter_map(|(client, interest)| {
+                let d = world.delta_with(interest)?;
+                (d != Delta::default()).then_some((*client, d))
+            })
+            .collect();
+        self.interests = interests;
+        out
+    }
+
+    /// Everything in `interest`'s circle that the client has not seen in its current state,
+    /// ranked by relevance × age and cut at the client's byte budget; updates `interest`.
+    fn delta_with(&self, interest: &mut Interest) -> Option<Delta> {
         let tick = self.tick;
         let quantum = self.cfg.pos_quantum;
         let default_budget = self.cfg.client_budget_bytes;
         // only the cells the interest circle touches are scanned, not the whole world
-        let cells = {
-            let i = self.interests.get(&client)?;
-            self.cells_in_radius(i.pos, i.radius)
-        };
-        let interest = self.interests.get_mut(&client)?;
+        let cells = self.cells_in_radius(interest.pos, interest.radius);
         let budget = interest.budget_bytes.unwrap_or(default_budget);
         let mut seen = HashSet::new();
         struct Cand {
