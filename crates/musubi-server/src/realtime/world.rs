@@ -222,6 +222,9 @@ pub struct WorldRegistry {
     tick_no: std::sync::atomic::AtomicU64,
     /// worlds that have a ticker thread (see `ensure_tickers`)
     ticking: Mutex<std::collections::HashSet<String>>,
+    /// (hosted_only, home_node) of each local shard, mirrored so that `home_of` — called on
+    /// every world subscription — does not queue behind a world's tick for two bools
+    shard_home: DashMap<String, (bool, Option<Uuid>)>,
     /// Raft directory (`world:<name>` → home) when the cluster runs the QUIC bus.
     cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
     /// `node.region` when set explicitly (`set_region`); otherwise taken from the cluster handle.
@@ -319,6 +322,7 @@ impl WorldRegistry {
             ticks: tokio::sync::broadcast::channel(16).0,
             tick_no: std::sync::atomic::AtomicU64::new(0),
             ticking: Mutex::new(Default::default()),
+            shard_home: DashMap::new(),
             cell_hosts: DashMap::new(),
             adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
@@ -444,6 +448,7 @@ impl WorldRegistry {
             None => false,
         };
         if idle {
+            self.shard_home.remove(name);
             if let Some((_, w)) = self.worlds.remove(name) {
                 w.lock().journal.clear();
             }
@@ -503,6 +508,7 @@ impl WorldRegistry {
                     admission: HashMap::new(),
                 }))
             });
+            self.note_home(name, true, home);
         }
         self.cell_hosts
             .insert((name.to_string(), cell), self.node_id);
@@ -1094,6 +1100,7 @@ impl WorldRegistry {
                     st.world.restore(ents);
                     st.hosted_only = false;
                     st.home_node = None;
+                    self.note_home(&name, false, None);
                     tracing::info!(world = %name, merged = n, ops = replayed, home_tick = tick, "hosted shard promoted to home");
                 }
                 self.homes.insert(name.clone(), self.node_id);
@@ -1117,6 +1124,7 @@ impl WorldRegistry {
             if replayed > 0 {
                 tracing::info!(world = %name, ops = replayed, tick = world.tick, "world journal replayed");
             }
+            self.note_home(&name, false, None);
             self.worlds.insert(
                 name.clone(),
                 Arc::new(Mutex::new(WorldState {
@@ -1235,6 +1243,7 @@ impl WorldRegistry {
                 // home (journaling Despawns the adopter replays over that snapshot) and the node
                 // exits before those handovers land
                 self.worlds.remove(&name);
+                self.shard_home.remove(&name);
                 self.homes.remove(&name);
                 out.push(name);
             }
@@ -1260,14 +1269,28 @@ impl WorldRegistry {
             let mut st = w.lock();
             if st.hosted_only && h != self.node_id {
                 st.home_node = Some(h);
+                self.note_home(name, true, Some(h));
             }
         }
         Some(h)
     }
 
+    fn note_home(&self, name: &str, hosted_only: bool, home: Option<Uuid>) {
+        self.shard_home
+            .insert(name.to_string(), (hosted_only, home));
+    }
+
     pub async fn home_of(&self, name: &str) -> Result<Option<Uuid>> {
         // a local shard makes us the home only if it is not merely hosting assigned cells
-        if let Some(w) = self.worlds.get(name) {
+        if let Some(m) = self.shard_home.get(name) {
+            let (hosted_only, home) = *m;
+            if !hosted_only {
+                return Ok(Some(self.node_id));
+            }
+            if let Some(h) = home {
+                return Ok(Some(h));
+            }
+        } else if let Some(w) = self.worlds.get(name) {
             let st = w.lock();
             if !st.hosted_only {
                 return Ok(Some(self.node_id));
@@ -1287,6 +1310,7 @@ impl WorldRegistry {
                         let mut st = w.lock();
                         if st.hosted_only && h != self.node_id {
                             st.home_node = Some(h);
+                            self.note_home(name, true, Some(h));
                         }
                     }
                     return Ok(Some(h));
@@ -1306,6 +1330,7 @@ impl WorldRegistry {
                 let mut st = w.lock();
                 if st.hosted_only && h != self.node_id {
                     st.home_node = Some(h);
+                    self.note_home(name, true, Some(h));
                 }
             }
         }
@@ -1531,6 +1556,7 @@ impl WorldRegistry {
                     e => Error::internal(e),
                 })?;
         }
+        self.note_home(name, false, None);
         self.worlds.insert(
             name.to_string(),
             Arc::new(Mutex::new(WorldState {
