@@ -18,6 +18,50 @@ pub use realtime::*;
 /// Free-form JSON (`serde_json::Value`) on a binary wire. Postcard is not self-describing and
 /// cannot decode `Value` (it needs `deserialize_any`), so in a non-human-readable encoding the
 /// value travels as its JSON text in a string; JSON encodings pass it through untouched.
+/// JSON kept as text: serialized once when a value changes, then copied verbatim into every
+/// frame that carries it (human-readable encodings emit it raw, binary ones as a string).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonText(pub std::sync::Arc<str>);
+
+impl JsonText {
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        Self(v.to_string().into())
+    }
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::from_str(&self.0).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl From<serde_json::Value> for JsonText {
+    fn from(v: serde_json::Value) -> Self {
+        Self::from_value(&v)
+    }
+}
+
+impl Serialize for JsonText {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            let raw = serde_json::value::RawValue::from_string(self.0.to_string())
+                .map_err(serde::ser::Error::custom)?;
+            raw.serialize(s)
+        } else {
+            s.serialize_str(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonText {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        if d.is_human_readable() {
+            let raw: Box<serde_json::value::RawValue> = Deserialize::deserialize(d)?;
+            Ok(Self(raw.get().into()))
+        } else {
+            let text = String::deserialize(d)?;
+            Ok(Self(text.into()))
+        }
+    }
+}
+
 pub mod json_in_binary {
     use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -196,5 +240,32 @@ mod tests {
             serde_json::from_str(r#"{"cid":"7","msg":{"status_follow":{"account_ids":[]}}}"#)
                 .unwrap();
         assert_eq!(env.cid.as_deref(), Some("7"));
+    }
+}
+
+#[cfg(test)]
+mod json_text_tests {
+    use super::*;
+
+    #[test]
+    fn json_text_round_trips_in_both_encodings_and_is_raw_in_json() {
+        let v = serde_json::json!({"hp": 3, "tags": ["a", "b"], "nested": {"x": 1.5}});
+        let c = realtime::WorldComponent {
+            name: "stats".into(),
+            value: JsonText::from_value(&v),
+            version: 7,
+        };
+        let json = Encoding::Json.encode(&c).unwrap();
+        let as_value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            as_value["value"], v,
+            "human-readable form carries the object itself"
+        );
+        let back: realtime::WorldComponent = Encoding::Json.decode(&json).unwrap();
+        assert_eq!(back.value.to_value(), v);
+        let bin = Encoding::Postcard.encode(&c).unwrap();
+        let back: realtime::WorldComponent = Encoding::Postcard.decode(&bin).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(back.value.to_value(), v);
     }
 }

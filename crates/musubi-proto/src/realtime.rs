@@ -388,8 +388,7 @@ pub struct WorldEntity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldComponent {
     pub name: String,
-    #[serde(with = "crate::json_in_binary")]
-    pub value: serde_json::Value,
+    pub value: crate::JsonText,
     pub version: u64,
 }
 

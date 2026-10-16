@@ -36,10 +36,34 @@ impl Pos {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Component {
     pub value: serde_json::Value,
     pub version: u64,
+    /// `value` as JSON text, built on first use and shared by every frame that carries it.
+    #[serde(skip)]
+    pub json: std::sync::OnceLock<std::sync::Arc<str>>,
+}
+
+impl Component {
+    pub fn new(value: serde_json::Value, version: u64) -> Self {
+        Self {
+            value,
+            version,
+            json: std::sync::OnceLock::new(),
+        }
+    }
+    pub fn json(&self) -> std::sync::Arc<str> {
+        self.json
+            .get_or_init(|| self.value.to_string().into())
+            .clone()
+    }
+}
+
+impl PartialEq for Component {
+    fn eq(&self, o: &Self) -> bool {
+        self.value == o.value && self.version == o.version
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -176,6 +200,92 @@ struct Interest {
     /// entity → tick of the last delta that carried it (priority grows with age).
     #[serde(default)]
     last_sent: HashMap<EntityId, u64>,
+    /// Tick of the last full scan, and the view/filter it was made with: while the view is
+    /// unchanged and no touched cell changed since, the scan is skipped outright.
+    #[serde(default)]
+    last_delta_tick: u64,
+    #[serde(default)]
+    last_view: Option<(Pos, f64)>,
+    #[serde(default)]
+    last_filter: BTreeMap<String, serde_json::Value>,
+}
+
+/// Entities per cell plus the tick each cell last changed (membership or any entity in it),
+/// so a client whose cells are all quiet since its last delta costs nothing per tick.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CellIndex {
+    map: HashMap<CellId, HashSet<EntityId>>,
+    #[serde(default)]
+    changed: HashMap<CellId, u64>,
+    /// (tick, entity) for every change, newest last; complete from `log_from` on. A client whose
+    /// view is unchanged re-examines only these instead of every entity in its circle.
+    #[serde(skip)]
+    log: Vec<(u64, EntityId)>,
+    #[serde(skip)]
+    log_from: u64,
+}
+
+impl CellIndex {
+    pub fn get(&self, c: &CellId) -> Option<&HashSet<EntityId>> {
+        self.map.get(c)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&CellId, &HashSet<EntityId>)> {
+        self.map.iter()
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &CellId> {
+        self.map.keys()
+    }
+    pub fn insert(&mut self, c: CellId, id: EntityId, tick: u64) {
+        self.map.entry(c).or_default().insert(id);
+        self.mark(c, id, tick);
+    }
+    pub fn remove(&mut self, c: &CellId, id: &EntityId, tick: u64) -> bool {
+        let Some(set) = self.map.get_mut(c) else {
+            return false;
+        };
+        let removed = set.remove(id);
+        if removed {
+            self.mark(*c, *id, tick);
+        }
+        removed
+    }
+    pub fn mark(&mut self, c: CellId, id: EntityId, tick: u64) {
+        self.changed.insert(c, tick);
+        if self.log.last() != Some(&(tick, id)) {
+            self.log.push((tick, id));
+        }
+    }
+    /// Whether every change at or after `since` is still in the log.
+    pub fn log_covers(&self, since: u64) -> bool {
+        since >= self.log_from
+    }
+    pub fn changed_since(&self, since: u64) -> impl Iterator<Item = EntityId> + '_ {
+        let start = self.log.partition_point(|(t, _)| *t < since);
+        self.log[start..].iter().map(|(_, id)| *id)
+    }
+    /// Forget changes older than `keep_from` ticks.
+    pub fn prune(&mut self, keep_from: u64) {
+        if keep_from > self.log_from {
+            let start = self.log.partition_point(|(t, _)| *t < keep_from);
+            self.log.drain(..start);
+            self.log_from = keep_from;
+        }
+    }
+    /// After a bulk load nothing before `tick` is known to be logged.
+    pub fn reset_log(&mut self, tick: u64) {
+        self.log.clear();
+        self.log_from = tick;
+    }
+    pub fn changed(&self, c: &CellId) -> u64 {
+        self.changed.get(c).copied().unwrap_or(0)
+    }
+}
+
+impl std::ops::Index<&CellId> for CellIndex {
+    type Output = HashSet<EntityId>;
+    fn index(&self, c: &CellId) -> &HashSet<EntityId> {
+        &self.map[c]
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,7 +306,7 @@ pub struct World {
     pub cfg: WorldConfig,
     pub tick: u64,
     entities: HashMap<EntityId, Entity>,
-    by_cell: HashMap<CellId, HashSet<EntityId>>,
+    by_cell: CellIndex,
     /// Cells put to sleep by `hibernate_cell`: not orphans, re-leased only when interest returns.
     hibernated: HashSet<CellId>,
     leases: HashMap<CellId, Lease>,
@@ -220,7 +330,7 @@ impl World {
             cfg,
             tick: 0,
             entities: HashMap::new(),
-            by_cell: HashMap::new(),
+            by_cell: CellIndex::default(),
             hibernated: HashSet::new(),
             last_owners: HashMap::new(),
             leases: HashMap::new(),
@@ -487,15 +597,7 @@ impl World {
             cell,
             components: components
                 .into_iter()
-                .map(|(k, v)| {
-                    (
-                        k,
-                        Component {
-                            value: v,
-                            version: 1,
-                        },
-                    )
-                })
+                .map(|(k, v)| (k, Component::new(v, 1)))
                 .collect(),
             persistent,
             transit: None,
@@ -503,7 +605,7 @@ impl World {
             touched_tick: self.tick,
             changed_tick: self.tick,
         };
-        self.by_cell.entry(cell).or_default().insert(id);
+        self.by_cell.insert(cell, id, self.tick);
         self.entities.insert(id, e);
         self.record_pos(id, pos);
         id
@@ -551,9 +653,7 @@ impl World {
         let Some(e) = self.entities.remove(&id) else {
             return false;
         };
-        if let Some(set) = self.by_cell.get_mut(&e.cell) {
-            set.remove(&id);
-        }
+        self.by_cell.remove(&e.cell, &id, self.tick);
         self.buffered_inputs.remove(&id);
         self.history.remove(&id);
         self.pins.remove(&id);
@@ -583,6 +683,7 @@ impl World {
                 e.decay_ticks = ticks;
                 e.touched_tick = tick;
                 e.changed_tick = tick;
+                self.by_cell.mark(e.cell, e.id, tick);
                 true
             }
             None => false,
@@ -595,6 +696,7 @@ impl World {
         if let Some(e) = self.entities.get_mut(&id) {
             e.touched_tick = tick;
             e.changed_tick = tick;
+            self.by_cell.mark(e.cell, e.id, tick);
         }
     }
 
@@ -658,6 +760,7 @@ impl World {
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
         e.touched_tick = tick;
         e.changed_tick = tick;
+        self.by_cell.mark(e.cell, e.id, tick);
         if let Some(p) = pos {
             e.pos = p;
         }
@@ -666,13 +769,12 @@ impl World {
         }
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
         for (k, v) in components {
-            let c = e.components.entry(k).or_insert(Component {
-                value: serde_json::Value::Null,
-                version: 0,
-            });
+            let c = e
+                .components
+                .entry(k)
+                .or_insert(Component::new(serde_json::Value::Null, 0));
             if c.value != v {
-                c.value = v;
-                c.version += 1;
+                *c = Component::new(v, c.version + 1);
             }
         }
         Ok(())
@@ -928,10 +1030,8 @@ impl World {
         let e = self.entities.get_mut(&id).unwrap();
         let old = e.cell;
         e.cell = target;
-        if let Some(s) = self.by_cell.get_mut(&old) {
-            s.remove(&id);
-        }
-        self.by_cell.entry(target).or_default().insert(id);
+        self.by_cell.remove(&old, &id, self.tick);
+        self.by_cell.insert(target, id, self.tick);
     }
 
     /// The new owner confirms it loaded the entity: authority flips, buffered inputs are returned
@@ -963,6 +1063,7 @@ impl World {
             e.transit = None;
             e.touched_tick = tick;
             e.changed_tick = tick;
+            self.by_cell.mark(e.cell, e.id, tick);
         }
         let inputs = self.buffered_inputs.remove(&id).unwrap_or_default();
         Ok((
@@ -1039,6 +1140,9 @@ impl World {
                 budget_bytes,
                 filter,
                 last_sent,
+                last_delta_tick: 0,
+                last_view: None,
+                last_filter: BTreeMap::new(),
             },
         );
     }
@@ -1067,11 +1171,12 @@ impl World {
     /// and the world is only read, so the per-player fan-out of a tick scales with cores instead
     /// of running one player after another. Clients with nothing to send are left out.
     pub fn deltas_all(&mut self) -> Vec<(ClientId, Delta)> {
-        use rayon::prelude::*;
+        // sequential on purpose: a world's tick already runs on its own thread, and fanning 500
+        // sub-millisecond jobs a tick into a shared pool cost more in scheduling than it saved
         let mut interests = std::mem::take(&mut self.interests);
         let world: &Self = self;
         let out: Vec<(ClientId, Delta)> = interests
-            .par_iter_mut()
+            .iter_mut()
             .filter_map(|(client, interest)| {
                 let d = world.delta_with(interest)?;
                 (d != Delta::default()).then_some((*client, d))
@@ -1089,6 +1194,16 @@ impl World {
         let default_budget = self.cfg.client_budget_bytes;
         // only the cells the interest circle touches are scanned, not the whole world
         let cells = self.cells_in_radius(interest.pos, interest.radius);
+        // same view, same filter, every touched cell quiet since the last scan (a change in the
+        // scan's own tick may have landed after it, hence strict): nothing can have changed
+        if interest.last_view == Some((interest.pos, interest.radius))
+            && interest.last_filter == interest.filter
+            && cells
+                .iter()
+                .all(|c| self.by_cell.changed(c) < interest.last_delta_tick)
+        {
+            return Some(Delta::default());
+        }
         let budget = interest.budget_bytes.unwrap_or(default_budget);
         let mut seen = HashSet::new();
         struct Cand {
@@ -1101,21 +1216,47 @@ impl World {
             update: Option<(EntityId, Pos, BTreeMap<String, Component>)>,
         }
         let mut cands: Vec<Cand> = Vec::new();
-        let in_cells = cells
-            .iter()
-            .filter_map(|c| self.by_cell.get(c))
-            .flatten()
-            .filter_map(|id| self.entities.get(id));
-        for e in in_cells {
-            let dist = e.pos.dist(&interest.pos);
-            if dist > interest.radius {
-                continue;
+        // same view as the last scan and the change log reaches back to it: only entities that
+        // changed since can differ from what the client knows, so only those are examined
+        let fast = interest.last_view == Some((interest.pos, interest.radius))
+            && interest.last_filter == interest.filter
+            && self.by_cell.log_covers(interest.last_delta_tick);
+        let mut fast_gone: Vec<EntityId> = Vec::new();
+        let scan: Vec<&Entity> = if fast {
+            let mut ids: Vec<EntityId> = self
+                .by_cell
+                .changed_since(interest.last_delta_tick)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let mut v = Vec::with_capacity(ids.len());
+            for id in ids {
+                match self.entities.get(&id) {
+                    Some(e) => v.push(e),
+                    None if interest.known.contains_key(&id) => fast_gone.push(id),
+                    None => {}
+                }
             }
-            if !interest
-                .filter
+            v
+        } else {
+            cells
                 .iter()
-                .all(|(k, v)| e.components.get(k).is_some_and(|c| &c.value == v))
-            {
+                .filter_map(|c| self.by_cell.get(c))
+                .flatten()
+                .filter_map(|id| self.entities.get(id))
+                .collect()
+        };
+        for e in scan {
+            let dist = e.pos.dist(&interest.pos);
+            let visible = dist <= interest.radius
+                && interest
+                    .filter
+                    .iter()
+                    .all(|(k, v)| e.components.get(k).is_some_and(|c| &c.value == v));
+            if !visible {
+                if fast && interest.known.contains_key(&e.id) {
+                    fast_gone.push(e.id);
+                }
                 continue;
             }
             seen.insert(e.id);
@@ -1176,8 +1317,10 @@ impl World {
         });
         let mut d = Delta::default();
         let mut used = 0usize;
+        let mut deferred = false;
         for c in cands {
             if used > 0 && used + c.bytes > budget {
+                deferred = true;
                 continue;
             }
             used += c.bytes;
@@ -1190,12 +1333,16 @@ impl World {
             interest.known.insert(c.id, (c.pos, c.versions));
             interest.last_sent.insert(c.id, tick);
         }
-        let gone: Vec<EntityId> = interest
-            .known
-            .keys()
-            .filter(|id| !seen.contains(id))
-            .copied()
-            .collect();
+        let gone: Vec<EntityId> = if fast {
+            fast_gone
+        } else {
+            interest
+                .known
+                .keys()
+                .filter(|id| !seen.contains(id))
+                .copied()
+                .collect()
+        };
         for id in &gone {
             interest.known.remove(id);
             interest.last_sent.remove(id);
@@ -1204,6 +1351,12 @@ impl World {
         d.spawned.sort_by_key(|e| e.id);
         d.updated.sort_by_key(|u| u.0);
         d.despawned.sort();
+        interest.last_delta_tick = tick;
+        // a budget-deferred entity must be retried next tick even if nothing else changes
+        interest.last_view = (!deferred).then_some((interest.pos, interest.radius));
+        if interest.last_filter != interest.filter {
+            interest.last_filter = interest.filter.clone();
+        }
         Some(d)
     }
 
@@ -1211,6 +1364,7 @@ impl World {
     pub fn advance(&mut self) -> Vec<HandoverOutcome> {
         self.tick += 1;
         let tick = self.tick;
+        self.by_cell.prune(tick.saturating_sub(CHANGE_LOG_TICKS));
         self.pins.retain(|_, (_, until)| *until > tick);
         self.expire_handovers()
     }
@@ -1253,9 +1407,7 @@ impl World {
     pub fn restore(&mut self, entities: Vec<Entity>) {
         for mut e in entities {
             if let Some(old) = self.entities.get(&e.id) {
-                if let Some(set) = self.by_cell.get_mut(&old.cell) {
-                    set.remove(&e.id);
-                }
+                self.by_cell.remove(&old.cell, &e.id, self.tick);
             }
             e.transit = None;
             e.cell = match self.pins.get(&e.id) {
@@ -1263,13 +1415,16 @@ impl World {
                 None => self.cell_of(e.pos),
             };
             e.changed_tick = self.tick;
-            self.by_cell.entry(e.cell).or_default().insert(e.id);
+            self.by_cell.insert(e.cell, e.id, self.tick);
             let (id, pos) = (e.id, e.pos);
             self.entities.insert(e.id, e);
             self.record_pos(id, pos);
         }
     }
 }
+
+/// How many ticks of per-entity changes are kept for incremental client deltas (~2 s at 30 Hz).
+const CHANGE_LOG_TICKS: u64 = 64;
 
 fn quantize(p: Pos, q: f64) -> Pos {
     if q <= 0.0 {
@@ -1542,6 +1697,75 @@ mod tests {
             (d.updated[0].1.x - 10.3).abs() < 1e-9,
             "{:?}",
             d.updated[0].1
+        );
+    }
+}
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Shape of the world bench (500 entities on a 447-unit arena, 500 viewers, 17 moves a tick).
+    #[test]
+    #[ignore]
+    fn deltas_all_cost() {
+        let mut w = World::new(WorldConfig::default());
+        let s1 = Uuid::now_v7();
+        let side = 447.0;
+        let radius: f64 = std::env::var("RADIUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100.0);
+        let lease_all = |w: &mut World| {
+            for x in 0..3 {
+                for y in 0..3 {
+                    w.grant_lease(CellId { x, y }, s1);
+                }
+            }
+        };
+        lease_all(&mut w);
+        let pt = |seed: u64| {
+            let h = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            Pos {
+                x: (h >> 11) as f64 / (1u64 << 53) as f64 * side,
+                y: (h.rotate_left(29) >> 11) as f64 / (1u64 << 53) as f64 * side,
+            }
+        };
+        let ids: Vec<EntityId> = (0..500u64)
+            .map(|i| w.spawn(pt(i), BTreeMap::new(), false))
+            .collect();
+        let clients: Vec<Uuid> = (0..500).map(|_| Uuid::now_v7()).collect();
+        for (i, c) in clients.iter().enumerate() {
+            w.subscribe_with(*c, pt(1000 + i as u64), radius, None, BTreeMap::new());
+        }
+        let mut total = std::time::Duration::ZERO;
+        let mut frames = 0usize;
+        let mut ents = 0usize;
+        for step in 0..200u64 {
+            lease_all(&mut w);
+            for j in 0..17u64 {
+                let i = ((step * 17 + j) % 500) as usize;
+                w.apply(s1, ids[i], Some(pt(5000 + step * 31 + j)), BTreeMap::new())
+                    .unwrap();
+            }
+            w.advance();
+            let t0 = std::time::Instant::now();
+            let out = w.deltas_all();
+            if step >= 20 {
+                total += t0.elapsed();
+                frames += out.len();
+                ents += out
+                    .iter()
+                    .map(|(_, d)| d.spawned.len() + d.updated.len())
+                    .sum::<usize>();
+            }
+        }
+        eprintln!(
+            "deltas_all: {:.1} µs/tick, {:.1} frames/tick, {:.1} entities/frame (radius {radius})",
+            total.as_micros() as f64 / 180.0,
+            frames as f64 / 180.0,
+            ents as f64 / frames.max(1) as f64
         );
     }
 }

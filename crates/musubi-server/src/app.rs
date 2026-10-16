@@ -577,7 +577,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         });
     }
-    let listener = tokio::net::TcpListener::bind(state.cfg.http.listen).await?;
+    let socket = match state.cfg.http.listen {
+        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(state.cfg.http.listen)?;
+    // Thousands of clients reconnecting at once (region failover, match start) must not be
+    // reset by the default accept backlog; the kernel caps this at somaxconn.
+    let listener = socket.listen(4096)?;
     info!(addr = %state.cfg.http.listen, "http listening");
     if let Some(listen) = state.cfg.quic.listen {
         crate::realtime::quic::start(state.clone(), listen).await?;

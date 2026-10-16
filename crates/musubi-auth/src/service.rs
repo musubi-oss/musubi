@@ -27,6 +27,8 @@ pub struct Authenticated {
     pub account_id: AccountId,
     pub session_id: SessionId,
     pub vars: serde_json::Map<String, serde_json::Value>,
+    /// From the token when it carries one; older tokens fall back to an account read.
+    pub username: Option<String>,
 }
 
 #[derive(Clone)]
@@ -244,6 +246,7 @@ impl AuthService {
             account_id: c.sub,
             session_id: c.sid,
             vars: c.vars,
+            username: c.name,
         })
     }
 
@@ -591,20 +594,20 @@ impl AuthService {
         vars: serde_json::Map<String, serde_json::Value>,
         dev: Device<'_>,
     ) -> Result<Session> {
-        let row: Option<(Option<OffsetDateTime>,)> = sqlx::query_as(
-            "select disabled_at from musubi.accounts where id = $1 and deleted_at is null",
+        let row: Option<(Option<OffsetDateTime>, String)> = sqlx::query_as(
+            "select disabled_at, username from musubi.accounts where id = $1 and deleted_at is null",
         )
         .bind(account_id.0)
         .fetch_optional(&self.db)
         .await
         .map_err(Error::internal)?;
-        match row {
+        let username = match row {
             None => return Err(Error::NotFound("account".into())),
-            Some((Some(_),)) => {
+            Some((Some(_), _)) => {
                 return Err(Error::PermissionDenied("account disabled".into()));
             }
-            Some((None,)) => {}
-        }
+            Some((None, username)) => username,
+        };
         let session_id = SessionId::new();
         let family = family.unwrap_or_else(Uuid::now_v7);
         let refresh = new_refresh_token();
@@ -630,6 +633,7 @@ impl AuthService {
             iat: now.unix_timestamp(),
             exp: now.unix_timestamp() + self.signer.access_ttl_secs as i64,
             vars,
+            name: Some(username),
         };
         Ok(Session {
             account_id,

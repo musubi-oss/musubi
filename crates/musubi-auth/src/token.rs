@@ -15,6 +15,9 @@ pub struct Claims {
     pub exp: i64,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub vars: serde_json::Map<String, serde_json::Value>,
+    /// Username at issue time, so a realtime handshake needs no account read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A managed ES256 key (`musubi.jwt_keys`): PKCS#8 private key plus its public point for JWKS.

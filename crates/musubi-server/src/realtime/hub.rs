@@ -330,7 +330,12 @@ impl Hub {
         msg: ServerMessage,
     ) -> Result<(), ServerMessage> {
         match self.sessions.get(&session_id) {
-            Some(h) => h.tx.try_send(msg).map_err(|e| e.into_inner()),
+            Some(h) => h.tx.try_send(msg).map_err(|e| {
+                if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    metrics::counter!("musubi_session_send_full_total").increment(1);
+                }
+                e.into_inner()
+            }),
             None => Err(msg),
         }
     }

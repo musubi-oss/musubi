@@ -280,7 +280,7 @@ pub fn to_wire(e: &Entity) -> WorldEntity {
             .iter()
             .map(|(k, c)| WorldComponent {
                 name: k.clone(),
-                value: c.value.clone(),
+                value: musubi_proto::JsonText(c.json()),
                 version: c.version,
             })
             .collect(),
@@ -2362,6 +2362,7 @@ impl WorldRegistry {
         {
             let started = std::time::Instant::now();
             let mut guard = w.lock();
+            let t_lock = started.elapsed();
             let st = &mut *guard;
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
@@ -2546,6 +2547,7 @@ impl WorldRegistry {
                 }
             }
             let tick = st.world.tick;
+            let t_sim = started.elapsed();
             metrics::histogram!("musubi_world_tick_duration_seconds", "world" => name.clone())
                 .record(started.elapsed().as_secs_f64());
             metrics::gauge!("musubi_world_entities", "world" => name.clone())
@@ -2566,16 +2568,29 @@ impl WorldRegistry {
                 })
                 .collect();
             drop(guard);
+            let t_deltas = fan_started.elapsed();
             let frames = pending.len() as u64;
-            let msgs: Vec<(SessionId, ServerMessage)> = {
-                use rayon::prelude::*;
-                pending
-                    .into_par_iter()
-                    .map(|(sid, scale, d)| (sid, delta_msg(&name, tick, scale, d)))
-                    .collect()
-            };
+            let msgs: Vec<(SessionId, ServerMessage)> = pending
+                .into_iter()
+                .map(|(sid, scale, d)| (sid, delta_msg(&name, tick, scale, d)))
+                .collect();
+            let t_build = fan_started.elapsed();
             for (sid, msg) in msgs {
                 fanout.session(sid, msg);
+            }
+            let t_send = fan_started.elapsed();
+            if tick % 150 == 0 && std::env::var_os("MUSUBI_TICK_TRACE").is_some() {
+                tracing::warn!(
+                    world = %name,
+                    tick,
+                    frames,
+                    lock_ms = t_lock.as_secs_f64() * 1e3,
+                    sim_ms = (t_sim - t_lock).as_secs_f64() * 1e3,
+                    deltas_ms = t_deltas.as_secs_f64() * 1e3,
+                    build_ms = (t_build - t_deltas).as_secs_f64() * 1e3,
+                    send_ms = (t_send - t_build).as_secs_f64() * 1e3,
+                    "tick trace"
+                );
             }
             metrics::histogram!("musubi_world_fanout_duration_seconds", "world" => name.clone())
                 .record(fan_started.elapsed().as_secs_f64());
@@ -2814,7 +2829,7 @@ fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta) -> ServerMessage {
                     .into_iter()
                     .map(|(k, c)| WorldComponent {
                         name: k,
-                        value: c.value,
+                        value: musubi_proto::JsonText(c.json()),
                         version: c.version,
                     })
                     .collect(),

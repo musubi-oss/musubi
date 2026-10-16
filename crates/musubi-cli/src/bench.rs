@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use musubi_proto::{ClientMessage, Envelope, ServerMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -40,6 +40,13 @@ struct WorldTotals {
     moves_timeout: AtomicU64,
     moves_4xx: AtomicU64,
     moves_5xx: AtomicU64,
+    apply_n: AtomicU64,
+    apply_ms_sum: AtomicU64,
+    apply_ms_max: AtomicU64,
+    /// Why a player gave up: WS handshake, first subscribe, stream closed/error, resubscribe.
+    err_connect: AtomicU64,
+    err_subscribe: AtomicU64,
+    err_stream: AtomicU64,
 }
 
 struct Arena {
@@ -151,6 +158,7 @@ async fn world_sim(
             let (http, url, arena, totals) =
                 (http.clone(), url.clone(), arena.clone(), totals.clone());
             futs.push(async move {
+                let t0 = Instant::now();
                 let res = http
                     .post(format!("{url}/v1/server/worlds/{}/apply", arena.name))
                     .header("x-musubi-server-key", KEY)
@@ -158,6 +166,10 @@ async fn world_sim(
                     .timeout(Duration::from_secs(2))
                     .send()
                     .await;
+                let ms = t0.elapsed().as_millis() as u64;
+                totals.apply_n.fetch_add(1, Ordering::Relaxed);
+                totals.apply_ms_sum.fetch_add(ms, Ordering::Relaxed);
+                totals.apply_ms_max.fetch_max(ms, Ordering::Relaxed);
                 if window.is_none() {
                     // warming up while players authenticate: keep moving, do not count
                     return;
@@ -197,6 +209,7 @@ async fn world_sim(
 
 /// First frames of a world run that are not deltas are printed (encoding/subscription problems).
 static FRAME_DEBUG: AtomicU64 = AtomicU64::new(0);
+static CONNECT_DEBUG: AtomicU64 = AtomicU64::new(0);
 
 struct Player {
     url: String,
@@ -225,15 +238,32 @@ async fn world_loop(p: Player) {
         totals,
     } = p;
     let enc = musubi_proto::Encoding::parse(&wire).unwrap_or_default();
-    let Ok((mut ws, _)) =
-        tokio_tungstenite::connect_async(format!("{}?token={token}&format={wire}", ws_url(&url)))
-            .await
-    else {
-        let _ = tx.send(sample("world", Instant::now(), false, false));
-        return;
+    let (mut ws, _) = match tokio_tungstenite::connect_async(format!(
+        "{}?token={token}&format={wire}",
+        ws_url(&url)
+    ))
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            if CONNECT_DEBUG.fetch_add(1, Ordering::Relaxed) < 3 {
+                eprintln!("world: connect failed: {e}");
+            }
+            totals.err_connect.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(sample("world", Instant::now(), false, false));
+            return;
+        }
     };
     let subscribe = |step: u64| {
-        let (x, y) = arena_point(arena.side, seed.wrapping_add(step.wrapping_mul(31)));
+        // random walk, not teleport: each move is a short hop, so the view keeps most of what
+        // the client already knows (a real player moves; it does not respawn across the map)
+        let hop = arena.side * 0.05;
+        let (mut x, mut y) = arena_point(arena.side, seed);
+        for k in 1..=step {
+            let (hx, hy) = arena_point(1.0, seed ^ k.wrapping_mul(0x9E37_79B9));
+            x = (x + (hx - 0.5) * 2.0 * hop).rem_euclid(arena.side);
+            y = (y + (hy - 0.5) * 2.0 * hop).rem_euclid(arena.side);
+        }
         let env = Envelope {
             cid: None,
             msg: ClientMessage::WorldSubscribe {
@@ -255,6 +285,7 @@ async fn world_loop(p: Player) {
         }
     };
     if ws.send(subscribe(0)).await.is_err() {
+        totals.err_subscribe.fetch_add(1, Ordering::Relaxed);
         let _ = tx.send(sample("world", Instant::now(), false, false));
         return;
     }
@@ -306,12 +337,14 @@ async fn world_loop(p: Player) {
             }
             Ok(Some(Ok(_))) => {}
             Ok(_) => {
+                totals.err_stream.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(sample("world", Instant::now(), false, false));
                 return;
             }
             Err(_) => {
                 next_move = Instant::now() + Duration::from_millis(200);
                 if ws.send(subscribe(step)).await.is_err() {
+                    totals.err_stream.fetch_add(1, Ordering::Relaxed);
                     let _ = tx.send(sample("world", Instant::now(), false, false));
                     return;
                 }
@@ -596,10 +629,18 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         }
     }
     let t0 = Instant::now();
-    let mut tokens = Vec::with_capacity(o.clients);
-    for i in 0..o.clients {
-        tokens.push(auth(&http, &url, &format!("bench-{run_id}-{i}")).await?);
-    }
+    // Logins go 64 at a time: one at a time makes a 10k setup take minutes, all at once
+    // measures the auth path's burst behaviour instead of the worlds.
+    let tokens: Vec<String> = futures::stream::iter(0..o.clients)
+        .map(|i| {
+            let http = http.clone();
+            let url = url.clone();
+            let id = format!("bench-{run_id}-{i}");
+            async move { auth(&http, &url, &id).await }
+        })
+        .buffered(64)
+        .try_collect()
+        .await?;
     let auth_ms = t0.elapsed().as_secs_f64() * 1e3;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let deadline = Instant::now() + o.duration;
@@ -641,6 +682,14 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     for t in tasks {
         let _ = t.await;
     }
+    // a run must not leave its arenas behind: the node would keep ticking them forever
+    for a in &arenas {
+        let _ = http
+            .delete(format!("{url}/v1/server/worlds/{}", a.name))
+            .header("x-musubi-server-key", KEY)
+            .send()
+            .await;
+    }
     let secs = o.duration.as_secs_f64();
     let mut report = json!({
         "url": url, "clients": o.clients, "duration_secs": secs,
@@ -655,6 +704,12 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "sim_moves_err_timeout": totals.moves_timeout.load(Ordering::Relaxed),
             "sim_moves_err_4xx": totals.moves_4xx.load(Ordering::Relaxed),
             "sim_moves_err_5xx": totals.moves_5xx.load(Ordering::Relaxed),
+            "sim_apply_mean_ms": totals.apply_ms_sum.load(Ordering::Relaxed) as f64
+                / totals.apply_n.load(Ordering::Relaxed).max(1) as f64,
+            "sim_apply_max_ms": totals.apply_ms_max.load(Ordering::Relaxed),
+            "client_err_connect": totals.err_connect.load(Ordering::Relaxed),
+            "client_err_subscribe": totals.err_subscribe.load(Ordering::Relaxed),
+            "client_err_stream": totals.err_stream.load(Ordering::Relaxed),
             "tick": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_tick_duration_seconds").await,
             "fanout": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_fanout_duration_seconds").await,
         }) },

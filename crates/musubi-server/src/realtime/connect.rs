@@ -34,17 +34,43 @@ pub fn encoding_of(hello: &Hello) -> Result<Encoding> {
     }
 }
 
-pub async fn authorize(s: &AppState, hello: &Hello) -> Result<(UserPresence, Encoding)> {
-    let me = s.auth.verify_access(&hello.token)?;
-    let encoding = encoding_of(hello)?;
+/// Account → username for the handshake, kept `USERNAME_TTL`. Ten thousand sockets opening
+/// together used to queue ten thousand reads on the pool and time out; a name does not change,
+/// and a deleted account is refused within the TTL (its tokens outlive it about as long anyway).
+static USERNAMES: std::sync::OnceLock<dashmap::DashMap<uuid::Uuid, (String, std::time::Instant)>> =
+    std::sync::OnceLock::new();
+const USERNAME_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn username_of(s: &AppState, account: uuid::Uuid) -> Result<String> {
+    let cache = USERNAMES.get_or_init(dashmap::DashMap::new);
+    let now = std::time::Instant::now();
+    if let Some(hit) = cache.get(&account) {
+        if now.duration_since(hit.1) < USERNAME_TTL {
+            return Ok(hit.0.clone());
+        }
+    }
     let username: String = sqlx::query_scalar(
         "select username from musubi.accounts where id = $1 and deleted_at is null",
     )
-    .bind(me.account_id.0)
+    .bind(account)
     .fetch_optional(&s.db)
     .await
     .map_err(Error::internal)?
     .ok_or_else(|| Error::Unauthenticated("account gone".into()))?;
+    if cache.len() > 65_536 {
+        cache.retain(|_, (_, at)| now.duration_since(*at) < USERNAME_TTL);
+    }
+    cache.insert(account, (username.clone(), now));
+    Ok(username)
+}
+
+pub async fn authorize(s: &AppState, hello: &Hello) -> Result<(UserPresence, Encoding)> {
+    let me = s.auth.verify_access(&hello.token)?;
+    let encoding = encoding_of(hello)?;
+    let username = match me.username {
+        Some(name) => name,
+        None => username_of(s, me.account_id.0).await?,
+    };
     // Each socket is its own realtime session, distinct from the auth session that issued the token.
     Ok((
         UserPresence {
