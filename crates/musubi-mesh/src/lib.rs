@@ -199,7 +199,7 @@ pub struct Delta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Interest {
+pub struct Interest {
     pos: Pos,
     radius: f64,
     /// entity → last component versions the client received (pos is always sent on move).
@@ -403,35 +403,6 @@ impl World {
             .fold(1.0, f64::min)
     }
 
-    pub fn cell_of(&self, p: Pos) -> CellId {
-        CellId {
-            x: (p.x / self.cfg.cell_size).floor() as i32,
-            y: (p.y / self.cfg.cell_size).floor() as i32,
-        }
-    }
-
-    pub fn cell_bounds(&self, c: CellId) -> (Pos, Pos) {
-        let s = self.cfg.cell_size;
-        (
-            Pos {
-                x: c.x as f64 * s,
-                y: c.y as f64 * s,
-            },
-            Pos {
-                x: (c.x + 1) as f64 * s,
-                y: (c.y + 1) as f64 * s,
-            },
-        )
-    }
-
-    /// Distance from `p` to the nearest border of cell `c` (negative = outside by that much).
-    pub fn border_distance(&self, c: CellId, p: Pos) -> f64 {
-        let (lo, hi) = self.cell_bounds(c);
-        let dx = (p.x - lo.x).min(hi.x - p.x);
-        let dy = (p.y - lo.y).min(hi.y - p.y);
-        dx.min(dy)
-    }
-
     // ----- leases -----
 
     pub fn grant_lease(&mut self, cell: CellId, sim: SimId) {
@@ -518,23 +489,72 @@ impl World {
         self.by_cell.get(&cell).map_or(0, |s| s.len())
     }
 
+    pub fn cell_of(&self, p: Pos) -> CellId {
+        grid_cell_of(self.cfg.cell_size, p)
+    }
+
+    pub fn cell_bounds(&self, c: CellId) -> (Pos, Pos) {
+        grid_bounds(self.cfg.cell_size, c)
+    }
+
+    /// Distance from `p` to the nearest border of cell `c` (negative = outside by that much).
+    pub fn border_distance(&self, c: CellId, p: Pos) -> f64 {
+        grid_border_distance(self.cfg.cell_size, c, p)
+    }
+
     /// Cells a circle of interest touches (bounding box).
     pub fn cells_in_radius(&self, p: Pos, radius: f64) -> Vec<CellId> {
-        let lo = self.cell_of(Pos {
-            x: p.x - radius,
-            y: p.y - radius,
-        });
-        let hi = self.cell_of(Pos {
-            x: p.x + radius,
-            y: p.y + radius,
-        });
-        let mut v = Vec::new();
-        for x in lo.x..=hi.x {
-            for y in lo.y..=hi.y {
-                v.push(CellId { x, y });
-            }
+        grid_cells_in_radius(self.cfg.cell_size, p, radius)
+    }
+
+    /// A read-only copy of what the per-client delta build needs, so that deltas for thousands
+    /// of clients can be built off the world lock (the tick holds it only for the copy).
+    pub fn snapshot(&self) -> WorldView {
+        WorldView {
+            tick: self.tick,
+            cfg: self.cfg.clone(),
+            entities: self.entities.clone(),
+            by_cell: self.by_cell.clone(),
+            cell_scale: self.cell_scale.clone(),
         }
-        v
+    }
+
+    /// Interest state of every client, taken out for an off-lock delta build (`WorldView`);
+    /// give it back with `restore_interests` before the next tick.
+    pub fn take_interests(&mut self) -> HashMap<ClientId, Interest> {
+        std::mem::take(&mut self.interests)
+    }
+
+    /// Put interests from `take_interests` back; `keep` filters out clients that left meanwhile
+    /// (their `unsubscribe` found nothing to remove while the state was out).
+    pub fn restore_interests(
+        &mut self,
+        mut interests: HashMap<ClientId, Interest>,
+        keep: impl Fn(&ClientId) -> bool,
+    ) {
+        interests.retain(|c, _| keep(c));
+        // anything subscribed while the state was out (none today; defensive) wins over the copy
+        for (c, i) in self.interests.drain() {
+            interests.insert(c, i);
+        }
+        self.interests = interests;
+    }
+
+    pub fn delta_for(&mut self, client: ClientId) -> Option<Delta> {
+        let mut interest = self.interests.remove(&client)?;
+        let d = self.snapshot().delta_with(&mut interest);
+        self.interests.insert(client, interest);
+        d
+    }
+
+    /// Deltas for every client (see `WorldView::deltas_all`). Clients with nothing to send are
+    /// left out.
+    pub fn deltas_all(&mut self) -> Vec<(ClientId, Delta)> {
+        let view = self.snapshot();
+        let mut interests = std::mem::take(&mut self.interests);
+        let out = view.deltas_all(&mut interests);
+        self.interests = interests;
+        out
     }
 
     pub fn owner(&self, cell: CellId) -> Option<SimId> {
@@ -1190,213 +1210,6 @@ impl World {
         self.interests.remove(&client);
     }
 
-    /// Delta since the client's last call: new entities in range, moved/changed ones, and those
-    /// that left range or despawned. Transparent to cell ownership and handovers.
-    /// What `client` has not seen yet, within its budget. Entities in the radius that pass the
-    /// filter are ranked by `relevance × (1 + age)` — relevance falls with distance, age is the
-    /// ticks since the client last heard about the entity — and taken in that order until the
-    /// estimated bytes exceed the budget (at least one always goes); the rest keep their old
-    /// state and come back next tick with a higher priority. Despawns are always delivered.
-    /// Positions are quantized to `pos_quantum`, so jitter below it is not an update.
-    /// Delta for one client (see `delta_with`).
-    pub fn delta_for(&mut self, client: ClientId) -> Option<Delta> {
-        let mut interest = self.interests.remove(&client)?;
-        let d = self.delta_with(&mut interest);
-        self.interests.insert(client, interest);
-        d
-    }
-
-    /// Deltas for every client, built in parallel: each client's interest state is independent
-    /// and the world is only read, so the per-player fan-out of a tick scales with cores instead
-    /// of running one player after another. Clients with nothing to send are left out.
-    pub fn deltas_all(&mut self) -> Vec<(ClientId, Delta)> {
-        // sequential on purpose: a world's tick already runs on its own thread, and fanning 500
-        // sub-millisecond jobs a tick into a shared pool cost more in scheduling than it saved
-        let mut interests = std::mem::take(&mut self.interests);
-        let world: &Self = self;
-        let out: Vec<(ClientId, Delta)> = interests
-            .iter_mut()
-            .filter_map(|(client, interest)| {
-                if interest.every > 1 && (world.tick + interest.phase) % interest.every != 0 {
-                    return None;
-                }
-                let d = world.delta_with(interest)?;
-                (d != Delta::default()).then_some((*client, d))
-            })
-            .collect();
-        self.interests = interests;
-        out
-    }
-
-    /// Everything in `interest`'s circle that the client has not seen in its current state,
-    /// ranked by relevance × age and cut at the client's byte budget; updates `interest`.
-    fn delta_with(&self, interest: &mut Interest) -> Option<Delta> {
-        let tick = self.tick;
-        let quantum = self.cfg.pos_quantum;
-        let default_budget = self.cfg.client_budget_bytes;
-        // only the cells the interest circle touches are scanned, not the whole world
-        let cells = self.cells_in_radius(interest.pos, interest.radius);
-        // same view, same filter, every touched cell quiet since the last scan (a change in the
-        // scan's own tick may have landed after it, hence strict): nothing can have changed
-        if interest.last_view == Some((interest.pos, interest.radius))
-            && interest.last_filter == interest.filter
-            && cells
-                .iter()
-                .all(|c| self.by_cell.changed(c) < interest.last_delta_tick)
-        {
-            return Some(Delta::default());
-        }
-        let budget = interest.budget_bytes.unwrap_or(default_budget);
-        let mut seen = HashSet::new();
-        struct Cand {
-            prio: f64,
-            bytes: usize,
-            id: EntityId,
-            pos: Pos,
-            rev: u64,
-            spawn: Option<Entity>,
-            update: Option<(EntityId, Pos, BTreeMap<String, Component>)>,
-        }
-        let mut cands: Vec<Cand> = Vec::new();
-        // same view as the last scan and the change log reaches back to it: only entities that
-        // changed since can differ from what the client knows, so only those are examined
-        let fast = interest.last_view == Some((interest.pos, interest.radius))
-            && interest.last_filter == interest.filter
-            && self.by_cell.log_covers(interest.last_delta_tick);
-        let mut fast_gone: Vec<EntityId> = Vec::new();
-        let scan: Vec<&Entity> = if fast {
-            let mut ids: Vec<EntityId> = self
-                .by_cell
-                .changed_since(interest.last_delta_tick)
-                .collect();
-            ids.sort_unstable();
-            ids.dedup();
-            let mut v = Vec::with_capacity(ids.len());
-            for id in ids {
-                match self.entities.get(&id) {
-                    Some(e) => v.push(e),
-                    None if interest.known.contains_key(&id) => fast_gone.push(id),
-                    None => {}
-                }
-            }
-            v
-        } else {
-            cells
-                .iter()
-                .filter_map(|c| self.by_cell.get(c))
-                .flatten()
-                .filter_map(|id| self.entities.get(id))
-                .collect()
-        };
-        for e in scan {
-            let dist = e.pos.dist(&interest.pos);
-            let visible = dist <= interest.radius
-                && interest
-                    .filter
-                    .iter()
-                    .all(|(k, v)| e.components.get(k).is_some_and(|c| &c.value == v));
-            if !visible {
-                if fast && interest.known.contains_key(&e.id) {
-                    fast_gone.push(e.id);
-                }
-                continue;
-            }
-            seen.insert(e.id);
-            // delivered after its last change (a change in the same tick as the delivery may
-            // have landed after it, so that tick is compared the slow way): nothing to compare
-            if interest.known.contains_key(&e.id)
-                && interest
-                    .last_sent
-                    .get(&e.id)
-                    .is_some_and(|sent| e.changed_tick < *sent)
-            {
-                continue;
-            }
-            let qpos = quantize(e.pos, quantum);
-            let (spawn, update, bytes) = match interest.known.get(&e.id) {
-                None => {
-                    let mut s = e.clone();
-                    s.pos = qpos;
-                    let bytes = estimate_components(s.components.iter()) + 64;
-                    (Some(s), None, bytes)
-                }
-                Some((pos, known_rev)) => {
-                    let changed: BTreeMap<String, Component> = e
-                        .components
-                        .iter()
-                        .filter(|(_, c)| c.changed_rev > *known_rev)
-                        .map(|(k, c)| (k.clone(), c.clone()))
-                        .collect();
-                    if *pos == qpos && changed.is_empty() {
-                        continue;
-                    }
-                    let bytes = estimate_components(changed.iter()) + 56;
-                    (None, Some((e.id, qpos, changed)), bytes)
-                }
-            };
-            let age = tick.saturating_sub(interest.last_sent.get(&e.id).copied().unwrap_or(0));
-            let relevance = 1.0 / (1.0 + dist / interest.radius.max(f64::EPSILON));
-            cands.push(Cand {
-                prio: relevance * (1.0 + age as f64),
-                bytes,
-                id: e.id,
-                pos: qpos,
-                rev: e.rev,
-                spawn,
-                update,
-            });
-        }
-        cands.sort_by(|a, b| {
-            b.prio
-                .partial_cmp(&a.prio)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.id.cmp(&b.id))
-        });
-        let mut d = Delta::default();
-        let mut used = 0usize;
-        let mut deferred = false;
-        for c in cands {
-            if used > 0 && used + c.bytes > budget {
-                deferred = true;
-                continue;
-            }
-            used += c.bytes;
-            if let Some(s) = c.spawn {
-                d.spawned.push(s);
-            }
-            if let Some(u) = c.update {
-                d.updated.push(u);
-            }
-            interest.known.insert(c.id, (c.pos, c.rev));
-            interest.last_sent.insert(c.id, tick);
-        }
-        let gone: Vec<EntityId> = if fast {
-            fast_gone
-        } else {
-            interest
-                .known
-                .keys()
-                .filter(|id| !seen.contains(id))
-                .copied()
-                .collect()
-        };
-        for id in &gone {
-            interest.known.remove(id);
-            interest.last_sent.remove(id);
-        }
-        d.despawned = gone;
-        d.spawned.sort_by_key(|e| e.id);
-        d.updated.sort_by_key(|u| u.0);
-        d.despawned.sort();
-        interest.last_delta_tick = tick;
-        // a budget-deferred entity must be retried next tick even if nothing else changes
-        interest.last_view = (!deferred).then_some((interest.pos, interest.radius));
-        if interest.last_filter != interest.filter {
-            interest.last_filter = interest.filter.clone();
-        }
-        Some(d)
-    }
-
     /// Advance the world clock; expire handovers.
     pub fn advance(&mut self) -> Vec<HandoverOutcome> {
         self.tick += 1;
@@ -1831,5 +1644,274 @@ mod perf {
             frames as f64 / 180.0,
             ents as f64 / frames.max(1) as f64
         );
+    }
+}
+
+fn grid_cell_of(size: f64, p: Pos) -> CellId {
+    CellId {
+        x: (p.x / size).floor() as i32,
+        y: (p.y / size).floor() as i32,
+    }
+}
+
+fn grid_bounds(size: f64, c: CellId) -> (Pos, Pos) {
+    let s = size;
+    (
+        Pos {
+            x: c.x as f64 * s,
+            y: c.y as f64 * s,
+        },
+        Pos {
+            x: (c.x + 1) as f64 * s,
+            y: (c.y + 1) as f64 * s,
+        },
+    )
+}
+
+fn grid_border_distance(size: f64, c: CellId, p: Pos) -> f64 {
+    let (lo, hi) = grid_bounds(size, c);
+    let dx = (p.x - lo.x).min(hi.x - p.x);
+    let dy = (p.y - lo.y).min(hi.y - p.y);
+    dx.min(dy)
+}
+
+fn grid_cells_in_radius(size: f64, p: Pos, radius: f64) -> Vec<CellId> {
+    let lo = grid_cell_of(
+        size,
+        Pos {
+            x: p.x - radius,
+            y: p.y - radius,
+        },
+    );
+    let hi = grid_cell_of(
+        size,
+        Pos {
+            x: p.x + radius,
+            y: p.y + radius,
+        },
+    );
+    let mut v = Vec::new();
+    for x in lo.x..=hi.x {
+        for y in lo.y..=hi.y {
+            v.push(CellId { x, y });
+        }
+    }
+    v
+}
+
+/// Read-only copy of a world's entities, cell index and time scales at one tick, taken with
+/// `World::snapshot`: the per-client delta build reads only this, so a tick holds the world lock
+/// for the copy and not for the thousands of clients.
+#[derive(Debug, Clone)]
+pub struct WorldView {
+    pub tick: u64,
+    pub cfg: WorldConfig,
+    entities: HashMap<EntityId, Entity>,
+    by_cell: CellIndex,
+    cell_scale: HashMap<CellId, f64>,
+}
+
+impl WorldView {
+    pub fn cells_in_radius(&self, p: Pos, radius: f64) -> Vec<CellId> {
+        grid_cells_in_radius(self.cfg.cell_size, p, radius)
+    }
+
+    /// Slowest time scale around a client's interest (1.0 when undilated).
+    pub fn scale_for(&self, interest: &Interest) -> f64 {
+        self.cell_scale
+            .iter()
+            .filter(|(c, _)| {
+                grid_border_distance(self.cfg.cell_size, **c, interest.pos) > -interest.radius
+            })
+            .map(|(_, s)| *s)
+            .fold(1.0, f64::min)
+    }
+
+    /// Deltas for every client in `interests` (their state is updated in place). Sequential on
+    /// purpose: a world's tick runs on its own thread, and fanning 500 sub-millisecond jobs a
+    /// tick into a shared pool cost more in scheduling than it saved.
+    pub fn deltas_all(
+        &self,
+        interests: &mut HashMap<ClientId, Interest>,
+    ) -> Vec<(ClientId, Delta)> {
+        interests
+            .iter_mut()
+            .filter_map(|(client, interest)| {
+                if interest.every > 1 && (self.tick + interest.phase) % interest.every != 0 {
+                    return None;
+                }
+                let d = self.delta_with(interest)?;
+                (d != Delta::default()).then_some((*client, d))
+            })
+            .collect()
+    }
+
+    /// Everything in `interest`'s circle that the client has not seen in its current state,
+    /// ranked by relevance × age and cut at the client's byte budget; updates `interest`.
+    pub fn delta_with(&self, interest: &mut Interest) -> Option<Delta> {
+        let tick = self.tick;
+        let quantum = self.cfg.pos_quantum;
+        let default_budget = self.cfg.client_budget_bytes;
+        // only the cells the interest circle touches are scanned, not the whole world
+        let cells = self.cells_in_radius(interest.pos, interest.radius);
+        // same view, same filter, every touched cell quiet since the last scan (a change in the
+        // scan's own tick may have landed after it, hence strict): nothing can have changed
+        if interest.last_view == Some((interest.pos, interest.radius))
+            && interest.last_filter == interest.filter
+            && cells
+                .iter()
+                .all(|c| self.by_cell.changed(c) < interest.last_delta_tick)
+        {
+            return Some(Delta::default());
+        }
+        let budget = interest.budget_bytes.unwrap_or(default_budget);
+        let mut seen = HashSet::new();
+        struct Cand {
+            prio: f64,
+            bytes: usize,
+            id: EntityId,
+            pos: Pos,
+            rev: u64,
+            spawn: Option<Entity>,
+            update: Option<(EntityId, Pos, BTreeMap<String, Component>)>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
+        // same view as the last scan and the change log reaches back to it: only entities that
+        // changed since can differ from what the client knows, so only those are examined
+        let fast = interest.last_view == Some((interest.pos, interest.radius))
+            && interest.last_filter == interest.filter
+            && self.by_cell.log_covers(interest.last_delta_tick);
+        let mut fast_gone: Vec<EntityId> = Vec::new();
+        let scan: Vec<&Entity> = if fast {
+            let mut ids: Vec<EntityId> = self
+                .by_cell
+                .changed_since(interest.last_delta_tick)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let mut v = Vec::with_capacity(ids.len());
+            for id in ids {
+                match self.entities.get(&id) {
+                    Some(e) => v.push(e),
+                    None if interest.known.contains_key(&id) => fast_gone.push(id),
+                    None => {}
+                }
+            }
+            v
+        } else {
+            cells
+                .iter()
+                .filter_map(|c| self.by_cell.get(c))
+                .flatten()
+                .filter_map(|id| self.entities.get(id))
+                .collect()
+        };
+        for e in scan {
+            let dist = e.pos.dist(&interest.pos);
+            let visible = dist <= interest.radius
+                && interest
+                    .filter
+                    .iter()
+                    .all(|(k, v)| e.components.get(k).is_some_and(|c| &c.value == v));
+            if !visible {
+                if fast && interest.known.contains_key(&e.id) {
+                    fast_gone.push(e.id);
+                }
+                continue;
+            }
+            seen.insert(e.id);
+            // delivered after its last change (a change in the same tick as the delivery may
+            // have landed after it, so that tick is compared the slow way): nothing to compare
+            if interest.known.contains_key(&e.id)
+                && interest
+                    .last_sent
+                    .get(&e.id)
+                    .is_some_and(|sent| e.changed_tick < *sent)
+            {
+                continue;
+            }
+            let qpos = quantize(e.pos, quantum);
+            let (spawn, update, bytes) = match interest.known.get(&e.id) {
+                None => {
+                    let mut s = e.clone();
+                    s.pos = qpos;
+                    let bytes = estimate_components(s.components.iter()) + 64;
+                    (Some(s), None, bytes)
+                }
+                Some((pos, known_rev)) => {
+                    let changed: BTreeMap<String, Component> = e
+                        .components
+                        .iter()
+                        .filter(|(_, c)| c.changed_rev > *known_rev)
+                        .map(|(k, c)| (k.clone(), c.clone()))
+                        .collect();
+                    if *pos == qpos && changed.is_empty() {
+                        continue;
+                    }
+                    let bytes = estimate_components(changed.iter()) + 56;
+                    (None, Some((e.id, qpos, changed)), bytes)
+                }
+            };
+            let age = tick.saturating_sub(interest.last_sent.get(&e.id).copied().unwrap_or(0));
+            let relevance = 1.0 / (1.0 + dist / interest.radius.max(f64::EPSILON));
+            cands.push(Cand {
+                prio: relevance * (1.0 + age as f64),
+                bytes,
+                id: e.id,
+                pos: qpos,
+                rev: e.rev,
+                spawn,
+                update,
+            });
+        }
+        cands.sort_by(|a, b| {
+            b.prio
+                .partial_cmp(&a.prio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.id.cmp(&b.id))
+        });
+        let mut d = Delta::default();
+        let mut used = 0usize;
+        let mut deferred = false;
+        for c in cands {
+            if used > 0 && used + c.bytes > budget {
+                deferred = true;
+                continue;
+            }
+            used += c.bytes;
+            if let Some(s) = c.spawn {
+                d.spawned.push(s);
+            }
+            if let Some(u) = c.update {
+                d.updated.push(u);
+            }
+            interest.known.insert(c.id, (c.pos, c.rev));
+            interest.last_sent.insert(c.id, tick);
+        }
+        let gone: Vec<EntityId> = if fast {
+            fast_gone
+        } else {
+            interest
+                .known
+                .keys()
+                .filter(|id| !seen.contains(id))
+                .copied()
+                .collect()
+        };
+        for id in &gone {
+            interest.known.remove(id);
+            interest.last_sent.remove(id);
+        }
+        d.despawned = gone;
+        d.spawned.sort_by_key(|e| e.id);
+        d.updated.sort_by_key(|u| u.0);
+        d.despawned.sort();
+        interest.last_delta_tick = tick;
+        // a budget-deferred entity must be retried next tick even if nothing else changes
+        interest.last_view = (!deferred).then_some((interest.pos, interest.radius));
+        if interest.last_filter != interest.filter {
+            interest.last_filter = interest.filter.clone();
+        }
+        Some(d)
     }
 }

@@ -2651,16 +2651,27 @@ impl WorldRegistry {
             let fan_started = std::time::Instant::now();
             let by_client: HashMap<Uuid, SessionId> =
                 st.subs.iter().map(|(s, c)| (*c, *s)).collect();
-            let pending: Vec<(SessionId, f64, Delta)> = st
-                .world
-                .deltas_all()
+            // the lock is held for a copy of the world, not for the delta build: simulator
+            // writes and the sessions' unsubscribes no longer wait behind thousands of clients
+            let view = st.world.snapshot();
+            let mut interests = st.world.take_interests();
+            drop(guard);
+            let pending: Vec<(SessionId, f64, Delta)> = view
+                .deltas_all(&mut interests)
                 .into_iter()
                 .filter_map(|(client, d)| {
                     let sid = *by_client.get(&client)?;
-                    Some((sid, st.world.scale_for_client(client), d))
+                    let scale = interests.get(&client).map_or(1.0, |i| view.scale_for(i));
+                    Some((sid, scale, d))
                 })
                 .collect();
-            drop(guard);
+            drop(view);
+            {
+                let mut guard = w.lock();
+                let st = &mut *guard;
+                let live: std::collections::HashSet<Uuid> = st.subs.values().copied().collect();
+                st.world.restore_interests(interests, |c| live.contains(c));
+            }
             let t_deltas = fan_started.elapsed();
             let frames = pending.len() as u64;
             let msgs: Vec<(SessionId, ServerMessage)> = pending
