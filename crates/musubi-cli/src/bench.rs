@@ -35,6 +35,9 @@ struct WorldTotals {
     entities: AtomicU64,
     moves_ok: AtomicU64,
     moves_err: AtomicU64,
+    moves_timeout: AtomicU64,
+    moves_4xx: AtomicU64,
+    moves_5xx: AtomicU64,
 }
 
 struct Arena {
@@ -108,7 +111,7 @@ async fn world_sim(
     http: reqwest::Client,
     url: String,
     arena: Arc<Arena>,
-    deadline: Instant,
+    mut deadline: tokio::sync::watch::Receiver<Option<Instant>>,
     totals: Arc<WorldTotals>,
 ) {
     let n = arena.entities.len();
@@ -119,7 +122,11 @@ async fn world_sim(
         .collect();
     let mut step = 0u64;
     let mut last_lease = Instant::now();
-    while Instant::now() < deadline {
+    loop {
+        let window = *deadline.borrow_and_update();
+        if window.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(33)).await;
         if last_lease.elapsed() >= Duration::from_millis(500) {
             last_lease = Instant::now();
@@ -149,10 +156,35 @@ async fn world_sim(
                     .timeout(Duration::from_secs(2))
                     .send()
                     .await;
-                if res.map(|r| r.status().is_success()).unwrap_or(false) {
-                    totals.moves_ok.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    totals.moves_err.fetch_add(1, Ordering::Relaxed);
+                if window.is_none() {
+                    // warming up while players authenticate: keep moving, do not count
+                    return;
+                }
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        totals.moves_ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(r) => {
+                        totals.moves_err.fetch_add(1, Ordering::Relaxed);
+                        if r.status().is_client_error() {
+                            totals.moves_4xx.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            totals.moves_5xx.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if totals.moves_err.load(Ordering::Relaxed) <= 3 {
+                            let st = r.status();
+                            let body = r.text().await.unwrap_or_default();
+                            eprintln!("sim apply failed: {st} {body}");
+                        }
+                    }
+                    Err(e) => {
+                        totals.moves_err.fetch_add(1, Ordering::Relaxed);
+                        if e.is_timeout() {
+                            totals.moves_timeout.fetch_add(1, Ordering::Relaxed);
+                        } else if totals.moves_err.load(Ordering::Relaxed) <= 3 {
+                            eprintln!("sim apply failed: {e}");
+                        }
+                    }
                 }
             });
         }
@@ -517,11 +549,23 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     let run_id = uuid::Uuid::now_v7().simple().to_string();
     let totals = Arc::new(WorldTotals::default());
     let mut arenas: Vec<Arc<Arena>> = Vec::new();
+    // the simulators start as soon as their arena exists: leases (2 s) must stay alive while
+    // the players authenticate; the measurement window opens later through `window_tx`
+    let (window_tx, window_rx) = tokio::sync::watch::channel::<Option<Instant>>(None);
+    let mut sims = Vec::new();
     if scenarios.contains(&"world") {
         let t = Instant::now();
         for i in 0..o.worlds.max(1) {
             let name = format!("bench-{run_id}-{i}");
-            arenas.push(Arc::new(world_setup(&http, &url, &name, o.entities).await?));
+            let arena = Arc::new(world_setup(&http, &url, &name, o.entities).await?);
+            sims.push(tokio::spawn(world_sim(
+                http.clone(),
+                url.clone(),
+                arena.clone(),
+                window_rx.clone(),
+                totals.clone(),
+            )));
+            arenas.push(arena);
         }
         if !o.json {
             eprintln!(
@@ -540,16 +584,8 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     let auth_ms = t0.elapsed().as_secs_f64() * 1e3;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let deadline = Instant::now() + o.duration;
-    let mut tasks = Vec::new();
-    for arena in &arenas {
-        tasks.push(tokio::spawn(world_sim(
-            http.clone(),
-            url.clone(),
-            arena.clone(),
-            deadline,
-            totals.clone(),
-        )));
-    }
+    let _ = window_tx.send(Some(deadline));
+    let mut tasks = sims;
     for (i, token) in tokens.into_iter().enumerate() {
         let sc = scenarios[i % scenarios.len()];
         let (http, url, tx) = (http.clone(), url.clone(), tx.clone());
@@ -595,6 +631,9 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "entity_updates_per_sec": totals.entities.load(Ordering::Relaxed) as f64 / secs,
             "sim_moves_ok": totals.moves_ok.load(Ordering::Relaxed),
             "sim_moves_err": totals.moves_err.load(Ordering::Relaxed),
+            "sim_moves_err_timeout": totals.moves_timeout.load(Ordering::Relaxed),
+            "sim_moves_err_4xx": totals.moves_4xx.load(Ordering::Relaxed),
+            "sim_moves_err_5xx": totals.moves_5xx.load(Ordering::Relaxed),
             "tick": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_tick_duration_seconds").await,
             "fanout": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_fanout_duration_seconds").await,
         }) },
