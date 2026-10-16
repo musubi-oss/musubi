@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
-use crate::realtime::world::{SpawnOutcome, SpawnSpec};
+use crate::realtime::world::{InteractSpec, SpawnOutcome, SpawnSpec};
 
 /// Simulator calls must hit the world's home node: redirect (307, same method+body) when the home
 /// advertises an HTTP address, otherwise explain which node to talk to.
@@ -153,6 +153,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/stream", get(stream))
         .route("/v1/server/worlds/{w}/handover/ack", post(handover_ack))
         .route("/v1/server/worlds/{w}/interact", post(interact))
+        .route("/v1/server/worlds/{w}/rewind", post(rewind))
 }
 
 #[derive(Deserialize)]
@@ -224,6 +225,47 @@ struct InteractReq {
     kind: String,
     #[serde(default)]
     payload: Value,
+    /// Lag compensation: the actor's tick and where it saw the target then.
+    #[serde(default)]
+    tick: Option<u64>,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+}
+
+impl InteractReq {
+    fn spec(self) -> (Uuid, String, InteractSpec) {
+        let at = match (self.x, self.y) {
+            (Some(x), Some(y)) => Some(Pos { x, y }),
+            _ => None,
+        };
+        (
+            self.sim,
+            self.entity,
+            InteractSpec {
+                kind: self.kind,
+                payload: self.payload,
+                at_tick: self.tick,
+                at,
+                tolerance: self.tolerance,
+            },
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct RewindReq {
+    entity: String,
+    tick: u64,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    tolerance: Option<f64>,
 }
 #[derive(Deserialize)]
 struct ApplyReq {
@@ -488,9 +530,33 @@ async fn interact(
     Json(r): Json<InteractReq>,
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
+    let (sim, entity, spec) = r.spec();
+    let r: Result<Json<Value>, ApiError> =
+        async { Ok(Json(s.worlds.interact(&w, sim, &entity, spec, &s.fanout)?)) }.await;
+    r.map_err(IntoResponse::into_response)
+}
+
+/// Lag compensation: where an entity was at `tick`, and whether `(x, y)` was within `tolerance`
+/// of it (`hit`); `pos` is null when history does not reach that far back.
+async fn rewind(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<RewindReq>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let at = match (r.x, r.y) {
+        (Some(x), Some(y)) => Some(Pos { x, y }),
+        _ => None,
+    };
     let r: Result<Json<Value>, ApiError> = async {
-        Ok(Json(s.worlds.interact(
-            &w, r.sim, &r.entity, &r.kind, r.payload, &s.fanout,
+        Ok(Json(s.worlds.rewind(
+            &w,
+            &r.entity,
+            r.tick,
+            at,
+            r.tolerance.unwrap_or(1.0),
         )?))
     }
     .await;
@@ -663,9 +729,19 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             }
             "interact" => {
                 let r: InteractReq = serde_json::from_value(cmd).map_err(bad)?;
-                reply["result"] = s
-                    .worlds
-                    .interact(w, sim, &r.entity, &r.kind, r.payload, &s.fanout)?;
+                let (_, entity, spec) = r.spec();
+                reply["result"] = s.worlds.interact(w, sim, &entity, spec, &s.fanout)?;
+                Ok(reply)
+            }
+            "rewind" => {
+                let r: RewindReq = serde_json::from_value(cmd).map_err(bad)?;
+                let at = match (r.x, r.y) {
+                    (Some(x), Some(y)) => Some(Pos { x, y }),
+                    _ => None,
+                };
+                reply["result"] =
+                    s.worlds
+                        .rewind(w, &r.entity, r.tick, at, r.tolerance.unwrap_or(1.0))?;
                 Ok(reply)
             }
             "handover_ack" => {

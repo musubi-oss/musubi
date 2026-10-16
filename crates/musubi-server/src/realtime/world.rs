@@ -93,6 +93,20 @@ pub struct SpawnSpec {
     pub queue: bool,
 }
 
+/// A simulator's interaction with an entity it may not own; `at_tick`/`at` let the owner check
+/// where the target really was when the actor acted (lag compensation).
+#[derive(Debug, Clone)]
+pub struct InteractSpec {
+    pub kind: String,
+    pub payload: Value,
+    /// The actor's world tick when it acted.
+    pub at_tick: Option<u64>,
+    /// Where the actor saw the target at that tick.
+    pub at: Option<Pos>,
+    /// Distance within which `at` counts as a hit (default 1.0).
+    pub tolerance: Option<f64>,
+}
+
 /// Result of a spawn that may wait for room.
 #[derive(Debug)]
 pub enum SpawnOutcome {
@@ -1708,6 +1722,25 @@ impl WorldRegistry {
         Ok(SpawnOutcome::Spawned(to_wire(st.world.get(id).unwrap())))
     }
 
+    /// Lag compensation query: where `entity` was at `tick` (and whether `at` was within
+    /// `tolerance` of it). Answered by the shard holding the entity.
+    pub fn rewind(
+        &self,
+        name: &str,
+        entity: &str,
+        tick: u64,
+        at: Option<Pos>,
+        tolerance: f64,
+    ) -> Result<Value> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let st = w.lock();
+        if st.world.get(id).is_none() {
+            return Err(mesh_err(musubi_mesh::MeshError::NoEntity));
+        }
+        Ok(rewind_json(&st.world, id, tick, at, tolerance))
+    }
+
     pub fn despawn(&self, name: &str, sim: Uuid, entity: &str) -> Result<()> {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
@@ -2016,8 +2049,7 @@ impl WorldRegistry {
         name: &str,
         sim: Uuid,
         entity: &str,
-        kind: &str,
-        payload: Value,
+        spec: InteractSpec,
         fanout: &Fanout,
     ) -> Result<Value> {
         let id = parse_entity(entity)?;
@@ -2025,7 +2057,8 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         let ev = json!({
-            "type": "interaction", "entity": id, "kind": kind, "payload": payload, "from_sim": sim
+            "type": "interaction", "entity": id, "kind": spec.kind, "payload": spec.payload,
+            "from_sim": sim, "at_tick": spec.at_tick, "at": spec.at, "tolerance": spec.tolerance,
         });
         match st.world.route_input(id, ev.clone()) {
             Ok(Some(owner)) => {
@@ -2406,6 +2439,13 @@ fn announce(st: &mut WorldState, a: &Assignment) {
 
 fn stamp_interaction(st: &mut WorldState, id: EntityId, mut ev: Value) -> Value {
     st.world.touch(id);
+    // the owner holds the target's history: answer "where was it when the actor acted" here,
+    // whether the interaction came from a local simulator or over the bus
+    if let Some(t) = ev["at_tick"].as_u64() {
+        let at = serde_json::from_value::<Option<Pos>>(ev["at"].clone()).unwrap_or(None);
+        let tol = ev["tolerance"].as_f64().unwrap_or(1.0);
+        ev["rewind"] = rewind_json(&st.world, id, t, at, tol);
+    }
     let seq = st.interaction_seq.entry(id).or_insert(0);
     *seq += 1;
     ev["seq"] = json!(*seq);
@@ -2434,6 +2474,17 @@ fn spawn_entity(
         });
     }
     id
+}
+
+/// `{tick, pos, hit, history_from}`: where `id` was at `tick` and whether `at` matches it.
+fn rewind_json(world: &World, id: EntityId, tick: u64, at: Option<Pos>, tolerance: f64) -> Value {
+    let pos = world.position_at(id, tick);
+    json!({
+        "tick": tick,
+        "pos": pos,
+        "hit": at.and_then(|a| world.was_at(id, tick, a, tolerance)),
+        "history_from": world.history_from(id),
+    })
 }
 
 /// Plan 4.9: entities whose `decay_ticks` ran out leave the world; persistent ones are

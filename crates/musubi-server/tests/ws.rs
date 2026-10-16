@@ -6355,3 +6355,152 @@ async fn time_machine_rebuilds_world_at_tick() {
     let (st, v) = at(router.clone(), t1 - 1).await;
     assert_eq!(st, 404, "{v}");
 }
+
+/// Lag compensation: the shard keeps `history_ticks` of positions per entity; `rewind` answers
+/// where the target was at a past tick (and whether a claimed point matches), an `interaction`
+/// with the actor's tick carries that answer to the owner, and history older than the window is
+/// unknown rather than guessed.
+#[tokio::test]
+async fn interaction_rewinds_target_to_the_actors_tick() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "history_ticks": 8}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "x": 10.0, "y": 10.0, "components": {}, "persistent": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let target = e["id"].as_str().unwrap().to_string();
+    let apply = |router: axum::Router, x: f64| {
+        let (world, target) = (world.clone(), target.clone());
+        async move {
+            let (st, v) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/apply"),
+                None,
+                true,
+                Some(json!({"sim": sim, "entity": target, "x": x, "y": 10.0, "components": {}})),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+        }
+    };
+    let tick_now = |router: axum::Router| {
+        let world = world.clone();
+        async move {
+            let (st, v) = http_json(
+                &router,
+                "GET",
+                &format!("/v1/admin/worlds/{world}/entities"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+            v["tick"].as_u64().unwrap()
+        }
+    };
+    let t_spawn = tick_now(router.clone()).await;
+    // 12 ticks: the spawn sample falls out of an 8-tick history once a newer one is recorded
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    apply(router.clone(), 20.0).await;
+    let t_mid = tick_now(router.clone()).await;
+    assert!(t_mid > t_spawn + 8, "{t_mid} vs {t_spawn}");
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    apply(router.clone(), 30.0).await;
+    let t_now = tick_now(router.clone()).await;
+    assert!(t_now > t_mid + 1 && t_now < t_mid + 8, "{t_now} vs {t_mid}");
+    let rewind = |router: axum::Router, tick: u64, x: f64| {
+        let (world, target) = (world.clone(), target.clone());
+        async move {
+            let (st, v) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/rewind"),
+                None,
+                true,
+                Some(json!({"entity": target, "tick": tick, "x": x, "y": 10.0, "tolerance": 0.5})),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+            v
+        }
+    };
+    // where it was then, not where it is now
+    let v = rewind(router.clone(), t_mid, 20.0).await;
+    assert_eq!(v["pos"]["x"], json!(20.0), "{v}");
+    assert_eq!(v["hit"], json!(true), "{v}");
+    let v = rewind(router.clone(), t_mid, 30.0).await;
+    assert_eq!(v["hit"], json!(false), "{v}");
+    let v = rewind(router.clone(), t_now, 30.0).await;
+    assert_eq!(v["pos"]["x"], json!(30.0), "{v}");
+    assert_eq!(v["hit"], json!(true), "{v}");
+    // older than the kept history: unknown, not a guess
+    let v = rewind(router.clone(), t_spawn, 10.0).await;
+    assert!(v["pos"].is_null(), "{v}");
+    assert!(v["hit"].is_null(), "{v}");
+    // an interaction stamped with the actor's tick carries the rewind to the owner
+    let shooter = uuid::Uuid::now_v7();
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/interact"),
+        None,
+        true,
+        Some(
+            json!({"sim": shooter, "entity": target, "kind": "hit", "payload": {"dmg": 5},
+                    "tick": t_mid, "x": 20.0, "y": 10.0, "tolerance": 0.5}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["delivered"], json!("owner"));
+    let (st, ev) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{world}/events?sim={sim}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let hit = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "interaction")
+        .unwrap_or_else(|| panic!("{ev}"));
+    assert_eq!(hit["rewind"]["tick"], json!(t_mid), "{hit}");
+    assert_eq!(hit["rewind"]["pos"]["x"], json!(20.0), "{hit}");
+    assert_eq!(hit["rewind"]["hit"], json!(true), "{hit}");
+}

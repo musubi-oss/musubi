@@ -9,7 +9,7 @@
 
 pub mod controller;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -101,6 +101,9 @@ pub struct WorldConfig {
     /// A leased cell no client has watched for this many ticks hibernates: lease revoked,
     /// ephemeral entities gone, persistent ones kept until interest returns (0 = never).
     pub hibernate_after_ticks: u64,
+    /// Ticks of position history kept per entity for lag compensation (`position_at`): a hit
+    /// claimed at the shooter's tick is checked against where the target was then.
+    pub history_ticks: u64,
 }
 
 impl Default for WorldConfig {
@@ -118,6 +121,7 @@ impl Default for WorldConfig {
             tidi_min: 0.1,
             queue_ttl_ticks: 600,
             hibernate_after_ticks: 1800,
+            history_ticks: 15,
         }
     }
 }
@@ -197,6 +201,8 @@ pub struct World {
     interests: HashMap<ClientId, Interest>,
     /// Inputs that arrived while the target entity was in transit; delivered to the new owner.
     buffered_inputs: HashMap<EntityId, Vec<serde_json::Value>>,
+    /// Recent `(tick, pos)` samples per entity, newest last (lag compensation rewind).
+    history: HashMap<EntityId, VecDeque<(u64, Pos)>>,
     /// Cells running slower than real time (EVE-style time dilation); absent = 1.0.
     cell_scale: HashMap<CellId, f64>,
 }
@@ -213,6 +219,7 @@ impl World {
             leases: HashMap::new(),
             interests: HashMap::new(),
             buffered_inputs: HashMap::new(),
+            history: HashMap::new(),
             cell_scale: HashMap::new(),
         }
     }
@@ -489,7 +496,46 @@ impl World {
         };
         self.by_cell.entry(cell).or_default().insert(id);
         self.entities.insert(id, e);
+        self.record_pos(id, pos);
         id
+    }
+
+    fn record_pos(&mut self, id: EntityId, pos: Pos) {
+        let (tick, keep) = (self.tick, self.cfg.history_ticks.max(1));
+        let h = self.history.entry(id).or_default();
+        match h.back_mut() {
+            Some(last) if last.0 == tick => last.1 = pos,
+            _ => h.push_back((tick, pos)),
+        }
+        while h
+            .front()
+            .is_some_and(|(t, _)| tick.saturating_sub(*t) > keep)
+        {
+            h.pop_front();
+        }
+    }
+
+    /// Where the entity was at the end of `tick`: its newest recorded position at or before it,
+    /// `None` when `tick` is older than the kept history (or before the entity existed).
+    pub fn position_at(&self, id: EntityId, tick: u64) -> Option<Pos> {
+        self.history
+            .get(&id)?
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= tick)
+            .map(|(_, p)| *p)
+    }
+
+    /// Oldest tick `position_at` can answer for the entity.
+    pub fn history_from(&self, id: EntityId) -> Option<u64> {
+        self.history.get(&id)?.front().map(|(t, _)| *t)
+    }
+
+    /// Source-style rewind check: was the entity within `tolerance` of `at` at `tick`? `None`
+    /// when history does not reach back that far.
+    pub fn was_at(&self, id: EntityId, tick: u64, at: Pos, tolerance: f64) -> Option<bool> {
+        let p = self.position_at(id, tick)?;
+        Some(((p.x - at.x).powi(2) + (p.y - at.y).powi(2)).sqrt() <= tolerance)
     }
 
     pub fn despawn(&mut self, id: EntityId) -> bool {
@@ -500,6 +546,7 @@ impl World {
             set.remove(&id);
         }
         self.buffered_inputs.remove(&id);
+        self.history.remove(&id);
         true
     }
 
@@ -601,6 +648,10 @@ impl World {
         if let Some(p) = pos {
             e.pos = p;
         }
+        if let Some(p) = pos {
+            self.record_pos(id, p);
+        }
+        let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
         for (k, v) in components {
             let c = e.components.entry(k).or_insert(Component {
                 value: serde_json::Value::Null,
@@ -1120,7 +1171,9 @@ impl World {
             e.transit = None;
             e.cell = self.cell_of(e.pos);
             self.by_cell.entry(e.cell).or_default().insert(e.id);
+            let (id, pos) = (e.id, e.pos);
             self.entities.insert(e.id, e);
+            self.record_pos(id, pos);
         }
     }
 }
