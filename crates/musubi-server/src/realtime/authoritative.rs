@@ -31,6 +31,8 @@ pub struct MatchRegistry {
     pub snapshot_every: u64,
     /// Journal flush interval in ticks (0 = off); bounds what a failover loses.
     pub journal_every: u64,
+    /// Set by `release_all`: no snapshot may re-own a row this node has just disowned.
+    draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for MatchRegistry {
@@ -51,6 +53,7 @@ impl MatchRegistry {
             events: std::sync::OnceLock::new(),
             snapshot_every: 50,
             journal_every: 5,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
         r
@@ -86,6 +89,7 @@ impl MatchRegistry {
         let node = self.node_id;
         let group = self.group.clone();
         let events = self.events.get().cloned();
+        let draining = self.draining.clone();
         Some(Arc::new(move |id: MatchId, snap: Option<Snapshot>| {
             let db = db.clone();
             let group = group.clone();
@@ -99,12 +103,15 @@ impl MatchRegistry {
                     });
                 }
             }
+            if draining.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             tokio::spawn(async move {
                 let res = match snap {
                     Some(s) => sqlx::query(
                         "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group)
                          values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
-                         on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = excluded.node_id, updated_at = now()",
+                         on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, updated_at = now()",
                     )
                     .bind(id.0)
                     .bind(&s.module)
@@ -286,6 +293,8 @@ impl MatchRegistry {
         let Some(db) = &self.db else {
             return Ok(0);
         };
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let r = sqlx::query("update musubi.match_snapshots set node_id = null where node_id = $1")
             .bind(self.node_id)
             .execute(db)
