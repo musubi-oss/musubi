@@ -166,6 +166,8 @@ Degradation under load (plan 4.8): `soft_cap` in the world config refuses spawns
 
 Operators: `GET /v1/admin/worlds/{w}/entities` dumps this node's shard of a world — every entity with cell, position, transit state and the live leases (where is entity X right now?); `musubi soak --rejoin-delay-secs N` keeps a killed node down for N seconds so the survivors alone must account for every entity.
 
+Shard rows are merged with provenance: when a world is rebuilt from several nodes' snapshots and journals (home hand-off at drain, a host that died, a host that handed its cell back), a `Despawn`/`Apply` from node X only touches entities whose current copy came from X — a stale "it left my shard" record of a former host can no longer erase the fresh home snapshot. Hand-offs also stop a node from persisting stale rows afterwards: a drained home drops its worlds right after the hand-off snapshot, a shard that gave up its last cell (drain, reassignment, boot hand-back after a restart) is dropped with its journal buffer, and cell assignments consulted during adoption and pruning are confirmed through the Raft leader. Found by the soak with `--victim leader` and a 1 s rejoin: 1 in 2–3 runs lost 5–15 persistent entities at drain; three consecutive runs since are at 0.
+
 ## Integrations (Zanshin LiveOps, Aurix voice)
 
 `[zanshin] url, server_key, flush_secs` and `[aurix] url, api_key, party_channel_type, match_channel_type` in the config (unset `url` = disabled). The Musubi account id is the `external_id` on both sides.

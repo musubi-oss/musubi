@@ -593,6 +593,7 @@ impl Fanout {
                             w.release_cell(&world, cell, node, &me);
                             w.forget_adoptions(&world, cell);
                             w.note_cell_host(&world, cell, node);
+                            w.drop_idle_shard(&world);
                         });
                     } else {
                         w.forget_adoptions(&world, cell);

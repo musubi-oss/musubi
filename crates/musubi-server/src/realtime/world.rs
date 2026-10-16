@@ -84,7 +84,16 @@ pub enum WorldMutation {
     },
 }
 
-fn replay(world: &mut World, ops: &[WorldOp], from_tick: u64) -> usize {
+/// Replays `node`'s journal over a world merged from several shards. `src` remembers which node's
+/// snapshot or Spawn produced each entity's current copy: a Despawn/Apply from another node is a
+/// stale "it left my shard" record and must not touch a copy that came from elsewhere.
+fn replay(
+    world: &mut World,
+    ops: &[WorldOp],
+    from_tick: u64,
+    node: Uuid,
+    src: &mut HashMap<musubi_mesh::EntityId, Uuid>,
+) -> usize {
     let mut n = 0;
     // ops at the snapshot's own tick may or may not be in it; every op is idempotent, so replay them
     for o in ops.iter().filter(|o| o.tick >= from_tick) {
@@ -101,17 +110,23 @@ fn replay(world: &mut World, ops: &[WorldOp], from_tick: u64) -> usize {
             } => {
                 if world.get(*id).is_none() {
                     world.spawn_with_id(*id, *pos, comps(components), true);
+                    src.insert(*id, node);
                 }
             }
             WorldMutation::Despawn { id } => {
-                world.despawn(*id);
+                if src.get(id).is_none_or(|s| *s == node) {
+                    world.despawn(*id);
+                    src.remove(id);
+                }
             }
             WorldMutation::Apply {
                 id,
                 pos,
                 components,
             } => {
-                let _ = world.force_apply(*id, *pos, comps(components));
+                if src.get(id).is_none_or(|s| *s == node) {
+                    let _ = world.force_apply(*id, *pos, comps(components));
+                }
             }
         }
         if o.tick > world.tick {
@@ -333,6 +348,31 @@ impl WorldRegistry {
         n
     }
 
+    /// A hosted-only shard that gave up its last cell must stop existing here: left ticking, it
+    /// would flush its journal (Despawns of the entities just handed back) and an empty periodic
+    /// snapshot after the new host merged and pruned our rows, and the next adoption of the world
+    /// would replay those Despawns over the fresh state.
+    pub fn drop_idle_shard(&self, name: &str) -> bool {
+        let idle = match self.worlds.get(name) {
+            Some(w) => {
+                w.lock().hosted_only
+                    && !self
+                        .cell_hosts
+                        .iter()
+                        .any(|r| r.key().0 == name && *r.value() == self.node_id)
+            }
+            None => false,
+        };
+        if idle {
+            if let Some((_, w)) = self.worlds.remove(name) {
+                w.lock().journal.clear();
+            }
+            self.homes.remove(name);
+            tracing::info!(world = name, "idle hosted shard dropped");
+        }
+        idle
+    }
+
     /// Cell containing `pos` under this world's grid (needs a local copy of the world).
     pub fn cell_of(&self, name: &str, pos: Pos) -> Result<CellId> {
         let w = self.get(name)?;
@@ -424,6 +464,12 @@ impl WorldRegistry {
             }
             if let Some(h) = target {
                 fanout.cell_assign(name, cell, h);
+                // a fresh process has no cached assignment, so the bus handler would not
+                // recognise us as the previous host: ship and drop the shard here, or it keeps
+                // ticking and persisting stale rows the next adoption of the world replays
+                self.release_cell(name, cell, h, fanout);
+                self.note_cell_host(name, cell, h);
+                self.drop_idle_shard(name);
             } else {
                 self.cell_hosts.remove(&(name.to_string(), cell));
             }
@@ -657,8 +703,12 @@ impl WorldRegistry {
         .await
         .map_err(Error::internal)?;
         let mut since: HashMap<Uuid, u64> = HashMap::new();
+        let mut src: HashMap<musubi_mesh::EntityId, Uuid> = HashMap::new();
         for (node, ents, tick) in snaps {
             let ents: Vec<musubi_mesh::Entity> = serde_json::from_value(ents)?;
+            for e in &ents {
+                src.insert(e.id, node);
+            }
             world.restore(ents);
             world.tick = world.tick.max(tick as u64);
             since.insert(node, tick as u64);
@@ -691,7 +741,7 @@ impl WorldRegistry {
             // the Spawn that came back later would erase the entity
             ops.sort_by_key(|o| o.tick);
             let from = since.get(&node).copied().unwrap_or(0);
-            replayed += replay(world, &ops, from);
+            replayed += replay(world, &ops, from, node, &mut src);
         }
         Ok(replayed)
     }
@@ -728,11 +778,19 @@ impl WorldRegistry {
         let Some(c) = self.cluster.get() else {
             return vec![];
         };
-        c.directory_prefix(&format!("world:{name}:cell:"))
-            .await
-            .into_iter()
-            .filter_map(|(_, v)| v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()))
-            .collect()
+        // confirmed through the leader: the local copy may still list a host that just gave the
+        // cell up, and keeping its rows means replaying them over fresher state later
+        let mut out = Vec::new();
+        for (key, _) in c.directory_prefix(&format!("world:{name}:cell:")).await {
+            if let Some(h) = c
+                .directory_get_fresh(&key)
+                .await
+                .and_then(|v| v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()))
+            {
+                out.push(h);
+            }
+        }
+        out
     }
 
     pub async fn snapshot_now(&self, name: &str) -> Result<()> {
@@ -791,8 +849,26 @@ impl WorldRegistry {
                     .strip_prefix("world:")
                     .and_then(|k| k.split_once(":cell:"))
                 {
-                    if let Some(h) = v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()) {
-                        assigned.entry(n.to_string()).or_default().push(h);
+                    let Some(h) = v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok())
+                    else {
+                        continue;
+                    };
+                    // a host counted as live keeps its shard out of the restore, so a stale local
+                    // copy of the directory (the drained node deleted its self-assignment on the
+                    // leader a moment ago) must not hide its fresh snapshot: confirm linearizably
+                    let fresh = match alive {
+                        Some(a) if a.contains(&h) && !dead_nodes.contains(&h) => {
+                            c.directory_get_fresh(&key).await.and_then(|v| {
+                                v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok())
+                            })
+                        }
+                        _ => Some(h),
+                    };
+                    match fresh {
+                        Some(h) => assigned.entry(n.to_string()).or_default().push(h),
+                        None => {
+                            tracing::info!(key, "stale cell assignment skipped during adoption")
+                        }
                     }
                 }
             }
@@ -935,6 +1011,8 @@ impl WorldRegistry {
             }
             fanout.cell_assign(&name, cell, home);
             self.release_cell(&name, cell, home, fanout);
+            self.note_cell_host(&name, cell, home);
+            self.drop_idle_shard(&name);
             out.push((name, cell));
         }
         if !out.is_empty() {
@@ -963,6 +1041,12 @@ impl WorldRegistry {
             .await
             .map_err(Error::internal)?;
             if r.rows_affected() > 0 {
+                // the snapshot is now the only authoritative copy: a world left ticking here would
+                // start handing its entities over to the adopter the moment it publishes itself as
+                // home (journaling Despawns the adopter replays over that snapshot) and the node
+                // exits before those handovers land
+                self.worlds.remove(&name);
+                self.homes.remove(&name);
                 out.push(name);
             }
         }
