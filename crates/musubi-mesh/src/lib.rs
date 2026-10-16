@@ -766,11 +766,12 @@ impl World {
     /// Co-locate: until `ttl_ticks` pass, `id`'s authoritative cell is `cell` regardless of its
     /// position — the regular handover path moves it there (state and inputs included) and
     /// hands it back once the pin lapses. Returns the tick the pin expires.
-    pub fn pin(&mut self, id: EntityId, cell: CellId, ttl_ticks: u64) -> Option<u64> {
-        self.entities.get(&id)?;
+    /// The entity need not be here yet: a node pins before the partner arrives from another
+    /// node so that it lands in the pinned cell instead of the one its position says.
+    pub fn pin(&mut self, id: EntityId, cell: CellId, ttl_ticks: u64) -> u64 {
         let until = self.tick + ttl_ticks.max(1);
         self.pins.insert(id, (cell, until));
-        Some(until)
+        until
     }
 
     pub fn unpin(&mut self, id: EntityId) -> bool {
@@ -1204,7 +1205,10 @@ impl World {
                 }
             }
             e.transit = None;
-            e.cell = self.cell_of(e.pos);
+            e.cell = match self.pins.get(&e.id) {
+                Some((c, _)) => *c,
+                None => self.cell_of(e.pos),
+            };
             self.by_cell.entry(e.cell).or_default().insert(e.id);
             let (id, pos) = (e.id, e.pos);
             self.entities.insert(e.id, e);

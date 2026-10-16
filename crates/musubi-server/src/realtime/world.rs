@@ -1775,6 +1775,34 @@ impl WorldRegistry {
     /// to it — `with` is pinned into that cell for `ttl_ticks` and the regular handover brings it
     /// over (its owner gets `handover_request`, `sim` acks); when the pin lapses it goes back to
     /// where its position says. Both entities must be on this shard.
+    /// Bus side of a cross-node co-locate: pin `id` into `cell` (hosted by the requester) so
+    /// `detect_remote_handovers` ships it there; its owner hears `co_locate`.
+    pub fn accept_remote_co_locate(
+        &self,
+        name: &str,
+        id: EntityId,
+        cell: CellId,
+        by: Uuid,
+        ttl_ticks: u64,
+    ) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        let Some(e) = st.world.get(id).cloned() else {
+            return;
+        };
+        let until = st.world.pin(id, cell, ttl_ticks);
+        if let Some(owner) = st.world.owner(e.cell) {
+            push_event(
+                st,
+                owner,
+                json!({"type": "co_locate", "entity": id, "cell": cell, "by": by, "until_tick": until}),
+            );
+        }
+    }
+
     pub fn co_locate(
         &self,
         name: &str,
@@ -1782,6 +1810,7 @@ impl WorldRegistry {
         entity: &str,
         with: &str,
         ttl_ticks: u64,
+        fanout: &Fanout,
     ) -> Result<Value> {
         let a = parse_entity(entity)?;
         let b = parse_entity(with)?;
@@ -1803,11 +1832,18 @@ impl WorldRegistry {
             None => return Err(Error::Conflict(format!("cell {cell:?} has no live lease"))),
         }
         if st.world.get(b).is_none() {
-            return Err(Error::NotFound(format!(
-                "entity {b} is not on this shard (cross-node co-locate is not supported yet)"
-            )));
+            if !self.is_split(name) {
+                return Err(Error::NotFound(format!("entity {b} is not in this world")));
+            }
+            // the partner lives on the node hosting its cell: pin here so it lands in `cell`
+            // when it arrives, and ask that node to pin and ship it
+            let until = st.world.pin(b, cell, ttl_ticks);
+            fanout.world_co_locate(name, b, cell, sim, ttl_ticks);
+            return Ok(
+                json!({"pinned": b, "with": a, "cell": cell, "until_tick": until, "forwarded": true}),
+            );
         }
-        let until = st.world.pin(b, cell, ttl_ticks).unwrap();
+        let until = st.world.pin(b, cell, ttl_ticks);
         if let Some(owner) = st.world.owner(st.world.get(b).unwrap().cell) {
             push_event(
                 st,
@@ -1994,7 +2030,12 @@ impl WorldRegistry {
         };
         let mut st = w.lock();
         let st = &mut *st;
-        let cell = st.world.cell_of(entity.pos);
+        // a co-located partner lands in the cell it was pinned to, not where its position says
+        let cell = st
+            .world
+            .pinned_to(entity.id)
+            .map(|(c, _)| c)
+            .unwrap_or_else(|| st.world.cell_of(entity.pos));
         // ours if assigned to us, or unassigned and we are the home
         let here = match self.cell_hosts.get(&(name.to_string(), cell)) {
             Some(h) => *h == self.node_id,

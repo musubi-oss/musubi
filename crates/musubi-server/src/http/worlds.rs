@@ -589,6 +589,7 @@ async fn colocate(
             &r.entity,
             &r.with,
             r.ttl_ticks,
+            &s.fanout,
         )?))
     }
     .await;
@@ -794,9 +795,9 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             }
             "colocate" => {
                 let r: CoLocateReq = serde_json::from_value(cmd).map_err(bad)?;
-                reply["result"] = s
-                    .worlds
-                    .co_locate(w, sim, &r.entity, &r.with, r.ttl_ticks)?;
+                reply["result"] =
+                    s.worlds
+                        .co_locate(w, sim, &r.entity, &r.with, r.ttl_ticks, &s.fanout)?;
                 Ok(reply)
             }
             "rewind" => {

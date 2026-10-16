@@ -84,6 +84,15 @@ enum Wire {
         entity: musubi_mesh::EntityId,
         input: serde_json::Value,
     },
+    /// Co-locate request for an entity living on another node: pin it into `cell` (hosted by the
+    /// sender) for `ttl_ticks`; its shard hands it over like a border crossing.
+    WorldCoLocate {
+        world: String,
+        entity: musubi_mesh::EntityId,
+        cell: musubi_mesh::CellId,
+        by: uuid::Uuid,
+        ttl_ticks: u64,
+    },
     /// Coordinator → cluster: `node` now hosts `cell` of `world` (cells of one world may spread).
     WorldCellAssign {
         world: String,
@@ -359,6 +368,23 @@ impl Fanout {
         });
     }
 
+    pub fn world_co_locate(
+        &self,
+        world: &str,
+        entity: musubi_mesh::EntityId,
+        cell: musubi_mesh::CellId,
+        by: uuid::Uuid,
+        ttl_ticks: u64,
+    ) {
+        self.publish(Wire::WorldCoLocate {
+            world: world.to_string(),
+            entity,
+            cell,
+            by,
+            ttl_ticks,
+        });
+    }
+
     /// Announce that `node` hosts `cell` of `world`.
     pub fn cell_assign(&self, world: &str, cell: musubi_mesh::CellId, node: uuid::Uuid) {
         self.publish(Wire::WorldCellAssign {
@@ -566,6 +592,17 @@ impl Fanout {
             }) => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_remote_input(&world, entity, input);
+                }
+            }
+            Ok(Wire::WorldCoLocate {
+                world,
+                entity,
+                cell,
+                by,
+                ttl_ticks,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_remote_co_locate(&world, entity, cell, by, ttl_ticks);
                 }
             }
             Ok(Wire::WorldCellAssign { world, cell, node }) => {

@@ -6719,3 +6719,176 @@ async fn world_for_a_region_without_nodes_is_placed_here() {
         .unwrap();
     assert_eq!(region, "eu-nowhere");
 }
+
+/// Cross-node co-locate: the partner lives in a cell hosted on another node; the request is
+/// forwarded over the bus, that node pins and ships the entity through its regular cross-node
+/// handover, and it lands in the caller's cell under the caller's authority.
+#[tokio::test]
+async fn colocate_pins_a_partner_from_another_node() {
+    let group = format!("xcolo-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": name, "config": {"cell_size": 100.0, "ghost_margin": 20.0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (sim_a, sim_b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    for (router, sim, cell) in [(&router1, sim_a, (0, 0)), (&router2, sim_b, (1, 0))] {
+        let (st, l) = http_json(
+            router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/lease"),
+            None,
+            true,
+            Some(json!({"sim": sim, "cells": [{"x": cell.0, "y": cell.1}]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{l}");
+    }
+    let spawn = |router: axum::Router, sim: uuid::Uuid, x: f64| {
+        let name = name.clone();
+        async move {
+            let (st, e) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{name}/spawn"),
+                None,
+                true,
+                Some(json!({"sim": sim, "x": x, "y": 50.0, "components": {}, "persistent": false})),
+            )
+            .await;
+            assert_eq!(st, 200, "{e}");
+            e["id"].as_str().unwrap().to_string()
+        }
+    };
+    let a = spawn(router1.clone(), sim_a, 50.0).await;
+    let b = spawn(router2.clone(), sim_b, 150.0).await;
+    let (st, r) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/colocate"),
+        None,
+        true,
+        Some(json!({"sim": sim_a, "entity": a, "with": b, "ttl_ticks": 600})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["forwarded"], json!(true), "{r}");
+    assert_eq!(r["cell"], json!({"x": 0, "y": 0}));
+    // the partner crosses nodes into the caller's cell
+    let mut owned = Vec::new();
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, va) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        owned = va["owned"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|g| g["id"].as_str().map(str::to_string))
+            .collect();
+        if owned.contains(&b) {
+            break;
+        }
+    }
+    if !owned.contains(&b) {
+        let (_, d1) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/admin/worlds/{name}/entities"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, d2) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/admin/worlds/{name}/entities"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, ev) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/events?sim={sim_a}"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        panic!("b not in caller's cell: {owned:?}\nnode1: {d1}\nnode2: {d2}\nsim_a events: {ev}");
+    }
+    assert!(owned.contains(&a));
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(json!({"sim": sim_a, "entity": b, "x": 151.0, "y": 50.0, "components": {}})),
+    )
+    .await;
+    assert_eq!(st, 200, "caller owns the partner now: {v}");
+}
