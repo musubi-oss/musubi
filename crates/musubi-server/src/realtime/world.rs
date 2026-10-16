@@ -51,7 +51,7 @@ struct WorldState {
     interaction_seq: HashMap<EntityId, u64>,
 }
 
-/// A cross-node handover is re-sent this many times before it is given up.
+/// A cross-node handover still unacknowledged after this many re-sends is logged (it keeps going).
 const REMOTE_HANDOVER_RETRIES: u32 = 5;
 
 /// Remote ghosts older than this are stale (their host stopped publishing or moved).
@@ -1556,6 +1556,30 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         let Some(t) = st.world.get(id).and_then(|e| e.transit.clone()) else {
+            // a late ack for a handover we already cancelled: if the receiver took the entity
+            // and its cell is not ours, our copy is the stale one — drop it instead of keeping
+            // two owners
+            if accepted {
+                if let Some(e) = st.world.get(id).cloned() {
+                    let cell = st.world.cell_of(e.pos);
+                    let elsewhere = match self.cell_hosts.get(&(name.to_string(), cell)) {
+                        Some(h) => *h != self.node_id,
+                        None => st.hosted_only,
+                    };
+                    if elsewhere {
+                        tracing::info!(world = name, %id, "late handover ack: stale local copy dropped");
+                        st.remote_transit.remove(&id);
+                        st.world.forget_for_clients(id);
+                        st.world.despawn(id);
+                        if e.persistent {
+                            st.journal.push(WorldOp {
+                                tick: st.world.tick,
+                                op: WorldMutation::Despawn { id },
+                            });
+                        }
+                    }
+                }
+            }
             return;
         };
         st.remote_transit.remove(&id);
@@ -1866,16 +1890,18 @@ impl WorldRegistry {
                     }
                     HandoverOutcome::Completed { .. } => {}
                     HandoverOutcome::Cancelled { entity, .. }
-                        if st
-                            .remote_transit
-                            .get(&entity)
-                            .is_some_and(|(_, n)| *n < REMOTE_HANDOVER_RETRIES) =>
+                        if st.remote_transit.contains_key(&entity) =>
                     {
                         // no ack from the other node yet: ship it again (the receiver re-acks if it
-                        // already has it) instead of giving up
+                        // already has it). Never give up: the entity sits in a cell another node
+                        // hosts, and a copy kept alive here would become a second owner once the
+                        // real one moves on (the stand saw 5 of 20 entities duplicated that way).
                         let Some((host, n)) = st.remote_transit.get(&entity).copied() else {
                             continue;
                         };
+                        if n + 1 == REMOTE_HANDOVER_RETRIES {
+                            tracing::warn!(world = %name, %entity, %host, tries = n + 1, "cross-node handover still unacknowledged; keeps retrying");
+                        }
                         st.remote_transit.insert(entity, (host, n + 1));
                         if st.world.begin_remote_handover(entity, host) {
                             if let Some(mut e) = st.world.get(entity).cloned() {
