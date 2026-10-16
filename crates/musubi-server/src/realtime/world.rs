@@ -2361,8 +2361,8 @@ impl WorldRegistry {
         let name = name.to_string();
         {
             let started = std::time::Instant::now();
-            let mut st = w.lock();
-            let st = &mut *st;
+            let mut guard = w.lock();
+            let st = &mut *guard;
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
             drain_admission(st);
@@ -2551,18 +2551,31 @@ impl WorldRegistry {
             metrics::gauge!("musubi_world_entities", "world" => name.clone())
                 .set(st.world.len() as f64);
             // per-client delta build + send: the part of a tick that grows with players, so it
-            // is measured apart from the simulation step above
+            // is measured apart from the simulation step above. Deltas are built under the lock
+            // (they read the world); wire messages are built and sent after it is released.
             let fan_started = std::time::Instant::now();
-            let mut frames = 0u64;
             let by_client: HashMap<Uuid, SessionId> =
                 st.subs.iter().map(|(s, c)| (*c, *s)).collect();
-            for (client, d) in st.world.deltas_all() {
-                let Some(sid) = by_client.get(&client) else {
-                    continue;
-                };
-                let scale = st.world.scale_for_client(client);
-                fanout.session(*sid, delta_msg(&name, tick, scale, d));
-                frames += 1;
+            let pending: Vec<(SessionId, f64, Delta)> = st
+                .world
+                .deltas_all()
+                .into_iter()
+                .filter_map(|(client, d)| {
+                    let sid = *by_client.get(&client)?;
+                    Some((sid, st.world.scale_for_client(client), d))
+                })
+                .collect();
+            drop(guard);
+            let frames = pending.len() as u64;
+            let msgs: Vec<(SessionId, ServerMessage)> = {
+                use rayon::prelude::*;
+                pending
+                    .into_par_iter()
+                    .map(|(sid, scale, d)| (sid, delta_msg(&name, tick, scale, d)))
+                    .collect()
+            };
+            for (sid, msg) in msgs {
+                fanout.session(sid, msg);
             }
             metrics::histogram!("musubi_world_fanout_duration_seconds", "world" => name.clone())
                 .record(fan_started.elapsed().as_secs_f64());

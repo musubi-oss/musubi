@@ -2226,6 +2226,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "quinn",
+ "rayon",
  "rcgen",
  "reqwest 0.12.28",
  "serde",

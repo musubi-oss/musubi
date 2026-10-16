@@ -321,6 +321,20 @@ impl Hub {
             .is_some_and(|h| h.tx.try_send(msg).is_ok())
     }
 
+    /// Like `send_to_session`, but hands the message back when the session is not here or its
+    /// queue is full, so the caller can forward it without having cloned it first.
+    #[allow(clippy::result_large_err)] // the point is to hand the message back
+    pub fn try_send_session(
+        &self,
+        session_id: SessionId,
+        msg: ServerMessage,
+    ) -> Result<(), ServerMessage> {
+        match self.sessions.get(&session_id) {
+            Some(h) => h.tx.try_send(msg).map_err(|e| e.into_inner()),
+            None => Err(msg),
+        }
+    }
+
     pub fn send_to_account(&self, account_id: AccountId, msg: ServerMessage) -> usize {
         let Some(sids) = self.by_account.get(&account_id) else {
             return 0;

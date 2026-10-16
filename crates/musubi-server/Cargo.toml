@@ -11,6 +11,7 @@ name = "musubi-server"
 path = "src/main.rs"
 
 [dependencies]
+rayon = "1"
 musubi-core.workspace = true
 musubi-auth.workspace = true
 musubi-storage.workspace = true
