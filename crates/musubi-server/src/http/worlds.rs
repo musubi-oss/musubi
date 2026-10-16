@@ -151,6 +151,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/events", get(events))
         .route("/v1/server/worlds/{w}/stream", get(stream))
         .route("/v1/server/worlds/{w}/handover/ack", post(handover_ack))
+        .route("/v1/server/worlds/{w}/interact", post(interact))
 }
 
 #[derive(Deserialize)]
@@ -201,6 +202,14 @@ struct EntityReq {
     entity: String,
 }
 
+#[derive(Deserialize)]
+struct InteractReq {
+    sim: Uuid,
+    entity: String,
+    kind: String,
+    #[serde(default)]
+    payload: Value,
+}
 #[derive(Deserialize)]
 struct ApplyReq {
     sim: Uuid,
@@ -428,12 +437,29 @@ async fn handover_ack(
     r.map_err(IntoResponse::into_response)
 }
 
+async fn interact(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<InteractReq>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        Ok(Json(s.worlds.interact(
+            &w, r.sim, &r.entity, &r.kind, r.payload, &s.fanout,
+        )?))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
+}
+
 /// `GET /v1/server/worlds/{w}/stream?sim=<uuid>` — the streaming simulator protocol. Instead of
 /// polling `/view` and `/events` every tick, the simulator keeps one WebSocket per node that
 /// hosts its cells: after every registry tick the node renews the simulator's lease (connected
 /// means alive), and pushes one `tick` frame with the view of every leased cell and the pending
 /// events. Commands go the other way as JSON objects with an `op` (`lease`, `spawn`, `despawn`,
-/// `apply`, `handover_ack`) and the same fields as the matching HTTP body (minus `sim`); the reply
+/// `apply`, `interact`, `handover_ack`) and the same fields as the matching HTTP body (minus `sim`); the reply
 /// echoes `op` and an optional `id`. A cell hosted by another node answers `lease`/`spawn` with
 /// `redirect` (that node's URL) exactly like the HTTP endpoints.
 async fn stream(
@@ -567,6 +593,13 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                 };
                 s.worlds.apply(w, sim, &r.entity, pos, r.components)?;
                 reply["ok"] = json!(true);
+                Ok(reply)
+            }
+            "interact" => {
+                let r: InteractReq = serde_json::from_value(cmd).map_err(bad)?;
+                reply["result"] = s
+                    .worlds
+                    .interact(w, sim, &r.entity, &r.kind, r.payload, &s.fanout)?;
                 Ok(reply)
             }
             "handover_ack" => {

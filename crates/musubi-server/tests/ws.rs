@@ -5451,3 +5451,189 @@ async fn simulator_stream_pushes_views_every_tick() {
     assert_eq!(r["id"], 3, "{r}");
     assert!(r["error"].as_str().unwrap().contains("unknown op"), "{r}");
 }
+
+/// A simulator hits an entity it does not own: locally (another cell on the same node) and from
+/// the node hosting a neighbouring cell. The owner's simulator gets `interaction` events in one
+/// per-entity sequence; nobody else may write the target.
+#[tokio::test]
+async fn cross_boundary_interaction_reaches_the_targets_owner() {
+    let group = format!("xint-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": name, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (sim1, sim2, sim3) = (
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+    );
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim1, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim3, "cells": [{"x": 0, "y": 1}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim2, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, e) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim1, "x": 95.0, "y": 50.0, "components": {"hp": 10}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let target = e["id"].as_str().unwrap().to_string();
+    // from the other node (sim2 sees the target as a ghost of cell (0,0))
+    for dmg in [3, 4] {
+        let (st, r) = http_json(
+            &router2,
+            "POST",
+            &format!("/v1/server/worlds/{name}/interact"),
+            None,
+            true,
+            Some(json!({"sim": sim2, "entity": target, "kind": "hit", "payload": {"damage": dmg}})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        assert_eq!(r["delivered"], "forwarded", "{r}");
+    }
+    // from another simulator on the owner's node
+    let (st, r) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/interact"),
+        None,
+        true,
+        Some(json!({"sim": sim3, "entity": target, "kind": "heal", "payload": {"amount": 1}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["delivered"], "owner", "{r}");
+    let mut got: Vec<Value> = Vec::new();
+    for _ in 0..40 {
+        let (_, ev) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/events?sim={sim1}"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        got.extend(
+            ev["events"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e["type"] == "interaction"),
+        );
+        if got.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(got.len(), 3, "{got:?}");
+    let seqs: Vec<u64> = got.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, vec![1, 2, 3], "{got:?}");
+    // the local call is synchronous and the forwarded ones cross the bus, so only the order of
+    // events from one source is guaranteed: the two hits keep their order
+    let mut kinds: Vec<&str> = got.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    kinds.sort();
+    assert_eq!(kinds, vec!["heal", "hit", "hit"], "{got:?}");
+    let hits: Vec<&Value> = got.iter().filter(|e| e["kind"] == "hit").collect();
+    assert_eq!(hits[0]["payload"]["damage"], 3, "{got:?}");
+    assert_eq!(hits[1]["payload"]["damage"], 4, "{got:?}");
+    assert!(hits.iter().all(|e| e["from_sim"] == json!(sim2)), "{got:?}");
+    let heal = got.iter().find(|e| e["kind"] == "heal").unwrap();
+    assert_eq!(heal["from_sim"], json!(sim3), "{got:?}");
+    // the owner is still the only writer: sim2 cannot apply to the target
+    let (st, _) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(json!({"sim": sim2, "entity": target, "components": {"hp": 0}})),
+    )
+    .await;
+    assert_ne!(st, 200);
+}

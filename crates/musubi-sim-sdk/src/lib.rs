@@ -199,6 +199,23 @@ impl WorldClient {
         Ok(serde_json::from_value(v["events"].clone()).unwrap_or_default())
     }
 
+    /// Act on an entity this simulator does not own (a hit on a ghost across a cell or node
+    /// border): the owner's simulator receives an `interaction` event with a per-entity `seq`.
+    pub async fn interact(
+        &self,
+        sim: Uuid,
+        entity: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        self.call(
+            reqwest::Method::POST,
+            "/interact",
+            Some(json!({"sim": sim, "entity": entity, "kind": kind, "payload": payload})),
+        )
+        .await
+    }
+
     pub async fn handover_ack(&self, sim: Uuid, entity: &str) -> Result<Vec<Value>> {
         let v = self
             .call(

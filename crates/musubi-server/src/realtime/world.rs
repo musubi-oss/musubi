@@ -46,6 +46,9 @@ struct WorldState {
     home_node: Option<Uuid>,
     /// Cross-node handovers in flight: entity → (target node, attempts so far).
     remote_transit: HashMap<EntityId, (Uuid, u32)>,
+    /// Per-target sequence of delivered interactions (this node is the single point of order
+    /// for the entities it owns; the counter restarts when an entity changes owner).
+    interaction_seq: HashMap<EntityId, u64>,
 }
 
 /// A cross-node handover is re-sent this many times before it is given up.
@@ -362,6 +365,7 @@ impl WorldRegistry {
                     hosted_only: true,
                     home_node: home,
                     remote_transit: HashMap::new(),
+                    interaction_seq: HashMap::new(),
                 }))
             });
         }
@@ -847,6 +851,7 @@ impl WorldRegistry {
                     hosted_only: false,
                     home_node: None,
                     remote_transit: HashMap::new(),
+            interaction_seq: HashMap::new(),
                 })),
             );
             self.homes.insert(name.clone(), self.node_id);
@@ -1159,6 +1164,7 @@ impl WorldRegistry {
                 hosted_only: false,
                 home_node: None,
                 remote_transit: HashMap::new(),
+                interaction_seq: HashMap::new(),
             })),
         );
         self.publish_home(name, Some(self.node_id)).await;
@@ -1569,7 +1575,49 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         if let Ok(Some(sim)) = st.world.route_input(id, input.clone()) {
-            push_event(st, sim, input);
+            let ev = if input["type"] == "interaction" {
+                stamp_interaction(st, id, input)
+            } else {
+                input
+            };
+            push_event(st, sim, ev);
+        }
+    }
+
+    /// A simulator acts on an entity it does not own (a hit on a ghost across a cell or node
+    /// border): the effect is delivered as an `interaction` event to the simulator that owns the
+    /// target, which alone applies it — one winner per conflict, in per-entity sequence order.
+    /// In transit the interaction travels with the entity's buffered inputs; an entity living in
+    /// a cell hosted elsewhere is forwarded over the bus.
+    pub fn interact(
+        &self,
+        name: &str,
+        sim: Uuid,
+        entity: &str,
+        kind: &str,
+        payload: Value,
+        fanout: &Fanout,
+    ) -> Result<Value> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        let ev = json!({
+            "type": "interaction", "entity": id, "kind": kind, "payload": payload, "from_sim": sim
+        });
+        match st.world.route_input(id, ev.clone()) {
+            Ok(Some(owner)) => {
+                let ev = stamp_interaction(st, id, ev);
+                let seq = ev["seq"].clone();
+                push_event(st, owner, ev);
+                Ok(json!({ "delivered": "owner", "seq": seq }))
+            }
+            Ok(None) => Ok(json!({ "delivered": "in_transit" })),
+            Err(musubi_mesh::MeshError::NoEntity) if self.is_split(name) => {
+                fanout.world_input(name, id, ev);
+                Ok(json!({ "delivered": "forwarded" }))
+            }
+            Err(e) => Err(mesh_err(e)),
         }
     }
 
@@ -1860,6 +1908,14 @@ fn announce(st: &mut WorldState, a: &Assignment) {
         a.to,
         json!({"type": "cell_assigned", "cell": a.cell, "from": a.from, "reason": a.reason}),
     );
+}
+
+fn stamp_interaction(st: &mut WorldState, id: EntityId, mut ev: Value) -> Value {
+    let seq = st.interaction_seq.entry(id).or_insert(0);
+    *seq += 1;
+    ev["seq"] = json!(*seq);
+    ev["tick"] = json!(st.world.tick);
+    ev
 }
 
 fn push_event(st: &mut WorldState, sim: Uuid, ev: Value) {
