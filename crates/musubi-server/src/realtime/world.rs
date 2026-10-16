@@ -127,6 +127,9 @@ pub struct WorldRegistry {
     worlds: DashMap<String, Arc<Mutex<WorldState>>>,
     /// world → home node (cache of `musubi.worlds`)
     homes: DashMap<String, Uuid>,
+    /// Fires after every registry tick with the tick number; streaming simulator sessions wake on it.
+    ticks: tokio::sync::broadcast::Sender<u64>,
+    tick_no: std::sync::atomic::AtomicU64,
     /// Raft directory (`world:<name>` → home) when the cluster runs the QUIC bus.
     cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
     /// Outbox for `world.rehomed`.
@@ -203,6 +206,8 @@ impl WorldRegistry {
             db,
             worlds: DashMap::new(),
             homes: DashMap::new(),
+            ticks: tokio::sync::broadcast::channel(16).0,
+            tick_no: std::sync::atomic::AtomicU64::new(0),
             cell_hosts: DashMap::new(),
             adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
@@ -1820,6 +1825,11 @@ impl WorldRegistry {
         }
     }
 
+    /// Tick numbers as they complete (lagging receivers skip ahead, never block the ticker).
+    pub fn subscribe_ticks(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.ticks.subscribe()
+    }
+
     pub fn spawn_ticker(self: Arc<Self>, fanout: Fanout) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(1000 / TICK_HZ));
@@ -1827,6 +1837,11 @@ impl WorldRegistry {
             loop {
                 iv.tick().await;
                 self.tick(&fanout);
+                let t = self
+                    .tick_no
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let _ = self.ticks.send(t);
             }
         })
     }

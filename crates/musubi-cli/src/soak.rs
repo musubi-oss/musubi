@@ -69,6 +69,8 @@ struct Counters {
     mesh_moves_ok: AtomicU64,
     mesh_moves_err: AtomicU64,
     mesh_lost: AtomicU64,
+    stream_frames: AtomicU64,
+    stream_reconnects: AtomicU64,
 }
 
 /// A world whose cell (1,0) is hosted on another node than its home; `entities` live on the border.
@@ -739,6 +741,13 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             alive.clone(),
             mw.clone(),
             run_deadline,
+            c.clone(),
+            stop.clone(),
+        )));
+        tasks.push(tokio::spawn(mesh_streamer(
+            alive.clone(),
+            mw.clone(),
+            run_deadline,
             c,
             stop.clone(),
         )));
@@ -1087,6 +1096,8 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "entities_per_world": o.mesh_entities,
             "moves_ok": c.mesh_moves_ok.load(Ordering::Relaxed),
             "moves_err": c.mesh_moves_err.load(Ordering::Relaxed),
+            "stream_frames": c.stream_frames.load(Ordering::Relaxed),
+            "stream_reconnects": c.stream_reconnects.load(Ordering::Relaxed),
             "lost_entities": c.mesh_lost.load(Ordering::Relaxed),
         },
         "ws": {
@@ -1151,6 +1162,11 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             report["mesh"]["moves_ok"],
             report["mesh"]["moves_err"],
             mesh_lost
+        );
+        println!(
+            "  stream: tick frames {}  reconnects {}",
+            c.stream_frames.load(Ordering::Relaxed),
+            c.stream_reconnects.load(Ordering::Relaxed)
         );
     }
     let timeouts = incidents.iter().filter(|i| i.timed_out).count();
@@ -1288,6 +1304,92 @@ async fn mesh_mover(
         } else {
             c.mesh_moves_err.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Hold the streaming simulator protocol open for `sim_a`'s cell (0,0) on whichever node hosts
+/// it: a handshake refused with a redirect (shard elsewhere) or a `lease` reply carrying
+/// `redirect` moves the stream to that node, a dropped socket (node killed or drained) reconnects
+/// through the alive list. Moves still go over HTTP, so every counted frame is a pure push.
+async fn mesh_streamer(
+    alive: Alive,
+    mw: MeshWorld,
+    deadline: Instant,
+    c: Arc<Counters>,
+    stop: Arc<AtomicBool>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let cell = json!({"x": 0, "y": 0});
+    let mut next: Option<String> = None;
+    let mut rot = 0usize;
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+        let base = match next.take() {
+            Some(u) => u,
+            None => {
+                let urls = alive.read().await.clone();
+                if urls.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                rot += 1;
+                urls[rot % urls.len()].clone()
+            }
+        };
+        let ws_base = base.replacen("http", "ws", 1);
+        let Ok(mut req) = format!(
+            "{ws_base}/v1/server/worlds/{}/stream?sim={}",
+            mw.name, mw.sim_a
+        )
+        .into_client_request() else {
+            continue;
+        };
+        req.headers_mut()
+            .insert("x-musubi-server-key", KEY.parse().unwrap());
+        let connected = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio_tungstenite::connect_async(req),
+        )
+        .await;
+        let Ok(Ok((mut ws, _))) = connected else {
+            // no shard here (redirect) or the node is gone: try the next one
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+        let lease = json!({"op": "lease", "cells": [cell.clone()]}).to_string();
+        if ws.send(Message::Text(lease)).await.is_err() {
+            continue;
+        }
+        while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
+            if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                return;
+            }
+            let Message::Text(t) = m else { continue };
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            if v["op"] == "lease" {
+                if let Some(r) = v["redirect"].as_str() {
+                    next = reqwest::Url::parse(r).ok().map(|u| {
+                        format!(
+                            "{}://{}:{}",
+                            u.scheme(),
+                            u.host_str().unwrap_or("127.0.0.1"),
+                            u.port_or_known_default().unwrap_or(80)
+                        )
+                    });
+                    break;
+                }
+                if v["error"].is_string() {
+                    break;
+                }
+            } else if v["type"] == "tick" {
+                c.stream_frames.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            c.stream_reconnects.fetch_add(1, Ordering::Relaxed);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 

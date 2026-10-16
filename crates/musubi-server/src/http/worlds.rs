@@ -5,6 +5,7 @@
 // Handlers return a ready `Response` (redirect) on the error path; axum's Response is large.
 #![allow(clippy::result_large_err)]
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -148,6 +149,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/apply", post(apply))
         .route("/v1/server/worlds/{w}/view/{x}/{y}", get(view))
         .route("/v1/server/worlds/{w}/events", get(events))
+        .route("/v1/server/worlds/{w}/stream", get(stream))
         .route("/v1/server/worlds/{w}/handover/ack", post(handover_ack))
 }
 
@@ -424,4 +426,173 @@ async fn handover_ack(
     let r: Result<Json<Value>, ApiError> =
         async { Ok(Json(s.worlds.handover_ack(&w, r.sim, &r.entity)?)) }.await;
     r.map_err(IntoResponse::into_response)
+}
+
+/// `GET /v1/server/worlds/{w}/stream?sim=<uuid>` — the streaming simulator protocol. Instead of
+/// polling `/view` and `/events` every tick, the simulator keeps one WebSocket per node that
+/// hosts its cells: after every registry tick the node renews the simulator's lease (connected
+/// means alive), and pushes one `tick` frame with the view of every leased cell and the pending
+/// events. Commands go the other way as JSON objects with an `op` (`lease`, `spawn`, `despawn`,
+/// `apply`, `handover_ack`) and the same fields as the matching HTTP body (minus `sim`); the reply
+/// echoes `op` and an optional `id`. A cell hosted by another node answers `lease`/`spawn` with
+/// `redirect` (that node's URL) exactly like the HTTP endpoints.
+async fn stream(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Query(q): Query<SimQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    Ok(ws.on_upgrade(move |socket| serve_stream(s, w, q.sim, uri, socket)))
+}
+
+async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, mut socket: WebSocket) {
+    let mut ticks = s.worlds.subscribe_ticks();
+    loop {
+        tokio::select! {
+            t = ticks.recv() => {
+                let t = match t {
+                    Ok(t) => t,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                let frame = match tick_frame(&s, &w, sim, t) {
+                    Ok(f) => f,
+                    Err(e) => json!({ "type": "error", "tick": t, "error": e.to_string() }),
+                };
+                if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+            m = socket.recv() => {
+                match m {
+                    Some(Ok(Message::Text(txt))) => {
+                        let reply = stream_command(&s, &w, sim, &uri, txt.as_str()).await;
+                        if socket.send(Message::Text(reply.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => {}
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                }
+            }
+        }
+    }
+}
+
+fn tick_frame(s: &AppState, w: &str, sim: Uuid, tick: u64) -> Result<Value, Error> {
+    let cells = s.worlds.renew(w, sim)?;
+    let mut views = Vec::with_capacity(cells.len());
+    for c in &cells {
+        let mut v = s.worlds.view(w, *c)?;
+        if let Some(o) = v.as_object_mut() {
+            o.insert("cell".into(), json!(c));
+        }
+        views.push(v);
+    }
+    let events = s.worlds.events(w, sim)?;
+    Ok(json!({ "type": "tick", "tick": tick, "cells": views, "events": events }))
+}
+
+/// Where the HTTP handler would redirect, the stream answers with the target URL.
+fn redirected(mut reply: Value, r: Result<(), Response>) -> Result<Value, Value> {
+    match r {
+        Ok(()) => Ok(reply),
+        Err(resp) => {
+            match resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(loc) => reply["redirect"] = json!(loc),
+                None => reply["error"] = json!(resp.status().to_string()),
+            }
+            Err(reply)
+        }
+    }
+}
+
+async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt: &str) -> Value {
+    let mut cmd: Value = match serde_json::from_str(txt) {
+        Ok(v) => v,
+        Err(e) => return json!({ "error": format!("bad command: {e}") }),
+    };
+    let op = cmd["op"].as_str().unwrap_or("").to_string();
+    let mut reply = json!({ "op": op });
+    if let Some(id) = cmd.get("id").cloned() {
+        reply["id"] = id;
+    }
+    cmd["sim"] = json!(sim);
+    let r: Result<Value, Error> = async {
+        match op.as_str() {
+            "lease" => {
+                let r: LeaseReq = serde_json::from_value(cmd).map_err(bad)?;
+                let mut reply =
+                    match redirected(reply, ensure_cells_home(s, w, &r.cells, uri).await) {
+                        Ok(r) => r,
+                        Err(r) => return Ok(r),
+                    };
+                reply["cells"] = json!(s.worlds.lease(w, sim, &r.cells)?);
+                Ok(reply)
+            }
+            "spawn" => {
+                let r: SpawnReq = serde_json::from_value(cmd).map_err(bad)?;
+                let pos = Pos { x: r.x, y: r.y };
+                let at_home = match s.worlds.cell_of(w, pos) {
+                    Ok(c) => ensure_cell_home(s, w, c, uri).await,
+                    Err(_) => ensure_home(s, w, uri).await,
+                };
+                let mut reply = match redirected(reply, at_home) {
+                    Ok(r) => r,
+                    Err(r) => return Ok(r),
+                };
+                let e = s.worlds.spawn(w, sim, pos, r.components, r.persistent)?;
+                reply["entity"] = serde_json::to_value(e).map_err(Error::internal)?;
+                Ok(reply)
+            }
+            "despawn" => {
+                let r: EntityReq = serde_json::from_value(cmd).map_err(bad)?;
+                s.worlds.despawn(w, sim, &r.entity)?;
+                reply["ok"] = json!(true);
+                Ok(reply)
+            }
+            "apply" => {
+                let r: ApplyReq = serde_json::from_value(cmd).map_err(bad)?;
+                let pos = match (r.x, r.y) {
+                    (Some(x), Some(y)) => Some(Pos { x, y }),
+                    (None, None) => None,
+                    _ => return Err(Error::InvalidArgument("x and y go together".into())),
+                };
+                s.worlds.apply(w, sim, &r.entity, pos, r.components)?;
+                reply["ok"] = json!(true);
+                Ok(reply)
+            }
+            "handover_ack" => {
+                let r: EntityReq = serde_json::from_value(cmd).map_err(bad)?;
+                reply["result"] = s.worlds.handover_ack(w, sim, &r.entity)?;
+                Ok(reply)
+            }
+            other => Err(Error::InvalidArgument(format!("unknown op `{other}`"))),
+        }
+    }
+    .await;
+    match r {
+        Ok(v) => v,
+        Err(e) => {
+            let mut reply = json!({ "op": op, "error": e.to_string() });
+            if let Some(id) = serde_json::from_str::<Value>(txt)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+            {
+                reply["id"] = id;
+            }
+            reply
+        }
+    }
+}
+
+fn bad(e: serde_json::Error) -> Error {
+    Error::InvalidArgument(e.to_string())
 }

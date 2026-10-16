@@ -266,6 +266,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("DELETE", "/v1/server/worlds/{w}/sims", "worlds"),
     ("POST", "/v1/server/worlds/{w}/sims", "worlds"),
     ("POST", "/v1/server/worlds/{w}/spawn", "worlds"),
+    ("GET", "/v1/server/worlds/{w}/stream", "worlds"),
     ("GET", "/v1/server/worlds/{w}/view/{x}/{y}", "worlds"),
     ("POST", "/v1/storage/delete", "storage"),
     ("POST", "/v1/storage/read", "storage"),

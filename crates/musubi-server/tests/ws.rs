@@ -5351,3 +5351,103 @@ async fn world_interest_across_nodes() {
     .await;
     assert_eq!(vb["owned"].as_array().map(|a| a.len()), Some(1), "{vb}");
 }
+
+/// Streaming simulator protocol: one WebSocket per node replaces per-tick `/view` + `/events`
+/// polling — the node pushes a `tick` frame after every registry tick and renews the lease while
+/// the socket lives; commands reuse the HTTP bodies.
+#[tokio::test]
+async fn simulator_stream_pushes_views_every_tick() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let req = Request::post("/v1/server/worlds")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::from(
+            json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 2.0}})
+                .to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let sim = uuid::Uuid::now_v7();
+    let mut creq = format!("ws://{addr}/v1/server/worlds/{world}/stream?sim={sim}")
+        .into_client_request()
+        .unwrap();
+    creq.headers_mut()
+        .insert("x-musubi-server-key", "defaultkey".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(creq).await.unwrap();
+    async fn next(ws: &mut Ws) -> Value {
+        loop {
+            if let Message::Text(t) = ws.next().await.unwrap().unwrap() {
+                return serde_json::from_str(&t).unwrap();
+            }
+        }
+    }
+    async fn reply(ws: &mut Ws, op: &str) -> Value {
+        let t0 = std::time::Instant::now();
+        loop {
+            let v = next(ws).await;
+            if v["op"] == op {
+                return v;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "no `{op}` reply: {v}"
+            );
+        }
+    }
+    ws.send(Message::Text(
+        json!({"op": "lease", "id": 1, "cells": [{"x": 0, "y": 0}]}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let r = reply(&mut ws, "lease").await;
+    assert_eq!(r["id"], 1, "{r}");
+    assert_eq!(r["cells"].as_array().unwrap().len(), 1, "{r}");
+    ws.send(Message::Text(
+        json!({"op": "spawn", "id": 2, "x": 50.0, "y": 50.0, "components": {"hp": 7}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let r = reply(&mut ws, "spawn").await;
+    let id = r["entity"]["id"].clone();
+    assert!(!id.is_null(), "{r}");
+    // the next tick frames carry the entity in the leased cell's view, without any request
+    let t0 = std::time::Instant::now();
+    let first = loop {
+        let v = next(&mut ws).await;
+        if v["type"] == "tick" {
+            let cells = v["cells"].as_array().cloned().unwrap_or_default();
+            let seen = cells.iter().any(|c| {
+                c["cell"] == json!({"x": 0, "y": 0})
+                    && c["owned"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|e| e["id"] == id))
+            });
+            if seen {
+                break v["tick"].as_u64().unwrap();
+            }
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "entity never streamed: {v}"
+        );
+    };
+    let later = loop {
+        let v = next(&mut ws).await;
+        if v["type"] == "tick" {
+            break v["tick"].as_u64().unwrap();
+        }
+    };
+    assert!(later > first, "{later} > {first}");
+    ws.send(Message::Text(json!({"op": "nope", "id": 3}).to_string()))
+        .await
+        .unwrap();
+    let r = reply(&mut ws, "nope").await;
+    assert_eq!(r["id"], 3, "{r}");
+    assert!(r["error"].as_str().unwrap().contains("unknown op"), "{r}");
+}
