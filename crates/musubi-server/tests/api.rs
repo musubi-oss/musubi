@@ -3065,7 +3065,7 @@ async fn raft_leader_owns_leases_and_world_directory() {
     let wb = musubi_server::realtime::WorldRegistry::new(b.node_id().0, None);
     wb.set_cluster(b.clone());
     let world = unique("w");
-    wa.create(&world, Default::default(), Default::default())
+    wa.create(&world, Default::default(), Default::default(), "")
         .await
         .unwrap();
     let t1 = Instant::now();

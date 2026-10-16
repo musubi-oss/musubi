@@ -988,6 +988,9 @@ impl WorldRegistry {
         let rows: Vec<(String, Value, Value)> = sqlx::query_as(
             "update musubi.worlds w set node_id = $2, node_epoch = $4
              where w.cluster_group = $3
+               and (w.region = '' or w.region = $5 or not exists
+                    (select 1 from musubi.nodes n where n.region = w.region
+                       and n.heartbeat_at > now() - interval '10 seconds'))
                and (w.node_id is null or w.node_id = any($1)
                     or not exists (select 1 from musubi.nodes n where n.id = w.node_id)
                     or exists (select 1 from musubi.nodes n where n.id = w.node_id and n.epoch > w.node_epoch
@@ -1003,6 +1006,7 @@ impl WorldRegistry {
         .bind(self.node_id)
         .bind(&self.group)
         .bind(self.epoch())
+        .bind(self.region())
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
@@ -1434,12 +1438,24 @@ impl WorldRegistry {
             .ok_or_else(|| Error::NotFound(format!("world {name}")))
     }
 
+    /// This node's region (`node.region`), the default placement for the worlds it creates.
+    fn region(&self) -> String {
+        self.cluster
+            .get()
+            .map(|c| c.me().region.clone())
+            .unwrap_or_default()
+    }
+
+    /// Creates the world here, or — when `region` names another region with a live node — as a
+    /// pending row (`node_id` null) that a node of that region adopts on its next failover round;
+    /// `None` means pending. Without a live node there the world is placed here.
     pub async fn create(
         &self,
         name: &str,
         cfg: WorldConfig,
         ctl: ControllerConfig,
-    ) -> Result<WorldInfo> {
+        region: &str,
+    ) -> Result<Option<WorldInfo>> {
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidArgument("world name 1..=64 chars".into()));
         }
@@ -1450,13 +1466,46 @@ impl WorldRegistry {
             return Err(Error::Conflict("world exists".into()));
         }
         if let Some(db) = &self.db {
-            sqlx::query("insert into musubi.worlds (name, node_id, config, controller, cluster_group, node_epoch) values ($1, $2, $3, $4, $5, $6)")
+            let elsewhere = !region.is_empty() && region != self.region();
+            let remote_alive: bool = if elsewhere {
+                sqlx::query_scalar(
+                    "select exists(select 1 from musubi.nodes where region = $1 and heartbeat_at > now() - interval '10 seconds')",
+                )
+                .bind(region)
+                .fetch_one(db)
+                .await
+                .map_err(Error::internal)?
+            } else {
+                false
+            };
+            if remote_alive {
+                sqlx::query("insert into musubi.worlds (name, node_id, config, controller, cluster_group, node_epoch, region) values ($1, null, $2, $3, $4, 0, $5)")
+                    .bind(name)
+                    .bind(serde_json::to_value(&cfg)?)
+                    .bind(serde_json::to_value(&ctl)?)
+                    .bind(&self.group)
+                    .bind(region)
+                    .execute(db)
+                    .await
+                    .map_err(|e| match e {
+                        sqlx::Error::Database(d) if d.is_unique_violation() => Error::Conflict("world exists on another node".into()),
+                        e => Error::internal(e),
+                    })?;
+                tracing::info!(
+                    world = name,
+                    region,
+                    "world placed for another region, pending adoption"
+                );
+                return Ok(None);
+            }
+            sqlx::query("insert into musubi.worlds (name, node_id, config, controller, cluster_group, node_epoch, region) values ($1, $2, $3, $4, $5, $6, $7)")
                 .bind(name)
                 .bind(self.node_id)
                 .bind(serde_json::to_value(&cfg)?)
                 .bind(serde_json::to_value(&ctl)?)
                 .bind(&self.group)
                 .bind(self.epoch())
+                .bind(region)
                 .execute(db)
                 .await
                 .map_err(|e| match e {
@@ -1481,7 +1530,7 @@ impl WorldRegistry {
             })),
         );
         self.publish_home(name, Some(self.node_id)).await;
-        self.info(name)
+        self.info(name).map(Some)
     }
 
     pub async fn delete(&self, name: &str) -> Result<()> {

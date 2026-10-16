@@ -330,13 +330,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 if !await_lease(&lease).await {
                     continue;
                 }
-                let Some(dead) = dead_nodes(&cluster).await else {
-                    continue;
-                };
+                // every round, dead nodes or not: worlds created for this region elsewhere wait
+                // as unowned rows for a node here to adopt them
+                let dead = dead_nodes(&cluster).await.unwrap_or_default();
                 match tokio::time::timeout(STAGE, worlds.recover(&dead)).await {
                     Ok(Ok(names)) if !names.is_empty() => {
-                        tracing::info!(?names, ?dead, "adopted worlds from dead nodes")
+                        tracing::info!(
+                            ?names,
+                            ?dead,
+                            "adopted worlds (dead homes or pending placement)"
+                        )
                     }
+                    Ok(Ok(_)) if dead.is_empty() => {}
                     Ok(Ok(_)) => tracing::info!(?dead, "world failover round: nothing to adopt"),
                     Ok(Err(e)) => tracing::warn!(error = %e, "world failover failed"),
                     Err(_) => tracing::warn!(?dead, "world failover: recover timed out"),

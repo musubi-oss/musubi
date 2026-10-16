@@ -3356,6 +3356,7 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
         &name,
         musubi_mesh::WorldConfig::default(),
         musubi_mesh::controller::ControllerConfig::default(),
+        "",
     )
     .await
     .unwrap();
@@ -3710,6 +3711,7 @@ async fn world_journal_is_replayed_on_rehome() {
         &name,
         musubi_mesh::WorldConfig::default(),
         musubi_mesh::controller::ControllerConfig::default(),
+        "",
     )
     .await
     .unwrap();
@@ -6663,4 +6665,57 @@ async fn colocate_pins_a_partner_into_the_callers_cell_and_returns_it() {
     ack(router.clone(), s2, b.clone()).await;
     assert_eq!(apply(router.clone(), s2, b.clone(), 153.0).await, 200);
     assert_ne!(apply(router.clone(), s1, b.clone(), 154.0).await, 200);
+}
+
+/// Multi-region: a world asked for a region with no live node there is placed on the creating
+/// node (not left pending) and works as usual; the row remembers the region.
+#[tokio::test]
+async fn world_for_a_region_without_nodes_is_placed_here() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, v) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "region": "eu-nowhere", "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["name"], json!(world));
+    let sim = uuid::Uuid::now_v7();
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "x": 10.0, "y": 10.0, "components": {}, "persistent": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let region: String = sqlx::query_scalar("select region from musubi.worlds where name = $1")
+        .bind(&world)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(region, "eu-nowhere");
 }

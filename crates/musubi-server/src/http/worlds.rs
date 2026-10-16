@@ -164,6 +164,9 @@ struct CreateReq {
     config: WorldConfig,
     #[serde(default)]
     controller: ControllerConfig,
+    /// Region to host the world in (default: the creating node's); 202 while a node there adopts it.
+    #[serde(default)]
+    region: String,
 }
 
 #[derive(Deserialize)]
@@ -301,8 +304,25 @@ async fn create(
     State(s): State<AppState>,
     ServerKey: ServerKey,
     Json(r): Json<CreateReq>,
-) -> Result<Json<Value>, ApiError> {
-    let info = s.worlds.create(&r.name, r.config, r.controller).await?;
+) -> Result<Response, ApiError> {
+    let Some(info) = s
+        .worlds
+        .create(&r.name, r.config, r.controller, &r.region)
+        .await?
+    else {
+        s.events
+            .emit(
+                "world.created",
+                None,
+                json!({ "name": r.name, "node_id": null, "region": r.region }),
+            )
+            .await;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"name": r.name, "pending": true, "region": r.region})),
+        )
+            .into_response());
+    };
     s.events
         .emit(
             "world.created",
@@ -310,7 +330,7 @@ async fn create(
             json!({ "name": r.name, "node_id": s.worlds.node_id() }),
         )
         .await;
-    Ok(Json(serde_json::to_value(info).map_err(Error::internal)?))
+    Ok(Json(serde_json::to_value(info).map_err(Error::internal)?).into_response())
 }
 
 async fn info(
