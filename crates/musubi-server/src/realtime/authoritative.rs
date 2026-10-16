@@ -33,6 +33,7 @@ pub struct MatchRegistry {
     pub journal_every: u64,
     /// Set by `release_all`: no snapshot may re-own a row this node has just disowned.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    epoch: i64,
 }
 
 impl Default for MatchRegistry {
@@ -54,6 +55,7 @@ impl MatchRegistry {
             snapshot_every: 50,
             journal_every: 5,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            epoch: 0,
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
         r
@@ -90,6 +92,7 @@ impl MatchRegistry {
         let group = self.group.clone();
         let events = self.events.get().cloned();
         let draining = self.draining.clone();
+        let epoch = self.epoch;
         Some(Arc::new(move |id: MatchId, snap: Option<Snapshot>| {
             let db = db.clone();
             let group = group.clone();
@@ -109,9 +112,9 @@ impl MatchRegistry {
             tokio::spawn(async move {
                 let res = match snap {
                     Some(s) => sqlx::query(
-                        "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group)
-                         values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
-                         on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, updated_at = now()",
+                        "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group, node_epoch)
+                         values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
+                         on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, node_epoch = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_epoch else musubi.match_snapshots.node_epoch end, updated_at = now()",
                     )
                     .bind(id.0)
                     .bind(&s.module)
@@ -121,6 +124,7 @@ impl MatchRegistry {
                     .bind(s.tick as i64)
                     .bind(node)
                     .bind(&group)
+                    .bind(epoch)
                     .execute(&db)
                     .await,
                     None => sqlx::query("delete from musubi.match_snapshots where match_id = $1").bind(id.0).execute(&db).await,
@@ -190,16 +194,18 @@ impl MatchRegistry {
         };
         // Claim atomically so two surviving nodes never resume the same match.
         let rows = sqlx::query_as::<_, (Uuid, String, String, serde_json::Value, Vec<u8>, i64)>(
-            "update musubi.match_snapshots set node_id = $2, updated_at = now()
-             where cluster_group = $3 and (node_id is null or node_id = any($1))
+            "update musubi.match_snapshots set node_id = $2, node_epoch = $4, updated_at = now()
+             where cluster_group = $3 and (node_id is null or node_id = any($1)
+                    or exists (select 1 from musubi.nodes n where n.id = match_snapshots.node_id and n.epoch > match_snapshots.node_epoch))
                and (node_id is null or node_id = $2 or not exists
                     (select 1 from musubi.nodes n where n.id = match_snapshots.node_id
-                       and n.heartbeat_at > now() - interval '10 seconds'))
+                       and n.heartbeat_at > now() - interval '10 seconds' and n.epoch <= match_snapshots.node_epoch))
              returning match_id, module, label, params, state, tick",
         )
         .bind(dead_nodes)
         .bind(self.node_id)
         .bind(&self.group)
+        .bind(self.epoch)
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
@@ -289,6 +295,12 @@ impl MatchRegistry {
 
     /// Drain: disown our matches in the snapshot store so the failover leader resumes them
     /// elsewhere (from their last snapshot). Returns how many were handed off.
+    /// Boot epoch written with every snapshot this node owns (see migration 0047).
+    pub fn with_epoch(mut self, epoch: i64) -> Self {
+        self.epoch = epoch;
+        self
+    }
+
     pub async fn release_all(&self) -> Result<u64> {
         let Some(db) = &self.db else {
             return Ok(0);

@@ -178,6 +178,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let relayed = Arc::new(RelayedRegistry::new(cluster.node_id().0));
     let matches = Arc::new(
         MatchRegistry::new(Some(db.clone()), cluster.node_id().0)
+            .with_epoch(cluster.epoch())
             .with_group(&cfg.node.cluster_group),
     );
     let wasm_mods = matches.register_wasm(&runtime);

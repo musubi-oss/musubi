@@ -697,6 +697,10 @@ impl WorldRegistry {
     }
 
     /// Nodes the directory currently assigns cells of `name` to.
+    fn epoch(&self) -> i64 {
+        self.cluster.get().map(|c| c.epoch()).unwrap_or(0)
+    }
+
     async fn assigned_hosts(&self, name: &str) -> Vec<Uuid> {
         let Some(c) = self.cluster.get() else {
             return vec![];
@@ -725,19 +729,21 @@ impl WorldRegistry {
             return Ok(vec![]);
         };
         let rows: Vec<(String, Value, Value)> = sqlx::query_as(
-            "update musubi.worlds w set node_id = $2
+            "update musubi.worlds w set node_id = $2, node_epoch = $4
              where w.cluster_group = $3
                and (w.node_id is null or w.node_id = any($1)
-                    or not exists (select 1 from musubi.nodes n where n.id = w.node_id))
-               and (w.node_id is null or not (w.node_id = $2 and $2 <> all($1)))
+                    or not exists (select 1 from musubi.nodes n where n.id = w.node_id)
+                    or exists (select 1 from musubi.nodes n where n.id = w.node_id and n.epoch > w.node_epoch))
+               and (w.node_id is null or not (w.node_id = $2 and $2 <> all($1) and w.node_epoch = $4))
                and (w.node_id is null or w.node_id = $2 or not exists
                     (select 1 from musubi.nodes n where n.id = w.node_id
-                       and n.heartbeat_at > now() - interval '10 seconds'))
+                       and n.heartbeat_at > now() - interval '10 seconds' and n.epoch <= w.node_epoch))
              returning name, config, controller",
         )
         .bind(dead_nodes)
         .bind(self.node_id)
         .bind(&self.group)
+        .bind(self.epoch())
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
@@ -1120,12 +1126,13 @@ impl WorldRegistry {
             return Err(Error::Conflict("world exists".into()));
         }
         if let Some(db) = &self.db {
-            sqlx::query("insert into musubi.worlds (name, node_id, config, controller, cluster_group) values ($1, $2, $3, $4, $5)")
+            sqlx::query("insert into musubi.worlds (name, node_id, config, controller, cluster_group, node_epoch) values ($1, $2, $3, $4, $5, $6)")
                 .bind(name)
                 .bind(self.node_id)
                 .bind(serde_json::to_value(&cfg)?)
                 .bind(serde_json::to_value(&ctl)?)
                 .bind(&self.group)
+                .bind(self.epoch())
                 .execute(db)
                 .await
                 .map_err(|e| match e {

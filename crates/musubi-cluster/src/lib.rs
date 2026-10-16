@@ -287,12 +287,18 @@ impl Cluster {
     }
 
     /// Insert our row, then keep heartbeating and relaying bus notifications until dropped.
+    /// Boot epoch of this process (the SWIM incarnation it started with): rows a previous
+    /// life of the same node id owned carry a smaller epoch and may be reclaimed at once.
+    pub fn epoch(&self) -> i64 {
+        self.incarnation.load(Ordering::Relaxed) as i64
+    }
+
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         if self.left.load(Ordering::Relaxed) {
             return Ok(());
         }
         sqlx::query(
-            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11) on conflict (id) do update set name = excluded.name, region = excluded.region, roles = excluded.roles, version = excluded.version, advertise = excluded.advertise, started_at = excluded.started_at, heartbeat_at = now(), bus_addr = excluded.bus_addr, bus_cert = excluded.bus_cert, raft_id = excluded.raft_id, cluster_group = excluded.cluster_group",
+            "insert into musubi.nodes (id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group, epoch) values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12) on conflict (id) do update set name = excluded.name, region = excluded.region, roles = excluded.roles, version = excluded.version, advertise = excluded.advertise, started_at = excluded.started_at, heartbeat_at = now(), bus_addr = excluded.bus_addr, bus_cert = excluded.bus_cert, raft_id = excluded.raft_id, cluster_group = excluded.cluster_group, epoch = excluded.epoch",
         )
         .bind(self.me.id.0)
         .bind(&self.me.name)
@@ -305,6 +311,7 @@ impl Cluster {
         .bind(&self.me.bus_cert)
         .bind(self.me.raft_id as i64)
         .bind(&self.me.group)
+        .bind(self.epoch())
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
