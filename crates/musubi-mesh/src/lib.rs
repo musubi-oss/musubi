@@ -81,6 +81,14 @@ pub struct WorldConfig {
     pub client_budget_bytes: usize,
     /// Positions in client deltas are rounded to this step; smaller moves send nothing.
     pub pos_quantum: f64,
+    /// Entities a cell accepts by spawn before new spawns into it are refused (0 = unlimited);
+    /// handovers always go through — physics cannot wait at a border.
+    pub soft_cap: u32,
+    /// A simulator whose last reported tick lags the world by more than this many ticks puts
+    /// its cells into time dilation.
+    pub tidi_after_ticks: u64,
+    /// Lowest time scale a dilated cell is allowed to drop to.
+    pub tidi_min: f64,
 }
 
 impl Default for WorldConfig {
@@ -93,6 +101,9 @@ impl Default for WorldConfig {
             handover_timeout_ticks: 3,
             client_budget_bytes: 16 * 1024,
             pos_quantum: 0.01,
+            soft_cap: 0,
+            tidi_after_ticks: 15,
+            tidi_min: 0.1,
         }
     }
 }
@@ -155,6 +166,8 @@ pub enum MeshError {
     NotAuthoritative(String),
     #[error("entity already in transit")]
     InTransit,
+    #[error("cell {0:?} is full (soft_cap {1})")]
+    CellFull(CellId, u32),
 }
 
 pub struct World {
@@ -166,6 +179,8 @@ pub struct World {
     interests: HashMap<ClientId, Interest>,
     /// Inputs that arrived while the target entity was in transit; delivered to the new owner.
     buffered_inputs: HashMap<EntityId, Vec<serde_json::Value>>,
+    /// Cells running slower than real time (EVE-style time dilation); absent = 1.0.
+    cell_scale: HashMap<CellId, f64>,
 }
 
 impl World {
@@ -178,7 +193,46 @@ impl World {
             leases: HashMap::new(),
             interests: HashMap::new(),
             buffered_inputs: HashMap::new(),
+            cell_scale: HashMap::new(),
         }
+    }
+
+    /// Whether a spawn into `cell` is allowed under `soft_cap`.
+    pub fn cell_has_room(&self, cell: CellId) -> bool {
+        self.cfg.soft_cap == 0 || (self.entities_in(cell) as u32) < self.cfg.soft_cap
+    }
+
+    /// Time scale of a cell: 1.0 = real time, lower = dilated.
+    pub fn time_scale(&self, cell: CellId) -> f64 {
+        self.cell_scale.get(&cell).copied().unwrap_or(1.0)
+    }
+
+    /// Set a cell's time scale; returns whether it changed.
+    pub fn set_time_scale(&mut self, cell: CellId, scale: f64) -> bool {
+        let before = self.time_scale(cell);
+        if scale >= 1.0 {
+            self.cell_scale.remove(&cell);
+        } else {
+            self.cell_scale.insert(cell, scale);
+        }
+        (before - self.time_scale(cell)).abs() > f64::EPSILON
+    }
+
+    /// Slowest time scale around a subscribed client (1.0 when unknown or undilated).
+    pub fn scale_for_client(&self, client: ClientId) -> f64 {
+        self.interests
+            .get(&client)
+            .map_or(1.0, |i| self.min_scale_near(i.pos, i.radius))
+    }
+
+    /// Slowest time scale among the cells within `radius` of `pos` (what a client at `pos`
+    /// should interpolate against).
+    pub fn min_scale_near(&self, pos: Pos, radius: f64) -> f64 {
+        self.cell_scale
+            .iter()
+            .filter(|(c, _)| self.border_distance(**c, pos) > -radius)
+            .map(|(_, s)| *s)
+            .fold(1.0, f64::min)
     }
 
     pub fn cell_of(&self, p: Pos) -> CellId {

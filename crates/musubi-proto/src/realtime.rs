@@ -337,6 +337,10 @@ pub enum ServerMessage {
         spawned: Vec<WorldEntity>,
         updated: Vec<WorldEntity>,
         despawned: Vec<String>,
+        /// Slowest time scale among the cells around the client (1.0 = real time; EVE-style
+        /// time dilation when a simulator cannot keep up). Interpolate against it.
+        #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")]
+        time_scale: f64,
     },
     MatchData {
         match_id: String,
@@ -474,4 +478,12 @@ pub struct Reaction {
     pub count: u32,
     #[serde(default)]
     pub me: bool,
+}
+
+fn one_f64() -> f64 {
+    1.0
+}
+
+fn is_one_f64(v: &f64) -> bool {
+    *v >= 1.0
 }

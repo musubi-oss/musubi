@@ -209,6 +209,9 @@ fn mesh_err(e: musubi_mesh::MeshError) -> Error {
         NoLease(c) => Error::Conflict(format!("cell {c:?} has no live lease")),
         NotAuthoritative(m) => Error::PermissionDenied(m),
         InTransit => Error::Conflict("entity in transit".into()),
+        CellFull(c, cap) => {
+            Error::ResourceExhausted(format!("cell {c:?} is full (soft_cap {cap})"))
+        }
     }
 }
 
@@ -1330,13 +1333,26 @@ impl WorldRegistry {
     }
 
     pub fn renew(&self, name: &str, sim: Uuid) -> Result<Vec<CellId>> {
+        self.renew_at(name, sim, None)
+    }
+
+    /// Heartbeat plus, optionally, the last world tick the simulator has fully processed —
+    /// the input of time dilation.
+    pub fn renew_at(&self, name: &str, sim: Uuid, done: Option<u64>) -> Result<Vec<CellId>> {
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
         st.world.renew_leases(sim);
         let tick = st.world.tick;
         st.controller.seen(sim, tick);
+        if let Some(t) = done {
+            st.controller.progress(sim, t.min(tick));
+        }
         Ok(st.world.cells_of(sim))
+    }
+
+    pub fn time_scale(&self, name: &str, cell: CellId) -> Result<f64> {
+        Ok(self.get(name)?.lock().world.time_scale(cell))
     }
 
     pub fn spawn(
@@ -1362,6 +1378,17 @@ impl WorldRegistry {
             {
                 announce(st, &a);
             }
+        }
+        if !st.world.cell_has_room(cell) {
+            push_event(
+                st,
+                sim,
+                json!({"type": "cell_full", "cell": cell, "soft_cap": st.world.cfg.soft_cap}),
+            );
+            return Err(mesh_err(musubi_mesh::MeshError::CellFull(
+                cell,
+                st.world.cfg.soft_cap,
+            )));
         }
         match st.world.owner(cell) {
             Some(o) if o == sim => {}
@@ -1926,6 +1953,16 @@ impl WorldRegistry {
                     announce(st, a);
                 }
             }
+            for (cell, scale) in st.controller.dilate(&mut st.world) {
+                if let Some(owner) = st.world.owner(cell) {
+                    push_event(
+                        st,
+                        owner,
+                        json!({"type": "time_scale", "cell": cell, "scale": scale}),
+                    );
+                }
+                tracing::info!(world = %name, ?cell, scale, "cell time scale changed");
+            }
             for o in outcomes {
                 match o {
                     HandoverOutcome::Started { entity, from, to } => {
@@ -2012,7 +2049,8 @@ impl WorldRegistry {
             for (sid, client) in subs {
                 if let Some(d) = st.world.delta_for(client) {
                     if d != Delta::default() {
-                        fanout.session(sid, delta_msg(&name, tick, d));
+                        let scale = st.world.scale_for_client(client);
+                        fanout.session(sid, delta_msg(&name, tick, scale, d));
                     }
                 }
             }
@@ -2071,10 +2109,11 @@ fn push_event(st: &mut WorldState, sim: Uuid, ev: Value) {
     }
 }
 
-fn delta_msg(world: &str, tick: u64, d: Delta) -> ServerMessage {
+fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta) -> ServerMessage {
     ServerMessage::WorldDelta {
         world: world.to_string(),
         tick,
+        time_scale: scale,
         spawned: d.spawned.iter().map(to_wire).collect(),
         updated: d
             .updated

@@ -5728,3 +5728,212 @@ async fn cross_boundary_interaction_reaches_the_targets_owner() {
     .await;
     assert_ne!(st, 200);
 }
+
+/// A simulator that reports falling behind the world puts its cell into time dilation: tick
+/// frames carry `time_scale` < 1 and the simulator gets a `time_scale` event; catching up
+/// brings the cell back to real time.
+#[tokio::test]
+async fn time_dilation_follows_a_lagging_simulator() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let req = Request::post("/v1/server/worlds")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::from(
+            json!({"name": world, "config": {"cell_size": 100.0, "tidi_after_ticks": 5, "tidi_min": 0.1}})
+                .to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let sim = uuid::Uuid::now_v7();
+    let mut creq = format!("ws://{addr}/v1/server/worlds/{world}/stream?sim={sim}")
+        .into_client_request()
+        .unwrap();
+    creq.headers_mut()
+        .insert("x-musubi-server-key", "defaultkey".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(creq).await.unwrap();
+    async fn next(ws: &mut Ws) -> Value {
+        loop {
+            if let Message::Text(t) = ws.next().await.unwrap().unwrap() {
+                return serde_json::from_str(&t).unwrap();
+            }
+        }
+    }
+    ws.send(Message::Text(
+        json!({"op": "lease", "id": 1, "cells": [{"x": 0, "y": 0}]}).to_string(),
+    ))
+    .await
+    .unwrap();
+    // register so the controller knows this simulator; report tick 0 forever = falling behind
+    let req = Request::post(format!("/v1/server/worlds/{world}/sims"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::from(json!({"sim": sim, "capacity": 4}).to_string()))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(req).await.unwrap().status().as_u16(),
+        200
+    );
+    let t0 = std::time::Instant::now();
+    let mut saw_event = false;
+    let mut dilated: Option<f64> = None;
+    let mut world_tick = 0u64;
+    while dilated.is_none() || !saw_event {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "no dilation"
+        );
+        ws.send(Message::Text(
+            json!({"op": "tick_done", "tick": 0}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let v = next(&mut ws).await;
+        if v["type"] != "tick" {
+            continue;
+        }
+        world_tick = v["tick"].as_u64().unwrap_or(0);
+        for c in v["cells"].as_array().cloned().unwrap_or_default() {
+            if let Some(s) = c["time_scale"].as_f64() {
+                assert!((0.1..1.0).contains(&s), "{v}");
+                dilated = Some(s);
+            }
+        }
+        if v["events"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|e| e["type"] == "time_scale" && e["scale"].as_f64().is_some_and(|s| s < 1.0))
+        }) {
+            saw_event = true;
+        }
+    }
+    // catching up (reporting the current tick) returns the cell to real time
+    let t0 = std::time::Instant::now();
+    loop {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "still dilated"
+        );
+        ws.send(Message::Text(
+            json!({"op": "tick_done", "tick": world_tick + 1000}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let v = next(&mut ws).await;
+        if v["type"] != "tick" {
+            continue;
+        }
+        world_tick = v["tick"].as_u64().unwrap_or(world_tick);
+        let cells = v["cells"].as_array().cloned().unwrap_or_default();
+        if cells.iter().all(|c| c["time_scale"].is_null()) {
+            break;
+        }
+    }
+    let (st, dump) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/worlds/{world}/entities"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{dump}");
+    assert_eq!(dump["leases"].as_array().unwrap().len(), 1, "{dump}");
+}
+
+/// `soft_cap` refuses spawns into a full cell (and tells the simulator), never handovers.
+#[tokio::test]
+async fn soft_cap_refuses_spawn_into_a_full_cell() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "soft_cap": 1}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let spawn =
+        |x: f64| json!({"sim": sim, "x": x, "y": 10.0, "components": {}, "persistent": false});
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(spawn(10.0)),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(spawn(20.0)),
+    )
+    .await;
+    assert_ne!(st, 200, "{e}");
+    assert!(e.to_string().contains("soft_cap"), "{e}");
+    // another cell still has room
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(spawn(150.0)),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let (st, ev) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{world}/events?sim={sim}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "cell_full"),
+        "{ev}"
+    );
+}

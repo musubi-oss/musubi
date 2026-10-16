@@ -175,8 +175,16 @@ fn one() -> u32 {
 }
 
 #[derive(Deserialize)]
+struct TickDoneReq {
+    tick: u64,
+}
+
+#[derive(Deserialize)]
 struct SimQuery {
     sim: Uuid,
+    /// Last world tick the simulator has fully processed (drives time dilation).
+    #[serde(default)]
+    tick: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -332,8 +340,12 @@ async fn renew(
     Json(r): Json<SimQuery>,
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
-    let r: Result<Json<Value>, ApiError> =
-        async { Ok(Json(json!({ "cells": s.worlds.renew(&w, r.sim)? }))) }.await;
+    let r: Result<Json<Value>, ApiError> = async {
+        Ok(Json(
+            json!({ "cells": s.worlds.renew_at(&w, r.sim, r.tick)? }),
+        ))
+    }
+    .await;
     r.map_err(IntoResponse::into_response)
 }
 
@@ -515,6 +527,10 @@ fn tick_frame(s: &AppState, w: &str, sim: Uuid, tick: u64) -> Result<Value, Erro
         let mut v = s.worlds.view(w, *c)?;
         if let Some(o) = v.as_object_mut() {
             o.insert("cell".into(), json!(c));
+            let scale = s.worlds.time_scale(w, *c)?;
+            if scale < 1.0 {
+                o.insert("time_scale".into(), json!(scale));
+            }
         }
         views.push(v);
     }
@@ -576,6 +592,11 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                 };
                 let e = s.worlds.spawn(w, sim, pos, r.components, r.persistent)?;
                 reply["entity"] = serde_json::to_value(e).map_err(Error::internal)?;
+                Ok(reply)
+            }
+            "tick_done" => {
+                let r: TickDoneReq = serde_json::from_value(cmd).map_err(bad)?;
+                reply["cells"] = json!(s.worlds.renew_at(w, sim, Some(r.tick))?);
                 Ok(reply)
             }
             "despawn" => {

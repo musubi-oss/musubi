@@ -15,6 +15,9 @@ pub struct SimInfo {
     /// Max cells this simulator accepts.
     pub capacity: u32,
     pub last_seen_tick: u64,
+    /// Last world tick the simulator reported having fully processed (None = never reported).
+    #[serde(default)]
+    pub acked_tick: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +65,7 @@ impl Controller {
             id,
             capacity,
             last_seen_tick: tick,
+            acked_tick: None,
         });
         e.capacity = capacity;
         e.last_seen_tick = tick;
@@ -71,6 +75,39 @@ impl Controller {
         if let Some(s) = self.sims.get_mut(&id) {
             s.last_seen_tick = tick;
         }
+    }
+
+    /// The simulator finished processing `tick` (a tick never goes backwards).
+    pub fn progress(&mut self, id: SimId, tick: u64) {
+        if let Some(s) = self.sims.get_mut(&id) {
+            s.acked_tick = Some(s.acked_tick.map_or(tick, |a| a.max(tick)));
+        }
+    }
+
+    /// Time dilation: a cell whose owner lags the world by more than `tidi_after_ticks` runs
+    /// at `tidi_after_ticks / lag` of real time (not below `tidi_min`); it returns to 1.0 as the
+    /// simulator catches up. Returns the cells whose scale changed.
+    pub fn dilate(&self, world: &mut World) -> Vec<(CellId, f64)> {
+        let after = world.cfg.tidi_after_ticks.max(1);
+        let min = world.cfg.tidi_min.clamp(0.01, 1.0);
+        let tick = world.tick;
+        let mut changed = Vec::new();
+        for (cell, sim) in world.leases() {
+            let lag = self
+                .sims
+                .get(&sim)
+                .and_then(|s| s.acked_tick)
+                .map_or(0, |a| tick.saturating_sub(a));
+            let scale = if lag > after {
+                (after as f64 / lag as f64).clamp(min, 1.0)
+            } else {
+                1.0
+            };
+            if world.set_time_scale(cell, scale) {
+                changed.push((cell, scale));
+            }
+        }
+        changed
     }
 
     pub fn unregister(&mut self, id: SimId) -> bool {
@@ -213,6 +250,78 @@ impl Controller {
 mod tests {
     use super::*;
     use crate::{Pos, WorldConfig};
+
+    #[test]
+    fn soft_cap_refuses_spawn_but_not_handover_room_check() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            soft_cap: 2,
+            ..WorldConfig::default()
+        });
+        let c = w.cell_of(Pos { x: 10.0, y: 10.0 });
+        assert!(w.cell_has_room(c));
+        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
+        w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
+        assert!(!w.cell_has_room(c), "two of two slots taken");
+        let other = w.cell_of(Pos { x: 150.0, y: 10.0 });
+        assert!(w.cell_has_room(other));
+        let mut unlimited = World::new(WorldConfig {
+            cell_size: 100.0,
+            soft_cap: 0,
+            ..WorldConfig::default()
+        });
+        for i in 0..10 {
+            unlimited.spawn(
+                Pos {
+                    x: i as f64,
+                    y: 1.0,
+                },
+                Default::default(),
+                false,
+            );
+        }
+        assert!(unlimited.cell_has_room(c));
+    }
+
+    #[test]
+    fn dilate_follows_owner_lag_and_recovers() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            tidi_after_ticks: 10,
+            tidi_min: 0.1,
+            ..WorldConfig::default()
+        });
+        let mut ctl = Controller::new(ControllerConfig::default());
+        let sim = SimId::now_v7();
+        ctl.register(sim, 4, 0);
+        let c = CellId { x: 0, y: 0 };
+        w.grant_lease(c, sim);
+        // never reported: no dilation
+        w.tick = 100;
+        w.renew_leases(sim);
+        assert!(ctl.dilate(&mut w).is_empty());
+        assert_eq!(w.time_scale(c), 1.0);
+        // 10 ticks behind is within the allowance
+        ctl.progress(sim, 90);
+        assert!(ctl.dilate(&mut w).is_empty());
+        // 40 ticks behind: 10/40 = 0.25
+        w.tick = 130;
+        w.renew_leases(sim);
+        let ch = ctl.dilate(&mut w);
+        assert_eq!(ch, vec![(c, 0.25)]);
+        assert_eq!(w.time_scale(c), 0.25);
+        assert_eq!(w.min_scale_near(Pos { x: 50.0, y: 50.0 }, 10.0), 0.25);
+        assert_eq!(w.min_scale_near(Pos { x: 500.0, y: 50.0 }, 10.0), 1.0);
+        // floor
+        w.tick = 1000;
+        w.renew_leases(sim);
+        assert_eq!(ctl.dilate(&mut w), vec![(c, 0.1)]);
+        // caught up: back to real time, reported once
+        ctl.progress(sim, 1000);
+        assert_eq!(ctl.dilate(&mut w), vec![(c, 1.0)]);
+        assert!(ctl.dilate(&mut w).is_empty());
+        assert_eq!(w.time_scale(c), 1.0);
+    }
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
