@@ -513,14 +513,32 @@ impl Default for MarketConfig {
 }
 
 /// Aurix voice. Unset `url` = disabled.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AurixConfig {
     pub url: Option<String>,
     pub api_key: String,
-    /// Aurix channel type for party / match channels.
+    /// Aurix channel type for party / match channels (empty = `team`).
     pub party_channel_type: String,
     pub match_channel_type: String,
+    /// Channel type of a world's proximity channel (`positional`: Aurix attenuates by the
+    /// positions the client reports, the same ones it sends the world).
+    pub world_channel_type: String,
+    /// Mirror account bans and friend blocks into Aurix (best effort, asynchronous).
+    pub moderation_sync: bool,
+}
+
+impl Default for AurixConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            api_key: String::new(),
+            party_channel_type: String::new(),
+            match_channel_type: String::new(),
+            world_channel_type: "positional".into(),
+            moderation_sync: true,
+        }
+    }
 }
 
 /// In-app purchase validation providers. A provider is enabled when its key path is set.

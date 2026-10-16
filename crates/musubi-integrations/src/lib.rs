@@ -217,6 +217,111 @@ impl AurixClient {
         })
     }
 
+    async fn post(&self, path: &str, body: Value, what: &str) -> Result<Value> {
+        let res = self
+            .http
+            .post(format!("{}{}", self.base, path))
+            .header("x-api-key", &self.key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(Error::internal)?;
+        check(res, what).await
+    }
+
+    /// Aurix's id of a Musubi account (its `external_id` there), if the account has ever been
+    /// issued a voice token; `None` means there is nothing in Aurix to act on.
+    pub async fn resolve_user(&self, external_id: &str) -> Result<Option<String>> {
+        let res = self
+            .http
+            .get(format!("{}/v1/users", self.base))
+            .header("x-api-key", &self.key)
+            .query(&[("q", external_id), ("per_page", "20")])
+            .send()
+            .await
+            .map_err(Error::internal)?;
+        let v = check(res, "aurix users").await?;
+        let items = v
+            .as_array()
+            .or_else(|| v["items"].as_array())
+            .or_else(|| v["users"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(items
+            .iter()
+            .find(|u| u["external_id"].as_str() == Some(external_id))
+            .and_then(|u| u["id"].as_str())
+            .map(str::to_string))
+    }
+
+    /// Account ban mirrored into voice (`POST /v1/moderation/ban`, scope `account`, permanent —
+    /// lifted by `unban_user`). `false`: the account never used voice.
+    pub async fn ban_user(&self, external_id: &str, reason: &str) -> Result<bool> {
+        let Some(uid) = self.resolve_user(external_id).await? else {
+            return Ok(false);
+        };
+        self.post(
+            "/v1/moderation/ban",
+            json!({ "user_id": uid, "scope": "account", "reason": reason }),
+            "aurix ban",
+        )
+        .await?;
+        Ok(true)
+    }
+
+    pub async fn unban_user(&self, external_id: &str) -> Result<bool> {
+        let Some(uid) = self.resolve_user(external_id).await? else {
+            return Ok(false);
+        };
+        self.post(&format!("/v1/users/{uid}/unban"), json!({}), "aurix unban")
+            .await?;
+        Ok(true)
+    }
+
+    /// A friend-list block also silences the blocked player's voice for the blocker.
+    pub async fn block(&self, external_id: &str, blocked_external_id: &str) -> Result<bool> {
+        let (Some(a), Some(b)) = (
+            self.resolve_user(external_id).await?,
+            self.resolve_user(blocked_external_id).await?,
+        ) else {
+            return Ok(false);
+        };
+        self.post(
+            &format!("/v1/users/{a}/blocks"),
+            json!({ "blocked_user_id": b }),
+            "aurix block",
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Player report filed in Aurix (`POST /v1/moderation/report`), where the voice evidence is.
+    pub async fn report(
+        &self,
+        reporter_external_id: &str,
+        target_external_id: &str,
+        channel_id: Option<&str>,
+        reason: &str,
+    ) -> Result<Value> {
+        let (Some(reporter), Some(target)) = (
+            self.resolve_user(reporter_external_id).await?,
+            self.resolve_user(target_external_id).await?,
+        ) else {
+            return Err(Error::NotFound("voice user not found".into()));
+        };
+        self.post(
+            "/v1/moderation/report",
+            json!({
+                "reporter_user_id": reporter,
+                "target_user_id": target,
+                "channel_id": channel_id,
+                "reason": reason,
+            }),
+            "aurix report",
+        )
+        .await
+    }
+
     /// Channel-wide moderation (`POST /v1/moderation/kick-all`), e.g. when a match ends.
     pub async fn kick_all(&self, channel_id: &str, reason: &str) -> Result<()> {
         let res = self

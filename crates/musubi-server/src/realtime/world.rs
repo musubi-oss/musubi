@@ -2410,6 +2410,18 @@ impl WorldRegistry {
         }
     }
 
+    /// Whether `sid` is subscribed to `name` on this node (an interest still queued for the
+    /// next tick counts).
+    pub fn is_subscribed(&self, name: &str, sid: SessionId) -> bool {
+        self.worlds
+            .get(name)
+            .is_some_and(|w| w.lock().subs.contains_key(&sid))
+            || self
+                .interest
+                .get(name)
+                .is_some_and(|q| q.lock().iter().any(|p| p.sid == sid))
+    }
+
     pub fn unsubscribe(&self, name: &str, sid: SessionId) -> Result<()> {
         let w = self.get(name)?;
         if let Some(q) = self.interest.get(name) {

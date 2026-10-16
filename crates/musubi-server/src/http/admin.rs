@@ -118,6 +118,25 @@ async fn account(
     })))
 }
 
+/// Mirror a ban into Aurix, best effort: the account is disabled here regardless, this only
+/// drops its live voice sessions and keeps it out of channels until the unban follows.
+fn voice_ban(s: &AppState, id: AccountId, banned: bool) {
+    let Some(v) = s.voice.clone() else { return };
+    if !s.cfg.aurix.moderation_sync {
+        return;
+    }
+    tokio::spawn(async move {
+        let r = if banned {
+            v.ban_user(&id.to_string(), "account banned").await
+        } else {
+            v.unban_user(&id.to_string()).await
+        };
+        if let Err(e) = r {
+            tracing::warn!(error = %e, account = %id, banned, "aurix ban sync failed");
+        }
+    });
+}
+
 /// Kick the account's live realtime sessions on every node.
 pub(crate) async fn kick_everywhere(s: &AppState, id: AccountId) -> usize {
     let local = s.hub.kick_account(id);
@@ -139,6 +158,7 @@ async fn ban(
     s.banned.set(id, true, s.cluster.as_ref()).await;
     s.events.emit("account.banned", Some(id), json!({})).await;
     let kicked = kick_everywhere(&s, id).await;
+    voice_ban(&s, id, true);
     Ok(Json(json!({ "banned": true, "kicked_local": kicked })))
 }
 
@@ -149,6 +169,7 @@ async fn unban(
 ) -> Result<Json<Value>, ApiError> {
     s.accounts.set_disabled(AccountId(id), false).await?;
     s.banned.set(AccountId(id), false, s.cluster.as_ref()).await;
+    voice_ban(&s, AccountId(id), false);
     s.events
         .emit("account.unbanned", Some(AccountId(id)), json!({}))
         .await;

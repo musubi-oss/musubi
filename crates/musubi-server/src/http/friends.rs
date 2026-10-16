@@ -102,6 +102,17 @@ async fn block(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ids = resolve(&s, b).await?;
     s.social.block(me.account_id, &ids).await?;
+    if let Some(v) = s.voice.clone().filter(|_| s.cfg.aurix.moderation_sync) {
+        // the block also silences them in voice; Aurix is a side channel, so best effort
+        let (me_id, ids) = (me.account_id, ids.clone());
+        tokio::spawn(async move {
+            for id in ids {
+                if let Err(e) = v.block(&me_id.to_string(), &id.to_string()).await {
+                    tracing::warn!(error = %e, "aurix block sync failed");
+                }
+            }
+        });
+    }
     s.events
         .emit("friend.blocked", Some(me.account_id), json!({ "ids": ids }))
         .await;

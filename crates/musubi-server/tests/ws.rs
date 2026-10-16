@@ -2657,6 +2657,31 @@ async fn mock_upstreams() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
         .route("/server/v1/flags", get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
             Json(json!({"flags": [{"key": "new_map", "value": true, "external_id": q.get("external_id")}]}))
         }))
+        .route("/v1/users", get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+            Json(json!([{"id": "u1", "external_id": q.get("q")}]))
+        }))
+        .route("/v1/moderation/ban", post({
+            let s3 = seen.clone();
+            move |Json(b): Json<Value>| {
+                let s3 = s3.clone();
+                async move {
+                    s3.lock().unwrap().push(json!({"aurix_ban": b}));
+                    Json(json!({"ban_id": "b1"}))
+                }
+            }
+        }))
+        .route("/v1/users/{id}/unban", post(|| async { Json(json!({"revoked": 1, "user_id": "u1"})) }))
+        .route("/v1/users/{id}/blocks", post(|| async { Json(json!({"blocked": true})) }))
+        .route("/v1/moderation/report", post({
+            let s4 = seen.clone();
+            move |Json(b): Json<Value>| {
+                let s4 = s4.clone();
+                async move {
+                    s4.lock().unwrap().push(json!({"aurix_report": b}));
+                    Json(json!({"id": "rep-1"}))
+                }
+            }
+        }))
         .route("/v1/tokens", post(|Json(b): Json<Value>| async move {
             Json(json!({"token": format!("aurix-{}", b["external_id"].as_str().unwrap_or("")), "user_id": "u1", "expires_at": "2030-01-01T00:00:00Z",
                 "channels": [{"channel_id": "chan-1", "name": b["channels"][0]["ad_hoc"]["name"]}], "endpoint": {"ws": "ws://voice/ws"}}))
@@ -2737,6 +2762,79 @@ async fn zanshin_and_aurix_integrations() {
         .body(body(&pid))
         .unwrap();
     assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 403);
+
+    // a world's proximity channel: only a subscriber of the world (on this node) gets a token
+    let world = format!("w{}", uuid::Uuid::now_v7().simple());
+    let req = Request::post("/v1/server/worlds")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"name": world, "config": {"cell_size": 100.0}}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 0.0,
+            y: 0.0,
+            radius: 200.0,
+            budget_bytes: None,
+            filter: None,
+            max_hz: None,
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let wbody = || Body::from(json!({"world": world, "display_name": "Alice"}).to_string());
+    let req = Request::post("/v1/voice/token")
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(wbody())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["channel_id"], "chan-1");
+    let req = Request::post("/v1/voice/token")
+        .header(header::AUTHORIZATION, format!("Bearer {tb}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(wbody())
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 403);
+
+    // a voice report is filed in Aurix under the caller's identity
+    let (_, acc_b) = token(&router).await;
+    let req = Request::post("/v1/voice/report")
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"target_account_id": acc_b, "reason": "slurs"}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+
+    // an account ban is mirrored into Aurix
+    let req = Request::post(format!("/v1/admin/accounts/{acc}/ban"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let ev = seen.lock().unwrap().clone();
+    assert!(
+        ev.iter().any(|e| e["aurix_report"]["reason"] == "slurs"),
+        "{ev:?}"
+    );
+    assert!(
+        ev.iter()
+            .any(|e| e["aurix_ban"]["scope"] == "account" && e["aurix_ban"]["user_id"] == "u1"),
+        "{ev:?}"
+    );
 }
 
 /// A test PKI shaped like Apple's: root (P-384) → intermediate (P-384) → leaf (P-256, receipt

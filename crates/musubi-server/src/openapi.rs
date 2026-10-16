@@ -299,6 +299,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/account/delete", "account"),
     ("GET", "/v1/users", "account"),
     ("GET", "/v1/users/{id}/groups", "groups"),
+    ("POST", "/v1/voice/report", "integrations"),
     ("POST", "/v1/voice/token", "integrations"),
     ("GET", "/v1/wallet", "economy"),
     ("GET", "/v1/wallet/ledger", "economy"),
