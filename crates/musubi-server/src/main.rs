@@ -11,6 +11,11 @@ struct Args {
     config: Option<PathBuf>,
 }
 
+/// glibc malloc serialises the runtime workers and the per-world tick threads on its arena
+/// locks under load (10k sessions: most worker samples sat in realloc/free waiting for one)
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
