@@ -124,6 +124,14 @@ impl Controller {
             .is_some_and(|s| tick.saturating_sub(s.last_seen_tick) <= self.cfg.sim_timeout_ticks)
     }
 
+    /// Ticks the simulator's last fully processed tick is behind the world (0 if never reported).
+    pub fn lag(&self, sim: SimId, tick: u64) -> u64 {
+        self.sims
+            .get(&sim)
+            .and_then(|s| s.acked_tick)
+            .map_or(0, |a| tick.saturating_sub(a))
+    }
+
     pub fn load(&self, world: &World, sim: SimId) -> f64 {
         world
             .cells_of(sim)
@@ -202,13 +210,17 @@ impl Controller {
         // empty cells of dead simulators simply become free
         world.drop_lapsed_leases();
         let tick = world.tick;
+        // a simulator that cannot keep up sheds a cell before its cells get dilated (plan 4.8:
+        // split first, time dilation only when there is nothing left to move)
+        let tidi_after = world.cfg.tidi_after_ticks.max(1);
         let sims: Vec<SimId> = self.sims.keys().copied().collect();
         for s in sims {
             if !self.is_alive(s, tick) {
                 continue;
             }
             let cells = world.cells_of(s);
-            if cells.len() < 2 || self.load(world, s) <= self.cfg.split_cost {
+            let lagging = self.lag(s, tick) > tidi_after;
+            if cells.len() < 2 || (self.load(world, s) <= self.cfg.split_cost && !lagging) {
                 continue;
             }
             // shed the cell with the fewest neighbours owned by `s` (least ghost coupling)
@@ -226,8 +238,11 @@ impl Controller {
                 .keys()
                 .copied()
                 .filter(|o| *o != s && self.is_alive(*o, tick) && self.has_room(world, *o))
+                .filter(|o| self.lag(*o, tick) <= tidi_after)
                 .filter(|o| {
-                    self.load(world, *o) + world.entities_in(victim) as f64 <= self.cfg.split_cost
+                    lagging
+                        || self.load(world, *o) + world.entities_in(victim) as f64
+                            <= self.cfg.split_cost
                 })
                 .min_by(|a, b| self.load(world, *a).total_cmp(&self.load(world, *b)))
             else {
@@ -239,7 +254,7 @@ impl Controller {
                 cell: victim,
                 from: Some(s),
                 to,
-                reason: "overloaded".into(),
+                reason: if lagging { "lagging" } else { "overloaded" }.into(),
             });
         }
         out
@@ -281,6 +296,62 @@ mod tests {
             );
         }
         assert!(unlimited.cell_has_room(c));
+    }
+
+    /// Plan 4.8: a simulator that cannot keep up first hands a cell to one that can; only what
+    /// it still holds afterwards is dilated, and with nobody to take the cell everything is.
+    #[test]
+    fn lagging_simulator_sheds_a_cell_before_dilating() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            tidi_after_ticks: 10,
+            tidi_min: 0.1,
+            ..WorldConfig::default()
+        });
+        let mut ctl = Controller::new(ControllerConfig::default());
+        let (slow, fast) = (SimId::now_v7(), SimId::now_v7());
+        ctl.register(slow, 4, 0);
+        ctl.register(fast, 4, 0);
+        let (a, b) = (CellId { x: 0, y: 0 }, CellId { x: 1, y: 0 });
+        w.grant_lease(a, slow);
+        w.grant_lease(b, slow);
+        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
+        w.spawn(Pos { x: 110.0, y: 10.0 }, Default::default(), false);
+        w.tick = 100;
+        w.renew_leases(slow);
+        w.renew_leases(fast);
+        ctl.seen(slow, 100);
+        ctl.seen(fast, 100);
+        ctl.progress(slow, 50);
+        ctl.progress(fast, 99);
+        // load 2 is far under split_cost: only the lag makes `slow` shed
+        let out = ctl.reconcile(&mut w);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].from, Some(slow));
+        assert_eq!(out[0].to, fast);
+        assert_eq!(out[0].reason, "lagging");
+        assert_eq!(w.cells_of(slow).len(), 1);
+        let kept = w.cells_of(slow)[0];
+        let moved = w.cells_of(fast)[0];
+        // what it still holds is dilated (10/50); the moved cell runs at real time
+        assert_eq!(ctl.dilate(&mut w), vec![(kept, 0.2)]);
+        assert_eq!(w.time_scale(moved), 1.0);
+        // one cell left: nothing more to shed
+        let extra = ctl.reconcile(&mut w);
+        assert!(extra.is_empty(), "{extra:?}");
+        // the world moves on and `fast` falls behind too: a lagging simulator is no destination
+        w.tick = 200;
+        w.renew_leases(slow);
+        w.renew_leases(fast);
+        ctl.seen(slow, 200);
+        ctl.seen(fast, 200);
+        w.grant_lease(moved, slow);
+        let extra = ctl.reconcile(&mut w);
+        assert!(extra.is_empty(), "{extra:?}");
+        // 150 behind: 10/150 is below the floor
+        assert_eq!(ctl.dilate(&mut w).len(), 2);
+        assert_eq!(w.time_scale(a), 0.1);
+        assert_eq!(w.time_scale(b), 0.1);
     }
 
     #[test]
