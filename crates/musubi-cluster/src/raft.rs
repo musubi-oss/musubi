@@ -521,8 +521,12 @@ impl Cluster {
         let started = Instant::now();
         loop {
             if self.is_raft_leader() {
-                if r.raft.ensure_linearizable().await.is_ok() {
-                    return r.sm.state.read().await.data.get(key).cloned();
+                // openraft waits for the read index to be applied with no deadline of its own: a
+                // leader that lost its quorum mid-change would park every caller for good
+                match tokio::time::timeout(RPC_TIMEOUT, r.raft.ensure_linearizable()).await {
+                    Ok(Ok(_)) => return r.sm.state.read().await.data.get(key).cloned(),
+                    Ok(Err(e)) => tracing::debug!(key, error = %e, "linearizable read failed"),
+                    Err(_) => tracing::warn!(key, "linearizable read timed out on the leader"),
                 }
             } else if let Some(leader) = self.raft_leader() {
                 if let Some(peer) = self.peer_by_raft_id(leader).await {
@@ -554,10 +558,13 @@ impl Cluster {
     pub(crate) async fn handle_forwarded_read(&self, body: &[u8]) -> Vec<u8> {
         let key = String::from_utf8_lossy(body).to_string();
         let res: std::result::Result<Option<Value>, String> = match self.raft_state() {
-            Some(r) if self.is_raft_leader() => match r.raft.ensure_linearizable().await {
-                Ok(_) => Ok(r.sm.state.read().await.data.get(&key).cloned()),
-                Err(e) => Err(format!("linearizable read: {e}")),
-            },
+            Some(r) if self.is_raft_leader() => {
+                match tokio::time::timeout(RPC_TIMEOUT, r.raft.ensure_linearizable()).await {
+                    Ok(Ok(_)) => Ok(r.sm.state.read().await.data.get(&key).cloned()),
+                    Ok(Err(e)) => Err(format!("linearizable read: {e}")),
+                    Err(_) => Err("linearizable read: timed out on the leader".into()),
+                }
+            }
             Some(_) => Err("not the raft leader".into()),
             None => Err("raft not running".into()),
         };
@@ -599,9 +606,10 @@ impl Cluster {
         let mut last = Error::Conflict("raft has no leader yet".into());
         loop {
             if self.is_raft_leader() {
-                match r.raft.client_write(op.clone()).await {
-                    Ok(resp) => return Ok(resp.data),
-                    Err(e) => last = Error::Internal(format!("raft write: {e}")),
+                match tokio::time::timeout(RPC_TIMEOUT, r.raft.client_write(op.clone())).await {
+                    Ok(Ok(resp)) => return Ok(resp.data),
+                    Ok(Err(e)) => last = Error::Internal(format!("raft write: {e}")),
+                    Err(_) => last = Error::Internal("raft write: timed out on the leader".into()),
                 }
             } else if let Some(leader) = self.raft_leader() {
                 match self.peer_by_raft_id(leader).await {
@@ -646,20 +654,20 @@ impl Cluster {
     }
 
     pub(crate) async fn handle_forwarded_write(&self, body: &[u8]) -> Vec<u8> {
-        let res: std::result::Result<DirectoryResp, String> =
-            match serde_json::from_slice::<DirectoryOp>(body) {
-                Ok(op) if self.is_raft_leader() => match self.raft_state() {
-                    Some(r) => r
-                        .raft
-                        .client_write(op)
-                        .await
-                        .map(|x| x.data)
-                        .map_err(|e| format!("raft write: {e}")),
-                    None => Err("raft not running".into()),
+        let res: std::result::Result<DirectoryResp, String> = match serde_json::from_slice::<
+            DirectoryOp,
+        >(body)
+        {
+            Ok(op) if self.is_raft_leader() => match self.raft_state() {
+                Some(r) => match tokio::time::timeout(RPC_TIMEOUT, r.raft.client_write(op)).await {
+                    Ok(res) => res.map(|x| x.data).map_err(|e| format!("raft write: {e}")),
+                    Err(_) => Err("raft write: timed out on the leader".into()),
                 },
-                Ok(_) => Err("not the raft leader".into()),
-                Err(e) => Err(format!("bad write: {e}")),
-            };
+                None => Err("raft not running".into()),
+            },
+            Ok(_) => Err("not the raft leader".into()),
+            Err(e) => Err(format!("bad write: {e}")),
+        };
         serde_json::to_vec(&res).unwrap_or_else(|_| b"null".to_vec())
     }
 

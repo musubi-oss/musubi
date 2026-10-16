@@ -297,20 +297,34 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 await_dead_agreement(&cluster).await;
                 // cells of our worlds hosted on a dead node come back to us (no lease: each home
                 // node handles its own worlds)
-                worlds.refresh_homes().await;
-                match worlds.reconcile_handed_back().await {
-                    Ok(n) if n > 0 => tracing::info!(entities = n, "handed-back cells reconciled"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "hand-back reconciliation failed"),
+                // every stage is bounded and named: a hang here froze world failover cluster-wide
+                // once without a single log line to point at it
+                const STAGE: std::time::Duration = std::time::Duration::from_secs(30);
+                if tokio::time::timeout(STAGE, worlds.refresh_homes())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("world failover: refresh_homes timed out");
+                }
+                match tokio::time::timeout(STAGE, worlds.reconcile_handed_back()).await {
+                    Err(_) => tracing::warn!("world failover: reconcile_handed_back timed out"),
+                    Ok(r) => match r {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(entities = n, "handed-back cells reconciled")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "hand-back reconciliation failed"),
+                    },
                 }
                 if let Some(dead) = dead_nodes(&cluster).await {
                     tracing::info!(?dead, "world failover round");
-                    match worlds.recover_cells(&dead, &fanout).await {
-                        Ok(cells) if !cells.is_empty() => {
+                    match tokio::time::timeout(STAGE, worlds.recover_cells(&dead, &fanout)).await {
+                        Ok(Ok(cells)) if !cells.is_empty() => {
                             tracing::info!(?cells, ?dead, "re-homed cells of dead hosts")
                         }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "cell failover failed"),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(error = %e, "cell failover failed"),
+                        Err(_) => tracing::warn!(?dead, "world failover: recover_cells timed out"),
                     }
                 }
                 if !await_lease(&lease).await {
@@ -319,12 +333,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 let Some(dead) = dead_nodes(&cluster).await else {
                     continue;
                 };
-                match worlds.recover(&dead).await {
-                    Ok(names) if !names.is_empty() => {
+                match tokio::time::timeout(STAGE, worlds.recover(&dead)).await {
+                    Ok(Ok(names)) if !names.is_empty() => {
                         tracing::info!(?names, ?dead, "adopted worlds from dead nodes")
                     }
-                    Ok(_) => tracing::info!(?dead, "world failover round: nothing to adopt"),
-                    Err(e) => tracing::warn!(error = %e, "world failover failed"),
+                    Ok(Ok(_)) => tracing::info!(?dead, "world failover round: nothing to adopt"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "world failover failed"),
+                    Err(_) => tracing::warn!(?dead, "world failover: recover timed out"),
                 }
             }
         });
