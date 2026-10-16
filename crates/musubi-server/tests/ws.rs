@@ -5939,3 +5939,159 @@ async fn soft_cap_refuses_spawn_into_a_full_cell() {
         "{ev}"
     );
 }
+
+/// A spawn into a full cell with `queue: true` waits (202 + `queued`) and is admitted in order
+/// once an entity leaves; a ticket older than `queue_ttl_ticks` expires with an event.
+#[tokio::test]
+async fn soft_cap_queue_admits_when_room_frees() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "soft_cap": 1, "queue_ttl_ticks": 20}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let spawn = |x: f64, queue: bool| json!({"sim": sim, "x": x, "y": 10.0, "components": {"n": x}, "persistent": false, "queue": queue});
+    let (st, a) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(spawn(10.0, false)),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    let (st, q) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(spawn(20.0, true)),
+    )
+    .await;
+    assert_eq!(st, 202, "{q}");
+    assert_eq!(q["queued"], json!(true));
+    assert_eq!(q["position"], json!(1));
+    assert!(q["eta_ticks"].is_null(), "no departures seen yet: {q}");
+    let ticket = q["ticket"].clone();
+    let events = |router: axum::Router| {
+        let world = world.clone();
+        async move {
+            let (st, ev) = http_json(
+                &router,
+                "GET",
+                &format!("/v1/server/worlds/{world}/events?sim={sim}"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{ev}");
+            ev["events"].as_array().cloned().unwrap_or_default()
+        }
+    };
+    let first = events(router.clone()).await;
+    assert!(
+        first
+            .iter()
+            .any(|e| e["type"] == "queued" && e["ticket"] == ticket),
+        "{first:?}"
+    );
+    // nothing is admitted while the cell stays full
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let idle = events(router.clone()).await;
+    assert!(
+        !idle.iter().any(|e| e["type"] == "queue_admitted"),
+        "{idle:?}"
+    );
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/despawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "entity": a["id"]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let mut admitted = None;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Some(e) = events(router.clone())
+            .await
+            .into_iter()
+            .find(|e| e["type"] == "queue_admitted")
+        {
+            admitted = Some(e);
+            break;
+        }
+    }
+    let admitted = admitted.expect("queued spawn admitted after the cell freed");
+    assert_eq!(admitted["ticket"], ticket);
+    assert_eq!(
+        admitted["entity"]["components"][0]["value"],
+        json!(20.0),
+        "{admitted}"
+    );
+    let (st, view) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{world}/view/0/0?sim={sim}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{view}");
+    assert!(
+        view.to_string()
+            .contains(admitted["entity"]["id"].as_str().unwrap()),
+        "{view}"
+    );
+    // the cell is full again: a new ticket outlives queue_ttl_ticks and expires
+    let (st, q2) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(spawn(30.0, true)),
+    )
+    .await;
+    assert_eq!(st, 202, "{q2}");
+    let mut expired = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Some(e) = events(router.clone())
+            .await
+            .into_iter()
+            .find(|e| e["type"] == "queue_expired")
+        {
+            expired = Some(e);
+            break;
+        }
+    }
+    let expired = expired.expect("ticket expired after queue_ttl_ticks");
+    assert_eq!(expired["ticket"], q2["ticket"]);
+    assert_eq!(expired["reason"], json!("timeout"));
+}

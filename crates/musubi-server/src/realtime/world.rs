@@ -49,6 +49,47 @@ struct WorldState {
     /// Per-target sequence of delivered interactions (this node is the single point of order
     /// for the entities it owns; the counter restarts when an entity changes owner).
     interaction_seq: HashMap<EntityId, u64>,
+    /// Spawns waiting for room in a full cell (`soft_cap`), per cell, in arrival order.
+    admission: HashMap<CellId, CellQueue>,
+}
+
+/// A spawn refused by `soft_cap` that asked to wait; admitted when its cell makes room.
+struct Queued {
+    ticket: Uuid,
+    sim: Uuid,
+    pos: Pos,
+    components: std::collections::BTreeMap<String, Value>,
+    persistent: bool,
+    enqueued_tick: u64,
+    /// (position, eta) last told to the simulator, to report only changes.
+    reported: (usize, Option<u64>),
+}
+
+#[derive(Default)]
+struct CellQueue {
+    entries: std::collections::VecDeque<Queued>,
+    /// Entity count after the previous tick's admissions, to measure departures.
+    prev_count: Option<usize>,
+    /// Departures per tick, exponentially smoothed; drives the ETA.
+    departures: f64,
+}
+
+impl CellQueue {
+    fn eta_ticks(&self, position: usize) -> Option<u64> {
+        (self.departures > 1e-6).then(|| (position as f64 / self.departures).ceil() as u64)
+    }
+}
+
+/// Result of a spawn that may wait for room.
+#[derive(Debug)]
+pub enum SpawnOutcome {
+    Spawned(WorldEntity),
+    Queued {
+        ticket: Uuid,
+        cell: CellId,
+        position: usize,
+        eta_ticks: Option<u64>,
+    },
 }
 
 /// A cross-node handover still unacknowledged after this many re-sends is logged (it keeps going).
@@ -420,6 +461,7 @@ impl WorldRegistry {
                     home_node: home,
                     remote_transit: HashMap::new(),
                     interaction_seq: HashMap::new(),
+                    admission: HashMap::new(),
                 }))
             });
         }
@@ -942,6 +984,7 @@ impl WorldRegistry {
                     home_node: None,
                     remote_transit: HashMap::new(),
             interaction_seq: HashMap::new(),
+            admission: HashMap::new(),
                 })),
             );
             self.homes.insert(name.clone(), self.node_id);
@@ -1300,6 +1343,7 @@ impl WorldRegistry {
                 home_node: None,
                 remote_transit: HashMap::new(),
                 interaction_seq: HashMap::new(),
+                admission: HashMap::new(),
             })),
         );
         self.publish_home(name, Some(self.node_id)).await;
@@ -1447,6 +1491,27 @@ impl WorldRegistry {
         components: Value,
         persistent: bool,
     ) -> Result<WorldEntity> {
+        match self.spawn_or_queue(name, sim, pos, components, persistent, false)? {
+            SpawnOutcome::Spawned(e) => Ok(e),
+            SpawnOutcome::Queued { .. } => {
+                Err(Error::Internal("spawn queued without asking".into()))
+            }
+        }
+    }
+
+    /// Spawns, or with `queue` joins the cell's admission queue when `soft_cap` refuses: the
+    /// simulator gets `queued` now and `queue_admitted` with the entity once there is room
+    /// (`queue_update` as its position/ETA change, `queue_expired` on `queue_ttl_ticks` or a lost
+    /// lease).
+    pub fn spawn_or_queue(
+        &self,
+        name: &str,
+        sim: Uuid,
+        pos: Pos,
+        components: Value,
+        persistent: bool,
+        queue: bool,
+    ) -> Result<SpawnOutcome> {
         let comps: std::collections::BTreeMap<String, Value> = components
             .as_object()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -1463,7 +1528,7 @@ impl WorldRegistry {
                 announce(st, &a);
             }
         }
-        if !st.world.cell_has_room(cell) {
+        if !st.world.cell_has_room(cell) && !queue {
             push_event(
                 st,
                 sim,
@@ -1483,18 +1548,37 @@ impl WorldRegistry {
             }
             None => return Err(Error::Conflict(format!("cell {cell:?} has no live lease"))),
         }
-        let id = st.world.spawn(pos, comps.clone(), persistent);
-        if persistent {
-            st.journal.push(WorldOp {
-                tick: st.world.tick,
-                op: WorldMutation::Spawn {
-                    id,
-                    pos,
-                    components: Value::Object(comps.into_iter().collect()),
-                },
+        if !st.world.cell_has_room(cell) {
+            let ticket = Uuid::now_v7();
+            let soft_cap = st.world.cfg.soft_cap;
+            let tick = st.world.tick;
+            let q = st.admission.entry(cell).or_default();
+            let position = q.entries.len() + 1;
+            let eta_ticks = q.eta_ticks(position);
+            q.entries.push_back(Queued {
+                ticket,
+                sim,
+                pos,
+                components: comps,
+                persistent,
+                enqueued_tick: tick,
+                reported: (position, eta_ticks),
+            });
+            push_event(
+                st,
+                sim,
+                json!({"type": "queued", "ticket": ticket, "cell": cell, "position": position,
+                       "eta_ticks": eta_ticks, "soft_cap": soft_cap}),
+            );
+            return Ok(SpawnOutcome::Queued {
+                ticket,
+                cell,
+                position,
+                eta_ticks,
             });
         }
-        Ok(to_wire(st.world.get(id).unwrap()))
+        let id = spawn_entity(st, pos, comps, persistent);
+        Ok(SpawnOutcome::Spawned(to_wire(st.world.get(id).unwrap())))
     }
 
     pub fn despawn(&self, name: &str, sim: Uuid, entity: &str) -> Result<()> {
@@ -1958,6 +2042,7 @@ impl WorldRegistry {
             let st = &mut *st;
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
+            drain_admission(st);
             if self.is_split(&name) {
                 let (hosted_only, home_node) = (st.hosted_only, st.home_node);
                 let remote = st.world.detect_remote_handovers(|c| {
@@ -2184,6 +2269,103 @@ fn stamp_interaction(st: &mut WorldState, id: EntityId, mut ev: Value) -> Value 
     ev["seq"] = json!(*seq);
     ev["tick"] = json!(st.world.tick);
     ev
+}
+
+fn spawn_entity(
+    st: &mut WorldState,
+    pos: Pos,
+    comps: std::collections::BTreeMap<String, Value>,
+    persistent: bool,
+) -> EntityId {
+    let id = st.world.spawn(pos, comps.clone(), persistent);
+    if persistent {
+        st.journal.push(WorldOp {
+            tick: st.world.tick,
+            op: WorldMutation::Spawn {
+                id,
+                pos,
+                components: Value::Object(comps.into_iter().collect()),
+            },
+        });
+    }
+    id
+}
+
+/// Admits queued spawns in arrival order as their cells make room; drops tickets past
+/// `queue_ttl_ticks` or whose simulator no longer owns the cell. ETA = position / smoothed
+/// departures per tick (unknown until the cell has seen entities leave).
+fn drain_admission(st: &mut WorldState) {
+    if st.admission.is_empty() {
+        return;
+    }
+    let tick = st.world.tick;
+    let ttl = st.world.cfg.queue_ttl_ticks;
+    let cells: Vec<CellId> = st.admission.keys().copied().collect();
+    let mut events = Vec::new();
+    for cell in cells {
+        let owner = st.world.owner(cell);
+        let count = st.world.entities_in(cell);
+        let Some(q) = st.admission.get_mut(&cell) else {
+            continue;
+        };
+        if let Some(prev) = q.prev_count {
+            let left = prev.saturating_sub(count) as f64;
+            q.departures = q.departures * 0.9 + left * 0.1;
+        }
+        q.entries.retain(|e| {
+            let expired = ttl > 0 && tick.saturating_sub(e.enqueued_tick) >= ttl;
+            let lost = owner != Some(e.sim);
+            if expired || lost {
+                events.push((
+                    e.sim,
+                    json!({"type": "queue_expired", "ticket": e.ticket, "cell": cell,
+                           "reason": if lost { "lease_lost" } else { "timeout" }}),
+                ));
+            }
+            !(expired || lost)
+        });
+        while st.world.cell_has_room(cell) {
+            let Some(e) = q.entries.pop_front() else {
+                break;
+            };
+            let id = st.world.spawn(e.pos, e.components.clone(), e.persistent);
+            if e.persistent {
+                st.journal.push(WorldOp {
+                    tick,
+                    op: WorldMutation::Spawn {
+                        id,
+                        pos: e.pos,
+                        components: Value::Object(e.components.into_iter().collect()),
+                    },
+                });
+            }
+            events.push((
+                e.sim,
+                json!({"type": "queue_admitted", "ticket": e.ticket, "cell": cell,
+                       "entity": to_wire(st.world.get(id).unwrap())}),
+            ));
+        }
+        let departures = q.departures;
+        for (i, e) in q.entries.iter_mut().enumerate() {
+            let position = i + 1;
+            let eta = (departures > 1e-6).then(|| (position as f64 / departures).ceil() as u64);
+            if e.reported != (position, eta) {
+                e.reported = (position, eta);
+                events.push((
+                    e.sim,
+                    json!({"type": "queue_update", "ticket": e.ticket, "cell": cell,
+                           "position": position, "eta_ticks": eta}),
+                ));
+            }
+        }
+        q.prev_count = Some(st.world.entities_in(cell));
+        if q.entries.is_empty() {
+            st.admission.remove(&cell);
+        }
+    }
+    for (sim, ev) in events {
+        push_event(st, sim, ev);
+    }
 }
 
 fn push_event(st: &mut WorldState, sim: Uuid, ev: Value) {

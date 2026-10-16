@@ -89,6 +89,9 @@ pub struct WorldConfig {
     pub tidi_after_ticks: u64,
     /// Lowest time scale a dilated cell is allowed to drop to.
     pub tidi_min: f64,
+    /// A spawn that asked to queue for a full cell is dropped after waiting this many ticks
+    /// (0 = never).
+    pub queue_ttl_ticks: u64,
 }
 
 impl Default for WorldConfig {
@@ -104,6 +107,7 @@ impl Default for WorldConfig {
             soft_cap: 0,
             tidi_after_ticks: 15,
             tidi_min: 0.1,
+            queue_ttl_ticks: 600,
         }
     }
 }

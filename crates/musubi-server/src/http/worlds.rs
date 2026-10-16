@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
+use crate::realtime::world::SpawnOutcome;
 
 /// Simulator calls must hit the world's home node: redirect (307, same method+body) when the home
 /// advertises an HTTP address, otherwise explain which node to talk to.
@@ -202,6 +203,9 @@ struct SpawnReq {
     components: Value,
     #[serde(default)]
     persistent: bool,
+    /// Wait in the cell's admission queue instead of failing when `soft_cap` is reached.
+    #[serde(default)]
+    queue: bool,
 }
 
 #[derive(Deserialize)]
@@ -355,23 +359,44 @@ async fn spawn(
     ServerKey: ServerKey,
     Path(w): Path<String>,
     Json(r): Json<SpawnReq>,
-) -> Result<Json<Value>, Response> {
+) -> Result<Response, Response> {
     match s.worlds.cell_of(&w, Pos { x: r.x, y: r.y }) {
         Ok(c) => ensure_cell_home(&s, &w, c, &uri).await?,
         Err(_) => ensure_home(&s, &w, &uri).await?,
     }
-    let r: Result<Json<Value>, ApiError> = async {
-        let e = s.worlds.spawn(
+    let r: Result<Response, ApiError> = async {
+        let out = s.worlds.spawn_or_queue(
             &w,
             r.sim,
             Pos { x: r.x, y: r.y },
             r.components,
             r.persistent,
+            r.queue,
         )?;
-        Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+        Ok(match out {
+            SpawnOutcome::Spawned(e) => {
+                Json(serde_json::to_value(e).map_err(Error::internal)?).into_response()
+            }
+            SpawnOutcome::Queued { .. } => {
+                (StatusCode::ACCEPTED, Json(queued_json(out))).into_response()
+            }
+        })
     }
     .await;
     r.map_err(IntoResponse::into_response)
+}
+
+fn queued_json(out: SpawnOutcome) -> Value {
+    match out {
+        SpawnOutcome::Queued {
+            ticket,
+            cell,
+            position,
+            eta_ticks,
+        } => json!({"queued": true, "ticket": ticket, "cell": cell, "position": position,
+                    "eta_ticks": eta_ticks}),
+        SpawnOutcome::Spawned(_) => Value::Null,
+    }
 }
 
 async fn despawn(
@@ -590,8 +615,15 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                     Ok(r) => r,
                     Err(r) => return Ok(r),
                 };
-                let e = s.worlds.spawn(w, sim, pos, r.components, r.persistent)?;
-                reply["entity"] = serde_json::to_value(e).map_err(Error::internal)?;
+                match s
+                    .worlds
+                    .spawn_or_queue(w, sim, pos, r.components, r.persistent, r.queue)?
+                {
+                    SpawnOutcome::Spawned(e) => {
+                        reply["entity"] = serde_json::to_value(e).map_err(Error::internal)?;
+                    }
+                    out => reply["queued"] = queued_json(out),
+                }
                 Ok(reply)
             }
             "tick_done" => {
