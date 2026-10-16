@@ -427,17 +427,26 @@ impl WorldRegistry {
         let mut tmp = World::new(cfg);
         let replayed = Self::load_shards(&db, name, &[prev], true, &mut tmp).await?;
         let ents = tmp.snapshot_persistent();
-        let mut st = w.lock();
-        let ents: Vec<_> = ents
-            .into_iter()
-            .filter(|e| st.world.cell_of(e.pos) == cell && st.world.get(e.id).is_none())
-            .collect();
-        let n = ents.len();
-        st.world.restore(ents);
-        drop(st);
+        let n = {
+            let mut st = w.lock();
+            let ents: Vec<_> = ents
+                .into_iter()
+                .filter(|e| st.world.cell_of(e.pos) == cell && st.world.get(e.id).is_none())
+                .collect();
+            let n = ents.len();
+            st.world.restore(ents);
+            n
+        };
         self.adopted_from.insert((name.to_string(), cell, prev));
         if n > 0 || replayed > 0 {
             tracing::info!(world = name, ?cell, %prev, entities = n, ops = replayed, "cell adopted from previous host");
+        }
+        let mut keep = self.assigned_hosts(name).await;
+        if !keep.contains(&prev) {
+            keep.push(self.node_id);
+            if let Err(e) = self.prune_shards(name, &keep).await {
+                tracing::warn!(world = name, %prev, error = %e, "stale shard rows not pruned");
+            }
         }
         Ok(n)
     }
@@ -666,6 +675,39 @@ impl WorldRegistry {
 
     /// Write the world's persistent entities to the snapshot store now (the ticker also does it
     /// every `SNAPSHOT_EVERY` ticks).
+    /// Shard rows of nodes that no longer hold any part of `name` were merged into this node's
+    /// state: persist that state first, then drop them so a later recovery cannot resurrect
+    /// stale entities (journal rows without a node are legacy single-node chunks).
+    async fn prune_shards(&self, name: &str, keep: &[Uuid]) -> Result<()> {
+        let Some(db) = &self.db else { return Ok(()) };
+        self.snapshot_now(name).await?;
+        sqlx::query("delete from musubi.world_snapshots where name = $1 and node_id <> all($2)")
+            .bind(name)
+            .bind(keep)
+            .execute(db)
+            .await
+            .map_err(Error::internal)?;
+        sqlx::query("delete from musubi.world_journal where name = $1 and node_id <> all($2)")
+            .bind(name)
+            .bind(keep)
+            .execute(db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Nodes the directory currently assigns cells of `name` to.
+    async fn assigned_hosts(&self, name: &str) -> Vec<Uuid> {
+        let Some(c) = self.cluster.get() else {
+            return vec![];
+        };
+        c.directory_prefix(&format!("world:{name}:cell:"))
+            .await
+            .into_iter()
+            .filter_map(|(_, v)| v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()))
+            .collect()
+    }
+
     pub async fn snapshot_now(&self, name: &str) -> Result<()> {
         let Some(db) = &self.db else { return Ok(()) };
         let (entities, tick) = {
@@ -796,6 +838,11 @@ impl WorldRegistry {
             );
             self.homes.insert(name.clone(), self.node_id);
             self.publish_home(&name, Some(self.node_id)).await;
+            let mut keep = live.clone();
+            keep.push(self.node_id);
+            if let Err(e) = self.prune_shards(&name, &keep).await {
+                tracing::warn!(world = %name, error = %e, "stale shard rows not pruned");
+            }
             if let Some(ev) = self.events.get() {
                 ev.emit(
                     "world.rehomed",

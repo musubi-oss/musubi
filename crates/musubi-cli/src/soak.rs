@@ -1335,7 +1335,7 @@ async fn mesh_detail(client: &reqwest::Client, alive: &Alive, mw: &MeshWorld) ->
     let urls: Vec<String> = alive.read().await.clone();
     let mut parts = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (i, u) in urls.iter().enumerate() {
+    for u in urls.iter() {
         let mut cells = Vec::new();
         for (x, y) in [(0, 0), (1, 0)] {
             let res = client
@@ -1377,7 +1377,7 @@ async fn mesh_detail(client: &reqwest::Client, alive: &Alive, mw: &MeshWorld) ->
             cells.push(format!("({x},{y})={d}"));
         }
         parts.push(format!(
-            "n{i}[{}]: {}",
+            "[{}]: {}",
             u.rsplit(':').next().unwrap_or(""),
             cells.join(" ")
         ));
