@@ -40,16 +40,20 @@ impl Pos {
 pub struct Component {
     pub value: serde_json::Value,
     pub version: u64,
+    /// The entity's revision when this component last changed (see `Entity::rev`).
+    #[serde(default)]
+    pub changed_rev: u64,
     /// `value` as JSON text, built on first use and shared by every frame that carries it.
     #[serde(skip)]
     pub json: std::sync::OnceLock<std::sync::Arc<str>>,
 }
 
 impl Component {
-    pub fn new(value: serde_json::Value, version: u64) -> Self {
+    pub fn new(value: serde_json::Value, version: u64, changed_rev: u64) -> Self {
         Self {
             value,
             version,
+            changed_rev,
             json: std::sync::OnceLock::new(),
         }
     }
@@ -85,6 +89,10 @@ pub struct Entity {
     /// client that already has the entity as of a later tick skips it without comparing.
     #[serde(default)]
     pub changed_tick: u64,
+    /// Bumped on every component write; a client remembers the revision it last received and
+    /// the components with a newer `changed_rev` are exactly the ones it has not seen.
+    #[serde(default)]
+    pub rev: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,7 +203,7 @@ struct Interest {
     pos: Pos,
     radius: f64,
     /// entity → last component versions the client received (pos is always sent on move).
-    known: HashMap<EntityId, (Pos, BTreeMap<String, u64>)>,
+    known: HashMap<EntityId, (Pos, u64)>,
     /// Per-tick byte budget override (`None` = world default).
     #[serde(default)]
     budget_bytes: Option<usize>,
@@ -612,13 +620,14 @@ impl World {
             cell,
             components: components
                 .into_iter()
-                .map(|(k, v)| (k, Component::new(v, 1)))
+                .map(|(k, v)| (k, Component::new(v, 1, 1)))
                 .collect(),
             persistent,
             transit: None,
             decay_ticks: None,
             touched_tick: self.tick,
             changed_tick: self.tick,
+            rev: 1,
         };
         self.by_cell.insert(cell, id, self.tick);
         self.entities.insert(id, e);
@@ -783,13 +792,17 @@ impl World {
             self.record_pos(id, p);
         }
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
+        if !components.is_empty() {
+            e.rev += 1;
+        }
+        let rev = e.rev;
         for (k, v) in components {
             let c = e
                 .components
                 .entry(k)
-                .or_insert(Component::new(serde_json::Value::Null, 0));
+                .or_insert(Component::new(serde_json::Value::Null, 0, 0));
             if c.value != v {
-                *c = Component::new(v, c.version + 1);
+                *c = Component::new(v, c.version + 1, rev);
             }
         }
         Ok(())
@@ -1240,7 +1253,7 @@ impl World {
             bytes: usize,
             id: EntityId,
             pos: Pos,
-            versions: BTreeMap<String, u64>,
+            rev: u64,
             spawn: Option<Entity>,
             update: Option<(EntityId, Pos, BTreeMap<String, Component>)>,
         }
@@ -1300,11 +1313,6 @@ impl World {
                 continue;
             }
             let qpos = quantize(e.pos, quantum);
-            let versions: BTreeMap<String, u64> = e
-                .components
-                .iter()
-                .map(|(k, c)| (k.clone(), c.version))
-                .collect();
             let (spawn, update, bytes) = match interest.known.get(&e.id) {
                 None => {
                     let mut s = e.clone();
@@ -1312,11 +1320,11 @@ impl World {
                     let bytes = estimate_components(s.components.iter()) + 64;
                     (Some(s), None, bytes)
                 }
-                Some((pos, known_versions)) => {
+                Some((pos, known_rev)) => {
                     let changed: BTreeMap<String, Component> = e
                         .components
                         .iter()
-                        .filter(|(k, c)| known_versions.get(*k) != Some(&c.version))
+                        .filter(|(_, c)| c.changed_rev > *known_rev)
                         .map(|(k, c)| (k.clone(), c.clone()))
                         .collect();
                     if *pos == qpos && changed.is_empty() {
@@ -1333,7 +1341,7 @@ impl World {
                 bytes,
                 id: e.id,
                 pos: qpos,
-                versions,
+                rev: e.rev,
                 spawn,
                 update,
             });
@@ -1359,7 +1367,7 @@ impl World {
             if let Some(u) = c.update {
                 d.updated.push(u);
             }
-            interest.known.insert(c.id, (c.pos, c.versions));
+            interest.known.insert(c.id, (c.pos, c.rev));
             interest.last_sent.insert(c.id, tick);
         }
         let gone: Vec<EntityId> = if fast {
