@@ -43,6 +43,11 @@ async fn start_with(leader: bool, group: &str) -> Option<(String, axum::Router)>
 }
 
 async fn build_state(leader: bool, group: &str) -> Option<AppState> {
+    build_state_in(leader, group, "local").await
+}
+
+/// A node of `group` in `region` (multi-region placement tests).
+async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppState> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
@@ -53,7 +58,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
     migrate_once(&db).await;
     let hub = Arc::new(Hub::new());
     let runtime = test_runtime();
-    let cluster = test_cluster(&db, group).await;
+    let cluster = test_cluster_in(&db, group, region).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
     let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
@@ -80,6 +85,7 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
         cluster.as_ref().unwrap().node_id().0,
         Some(db.clone()),
     ));
+    worlds.set_region(region);
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
@@ -1172,12 +1178,16 @@ async fn rpc_over_socket() {
     ));
 }
 
-async fn test_cluster(db: &sqlx::PgPool, group: &str) -> Option<Arc<musubi_cluster::Cluster>> {
+async fn test_cluster_in(
+    db: &sqlx::PgPool,
+    group: &str,
+    region: &str,
+) -> Option<Arc<musubi_cluster::Cluster>> {
     let c = Arc::new(
         musubi_cluster::Cluster::new(
             db.clone(),
             "test-node",
-            "local",
+            region,
             vec!["all".into()],
             "127.0.0.1:0",
         )
@@ -6891,4 +6901,106 @@ async fn colocate_pins_a_partner_from_another_node() {
     )
     .await;
     assert_eq!(st, 200, "caller owns the partner now: {v}");
+}
+
+/// Multi-region: a world asked for another region with a live node there is created pending
+/// (202); a failover round on a node of another region leaves it alone while that region has a
+/// live node, and a node of that region adopts it (the harness has no failover loop, so the
+/// rounds are driven by hand).
+#[tokio::test]
+async fn world_asked_for_another_region_is_adopted_there() {
+    let group = format!("xreg-{}", uuid::Uuid::now_v7().simple());
+    let Some(state1) = build_state_in(true, &group, "eu").await else {
+        return;
+    };
+    let Some(state2) = build_state_in(false, &group, "us").await else {
+        return;
+    };
+    let (router1, router2) = (
+        musubi_server::http::router(state1.clone()),
+        musubi_server::http::router(state2.clone()),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let cluster_worlds = |router: axum::Router| async move {
+        let (st, cw) =
+            http_json(&router, "GET", "/v1/admin/cluster/worlds", None, true, None).await;
+        assert_eq!(st, 200, "{cw}");
+        cw
+    };
+    let cw = cluster_worlds(router2.clone()).await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": name, "region": "us", "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 202, "{v}");
+    assert_eq!(v["pending"], json!(true));
+    // (recover also sweeps up worlds left behind by earlier tests in the shared database, so
+    // look for this world only)
+    let taken = state1.worlds.recover(&[]).await.unwrap();
+    assert!(
+        !taken.contains(&name),
+        "eu leaves a us world alone while a us node is alive: {taken:?}"
+    );
+    let taken = state2.worlds.recover(&[]).await.unwrap();
+    assert!(taken.contains(&name), "us adopts it: {taken:?}");
+    let cw = cluster_worlds(router1.clone()).await;
+    let home = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == name)
+        .and_then(|w| w["node_id"].as_str())
+        .map(str::to_string);
+    assert_eq!(
+        home.as_deref(),
+        Some(node2.as_str()),
+        "adopted by the us node"
+    );
+    // and it serves from there
+    let sim = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    let (st, e) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "x": 10.0, "y": 10.0, "components": {}, "persistent": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
 }

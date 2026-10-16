@@ -222,6 +222,8 @@ pub struct WorldRegistry {
     tick_no: std::sync::atomic::AtomicU64,
     /// Raft directory (`world:<name>` → home) when the cluster runs the QUIC bus.
     cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
+    /// `node.region` when set explicitly (`set_region`); otherwise taken from the cluster handle.
+    region: std::sync::OnceLock<String>,
     /// Outbox for `world.rehomed`.
     events: std::sync::OnceLock<Arc<crate::events::Events>>,
     /// (world, cell) → host node, cached from the directory.
@@ -315,6 +317,7 @@ impl WorldRegistry {
             cell_hosts: DashMap::new(),
             adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
+            region: std::sync::OnceLock::new(),
             events: std::sync::OnceLock::new(),
         }
     }
@@ -1440,10 +1443,18 @@ impl WorldRegistry {
 
     /// This node's region (`node.region`), the default placement for the worlds it creates.
     fn region(&self) -> String {
+        if let Some(r) = self.region.get() {
+            return r.clone();
+        }
         self.cluster
             .get()
             .map(|c| c.me().region.clone())
             .unwrap_or_default()
+    }
+
+    /// Pin this node's region (nodes without a cluster handle, e.g. tests); first call wins.
+    pub fn set_region(&self, region: &str) {
+        let _ = self.region.set(region.to_string());
     }
 
     /// Creates the world here, or — when `region` names another region with a live node — as a
