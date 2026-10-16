@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod docker;
+pub mod firecracker;
 pub mod kubernetes;
 
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);

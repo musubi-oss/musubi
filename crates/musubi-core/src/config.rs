@@ -467,6 +467,43 @@ impl Default for LimitsConfig {
 #[serde(default)]
 pub struct FleetConfig {
     pub kubernetes: KubernetesConfig,
+    pub firecracker: FirecrackerConfig,
+}
+
+/// Firecracker microVM fleet provider; registered when `binary` is set. Needs KVM, a kernel
+/// image and a read-only rootfs whose init reads `musubi.*` from the kernel command line, and —
+/// for networking — a host bridge (`bridge`) with `subnet`/`gateway` the guests are told about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FirecrackerConfig {
+    pub binary: Option<String>,
+    pub kernel: String,
+    pub rootfs: String,
+    pub vcpus: u32,
+    pub mem_mib: u32,
+    pub run_dir: String,
+    pub boot_args: String,
+    pub bridge: Option<String>,
+    /// CIDR, e.g. `172.16.0.0/24`.
+    pub subnet: Option<String>,
+    pub gateway: Option<String>,
+}
+
+impl Default for FirecrackerConfig {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            kernel: "/var/lib/musubi/firecracker/vmlinux".into(),
+            rootfs: "/var/lib/musubi/firecracker/rootfs.ext4".into(),
+            vcpus: 1,
+            mem_mib: 512,
+            run_dir: "/var/lib/musubi/firecracker/run".into(),
+            boot_args: String::new(),
+            bridge: None,
+            subnet: None,
+            gateway: None,
+        }
+    }
 }
 
 /// Kubernetes / Agones fleet providers. With no `url` the node uses the in-cluster service account

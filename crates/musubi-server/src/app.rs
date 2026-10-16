@@ -151,6 +151,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         &format!("http://{}", cfg.http.listen),
         &cfg.http.server_key,
     );
+    if let Some(bin) = &cfg.fleet.firecracker.binary {
+        match firecracker_settings(bin, &cfg.fleet.firecracker)
+            .and_then(musubi_fleet::firecracker::FirecrackerProvider::new)
+        {
+            Ok(p) => {
+                tracing::info!(provider = "firecracker", binary = %bin, "fleet provider registered");
+                fleets = fleets.with_provider("firecracker", Arc::new(p));
+            }
+            Err(e) => {
+                tracing::warn!(provider = "firecracker", error = %e, "fleet provider disabled")
+            }
+        }
+    }
     if let Some(kube) = kube_config(&cfg.fleet.kubernetes) {
         use musubi_fleet::kubernetes::{KubernetesProvider, Mode};
         let modes: &[(&str, Mode)] = if cfg.fleet.kubernetes.agones {
@@ -808,4 +821,44 @@ fn kube_config(
     }
     cfg.insecure |= k.insecure;
     Some(cfg)
+}
+
+/// `[fleet.firecracker]` → provider settings; the network is optional but all-or-nothing.
+fn firecracker_settings(
+    bin: &str,
+    c: &musubi_core::config::FirecrackerConfig,
+) -> musubi_core::Result<musubi_fleet::firecracker::FirecrackerSettings> {
+    use musubi_fleet::firecracker::{FirecrackerNetwork, FirecrackerSettings};
+    let network = match (&c.bridge, &c.subnet, &c.gateway) {
+        (None, None, None) => None,
+        (Some(bridge), Some(subnet), Some(gateway)) => {
+            let (net, prefix) = subnet.split_once('/').ok_or_else(|| {
+                musubi_core::Error::InvalidArgument("fleet.firecracker.subnet must be CIDR".into())
+            })?;
+            let bad = |what: &str| {
+                musubi_core::Error::InvalidArgument(format!("fleet.firecracker.{what} invalid"))
+            };
+            Some(FirecrackerNetwork {
+                bridge: bridge.clone(),
+                subnet: net.parse().map_err(|_| bad("subnet"))?,
+                prefix: prefix.parse().map_err(|_| bad("subnet"))?,
+                gateway: gateway.parse().map_err(|_| bad("gateway"))?,
+            })
+        }
+        _ => {
+            return Err(musubi_core::Error::InvalidArgument(
+                "fleet.firecracker needs bridge, subnet and gateway together".into(),
+            ))
+        }
+    };
+    Ok(FirecrackerSettings {
+        binary: bin.into(),
+        kernel: c.kernel.clone().into(),
+        rootfs: c.rootfs.clone().into(),
+        vcpus: c.vcpus,
+        mem_mib: c.mem_mib,
+        run_dir: c.run_dir.clone().into(),
+        boot_args: c.boot_args.clone(),
+        network,
+    })
 }
