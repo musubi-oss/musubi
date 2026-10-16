@@ -45,6 +45,10 @@ struct WorldTotals {
     apply_n: AtomicU64,
     apply_ms_sum: AtomicU64,
     apply_ms_max: AtomicU64,
+    /// Simulator ticks that went out inside the window, and ticks dropped because eight
+    /// batches were still in flight (the server answering slower than the simulator moves).
+    sim_ticks: AtomicU64,
+    sim_skipped: AtomicU64,
     /// Why a player gave up: WS handshake, first subscribe, stream closed/error, resubscribe.
     err_connect: AtomicU64,
     err_subscribe: AtomicU64,
@@ -117,7 +121,9 @@ fn arena_point(side: f64, seed: u64) -> (f64, f64) {
 
 /// Simulator side of the arena: renew the lease every 500 ms and, every tick (33 ms), move a
 /// thirtieth of the entities so each one moves about once a second and every tick carries
-/// changes (a plain HTTP `apply` per entity — the simplest, not the fastest, simulator).
+/// changes (a plain HTTP `apply` per entity — the simplest, not the fastest, simulator). Paced
+/// by the clock, not by the replies: a slow `apply` shows up as latency, not as a slower
+/// simulator (which used to read as "fewer frames per player").
 async fn world_sim(
     http: reqwest::Client,
     url: String,
@@ -133,12 +139,15 @@ async fn world_sim(
         .collect();
     let mut step = 0u64;
     let mut last_lease = Instant::now();
+    let mut iv = tokio::time::interval(Duration::from_millis(33));
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         let window = *deadline.borrow_and_update();
         if window.is_some_and(|d| Instant::now() >= d) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(33)).await;
+        iv.tick().await;
         if last_lease.elapsed() >= Duration::from_millis(500) {
             last_lease = Instant::now();
             let _ = http
@@ -204,7 +213,19 @@ async fn world_sim(
                 }
             });
         }
-        futures::future::join_all(futs).await;
+        if inflight.load(Ordering::Relaxed) >= 8 {
+            totals.sim_skipped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            if window.is_some() {
+                totals.sim_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+            inflight.fetch_add(1, Ordering::Relaxed);
+            let inflight = inflight.clone();
+            tokio::spawn(async move {
+                futures::future::join_all(futs).await;
+                inflight.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
         step += 1;
     }
 }
@@ -714,6 +735,8 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "sim_apply_mean_ms": totals.apply_ms_sum.load(Ordering::Relaxed) as f64
                 / totals.apply_n.load(Ordering::Relaxed).max(1) as f64,
             "sim_apply_max_ms": totals.apply_ms_max.load(Ordering::Relaxed),
+            "sim_ticks_per_sec": totals.sim_ticks.load(Ordering::Relaxed) as f64 / secs / arenas.len().max(1) as f64,
+            "sim_skipped": totals.sim_skipped.load(Ordering::Relaxed),
             "client_err_connect": totals.err_connect.load(Ordering::Relaxed),
             "client_err_subscribe": totals.err_subscribe.load(Ordering::Relaxed),
             "client_err_stream": totals.err_stream.load(Ordering::Relaxed),
