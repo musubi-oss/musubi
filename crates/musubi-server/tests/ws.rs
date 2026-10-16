@@ -6504,3 +6504,163 @@ async fn interaction_rewinds_target_to_the_actors_tick() {
     assert_eq!(hit["rewind"]["pos"]["x"], json!(20.0), "{hit}");
     assert_eq!(hit["rewind"]["hit"], json!(true), "{hit}");
 }
+
+/// Co-locate (plan 4.6): a simulator pins a partner entity from a neighbouring simulator's cell
+/// into its own; the normal handover brings it over, it is authoritative over both while the
+/// pin holds, and the partner goes back once the pin lapses.
+#[tokio::test]
+async fn colocate_pins_a_partner_into_the_callers_cell_and_returns_it() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "hysteresis": 5.0}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (s1, s2) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    for (sim, x) in [(s1, 0), (s2, 1)] {
+        let (st, _) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/server/worlds/{world}/lease"),
+            None,
+            true,
+            Some(json!({"sim": sim, "cells": [{"x": x, "y": 0}]})),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    let spawn = |router: axum::Router, sim: uuid::Uuid, x: f64| {
+        let world = world.clone();
+        async move {
+            let (st, e) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/spawn"),
+                None,
+                true,
+                Some(json!({"sim": sim, "x": x, "y": 10.0, "components": {}, "persistent": false})),
+            )
+            .await;
+            assert_eq!(st, 200, "{e}");
+            e["id"].as_str().unwrap().to_string()
+        }
+    };
+    let a = spawn(router.clone(), s1, 10.0).await;
+    let b = spawn(router.clone(), s2, 150.0).await;
+    let apply = |router: axum::Router, sim: uuid::Uuid, id: String, x: f64| {
+        let world = world.clone();
+        async move {
+            http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/apply"),
+                None,
+                true,
+                Some(json!({"sim": sim, "entity": id, "x": x, "y": 10.0, "components": {}})),
+            )
+            .await
+            .0
+        }
+    };
+    assert_ne!(
+        apply(router.clone(), s1, b.clone(), 150.0).await,
+        200,
+        "s1 does not own b yet"
+    );
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/colocate"),
+        None,
+        true,
+        Some(json!({"sim": s1, "entity": a, "with": b, "ttl_ticks": 20})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["cell"], json!({"x": 0, "y": 0}));
+    // the handover reaches s1 as a request it acks, exactly like a border crossing
+    let events = |router: axum::Router, sim: uuid::Uuid| {
+        let world = world.clone();
+        async move {
+            let (st, ev) = http_json(
+                &router,
+                "GET",
+                &format!("/v1/server/worlds/{world}/events?sim={sim}"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{ev}");
+            ev["events"].as_array().cloned().unwrap_or_default()
+        }
+    };
+    let ack = |router: axum::Router, sim: uuid::Uuid, id: String| {
+        let world = world.clone();
+        async move {
+            let (st, v) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/handover/ack"),
+                None,
+                true,
+                Some(json!({"sim": sim, "entity": id})),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+        }
+    };
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        seen.extend(events(router.clone(), s1).await);
+        if seen
+            .iter()
+            .any(|e| e["type"] == "handover_request" && e["entity"] == json!(b))
+        {
+            break;
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|e| e["type"] == "handover_request" && e["entity"] == json!(b)),
+        "{seen:?}"
+    );
+    ack(router.clone(), s1, b.clone()).await;
+    let s2_events = events(router.clone(), s2).await;
+    assert!(
+        s2_events.iter().any(|e| e["type"] == "co_locate"),
+        "{s2_events:?}"
+    );
+    // s1 now runs both; b keeps its position in the other cell
+    assert_eq!(apply(router.clone(), s1, b.clone(), 151.0).await, 200);
+    assert_ne!(apply(router.clone(), s2, b.clone(), 152.0).await, 200);
+    // the pin lapses (20 ticks): b hands back to s2 by position
+    let mut back = Vec::new();
+    for _ in 0..80 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        back.extend(events(router.clone(), s2).await);
+        if back
+            .iter()
+            .any(|e| e["type"] == "handover_request" && e["entity"] == json!(b))
+        {
+            break;
+        }
+    }
+    assert!(
+        back.iter()
+            .any(|e| e["type"] == "handover_request" && e["entity"] == json!(b)),
+        "{back:?}"
+    );
+    ack(router.clone(), s2, b.clone()).await;
+    assert_eq!(apply(router.clone(), s2, b.clone(), 153.0).await, 200);
+    assert_ne!(apply(router.clone(), s1, b.clone(), 154.0).await, 200);
+}

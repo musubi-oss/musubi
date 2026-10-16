@@ -65,6 +65,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/admin/jwt/rotate", "admin"),
     ("DELETE", "/v1/admin/jwt/keys/{kid}", "admin"),
     ("POST", "/v1/server/worlds/{w}/rewind", "server"),
+    ("POST", "/v1/server/worlds/{w}/colocate", "server"),
     ("GET", "/v1/server/presence/{account_id}", "server"),
     ("GET", "/v1/admin/chat/{id}/moderation", "admin"),
     ("POST", "/v1/admin/chat/{id}/moderation", "admin"),

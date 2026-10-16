@@ -154,6 +154,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/handover/ack", post(handover_ack))
         .route("/v1/server/worlds/{w}/interact", post(interact))
         .route("/v1/server/worlds/{w}/rewind", post(rewind))
+        .route("/v1/server/worlds/{w}/colocate", post(colocate))
 }
 
 #[derive(Deserialize)]
@@ -254,6 +255,21 @@ impl InteractReq {
             },
         )
     }
+}
+
+#[derive(Deserialize)]
+struct CoLocateReq {
+    sim: Uuid,
+    /// The entity whose cell the partner joins (the caller must own that cell).
+    entity: String,
+    /// The partner to bring over.
+    with: String,
+    #[serde(default = "default_colocate_ttl")]
+    ttl_ticks: u64,
+}
+
+fn default_colocate_ttl() -> u64 {
+    300
 }
 
 #[derive(Deserialize)]
@@ -536,6 +552,29 @@ async fn interact(
     r.map_err(IntoResponse::into_response)
 }
 
+/// Co-locate: pin `with` into `entity`'s cell for `ttl_ticks` so one simulator runs both (docking,
+/// grappling); the regular handover moves it and brings it back when the pin lapses.
+async fn colocate(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<CoLocateReq>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        Ok(Json(s.worlds.co_locate(
+            &w,
+            r.sim,
+            &r.entity,
+            &r.with,
+            r.ttl_ticks,
+        )?))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
+}
+
 /// Lag compensation: where an entity was at `tick`, and whether `(x, y)` was within `tolerance`
 /// of it (`hit`); `pos` is null when history does not reach that far back.
 async fn rewind(
@@ -731,6 +770,13 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                 let r: InteractReq = serde_json::from_value(cmd).map_err(bad)?;
                 let (_, entity, spec) = r.spec();
                 reply["result"] = s.worlds.interact(w, sim, &entity, spec, &s.fanout)?;
+                Ok(reply)
+            }
+            "colocate" => {
+                let r: CoLocateReq = serde_json::from_value(cmd).map_err(bad)?;
+                reply["result"] = s
+                    .worlds
+                    .co_locate(w, sim, &r.entity, &r.with, r.ttl_ticks)?;
                 Ok(reply)
             }
             "rewind" => {

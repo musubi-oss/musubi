@@ -203,6 +203,9 @@ pub struct World {
     buffered_inputs: HashMap<EntityId, Vec<serde_json::Value>>,
     /// Recent `(tick, pos)` samples per entity, newest last (lag compensation rewind).
     history: HashMap<EntityId, VecDeque<(u64, Pos)>>,
+    /// Co-located entities: authoritative cell forced to a partner's cell until `expires_tick`,
+    /// whatever the position says (plan 4.6 `co-locate`).
+    pins: HashMap<EntityId, (CellId, u64)>,
     /// Cells running slower than real time (EVE-style time dilation); absent = 1.0.
     cell_scale: HashMap<CellId, f64>,
 }
@@ -220,6 +223,7 @@ impl World {
             interests: HashMap::new(),
             buffered_inputs: HashMap::new(),
             history: HashMap::new(),
+            pins: HashMap::new(),
             cell_scale: HashMap::new(),
         }
     }
@@ -547,6 +551,7 @@ impl World {
         }
         self.buffered_inputs.remove(&id);
         self.history.remove(&id);
+        self.pins.remove(&id);
         true
     }
 
@@ -758,6 +763,32 @@ impl World {
     /// Called by the Replication Layer after applying a tick: entities that left their cell by more
     /// than `hysteresis` start a handover to the cell they are in now (if it has a live lease held
     /// by another simulator) or simply move cells (same simulator owns both).
+    /// Co-locate: until `ttl_ticks` pass, `id`'s authoritative cell is `cell` regardless of its
+    /// position — the regular handover path moves it there (state and inputs included) and
+    /// hands it back once the pin lapses. Returns the tick the pin expires.
+    pub fn pin(&mut self, id: EntityId, cell: CellId, ttl_ticks: u64) -> Option<u64> {
+        self.entities.get(&id)?;
+        let until = self.tick + ttl_ticks.max(1);
+        self.pins.insert(id, (cell, until));
+        Some(until)
+    }
+
+    pub fn unpin(&mut self, id: EntityId) -> bool {
+        self.pins.remove(&id).is_some()
+    }
+
+    pub fn pinned_to(&self, id: EntityId) -> Option<(CellId, u64)> {
+        self.pins.get(&id).copied()
+    }
+
+    /// Where authority over the entity belongs: its pin while co-located, else its position.
+    fn target_cell(&self, id: EntityId, pos: Pos) -> (CellId, bool) {
+        match self.pins.get(&id) {
+            Some((c, _)) => (*c, true),
+            None => (self.cell_of(pos), false),
+        }
+    }
+
     pub fn detect_handovers(&mut self) -> Vec<HandoverOutcome> {
         let mut out = Vec::new();
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
@@ -769,8 +800,9 @@ impl World {
             if in_transit {
                 continue;
             }
-            let target = self.cell_of(pos);
-            if target == cell || -self.border_distance(cell, pos) < self.cfg.hysteresis {
+            let (target, pinned) = self.target_cell(id, pos);
+            if target == cell || (!pinned && -self.border_distance(cell, pos) < self.cfg.hysteresis)
+            {
                 continue;
             }
             let from = self.owner(cell);
@@ -818,8 +850,9 @@ impl World {
             if in_transit {
                 continue;
             }
-            let target = self.cell_of(pos);
-            if target == cell || -self.border_distance(cell, pos) < self.cfg.hysteresis {
+            let (target, pinned) = self.target_cell(id, pos);
+            if target == cell || (!pinned && -self.border_distance(cell, pos) < self.cfg.hysteresis)
+            {
                 continue;
             }
             if self.owner(target).is_some() {
@@ -1123,6 +1156,8 @@ impl World {
     /// Advance the world clock; expire handovers.
     pub fn advance(&mut self) -> Vec<HandoverOutcome> {
         self.tick += 1;
+        let tick = self.tick;
+        self.pins.retain(|_, (_, until)| *until > tick);
         self.expire_handovers()
     }
 

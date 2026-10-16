@@ -1722,6 +1722,53 @@ impl WorldRegistry {
         Ok(SpawnOutcome::Spawned(to_wire(st.world.get(id).unwrap())))
     }
 
+    /// Co-locate (plan 4.6): `sim`, owning `entity`'s cell, asks for `with` to be simulated next
+    /// to it — `with` is pinned into that cell for `ttl_ticks` and the regular handover brings it
+    /// over (its owner gets `handover_request`, `sim` acks); when the pin lapses it goes back to
+    /// where its position says. Both entities must be on this shard.
+    pub fn co_locate(
+        &self,
+        name: &str,
+        sim: Uuid,
+        entity: &str,
+        with: &str,
+        ttl_ticks: u64,
+    ) -> Result<Value> {
+        let a = parse_entity(entity)?;
+        let b = parse_entity(with)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        let cell = st
+            .world
+            .get(a)
+            .ok_or_else(|| Error::NotFound(format!("entity {a} is not on this shard")))?
+            .cell;
+        match st.world.owner(cell) {
+            Some(o) if o == sim => {}
+            Some(o) => {
+                return Err(Error::PermissionDenied(format!(
+                    "cell {cell:?} is owned by {o}"
+                )))
+            }
+            None => return Err(Error::Conflict(format!("cell {cell:?} has no live lease"))),
+        }
+        if st.world.get(b).is_none() {
+            return Err(Error::NotFound(format!(
+                "entity {b} is not on this shard (cross-node co-locate is not supported yet)"
+            )));
+        }
+        let until = st.world.pin(b, cell, ttl_ticks).unwrap();
+        if let Some(owner) = st.world.owner(st.world.get(b).unwrap().cell) {
+            push_event(
+                st,
+                owner,
+                json!({"type": "co_locate", "entity": b, "with": a, "cell": cell, "by": sim, "until_tick": until}),
+            );
+        }
+        Ok(json!({"pinned": b, "with": a, "cell": cell, "until_tick": until}))
+    }
+
     /// Lag compensation query: where `entity` was at `tick` (and whether `at` was within
     /// `tolerance` of it). Answered by the shard holding the entity.
     pub fn rewind(
