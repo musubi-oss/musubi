@@ -458,7 +458,9 @@ impl WorldRegistry {
             .map(|w| w.key().clone())
             .collect();
         for name in hosted {
-            let _ = self.home_of(&name).await;
+            if self.home_fresh(&name).await.is_none() {
+                let _ = self.home_of(&name).await;
+            }
         }
     }
 
@@ -824,7 +826,11 @@ impl WorldRegistry {
             .collect();
         let mut out = Vec::new();
         for (name, cell) in mine {
-            let home = match self.worlds.get(&name).and_then(|w| w.lock().home_node) {
+            let cached = match self.home_fresh(&name).await {
+                Some(h) => Some(h),
+                None => self.worlds.get(&name).and_then(|w| w.lock().home_node),
+            };
+            let home = match cached {
                 Some(h) if h != self.node_id => h,
                 _ => match self.home_of(&name).await {
                     Ok(Some(h)) if h != self.node_id => h,
@@ -889,6 +895,24 @@ impl WorldRegistry {
     }
 
     /// Home node of a world: local registry first, then the directory. `None` = unknown world.
+    /// Linearizable read of a world's home from the directory; refreshes the caches a hosted
+    /// shard keeps (its home may have been adopted by another node since the cell was assigned).
+    async fn home_fresh(&self, name: &str) -> Option<Uuid> {
+        let c = self.cluster.get()?;
+        let v = c.directory_get_fresh(&Self::directory_key(name)).await?;
+        let h = v["node_id"]
+            .as_str()
+            .and_then(|x| Uuid::parse_str(x).ok())?;
+        self.homes.insert(name.to_string(), h);
+        if let Some(w) = self.worlds.get(name) {
+            let mut st = w.lock();
+            if st.hosted_only && h != self.node_id {
+                st.home_node = Some(h);
+            }
+        }
+        Some(h)
+    }
+
     pub async fn home_of(&self, name: &str) -> Result<Option<Uuid>> {
         // a local shard makes us the home only if it is not merely hosting assigned cells
         if let Some(w) = self.worlds.get(name) {

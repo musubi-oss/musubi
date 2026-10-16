@@ -204,6 +204,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             let mut members = cluster.member_events();
             loop {
                 wait_failover_round(&mut tick, &mut leaves, &mut members).await;
+                await_dead_agreement(&cluster).await;
                 if !await_lease(&lease).await {
                     continue;
                 }
@@ -292,16 +293,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 wait_failover_round(&mut tick, &mut leaves, &mut members).await;
                 // SWIM's verdict comes within seconds, the heartbeat check a few seconds later:
                 // poll until they agree instead of waiting for the next tick
-                for _ in 0..6 {
-                    let (s, d) = (
-                        swim_dead(&cluster).await,
-                        dead_nodes(&cluster).await.map(|d| d.len()).unwrap_or(0),
-                    );
-                    if s <= d {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
+                await_dead_agreement(&cluster).await;
                 // cells of our worlds hosted on a dead node come back to us (no lease: each home
                 // node handles its own worlds)
                 worlds.refresh_homes().await;
@@ -597,6 +589,19 @@ async fn swim_dead(cluster: &musubi_cluster::Cluster) -> usize {
         .unwrap_or(0)
 }
 
+/// SWIM's verdict comes within seconds, the database heartbeat fence a few seconds later:
+/// poll until they agree instead of waiting for the next round.
+async fn await_dead_agreement(cluster: &musubi_cluster::Cluster) {
+    for _ in 0..24 {
+        let s = swim_dead(cluster).await;
+        let d = dead_nodes(cluster).await.map(|d| d.len()).unwrap_or(0);
+        if s <= d {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 async fn dead_nodes(cluster: &musubi_cluster::Cluster) -> Option<Vec<uuid::Uuid>> {
     for attempt in 0..3 {
         match cluster.nodes().await {
@@ -608,7 +613,9 @@ async fn dead_nodes(cluster: &musubi_cluster::Cluster) -> Option<Vec<uuid::Uuid>
                     nodes
                         .iter()
                         .filter(|n| {
-                            !n.alive && now - n.heartbeat_at > musubi_cluster::HEARTBEAT * 2
+                            !n.alive
+                                && now - n.heartbeat_at
+                                    > musubi_cluster::HEARTBEAT + time::Duration::seconds(2)
                         })
                         .map(|n| n.id.0)
                         .collect(),
