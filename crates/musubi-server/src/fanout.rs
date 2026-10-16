@@ -116,6 +116,9 @@ pub struct Fanout {
     leader: Arc<AtomicBool>,
     fleets: Arc<OnceLock<Arc<FleetService>>>,
     worlds: Arc<OnceLock<Arc<WorldRegistry>>>,
+    /// Bus messages leave in the order they were published: one publisher task per node, fed by
+    /// this queue (a task per message would let two inputs from one source overtake each other).
+    bus: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<Wire>>>,
 }
 
 impl Fanout {
@@ -134,6 +137,7 @@ impl Fanout {
             relayed,
             leader: Arc::new(AtomicBool::new(true)),
             fleets: Arc::new(OnceLock::new()),
+            bus: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
             online_remote: Arc::new(dashmap::DashMap::new()),
         };
@@ -681,10 +685,17 @@ impl Fanout {
         let Some(c) = self.cluster.clone() else {
             return;
         };
-        tokio::spawn(async move {
-            if let Err(e) = c.publish(TOPIC, &w).await {
-                tracing::warn!(error = %e, "fanout publish failed");
-            }
+        let tx = self.bus.get_or_init(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Wire>();
+            tokio::spawn(async move {
+                while let Some(w) = rx.recv().await {
+                    if let Err(e) = c.publish(TOPIC, &w).await {
+                        tracing::warn!(error = %e, "fanout publish failed");
+                    }
+                }
+            });
+            tx
         });
+        let _ = tx.send(w);
     }
 }

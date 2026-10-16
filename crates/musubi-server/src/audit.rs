@@ -20,11 +20,84 @@ use crate::http::{ApiError, ServerKey};
 
 const MAX_BODY: usize = 64 * 1024;
 
+/// Operator and server-key mutations are audited; the simulator data-plane of a world
+/// (`/v1/server/worlds/{w}/spawn|apply|lease|...`, hundreds of calls a second per world) is
+/// game state, not an operator action, and would only flood the log and the pool. Creating and
+/// deleting worlds stays audited.
 fn audited(method: &Method, path: &str) -> bool {
-    matches!(
+    if !matches!(
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    ) && (path.starts_with("/v1/admin/") || path.starts_with("/v1/server/"))
+    ) {
+        return false;
+    }
+    if let Some(rest) = path.strip_prefix("/v1/server/worlds/") {
+        if rest.contains('/') {
+            return false;
+        }
+    }
+    path.starts_with("/v1/admin/") || path.starts_with("/v1/server/")
+}
+
+struct Row {
+    actor: String,
+    method: String,
+    route: String,
+    path: String,
+    status: i32,
+    ip: String,
+    body: Option<Value>,
+    duration_ms: i32,
+}
+
+/// One writer for the whole process: rows queue on a bounded channel and are written over a
+/// single connection, so a burst of audited calls never takes the pool from the request path;
+/// when the queue is full the row is dropped with a warning rather than slowing the request.
+fn sink(db: &sqlx::PgPool) -> &'static tokio::sync::mpsc::Sender<Row> {
+    static SINK: std::sync::OnceLock<tokio::sync::mpsc::Sender<Row>> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Row>(10_000);
+        let db = db.clone();
+        tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut batch = vec![first];
+                while batch.len() < 256 {
+                    match rx.try_recv() {
+                        Ok(r) => batch.push(r),
+                        Err(_) => break,
+                    }
+                }
+                let mut conn = match db.acquire().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, dropped = batch.len(), "audit writer: no connection");
+                        continue;
+                    }
+                };
+                for r in batch {
+                    let res = sqlx::query(
+                        "insert into musubi.audit_log (id, actor, method, route, path, status, ip, body, duration_ms)
+                         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    )
+                    .bind(Uuid::now_v7())
+                    .bind(&r.actor)
+                    .bind(&r.method)
+                    .bind(&r.route)
+                    .bind(&r.path)
+                    .bind(r.status)
+                    .bind(&r.ip)
+                    .bind(&r.body)
+                    .bind(r.duration_ms)
+                    .execute(&mut *conn)
+                    .await;
+                    if let Err(e) = res {
+                        tracing::warn!(error = %e, route = r.route, "audit write failed");
+                    }
+                }
+            }
+        });
+        tx
+    })
 }
 
 pub fn redact(v: &mut Value) {
@@ -121,27 +194,19 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
     let res = next.run(Request::from_parts(parts, body)).await;
     let status = res.status().as_u16() as i32;
     let duration_ms = started.elapsed().as_millis() as i32;
-    let db = s.db.clone();
-    tokio::spawn(async move {
-        let r = sqlx::query(
-            "insert into musubi.audit_log (id, actor, method, route, path, status, ip, body, duration_ms)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(Uuid::now_v7())
-        .bind(&actor)
-        .bind(&method)
-        .bind(&route)
-        .bind(&path)
-        .bind(status)
-        .bind(&ip)
-        .bind(&body_json)
-        .bind(duration_ms)
-        .execute(&db)
-        .await;
-        if let Err(e) = r {
-            tracing::warn!(error = %e, route, "audit write failed");
-        }
-    });
+    let row = Row {
+        actor,
+        method,
+        route: route.clone(),
+        path,
+        status,
+        ip,
+        body: body_json,
+        duration_ms,
+    };
+    if sink(&s.db).try_send(row).is_err() {
+        tracing::warn!(route, "audit queue full: entry dropped");
+    }
     res
 }
 
@@ -185,4 +250,20 @@ pub async fn list(
         .and_then(|r| r["id"].as_str())
         .map(String::from);
     Ok(Json(json!({ "entries": rows, "cursor": cursor })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_data_plane_is_not_audited() {
+        let p = Method::POST;
+        assert!(audited(&p, "/v1/server/worlds"));
+        assert!(audited(&Method::DELETE, "/v1/server/worlds/arena"));
+        assert!(audited(&p, "/v1/admin/accounts/x/ban"));
+        assert!(!audited(&p, "/v1/server/worlds/arena/apply"));
+        assert!(!audited(&p, "/v1/server/worlds/arena/handover/ack"));
+        assert!(!audited(&Method::GET, "/v1/admin/accounts/x"));
+    }
 }
