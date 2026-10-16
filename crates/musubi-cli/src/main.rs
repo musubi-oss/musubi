@@ -101,6 +101,9 @@ enum Cmd {
         duration_secs: u64,
         #[arg(long, default_value_t = 10)]
         kill_every_secs: u64,
+        /// seconds to wait before restarting a killed node
+        #[arg(long, default_value_t = 0)]
+        rejoin_delay_secs: u64,
         /// kill | drain | mixed
         #[arg(long, default_value = "mixed")]
         mode: String,
@@ -206,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
             mesh_entities,
             duration_secs,
             kill_every_secs,
+            rejoin_delay_secs,
             mode,
             victim,
             json,
@@ -220,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
                 mesh_entities,
                 duration: std::time::Duration::from_secs(duration_secs),
                 kill_every: std::time::Duration::from_secs(kill_every_secs),
+                rejoin_delay: std::time::Duration::from_secs(rejoin_delay_secs),
                 mode,
                 victim,
                 json,

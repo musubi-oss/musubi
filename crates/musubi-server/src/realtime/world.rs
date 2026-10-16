@@ -1105,7 +1105,33 @@ impl WorldRegistry {
                 tracing::warn!(world = %name, ?cell, error = %e, "cell not re-homed: no directory quorum");
                 continue;
             }
+            // the local cache must follow at once: with it still naming the dead node, every
+            // entity entering the cell would start a cross-node handover to a dead host and sit
+            // in transit (invisible to views) until that node came back
+            self.cell_hosts.insert((name.clone(), cell), self.node_id);
             fanout.cell_assign(&name, cell, self.node_id);
+            // entities we were handing to the dead host never got their ack: the cell is ours
+            // now, so they simply stay here instead of retrying against a dead node
+            if let Ok(w) = self.get(&name) {
+                let mut st = w.lock();
+                let st = &mut *st;
+                let stuck: Vec<EntityId> = st
+                    .remote_transit
+                    .iter()
+                    .filter(|(_, (h, _))| *h == dead)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in stuck {
+                    st.remote_transit.remove(&id);
+                    if let Some(t) = st.world.cancel_handover(id) {
+                        push_event(
+                            st,
+                            t.from,
+                            json!({"type": "handover_cancelled", "entity": id, "reason": "target node died; cell re-homed"}),
+                        );
+                    }
+                }
+            }
             if !restored.contains(&(name.clone(), dead)) {
                 if let (Some(db), Ok(w)) = (&self.db, self.get(&name)) {
                     let cfg = w.lock().world.cfg.clone();
@@ -1896,9 +1922,36 @@ impl WorldRegistry {
                         // already has it). Never give up: the entity sits in a cell another node
                         // hosts, and a copy kept alive here would become a second owner once the
                         // real one moves on (the stand saw 5 of 20 entities duplicated that way).
-                        let Some((host, n)) = st.remote_transit.get(&entity).copied() else {
+                        let Some((stale, n)) = st.remote_transit.get(&entity).copied() else {
                             continue;
                         };
+                        // the target may have moved since the first attempt (host died and the
+                        // cell was re-homed, home adopted by another node): resolve it again
+                        let fresh = st
+                            .world
+                            .get(entity)
+                            .map(|e| st.world.cell_of(e.pos))
+                            .and_then(|c| {
+                                self.cell_hosts
+                                    .get(&(name.clone(), c))
+                                    .map(|h| *h)
+                                    .or(if st.hosted_only {
+                                        self.homes.get(&name).map(|h| *h).or(st.home_node)
+                                    } else {
+                                        None
+                                    })
+                                    .filter(|h| *h != self.node_id)
+                            });
+                        let Some(host) = fresh else {
+                            // the cell is ours now: the entity simply stays
+                            st.remote_transit.remove(&entity);
+                            st.world.cancel_handover(entity);
+                            tracing::info!(world = %name, %entity, was = %stale, "cross-node handover dropped: target cell is local now");
+                            continue;
+                        };
+                        if host != stale {
+                            tracing::info!(world = %name, %entity, from = %stale, to = %host, "cross-node handover re-targeted");
+                        }
                         if n + 1 == REMOTE_HANDOVER_RETRIES {
                             tracing::warn!(world = %name, %entity, %host, tries = n + 1, "cross-node handover still unacknowledged; keeps retrying");
                         }

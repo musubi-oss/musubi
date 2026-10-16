@@ -5166,16 +5166,97 @@ async fn world_cell_host_failover() {
         .filter_map(|g| g["id"].as_str())
         .collect();
     assert_eq!(owned, vec![id.as_str()], "{va}");
+    let sim_c = uuid::Uuid::now_v7();
     let (st, _) = http_json(
         &router1,
         "POST",
         &format!("/v1/server/worlds/{name}/lease"),
         None,
         true,
-        Some(serde_json::json!({"sim": uuid::Uuid::now_v7(), "cells": [{"x": 1, "y": 0}]})),
+        Some(serde_json::json!({"sim": sim_c, "cells": [{"x": 1, "y": 0}]})),
     )
     .await;
     assert_eq!(st, 200, "the cell is leasable on the home again");
+    let sim_a = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_a, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    // both cells now live on the home: a border crossing is a local handover that must reach
+    // the target simulator as handover_request and complete on its ack
+    let (st, r) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_c, "entity": id, "x": 50.0, "y": 50.0})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let mut requested = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (st, ev) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/events?sim={sim_a}"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{ev}");
+        if ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "handover_request" && e["entity"] == id.as_str())
+        {
+            requested = true;
+            break;
+        }
+    }
+    assert!(requested, "sim_a was asked to take the entity");
+    let (st, a) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/handover/ack"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_a, "entity": id})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    let mut owned_home = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_, v0) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        if v0["owned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["id"] == id.as_str())
+        {
+            owned_home = true;
+            break;
+        }
+    }
+    assert!(owned_home, "entity completed the local handover into (0,0)");
 }
 
 /// Three nodes: A is the world's home with cell (0,0), B hosts cell (1,0), a client connected to C

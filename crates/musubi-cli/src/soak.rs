@@ -33,6 +33,8 @@ pub struct Opts {
     pub mesh_entities: usize,
     pub duration: Duration,
     pub kill_every: Duration,
+    /// Wait this long before restarting a killed node (0 = at once).
+    pub rejoin_delay: Duration,
     pub mode: String,
     /// random | leader: which node incidents hit (leader = the current Raft leader).
     pub victim: String,
@@ -936,6 +938,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             }
         };
         // restart on the same ports/data dir
+        tokio::time::sleep(o.rejoin_delay).await;
         let t1 = Instant::now();
         spawn(&bin, &mut nodes[victim], &o.database_url, &group)?;
         let rejoined_ms = match tokio::time::timeout(budget, async {
@@ -1384,6 +1387,18 @@ async fn mesh_streamer(
                 }
             } else if v["type"] == "tick" {
                 c.stream_frames.fetch_add(1, Ordering::Relaxed);
+                // the stream drains this simulator's events, so handover requests addressed
+                // to it must be answered here or the entities stay in transit
+                for ev in v["events"].as_array().cloned().unwrap_or_default() {
+                    if ev["type"] == "handover_request" {
+                        let ack =
+                            json!({"op": "handover_ack", "sim": mw.sim_a, "entity": ev["entity"]})
+                                .to_string();
+                        if ws.send(Message::Text(ack)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
         }
         if !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -1402,9 +1417,11 @@ async fn mesh_leaser(
     stop: Arc<AtomicBool>,
 ) {
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let urls: Vec<String> = alive.read().await.clone();
         for (sim, cell) in [(mw.sim_a, (0, 0)), (mw.sim_b, (1, 0))] {
+            let mut last = String::new();
+            let mut ok = false;
             for u in &urls {
                 let res = client
                     .post(format!("{u}/v1/server/worlds/{}/lease", mw.name))
@@ -1413,8 +1430,53 @@ async fn mesh_leaser(
                     .timeout(Duration::from_secs(2))
                     .send()
                     .await;
-                if res.map(|r| r.status().is_success()).unwrap_or(false) {
-                    break;
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        ok = true;
+                        break;
+                    }
+                    Ok(r) => {
+                        let st = r.status();
+                        let body = r.text().await.unwrap_or_default();
+                        last.push_str(&format!(" | {u} -> {st} {}", &body[..body.len().min(160)]));
+                    }
+                    Err(e) => last.push_str(&format!(" | {u} -> {e}")),
+                }
+            }
+            if !ok && std::env::var_os("MUSUBI_SOAK_LEASE_DEBUG").is_some() {
+                eprintln!(
+                    "[soak] lease {:?} for {} by {sim} failed everywhere:{last}",
+                    cell,
+                    &mw.name[5..7]
+                );
+            }
+        }
+        // play the simulators: when both border cells end up on one node (after a failover)
+        // handovers are local and wait for the target simulator's ack — without it entities
+        // flap in transit, hidden from every view. Events live on the node holding the shard,
+        // so ask every alive node.
+        for (sim, _) in [(mw.sim_a, (0, 0)), (mw.sim_b, (1, 0))] {
+            for u in &urls {
+                let events = client
+                    .get(format!("{u}/v1/server/worlds/{}/events?sim={sim}", mw.name))
+                    .header("x-musubi-server-key", KEY)
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await;
+                let Ok(r) = events else { continue };
+                let Ok(v) = r.json::<Value>().await else {
+                    continue;
+                };
+                for ev in v["events"].as_array().cloned().unwrap_or_default() {
+                    if ev["type"] == "handover_request" {
+                        let _ = client
+                            .post(format!("{u}/v1/server/worlds/{}/handover/ack", mw.name))
+                            .header("x-musubi-server-key", KEY)
+                            .json(&json!({ "sim": sim, "entity": ev["entity"] }))
+                            .timeout(Duration::from_secs(2))
+                            .send()
+                            .await;
+                    }
                 }
             }
         }
