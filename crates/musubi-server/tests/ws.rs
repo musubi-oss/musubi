@@ -2137,7 +2137,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
     )
     .await;
     assert_eq!(st, 200, "{e}");
-    let eid = e["id"].as_str().unwrap().to_string();
+    let eid: uuid::Uuid = e["id"].as_str().unwrap().parse().unwrap();
     match recv(&mut c).await.msg {
         ServerMessage::WorldDelta { spawned, .. } => {
             assert_eq!(spawned.len(), 1);
@@ -2169,7 +2169,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
         None,
         ClientMessage::WorldInput {
             world: world.clone(),
-            entity: eid.clone(),
+            entity: eid.to_string(),
             input: json!({"move": [1, 0]}),
         },
     )
@@ -2193,7 +2193,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["type"] == "input" && e["entity"] == eid),
+            .any(|e| e["type"] == "input" && e["entity"] == eid.to_string()),
         "{ev}"
     );
     // ghost: entity near the border is visible to s2's view of cell (1,0)
@@ -2233,7 +2233,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["type"] == "handover_request" && e["entity"] == eid)
+            .any(|e| e["type"] == "handover_request" && e["entity"] == eid.to_string())
         {
             got = true;
             break;
@@ -2275,7 +2275,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
                     saw_update = true;
                     break;
                 }
-                if despawned.contains(&eid) {
+                if despawned.contains(&eid.to_string()) {
                     break;
                 }
             }
@@ -2449,7 +2449,7 @@ impl musubi_sim_sdk::Simulator for Mover {
         view.owned
             .iter()
             .map(|e| musubi_sim_sdk::Update {
-                entity: e.id.clone(),
+                entity: e.id.to_string(),
                 pos: Some((e.x + 10.0, e.y)),
                 components: Default::default(),
             })
@@ -2594,7 +2594,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
         None,
         ClientMessage::WorldInput {
             world: world.clone(),
-            entity: e.id.clone(),
+            entity: e.id.to_string(),
             input: json!({"fire": true}),
         },
     )
@@ -2607,7 +2607,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
             .await
             .unwrap()
             .iter()
-            .any(|ev| ev["type"] == "input" && ev["entity"] == e.id)
+            .any(|ev| ev["type"] == "input" && ev["entity"] == e.id.to_string())
         {
             got = true;
             break;
@@ -3408,7 +3408,7 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
     let cell = musubi_mesh::CellId { x: 0, y: 0 };
     let view = r2.view(&name, cell).unwrap();
     let s = view.to_string();
-    assert!(s.contains(&keep.id), "{s}");
+    assert!(s.contains(&keep.id.to_string()), "{s}");
     assert!(s.contains("\"hp\""), "{s}");
     // n2 is a live node now, so a third registry has nothing left to claim
     sqlx::query("insert into musubi.nodes (id, name, cluster_group) values ($1, 'n2', $2)")
@@ -3742,7 +3742,7 @@ async fn world_journal_is_replayed_on_rehome() {
         .unwrap();
     r1.snapshot_now(&name).await.unwrap();
     // after the snapshot: damage the first entity, spawn a second persistent one, despawn a third
-    r1.apply(&name, sim, &keep.id, None, json!({"hp": 5}))
+    r1.apply(&name, sim, &keep.id.to_string(), None, json!({"hp": 5}))
         .unwrap();
     let late = r1
         .spawn(
@@ -3762,7 +3762,7 @@ async fn world_journal_is_replayed_on_rehome() {
             true,
         )
         .unwrap();
-    r1.despawn(&name, sim, &gone.id).unwrap();
+    r1.despawn(&name, sim, &gone.id.to_string()).unwrap();
     r1.flush_journal(&name).await.unwrap();
     let rows: i64 = sqlx::query_scalar("select count(*) from musubi.world_journal where name = $1")
         .bind(&name)
@@ -3780,7 +3780,9 @@ async fn world_journal_is_replayed_on_rehome() {
         .unwrap()
         .to_string();
     assert!(
-        view.contains(&keep.id) && view.contains(&late.id) && !view.contains(&gone.id),
+        view.contains(&keep.id.to_string())
+            && view.contains(&late.id.to_string())
+            && !view.contains(&gone.id.to_string()),
         "{view}"
     );
     assert!(view.contains("\"name\":\"hp\",\"value\":5"), "{view}");
@@ -5400,7 +5402,7 @@ async fn world_interest_across_nodes() {
                 known.remove(&d);
             }
             for e in spawned.into_iter().chain(updated) {
-                known.insert(e.id, e.x);
+                known.insert(e.id.to_string(), e.x);
             }
         }
     };

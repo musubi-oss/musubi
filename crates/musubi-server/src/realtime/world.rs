@@ -274,7 +274,7 @@ pub struct WorldInfo {
 
 pub fn to_wire(e: &Entity) -> WorldEntity {
     WorldEntity {
-        id: e.id.to_string(),
+        id: e.id,
         x: e.pos.x,
         y: e.pos.y,
         components: e
@@ -2832,7 +2832,7 @@ fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta) -> ServerMessage {
             .updated
             .into_iter()
             .map(|(id, pos, comps)| WorldEntity {
-                id: id.to_string(),
+                id,
                 x: pos.x,
                 y: pos.y,
                 components: comps

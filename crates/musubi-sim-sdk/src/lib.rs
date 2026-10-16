@@ -313,10 +313,11 @@ pub async fn run_sim<S: Simulator, F: std::future::Future<Output = ()>>(
                         continue;
                     };
                     if logic.on_handover_request(&e) {
-                        match client.handover_ack(sim, &e.id).await {
+                        let id = e.id.to_string();
+                        match client.handover_ack(sim, &id).await {
                             Ok(inputs) => {
                                 for i in inputs {
-                                    logic.on_input(&e.id, &i["input"]);
+                                    logic.on_input(&id, &i["input"]);
                                 }
                             }
                             Err(err) => {

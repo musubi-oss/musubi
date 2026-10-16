@@ -383,7 +383,7 @@ pub enum ServerMessage {
 /// Entity as seen by a client: position plus (changed) components with their versions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldEntity {
-    pub id: String,
+    pub id: uuid::Uuid,
     pub x: f64,
     pub y: f64,
     pub components: Vec<WorldComponent>,
