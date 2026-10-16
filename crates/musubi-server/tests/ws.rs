@@ -46,7 +46,9 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
-    cfg.database.max_connections = 3;
+    // a node runs world ticks, snapshots, journals, match loops and failover rounds on this
+    // pool at once; 3 starved them into 30 s acquire timeouts on the 4-thread CI runner
+    cfg.database.max_connections = 5;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let hub = Arc::new(Hub::new());
