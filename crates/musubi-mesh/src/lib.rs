@@ -358,6 +358,14 @@ impl World {
         v
     }
 
+    /// Clients whose interest is centred in `cell` (the "players" term of a cell's cost).
+    pub fn players_in(&self, cell: CellId) -> usize {
+        self.interests
+            .values()
+            .filter(|i| self.cell_of(i.pos) == cell)
+            .count()
+    }
+
     pub fn entities_in(&self, cell: CellId) -> usize {
         self.by_cell.get(&cell).map_or(0, |s| s.len())
     }

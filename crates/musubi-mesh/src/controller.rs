@@ -31,10 +31,26 @@ pub struct Assignment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ControllerConfig {
-    /// A simulator carrying more entity-cost than this sheds cells (if someone else has room).
+    /// A simulator whose cost (see `Controller::cost`) exceeds this sheds cells (if someone else
+    /// has room for them under the same bar).
     pub split_cost: f64,
     /// Simulators unseen for this many ticks are not assigned new cells.
     pub sim_timeout_ticks: u64,
+    /// Cell cost weights (plan 4.x `cost = a·entities + b·players + c·tick_lag + d·boundary_traffic`):
+    /// per entity in the cell,
+    pub cost_entity: f64,
+    /// per client whose interest is centred in the cell,
+    pub cost_player: f64,
+    /// per tick the owning simulator lags the world (charged to the simulator, not a cell),
+    pub cost_lag: f64,
+    /// per entity in handover out of the cell (smoothed over recent ticks).
+    pub cost_traffic: f64,
+    /// A simulator whose cost stays under this for `merge_after_rounds` control rounds hands its
+    /// cells to the owners of neighbouring cells (co-locate: fewer ghosts and handovers cross
+    /// simulators) and is left free to go away.
+    pub merge_cost: f64,
+    /// Consecutive control rounds under `merge_cost` before merging (hysteresis against flapping).
+    pub merge_after_rounds: u32,
 }
 
 impl Default for ControllerConfig {
@@ -42,9 +58,18 @@ impl Default for ControllerConfig {
         Self {
             split_cost: 500.0,
             sim_timeout_ticks: 90,
+            cost_entity: 1.0,
+            cost_player: 5.0,
+            cost_lag: 10.0,
+            cost_traffic: 20.0,
+            merge_cost: 50.0,
+            merge_after_rounds: 30,
         }
     }
 }
+
+/// A merge destination must stay this far under `split_cost`, or the next round splits it back.
+const MERGE_HEADROOM: f64 = 0.75;
 
 #[derive(Debug, Default)]
 pub struct Controller {
@@ -52,6 +77,10 @@ pub struct Controller {
     sims: BTreeMap<SimId, SimInfo>,
     /// Leased cells no client watches → tick the idleness started (hibernation clock).
     idle_since: BTreeMap<CellId, u64>,
+    /// Smoothed count of entities in handover out of each leased cell (boundary traffic).
+    traffic: BTreeMap<CellId, f64>,
+    /// Control rounds each simulator has spent under `merge_cost` in a row.
+    quiet_rounds: BTreeMap<SimId, u32>,
 }
 
 impl Controller {
@@ -60,6 +89,8 @@ impl Controller {
             cfg,
             sims: BTreeMap::new(),
             idle_since: BTreeMap::new(),
+            traffic: BTreeMap::new(),
+            quiet_rounds: BTreeMap::new(),
         }
     }
 
@@ -135,6 +166,40 @@ impl Controller {
             .map_or(0, |a| tick.saturating_sub(a))
     }
 
+    /// Per-tick sample of boundary traffic: entities currently in handover out of each cell.
+    pub fn observe(&mut self, world: &World) {
+        let leased = world.leases();
+        self.traffic
+            .retain(|c, _| leased.iter().any(|(l, _)| l == c));
+        for (cell, _) in leased {
+            let moving = world
+                .entities_of(cell)
+                .iter()
+                .filter(|e| e.transit.is_some())
+                .count() as f64;
+            let t = self.traffic.entry(cell).or_insert(0.0);
+            *t = *t * 0.9 + moving * 0.1;
+        }
+    }
+
+    /// `cost_entity·entities + cost_player·players + cost_traffic·traffic` of one cell.
+    pub fn cell_cost(&self, world: &World, cell: CellId) -> f64 {
+        self.cfg.cost_entity * world.entities_in(cell) as f64
+            + self.cfg.cost_player * world.players_in(cell) as f64
+            + self.cfg.cost_traffic * self.traffic.get(&cell).copied().unwrap_or(0.0)
+    }
+
+    /// A simulator's cost: its cells plus `cost_lag` per tick it lags the world.
+    pub fn cost(&self, world: &World, sim: SimId) -> f64 {
+        world
+            .cells_of(sim)
+            .iter()
+            .map(|c| self.cell_cost(world, *c))
+            .sum::<f64>()
+            + self.cfg.cost_lag * self.lag(sim, world.tick) as f64
+    }
+
+    /// Entities across a simulator's cells (the pre-cost-model load figure).
     pub fn load(&self, world: &World, sim: SimId) -> f64 {
         world
             .cells_of(sim)
@@ -163,7 +228,7 @@ impl Controller {
                 continue;
             }
             let adjacent = World::neighbours(cell).any(|n| world.owner(n) == Some(s));
-            let load = self.load(world, s);
+            let load = self.cost(world, s);
             let key = (adjacent, load, s);
             best = match best {
                 None => Some(key),
@@ -235,8 +300,9 @@ impl Controller {
         out
     }
 
-    /// Periodic pass: re-lease orphaned cells, shed load from overloaded simulators.
-    pub fn reconcile(&self, world: &mut World) -> Vec<Assignment> {
+    /// Periodic pass: re-lease orphaned cells, shed load from overloaded simulators, merge the
+    /// cells of quiet ones onto their neighbours.
+    pub fn reconcile(&mut self, world: &mut World) -> Vec<Assignment> {
         let mut out = Vec::new();
         for c in world.orphaned_cells() {
             if let Some(a) = self.ensure_leased(world, c, None, "orphaned") {
@@ -262,7 +328,7 @@ impl Controller {
             }
             let cells = world.cells_of(s);
             let lagging = self.lag(s, tick) > tidi_after;
-            if cells.len() < 2 || (self.load(world, s) <= self.cfg.split_cost && !lagging) {
+            if cells.len() < 2 || (self.cost(world, s) <= self.cfg.split_cost && !lagging) {
                 continue;
             }
             // shed the cell with the fewest neighbours owned by `s` (least ghost coupling)
@@ -283,10 +349,10 @@ impl Controller {
                 .filter(|o| self.lag(*o, tick) <= tidi_after)
                 .filter(|o| {
                     lagging
-                        || self.load(world, *o) + world.entities_in(victim) as f64
+                        || self.cost(world, *o) + self.cell_cost(world, victim)
                             <= self.cfg.split_cost
                 })
-                .min_by(|a, b| self.load(world, *a).total_cmp(&self.load(world, *b)))
+                .min_by(|a, b| self.cost(world, *a).total_cmp(&self.cost(world, *b)))
             else {
                 continue;
             };
@@ -299,6 +365,60 @@ impl Controller {
                 reason: if lagging { "lagging" } else { "overloaded" }.into(),
             });
         }
+        // merge (co-locate): a simulator quiet for `merge_after_rounds` rounds gives every cell
+        // to the owner of a neighbouring cell with room well under split_cost — all cells or
+        // none, half a merge is just churn — and ends up free
+        let mut quiet = std::mem::take(&mut self.quiet_rounds);
+        let sims: Vec<SimId> = self.sims.keys().copied().collect();
+        for s in sims {
+            let cells = world.cells_of(s);
+            if cells.is_empty()
+                || !self.is_alive(s, tick)
+                || self.cost(world, s) >= self.cfg.merge_cost
+            {
+                quiet.remove(&s);
+                continue;
+            }
+            let rounds = quiet.entry(s).or_insert(0);
+            *rounds += 1;
+            if *rounds < self.cfg.merge_after_rounds.max(1) {
+                continue;
+            }
+            let mut plan: Vec<(CellId, SimId)> = Vec::new();
+            for c in &cells {
+                let dest = World::neighbours(*c)
+                    .filter_map(|n| world.owner(n))
+                    .filter(|o| *o != s && self.is_alive(*o, tick) && self.has_room(world, *o))
+                    .filter(|o| self.lag(*o, tick) <= tidi_after)
+                    .filter(|o| {
+                        self.cost(world, *o) + self.cell_cost(world, *c)
+                            <= self.cfg.split_cost * MERGE_HEADROOM
+                    })
+                    .min_by(|a, b| self.cost(world, *a).total_cmp(&self.cost(world, *b)));
+                match dest {
+                    Some(d) => plan.push((*c, d)),
+                    None => {
+                        plan.clear();
+                        break;
+                    }
+                }
+            }
+            if plan.is_empty() {
+                continue;
+            }
+            for (c, d) in plan {
+                world.revoke_lease(c);
+                world.grant_lease(c, d);
+                out.push(Assignment {
+                    cell: c,
+                    from: Some(s),
+                    to: d,
+                    reason: "merge".into(),
+                });
+            }
+            quiet.remove(&s);
+        }
+        self.quiet_rounds = quiet;
         out
     }
 }
@@ -484,6 +604,122 @@ mod tests {
         assert!(w.get(forever).is_some());
     }
 
+    /// Cost is not just entities: clients watching a cell and handover traffic count, so a
+    /// simulator with few entities but a crowd of players sheds its cheap cell to a free one.
+    #[test]
+    fn players_and_traffic_count_toward_cost() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..WorldConfig::default()
+        });
+        let mut ctl = Controller::new(ControllerConfig {
+            split_cost: 40.0,
+            ..ControllerConfig::default()
+        });
+        let (s1, s2) = (SimId::now_v7(), SimId::now_v7());
+        ctl.register(s1, 4, 0);
+        ctl.register(s2, 4, 0);
+        let (a, b) = (CellId { x: 0, y: 0 }, CellId { x: 1, y: 0 });
+        w.grant_lease(a, s1);
+        w.grant_lease(b, s1);
+        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
+        w.spawn(Pos { x: 110.0, y: 10.0 }, Default::default(), false);
+        assert!(ctl.reconcile(&mut w).is_empty(), "2 entities are no load");
+        // ten clients crowd cell b: 10 × 5 = 50 > split_cost
+        for i in 0..10 {
+            w.subscribe(
+                Uuid::now_v7(),
+                Pos {
+                    x: 150.0 + i as f64,
+                    y: 50.0,
+                },
+                10.0,
+            );
+        }
+        assert_eq!(w.players_in(b), 10);
+        assert_eq!(ctl.cell_cost(&w, b), 51.0);
+        assert_eq!(ctl.cost(&w, s1), 52.0);
+        let out = ctl.reconcile(&mut w);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].reason, "overloaded");
+        assert_eq!(out[0].cell, a, "the cheap, least-coupled cell moves");
+        assert_eq!(out[0].to, s2);
+        // traffic: entities in handover out of a cell raise its cost over a few samples
+        ctl.observe(&w);
+        assert_eq!(ctl.traffic.get(&b).copied().unwrap_or(0.0), 0.0);
+    }
+
+    /// Two simulators each holding one quiet neighbouring cell: after `merge_after_rounds`
+    /// rounds under `merge_cost` one hands its cell to the other (co-locate) and is left free;
+    /// nothing moves back while the merged simulator stays under split_cost.
+    #[test]
+    fn quiet_simulators_merge_onto_a_neighbour_with_hysteresis() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..WorldConfig::default()
+        });
+        let mut ctl = Controller::new(ControllerConfig {
+            merge_cost: 10.0,
+            merge_after_rounds: 3,
+            ..ControllerConfig::default()
+        });
+        let (s1, s2) = (SimId::now_v7(), SimId::now_v7());
+        ctl.register(s1, 4, 0);
+        ctl.register(s2, 4, 0);
+        let (a, b) = (CellId { x: 0, y: 0 }, CellId { x: 1, y: 0 });
+        w.grant_lease(a, s1);
+        w.grant_lease(b, s2);
+        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
+        w.spawn(Pos { x: 110.0, y: 10.0 }, Default::default(), false);
+        for round in 0..2 {
+            assert!(
+                ctl.reconcile(&mut w).is_empty(),
+                "round {round} is hysteresis"
+            );
+        }
+        let out = ctl.reconcile(&mut w);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].reason, "merge");
+        let (giver, taker) = (out[0].from.unwrap(), out[0].to);
+        assert!(w.cells_of(giver).is_empty());
+        assert_eq!(w.cells_of(taker).len(), 2);
+        for _ in 0..5 {
+            assert!(ctl.reconcile(&mut w).is_empty(), "no flapping");
+        }
+        // the quiet clock resets when a simulator gets busy
+        let mut busy = Controller::new(ControllerConfig {
+            merge_cost: 10.0,
+            merge_after_rounds: 2,
+            ..ControllerConfig::default()
+        });
+        busy.register(s1, 4, 0);
+        busy.register(s2, 4, 0);
+        w.revoke_lease(a);
+        w.grant_lease(a, s1);
+        w.revoke_lease(b);
+        w.grant_lease(b, s2);
+        assert!(busy.reconcile(&mut w).is_empty());
+        for i in 0..3 {
+            w.subscribe(
+                Uuid::now_v7(),
+                Pos {
+                    x: 10.0 + i as f64,
+                    y: 10.0,
+                },
+                5.0,
+            );
+        }
+        // s1 is busy now (clock reset); the still-quiet s2 merges its cell onto busy s1 instead
+        let out = busy.reconcile(&mut w);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (out[0].reason.as_str(), out[0].from, out[0].to),
+            ("merge", Some(s2), s1)
+        );
+        assert_eq!(busy.quiet_rounds.get(&s1), None);
+        assert_eq!(w.cells_of(s1).len(), 2);
+    }
+
     #[test]
     fn dilate_follows_owner_lag_and_recovers() {
         let mut w = World::new(WorldConfig {
@@ -565,6 +801,7 @@ mod tests {
         let mut c = Controller::new(ControllerConfig {
             split_cost: 2.0,
             sim_timeout_ticks: 5,
+            ..ControllerConfig::default()
         });
         let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
         c.register(s1, 4, 0);

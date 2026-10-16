@@ -2245,6 +2245,7 @@ impl WorldRegistry {
                     });
                 }
             }
+            st.controller.observe(&st.world);
             if st.world.tick % CONTROL_EVERY == 0 {
                 let moves = st.controller.reconcile(&mut st.world);
                 for a in &moves {
