@@ -57,6 +57,10 @@ pub struct Entity {
     /// World tick of the last write, interaction or handover (drives `decay_ticks`).
     #[serde(default)]
     pub touched_tick: u64,
+    /// World tick of the last change a client could see (position, components, arrival): a
+    /// client that already has the entity as of a later tick skips it without comparing.
+    #[serde(default)]
+    pub changed_tick: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -497,6 +501,7 @@ impl World {
             transit: None,
             decay_ticks: None,
             touched_tick: self.tick,
+            changed_tick: self.tick,
         };
         self.by_cell.entry(cell).or_default().insert(id);
         self.entities.insert(id, e);
@@ -577,6 +582,7 @@ impl World {
             Some(e) => {
                 e.decay_ticks = ticks;
                 e.touched_tick = tick;
+                e.changed_tick = tick;
                 true
             }
             None => false,
@@ -588,6 +594,7 @@ impl World {
         let tick = self.tick;
         if let Some(e) = self.entities.get_mut(&id) {
             e.touched_tick = tick;
+            e.changed_tick = tick;
         }
     }
 
@@ -650,6 +657,7 @@ impl World {
         let tick = self.tick;
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
         e.touched_tick = tick;
+        e.changed_tick = tick;
         if let Some(p) = pos {
             e.pos = p;
         }
@@ -954,6 +962,7 @@ impl World {
             let e = self.entities.get_mut(&id).unwrap();
             e.transit = None;
             e.touched_tick = tick;
+            e.changed_tick = tick;
         }
         let inputs = self.buffered_inputs.remove(&id).unwrap_or_default();
         Ok((
@@ -1110,6 +1119,16 @@ impl World {
                 continue;
             }
             seen.insert(e.id);
+            // delivered after its last change (a change in the same tick as the delivery may
+            // have landed after it, so that tick is compared the slow way): nothing to compare
+            if interest.known.contains_key(&e.id)
+                && interest
+                    .last_sent
+                    .get(&e.id)
+                    .is_some_and(|sent| e.changed_tick < *sent)
+            {
+                continue;
+            }
             let qpos = quantize(e.pos, quantum);
             let versions: BTreeMap<String, u64> = e
                 .components
@@ -1243,6 +1262,7 @@ impl World {
                 Some((c, _)) => *c,
                 None => self.cell_of(e.pos),
             };
+            e.changed_tick = self.tick;
             self.by_cell.entry(e.cell).or_default().insert(e.id);
             let (id, pos) = (e.id, e.pos);
             self.entities.insert(e.id, e);
