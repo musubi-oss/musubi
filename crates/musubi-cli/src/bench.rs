@@ -2,6 +2,8 @@
 //! Every client authenticates with a device id, then loops its scenario until the deadline;
 //! latencies are reported as p50/p95/p99/max with throughput and error counts.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
@@ -15,7 +17,310 @@ pub struct Opts {
     pub clients: usize,
     pub duration: Duration,
     pub scenario: String,
+    /// `world` scenario: worlds to create, entities per world, client interest radius.
+    pub worlds: usize,
+    pub entities: usize,
+    pub radius: f64,
     pub json: bool,
+}
+
+/// Dev server key (`[auth] server_key` default) for the world scenario's simulator side.
+const KEY: &str = "defaultkey";
+
+/// Totals of the `world` scenario across all clients.
+#[derive(Default)]
+struct WorldTotals {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    entities: AtomicU64,
+    moves_ok: AtomicU64,
+    moves_err: AtomicU64,
+}
+
+struct Arena {
+    name: String,
+    sim: uuid::Uuid,
+    side: f64,
+    entities: Vec<String>,
+}
+
+/// Create a world, lease the cells covering a square arena and spawn `entities` in it.
+async fn world_setup(
+    http: &reqwest::Client,
+    url: &str,
+    name: &str,
+    entities: usize,
+) -> anyhow::Result<Arena> {
+    let cell = 256.0;
+    let side = ((entities.max(1) as f64).sqrt() * 20.0).max(cell);
+    let r = http
+        .post(format!("{url}/v1/server/worlds"))
+        .header("x-musubi-server-key", KEY)
+        .json(&json!({"name": name, "config": {"cell_size": cell}}))
+        .send()
+        .await?;
+    anyhow::ensure!(r.status().is_success(), "create world: {}", r.status());
+    let sim = uuid::Uuid::now_v7();
+    let n = (side / cell).ceil() as i64;
+    let cells: Vec<Value> = (0..n)
+        .flat_map(|x| (0..n).map(move |y| json!({"x": x, "y": y})))
+        .collect();
+    let r = http
+        .post(format!("{url}/v1/server/worlds/{name}/lease"))
+        .header("x-musubi-server-key", KEY)
+        .json(&json!({"sim": sim, "cells": cells}))
+        .send()
+        .await?;
+    anyhow::ensure!(r.status().is_success(), "lease: {}", r.status());
+    let mut ids = Vec::with_capacity(entities);
+    for i in 0..entities {
+        let (x, y) = arena_point(side, i as u64);
+        let r = http
+            .post(format!("{url}/v1/server/worlds/{name}/spawn"))
+            .header("x-musubi-server-key", KEY)
+            .json(&json!({"sim": sim, "x": x, "y": y, "components": {"hp": 100}, "persistent": false}))
+            .send()
+            .await?;
+        anyhow::ensure!(r.status().is_success(), "spawn: {}", r.status());
+        let v: Value = r.json().await?;
+        ids.push(v["id"].as_str().unwrap_or_default().to_string());
+    }
+    Ok(Arena {
+        name: name.to_string(),
+        sim,
+        side,
+        entities: ids,
+    })
+}
+
+/// Deterministic pseudo-random point in the arena (no rand dependency).
+fn arena_point(side: f64, seed: u64) -> (f64, f64) {
+    let h = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let x = (h >> 11) as f64 / (1u64 << 53) as f64;
+    let y = (h.rotate_left(29) >> 11) as f64 / (1u64 << 53) as f64;
+    (x * side, y * side)
+}
+
+/// Simulator side of the arena: renew the lease every 500 ms and, every tick (33 ms), move a
+/// thirtieth of the entities so each one moves about once a second and every tick carries
+/// changes (a plain HTTP `apply` per entity — the simplest, not the fastest, simulator).
+async fn world_sim(
+    http: reqwest::Client,
+    url: String,
+    arena: Arc<Arena>,
+    deadline: Instant,
+    totals: Arc<WorldTotals>,
+) {
+    let n = arena.entities.len();
+    let cell = 256.0;
+    let k = (arena.side / cell).ceil() as i64;
+    let cells: Vec<Value> = (0..k)
+        .flat_map(|x| (0..k).map(move |y| json!({"x": x, "y": y})))
+        .collect();
+    let mut step = 0u64;
+    let mut last_lease = Instant::now();
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(33)).await;
+        if last_lease.elapsed() >= Duration::from_millis(500) {
+            last_lease = Instant::now();
+            let _ = http
+                .post(format!("{url}/v1/server/worlds/{}/lease", arena.name))
+                .header("x-musubi-server-key", KEY)
+                .json(&json!({"sim": arena.sim, "cells": cells}))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await;
+        }
+        if n == 0 {
+            continue;
+        }
+        let batch = (n / 30).max(1);
+        let mut futs = Vec::with_capacity(batch);
+        for j in 0..batch {
+            let i = ((step as usize) * batch + j) % n;
+            let (x, y) = arena_point(arena.side, step.wrapping_mul(7919).wrapping_add(i as u64));
+            let (http, url, arena, totals) =
+                (http.clone(), url.clone(), arena.clone(), totals.clone());
+            futs.push(async move {
+                let res = http
+                    .post(format!("{url}/v1/server/worlds/{}/apply", arena.name))
+                    .header("x-musubi-server-key", KEY)
+                    .json(&json!({"sim": arena.sim, "entity": arena.entities[i], "x": x, "y": y}))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await;
+                if res.map(|r| r.status().is_success()).unwrap_or(false) {
+                    totals.moves_ok.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    totals.moves_err.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        futures::future::join_all(futs).await;
+        step += 1;
+    }
+}
+
+struct Player {
+    url: String,
+    token: String,
+    arena: Arc<Arena>,
+    radius: f64,
+    seed: u64,
+    deadline: Instant,
+    tx: mpsc::UnboundedSender<Sample>,
+    totals: Arc<WorldTotals>,
+}
+
+/// A player: subscribe at a point of the arena, drift it every 200 ms, count delta frames; each
+/// sample is the gap between consecutive frames (33 ms at 30 Hz when the server keeps up).
+async fn world_loop(p: Player) {
+    let Player {
+        url,
+        token,
+        arena,
+        radius,
+        seed,
+        deadline,
+        tx,
+        totals,
+    } = p;
+    let Ok((mut ws, _)) =
+        tokio_tungstenite::connect_async(format!("{}?token={token}&format=json", ws_url(&url)))
+            .await
+    else {
+        let _ = tx.send(sample("world", Instant::now(), false, false));
+        return;
+    };
+    let subscribe = |step: u64| {
+        let (x, y) = arena_point(arena.side, seed.wrapping_add(step.wrapping_mul(31)));
+        serde_json::to_string(&Envelope {
+            cid: None,
+            msg: ClientMessage::WorldSubscribe {
+                world: arena.name.clone(),
+                x,
+                y,
+                radius,
+                budget_bytes: None,
+                filter: None,
+            },
+        })
+        .unwrap()
+    };
+    if ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(subscribe(0)))
+        .await
+        .is_err()
+    {
+        let _ = tx.send(sample("world", Instant::now(), false, false));
+        return;
+    }
+    let mut last_frame: Option<Instant> = None;
+    let mut next_move = Instant::now() + Duration::from_millis(200);
+    let mut step = 1u64;
+    while Instant::now() < deadline {
+        let wait = next_move.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(wait.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt)))) => {
+                totals.bytes.fetch_add(txt.len() as u64, Ordering::Relaxed);
+                if let Ok(Envelope {
+                    msg:
+                        ServerMessage::WorldDelta {
+                            spawned, updated, ..
+                        },
+                    ..
+                }) = serde_json::from_str::<Envelope<ServerMessage>>(&txt)
+                {
+                    totals.frames.fetch_add(1, Ordering::Relaxed);
+                    totals
+                        .entities
+                        .fetch_add((spawned.len() + updated.len()) as u64, Ordering::Relaxed);
+                    let now = Instant::now();
+                    if let Some(prev) = last_frame {
+                        let _ = tx.send(Sample {
+                            scenario: "world",
+                            ms: now.duration_since(prev).as_secs_f64() * 1e3,
+                            ok: true,
+                            throttled: false,
+                        });
+                    }
+                    last_frame = Some(now);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(_) => {
+                let _ = tx.send(sample("world", Instant::now(), false, false));
+                return;
+            }
+            Err(_) => {
+                next_move = Instant::now() + Duration::from_millis(200);
+                if ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(subscribe(
+                        step,
+                    )))
+                    .await
+                    .is_err()
+                {
+                    let _ = tx.send(sample("world", Instant::now(), false, false));
+                    return;
+                }
+                step += 1;
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+}
+
+/// World tick duration from `/metrics`: mean, p50 and p99 (ms) over the bench worlds, from the
+/// Prometheus histogram (buckets) or summary (quantiles), whichever the exporter renders.
+async fn scrape_tick(http: &reqwest::Client, url: &str, prefix: &str, metric: &str) -> Value {
+    let Ok(r) = http.get(format!("{url}/metrics")).send().await else {
+        return Value::Null;
+    };
+    let Ok(text) = r.text().await else {
+        return Value::Null;
+    };
+    let mut buckets: std::collections::BTreeMap<String, f64> = Default::default();
+    let (mut sum, mut count) = (0.0, 0.0);
+    let mut quantiles = serde_json::Map::new();
+    for line in text.lines() {
+        if !line.starts_with(metric) || !line.contains(&format!("world=\"{prefix}")) {
+            continue;
+        }
+        let Some((lhs, val)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let val: f64 = val.parse().unwrap_or(0.0);
+        if lhs.starts_with(&format!("{metric}_sum")) {
+            sum += val;
+        } else if lhs.starts_with(&format!("{metric}_count")) {
+            count += val;
+        } else if let Some(le) = lhs.split("le=\"").nth(1) {
+            let le = le.split('"').next().unwrap_or("+Inf").to_string();
+            *buckets.entry(le).or_insert(0.0) += val;
+        } else if let Some(q) = lhs.split("quantile=\"").nth(1) {
+            let q = q.split('"').next().unwrap_or("").to_string();
+            quantiles.insert(q, json!(val * 1e3));
+        }
+    }
+    let pct = |p: f64| -> Option<f64> {
+        let mut bs: Vec<(f64, f64)> = buckets
+            .iter()
+            .map(|(le, c)| (le.parse::<f64>().unwrap_or(f64::INFINITY), *c))
+            .collect();
+        bs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let total = bs.last()?.1;
+        bs.iter()
+            .find(|(_, c)| *c >= total * p)
+            .map(|(le, _)| le * 1e3)
+    };
+    json!({
+        "ticks": count,
+        "mean_ms": if count > 0.0 { sum / count * 1e3 } else { 0.0 },
+        "p50_ms": pct(0.5),
+        "p99_ms": pct(0.99),
+        "quantiles_ms": quantiles,
+    })
 }
 
 #[derive(Debug)]
@@ -206,9 +511,27 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         "http" => vec!["http"],
         "storage" => vec!["storage"],
         "ws" => vec!["ws"],
-        other => anyhow::bail!("unknown scenario {other}; use http|storage|ws|all"),
+        "world" => vec!["world"],
+        other => anyhow::bail!("unknown scenario {other}; use http|storage|ws|world|all"),
     };
     let run_id = uuid::Uuid::now_v7().simple().to_string();
+    let totals = Arc::new(WorldTotals::default());
+    let mut arenas: Vec<Arc<Arena>> = Vec::new();
+    if scenarios.contains(&"world") {
+        let t = Instant::now();
+        for i in 0..o.worlds.max(1) {
+            let name = format!("bench-{run_id}-{i}");
+            arenas.push(Arc::new(world_setup(&http, &url, &name, o.entities).await?));
+        }
+        if !o.json {
+            eprintln!(
+                "world setup: {} worlds x {} entities in {:.1}s",
+                arenas.len(),
+                o.entities,
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
     let t0 = Instant::now();
     let mut tokens = Vec::with_capacity(o.clients);
     for i in 0..o.clients {
@@ -218,13 +541,37 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let deadline = Instant::now() + o.duration;
     let mut tasks = Vec::new();
+    for arena in &arenas {
+        tasks.push(tokio::spawn(world_sim(
+            http.clone(),
+            url.clone(),
+            arena.clone(),
+            deadline,
+            totals.clone(),
+        )));
+    }
     for (i, token) in tokens.into_iter().enumerate() {
         let sc = scenarios[i % scenarios.len()];
         let (http, url, tx) = (http.clone(), url.clone(), tx.clone());
+        let arena = arenas.get(i % arenas.len().max(1)).cloned();
+        let (radius, totals) = (o.radius, totals.clone());
         tasks.push(tokio::spawn(async move {
             match sc {
                 "http" => http_loop(http, url, token, deadline, tx).await,
                 "storage" => storage_loop(http, url, token, deadline, tx).await,
+                "world" => {
+                    world_loop(Player {
+                        url,
+                        token,
+                        arena: arena.unwrap(),
+                        radius,
+                        seed: i as u64,
+                        deadline,
+                        tx,
+                        totals,
+                    })
+                    .await
+                }
                 _ => ws_loop(url, token, deadline, tx).await,
             }
         }));
@@ -240,6 +587,17 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     let secs = o.duration.as_secs_f64();
     let mut report = json!({
         "url": url, "clients": o.clients, "duration_secs": secs,
+        "world": if arenas.is_empty() { Value::Null } else { json!({
+            "worlds": arenas.len(), "entities_per_world": o.entities, "radius": o.radius,
+            "frames": totals.frames.load(Ordering::Relaxed),
+            "frames_per_client_per_sec": totals.frames.load(Ordering::Relaxed) as f64 / secs / o.clients.max(1) as f64,
+            "kbytes_per_sec": totals.bytes.load(Ordering::Relaxed) as f64 / secs / 1024.0,
+            "entity_updates_per_sec": totals.entities.load(Ordering::Relaxed) as f64 / secs,
+            "sim_moves_ok": totals.moves_ok.load(Ordering::Relaxed),
+            "sim_moves_err": totals.moves_err.load(Ordering::Relaxed),
+            "tick": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_tick_duration_seconds").await,
+            "fanout": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_fanout_duration_seconds").await,
+        }) },
         "auth": { "clients": o.clients, "total_ms": auth_ms, "per_client_ms": auth_ms / o.clients.max(1) as f64 },
         "scenarios": {}
     });

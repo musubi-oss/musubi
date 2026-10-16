@@ -70,6 +70,15 @@ enum Cmd {
         duration_secs: u64,
         #[arg(long, default_value = "all")]
         scenario: String,
+        /// `world` scenario: worlds to create (clients are spread over them).
+        #[arg(long, default_value_t = 1)]
+        worlds: usize,
+        /// `world` scenario: entities per world, moved by a simulator while clients watch.
+        #[arg(long, default_value_t = 200)]
+        entities: usize,
+        /// `world` scenario: client interest radius.
+        #[arg(long, default_value_t = 200.0)]
+        radius: f64,
         #[arg(long)]
         json: bool,
     },
@@ -188,6 +197,9 @@ async fn main() -> anyhow::Result<()> {
             clients,
             duration_secs,
             scenario,
+            worlds,
+            entities,
+            radius,
             json,
         } => {
             bench::run(bench::Opts {
@@ -195,6 +207,9 @@ async fn main() -> anyhow::Result<()> {
                 clients,
                 duration: std::time::Duration::from_secs(duration_secs),
                 scenario,
+                worlds,
+                entities,
+                radius,
                 json,
             })
             .await

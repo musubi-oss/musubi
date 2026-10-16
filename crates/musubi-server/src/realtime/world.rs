@@ -2343,9 +2343,23 @@ impl WorldRegistry {
     // ----- ticking -----
 
     /// One tick of every world: clock, handover detection/expiry, client deltas.
+    /// One tick of every world here, one after another (tests and single-world nodes); the
+    /// ticker runs worlds in parallel through `tick_world`.
     pub fn tick(&self, fanout: &Fanout) {
-        for w in self.worlds.iter() {
-            let name = w.key().clone();
+        let names: Vec<String> = self.worlds.iter().map(|w| w.key().clone()).collect();
+        for name in names {
+            self.tick_world(&name, fanout);
+        }
+    }
+
+    /// One tick of one world: simulation step, handovers, admission, decay, then the per-client
+    /// delta fan-out. Worlds are independent, so the ticker runs these concurrently.
+    pub fn tick_world(&self, name: &str, fanout: &Fanout) {
+        let Some(w) = self.worlds.get(name).map(|w| w.clone()) else {
+            return;
+        };
+        let name = name.to_string();
+        {
             let started = std::time::Instant::now();
             let mut st = w.lock();
             let st = &mut *st;
@@ -2536,15 +2550,44 @@ impl WorldRegistry {
                 .record(started.elapsed().as_secs_f64());
             metrics::gauge!("musubi_world_entities", "world" => name.clone())
                 .set(st.world.len() as f64);
+            // per-client delta build + send: the part of a tick that grows with players, so it
+            // is measured apart from the simulation step above
+            let fan_started = std::time::Instant::now();
+            let mut frames = 0u64;
             let subs: Vec<(SessionId, Uuid)> = st.subs.iter().map(|(s, c)| (*s, *c)).collect();
             for (sid, client) in subs {
                 if let Some(d) = st.world.delta_for(client) {
                     if d != Delta::default() {
                         let scale = st.world.scale_for_client(client);
                         fanout.session(sid, delta_msg(&name, tick, scale, d));
+                        frames += 1;
                     }
                 }
             }
+            metrics::histogram!("musubi_world_fanout_duration_seconds", "world" => name.clone())
+                .record(fan_started.elapsed().as_secs_f64());
+            metrics::counter!("musubi_world_frames_total", "world" => name.clone())
+                .increment(frames);
+        }
+    }
+
+    /// Tick all worlds, each on its own blocking thread, and wait for the slowest: a node with
+    /// several worlds uses several cores instead of serializing their fan-outs.
+    async fn tick_parallel(self: &Arc<Self>, fanout: &Fanout) {
+        let names: Vec<String> = self.worlds.iter().map(|w| w.key().clone()).collect();
+        if names.len() <= 1 {
+            self.tick(fanout);
+            return;
+        }
+        let handles: Vec<_> = names
+            .into_iter()
+            .map(|name| {
+                let (this, fanout) = (self.clone(), fanout.clone());
+                tokio::task::spawn_blocking(move || this.tick_world(&name, &fanout))
+            })
+            .collect();
+        for h in handles {
+            let _ = h.await;
         }
     }
 
@@ -2559,7 +2602,7 @@ impl WorldRegistry {
             iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 iv.tick().await;
-                self.tick(&fanout);
+                self.tick_parallel(&fanout).await;
                 let t = self
                     .tick_no
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)

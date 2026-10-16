@@ -1050,6 +1050,11 @@ impl World {
         let tick = self.tick;
         let quantum = self.cfg.pos_quantum;
         let default_budget = self.cfg.client_budget_bytes;
+        // only the cells the interest circle touches are scanned, not the whole world
+        let cells = {
+            let i = self.interests.get(&client)?;
+            self.cells_in_radius(i.pos, i.radius)
+        };
         let interest = self.interests.get_mut(&client)?;
         let budget = interest.budget_bytes.unwrap_or(default_budget);
         let mut seen = HashSet::new();
@@ -1063,7 +1068,12 @@ impl World {
             update: Option<(EntityId, Pos, BTreeMap<String, Component>)>,
         }
         let mut cands: Vec<Cand> = Vec::new();
-        for e in self.entities.values() {
+        let in_cells = cells
+            .iter()
+            .filter_map(|c| self.by_cell.get(c))
+            .flatten()
+            .filter_map(|id| self.entities.get(id));
+        for e in in_cells {
             let dist = e.pos.dist(&interest.pos);
             if dist > interest.radius {
                 continue;
