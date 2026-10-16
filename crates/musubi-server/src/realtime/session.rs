@@ -297,14 +297,29 @@ async fn run_loop_inner(
     loop {
         tokio::select! {
             out = rx.recv() => {
-                let Some(msg) = out else { return Ok(Exit::Clean) };
-                let unreliable = matches!(&msg, ServerMessage::MatchData { reliable: false, .. });
-                let bytes = encoding.encode(&Envelope { cid: None, msg })?;
-                let frame = Frame::encoded(encoding, bytes);
-                if unreliable {
-                    conn.send_unreliable(frame).await?;
-                } else {
-                    conn.send(frame).await?;
+                let Some(first) = out else { return Ok(Exit::Clean) };
+                // whatever queued up while this task waited for a core (several ticks of
+                // deltas under load) goes out as one burst with a single flush
+                let mut next = Some(first);
+                let mut batch: Vec<Frame> = Vec::new();
+                while let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) {
+                    let unreliable = matches!(&msg, ServerMessage::MatchData { reliable: false, .. });
+                    let bytes = encoding.encode(&Envelope { cid: None, msg })?;
+                    let frame = Frame::encoded(encoding, bytes);
+                    if unreliable {
+                        if !batch.is_empty() {
+                            conn.send_many(std::mem::take(&mut batch)).await?;
+                        }
+                        conn.send_unreliable(frame).await?;
+                    } else {
+                        batch.push(frame);
+                        if batch.len() >= 64 {
+                            break;
+                        }
+                    }
+                }
+                if !batch.is_empty() {
+                    conn.send_many(batch).await?;
                 }
             }
             inc = conn.recv() => {

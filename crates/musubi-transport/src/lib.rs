@@ -66,6 +66,16 @@ pub trait Connection: Send {
         self.send(frame)
     }
     fn recv(&mut self) -> BoxFuture<'_, Result<Frame, TransportError>>;
+    /// Several frames at once. Transports that can flush once per burst override this (one
+    /// write for a queue of deltas, not one per frame); the default sends them one by one.
+    fn send_many(&mut self, frames: Vec<Frame>) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            for f in frames {
+                self.send(f).await?;
+            }
+            Ok(())
+        })
+    }
     fn close(&mut self) -> BoxFuture<'_, ()>;
     fn kind(&self) -> &'static str;
 }

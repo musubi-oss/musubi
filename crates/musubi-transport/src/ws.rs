@@ -1,6 +1,6 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures::future::BoxFuture;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 
 use crate::{Connection, Frame, TransportError};
 
@@ -17,13 +17,23 @@ impl WsConnection {
 impl Connection for WsConnection {
     fn send(&mut self, frame: Frame) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
-            let msg = match frame {
-                Frame::Text(s) => Message::Text(s.into()),
-                Frame::Binary(b) => Message::Binary(b),
-                Frame::Close => Message::Close(None),
-            };
             self.inner
-                .send(msg)
+                .send(to_message(frame))
+                .await
+                .map_err(|e| TransportError::Io(e.to_string()))
+        })
+    }
+
+    fn send_many(&mut self, frames: Vec<Frame>) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            for f in frames {
+                self.inner
+                    .feed(to_message(f))
+                    .await
+                    .map_err(|e| TransportError::Io(e.to_string()))?;
+            }
+            self.inner
+                .flush()
                 .await
                 .map_err(|e| TransportError::Io(e.to_string()))
         })
@@ -53,5 +63,13 @@ impl Connection for WsConnection {
 
     fn kind(&self) -> &'static str {
         "ws"
+    }
+}
+
+fn to_message(frame: Frame) -> Message {
+    match frame {
+        Frame::Text(s) => Message::Text(s.into()),
+        Frame::Binary(b) => Message::Binary(b),
+        Frame::Close => Message::Close(None),
     }
 }
