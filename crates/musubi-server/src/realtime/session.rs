@@ -570,7 +570,22 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             x,
             y,
             radius,
-        } => world_dispatch(ctx, &world, WorldCmd::Subscribe { x, y, radius }).await,
+            budget_bytes,
+            filter,
+        } => {
+            world_dispatch(
+                ctx,
+                &world,
+                WorldCmd::Subscribe {
+                    x,
+                    y,
+                    radius,
+                    budget_bytes,
+                    filter,
+                },
+            )
+            .await
+        }
         ClientMessage::WorldUnsubscribe { world } => {
             world_dispatch(ctx, &world, WorldCmd::Unsubscribe).await
         }

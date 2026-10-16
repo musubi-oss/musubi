@@ -77,6 +77,10 @@ pub struct WorldConfig {
     pub hysteresis: f64,
     pub lease_ttl_ticks: u64,
     pub handover_timeout_ticks: u64,
+    /// Default per-client delta budget per tick (bytes, estimated); a subscription may lower it.
+    pub client_budget_bytes: usize,
+    /// Positions in client deltas are rounded to this step; smaller moves send nothing.
+    pub pos_quantum: f64,
 }
 
 impl Default for WorldConfig {
@@ -87,6 +91,8 @@ impl Default for WorldConfig {
             hysteresis: 24.0,
             lease_ttl_ticks: 60,
             handover_timeout_ticks: 3,
+            client_budget_bytes: 16 * 1024,
+            pos_quantum: 0.01,
         }
     }
 }
@@ -128,6 +134,15 @@ struct Interest {
     radius: f64,
     /// entity → last component versions the client received (pos is always sent on move).
     known: HashMap<EntityId, (Pos, BTreeMap<String, u64>)>,
+    /// Per-tick byte budget override (`None` = world default).
+    #[serde(default)]
+    budget_bytes: Option<usize>,
+    /// Fine filter: every listed component must equal the given value (empty = all entities).
+    #[serde(default)]
+    filter: BTreeMap<String, serde_json::Value>,
+    /// entity → tick of the last delta that carried it (priority grows with age).
+    #[serde(default)]
+    last_sent: HashMap<EntityId, u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -726,13 +741,34 @@ impl World {
     // ----- interest & client deltas -----
 
     pub fn subscribe(&mut self, client: ClientId, pos: Pos, radius: f64) {
-        let known = self
+        self.subscribe_with(client, pos, radius, None, BTreeMap::new());
+    }
+
+    /// Subscribe with a per-tick byte budget and a component-equality filter (see `delta_for`).
+    pub fn subscribe_with(
+        &mut self,
+        client: ClientId,
+        pos: Pos,
+        radius: f64,
+        budget_bytes: Option<usize>,
+        filter: BTreeMap<String, serde_json::Value>,
+    ) {
+        let (known, last_sent) = self
             .interests
             .get(&client)
-            .map(|i| i.known.clone())
+            .map(|i| (i.known.clone(), i.last_sent.clone()))
             .unwrap_or_default();
-        self.interests
-            .insert(client, Interest { pos, radius, known });
+        self.interests.insert(
+            client,
+            Interest {
+                pos,
+                radius,
+                known,
+                budget_bytes,
+                filter,
+                last_sent,
+            },
+        );
     }
 
     pub fn unsubscribe(&mut self, client: ClientId) {
@@ -741,22 +777,55 @@ impl World {
 
     /// Delta since the client's last call: new entities in range, moved/changed ones, and those
     /// that left range or despawned. Transparent to cell ownership and handovers.
+    /// What `client` has not seen yet, within its budget. Entities in the radius that pass the
+    /// filter are ranked by `relevance × (1 + age)` — relevance falls with distance, age is the
+    /// ticks since the client last heard about the entity — and taken in that order until the
+    /// estimated bytes exceed the budget (at least one always goes); the rest keep their old
+    /// state and come back next tick with a higher priority. Despawns are always delivered.
+    /// Positions are quantized to `pos_quantum`, so jitter below it is not an update.
     pub fn delta_for(&mut self, client: ClientId) -> Option<Delta> {
+        let tick = self.tick;
+        let quantum = self.cfg.pos_quantum;
+        let default_budget = self.cfg.client_budget_bytes;
         let interest = self.interests.get_mut(&client)?;
-        let mut d = Delta::default();
+        let budget = interest.budget_bytes.unwrap_or(default_budget);
         let mut seen = HashSet::new();
+        struct Cand {
+            prio: f64,
+            bytes: usize,
+            id: EntityId,
+            pos: Pos,
+            versions: BTreeMap<String, u64>,
+            spawn: Option<Entity>,
+            update: Option<(EntityId, Pos, BTreeMap<String, Component>)>,
+        }
+        let mut cands: Vec<Cand> = Vec::new();
         for e in self.entities.values() {
-            if e.pos.dist(&interest.pos) > interest.radius {
+            let dist = e.pos.dist(&interest.pos);
+            if dist > interest.radius {
+                continue;
+            }
+            if !interest
+                .filter
+                .iter()
+                .all(|(k, v)| e.components.get(k).is_some_and(|c| &c.value == v))
+            {
                 continue;
             }
             seen.insert(e.id);
+            let qpos = quantize(e.pos, quantum);
             let versions: BTreeMap<String, u64> = e
                 .components
                 .iter()
                 .map(|(k, c)| (k.clone(), c.version))
                 .collect();
-            match interest.known.get(&e.id) {
-                None => d.spawned.push(e.clone()),
+            let (spawn, update, bytes) = match interest.known.get(&e.id) {
+                None => {
+                    let mut s = e.clone();
+                    s.pos = qpos;
+                    let bytes = estimate_components(s.components.iter()) + 64;
+                    (Some(s), None, bytes)
+                }
                 Some((pos, known_versions)) => {
                     let changed: BTreeMap<String, Component> = e
                         .components
@@ -764,12 +833,46 @@ impl World {
                         .filter(|(k, c)| known_versions.get(*k) != Some(&c.version))
                         .map(|(k, c)| (k.clone(), c.clone()))
                         .collect();
-                    if *pos != e.pos || !changed.is_empty() {
-                        d.updated.push((e.id, e.pos, changed));
+                    if *pos == qpos && changed.is_empty() {
+                        continue;
                     }
+                    let bytes = estimate_components(changed.iter()) + 56;
+                    (None, Some((e.id, qpos, changed)), bytes)
                 }
+            };
+            let age = tick.saturating_sub(interest.last_sent.get(&e.id).copied().unwrap_or(0));
+            let relevance = 1.0 / (1.0 + dist / interest.radius.max(f64::EPSILON));
+            cands.push(Cand {
+                prio: relevance * (1.0 + age as f64),
+                bytes,
+                id: e.id,
+                pos: qpos,
+                versions,
+                spawn,
+                update,
+            });
+        }
+        cands.sort_by(|a, b| {
+            b.prio
+                .partial_cmp(&a.prio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.id.cmp(&b.id))
+        });
+        let mut d = Delta::default();
+        let mut used = 0usize;
+        for c in cands {
+            if used > 0 && used + c.bytes > budget {
+                continue;
             }
-            interest.known.insert(e.id, (e.pos, versions));
+            used += c.bytes;
+            if let Some(s) = c.spawn {
+                d.spawned.push(s);
+            }
+            if let Some(u) = c.update {
+                d.updated.push(u);
+            }
+            interest.known.insert(c.id, (c.pos, c.versions));
+            interest.last_sent.insert(c.id, tick);
         }
         let gone: Vec<EntityId> = interest
             .known
@@ -779,6 +882,7 @@ impl World {
             .collect();
         for id in &gone {
             interest.known.remove(id);
+            interest.last_sent.remove(id);
         }
         d.despawned = gone;
         d.spawned.sort_by_key(|e| e.id);
@@ -822,6 +926,22 @@ impl World {
             self.entities.insert(e.id, e);
         }
     }
+}
+
+fn quantize(p: Pos, q: f64) -> Pos {
+    if q <= 0.0 {
+        return p;
+    }
+    Pos {
+        x: (p.x / q).round() * q,
+        y: (p.y / q).round() * q,
+    }
+}
+
+/// Rough wire size of components in a JSON delta (names, values, version numbers).
+fn estimate_components<'a>(it: impl Iterator<Item = (&'a String, &'a Component)>) -> usize {
+    it.map(|(k, c)| k.len() + c.value.to_string().len() + 24)
+        .sum()
 }
 
 #[cfg(test)]
@@ -998,5 +1118,87 @@ mod tests {
         let d = w.delta_for(c).unwrap();
         assert_eq!(d.despawned, vec![near]);
         let _ = far;
+    }
+
+    #[test]
+    fn delta_budget_sends_nearest_first_and_catches_up() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 1000.0,
+            ..Default::default()
+        });
+        let s1 = Uuid::now_v7();
+        w.grant_lease(CellId { x: 0, y: 0 }, s1);
+        let c = Uuid::now_v7();
+        // budget of one byte: exactly one entity per tick, nearest first
+        w.subscribe_with(c, Pos { x: 0.0, y: 0.0 }, 500.0, Some(1), BTreeMap::new());
+        let far = w.spawn(Pos { x: 300.0, y: 0.0 }, BTreeMap::new(), false);
+        let mid = w.spawn(Pos { x: 100.0, y: 0.0 }, BTreeMap::new(), false);
+        let near = w.spawn(Pos { x: 10.0, y: 0.0 }, BTreeMap::new(), false);
+        let ids = |d: &Delta| d.spawned.iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(&w.delta_for(c).unwrap()), vec![near]);
+        w.advance();
+        assert_eq!(ids(&w.delta_for(c).unwrap()), vec![mid]);
+        w.advance();
+        assert_eq!(ids(&w.delta_for(c).unwrap()), vec![far]);
+        w.advance();
+        assert_eq!(w.delta_for(c).unwrap(), Delta::default());
+        // a stale far entity outranks a fresh near one once it has waited long enough
+        w.apply(s1, far, Some(Pos { x: 301.0, y: 0.0 }), BTreeMap::new())
+            .unwrap();
+        w.apply(s1, near, Some(Pos { x: 11.0, y: 0.0 }), BTreeMap::new())
+            .unwrap();
+        for _ in 0..10 {
+            w.advance();
+        }
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(d.updated.len(), 1);
+        // both waited the same: the near one wins; next tick the far one (now older) follows
+        assert_eq!(d.updated[0].0, near);
+        w.advance();
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(d.updated.iter().map(|u| u.0).collect::<Vec<_>>(), vec![far]);
+    }
+
+    #[test]
+    fn delta_filter_and_quantization() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 1000.0,
+            pos_quantum: 0.1,
+            ..Default::default()
+        });
+        let s1 = Uuid::now_v7();
+        w.grant_lease(CellId { x: 0, y: 0 }, s1);
+        let c = Uuid::now_v7();
+        let mut filter = BTreeMap::new();
+        filter.insert("team".to_string(), serde_json::json!("red"));
+        w.subscribe_with(c, Pos { x: 0.0, y: 0.0 }, 500.0, None, filter);
+        let red = w.spawn(
+            Pos { x: 10.0, y: 0.0 },
+            comps(serde_json::json!({"team": "red"})),
+            false,
+        );
+        let _blue = w.spawn(
+            Pos { x: 10.0, y: 5.0 },
+            comps(serde_json::json!({"team": "blue"})),
+            false,
+        );
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(
+            d.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![red]
+        );
+        // a move below the quantum is not an update; above it is, and arrives quantized
+        w.apply(s1, red, Some(Pos { x: 10.04, y: 0.0 }), BTreeMap::new())
+            .unwrap();
+        assert_eq!(w.delta_for(c).unwrap(), Delta::default());
+        w.apply(s1, red, Some(Pos { x: 10.26, y: 0.0 }), BTreeMap::new())
+            .unwrap();
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(d.updated.len(), 1);
+        assert!(
+            (d.updated[0].1.x - 10.3).abs() < 1e-9,
+            "{:?}",
+            d.updated[0].1
+        );
     }
 }

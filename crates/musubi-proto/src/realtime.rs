@@ -151,6 +151,13 @@ pub enum ClientMessage {
         x: f64,
         y: f64,
         radius: f64,
+        /// Per-tick delta budget in bytes (estimated); default = the world's `client_budget_bytes`.
+        /// Entities are ranked by relevance × age and deferred when the budget is spent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_bytes: Option<u32>,
+        /// Fine filter: object of component name → value every delivered entity must match.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<serde_json::Value>,
     },
     WorldUnsubscribe {
         world: String,

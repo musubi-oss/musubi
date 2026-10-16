@@ -146,9 +146,20 @@ pub struct WorldRegistry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorldCmd {
-    Subscribe { x: f64, y: f64, radius: f64 },
+    Subscribe {
+        x: f64,
+        y: f64,
+        radius: f64,
+        #[serde(default)]
+        budget_bytes: Option<u32>,
+        #[serde(default)]
+        filter: Option<Value>,
+    },
     Unsubscribe,
-    Input { entity: String, input: Value },
+    Input {
+        entity: String,
+        input: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1034,9 +1045,20 @@ impl WorldRegistry {
     /// for an entity that lives in a cell hosted elsewhere is forwarded over the bus.
     pub fn exec(&self, env: WorldCmdEnv, fanout: &Fanout) -> Option<ServerMessage> {
         let r = match env.cmd {
-            WorldCmd::Subscribe { x, y, radius } => {
-                self.subscribe(&env.world, env.session_id, Pos { x, y }, radius)
-            }
+            WorldCmd::Subscribe {
+                x,
+                y,
+                radius,
+                budget_bytes,
+                filter,
+            } => self.subscribe(
+                &env.world,
+                env.session_id,
+                Pos { x, y },
+                radius,
+                budget_bytes.map(|b| b as usize),
+                filter,
+            ),
             WorldCmd::Unsubscribe => self.unsubscribe(&env.world, env.session_id),
             WorldCmd::Input { entity, input } => {
                 match self.input(&env.world, env.session_id, &entity, input.clone()) {
@@ -1657,15 +1679,33 @@ impl WorldRegistry {
 
     // ----- client side -----
 
-    pub fn subscribe(&self, name: &str, sid: SessionId, pos: Pos, radius: f64) -> Result<()> {
+    pub fn subscribe(
+        &self,
+        name: &str,
+        sid: SessionId,
+        pos: Pos,
+        radius: f64,
+        budget_bytes: Option<usize>,
+        filter: Option<Value>,
+    ) -> Result<()> {
         if !(0.0..=100_000.0).contains(&radius) {
             return Err(Error::InvalidArgument("radius 0..=100000".into()));
         }
+        let filter: std::collections::BTreeMap<String, Value> = match filter {
+            None | Some(Value::Null) => Default::default(),
+            Some(Value::Object(m)) => m.into_iter().collect(),
+            Some(_) => {
+                return Err(Error::InvalidArgument(
+                    "filter must be an object of component → value".into(),
+                ))
+            }
+        };
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
         let client = *st.subs.entry(sid).or_insert_with(Uuid::now_v7);
-        st.world.subscribe(client, pos, radius);
+        st.world
+            .subscribe_with(client, pos, radius, budget_bytes, filter);
         let hosted_only = st.hosted_only;
         for c in st.world.cells_in_radius(pos, radius) {
             // only cells this shard is responsible for get a simulator from here
