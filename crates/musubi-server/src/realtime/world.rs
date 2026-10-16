@@ -209,6 +209,15 @@ fn replay(
     n
 }
 
+struct PendingInterest {
+    sid: SessionId,
+    pos: Pos,
+    radius: f64,
+    budget_bytes: Option<usize>,
+    filter: std::collections::BTreeMap<String, Value>,
+    every: u64,
+}
+
 pub struct WorldRegistry {
     node_id: Uuid,
     /// `node.cluster_group`: worlds of other clusters sharing the database are invisible here.
@@ -225,6 +234,8 @@ pub struct WorldRegistry {
     /// (hosted_only, home_node) of each local shard, mirrored so that `home_of` — called on
     /// every world subscription — does not queue behind a world's tick for two bools
     shard_home: DashMap<String, (bool, Option<Uuid>)>,
+    /// interest updates waiting for the world's next tick (see `subscribe`)
+    interest: DashMap<String, Mutex<Vec<PendingInterest>>>,
     /// Raft directory (`world:<name>` → home) when the cluster runs the QUIC bus.
     cluster: std::sync::OnceLock<Arc<musubi_cluster::Cluster>>,
     /// `node.region` when set explicitly (`set_region`); otherwise taken from the cluster handle.
@@ -323,6 +334,7 @@ impl WorldRegistry {
             tick_no: std::sync::atomic::AtomicU64::new(0),
             ticking: Mutex::new(Default::default()),
             shard_home: DashMap::new(),
+            interest: DashMap::new(),
             cell_hosts: DashMap::new(),
             adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
@@ -449,6 +461,7 @@ impl WorldRegistry {
         };
         if idle {
             self.shard_home.remove(name);
+            self.interest.remove(name);
             if let Some((_, w)) = self.worlds.remove(name) {
                 w.lock().journal.clear();
             }
@@ -1244,6 +1257,7 @@ impl WorldRegistry {
                 // exits before those handovers land
                 self.worlds.remove(&name);
                 self.shard_home.remove(&name);
+                self.interest.remove(&name);
                 self.homes.remove(&name);
                 out.push(name);
             }
@@ -2320,9 +2334,43 @@ impl WorldRegistry {
             Some(hz) if hz > 0 => TICK_HZ.div_ceil(hz as u64),
             _ => 1,
         };
-        let w = self.get(name)?;
-        let mut st = w.lock();
-        let st = &mut *st;
+        self.get(name)?;
+        // applied by the world's own tick thread: at 10k players re-sending interest a few
+        // times a second, taking the world lock here parked the runtime behind every tick
+        self.interest
+            .entry(name.to_string())
+            .or_default()
+            .lock()
+            .push(PendingInterest {
+                sid,
+                pos,
+                radius,
+                budget_bytes,
+                filter,
+                every,
+            });
+        Ok(())
+    }
+
+    fn drain_interest(&self, name: &str, st: &mut WorldState) {
+        let pending = match self.interest.get(name) {
+            Some(q) => std::mem::take(&mut *q.lock()),
+            None => return,
+        };
+        for p in pending {
+            self.apply_interest(name, st, p);
+        }
+    }
+
+    fn apply_interest(&self, name: &str, st: &mut WorldState, p: PendingInterest) {
+        let PendingInterest {
+            sid,
+            pos,
+            radius,
+            budget_bytes,
+            filter,
+            every,
+        } = p;
         let client = *st.subs.entry(sid).or_insert_with(Uuid::now_v7);
         st.world
             .subscribe_with(client, pos, radius, budget_bytes, filter, every);
@@ -2343,11 +2391,13 @@ impl WorldRegistry {
                 announce(st, &a);
             }
         }
-        Ok(())
     }
 
     pub fn unsubscribe(&self, name: &str, sid: SessionId) -> Result<()> {
         let w = self.get(name)?;
+        if let Some(q) = self.interest.get(name) {
+            q.lock().retain(|p| p.sid != sid);
+        }
         let mut st = w.lock();
         let st = &mut *st;
         if let Some(c) = st.subs.remove(&sid) {
@@ -2357,6 +2407,9 @@ impl WorldRegistry {
     }
 
     pub fn unsubscribe_all(&self, sid: SessionId) {
+        for q in self.interest.iter() {
+            q.lock().retain(|p| p.sid != sid);
+        }
         for w in self.worlds.iter() {
             let mut st = w.lock();
             let st = &mut *st;
@@ -2403,6 +2456,7 @@ impl WorldRegistry {
             let mut guard = w.lock();
             let t_lock = started.elapsed();
             let st = &mut *guard;
+            self.drain_interest(&name, st);
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
             drain_admission(st);
