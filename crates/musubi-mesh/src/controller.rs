@@ -50,6 +50,8 @@ impl Default for ControllerConfig {
 pub struct Controller {
     pub cfg: ControllerConfig,
     sims: BTreeMap<SimId, SimInfo>,
+    /// Leased cells no client watches → tick the idleness started (hibernation clock).
+    idle_since: BTreeMap<CellId, u64>,
 }
 
 impl Controller {
@@ -57,6 +59,7 @@ impl Controller {
         Self {
             cfg,
             sims: BTreeMap::new(),
+            idle_since: BTreeMap::new(),
         }
     }
 
@@ -191,6 +194,45 @@ impl Controller {
             to,
             reason: reason.into(),
         })
+    }
+
+    /// Plan 4.9 scale-to-zero: a cell no client has watched for `hibernate_after_ticks` — leased
+    /// or holding entities under a lapsed lease — with nothing in transit or written to recently
+    /// goes to sleep (see `World::hibernate_cell`); interest returning re-leases it through
+    /// `reconcile` (`interest`). Returns `(cell, owner at the time, ephemeral entities despawned)`.
+    pub fn hibernate(&mut self, world: &mut World) -> Vec<(CellId, Option<SimId>, usize)> {
+        let after = world.cfg.hibernate_after_ticks;
+        if after == 0 {
+            self.idle_since.clear();
+            return Vec::new();
+        }
+        let tick = world.tick;
+        let watched: std::collections::BTreeSet<CellId> =
+            world.interest_cells().into_iter().collect();
+        let mut candidates: Vec<CellId> = world.leases().into_iter().map(|(c, _)| c).collect();
+        candidates.extend(world.orphaned_cells());
+        candidates.sort();
+        candidates.dedup();
+        candidates.retain(|c| !watched.contains(c));
+        self.idle_since.retain(|c, _| candidates.contains(c));
+        let mut out = Vec::new();
+        for cell in candidates {
+            let since = *self.idle_since.entry(cell).or_insert(tick);
+            // something still being simulated (recent writes) or in flight keeps the cell awake
+            let active = world
+                .entities_of(cell)
+                .iter()
+                .any(|e| e.transit.is_some() || tick.saturating_sub(e.touched_tick) < after);
+            if tick.saturating_sub(since) < after || active {
+                continue;
+            }
+            // after a lapsed lease the last simulator still hears about it
+            let last = world.last_owner(cell);
+            let (owner, ephemeral) = world.hibernate_cell(cell);
+            self.idle_since.remove(&cell);
+            out.push((cell, owner.or(last), ephemeral));
+        }
+        out
     }
 
     /// Periodic pass: re-lease orphaned cells, shed load from overloaded simulators.
@@ -352,6 +394,94 @@ mod tests {
         assert_eq!(ctl.dilate(&mut w).len(), 2);
         assert_eq!(w.time_scale(a), 0.1);
         assert_eq!(w.time_scale(b), 0.1);
+    }
+
+    /// Plan 4.9: an unwatched cell hibernates after `hibernate_after_ticks` — ephemeral entities
+    /// die, persistent ones stay, the lease goes away without the cell becoming an orphan — and a
+    /// client's interest wakes it through `reconcile`.
+    #[test]
+    fn unwatched_cell_hibernates_and_interest_wakes_it() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            hibernate_after_ticks: 5,
+            ..WorldConfig::default()
+        });
+        let mut ctl = Controller::new(ControllerConfig::default());
+        let sim = SimId::now_v7();
+        ctl.register(sim, 4, 0);
+        let c = CellId { x: 0, y: 0 };
+        w.grant_lease(c, sim);
+        let keep = w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), true);
+        let litter = w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
+        // the idle clock starts at the first unwatched check (tick 1) and fires at 1 + 5
+        for _ in 0..5 {
+            w.advance();
+            w.renew_leases(sim);
+            ctl.seen(sim, w.tick);
+            assert!(ctl.hibernate(&mut w).is_empty());
+        }
+        w.advance();
+        w.renew_leases(sim);
+        ctl.seen(sim, w.tick);
+        assert_eq!(ctl.hibernate(&mut w), vec![(c, Some(sim), 1)]);
+        assert!(w.is_hibernated(c));
+        assert_eq!(w.owner(c), None);
+        assert!(w.get(keep).is_some());
+        assert!(w.get(litter).is_none());
+        assert_eq!(w.snapshot_persistent().len(), 1);
+        // asleep is not orphaned: nothing re-leases it while nobody looks
+        assert!(w.orphaned_cells().is_empty());
+        assert!(ctl.reconcile(&mut w).is_empty());
+        // a client arrives: the cell is leased again with its persistent entity in place
+        w.subscribe(Uuid::now_v7(), Pos { x: 15.0, y: 15.0 }, 10.0);
+        let out = ctl.reconcile(&mut w);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].reason, "interest");
+        assert_eq!(w.owner(c), Some(sim));
+        assert!(!w.is_hibernated(c));
+        assert!(w.get(keep).is_some());
+        // watched cells never hibernate
+        for _ in 0..10 {
+            w.advance();
+            w.renew_leases(sim);
+            assert!(ctl.hibernate(&mut w).is_empty());
+        }
+    }
+
+    /// Plan 4.9 `decay(ttl)`: an entity nobody writes to for `decay_ticks` disappears; a write
+    /// resets the clock; entities without decay live on.
+    #[test]
+    fn decay_despawns_untouched_entities() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..WorldConfig::default()
+        });
+        let sim = SimId::now_v7();
+        let c = CellId { x: 0, y: 0 };
+        w.grant_lease(c, sim);
+        let litter = w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), true);
+        let forever = w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
+        assert!(w.set_decay(litter, Some(3)));
+        for _ in 0..2 {
+            w.advance();
+            assert!(w.decay().is_empty());
+        }
+        // touched at tick 2: the clock restarts
+        w.apply(
+            sim,
+            litter,
+            Some(Pos { x: 11.0, y: 10.0 }),
+            Default::default(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            w.advance();
+            assert!(w.decay().is_empty());
+        }
+        w.advance();
+        assert_eq!(w.decay(), vec![(litter, c, true)]);
+        assert!(w.get(litter).is_none());
+        assert!(w.get(forever).is_some());
     }
 
     #[test]

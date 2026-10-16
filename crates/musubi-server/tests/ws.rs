@@ -6095,3 +6095,127 @@ async fn soft_cap_queue_admits_when_room_frees() {
     assert_eq!(expired["ticket"], q2["ticket"]);
     assert_eq!(expired["reason"], json!("timeout"));
 }
+
+/// Plan 4.9 PES over HTTP: a spawn with `decay_ticks` disappears once nobody touches it (event
+/// `decayed`); a leased cell nobody watches or writes to hibernates (`cell_hibernated`, lease
+/// gone) keeping its persistent entity, and leasing it again finds that entity in place.
+#[tokio::test]
+async fn pes_decay_and_hibernation() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "hibernate_after_ticks": 10}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let lease = |router: axum::Router| {
+        let world = world.clone();
+        async move {
+            http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/lease"),
+                None,
+                true,
+                Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+            )
+            .await
+        }
+    };
+    assert_eq!(lease(router.clone()).await.0, 200);
+    let (st, keep) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "x": 10.0, "y": 10.0, "components": {"kind": "chest"}, "persistent": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{keep}");
+    let (st, litter) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "x": 20.0, "y": 10.0, "components": {}, "persistent": false, "decay_ticks": 3})),
+    )
+    .await;
+    assert_eq!(st, 200, "{litter}");
+    let events = |router: axum::Router| {
+        let world = world.clone();
+        async move {
+            let (st, ev) = http_json(
+                &router,
+                "GET",
+                &format!("/v1/server/worlds/{world}/events?sim={sim}"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{ev}");
+            ev["events"].as_array().cloned().unwrap_or_default()
+        }
+    };
+    let mut seen: Vec<Value> = Vec::new();
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        seen.extend(events(router.clone()).await);
+        if seen.iter().any(|e| e["type"] == "decayed") {
+            break;
+        }
+    }
+    let decayed = seen
+        .iter()
+        .find(|e| e["type"] == "decayed")
+        .expect("litter decayed");
+    assert_eq!(decayed["entity"], litter["id"], "{decayed}");
+    // nobody watches or writes: the cell goes to sleep with the chest kept
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        seen.extend(events(router.clone()).await);
+        if seen.iter().any(|e| e["type"] == "cell_hibernated") {
+            break;
+        }
+    }
+    let slept = seen
+        .iter()
+        .find(|e| e["type"] == "cell_hibernated")
+        .unwrap_or_else(|| panic!("unwatched cell hibernated: {seen:?}"));
+    assert_eq!(slept["persistent_kept"], json!(1), "{slept}");
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/apply"),
+        None,
+        true,
+        Some(json!({"sim": sim, "entity": keep["id"], "components": {"kind": "chest"}})),
+    )
+    .await;
+    assert_ne!(st, 200, "lease was revoked by hibernation: {e}");
+    // the simulator leases the cell again: the chest is still there, the litter is not
+    assert_eq!(lease(router.clone()).await.0, 200);
+    let (st, view) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{world}/view/0/0?sim={sim}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{view}");
+    let v = view.to_string();
+    assert!(v.contains(keep["id"].as_str().unwrap()), "{view}");
+    assert!(!v.contains(litter["id"].as_str().unwrap()), "{view}");
+}

@@ -60,6 +60,7 @@ struct Queued {
     pos: Pos,
     components: std::collections::BTreeMap<String, Value>,
     persistent: bool,
+    decay_ticks: Option<u64>,
     enqueued_tick: u64,
     /// (position, eta) last told to the simulator, to report only changes.
     reported: (usize, Option<u64>),
@@ -78,6 +79,18 @@ impl CellQueue {
     fn eta_ticks(&self, position: usize) -> Option<u64> {
         (self.departures > 1e-6).then(|| (position as f64 / self.departures).ceil() as u64)
     }
+}
+
+/// What a simulator asks to spawn.
+#[derive(Debug, Clone)]
+pub struct SpawnSpec {
+    pub pos: Pos,
+    pub components: Value,
+    pub persistent: bool,
+    /// Despawn after this many ticks without a write, interaction or handover (litter).
+    pub decay_ticks: Option<u64>,
+    /// Wait in the cell's admission queue instead of failing on `soft_cap`.
+    pub queue: bool,
 }
 
 /// Result of a spawn that may wait for room.
@@ -114,6 +127,8 @@ pub enum WorldMutation {
         id: Uuid,
         pos: Pos,
         components: Value,
+        #[serde(default)]
+        decay_ticks: Option<u64>,
     },
     Despawn {
         id: Uuid,
@@ -148,9 +163,11 @@ fn replay(
                 id,
                 pos,
                 components,
+                decay_ticks,
             } => {
                 if world.get(*id).is_none() {
                     world.spawn_with_id(*id, *pos, comps(components), true);
+                    world.set_decay(*id, *decay_ticks);
                     src.insert(*id, node);
                 }
             }
@@ -1491,7 +1508,14 @@ impl WorldRegistry {
         components: Value,
         persistent: bool,
     ) -> Result<WorldEntity> {
-        match self.spawn_or_queue(name, sim, pos, components, persistent, false)? {
+        let spec = SpawnSpec {
+            pos,
+            components,
+            persistent,
+            decay_ticks: None,
+            queue: false,
+        };
+        match self.spawn_or_queue(name, sim, spec)? {
             SpawnOutcome::Spawned(e) => Ok(e),
             SpawnOutcome::Queued { .. } => {
                 Err(Error::Internal("spawn queued without asking".into()))
@@ -1503,15 +1527,14 @@ impl WorldRegistry {
     /// simulator gets `queued` now and `queue_admitted` with the entity once there is room
     /// (`queue_update` as its position/ETA change, `queue_expired` on `queue_ttl_ticks` or a lost
     /// lease).
-    pub fn spawn_or_queue(
-        &self,
-        name: &str,
-        sim: Uuid,
-        pos: Pos,
-        components: Value,
-        persistent: bool,
-        queue: bool,
-    ) -> Result<SpawnOutcome> {
+    pub fn spawn_or_queue(&self, name: &str, sim: Uuid, spec: SpawnSpec) -> Result<SpawnOutcome> {
+        let SpawnSpec {
+            pos,
+            components,
+            persistent,
+            decay_ticks,
+            queue,
+        } = spec;
         let comps: std::collections::BTreeMap<String, Value> = components
             .as_object()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -1561,6 +1584,7 @@ impl WorldRegistry {
                 pos,
                 components: comps,
                 persistent,
+                decay_ticks,
                 enqueued_tick: tick,
                 reported: (position, eta_ticks),
             });
@@ -1577,7 +1601,7 @@ impl WorldRegistry {
                 eta_ticks,
             });
         }
-        let id = spawn_entity(st, pos, comps, persistent);
+        let id = spawn_entity(st, pos, comps, persistent, decay_ticks);
         Ok(SpawnOutcome::Spawned(to_wire(st.world.get(id).unwrap())))
     }
 
@@ -1765,6 +1789,7 @@ impl WorldRegistry {
                 op: WorldMutation::Spawn {
                     id,
                     pos: entity.pos,
+                    decay_ticks: entity.decay_ticks,
                     components: Value::Object(
                         entity
                             .components
@@ -2043,6 +2068,7 @@ impl WorldRegistry {
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
             drain_admission(st);
+            decay_entities(st);
             if self.is_split(&name) {
                 let (hosted_only, home_node) = (st.hosted_only, st.home_node);
                 let remote = st.world.detect_remote_handovers(|c| {
@@ -2120,6 +2146,17 @@ impl WorldRegistry {
                 let moves = st.controller.reconcile(&mut st.world);
                 for a in &moves {
                     announce(st, a);
+                }
+                for (cell, sim, ephemeral) in st.controller.hibernate(&mut st.world) {
+                    if let Some(sim) = sim {
+                        push_event(
+                            st,
+                            sim,
+                            json!({"type": "cell_hibernated", "cell": cell, "ephemeral_despawned": ephemeral,
+                                   "persistent_kept": st.world.entities_in(cell)}),
+                        );
+                    }
+                    tracing::info!(world = %name, ?cell, ephemeral, "cell hibernated");
                 }
             }
             for (cell, scale) in st.controller.dilate(&mut st.world) {
@@ -2264,6 +2301,7 @@ fn announce(st: &mut WorldState, a: &Assignment) {
 }
 
 fn stamp_interaction(st: &mut WorldState, id: EntityId, mut ev: Value) -> Value {
+    st.world.touch(id);
     let seq = st.interaction_seq.entry(id).or_insert(0);
     *seq += 1;
     ev["seq"] = json!(*seq);
@@ -2276,8 +2314,10 @@ fn spawn_entity(
     pos: Pos,
     comps: std::collections::BTreeMap<String, Value>,
     persistent: bool,
+    decay_ticks: Option<u64>,
 ) -> EntityId {
     let id = st.world.spawn(pos, comps.clone(), persistent);
+    st.world.set_decay(id, decay_ticks);
     if persistent {
         st.journal.push(WorldOp {
             tick: st.world.tick,
@@ -2285,10 +2325,31 @@ fn spawn_entity(
                 id,
                 pos,
                 components: Value::Object(comps.into_iter().collect()),
+                decay_ticks,
             },
         });
     }
     id
+}
+
+/// Plan 4.9: entities whose `decay_ticks` ran out leave the world; persistent ones are
+/// journaled so no shard resurrects them, and the cell's simulator hears `decayed`.
+fn decay_entities(st: &mut WorldState) {
+    for (id, cell, persistent) in st.world.decay() {
+        if persistent {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Despawn { id },
+            });
+        }
+        if let Some(owner) = st.world.owner(cell) {
+            push_event(
+                st,
+                owner,
+                json!({"type": "decayed", "entity": id, "cell": cell}),
+            );
+        }
+    }
 }
 
 /// Admits queued spawns in arrival order as their cells make room; drops tickets past
@@ -2329,6 +2390,7 @@ fn drain_admission(st: &mut WorldState) {
                 break;
             };
             let id = st.world.spawn(e.pos, e.components.clone(), e.persistent);
+            st.world.set_decay(id, e.decay_ticks);
             if e.persistent {
                 st.journal.push(WorldOp {
                     tick,
@@ -2336,6 +2398,7 @@ fn drain_admission(st: &mut WorldState) {
                         id,
                         pos: e.pos,
                         components: Value::Object(e.components.into_iter().collect()),
+                        decay_ticks: e.decay_ticks,
                     },
                 });
             }

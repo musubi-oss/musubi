@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
-use crate::realtime::world::SpawnOutcome;
+use crate::realtime::world::{SpawnOutcome, SpawnSpec};
 
 /// Simulator calls must hit the world's home node: redirect (307, same method+body) when the home
 /// advertises an HTTP address, otherwise explain which node to talk to.
@@ -206,6 +206,9 @@ struct SpawnReq {
     /// Wait in the cell's admission queue instead of failing when `soft_cap` is reached.
     #[serde(default)]
     queue: bool,
+    /// Despawn after this many ticks without a write, interaction or handover (litter).
+    #[serde(default)]
+    decay_ticks: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -368,10 +371,13 @@ async fn spawn(
         let out = s.worlds.spawn_or_queue(
             &w,
             r.sim,
-            Pos { x: r.x, y: r.y },
-            r.components,
-            r.persistent,
-            r.queue,
+            SpawnSpec {
+                pos: Pos { x: r.x, y: r.y },
+                components: r.components,
+                persistent: r.persistent,
+                decay_ticks: r.decay_ticks,
+                queue: r.queue,
+            },
         )?;
         Ok(match out {
             SpawnOutcome::Spawned(e) => {
@@ -615,10 +621,17 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                     Ok(r) => r,
                     Err(r) => return Ok(r),
                 };
-                match s
-                    .worlds
-                    .spawn_or_queue(w, sim, pos, r.components, r.persistent, r.queue)?
-                {
+                match s.worlds.spawn_or_queue(
+                    w,
+                    sim,
+                    SpawnSpec {
+                        pos,
+                        components: r.components,
+                        persistent: r.persistent,
+                        decay_ticks: r.decay_ticks,
+                        queue: r.queue,
+                    },
+                )? {
                     SpawnOutcome::Spawned(e) => {
                         reply["entity"] = serde_json::to_value(e).map_err(Error::internal)?;
                     }

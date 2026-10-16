@@ -51,6 +51,12 @@ pub struct Entity {
     /// Survives everyone leaving and cluster restarts (persistent entity streaming).
     pub persistent: bool,
     pub transit: Option<Transit>,
+    /// Despawned after this many ticks without a write, interaction or handover (`None` = never).
+    #[serde(default)]
+    pub decay_ticks: Option<u64>,
+    /// World tick of the last write, interaction or handover (drives `decay_ticks`).
+    #[serde(default)]
+    pub touched_tick: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -92,6 +98,9 @@ pub struct WorldConfig {
     /// A spawn that asked to queue for a full cell is dropped after waiting this many ticks
     /// (0 = never).
     pub queue_ttl_ticks: u64,
+    /// A leased cell no client has watched for this many ticks hibernates: lease revoked,
+    /// ephemeral entities gone, persistent ones kept until interest returns (0 = never).
+    pub hibernate_after_ticks: u64,
 }
 
 impl Default for WorldConfig {
@@ -108,6 +117,7 @@ impl Default for WorldConfig {
             tidi_after_ticks: 15,
             tidi_min: 0.1,
             queue_ttl_ticks: 600,
+            hibernate_after_ticks: 1800,
         }
     }
 }
@@ -179,7 +189,11 @@ pub struct World {
     pub tick: u64,
     entities: HashMap<EntityId, Entity>,
     by_cell: HashMap<CellId, HashSet<EntityId>>,
+    /// Cells put to sleep by `hibernate_cell`: not orphans, re-leased only when interest returns.
+    hibernated: HashSet<CellId>,
     leases: HashMap<CellId, Lease>,
+    /// Last simulator granted each cell, kept after the lease lapses (who to tell about it).
+    last_owners: HashMap<CellId, SimId>,
     interests: HashMap<ClientId, Interest>,
     /// Inputs that arrived while the target entity was in transit; delivered to the new owner.
     buffered_inputs: HashMap<EntityId, Vec<serde_json::Value>>,
@@ -194,6 +208,8 @@ impl World {
             tick: 0,
             entities: HashMap::new(),
             by_cell: HashMap::new(),
+            hibernated: HashSet::new(),
+            last_owners: HashMap::new(),
             leases: HashMap::new(),
             interests: HashMap::new(),
             buffered_inputs: HashMap::new(),
@@ -271,6 +287,8 @@ impl World {
     // ----- leases -----
 
     pub fn grant_lease(&mut self, cell: CellId, sim: SimId) {
+        self.hibernated.remove(&cell);
+        self.last_owners.insert(cell, sim);
         self.leases.insert(
             cell,
             Lease {
@@ -295,6 +313,11 @@ impl World {
     /// Last holder even if the lease lapsed (None once revoked).
     pub fn lease_holder(&self, cell: CellId) -> Option<SimId> {
         self.leases.get(&cell).map(|l| l.sim)
+    }
+
+    /// The simulator the cell was last granted to, even after its lease lapsed or was revoked.
+    pub fn last_owner(&self, cell: CellId) -> Option<SimId> {
+        self.last_owners.get(&cell).copied()
     }
 
     pub fn leased_cells(&self) -> Vec<(CellId, SimId)> {
@@ -366,11 +389,38 @@ impl World {
     }
 
     /// Cells whose lease lapsed (simulator died): entities there are frozen until re-leased.
+    /// Plan 4.9 scale-to-zero for a cell: its lease is revoked and ephemeral entities despawned;
+    /// persistent ones stay in memory (and the next snapshot) and the cell is not an orphan — it
+    /// wakes when a client's interest reaches it. Returns the former owner and how many
+    /// ephemeral entities died.
+    pub fn hibernate_cell(&mut self, cell: CellId) -> (Option<SimId>, usize) {
+        let ephemeral: Vec<EntityId> = self
+            .entities_of(cell)
+            .into_iter()
+            .filter(|e| !e.persistent)
+            .map(|e| e.id)
+            .collect();
+        for id in &ephemeral {
+            self.despawn(*id);
+        }
+        let owner = self.revoke_lease(cell);
+        self.hibernated.insert(cell);
+        (owner, ephemeral.len())
+    }
+
+    pub fn is_hibernated(&self, cell: CellId) -> bool {
+        self.hibernated.contains(&cell)
+    }
+
     pub fn orphaned_cells(&self) -> Vec<CellId> {
         let mut v: Vec<CellId> = self
             .by_cell
             .keys()
-            .filter(|c| self.owner(**c).is_none() && !self.by_cell[c].is_empty())
+            .filter(|c| {
+                self.owner(**c).is_none()
+                    && !self.by_cell[c].is_empty()
+                    && !self.hibernated.contains(*c)
+            })
             .copied()
             .collect();
         v.sort();
@@ -426,6 +476,8 @@ impl World {
                 .collect(),
             persistent,
             transit: None,
+            decay_ticks: None,
+            touched_tick: self.tick,
         };
         self.by_cell.entry(cell).or_default().insert(id);
         self.entities.insert(id, e);
@@ -445,6 +497,59 @@ impl World {
 
     pub fn get(&self, id: EntityId) -> Option<&Entity> {
         self.entities.get(&id)
+    }
+
+    /// Entities currently in `cell` (any state).
+    pub fn entities_of(&self, cell: CellId) -> Vec<&Entity> {
+        self.by_cell
+            .get(&cell)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.entities.get(id))
+            .collect()
+    }
+
+    /// Plan 4.9 `decay(ttl)`: the entity disappears after `ticks` without a write, interaction or
+    /// handover (`None` = lives until despawned) — abandoned litter cleans itself up.
+    pub fn set_decay(&mut self, id: EntityId, ticks: Option<u64>) -> bool {
+        let tick = self.tick;
+        match self.entities.get_mut(&id) {
+            Some(e) => {
+                e.decay_ticks = ticks;
+                e.touched_tick = tick;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Marks the entity as touched this tick (resets its decay clock).
+    pub fn touch(&mut self, id: EntityId) {
+        let tick = self.tick;
+        if let Some(e) = self.entities.get_mut(&id) {
+            e.touched_tick = tick;
+        }
+    }
+
+    /// Despawns entities whose decay ran out (never one in transit). Returns
+    /// `(id, cell, persistent)` so the caller can journal the persistent ones.
+    pub fn decay(&mut self) -> Vec<(EntityId, CellId, bool)> {
+        let tick = self.tick;
+        let mut gone: Vec<(EntityId, CellId, bool)> = self
+            .entities
+            .values()
+            .filter(|e| e.transit.is_none())
+            .filter(|e| {
+                e.decay_ticks
+                    .is_some_and(|d| tick.saturating_sub(e.touched_tick) >= d)
+            })
+            .map(|e| (e.id, e.cell, e.persistent))
+            .collect();
+        gone.sort_by_key(|g| g.0);
+        for (id, _, _) in &gone {
+            self.despawn(*id);
+        }
+        gone
     }
 
     pub fn len(&self) -> usize {
@@ -482,7 +587,9 @@ impl World {
         pos: Option<Pos>,
         components: BTreeMap<String, serde_json::Value>,
     ) -> Result<(), MeshError> {
+        let tick = self.tick;
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
+        e.touched_tick = tick;
         if let Some(p) = pos {
             e.pos = p;
         }
@@ -749,7 +856,12 @@ impl World {
             )));
         }
         self.move_cell(id, t.to_cell);
-        self.entities.get_mut(&id).unwrap().transit = None;
+        {
+            let tick = self.tick;
+            let e = self.entities.get_mut(&id).unwrap();
+            e.transit = None;
+            e.touched_tick = tick;
+        }
         let inputs = self.buffered_inputs.remove(&id).unwrap_or_default();
         Ok((
             HandoverOutcome::Completed {
