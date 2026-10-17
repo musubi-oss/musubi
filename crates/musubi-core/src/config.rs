@@ -57,6 +57,7 @@ pub struct Config {
     pub email: EmailConfig,
     pub anticheat: AntiCheatConfig,
     pub regions: RegionsConfig,
+    pub operators: OperatorsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1326,4 +1327,60 @@ pub struct RegionEntry {
     pub echo: String,
     /// HTTP(S) URL to time a request against in that region.
     pub http: String,
+}
+
+/// Console operators: SSO through an OpenID Connect provider mints short-lived operator keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OperatorsConfig {
+    pub sso: OperatorSsoConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OperatorSsoConfig {
+    /// OIDC issuer (`https://accounts.google.com`, `https://login.microsoftonline.com/<tenant>/v2.0`,
+    /// Okta/Keycloak realm…); empty = operator SSO is off. Endpoints come from discovery unless
+    /// `authorize_url` / `token_url` / `jwks_url` are set.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub jwks_url: String,
+    /// Where the provider sends the operator back: `https://api.example.com/v1/admin/sso/callback`.
+    pub redirect_url: String,
+    /// Extra scopes on top of `openid email profile` (e.g. `groups`).
+    pub scopes: Vec<String>,
+    /// ID-token claim holding the operator's groups/roles (a string or an array of strings).
+    pub role_claim: String,
+    /// Claim value → operator role (`admin` / `support` / `liveops` / `ops`); the most privileged
+    /// matching role wins.
+    pub role_map: std::collections::BTreeMap<String, String>,
+    /// Role for operators without a mapped group; empty = refuse them.
+    pub default_role: String,
+    /// Only e-mails of these domains may log in (empty = any).
+    pub allowed_domains: Vec<String>,
+    /// Lifetime of the minted operator key.
+    pub session_hours: u64,
+}
+
+impl Default for OperatorSsoConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            authorize_url: String::new(),
+            token_url: String::new(),
+            jwks_url: String::new(),
+            redirect_url: String::new(),
+            scopes: Vec::new(),
+            role_claim: "groups".into(),
+            role_map: Default::default(),
+            default_role: String::new(),
+            allowed_domains: Vec::new(),
+            session_hours: 12,
+        }
+    }
 }

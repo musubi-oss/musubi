@@ -23,6 +23,8 @@ type KeyRow = (
     time::OffsetDateTime,
     Option<time::OffsetDateTime>,
     Option<time::OffsetDateTime>,
+    Option<time::OffsetDateTime>,
+    Option<String>,
 );
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
 
@@ -94,7 +96,7 @@ impl Role {
             Role::Ops => "ops",
         }
     }
-    fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "server" => Some(Role::Server),
             "admin" => Some(Role::Admin),
@@ -149,6 +151,7 @@ impl Caller {
 pub struct ServerKeys {
     by_hash: DashMap<String, Caller>,
     touched: DashMap<Uuid, Instant>,
+    expires: DashMap<Uuid, time::OffsetDateTime>,
 }
 
 pub(crate) fn hash(secret: &str) -> String {
@@ -157,14 +160,17 @@ pub(crate) fn hash(secret: &str) -> String {
 
 impl ServerKeys {
     pub async fn load(&self, db: &PgPool) -> Result<usize> {
-        let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(
-            "select id, name, role, hash from musubi.server_keys where revoked_at is null",
-        )
-        .fetch_all(db)
-        .await
-        .map_err(Error::internal)?;
+        let rows: Vec<(Uuid, String, String, String, Option<time::OffsetDateTime>)> =
+            sqlx::query_as(
+                "select id, name, role, hash, expires_at from musubi.server_keys
+             where revoked_at is null and (expires_at is null or expires_at > now())",
+            )
+            .fetch_all(db)
+            .await
+            .map_err(Error::internal)?;
         self.by_hash.clear();
-        for (id, name, role, h) in &rows {
+        self.expires.clear();
+        for (id, name, role, h, exp) in &rows {
             if let Some(role) = Role::parse(role) {
                 self.by_hash.insert(
                     h.clone(),
@@ -174,13 +180,26 @@ impl ServerKeys {
                         role,
                     },
                 );
+                if let Some(exp) = exp {
+                    self.expires.insert(*id, *exp);
+                }
             }
         }
         Ok(rows.len())
     }
 
     pub fn lookup(&self, secret: &str) -> Option<Caller> {
-        self.by_hash.get(&hash(secret)).map(|c| c.clone())
+        let h = hash(secret);
+        let c = self.by_hash.get(&h).map(|c| c.clone())?;
+        if let Some(exp) = self.expires.get(&c.id) {
+            if *exp <= time::OffsetDateTime::now_utc() {
+                drop(exp);
+                self.expires.remove(&c.id);
+                self.by_hash.remove(&h);
+                return None;
+            }
+        }
+        Some(c)
     }
 
     /// Record use at most once a minute per key, off the request path.
@@ -205,6 +224,19 @@ impl ServerKeys {
 
     /// Create a key; the secret is returned exactly once.
     pub async fn issue(&self, db: &PgPool, name: &str, role: Role) -> Result<(Caller, String)> {
+        self.issue_with(db, name, role, None, None).await
+    }
+
+    /// A key that stops working at `expires_at` (operator SSO sessions) and remembers the
+    /// identity it was minted for.
+    pub async fn issue_with(
+        &self,
+        db: &PgPool,
+        name: &str,
+        role: Role,
+        expires_at: Option<time::OffsetDateTime>,
+        subject: Option<&str>,
+    ) -> Result<(Caller, String)> {
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidArgument("name 1..=64 chars".into()));
         }
@@ -218,12 +250,14 @@ impl ServerKeys {
         let secret = format!("msk_{}", hash(&seed));
         let id = Uuid::now_v7();
         sqlx::query(
-            "insert into musubi.server_keys (id, name, role, hash) values ($1, $2, $3, $4)",
+            "insert into musubi.server_keys (id, name, role, hash, expires_at, subject) values ($1, $2, $3, $4, $5, $6)",
         )
         .bind(id)
         .bind(name)
         .bind(role.as_str())
         .bind(hash(&secret))
+        .bind(expires_at)
+        .bind(subject)
         .execute(db)
         .await
         .map_err(Error::internal)?;
@@ -232,6 +266,9 @@ impl ServerKeys {
             name: name.to_string(),
             role,
         };
+        if let Some(exp) = expires_at {
+            self.expires.insert(id, exp);
+        }
         self.by_hash.insert(hash(&secret), caller.clone());
         Ok((caller, secret))
     }
@@ -250,19 +287,21 @@ impl ServerKeys {
 
     pub async fn list(db: &PgPool) -> Result<Vec<Value>> {
         let rows: Vec<KeyRow> = sqlx::query_as(
-            "select id, name, role, created_at, revoked_at, last_used_at from musubi.server_keys order by created_at desc",
+            "select id, name, role, created_at, revoked_at, last_used_at, expires_at, subject from musubi.server_keys order by created_at desc",
         )
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, role, c, r, u)| {
+            .map(|(id, name, role, c, r, u, e, subject)| {
                 json!({
                     "id": id, "name": name, "role": role,
                     "created_at": c.unix_timestamp(),
                     "revoked_at": r.map(|t| t.unix_timestamp()),
                     "last_used_at": u.map(|t| t.unix_timestamp()),
+                    "expires_at": e.map(|t| t.unix_timestamp()),
+                    "subject": subject,
                 })
             })
             .collect())

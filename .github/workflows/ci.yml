@@ -25,10 +25,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # integration tests start many nodes at once and finished tests keep their pools until the
-      # binary exits; the image's default 100 connections overflow on a 4-thread runner
+      # binary exits; the image's default 100 connections (and later 300) overflow on a 4-thread runner
       - name: widen postgres connection limit
         run: |
-          docker exec ${{ job.services.postgres.id }} psql -U musubi -c "alter system set max_connections = 300"
+          docker exec ${{ job.services.postgres.id }} psql -U musubi -c "alter system set max_connections = 1000"
           docker restart ${{ job.services.postgres.id }}
           for i in $(seq 1 30); do pg_isready -h localhost -U musubi && break; sleep 1; done
       - run: cargo fmt --all --check

@@ -13280,3 +13280,272 @@ async fn item_definitions_are_versioned_and_inventories_migrate() {
     .await;
     assert_eq!(st, 404, "{r}");
 }
+
+/// Operator SSO against a mock OpenID Connect provider: login redirects to the provider with a
+/// signed state, the callback exchanges the code, verifies the ES256 ID token and nonce, maps the
+/// operator's groups to a role and mints a short-lived operator key that works like any other key.
+#[tokio::test]
+async fn operator_sso_mints_scoped_keys() {
+    use base64::Engine;
+    use ring::signature::KeyPair;
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    // ----- mock IdP -----
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        &rng,
+    )
+    .unwrap();
+    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        pkcs8.as_ref(),
+        &rng,
+    )
+    .unwrap();
+    let pubkey = pair.public_key().as_ref().to_vec(); // 0x04 || x || y
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let jwks = json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "op1", "alg": "ES256", "use": "sig",
+        "x": b64(&pubkey[1..33]), "y": b64(&pubkey[33..65])}]});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let enc_key = jsonwebtoken::EncodingKey::from_ec_der(pkcs8.as_ref());
+    let (iss, iss2) = (issuer.clone(), issuer.clone());
+    let idp = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(move || {
+                let iss = iss.clone();
+                async move {
+                    axum::Json(json!({"issuer": iss, "authorization_endpoint": format!("{iss}/authorize"),
+                        "token_endpoint": format!("{iss}/token"), "jwks_uri": format!("{iss}/jwks")}))
+                }
+            }),
+        )
+        .route(
+            "/jwks",
+            axum::routing::get(move || {
+                let jwks = jwks.clone();
+                async move { axum::Json(jwks) }
+            }),
+        )
+        .route(
+            "/token",
+            axum::routing::post(
+                move |axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| {
+                    let iss = iss2.clone();
+                    let enc_key = enc_key.clone();
+                    async move {
+                        if f.get("client_id").map(String::as_str) != Some("console")
+                            || f.get("client_secret").map(String::as_str) != Some("console-secret")
+                            || f.get("grant_type").map(String::as_str) != Some("authorization_code")
+                        {
+                            return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({"error": "invalid_client"})));
+                        }
+                        // the code encodes who logs in and which nonce the login carried
+                        let Some(code) = f.get("code") else {
+                            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": "invalid_grant"})));
+                        };
+                        let Some((who, nonce)) = code.split_once(':') else {
+                            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": "invalid_grant", "error_description": "bad code"})));
+                        };
+                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                        let (email, groups) = match who {
+                            "liveops" => ("lo@studio.gg", json!(["eng", "liveops-team"])),
+                            "admin" => ("boss@studio.gg", json!(["eng", "liveops-team", "admins"])),
+                            "nobody" => ("guest@studio.gg", json!(["eng"])),
+                            _ => ("x@evil.io", json!(["admins"])),
+                        };
+                        let claims = json!({"iss": iss, "aud": "console", "sub": format!("sub-{who}"), "email": email,
+                            "groups": groups, "nonce": nonce, "iat": now, "exp": now + 300});
+                        let mut h = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+                        h.kid = Some("op1".into());
+                        let id_token = jsonwebtoken::encode(&h, &claims, &enc_key).unwrap();
+                        (axum::http::StatusCode::OK, axum::Json(json!({"id_token": id_token, "access_token": "at", "token_type": "Bearer"})))
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    // ----- SSO on -----
+    {
+        let cfg = Arc::make_mut(&mut state.cfg);
+        let sso = &mut cfg.operators.sso;
+        sso.issuer = issuer.clone();
+        sso.client_id = "console".into();
+        sso.client_secret = "console-secret".into();
+        sso.redirect_url = "https://api.studio.gg/v1/admin/sso/callback".into();
+        sso.role_map.insert("liveops-team".into(), "liveops".into());
+        sso.role_map.insert("admins".into(), "admin".into());
+        sso.allowed_domains = vec!["studio.gg".into()];
+        sso.session_hours = 8;
+    }
+    let router = musubi_server::http::router(state.clone());
+    let (st, r) = http_json(&router, "GET", "/v1/admin/sso", None, false, None).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["enabled"], true);
+    assert_eq!(r["roles"], json!(["admin", "liveops"]));
+    // login → provider
+    let go = |uri: String| {
+        let router = router.clone();
+        async move {
+            let req = Request::get(uri).body(axum::body::Body::empty()).unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            let st = resp.status().as_u16();
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (
+                st,
+                loc,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (st, _, r) = go("/v1/admin/sso/login?return_to=javascript:alert(1)".into()).await;
+    assert_eq!(st, 400, "{r}");
+    let (st, loc, _) =
+        go("/v1/admin/sso/login?return_to=https%3A%2F%2Fconsole.studio.gg%2Flogin".into()).await;
+    assert_eq!(st, 303, "{loc}");
+    assert!(loc.starts_with(&format!("{issuer}/authorize?")), "{loc}");
+    assert!(loc.contains("client_id=console"), "{loc}");
+    assert!(
+        loc.contains("redirect_uri=https%3A%2F%2Fapi.studio.gg%2Fv1%2Fadmin%2Fsso%2Fcallback"),
+        "{loc}"
+    );
+    assert!(loc.contains("scope=openid%20email%20profile"), "{loc}");
+    let param = |loc: &str, k: &str| -> String {
+        loc.split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix(&format!("{k}=")).map(str::to_string))
+            .unwrap()
+    };
+    let (st_param, nonce) = (param(&loc, "state"), param(&loc, "nonce"));
+    // callback: tampered state, provider error, wrong code
+    let (st, _, r) = go(format!(
+        "/v1/admin/sso/callback?code=liveops:{nonce}&state=AAAA.BBBB"
+    ))
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, _, r) = go(format!(
+        "/v1/admin/sso/callback?error=access_denied&error_description=nope&state={st_param}"
+    ))
+    .await;
+    assert_eq!(st, 401, "{r}");
+    let (st, _, r) = go(format!(
+        "/v1/admin/sso/callback?code=garbage&state={st_param}"
+    ))
+    .await;
+    assert_eq!(st, 401, "bad code: {r}");
+    // a token for another nonce (replayed login) is refused
+    let (st, _, r) = go(format!(
+        "/v1/admin/sso/callback?code=liveops:other&state={st_param}"
+    ))
+    .await;
+    assert_eq!(st, 401, "nonce: {r}");
+    // outside the allowed domains / without a mapped group
+    let (st, _, r) = go(format!(
+        "/v1/admin/sso/callback?code=evil:{nonce}&state={st_param}"
+    ))
+    .await;
+    assert_eq!(st, 403, "{r}");
+    let (st, _, r) = go(format!(
+        "/v1/admin/sso/callback?code=nobody:{nonce}&state={st_param}"
+    ))
+    .await;
+    assert_eq!(st, 403, "{r}");
+    assert!(r.to_string().contains("no operator role"), "{r}");
+    // the real thing: back to the console with a liveops key
+    let (st, loc, _) = go(format!(
+        "/v1/admin/sso/callback?code=liveops:{nonce}&state={st_param}"
+    ))
+    .await;
+    assert_eq!(st, 303, "{loc}");
+    assert!(
+        loc.starts_with("https://console.studio.gg/login#key=msk_"),
+        "{loc}"
+    );
+    let key = param(&loc.replacen('#', "?", 1), "key");
+    assert_eq!(param(&loc.replacen('#', "?", 1), "role"), "liveops");
+    let with_key = |method: &'static str, uri: &'static str, key: String| {
+        let router = router.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("x-musubi-server-key", key)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(if method == "POST" {
+                    json!({"name": "x", "role": "admin"}).to_string()
+                } else {
+                    String::new()
+                }))
+                .unwrap();
+            router.oneshot(req).await.unwrap().status().as_u16()
+        }
+    };
+    assert_eq!(with_key("GET", "/v1/admin/content", key.clone()).await, 200);
+    assert_eq!(
+        with_key("POST", "/v1/admin/keys", key.clone()).await,
+        403,
+        "liveops may not issue keys"
+    );
+    assert_eq!(
+        with_key("GET", "/v1/admin/content", "msk_forged".into()).await,
+        401
+    );
+    // listed like any key, with its identity and expiry
+    let (st, r) = http_json(&router, "GET", "/v1/admin/keys", None, true, None).await;
+    assert_eq!(st, 200, "{r}");
+    let k = r["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == "sso:lo@studio.gg")
+        .unwrap_or_else(|| panic!("sso key listed: {r}"));
+    assert_eq!(k["role"], "liveops");
+    assert!(k["expires_at"].is_number(), "{k}");
+    assert_eq!(k["subject"], "sub-liveops");
+    // the JSON flavour (no return_to) and the most privileged group winning
+    let (_, loc, _) = go("/v1/admin/sso/login".into()).await;
+    let (st_param, nonce) = (param(&loc, "state"), param(&loc, "nonce"));
+    let (st, _, r) = go(format!(
+        "/v1/admin/sso/callback?code=admin:{nonce}&state={st_param}"
+    ))
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["role"], "admin");
+    assert_eq!(r["name"], "sso:boss@studio.gg");
+    let admin_key = r["key"].as_str().unwrap().to_string();
+    assert_eq!(
+        with_key("POST", "/v1/admin/keys", admin_key.clone()).await,
+        200
+    );
+    // an expired SSO key stops working once the cache reloads
+    sqlx::query("update musubi.server_keys set expires_at = now() - interval '1 minute' where name = 'sso:boss@studio.gg'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    state.keys.load(&state.db).await.unwrap();
+    assert_eq!(with_key("GET", "/v1/admin/content", admin_key).await, 401);
+    // SSO off → 404
+    {
+        let cfg = Arc::make_mut(&mut state.cfg);
+        cfg.operators.sso.issuer.clear();
+    }
+    let router = musubi_server::http::router(state.clone());
+    let (st, r) = http_json(&router, "GET", "/v1/admin/sso", None, false, None).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["enabled"], false);
+    let (st, _, _) = go("/v1/admin/sso/login".into()).await;
+    assert_eq!(st, 303, "the old router still has SSO on");
+    let req = Request::get("/v1/admin/sso/login")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
+}

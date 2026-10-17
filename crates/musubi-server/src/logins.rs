@@ -46,6 +46,9 @@ pub struct IdClaims {
     /// PSN puts the player's online id in the id token.
     #[serde(default)]
     pub online_id: Option<String>,
+    /// Every other claim (groups, roles, name…).
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +242,29 @@ impl Social {
             .get(name)
             .ok_or_else(|| Error::NotFound(format!("unknown login provider {name}")))?;
         self.verify_oidc(c, id_token).await
+    }
+
+    /// Verify an ID token against an arbitrary issuer config (operator SSO).
+    pub async fn verify_id_token(&self, c: &OidcLoginConfig, token: &str) -> Result<IdClaims> {
+        self.verify_oidc(c, token).await
+    }
+
+    /// The provider's `/.well-known/openid-configuration` document.
+    pub async fn discover(&self, issuer: &str) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        self.http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("oidc discovery: {e}")))?
+            .error_for_status()
+            .map_err(|e| Error::Internal(format!("oidc discovery: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::Internal(format!("oidc discovery: {e}")))
     }
 
     async fn verify_oidc(&self, c: &OidcLoginConfig, token: &str) -> Result<IdClaims> {
