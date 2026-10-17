@@ -9,7 +9,7 @@ pub mod password;
 mod service;
 pub mod token;
 
-pub use service::{AuthService, Authenticated, Session};
+pub use service::{AuthService, Authenticated, Session, SessionInfo};
 pub use token::{Claims, TokenSigner};
 
 use serde::{Deserialize, Serialize};

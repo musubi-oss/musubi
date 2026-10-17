@@ -21,6 +21,30 @@ pub struct Session {
     pub created: bool,
 }
 
+type SessionRow = (
+    Uuid,
+    Uuid,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    OffsetDateTime,
+    OffsetDateTime,
+    OffsetDateTime,
+);
+
+/// One login/device of an account as seen in `GET /v1/account/sessions`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionInfo {
+    pub id: SessionId,
+    pub family: Uuid,
+    pub device_id: Option<String>,
+    pub user_agent: Option<String>,
+    pub ip: Option<String>,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+}
+
 /// Result of verifying a bearer token on a request.
 #[derive(Debug, Clone)]
 pub struct Authenticated {
@@ -309,6 +333,52 @@ impl AuthService {
             .await
             .map_err(Error::internal)?;
         Ok(())
+    }
+
+    /// Live refresh families of an account (one row per device/login), newest activity first.
+    pub async fn sessions(&self, account_id: AccountId) -> Result<Vec<SessionInfo>> {
+        let rows: Vec<SessionRow> = sqlx::query_as(
+            "select distinct on (family) id, family, device_id, user_agent, host(ip), created_at, last_seen_at, expires_at
+             from musubi.sessions
+             where account_id = $1 and revoked_at is null and expires_at > now()
+             order by family, created_at desc",
+        )
+        .bind(account_id.0)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut out: Vec<SessionInfo> = rows
+            .into_iter()
+            .map(|r| SessionInfo {
+                id: SessionId(r.0),
+                family: r.1,
+                device_id: r.2,
+                user_agent: r.3,
+                ip: r.4,
+                created_at: r.5.unix_timestamp(),
+                last_seen_at: r.6.unix_timestamp(),
+                expires_at: r.7.unix_timestamp(),
+            })
+            .collect();
+        out.sort_by_key(|s| std::cmp::Reverse(s.last_seen_at));
+        Ok(out)
+    }
+
+    /// Revoke one device's refresh family (`session` = any id of that family). The access token
+    /// already issued stays valid until it expires. Returns false when nothing matched.
+    pub async fn revoke_family(&self, account_id: AccountId, session: SessionId) -> Result<bool> {
+        let n = sqlx::query(
+            "update musubi.sessions set revoked_at = now()
+             where account_id = $1 and revoked_at is null
+               and family = (select family from musubi.sessions where id = $2 and account_id = $1)",
+        )
+        .bind(account_id.0)
+        .bind(session.0)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        Ok(n > 0)
     }
 
     pub async fn link(

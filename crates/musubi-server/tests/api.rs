@@ -8435,3 +8435,80 @@ async fn storage_patch_sort_count_and_quota() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
+
+#[tokio::test]
+async fn account_sessions_list_and_revoke_one_device() {
+    let Some(app) = app().await else { return };
+    let dev = unique("dv");
+    let (_, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    let t1 = s1["access_token"].as_str().unwrap().to_string();
+    // same account from a second device
+    let (_, s2) = call(
+        &app,
+        "POST",
+        "/v1/account/link/device",
+        Some(&t1),
+        Some(json!({"id": unique("dv2")})),
+    )
+    .await;
+    let _ = s2;
+    let (_, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    let t2 = s2["access_token"].as_str().unwrap().to_string();
+    let r2 = s2["refresh_token"].as_str().unwrap().to_string();
+    assert_eq!(s1["account_id"], s2["account_id"]);
+    let (st, v) = call(&app, "GET", "/v1/account/sessions", Some(&t1), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let list = v["sessions"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{v}");
+    assert_eq!(list.iter().filter(|s| s["current"] == true).count(), 1);
+    let other = list.iter().find(|s| s["current"] == false).unwrap();
+    assert_eq!(other["device_id"], dev);
+    let other_id = other["id"].as_str().unwrap().to_string();
+    // revoke the other device: it cannot refresh any more, the caller still can
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/account/sessions/{other_id}"),
+        Some(&t1),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": r2})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (_, v) = call(&app, "GET", "/v1/account/sessions", Some(&t1), None).await;
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["sessions"][0]["current"], true);
+    // revoking an unknown / foreign session is 404
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/account/sessions/{}", uuid::Uuid::now_v7()),
+        Some(&t1),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let _ = t2;
+}

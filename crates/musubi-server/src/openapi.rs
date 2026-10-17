@@ -114,6 +114,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/channel/{id}/messages", "chat"),
     ("POST", "/v1/channel/{id}/report", "chat"),
     ("GET", "/v1/channel/unread", "chat"),
+    ("GET", "/v1/account/sessions", "account"),
+    ("DELETE", "/v1/account/sessions/{id}", "account"),
     ("POST", "/v1/storage/patch", "storage"),
     ("GET", "/v1/storage/{collection}/count", "storage"),
     ("POST", "/v1/groups/{id}/ban", "groups"),

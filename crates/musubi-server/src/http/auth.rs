@@ -22,6 +22,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/email/reset/request", post(reset_request))
         .route("/v1/auth/email/reset", post(reset))
         .route("/v1/account/me", get(me))
+        .route("/v1/account/sessions", get(sessions))
+        .route(
+            "/v1/account/sessions/{id}",
+            axum::routing::delete(revoke_session),
+        )
 }
 
 #[derive(Deserialize)]
@@ -378,4 +383,40 @@ async fn apple(
         .await?;
     authenticated(&s, &sess, musubi_auth::provider::APPLE);
     Ok(Json(sess))
+}
+
+/// `GET /v1/account/sessions` — live logins (one per refresh family) with `current` marking the caller's.
+async fn sessions(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let list = s.auth.sessions(me.account_id).await?;
+    let mine =
+        sqlx::query_scalar::<_, uuid::Uuid>("select family from musubi.sessions where id = $1")
+            .bind(me.session_id.0)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(musubi_core::Error::internal)?;
+    let sessions: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|si| {
+            let mut v = serde_json::to_value(&si).unwrap_or_default();
+            v["current"] = json!(mine == Some(si.family));
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+/// `DELETE /v1/account/sessions/{id}` — sign that device out (its refresh family is revoked; the
+/// short-lived access token it holds expires on its own).
+async fn revoke_session(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<musubi_core::SessionId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !s.auth.revoke_family(me.account_id, id).await? {
+        return Err(musubi_core::Error::NotFound("session".into()).into());
+    }
+    Ok(Json(json!({ "ok": true })))
 }
