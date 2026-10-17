@@ -9080,3 +9080,95 @@ async fn world_attached_entities_hand_over_with_their_root() {
     .await;
     assert_eq!(st, 400, "already detached");
 }
+
+#[tokio::test]
+async fn world_fenced_host_cannot_persist() {
+    let Some(url) = std::env::var("MUSUBI_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let group = test_group();
+    migrate_once(&db).await;
+    let (n1, n2) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone())).with_group(&group);
+    let name = format!("w-{}", n1.simple());
+    r1.create(
+        &name,
+        musubi_mesh::WorldConfig::default(),
+        musubi_mesh::controller::ControllerConfig::default(),
+        "",
+    )
+    .await
+    .unwrap();
+    let sim = uuid::Uuid::now_v7();
+    r1.register_sim(&name, sim, 8).unwrap();
+    r1.spawn(
+        &name,
+        sim,
+        musubi_mesh::Pos { x: 1.0, y: 1.0 },
+        json!({"hp": 10}),
+        true,
+    )
+    .unwrap();
+    let t1 = r1.snapshot_now(&name).await.unwrap();
+    let hosts: Vec<(uuid::Uuid, i64)> =
+        sqlx::query_as("select node_id, term from musubi.world_hosts where name = $1")
+            .bind(&name)
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(hosts, vec![(n1, 1)], "{hosts:?}");
+
+    // n2 takes the world over: n1 is fenced even though it still reaches Postgres
+    let r2 = musubi_server::realtime::WorldRegistry::new(n2, Some(db.clone())).with_group(&group);
+    assert_eq!(r2.recover(&[n1]).await.unwrap(), vec![name.clone()]);
+    let hosts: Vec<(uuid::Uuid, i64)> =
+        sqlx::query_as("select node_id, term from musubi.world_hosts where name = $1")
+            .bind(&name)
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(hosts, vec![(n2, 2)], "{hosts:?}");
+    r1.spawn(
+        &name,
+        sim,
+        musubi_mesh::Pos { x: 3.0, y: 3.0 },
+        json!({"stale": true}),
+        true,
+    )
+    .unwrap();
+    let err = r1.snapshot_now(&name).await.unwrap_err();
+    assert!(err.to_string().contains("fenced"), "{err}");
+    assert!(r1
+        .flush_journal(&name)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("fenced"));
+    // n1's pre-fence row was merged into n2's and pruned; nothing written after the fence exists
+    let rows: Vec<(uuid::Uuid, i64, serde_json::Value)> = sqlx::query_as(
+        "select node_id, tick, entities from musubi.world_snapshots where name = $1",
+    )
+    .bind(&name)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert!(!rows.is_empty());
+    for (node, tick, ents) in &rows {
+        assert_eq!(*node, n2, "{rows:?}");
+        assert!(*tick as u64 >= t1);
+        assert!(!ents.to_string().contains("stale"), "{ents}");
+    }
+    let journal: i64 = sqlx::query_scalar(
+        "select count(*) from musubi.world_journal where name = $1 and node_id = $2 and node_term = 1 and entries::text like '%stale%'",
+    )
+    .bind(&name)
+    .bind(n1)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(journal, 0);
+    // the new home persists freely
+    r2.snapshot_now(&name).await.unwrap();
+    r2.delete(&name).await.unwrap();
+}

@@ -273,6 +273,8 @@ pub struct WorldRegistry {
     events: std::sync::OnceLock<Arc<crate::events::Events>>,
     /// (world, cell) → host node, cached from the directory.
     cell_hosts: DashMap<(String, CellId), Uuid>,
+    /// Fencing term this node holds per world (`musubi.world_hosts`); absent = may not persist.
+    host_terms: DashMap<String, i64>,
     /// (world, cell, previous host) shards already merged after a hand-back, so a later
     /// reconciliation round does not resurrect entities despawned since.
     adopted_from: DashSet<(String, CellId, Uuid)>,
@@ -384,6 +386,7 @@ impl WorldRegistry {
             shard_home: DashMap::new(),
             interest: DashMap::new(),
             cell_hosts: DashMap::new(),
+            host_terms: DashMap::new(),
             adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
             region: std::sync::OnceLock::new(),
@@ -451,6 +454,9 @@ impl WorldRegistry {
         match host {
             Some(h) => {
                 self.cell_hosts.insert((name.to_string(), cell), h);
+                if h == self.node_id && !self.host_terms.contains_key(name) {
+                    self.enroll_host(name).await?;
+                }
             }
             None => {
                 self.cell_hosts.remove(&(name.to_string(), cell));
@@ -574,6 +580,9 @@ impl WorldRegistry {
         }
         self.cell_hosts
             .insert((name.to_string(), cell), self.node_id);
+        if !self.host_terms.contains_key(name) {
+            self.enroll_host(name).await?;
+        }
         Ok(vec![cell])
     }
 
@@ -662,6 +671,9 @@ impl WorldRegistry {
         let mut keep = self.assigned_hosts(name).await;
         if !keep.contains(&prev) {
             keep.push(self.node_id);
+            if let Err(e) = self.fence_hosts(name, &keep).await {
+                tracing::warn!(world = name, %prev, error = %e, "previous host not fenced");
+            }
             if let Err(e) = self.prune_shards(name, &keep).await {
                 tracing::warn!(world = name, %prev, error = %e, "stale shard rows not pruned");
             }
@@ -795,34 +807,95 @@ impl WorldRegistry {
         }
     }
 
+    /// Take (or keep) this node's fencing term for `name`. Called only where ownership was just
+    /// won through the quorum (world creation, a directory write that assigned us a cell, a home
+    /// claim in `recover`), never lazily: a fenced-out node must not re-enroll itself.
+    async fn enroll_host(&self, name: &str) -> Result<()> {
+        let Some(db) = &self.db else { return Ok(()) };
+        let (term,): (i64,) = sqlx::query_as(
+            "insert into musubi.world_hosts (name, node_id, term)
+             values ($1, $2, coalesce((select max(term) from musubi.world_hosts where name = $1), 0) + 1)
+             on conflict (name, node_id) do update set term = musubi.world_hosts.term
+             returning term",
+        )
+        .bind(name)
+        .bind(self.node_id)
+        .fetch_one(db)
+        .await
+        .map_err(Error::internal)?;
+        self.host_terms.insert(name.to_string(), term);
+        Ok(())
+    }
+
+    /// Fence every other host of `name` that the directory no longer assigns anything to: their
+    /// later snapshot / journal writes are rejected. `live` are the nodes still hosting cells.
+    async fn fence_hosts(&self, name: &str, live: &[Uuid]) -> Result<()> {
+        let Some(db) = &self.db else { return Ok(()) };
+        let n = sqlx::query(
+            "delete from musubi.world_hosts where name = $1 and node_id <> $2 and node_id <> all($3)",
+        )
+        .bind(name)
+        .bind(self.node_id)
+        .bind(live)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n > 0 {
+            tracing::info!(world = name, fenced = n, "previous hosts fenced");
+        }
+        Ok(())
+    }
+
+    /// The term to persist under, or an error when this node is not an enrolled host of `name`.
+    fn host_term(&self, name: &str) -> Result<i64> {
+        self.host_terms
+            .get(name)
+            .map(|t| *t)
+            .ok_or_else(|| Error::Unavailable(format!("not an enrolled host of world {name}")))
+    }
+
     /// Snapshot of this node's shard of `name` (cells of a world may live on several nodes, each
     /// writes its own row) and the journal chunks it supersedes.
     async fn write_snapshot(
         db: &PgPool,
         name: &str,
         node: Uuid,
+        term: i64,
         entities: Vec<musubi_mesh::Entity>,
         tick: u64,
     ) -> Result<()> {
-        sqlx::query(
-            "insert into musubi.world_snapshots (name, node_id, entities, tick, updated_at) values ($1, $2, $3, $4, now())
-             on conflict (name, node_id) do update set entities = excluded.entities, tick = excluded.tick, updated_at = now()",
+        // `where exists` is the fence: once the row in world_hosts is gone (or carries a newer
+        // term) nothing of this node's reaches the table any more
+        let n = sqlx::query(
+            "insert into musubi.world_snapshots (name, node_id, entities, tick, updated_at, node_term)
+             select $1, $2, $3, $4, now(), $5
+             where exists (select 1 from musubi.world_hosts h where h.name = $1 and h.node_id = $2 and h.term = $5)
+             on conflict (name, node_id) do update set entities = excluded.entities, tick = excluded.tick, updated_at = now(), node_term = excluded.node_term",
         )
         .bind(name)
         .bind(node)
         .bind(serde_json::to_value(&entities)?)
         .bind(tick as i64)
+        .bind(term)
         .execute(db)
         .await
-        .map_err(Error::internal)?;
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::Unavailable(format!(
+                "fenced: node {node} no longer hosts world {name} (term {term})"
+            )));
+        }
         sqlx::query(
-            "insert into musubi.world_history (name, node_id, tick, entities) values ($1, $2, $3, $4)
+            "insert into musubi.world_history (name, node_id, tick, entities, node_term) values ($1, $2, $3, $4, $5)
              on conflict (name, node_id, tick) do nothing",
         )
         .bind(name)
         .bind(node)
         .bind(tick as i64)
         .bind(serde_json::to_value(&entities)?)
+        .bind(term)
         .execute(db)
         .await
         .map_err(Error::internal)?;
@@ -1050,7 +1123,15 @@ impl WorldRegistry {
             (st.world.snapshot_persistent(), st.world.tick)
         };
         if let Some(db) = &self.db {
-            Self::write_snapshot(db, name, self.node_id, entities, tick).await?;
+            Self::write_snapshot(
+                db,
+                name,
+                self.node_id,
+                self.host_term(name)?,
+                entities,
+                tick,
+            )
+            .await?;
         }
         Ok(tick)
     }
@@ -1167,6 +1248,9 @@ impl WorldRegistry {
                 }
                 self.homes.insert(name.clone(), self.node_id);
                 self.publish_home(&name, Some(self.node_id)).await;
+                self.enroll_host(&name).await?;
+                let live: Vec<Uuid> = assigned.get(&name).cloned().unwrap_or_default().into_iter().filter(|h| is_live(h) && !dead_nodes.contains(h)).collect();
+                self.fence_hosts(&name, &live).await?;
                 if let Some(ev) = self.events.get() {
                     ev.emit(
                         "world.rehomed",
@@ -1206,6 +1290,8 @@ impl WorldRegistry {
             );
             self.homes.insert(name.clone(), self.node_id);
             self.publish_home(&name, Some(self.node_id)).await;
+            self.enroll_host(&name).await?;
+            self.fence_hosts(&name, &live).await?;
             let mut keep = live.clone();
             keep.push(self.node_id);
             if let Err(e) = self.prune_shards(&name, &keep).await {
@@ -1621,6 +1707,7 @@ impl WorldRegistry {
                     sqlx::Error::Database(d) if d.is_unique_violation() => Error::Conflict("world exists on another node".into()),
                     e => Error::internal(e),
                 })?;
+            self.enroll_host(name).await?;
         }
         self.note_home(name, false, None);
         self.worlds.insert(
@@ -2102,13 +2189,14 @@ impl WorldRegistry {
             let mut st = w.lock();
             (std::mem::take(&mut st.journal), st.world.tick)
         };
-        Self::write_journal(db, name, self.node_id, ops, tick).await
+        Self::write_journal(db, name, self.node_id, self.host_term(name)?, ops, tick).await
     }
 
     async fn write_journal(
         db: &PgPool,
         name: &str,
         node: Uuid,
+        term: i64,
         ops: Vec<WorldOp>,
         tick: u64,
     ) -> Result<()> {
@@ -2116,8 +2204,10 @@ impl WorldRegistry {
             return Ok(());
         }
         let from = ops.first().map(|o| o.tick).unwrap_or(tick);
-        sqlx::query(
-            "insert into musubi.world_journal (name, tick_from, tick_to, entries, node_id) values ($1, $2, $3, $4, $5)
+        let n = sqlx::query(
+            "insert into musubi.world_journal (name, tick_from, tick_to, entries, node_id, node_term)
+             select $1, $2, $3, $4, $5, $6
+             where exists (select 1 from musubi.world_hosts h where h.name = $1 and h.node_id = $5 and h.term = $6)
              on conflict (name, node_id, tick_from) do update set tick_to = greatest(musubi.world_journal.tick_to, excluded.tick_to), entries = musubi.world_journal.entries || excluded.entries",
         )
         .bind(name)
@@ -2125,9 +2215,16 @@ impl WorldRegistry {
         .bind(tick as i64)
         .bind(serde_json::to_value(&ops)?)
         .bind(node)
+        .bind(term)
         .execute(db)
         .await
-        .map_err(Error::internal)?;
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::Unavailable(format!(
+                "fenced: node {node} no longer hosts world {name} (term {term})"
+            )));
+        }
         Ok(())
     }
 
@@ -2650,14 +2747,19 @@ impl WorldRegistry {
             }
             if st.world.tick % JOURNAL_EVERY == 0 && !st.journal.is_empty() {
                 if let Some(db) = self.db.clone() {
-                    let (ops, tick, n, node) = (
+                    let (ops, tick, n, node, term) = (
                         std::mem::take(&mut st.journal),
                         st.world.tick,
                         name.clone(),
                         self.node_id,
+                        self.host_terms.get(&name).map(|t| *t),
                     );
                     tokio::spawn(async move {
-                        if let Err(e) = Self::write_journal(&db, &n, node, ops, tick).await {
+                        let Some(term) = term else {
+                            tracing::warn!(world = %n, "world journal skipped: not an enrolled host");
+                            return;
+                        };
+                        if let Err(e) = Self::write_journal(&db, &n, node, term, ops, tick).await {
                             tracing::warn!(world = %n, error = %e, "world journal failed");
                         }
                     });
@@ -2665,14 +2767,21 @@ impl WorldRegistry {
             }
             if st.world.tick % SNAPSHOT_EVERY == 0 {
                 if let Some(db) = self.db.clone() {
-                    let (entities, tick, n, node) = (
+                    let (entities, tick, n, node, term) = (
                         st.world.snapshot_persistent(),
                         st.world.tick,
                         name.clone(),
                         self.node_id,
+                        self.host_terms.get(&name).map(|t| *t),
                     );
                     tokio::spawn(async move {
-                        if let Err(e) = Self::write_snapshot(&db, &n, node, entities, tick).await {
+                        let Some(term) = term else {
+                            tracing::warn!(world = %n, "world snapshot skipped: not an enrolled host");
+                            return;
+                        };
+                        if let Err(e) =
+                            Self::write_snapshot(&db, &n, node, term, entities, tick).await
+                        {
                             tracing::warn!(world = %n, error = %e, "world snapshot failed");
                         }
                     });
