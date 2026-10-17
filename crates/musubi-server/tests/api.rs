@@ -69,6 +69,14 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
         groups: musubi_social::GroupService::new(db.clone()),
+        lobbies: musubi_server::lobby::LobbyService::new(
+            db.clone(),
+            musubi_server::notify::Notifier::new(
+                musubi_social::NotificationService::new(db.clone()),
+                fanout.clone(),
+            )
+            .with_push(push.clone()),
+        ),
         notify: musubi_server::notify::Notifier::new(
             musubi_social::NotificationService::new(db.clone()),
             fanout.clone(),
@@ -7457,4 +7465,381 @@ async fn private_tournament_requires_join_code() {
     if let Some(m) = mine {
         assert_eq!(m["private"], true, "{m}");
     }
+}
+
+#[tokio::test]
+async fn lobbies_lifecycle_teams_password_and_start() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..5 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("lb")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let (tc, c) = users[2].clone();
+    let (td, d) = users[3].clone();
+    let (te, _e) = users[4].clone();
+    let mode = unique("ctf");
+
+    // shape validation
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies",
+        Some(&ta),
+        Some(json!({"name": "x", "team_count": 2, "team_size": 1, "max_members": 4})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    let (st, l) = call(
+        &app,
+        "POST",
+        "/v1/lobbies",
+        Some(&ta),
+        Some(json!({
+            "name": "Alpha", "visibility": "private", "password": "pw",
+            "team_count": 2, "team_size": 2, "metadata": {"mode": mode}, "region": "eu"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let id = l["id"].as_str().unwrap().to_string();
+    let code = l["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 6);
+    assert_eq!(l["has_password"], true);
+    assert_eq!(l["max_members"], 4);
+    assert_eq!(l["member_count"], 1);
+    assert_eq!(l["members"][0]["account_id"], a);
+    assert_eq!(l["host_id"], a);
+    // a second lobby for the same host is refused
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies",
+        Some(&ta),
+        Some(json!({"name": "Beta"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+
+    // private: not listed, not joinable by id, code hidden from outsiders
+    let filter = json!({"mode": mode})
+        .to_string()
+        .replace('{', "%7B")
+        .replace('}', "%7D")
+        .replace('"', "%22")
+        .replace(':', "%3A");
+    let path = format!("/v1/lobbies?metadata={filter}");
+    let (_, v) = call(&app, "GET", &path, Some(&tb), None).await;
+    assert_eq!(v["lobbies"].as_array().unwrap().len(), 0, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&tb),
+        Some(json!({"id": id, "password": "pw"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (_, v) = call(&app, "GET", &format!("/v1/lobbies/{id}"), Some(&tb), None).await;
+    assert!(v.get("code").is_none(), "{v}");
+    // wrong / missing password
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&tb),
+        Some(json!({"code": code.to_lowercase(), "password": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    // B joins by code, picks team 0 (host is there, room for one more)
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&tb),
+        Some(json!({"code": code.to_lowercase(), "password": "pw", "team": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["member_count"], 2);
+    assert_eq!(v["code"], code);
+
+    // host flips it public: now listed with filters; C auto-lands on the emptier team 1
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/lobbies/{id}"),
+        Some(&ta),
+        Some(json!({"visibility": "public"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v.get("code").is_none(), "{v}");
+    let (_, v) = call(&app, "GET", &path, Some(&tc), None).await;
+    assert_eq!(v["lobbies"][0]["id"], id, "{v}");
+    assert_eq!(v["lobbies"][0]["member_count"], 2);
+    assert!(v["lobbies"][0]["members"].as_array().unwrap().is_empty());
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/lobbies?name=alp&region=eu",
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert!(
+        v["lobbies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["id"] == id),
+        "{v}"
+    );
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/lobbies?name=alp&region=us",
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert!(
+        !v["lobbies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["id"] == id),
+        "{v}"
+    );
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&tc),
+        Some(json!({"id": id, "password": "pw"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let c_team = v["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["account_id"] == c)
+        .unwrap()["team"]
+        .clone();
+    assert_eq!(c_team, 1);
+    // D: team 0 is full, team 1 fits; then the lobby is full and drops out of the listing
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&td),
+        Some(json!({"id": id, "password": "pw", "team": 0})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&td),
+        Some(json!({"id": id, "password": "pw", "team": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&te),
+        Some(json!({"id": id, "password": "pw"})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (_, v) = call(&app, "GET", &path, Some(&te), None).await;
+    assert_eq!(v["lobbies"].as_array().unwrap().len(), 0, "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("{path}&has_slots=false"),
+        Some(&te),
+        None,
+    )
+    .await;
+    assert_eq!(v["lobbies"][0]["id"], id, "{v}");
+
+    // ready gate, kick, team switch
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/start"),
+        Some(&ta),
+        Some(json!({"connect": {"host": "1.2.3.4"}, "require_ready": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    for t in [&tb, &tc] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            &format!("/v1/lobbies/{id}/ready"),
+            Some(t),
+            Some(json!({"ready": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/kick"),
+        Some(&tb),
+        Some(json!({"account_id": d})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/kick"),
+        Some(&ta),
+        Some(json!({"account_id": d})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call(&app, "GET", "/v1/lobbies/mine", Some(&td), None).await;
+    assert!(v["lobby"].is_null(), "{v}");
+    let (_, v) = call(&app, "GET", "/v1/notifications", Some(&td), None).await;
+    let kicked =
+        v["notifications"].as_array().unwrap().iter().any(|n| {
+            n["subject"] == "lobby" && n["content"]["event"] == "kicked" && n["code"] == 20
+        });
+    assert!(kicked, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/team"),
+        Some(&tc),
+        Some(json!({"team": 0})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "team 0 is full: {v}");
+    // non-member cannot start or heartbeat
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/heartbeat"),
+        Some(&td),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/heartbeat"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // start with the host's own connect info; everyone gets the persisted `started`
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/start"),
+        Some(&ta),
+        Some(json!({"connect": {"host": "1.2.3.4"}, "require_ready": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "started");
+    assert_eq!(v["started"]["kind"], "custom");
+    assert_eq!(v["started"]["connect"]["host"], "1.2.3.4");
+    let (_, v) = call(&app, "GET", "/v1/notifications", Some(&tc), None).await;
+    let started = v["notifications"].as_array().unwrap().iter().any(|n| {
+        n["subject"] == "lobby"
+            && n["content"]["event"] == "started"
+            && n["content"]["started"]["connect"]["host"] == "1.2.3.4"
+    });
+    assert!(started, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/start"),
+        Some(&ta),
+        Some(json!({"connect": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&te),
+        Some(json!({"id": id, "password": "pw"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+
+    // host leaves → longest-standing member (B) takes over; B closes
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/lobbies/{id}/leave"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call(&app, "GET", &format!("/v1/lobbies/{id}"), Some(&tb), None).await;
+    assert_eq!(v["host_id"], b, "{v}");
+    assert_eq!(v["member_count"], 2);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/lobbies/{id}"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/lobbies/{id}"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", &format!("/v1/lobbies/{id}"), Some(&tc), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call(&app, "GET", "/v1/lobbies/mine", Some(&tc), None).await;
+    assert!(v["lobby"].is_null(), "{v}");
+    // A is free again
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies",
+        Some(&ta),
+        Some(json!({"name": "Beta"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
 }

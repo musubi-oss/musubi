@@ -33,6 +33,7 @@ pub struct AppState {
     pub social: SocialService,
     pub groups: GroupService,
     pub notify: Notifier,
+    pub lobbies: crate::lobby::LobbyService,
     pub chat: ChatService,
     pub leaderboards: LeaderboardService,
     pub tournaments: TournamentService,
@@ -459,6 +460,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
+        lobbies: crate::lobby::LobbyService::new(db.clone(), notify.clone()),
         db,
         auth,
         storage,
@@ -564,6 +566,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 match crate::retention::run(&st.db, &st.cfg.retention).await {
                     Ok(v) => tracing::info!(removed = %v, "retention pass"),
                     Err(e) => tracing::warn!(error = %e, "retention pass failed"),
+                }
+            }
+        });
+    }
+    if let Some(c) = state.cluster.clone() {
+        let st = state.clone();
+        let lease = c.lease("lobbies", musubi_cluster::DEAD_AFTER);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
+                match st.lobbies.sweep(crate::lobby::TTL).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(removed = n, "stale lobbies swept"),
+                    Err(e) => tracing::warn!(error = %e, "lobby sweep failed"),
                 }
             }
         });

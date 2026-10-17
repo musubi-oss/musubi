@@ -13,6 +13,7 @@ pub mod idempotency;
 pub mod jwt;
 pub mod keys;
 pub mod limits;
+pub mod lobby;
 pub mod logins;
 pub mod metrics;
 pub mod modules;

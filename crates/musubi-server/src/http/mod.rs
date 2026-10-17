@@ -11,6 +11,7 @@ mod friends;
 mod groups;
 mod integrations;
 mod leaderboards;
+mod lobbies;
 mod matches;
 mod matchmaker;
 mod notifications;
@@ -52,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .merge(notifications::routes())
         .merge(chat::routes())
         .merge(leaderboards::routes())
+        .merge(lobbies::routes())
         .merge(tournaments::routes())
         .merge(rpc::routes())
         .merge(cluster::routes())

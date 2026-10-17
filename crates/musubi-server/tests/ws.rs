@@ -109,6 +109,13 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
         groups: musubi_social::GroupService::new(db.clone()),
+        lobbies: musubi_server::lobby::LobbyService::new(
+            db.clone(),
+            musubi_server::notify::Notifier::new(
+                musubi_social::NotificationService::new(db.clone()),
+                fanout.clone(),
+            ),
+        ),
         notify: musubi_server::notify::Notifier::new(
             musubi_social::NotificationService::new(db.clone()),
             fanout.clone(),
