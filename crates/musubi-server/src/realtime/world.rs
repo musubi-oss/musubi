@@ -222,6 +222,10 @@ struct WorldState {
     txs: HashMap<Uuid, TxRecord>,
     /// Entities held by a prepared transaction: no writes until commit, abort or the deadline.
     tx_locks: HashMap<EntityId, (Uuid, u64)>,
+    /// Hibernated cells and the tick they fell asleep (drives `unload_after_ticks`).
+    hibernated_since: HashMap<CellId, u64>,
+    /// Cells whose cold-cell row is being written or read right now.
+    loading: std::collections::HashSet<CellId>,
     /// This shard exists only for cells assigned to this node (it is not the world's home).
     hosted_only: bool,
     /// The world's home node as of shard creation: cells without an explicit host live there.
@@ -494,6 +498,8 @@ pub struct WorldInfo {
     pub subscribers: usize,
     pub cells: Vec<(CellId, Uuid)>,
     pub orphaned: Vec<CellId>,
+    /// Hibernated cells whose persistent entities live in `world_cold_cells`, not in memory.
+    pub cold_cells: Vec<CellId>,
     pub sims: Vec<SimInfo>,
     pub config: WorldConfig,
 }
@@ -749,6 +755,8 @@ impl WorldRegistry {
                     full_resend: std::collections::HashSet::new(),
                     txs: HashMap::new(),
                     tx_locks: HashMap::new(),
+                    hibernated_since: HashMap::new(),
+                    loading: std::collections::HashSet::new(),
                     sub_opts: HashMap::new(),
                     hosted_only: true,
                     home_node: home,
@@ -1217,6 +1225,15 @@ impl WorldRegistry {
             world.tick = world.tick.max(tick as u64);
             since.insert(node, tick as u64);
         }
+        let cold: Vec<(i32, i32)> =
+            sqlx::query_as("select x, y from musubi.world_cold_cells where name = $1")
+                .bind(name)
+                .fetch_all(db)
+                .await
+                .map_err(Error::internal)?;
+        for (x, y) in cold {
+            world.mark_unloaded(CellId { x, y });
+        }
         let rows: Vec<(Option<Uuid>, Value)> = sqlx::query_as(if only {
             "select node_id, entries from musubi.world_journal where name = $1 and (node_id = any($2) or node_id is null) order by tick_from"
         } else {
@@ -1465,6 +1482,8 @@ impl WorldRegistry {
                 full_resend: std::collections::HashSet::new(),
                 txs: HashMap::new(),
                 tx_locks: HashMap::new(),
+                hibernated_since: HashMap::new(),
+                loading: std::collections::HashSet::new(),
             sub_opts: HashMap::new(),
                     hosted_only: false,
                     home_node: None,
@@ -1908,6 +1927,8 @@ impl WorldRegistry {
                 full_resend: std::collections::HashSet::new(),
                 txs: HashMap::new(),
                 tx_locks: HashMap::new(),
+                hibernated_since: HashMap::new(),
+                loading: std::collections::HashSet::new(),
                 sub_opts: HashMap::new(),
                 hosted_only: false,
                 home_node: None,
@@ -1949,6 +1970,7 @@ impl WorldRegistry {
             subscribers: st.subs.len(),
             cells,
             orphaned: st.world.orphaned_cells(),
+            cold_cells: st.world.unloaded_cells(),
             sims: st.controller.sims(),
             config: st.world.cfg.clone(),
         })
@@ -2878,6 +2900,207 @@ impl WorldRegistry {
         }
     }
 
+    /// Does this node host `cell` of `name` (assigned to it, or unassigned on the home)?
+    fn hosts_cell(&self, st: &WorldState, name: &str, cell: CellId) -> bool {
+        match self.cell_hosts.get(&(name.to_string(), cell)) {
+            Some(h) => *h == self.node_id,
+            None => !st.hosted_only,
+        }
+    }
+
+    /// Hibernated cells idle for `unload_after_ticks` more: their persistent entities are written
+    /// to `world_cold_cells` first and dropped from memory once the row is there.
+    fn unload_cold_cells(&self, st: &mut WorldState, name: &str) {
+        let after = st.world.cfg.unload_after_ticks;
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        if after == 0 {
+            st.hibernated_since.clear();
+            return;
+        }
+        let now = st.world.tick;
+        let world = &st.world;
+        st.hibernated_since.retain(|c, _| world.is_hibernated(*c));
+        let due: Vec<CellId> = st
+            .hibernated_since
+            .iter()
+            .filter(|(c, since)| {
+                now.saturating_sub(**since) >= after
+                    && world.entities_in(**c) > 0
+                    && !world.is_unloaded(**c)
+                    && !st.loading.contains(*c)
+            })
+            .map(|(c, _)| *c)
+            .collect();
+        for cell in due {
+            if !self.hosts_cell(st, name, cell) {
+                continue;
+            }
+            let mut snapshot: Vec<Entity> = st
+                .world
+                .entities_of(cell)
+                .into_iter()
+                .filter(|e| e.persistent)
+                .cloned()
+                .collect();
+            snapshot.sort_by_key(|e| e.id);
+            st.hibernated_since.remove(&cell);
+            if snapshot.is_empty() {
+                continue;
+            }
+            let Ok(w) = self.get(name) else {
+                continue;
+            };
+            st.loading.insert(cell);
+            let (db, n) = (db.clone(), name.to_string());
+            tokio::spawn(async move {
+                let written = Self::write_cold_cell(&db, &n, cell, &snapshot, now).await;
+                // decide under the lock, talk to the database outside it
+                let cold: Option<Vec<Entity>> = {
+                    let mut st = w.lock();
+                    st.loading.remove(&cell);
+                    if let Err(e) = written {
+                        tracing::warn!(world = %n, ?cell, error = %e, "cold cell write failed, kept in memory");
+                        return;
+                    }
+                    if st.world.is_hibernated(cell) && !st.world.is_unloaded(cell) {
+                        Some(st.world.unload_cell(cell))
+                    } else {
+                        None
+                    }
+                };
+                let Some(cold) = cold else {
+                    // woke up while the row was being written: the row would be stale
+                    if let Err(e) = Self::delete_cold_cell(&db, &n, cell).await {
+                        tracing::warn!(world = %n, ?cell, error = %e, "stale cold cell row not removed");
+                    }
+                    return;
+                };
+                let same = cold.len() == snapshot.len()
+                    && cold
+                        .iter()
+                        .zip(&snapshot)
+                        .all(|(a, b)| a.id == b.id && a.rev == b.rev && a.pos == b.pos);
+                if !same {
+                    // something arrived or changed between the write and the unload
+                    if let Err(e) = Self::write_cold_cell(&db, &n, cell, &cold, now).await {
+                        tracing::error!(world = %n, ?cell, error = %e, "cold cell rewrite failed after unload");
+                    }
+                }
+                tracing::info!(world = %n, ?cell, entities = cold.len(), "cell unloaded");
+            });
+        }
+    }
+
+    /// Unloaded cells that are watched, leased or spawned into again get their entities back.
+    fn reload_cold_cells(&self, st: &mut WorldState, name: &str) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        let unloaded = st.world.unloaded_cells();
+        if unloaded.is_empty() {
+            return;
+        }
+        let watched: std::collections::HashSet<CellId> =
+            st.world.interest_cells().into_iter().collect();
+        for cell in unloaded {
+            let wanted = watched.contains(&cell)
+                || st.world.owner(cell).is_some()
+                || st.world.entities_in(cell) > 0;
+            if !wanted || st.loading.contains(&cell) || !self.hosts_cell(st, name, cell) {
+                continue;
+            }
+            let Ok(w) = self.get(name) else {
+                continue;
+            };
+            st.loading.insert(cell);
+            let (db, n) = (db.clone(), name.to_string());
+            tokio::spawn(async move {
+                let loaded = Self::read_cold_cell(&db, &n, cell).await;
+                let count = {
+                    let mut st = w.lock();
+                    st.loading.remove(&cell);
+                    match loaded {
+                        Ok(Some(entities)) => {
+                            let count = entities.len();
+                            st.world.reload_cell(cell, entities);
+                            if let Some(owner) = st.world.owner(cell) {
+                                push_event(
+                                    &mut st,
+                                    owner,
+                                    json!({"type": "cell_reloaded", "cell": cell, "entities": count}),
+                                );
+                            }
+                            count
+                        }
+                        Ok(None) => {
+                            st.world.reload_cell(cell, Vec::new());
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(world = %n, ?cell, error = %e, "cold cell read failed");
+                            return;
+                        }
+                    }
+                };
+                tracing::info!(world = %n, ?cell, entities = count, "cell reloaded");
+                if let Err(e) = Self::delete_cold_cell(&db, &n, cell).await {
+                    tracing::warn!(world = %n, ?cell, error = %e, "cold cell row not removed after reload");
+                }
+            });
+        }
+    }
+
+    async fn write_cold_cell(
+        db: &PgPool,
+        name: &str,
+        cell: CellId,
+        entities: &[Entity],
+        tick: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into musubi.world_cold_cells (name, x, y, entities, tick) values ($1, $2, $3, $4, $5)
+             on conflict (name, x, y) do update set entities = excluded.entities, tick = excluded.tick, unloaded_at = now()",
+        )
+        .bind(name)
+        .bind(cell.x)
+        .bind(cell.y)
+        .bind(serde_json::to_value(entities)?)
+        .bind(tick as i64)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    async fn read_cold_cell(db: &PgPool, name: &str, cell: CellId) -> Result<Option<Vec<Entity>>> {
+        let row: Option<(Value,)> = sqlx::query_as(
+            "select entities from musubi.world_cold_cells where name = $1 and x = $2 and y = $3",
+        )
+        .bind(name)
+        .bind(cell.x)
+        .bind(cell.y)
+        .fetch_optional(db)
+        .await
+        .map_err(Error::internal)?;
+        match row {
+            Some((v,)) => Ok(Some(serde_json::from_value(v)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn delete_cold_cell(db: &PgPool, name: &str, cell: CellId) -> Result<()> {
+        sqlx::query("delete from musubi.world_cold_cells where name = $1 and x = $2 and y = $3")
+            .bind(name)
+            .bind(cell.x)
+            .bind(cell.y)
+            .execute(db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
     /// Input forwarded from another node; dropped unless the entity lives here.
     pub fn accept_remote_input(&self, name: &str, id: EntityId, input: Value) {
         let Some(w) = self.worlds.get(name) else {
@@ -3284,7 +3507,10 @@ impl WorldRegistry {
                         );
                     }
                     tracing::info!(world = %name, ?cell, ephemeral, "cell hibernated");
+                    st.hibernated_since.insert(cell, st.world.tick);
                 }
+                self.unload_cold_cells(&mut *st, &name);
+                self.reload_cold_cells(&mut *st, &name);
             }
             for (cell, scale) in st.controller.dilate(&mut st.world) {
                 if let Some(owner) = st.world.owner(cell) {

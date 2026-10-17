@@ -178,6 +178,10 @@ pub struct WorldConfig {
     pub ghost_keyframe_ticks: u64,
     /// Ghosts from a cell whose host sent nothing for this many ticks are dropped from views.
     pub ghost_stale_ticks: u64,
+    /// A hibernated cell nobody touched for this many more ticks is unloaded: its persistent
+    /// entities leave memory for the cold-cell store and come back when interest, a lease or a
+    /// spawn reaches the cell (0 = never).
+    pub unload_after_ticks: u64,
 }
 
 impl Default for WorldConfig {
@@ -201,6 +205,7 @@ impl Default for WorldConfig {
             ghost_budget_bytes: 256 * 1024,
             ghost_keyframe_ticks: 30,
             ghost_stale_ticks: 60,
+            unload_after_ticks: 0,
         }
     }
 }
@@ -419,6 +424,8 @@ pub struct World {
     by_cell: CellIndex,
     /// Cells put to sleep by `hibernate_cell`: not orphans, re-leased only when interest returns.
     hibernated: HashSet<CellId>,
+    /// Hibernated cells whose persistent entities were dropped from memory (`unload_cell`).
+    unloaded: HashSet<CellId>,
     leases: HashMap<CellId, Lease>,
     /// Last simulator granted each cell, kept after the lease lapses (who to tell about it).
     last_owners: HashMap<CellId, SimId>,
@@ -445,6 +452,7 @@ impl World {
             children: HashMap::new(),
             by_cell: CellIndex::default(),
             hibernated: HashSet::new(),
+            unloaded: HashSet::new(),
             last_owners: HashMap::new(),
             leases: HashMap::new(),
             interests: HashMap::new(),
@@ -683,6 +691,44 @@ impl World {
             }
             None => false,
         }
+    }
+
+    /// Drop the persistent entities of a hibernated cell from memory (the caller has stored
+    /// them); the cell is marked unloaded until `reload_cell` brings them back.
+    pub fn unload_cell(&mut self, cell: CellId) -> Vec<Entity> {
+        let mut cold: Vec<Entity> = self
+            .entities_of(cell)
+            .into_iter()
+            .filter(|e| e.persistent)
+            .cloned()
+            .collect();
+        cold.sort_by_key(|e| e.id);
+        for e in &cold {
+            self.despawn(e.id);
+        }
+        self.unloaded.insert(cell);
+        cold
+    }
+
+    /// The stored entities of an unloaded cell are back in memory.
+    pub fn reload_cell(&mut self, cell: CellId, entities: Vec<Entity>) {
+        self.unloaded.remove(&cell);
+        self.restore(entities);
+    }
+
+    /// Known to be unloaded (learned from the store on load) without having done it here.
+    pub fn mark_unloaded(&mut self, cell: CellId) {
+        self.unloaded.insert(cell);
+    }
+
+    pub fn is_unloaded(&self, cell: CellId) -> bool {
+        self.unloaded.contains(&cell)
+    }
+
+    pub fn unloaded_cells(&self) -> Vec<CellId> {
+        let mut v: Vec<CellId> = self.unloaded.iter().copied().collect();
+        v.sort();
+        v
     }
 
     pub fn is_hibernated(&self, cell: CellId) -> bool {

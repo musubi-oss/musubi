@@ -9684,3 +9684,128 @@ async fn world_tx_cross_nodes() {
     .await;
     assert_eq!(st, 400);
 }
+
+/// Scale-to-zero for persistent worlds: an unwatched cell hibernates, then its persistent
+/// entities leave memory for `world_cold_cells`; a lease on the cell brings them back intact.
+#[tokio::test]
+async fn world_cold_cell_unloads_and_reloads() {
+    let group = format!("xcold-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a, router)) = start_with(true, &group).await else {
+        return;
+    };
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": name, "config": {
+            "cell_size": 100.0, "hibernate_after_ticks": 3, "unload_after_ticks": 3,
+        }})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let sim = uuid::Uuid::now_v7();
+    let lease = || async {
+        http_json(
+            &router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/lease"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+        )
+        .await
+    };
+    let (st, l) = lease().await;
+    assert_eq!(st, 200, "{l}");
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim, "x": 50.0, "y": 50.0, "components": {"hp": 7}, "persistent": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let id = e["id"].as_str().unwrap().to_string();
+    // nobody watches the cell: it hibernates, then unloads
+    let mut info = Value::Null;
+    let mut unloaded = false;
+    for _ in 0..200 {
+        let (st, i) = http_json(
+            &router,
+            "GET",
+            &format!("/v1/server/worlds/{name}"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{i}");
+        info = i;
+        if info["cold_cells"].as_array().is_some_and(|c| !c.is_empty()) && info["entities"] == 0 {
+            unloaded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(unloaded, "cell never unloaded: {info}");
+    assert_eq!(
+        info["cold_cells"][0],
+        serde_json::json!({"x": 0, "y": 0}),
+        "{info}"
+    );
+    // a lease on the cold cell reads its entities back
+    let (st, l) = lease().await;
+    assert_eq!(st, 200, "{l}");
+    let mut view = Value::Null;
+    let mut back = false;
+    for _ in 0..200 {
+        let (_, v) = http_json(
+            &router,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        view = v;
+        let hp = view["owned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .and_then(|e| {
+                e["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["name"] == "hp")
+                    .map(|c| c["value"].clone())
+            });
+        if hp == Some(serde_json::json!(7)) {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(back, "entity never came back: {view}");
+    let (_, info) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{name}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        info["cold_cells"].as_array().is_some_and(|c| c.is_empty()),
+        "{info}"
+    );
+    assert_eq!(info["entities"], 1, "{info}");
+}
