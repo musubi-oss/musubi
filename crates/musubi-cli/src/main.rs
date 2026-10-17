@@ -105,6 +105,9 @@ enum Cmd {
         /// Subscribe with `unreliable_updates`: position deltas as sequenced unreliable frames.
         #[arg(long)]
         unreliable: bool,
+        /// `match` scenario: players per relayed match (one creates, the rest join).
+        #[arg(long, default_value_t = 8)]
+        match_size: usize,
         #[arg(long)]
         json: bool,
     },
@@ -244,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
             transport,
             quic_addr,
             unreliable,
+            match_size,
             json,
         } => {
             bench::run(bench::Opts {
@@ -260,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
                 quic_addr,
                 unreliable,
                 json,
+                match_size,
             })
             .await
         }

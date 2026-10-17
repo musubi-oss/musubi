@@ -31,6 +31,8 @@ pub struct Opts {
     /// `WorldSubscribe.unreliable_updates`.
     pub unreliable: bool,
     pub json: bool,
+    /// `match` scenario: players per relayed match (one creates, the rest join).
+    pub match_size: usize,
 }
 
 /// Dev server key (`[auth] server_key` default) for the world scenario's simulator side.
@@ -625,19 +627,247 @@ async fn ws_loop(url: String, token: String, deadline: Instant, tx: mpsc::Unboun
     let _ = ws.close(None).await;
 }
 
+type MatchChannel = (
+    tokio::sync::watch::Sender<Option<String>>,
+    tokio::sync::watch::Receiver<Option<String>>,
+);
+
+/// A relayed match shared by `match_size` bench players: the leader creates it and publishes
+/// the id, the others join once it is there.
+struct MatchGroup {
+    leader: bool,
+    tx: tokio::sync::watch::Sender<Option<String>>,
+    rx: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+/// Process-wide epoch so a send time can travel inside match data and be read by another task.
+fn epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn ws_connect(url: &str, token: &str) -> Option<WsStream> {
+    tokio_tungstenite::connect_async(format!("{}?token={token}&format=json", ws_url(url)))
+        .await
+        .ok()
+        .map(|(ws, _)| ws)
+}
+
+fn envelope(msg: ClientMessage) -> tokio_tungstenite::tungstenite::Message {
+    tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&Envelope { cid: None, msg }).unwrap(),
+    )
+}
+
+/// Next server message within `wait`; `None` on close, error or timeout.
+async fn ws_recv(ws: &mut WsStream, wait: Duration) -> Option<ServerMessage> {
+    let until = Instant::now() + wait;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt)))) => {
+                if let Ok(e) = serde_json::from_str::<Envelope<ServerMessage>>(&txt) {
+                    return Some(e.msg);
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            _ => return None,
+        }
+    }
+}
+
+/// `chat`: 50 clients share a room; each measures send → own echo (the room fan-out to the other
+/// 49 rides along as server load).
+async fn chat_loop(
+    url: String,
+    token: String,
+    room: String,
+    deadline: Instant,
+    tx: mpsc::UnboundedSender<Sample>,
+) {
+    let fail = |t: Instant| {
+        let _ = tx.send(sample("chat", t, false, false));
+    };
+    let Some(mut ws) = ws_connect(&url, &token).await else {
+        return fail(Instant::now());
+    };
+    if ws
+        .send(envelope(ClientMessage::ChannelJoin {
+            target: room,
+            kind: musubi_proto::ChannelKind::Room,
+            persistence: false,
+            hidden: false,
+        }))
+        .await
+        .is_err()
+    {
+        return fail(Instant::now());
+    }
+    let channel_id = loop {
+        match ws_recv(&mut ws, Duration::from_secs(10)).await {
+            Some(ServerMessage::Channel { id, .. }) => break id,
+            Some(_) => continue,
+            None => return fail(Instant::now()),
+        }
+    };
+    let tag = uuid::Uuid::now_v7().simple().to_string();
+    let throttled_code = musubi_core::Error::ResourceExhausted(String::new()).code();
+    let mut seq: u64 = 0;
+    while Instant::now() < deadline {
+        seq += 1;
+        let t = Instant::now();
+        if ws
+            .send(envelope(ClientMessage::ChannelMessageSend {
+                channel_id: channel_id.clone(),
+                content: json!({ "tag": tag, "seq": seq }),
+                reply_to: None,
+            }))
+            .await
+            .is_err()
+        {
+            return fail(t);
+        }
+        let outcome = loop {
+            match ws_recv(&mut ws, Duration::from_secs(5)).await {
+                Some(ServerMessage::ChannelMessage(m))
+                    if m.content["tag"] == json!(tag) && m.content["seq"] == json!(seq) =>
+                {
+                    break Some(true)
+                }
+                Some(ServerMessage::Error { code, .. }) if code == throttled_code => {
+                    break Some(false)
+                }
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        match outcome {
+            Some(true) => {
+                let _ = tx.send(sample("chat", t, true, false));
+            }
+            Some(false) => {
+                let _ = tx.send(sample("chat", t, false, true));
+                tokio::time::sleep(THROTTLE_PAUSE).await;
+            }
+            None => return fail(t),
+        }
+    }
+    let _ = ws.close(None).await;
+}
+
+/// `match`: `match_size` players in a relayed match, each sending its input at 30 Hz; the
+/// sample is the relay latency measured at the receivers (send time travels in the payload), so
+/// a group of one produces no samples.
+async fn match_loop(
+    url: String,
+    token: String,
+    group: Option<MatchGroup>,
+    deadline: Instant,
+    tx: mpsc::UnboundedSender<Sample>,
+) {
+    let fail = |t: Instant| {
+        let _ = tx.send(sample("match", t, false, false));
+    };
+    let Some(mut group) = group else {
+        return fail(Instant::now());
+    };
+    let Some(mut ws) = ws_connect(&url, &token).await else {
+        return fail(Instant::now());
+    };
+    let join = if group.leader {
+        ClientMessage::MatchCreate { name: None }
+    } else {
+        let id =
+            match tokio::time::timeout(Duration::from_secs(15), group.rx.wait_for(|v| v.is_some()))
+                .await
+            {
+                Ok(Ok(v)) => v.clone().unwrap(),
+                _ => return fail(Instant::now()),
+            };
+        ClientMessage::MatchJoin {
+            match_id: Some(id),
+            token: None,
+            metadata: Default::default(),
+            spectator: false,
+        }
+    };
+    if ws.send(envelope(join)).await.is_err() {
+        return fail(Instant::now());
+    }
+    let match_id = loop {
+        match ws_recv(&mut ws, Duration::from_secs(10)).await {
+            Some(ServerMessage::Match { match_id, .. }) => break match_id,
+            Some(_) => continue,
+            None => return fail(Instant::now()),
+        }
+    };
+    if group.leader {
+        let _ = group.tx.send(Some(match_id.clone()));
+    }
+    let epoch = epoch();
+    let mut every = tokio::time::interval(Duration::from_millis(33));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    while Instant::now() < deadline {
+        tokio::select! {
+            _ = every.tick() => {
+                let nanos = epoch.elapsed().as_nanos() as u64;
+                if ws
+                    .send(envelope(ClientMessage::MatchDataSend {
+                        match_id: match_id.clone(),
+                        op_code: 1,
+                        data: nanos.to_le_bytes().to_vec(),
+                        presences: vec![],
+                        reliable: true,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return fail(Instant::now());
+                }
+            }
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt))) => {
+                        if let Ok(Envelope { msg: ServerMessage::MatchData { op_code: 1, data, .. }, .. }) =
+                            serde_json::from_str::<Envelope<ServerMessage>>(&txt)
+                        {
+                            if let Ok(b) = <[u8; 8]>::try_from(data.as_slice()) {
+                                let sent = epoch + Duration::from_nanos(u64::from_le_bytes(b));
+                                let _ = tx.send(sample("match", sent, true, false));
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return fail(Instant::now()),
+                }
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+}
+
 pub async fn run(o: Opts) -> anyhow::Result<()> {
     let url = o.url.trim_end_matches('/').to_string();
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(o.clients)
         .build()?;
     let scenarios: Vec<&'static str> = match o.scenario.as_str() {
-        "all" => vec!["http", "storage", "ws"],
+        "all" => vec!["http", "storage", "ws", "chat", "match"],
         "http" => vec!["http"],
         "storage" => vec!["storage"],
         "ws" => vec!["ws"],
+        "chat" => vec!["chat"],
+        "match" => vec!["match"],
         "world" => vec!["world"],
-        other => anyhow::bail!("unknown scenario {other}; use http|storage|ws|world|all"),
+        other => {
+            anyhow::bail!("unknown scenario {other}; use http|storage|ws|chat|match|world|all")
+        }
     };
+    let match_size = o.match_size.max(1);
+    let mut match_groups: Vec<MatchChannel> = Vec::new();
     let run_id = uuid::Uuid::now_v7().simple().to_string();
     let totals = Arc::new(WorldTotals::default());
     let mut arenas: Vec<Arc<Arena>> = Vec::new();
@@ -689,6 +919,23 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     for (i, token) in tokens.into_iter().enumerate() {
         let sc = scenarios[i % scenarios.len()];
         let (http, url, tx) = (http.clone(), url.clone(), tx.clone());
+        // ordinal among the clients of this scenario: chat rooms of 50, matches of `match_size`
+        let j = i / scenarios.len();
+        let room = format!("bench-{run_id}-{}", j / 50);
+        let group = if sc == "match" {
+            let g = j / match_size;
+            while match_groups.len() <= g {
+                match_groups.push(tokio::sync::watch::channel(None));
+            }
+            let (gtx, grx) = &match_groups[g];
+            Some(MatchGroup {
+                leader: j % match_size == 0,
+                tx: gtx.clone(),
+                rx: grx.clone(),
+            })
+        } else {
+            None
+        };
         let arena = arenas.get(i % arenas.len().max(1)).cloned();
         let (radius, totals) = (o.radius, totals.clone());
         let max_hz = o.max_hz;
@@ -700,6 +947,8 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             match sc {
                 "http" => http_loop(http, url, token, deadline, tx).await,
                 "storage" => storage_loop(http, url, token, deadline, tx).await,
+                "chat" => chat_loop(url, token, room, deadline, tx).await,
+                "match" => match_loop(url, token, group, deadline, tx).await,
                 "world" => {
                     world_loop(Player {
                         url,

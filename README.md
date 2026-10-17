@@ -28,7 +28,7 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 | `musubi doctor` | config sanity (built-in secrets are refused outside `musubi dev`), database + pending migrations, data dir, ports; exit 1 if the server would not start |
 | `musubi migrate` | apply migrations and exit |
 | `musubi export --out dump.jsonl` / `musubi import --input dump.jsonl [--replace]` | move game data between environments (every `musubi` table except runtime state, foreign-key order, idempotent import) |
-| `musubi bench --url … --clients 50 --duration-secs 10 --scenario http\|storage\|ws\|all` | load generator with p50/p95/p99, throughput, errors and 429s |
+| `musubi bench --url … --clients 50 --duration-secs 10 --scenario http\|storage\|ws\|chat\|match\|world\|all [--match-size 8]` | load generator with p50/p95/p99, throughput, errors and 429s (`chat`: rooms of 50, send → own echo; `match`: relayed matches of `match_size` players at 30 Hz, relay latency measured at the receivers) |
 | `musubi config --format json` | effective configuration (secrets included — do not paste it anywhere) |
 
 Server-to-server keys: `http.server_key` is the bootstrap admin key; issue scoped keys with
