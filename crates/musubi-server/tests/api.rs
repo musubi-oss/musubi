@@ -12001,3 +12001,124 @@ async fn player_reports_queue_and_ban_from_decision() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn limited_grants_cap_server_grants_per_window() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("lg-")})),
+    )
+    .await;
+    let acc = v["account_id"].as_str().unwrap().to_string();
+    let (cur, item) = (unique("lgc"), unique("lgi-"));
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": cur, "name": "Gold", "max_balance": 1_000_000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": item, "name": "Key", "category": "misc", "stackable": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // bad kinds / values
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/grant_limits",
+        k,
+        Some(json!({"kind": "xp", "key": cur, "window_secs": 60, "max_per_account": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/grant_limits",
+        k,
+        Some(json!({"kind": "currency", "key": cur, "window_secs": 60, "max_per_account": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/grant_limits",
+        k,
+        Some(json!({"kind": "item", "key": item, "window_secs": 60, "max_per_account": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // 60 ok, +50 → 429, +40 ok (exactly 100), negative deltas never limited
+    let adj = |d: i64| json!({"account_id": acc, "currency": cur, "delta": d, "reason": "test"});
+    let (st, v) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(adj(60))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(adj(50))).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(v["code"], "resource_exhausted");
+    let (st, _) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(adj(40))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(adj(-30))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(adj(1))).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    // items: one per window
+    let gi = json!({"account_id": acc, "item_id": item, "quantity": 1});
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(gi.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/inventory/grant", k, Some(gi)).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    // usage visible, limit removable → grants flow again
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{acc}/grants"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["grants"].as_array().unwrap().len(), 3, "{v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/grant_limits", k, None).await;
+    assert!(v["limits"].as_array().unwrap().len() >= 2, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/grant_limits/currency/{cur}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(adj(1000))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/grant_limits/currency/{cur}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

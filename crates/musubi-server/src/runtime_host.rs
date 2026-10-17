@@ -167,10 +167,19 @@ impl ServerHost {
                 let delta = req["delta"]
                     .as_i64()
                     .ok_or_else(|| Error::InvalidArgument("wallet.adjust needs `delta`".into()))?;
+                let who = account(&req, ctx)?;
+                crate::grant_limits::check(
+                    &s.db,
+                    who,
+                    "currency",
+                    str_field(&req, "currency")?,
+                    delta,
+                )
+                .await?;
                 let (entry, replayed) = s
                     .economy
                     .adjust(
-                        account(&req, ctx)?,
+                        who,
                         str_field(&req, "currency")?,
                         delta,
                         req["reason"].as_str().unwrap_or("runtime"),
@@ -179,19 +188,36 @@ impl ServerHost {
                         req.get("metadata").cloned().unwrap_or(json!({})),
                     )
                     .await?;
+                if !replayed {
+                    crate::grant_limits::record(
+                        &s.db,
+                        who,
+                        "currency",
+                        str_field(&req, "currency")?,
+                        delta,
+                    )
+                    .await?;
+                }
                 Ok(json!({ "entry": to_json(entry)?, "replayed": replayed }))
             }
             "inventory.get" => to_json(s.economy.inventory(account(&req, ctx)?).await?),
-            "inventory.grant" => to_json(
-                s.economy
+            "inventory.grant" => {
+                let who = account(&req, ctx)?;
+                let item = str_field(&req, "item_id")?;
+                let qty = req["quantity"].as_i64().unwrap_or(1);
+                crate::grant_limits::check(&s.db, who, "item", item, qty).await?;
+                let e = s
+                    .economy
                     .grant_item(
-                        account(&req, ctx)?,
-                        str_field(&req, "item_id")?,
-                        req["quantity"].as_i64().unwrap_or(1),
+                        who,
+                        item,
+                        qty,
                         req.get("instance").cloned().unwrap_or(json!({})),
                     )
-                    .await?,
-            ),
+                    .await?;
+                crate::grant_limits::record(&s.db, who, "item", item, qty).await?;
+                to_json(e)
+            }
             "notify.send" => {
                 s.notify
                     .send(vec![NewNotification {

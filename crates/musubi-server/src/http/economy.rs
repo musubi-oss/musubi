@@ -115,6 +115,15 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/wallet/adjust", post(adjust))
         .route("/v1/server/items", get(items).post(upsert_item))
         .route("/v1/server/inventory/grant", post(grant_item))
+        .route(
+            "/v1/server/grant_limits",
+            get(grant_limits).put(put_grant_limit),
+        )
+        .route(
+            "/v1/server/grant_limits/{kind}/{key}",
+            axum::routing::delete(delete_grant_limit),
+        )
+        .route("/v1/admin/accounts/{id}/grants", get(account_grants))
         .route("/v1/server/store", get(store_all).post(upsert_store_item))
         .route("/v1/server/store/coupons", get(coupons).put(upsert_coupon))
         .route(
@@ -273,10 +282,13 @@ async fn adjust(
     ServerKey: ServerKey,
     Json(r): Json<AdjustReq>,
 ) -> Result<Json<Value>, ApiError> {
+    let who = account(&r.account_id)?;
+    crate::grant_limits::check(&s.db, who, "currency", &r.currency, r.delta).await?;
+    crate::grant_limits::record(&s.db, who, "currency", &r.currency, r.delta).await?;
     let (entry, replayed) = s
         .economy
         .adjust(
-            account(&r.account_id)?,
+            who,
             &r.currency,
             r.delta,
             &r.reason,
@@ -321,11 +333,61 @@ async fn grant_item(
     ServerKey: ServerKey,
     Json(r): Json<GrantItemReq>,
 ) -> Result<Json<Value>, ApiError> {
+    let who = account(&r.account_id)?;
+    crate::grant_limits::check(&s.db, who, "item", &r.item_id, r.quantity).await?;
     let e = s
         .economy
-        .grant_item(account(&r.account_id)?, &r.item_id, r.quantity, r.instance)
+        .grant_item(who, &r.item_id, r.quantity, r.instance)
         .await?;
+    crate::grant_limits::record(&s.db, who, "item", &r.item_id, r.quantity).await?;
     Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+}
+
+async fn grant_limits(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "limits": crate::grant_limits::list(&s.db).await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct GrantLimitReq {
+    kind: String,
+    key: String,
+    window_secs: i32,
+    max_per_account: i64,
+}
+
+async fn put_grant_limit(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<GrantLimitReq>,
+) -> Result<Json<Value>, ApiError> {
+    crate::grant_limits::upsert(&s.db, &r.kind, &r.key, r.window_secs, r.max_per_account).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_grant_limit(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((kind, key)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    if !crate::grant_limits::delete(&s.db, &kind, &key).await? {
+        return Err(Error::NotFound("grant limit".into()).into());
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn account_grants(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "grants": crate::grant_limits::usage(&s.db, AccountId(id)).await? }),
+    ))
 }
 
 async fn store_all(
@@ -458,10 +520,13 @@ async fn reward_grant(
     ServerKey: ServerKey,
     Json(r): Json<RewardGrantReq>,
 ) -> Result<Json<Value>, ApiError> {
+    let who = account(&r.account_id)?;
+    crate::grant_limits::check(&s.db, who, "reward_table", &r.table_id, 1).await?;
     let rewards = s
         .economy
-        .grant_table(account(&r.account_id)?, &r.table_id, &r.reference)
+        .grant_table(who, &r.table_id, &r.reference)
         .await?;
+    crate::grant_limits::record(&s.db, who, "reward_table", &r.table_id, 1).await?;
     Ok(Json(json!({ "rewards": rewards })))
 }
 
