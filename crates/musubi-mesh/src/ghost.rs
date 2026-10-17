@@ -72,6 +72,10 @@ impl GhostSendState {
     pub fn tracked(&self) -> usize {
         self.sent.len()
     }
+    /// Revision of `id` the neighbours hold (what a handover may build on), if it was ever sent.
+    pub fn sent_rev(&self, id: EntityId) -> Option<u64> {
+        self.sent.get(&id).map(|(r, _)| *r)
+    }
     /// Forget everything: the next delta is a keyframe (a neighbour asked for a resync).
     pub fn reset(&mut self) {
         self.sent.clear();
@@ -236,6 +240,10 @@ impl GhostCache {
         true
     }
 
+    /// Remove and return a ghost: it is being promoted to an owned entity by a handover.
+    pub fn take(&mut self, id: EntityId) -> Option<Entity> {
+        self.entities.remove(&id)
+    }
     pub fn is_synced(&self) -> bool {
         self.synced
     }

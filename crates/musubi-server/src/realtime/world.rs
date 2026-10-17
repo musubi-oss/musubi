@@ -29,6 +29,29 @@ const SNAPSHOT_EVERY: u64 = 150;
 /// Controller pass every N ticks (1 s at 30 Hz).
 pub const CONTROL_EVERY: u64 = 30;
 
+/// Ship an entity to the node hosting its new cell. When the neighbours already hold it as a
+/// ghost, only the components newer than the revision they have travel (`base_rev`); the
+/// receiver merges them onto its ghost. After a `resend_full` refusal the full state goes.
+fn ship_handover(
+    st: &mut WorldState,
+    fanout: &Fanout,
+    name: &str,
+    node_id: Uuid,
+    mut e: Entity,
+    inputs: Vec<Value>,
+) {
+    let id = e.id;
+    let base = if st.full_resend.remove(&id) {
+        None
+    } else {
+        st.ghost_send.values().find_map(|g| g.sent_rev(id))
+    };
+    if let Some(r) = base {
+        e.components.retain(|_, c| c.changed_rev > r);
+    }
+    fanout.world_handover(name, e, node_id, inputs, false, base);
+}
+
 struct WorldState {
     world: World,
     controller: Controller,
@@ -44,6 +67,8 @@ struct WorldState {
     remote_ghosts: HashMap<CellId, musubi_mesh::GhostCache>,
     /// Per leased cell: what the neighbours already hold, so each tick sends only the changes.
     ghost_send: HashMap<CellId, musubi_mesh::GhostSendState>,
+    /// Entities whose next handover must carry the full state (the receiver had no ghost of them).
+    full_resend: std::collections::HashSet<EntityId>,
     /// This shard exists only for cells assigned to this node (it is not the world's home).
     hosted_only: bool,
     /// The world's home node as of shard creation: cells without an explicit host live there.
@@ -482,7 +507,7 @@ impl WorldRegistry {
             st.world.forget_for_clients(id);
             st.world.despawn(id);
             e.transit = None;
-            fanout.world_handover(name, e, self.node_id, inputs, true);
+            fanout.world_handover(name, e, self.node_id, inputs, true, None);
         }
         if let Some(sim) = st.world.revoke_lease(cell) {
             push_event(
@@ -568,6 +593,7 @@ impl WorldRegistry {
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
                     ghost_send: HashMap::new(),
+                    full_resend: std::collections::HashSet::new(),
                     sub_opts: HashMap::new(),
                     hosted_only: true,
                     home_node: home,
@@ -1281,6 +1307,7 @@ impl WorldRegistry {
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
+                full_resend: std::collections::HashSet::new(),
             sub_opts: HashMap::new(),
                     hosted_only: false,
                     home_node: None,
@@ -1721,6 +1748,7 @@ impl WorldRegistry {
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
+                full_resend: std::collections::HashSet::new(),
                 sub_opts: HashMap::new(),
                 hosted_only: false,
                 home_node: None,
@@ -2283,6 +2311,7 @@ impl WorldRegistry {
     /// An entity handed over from another node into a cell hosted here. Taken when a local
     /// simulator owns the cell (it gets a `handover_arrived` event with the state and the inputs
     /// buffered so far); refused otherwise. Nodes that do not host the cell stay silent.
+    #[allow(clippy::too_many_arguments)]
     pub fn accept_handover(
         &self,
         name: &str,
@@ -2290,6 +2319,7 @@ impl WorldRegistry {
         from_node: Uuid,
         inputs: Vec<Value>,
         forced: bool,
+        base_rev: Option<u64>,
         fanout: &Fanout,
     ) -> bool {
         let Some(w) = self.worlds.get(name) else {
@@ -2315,12 +2345,37 @@ impl WorldRegistry {
         if st.world.get(id).is_some() {
             // already taken earlier; the ack was lost — answer again, keep our copy
             tracing::warn!(world = name, %id, %from_node, "handover re-acked (duplicate delivery)");
-            fanout.world_handover_ack(name, id, from_node, true);
+            fanout.world_handover_ack(name, id, from_node, true, false);
             return false;
         }
+        let entity = match base_rev {
+            None => entity,
+            Some(base) => match st.remote_ghosts.values_mut().find_map(|c| c.take(id)) {
+                Some(mut g) if g.rev >= base => {
+                    g.components.extend(entity.components);
+                    g.pos = entity.pos;
+                    g.cell = entity.cell;
+                    g.rev = entity.rev;
+                    g.changed_tick = entity.changed_tick;
+                    g.persistent = entity.persistent;
+                    g.attached_to = entity.attached_to;
+                    g.decay_ticks = entity.decay_ticks;
+                    g.touched_tick = entity.touched_tick;
+                    g.handover_attempts = entity.handover_attempts;
+                    g.handover_retry_tick = entity.handover_retry_tick;
+                    g.transit = None;
+                    g
+                }
+                _ => {
+                    tracing::info!(world = name, %id, %from_node, base, "handover: no ghost to build on, asking for the full state");
+                    fanout.world_handover_ack(name, id, from_node, false, true);
+                    return false;
+                }
+            },
+        };
         let owner = st.world.owner(cell);
         if owner.is_none() && !forced {
-            fanout.world_handover_ack(name, id, from_node, false);
+            fanout.world_handover_ack(name, id, from_node, false, false);
             return false;
         }
         if entity.persistent {
@@ -2356,13 +2411,20 @@ impl WorldRegistry {
             // or a crash in between loses the entity — the caller flushes, then acks
             return true;
         }
-        fanout.world_handover_ack(name, id, from_node, true);
+        fanout.world_handover_ack(name, id, from_node, true, false);
         false
     }
 
     /// The other node answered our handover: on success the entity leaves this shard (inputs
     /// buffered meanwhile follow it over the bus), on refusal it stays with its owner.
-    pub fn handover_acked(&self, name: &str, id: EntityId, accepted: bool, fanout: &Fanout) {
+    pub fn handover_acked(
+        &self,
+        name: &str,
+        id: EntityId,
+        accepted: bool,
+        resend_full: bool,
+        fanout: &Fanout,
+    ) {
         let Some(w) = self.worlds.get(name) else {
             return;
         };
@@ -2396,6 +2458,9 @@ impl WorldRegistry {
             return;
         };
         st.remote_transit.remove(&id);
+        if !accepted && resend_full {
+            st.full_resend.insert(id);
+        }
         if accepted {
             let inputs = st.world.take_buffered_inputs(id);
             let persistent = st.world.get(id).is_some_and(|e| e.persistent);
@@ -2714,18 +2779,19 @@ impl WorldRegistry {
                             .unwrap_or_default();
                         let mut shipped = e;
                         shipped.transit = None;
-                        fanout.world_handover(&name, shipped, self.node_id, inputs, false);
+                        ship_handover(&mut *st, fanout, &name, self.node_id, shipped, inputs);
                         // attached entities travel with their root (plan 4.5)
                         for m in group {
                             if let Some(mut part) = st.world.get(m).cloned() {
                                 let part_inputs = st.world.take_buffered_inputs(m);
                                 part.transit = None;
-                                fanout.world_handover(
+                                ship_handover(
+                                    &mut *st,
+                                    fanout,
                                     &name,
-                                    part,
                                     self.node_id,
+                                    part,
                                     part_inputs,
-                                    false,
                                 );
                             }
                         }
@@ -2900,12 +2966,13 @@ impl WorldRegistry {
                             for m in std::iter::once(entity).chain(group) {
                                 if let Some(mut e) = st.world.get(m).cloned() {
                                     e.transit = None;
-                                    fanout.world_handover(
+                                    ship_handover(
+                                        &mut *st,
+                                        fanout,
                                         &name,
-                                        e,
                                         self.node_id,
+                                        e,
                                         Vec::new(),
-                                        false,
                                     );
                                 }
                             }

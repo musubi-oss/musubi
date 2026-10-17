@@ -93,6 +93,10 @@ enum Wire {
         inputs: Vec<serde_json::Value>,
         /// Cell migration: the host takes the entity even without a simulator on the cell.
         forced: bool,
+        /// Set when `entity` carries only the components newer than this revision: the receiver
+        /// already holds the rest as a ghost streamed by `WorldGhosts` and merges onto it.
+        #[serde(default)]
+        base_rev: Option<u64>,
     },
     /// Receiving host → `from_node`: handover taken (or refused: no simulator owns the cell).
     WorldHandoverAck {
@@ -100,6 +104,10 @@ enum Wire {
         entity: musubi_mesh::EntityId,
         from_node: uuid::Uuid,
         accepted: bool,
+        /// Refused because the receiver had no ghost to build a partial handover on: the sender
+        /// retries with the full state.
+        #[serde(default)]
+        resend_full: bool,
     },
     /// Input for an entity that lives on another node (e.g. buffered during a handover).
     WorldInput {
@@ -360,6 +368,7 @@ impl Fanout {
         from_node: uuid::Uuid,
         inputs: Vec<serde_json::Value>,
         forced: bool,
+        base_rev: Option<u64>,
     ) {
         self.publish(Wire::WorldHandover {
             world: world.to_string(),
@@ -367,6 +376,7 @@ impl Fanout {
             from_node,
             inputs,
             forced,
+            base_rev,
         });
     }
 
@@ -377,12 +387,14 @@ impl Fanout {
         entity: musubi_mesh::EntityId,
         from_node: uuid::Uuid,
         accepted: bool,
+        resend_full: bool,
     ) {
         self.publish(Wire::WorldHandoverAck {
             world: world.to_string(),
             entity,
             from_node,
             accepted,
+            resend_full,
         });
     }
 
@@ -664,16 +676,18 @@ impl Fanout {
                 from_node,
                 inputs,
                 forced,
+                base_rev,
             }) => {
                 if let Some(w) = self.worlds.get().cloned() {
                     let id = entity.id;
-                    if w.accept_handover(&world, entity, from_node, inputs, forced, self) {
+                    if w.accept_handover(&world, entity, from_node, inputs, forced, base_rev, self)
+                    {
                         let me = self.clone();
                         tokio::spawn(async move {
                             if let Err(e) = w.flush_journal(&world).await {
                                 tracing::warn!(world = %world, error = %e, "handover journal flush failed");
                             }
-                            me.world_handover_ack(&world, id, from_node, true);
+                            me.world_handover_ack(&world, id, from_node, true, false);
                         });
                     }
                 }
@@ -683,10 +697,11 @@ impl Fanout {
                 entity,
                 from_node,
                 accepted,
+                resend_full,
             }) => {
                 if let Some(w) = self.worlds.get() {
                     if from_node == w.node_id() {
-                        w.handover_acked(&world, entity, accepted, self);
+                        w.handover_acked(&world, entity, accepted, resend_full, self);
                     }
                 }
             }
