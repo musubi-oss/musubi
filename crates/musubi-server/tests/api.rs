@@ -8909,3 +8909,169 @@ async fn totp_mfa_gates_email_login() {
     assert_eq!(st, StatusCode::OK);
     assert!(s4["access_token"].is_string(), "{s4}");
 }
+
+#[tokio::test]
+async fn fleet_builds_canary_promote_and_usage() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("bfleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "buffer": 1, "max_servers": 2,
+            "port_start": 48000, "port_end": 48100, "spec": {"command": ["sleep", "60"], "vcpu": 2}}))).await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        Some(json!({"version": "bad version!", "spec": {"command": ["sleep", "60"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v1) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        Some(json!({"version": "1.0.0", "spec": {"command": ["sleep", "60"], "vcpu": 2}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v1}");
+    assert_eq!(v1["state"], "active");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        Some(json!({"version": "1.0.0", "spec": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v2) = call_server(&app, "POST", &format!("/v1/server/fleets/{fid}/builds"), k,
+        Some(json!({"version": "1.1.0", "spec": {"command": ["sleep", "60"], "vcpu": 4}, "canary_percent": 100}))).await;
+    assert_eq!(st, StatusCode::OK, "{v2}");
+    assert_eq!(v2["state"], "canary");
+    // a new server picks the 100 % canary
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let _ = svc.reconcile().await.unwrap();
+    let (_, list) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let servers = list["servers"].as_array().unwrap();
+    assert!(!servers.is_empty(), "{list}");
+    assert!(
+        servers.iter().all(|s| s["build_version"] == "1.1.0"),
+        "{list}"
+    );
+    // promote the canary: it is active, 1.0.0 retired; the active build cannot be retired
+    let (st, p) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds/1.1.0/promote"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    assert_eq!(p["state"], "active");
+    let (_, b) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        None,
+    )
+    .await;
+    let state = |v: &str| {
+        b["builds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["version"] == v)
+            .unwrap()["state"]
+            .clone()
+    };
+    assert_eq!(state("1.1.0"), "active");
+    assert_eq!(state("1.0.0"), "retired");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/{fid}/builds/1.1.0"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // rollback = promote the old build
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds/1.0.0/promote"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/{fid}/builds/1.1.0"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds/nope/promote"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // usage: the running server counts with the canary's 4 vCPU
+    let (st, u) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/usage"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+    let rows = u["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{u}");
+    assert_eq!(rows[0]["build_version"], "1.1.0");
+    assert_eq!(rows[0]["servers"], servers.len() as i64);
+    assert!(rows[0]["vcpu_hours"].as_f64().unwrap() >= 0.0);
+    assert_eq!(u["vcpu_hours"], rows[0]["vcpu_hours"]);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/usage?from=2030-01-01T00:00:00Z"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // stop what we started
+    let (_, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"buffer": 0, "min_servers": 0})),
+    )
+    .await;
+    let _ = svc.reconcile().await;
+}

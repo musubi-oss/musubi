@@ -32,6 +32,8 @@ pub struct FleetSpec {
     pub image: Option<String>,
     pub env: HashMap<String, String>,
     pub working_dir: Option<String>,
+    /// vCPUs one server uses, for usage accounting (default 1).
+    pub vcpu: Option<f64>,
 }
 
 /// Autoscale policy (plan 05): buffer overrides by schedule plus an optional demand forecast.
@@ -242,7 +244,72 @@ pub struct GameServer {
     pub last_health: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Fleet build this server was started from (`None` = the fleet's own spec).
+    pub build_version: Option<String>,
 }
+
+/// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
+/// `canary_percent` of new servers (optionally only in `canary_regions`), `retired` is kept for rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetBuild {
+    pub fleet_id: Uuid,
+    pub version: String,
+    pub spec: FleetSpec,
+    pub state: String,
+    pub canary_percent: i32,
+    pub canary_regions: Vec<String>,
+    pub notes: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CreateBuild {
+    pub version: String,
+    pub spec: FleetSpec,
+    /// > 0 makes this a canary taking that share of new servers; 0 makes it the active build at once.
+    pub canary_percent: i32,
+    pub canary_regions: Vec<String>,
+    pub notes: String,
+}
+
+/// vCPU-hours consumed by a fleet's servers inside a window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRow {
+    pub region: String,
+    pub provider: String,
+    pub build_version: Option<String>,
+    pub servers: i64,
+    pub vcpu_hours: f64,
+}
+
+type BuildRow = (
+    Uuid,
+    String,
+    serde_json::Value,
+    String,
+    i32,
+    Vec<String>,
+    String,
+    OffsetDateTime,
+);
+
+fn row_to_build(r: BuildRow) -> FleetBuild {
+    FleetBuild {
+        fleet_id: r.0,
+        version: r.1,
+        spec: serde_json::from_value(r.2).unwrap_or_default(),
+        state: r.3,
+        canary_percent: r.4,
+        canary_regions: r.5,
+        notes: r.6,
+        created_at: r.7,
+    }
+}
+
+const BUILD_COLS: &str =
+    "fleet_id, version, spec, state, canary_percent, canary_regions, notes, created_at";
 
 /// What a client gets back from an allocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +483,7 @@ type ServerRow = (
     Option<serde_json::Value>,
     OffsetDateTime,
     OffsetDateTime,
+    Option<String>,
 );
 
 fn row_to_server(r: ServerRow) -> GameServer {
@@ -431,13 +499,14 @@ fn row_to_server(r: ServerRow) -> GameServer {
         allocation: r.8,
         last_health: r.9,
         created_at: r.10,
+        build_version: r.11,
     }
 }
 
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version";
 
 impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
@@ -637,7 +706,9 @@ impl FleetService {
     async fn set_state(&self, id: Uuid, from: &[&str], to: &str) -> Result<GameServer> {
         let froms: Vec<String> = from.iter().map(|s| s.to_string()).collect();
         let r = sqlx::query_as::<_, ServerRow>(&format!(
-            "update musubi.game_servers set state = $2, updated_at = now(), last_health = now()
+            "update musubi.game_servers set state = $2, updated_at = now(), last_health = now(),
+               ready_at = case when $2 = 'ready' then coalesce(ready_at, now()) else ready_at end,
+               terminated_at = case when $2 = 'terminated' then coalesce(terminated_at, now()) else terminated_at end
              where id = $1 and (cardinality($3::text[]) = 0 or state = any($3)) returning {SERVER_COLS}"
         ))
         .bind(id)
@@ -821,7 +892,7 @@ impl FleetService {
             p.stop(id).await;
         }
         let _ = sqlx::query(
-            "update musubi.game_servers set state = 'terminated', updated_at = now() where id = $1",
+            "update musubi.game_servers set state = 'terminated', terminated_at = coalesce(terminated_at, now()), updated_at = now() where id = $1",
         )
         .bind(id)
         .execute(&self.db)
@@ -851,11 +922,18 @@ impl FleetService {
             })?;
         let id = Uuid::now_v7();
         let port = self.free_port(f).await?;
-        sqlx::query("insert into musubi.game_servers (id, fleet_id, state, node_id, port) values ($1, $2, 'starting', $3, $4)")
+        let build = self.pick_build(f).await?;
+        let mut with_build = f.clone();
+        if let Some(b) = &build {
+            with_build.spec = b.spec.clone();
+        }
+        let f = &with_build;
+        sqlx::query("insert into musubi.game_servers (id, fleet_id, state, node_id, port, build_version) values ($1, $2, 'starting', $3, $4, $5)")
             .bind(id)
             .bind(f.id)
             .bind(self.node_id)
             .bind(port)
+            .bind(build.as_ref().map(|b| b.version.clone()))
             .execute(&self.db)
             .await
             .map_err(Error::internal)?;
@@ -881,7 +959,7 @@ impl FleetService {
                 self.server(id).await
             }
             Err(e) => {
-                let _ = sqlx::query("update musubi.game_servers set state = 'terminated', labels = labels || jsonb_build_object('error', $2::text) where id = $1")
+                let _ = sqlx::query("update musubi.game_servers set state = 'terminated', terminated_at = coalesce(terminated_at, now()), labels = labels || jsonb_build_object('error', $2::text) where id = $1")
                     .bind(id)
                     .bind(e.to_string())
                     .execute(&self.db)
@@ -889,6 +967,186 @@ impl FleetService {
                 Err(e)
             }
         }
+    }
+
+    /// Which build a new server of `f` should run: the canary with probability `canary_percent`
+    /// (when its regions allow the fleet's region), else the active build, else none (fleet spec).
+    async fn pick_build(&self, f: &Fleet) -> Result<Option<FleetBuild>> {
+        let builds = self.builds(f.id).await?;
+        let canary = builds.iter().find(|b| {
+            b.state == "canary"
+                && b.canary_percent > 0
+                && (b.canary_regions.is_empty() || b.canary_regions.iter().any(|r| r == &f.region))
+        });
+        if let Some(c) = canary {
+            let roll = (Uuid::now_v7().as_bytes()[15] % 100) as i32;
+            if roll < c.canary_percent {
+                return Ok(Some(c.clone()));
+            }
+        }
+        Ok(builds.into_iter().find(|b| b.state == "active"))
+    }
+
+    pub async fn builds(&self, fleet_id: Uuid) -> Result<Vec<FleetBuild>> {
+        let rows: Vec<BuildRow> = sqlx::query_as(&format!(
+            "select {BUILD_COLS} from musubi.fleet_builds where fleet_id = $1 order by created_at desc"
+        ))
+        .bind(fleet_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(row_to_build).collect())
+    }
+
+    /// Register a build. `canary_percent` 0 makes it active right away (the previous active build
+    /// is retired, kept for rollback); > 0 makes it a canary alongside the current active build.
+    pub async fn add_build(&self, fleet_id: Uuid, c: CreateBuild) -> Result<FleetBuild> {
+        let v = c.version.trim();
+        if v.is_empty()
+            || v.len() > 64
+            || !v
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
+        {
+            return Err(Error::InvalidArgument(
+                "version must be 1..=64 of [A-Za-z0-9._-+]".into(),
+            ));
+        }
+        if !(0..=100).contains(&c.canary_percent) {
+            return Err(Error::InvalidArgument(
+                "canary_percent must be 0..=100".into(),
+            ));
+        }
+        self.get(fleet_id).await?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let state = if c.canary_percent > 0 {
+            "canary"
+        } else {
+            "active"
+        };
+        if state == "active" {
+            sqlx::query("update musubi.fleet_builds set state = 'retired', updated_at = now() where fleet_id = $1 and state = 'active'")
+                .bind(fleet_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+        }
+        let ins = sqlx::query_as::<_, BuildRow>(&format!(
+            "insert into musubi.fleet_builds (fleet_id, version, spec, state, canary_percent, canary_regions, notes)
+             values ($1, $2, $3, $4, $5, $6, $7) returning {BUILD_COLS}"
+        ))
+        .bind(fleet_id)
+        .bind(v)
+        .bind(serde_json::to_value(&c.spec).map_err(Error::internal)?)
+        .bind(state)
+        .bind(c.canary_percent)
+        .bind(&c.canary_regions)
+        .bind(&c.notes)
+        .fetch_one(&mut *tx)
+        .await;
+        let row = match ins {
+            Ok(r) => r,
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                return Err(Error::AlreadyExists(format!("build {v} exists")))
+            }
+            Err(e) => return Err(Error::internal(e)),
+        };
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(row_to_build(row))
+    }
+
+    /// Make `version` the active build (promote a canary, or roll back to a retired build);
+    /// every other build is retired. Running servers are not touched.
+    pub async fn promote_build(&self, fleet_id: Uuid, version: &str) -> Result<FleetBuild> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let row: Option<BuildRow> = sqlx::query_as(&format!(
+            "update musubi.fleet_builds set state = 'active', canary_percent = 0, updated_at = now()
+             where fleet_id = $1 and version = $2 returning {BUILD_COLS}"
+        ))
+        .bind(fleet_id)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let Some(row) = row else {
+            return Err(Error::NotFound("build".into()));
+        };
+        sqlx::query("update musubi.fleet_builds set state = 'retired', updated_at = now() where fleet_id = $1 and version <> $2 and state <> 'retired'")
+            .bind(fleet_id)
+            .bind(version)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(row_to_build(row))
+    }
+
+    /// Retire a canary or an old build; the active build cannot be retired (promote another first).
+    pub async fn retire_build(&self, fleet_id: Uuid, version: &str) -> Result<()> {
+        let state: Option<String> = sqlx::query_scalar(
+            "select state from musubi.fleet_builds where fleet_id = $1 and version = $2",
+        )
+        .bind(fleet_id)
+        .bind(version)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        match state.as_deref() {
+            None => Err(Error::NotFound("build".into())),
+            Some("active") => Err(Error::Conflict("cannot retire the active build".into())),
+            Some(_) => {
+                sqlx::query("update musubi.fleet_builds set state = 'retired', canary_percent = 0, updated_at = now() where fleet_id = $1 and version = $2")
+                    .bind(fleet_id)
+                    .bind(version)
+                    .execute(&self.db)
+                    .await
+                    .map_err(Error::internal)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// vCPU-hours of this fleet's servers overlapping [from, to), by build: a server counts from
+    /// its start until termination (or `to` while still running) × the spec's vCPUs (default 1).
+    pub async fn usage(
+        &self,
+        fleet_id: Uuid,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Result<Vec<UsageRow>> {
+        let f = self.get(fleet_id).await?;
+        let builds = self.builds(fleet_id).await?;
+        let rows: Vec<(Option<String>, i64, f64)> = sqlx::query_as(
+            "select build_version, count(*),
+                    coalesce(sum(extract(epoch from (least(coalesce(terminated_at, now()), $3) - greatest(created_at, $2)))), 0)::float8 / 3600
+             from musubi.game_servers
+             where fleet_id = $1 and created_at < $3 and coalesce(terminated_at, now()) > $2
+             group by build_version order by build_version",
+        )
+        .bind(fleet_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(bv, servers, hours)| {
+                let vcpu = bv
+                    .as_deref()
+                    .and_then(|v| builds.iter().find(|b| b.version == v))
+                    .map(|b| b.spec.vcpu)
+                    .unwrap_or(f.spec.vcpu)
+                    .unwrap_or(1.0);
+                UsageRow {
+                    region: f.region.clone(),
+                    provider: f.provider.clone(),
+                    build_version: bv,
+                    servers,
+                    vcpu_hours: hours * vcpu,
+                }
+            })
+            .collect())
     }
 
     /// One reconcile pass over every fleet: reap dead/unhealthy servers, then size the ready pool to

@@ -115,6 +115,7 @@ fn fleet() -> Fleet {
                 .into_iter()
                 .collect(),
             working_dir: None,
+            vcpu: None,
         },
         buffer: 1,
         max_servers: 2,

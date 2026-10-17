@@ -22,6 +22,16 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets/{id}/allocate", post(allocate))
         .route("/v1/server/fleets/{id}/servers", get(servers))
         .route("/v1/server/fleets/{id}/demand", get(demand))
+        .route("/v1/server/fleets/{id}/builds", get(builds).post(add_build))
+        .route(
+            "/v1/server/fleets/{id}/builds/{version}",
+            axum::routing::delete(retire_build),
+        )
+        .route(
+            "/v1/server/fleets/{id}/builds/{version}/promote",
+            post(promote_build),
+        )
+        .route("/v1/server/fleets/{id}/usage", get(usage))
         .route(
             "/v1/server/gameservers/{id}",
             get(server_get).delete(server_delete),
@@ -240,5 +250,103 @@ async fn sdk_connect(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         s.fleets.sdk_connect(self_id(&headers)?, &r.token).await?,
+    ))
+}
+
+async fn builds(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse(&id)?;
+    s.fleets.get(id).await?;
+    let builds: Vec<musubi_fleet::FleetBuild> = s.fleets.builds(id).await?;
+    Ok(Json(json!({ "builds": builds })))
+}
+
+async fn add_build(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(c): Json<musubi_fleet::CreateBuild>,
+) -> Result<Json<musubi_fleet::FleetBuild>, ApiError> {
+    let id = parse(&id)?;
+    let b = s.fleets.add_build(id, c).await?;
+    s.events
+        .emit(
+            "fleet.build_added",
+            None,
+            json!({ "fleet_id": id, "version": b.version, "state": b.state }),
+        )
+        .await;
+    Ok(Json(b))
+}
+
+async fn promote_build(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Json<musubi_fleet::FleetBuild>, ApiError> {
+    let id = parse(&id)?;
+    let b = s.fleets.promote_build(id, &version).await?;
+    s.events
+        .emit(
+            "fleet.build_promoted",
+            None,
+            json!({ "fleet_id": id, "version": b.version }),
+        )
+        .await;
+    Ok(Json(b))
+}
+
+async fn retire_build(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse(&id)?;
+    s.fleets.retire_build(id, &version).await?;
+    Ok(Json(json!({ "retired": version })))
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct UsageQuery {
+    /// RFC 3339; default = 30 days ago.
+    from: Option<String>,
+    /// RFC 3339; default = now.
+    to: Option<String>,
+}
+
+fn parse_time(
+    s: Option<&str>,
+    default: time::OffsetDateTime,
+) -> Result<time::OffsetDateTime, ApiError> {
+    match s {
+        None => Ok(default),
+        Some(s) => time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| {
+                musubi_core::Error::InvalidArgument("from/to must be RFC 3339".into()).into()
+            }),
+    }
+}
+
+async fn usage(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse(&id)?;
+    let now = time::OffsetDateTime::now_utc();
+    let to = parse_time(q.to.as_deref(), now)?;
+    let from = parse_time(q.from.as_deref(), now - time::Duration::days(30))?;
+    if from >= to {
+        return Err(musubi_core::Error::InvalidArgument("from must be before to".into()).into());
+    }
+    let rows: Vec<musubi_fleet::UsageRow> = s.fleets.usage(id, from, to).await?;
+    let total: f64 = rows.iter().map(|r| r.vcpu_hours).sum();
+    Ok(Json(
+        json!({ "from": from.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(), "to": to.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(), "rows": rows, "vcpu_hours": total }),
     ))
 }
