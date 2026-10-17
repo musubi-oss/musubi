@@ -89,6 +89,9 @@ enum Wire {
     WorldRepl {
         world: String,
         from_node: uuid::Uuid,
+        /// Host incarnation: a mirror never goes back to an older epoch of the cell's host.
+        #[serde(default)]
+        epoch: i64,
         replicas: Vec<uuid::Uuid>,
         delta: musubi_mesh::GhostDelta,
     },
@@ -406,12 +409,14 @@ impl Fanout {
         &self,
         world: &str,
         from_node: uuid::Uuid,
+        epoch: i64,
         replicas: Vec<uuid::Uuid>,
         delta: musubi_mesh::GhostDelta,
     ) {
         self.publish(Wire::WorldRepl {
             world: world.to_string(),
             from_node,
+            epoch,
             replicas,
             delta,
         });
@@ -798,11 +803,12 @@ impl Fanout {
             Ok(Wire::WorldRepl {
                 world,
                 from_node,
+                epoch,
                 replicas,
                 delta,
             }) => {
                 if let Some(w) = self.worlds.get() {
-                    w.accept_repl(&world, from_node, &replicas, delta, self);
+                    w.accept_repl(&world, from_node, epoch, &replicas, delta, self);
                 }
             }
             Ok(Wire::WorldReplAck {

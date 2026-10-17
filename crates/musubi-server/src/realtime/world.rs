@@ -505,6 +505,9 @@ pub struct WorldCmdEnv {
 /// A standby copy of one cell hosted on `from`, mirrored from its replication stream.
 struct Mirror {
     from: Uuid,
+    /// Incarnation of `from` when it streamed: an older host (restarted node, late packets of a
+    /// replaced host) cannot overwrite a newer mirror.
+    epoch: i64,
     cache: musubi_mesh::GhostCache,
     /// Host tick the mirror is complete up to.
     tick: u64,
@@ -2603,6 +2606,7 @@ impl WorldRegistry {
         &self,
         name: &str,
         from_node: Uuid,
+        epoch: i64,
         replicas: &[Uuid],
         delta: musubi_mesh::GhostDelta,
         fanout: &Fanout,
@@ -2611,25 +2615,30 @@ impl WorldRegistry {
             return;
         }
         let key = (name.to_string(), delta.cell);
-        if self
-            .cell_hosts
-            .get(&key)
-            .is_some_and(|h| *h == self.node_id)
-        {
+        // fenced by the cell directory: only the node it names as host may feed the mirror
+        // (an unknown cell is accepted — the directory may lag a fresh assignment by a tick)
+        if self.cell_hosts.get(&key).is_some_and(|h| *h != from_node) {
             return;
         }
         let (cell, tick) = (delta.cell, delta.tick);
         let mut m = self.mirrors.entry(key).or_insert_with(|| Mirror {
             from: from_node,
+            epoch,
             cache: musubi_mesh::GhostCache::default(),
             tick: 0,
         });
-        if m.from != from_node {
+        // fenced by epoch: a replaced or restarted host streams from a newer incarnation and
+        // must start with a keyframe; anything older than the mirror's source is dropped
+        if epoch < m.epoch {
+            return;
+        }
+        if m.from != from_node || epoch > m.epoch {
             if !delta.keyframe {
                 return;
             }
             *m = Mirror {
                 from: from_node,
+                epoch,
                 cache: musubi_mesh::GhostCache::default(),
                 tick: 0,
             };
@@ -3571,7 +3580,7 @@ impl WorldRegistry {
                 acks.retain(|n, _| targets.contains(n));
             }
             if let Some(d) = st.world.repl_delta(cell, &mut gs) {
-                fanout.world_repl(name, self.node_id, targets, d);
+                fanout.world_repl(name, self.node_id, self.epoch(), targets, d);
             }
             st.repl_send.insert(cell, gs);
         }

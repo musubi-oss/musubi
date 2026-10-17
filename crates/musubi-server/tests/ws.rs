@@ -12954,6 +12954,52 @@ async fn world_replica_takes_over_without_snapshot() {
         "home mirrors the cell hosted on node 2: {:?}",
         info1.mirrors
     );
+    // fenced: a keyframe from a node the directory does not name as host, or from an older
+    // incarnation of the host, must not touch the mirror
+    let mirror_tick = |st: &AppState| {
+        st.worlds
+            .info(&name)
+            .unwrap()
+            .mirrors
+            .iter()
+            .find(|m| m.cell == musubi_mesh::CellId { x: 1, y: 0 })
+            .map(|m| (m.node, m.tick))
+    };
+    let before = mirror_tick(&state1).expect("mirror present");
+    let forged = |keyframe: bool| musubi_mesh::GhostDelta {
+        cell: musubi_mesh::CellId { x: 1, y: 0 },
+        tick: before.1 + 1000,
+        keyframe,
+        upserts: Vec::new(),
+        removed: Vec::new(),
+    };
+    state1.worlds.accept_repl(
+        &name,
+        uuid::Uuid::now_v7(),
+        i64::MAX,
+        &[node1],
+        forged(true),
+        &state1.fanout,
+    );
+    assert_eq!(mirror_tick(&state1), Some(before), "stranger ignored");
+    state1
+        .worlds
+        .accept_repl(&name, node2, -1, &[node1], forged(true), &state1.fanout);
+    assert_eq!(mirror_tick(&state1), Some(before), "older epoch ignored");
+    state1.worlds.accept_repl(
+        &name,
+        node2,
+        i64::MAX,
+        &[node1],
+        forged(false),
+        &state1.fanout,
+    );
+    assert_eq!(
+        mirror_tick(&state1),
+        Some(before),
+        "a newer incarnation must start with a keyframe"
+    );
+
     let rows: Vec<(uuid::Uuid,)> =
         sqlx::query_as("select node_id from musubi.world_snapshots where name = $1")
             .bind(&name)
