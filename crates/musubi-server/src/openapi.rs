@@ -155,6 +155,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/groups/{id}/events", "groups"),
     ("GET", "/v1/friends/recent", "friends"),
     ("GET", "/v1/friends/suggestions", "friends"),
+    ("POST", "/v1/friends/import", "friends"),
     ("PATCH", "/v1/friends/{id}", "friends"),
     ("GET", "/v1/lobbies", "lobbies"),
     ("POST", "/v1/lobbies", "lobbies"),

@@ -16,6 +16,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/friends/block", post(block))
         .route("/v1/friends/recent", get(recent))
         .route("/v1/friends/suggestions", get(suggestions))
+        .route("/v1/friends/import", post(import))
         .route("/v1/friends/{id}", axum::routing::patch(annotate))
 }
 
@@ -90,6 +91,57 @@ async fn resolve(s: &AppState, b: Ids) -> Result<Vec<AccountId>, ApiError> {
         ids.extend(users.into_iter().map(|u| u.id));
     }
     Ok(ids)
+}
+
+#[derive(Deserialize)]
+struct ImportBody {
+    /// Identity provider the ids belong to: `steam`, `xbox`, `psn`, `nintendo`, `oidc:<name>`, …
+    provider: String,
+    /// Platform ids of the player's friends, as the platform SDK reports them.
+    subjects: Vec<String>,
+    /// Also send friend requests to every match.
+    #[serde(default)]
+    add: bool,
+}
+
+/// Platform friends import: the console/launcher friend list only exists on the client, so it
+/// sends the platform ids and the server maps them to accounts here.
+async fn import(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<ImportBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let found = s.accounts.by_identities(&b.provider, &b.subjects).await?;
+    let matches: Vec<serde_json::Value> = found
+        .iter()
+        .filter(|(_, a)| a.id != me.account_id && a.disabled_at.is_none())
+        .map(|(subject, a)| {
+            json!({
+                "subject": subject,
+                "account_id": a.id,
+                "username": a.username,
+                "display_name": a.display_name,
+            })
+        })
+        .collect();
+    let mut added = 0usize;
+    if b.add && !matches.is_empty() {
+        let ids: Vec<musubi_core::AccountId> = found
+            .iter()
+            .filter(|(_, a)| a.id != me.account_id && a.disabled_at.is_none())
+            .map(|(_, a)| a.id)
+            .collect();
+        let outcomes = s.social.add(me.account_id, &ids).await?;
+        added = outcomes.len();
+        s.events
+            .emit(
+                "friend.added",
+                Some(me.account_id),
+                json!({ "ids": ids, "outcomes": outcomes, "import": b.provider }),
+            )
+            .await;
+    }
+    Ok(Json(json!({ "matches": matches, "added": added })))
 }
 
 async fn add(

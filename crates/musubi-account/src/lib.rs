@@ -561,6 +561,63 @@ impl AccountService {
 
     /// `search` narrowed to accounts holding a linked identity `provider:subject` (device id,
     /// e-mail, Steam id, `oidc:<name>` subject, passkey credential id …) when `identity` is set.
+    /// Accounts holding any of `subjects` under `provider` (platform friends import): live
+    /// accounts only, in the order of `subjects`, unknown subjects skipped.
+    pub async fn by_identities(
+        &self,
+        provider: &str,
+        subjects: &[String],
+    ) -> Result<Vec<(String, AccountSummary)>> {
+        if provider.is_empty() || provider.len() > 64 {
+            return Err(Error::InvalidArgument("provider".into()));
+        }
+        if subjects.len() > 500 {
+            return Err(Error::InvalidArgument("at most 500 subjects".into()));
+        }
+        type Row = (
+            String,
+            Uuid,
+            String,
+            Option<String>,
+            OffsetDateTime,
+            Option<OffsetDateTime>,
+            Option<OffsetDateTime>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "select i.subject, a.id, a.username, a.display_name, a.created_at, a.disabled_at, a.deleted_at
+             from musubi.identities i
+             join musubi.accounts a on a.id = i.account_id
+             where i.provider = $1 and i.subject = any($2) and a.deleted_at is null",
+        )
+        .bind(provider)
+        .bind(subjects)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut by_subject: std::collections::HashMap<String, AccountSummary> = rows
+            .into_iter()
+            .map(
+                |(s, id, username, display_name, created_at, disabled_at, deleted_at)| {
+                    (
+                        s,
+                        AccountSummary {
+                            id: AccountId(id),
+                            username,
+                            display_name,
+                            created_at,
+                            disabled_at,
+                            deleted_at,
+                        },
+                    )
+                },
+            )
+            .collect();
+        Ok(subjects
+            .iter()
+            .filter_map(|s| by_subject.remove(s).map(|a| (s.clone(), a)))
+            .collect())
+    }
+
     pub async fn search_by(
         &self,
         q: Option<&str>,

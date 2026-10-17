@@ -11548,3 +11548,68 @@ async fn console_logins_xbox_psn_nintendo() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
 }
+
+#[tokio::test]
+async fn friends_import_maps_platform_ids_to_accounts() {
+    let Some(app) = app().await else { return };
+    let (d1, d2, d3) = (unique("imp-a-"), unique("imp-b-"), unique("imp-c-"));
+    let mut toks = vec![];
+    for d in [&d1, &d2, &d3] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": d})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        toks.push((
+            v["access_token"].as_str().unwrap().to_string(),
+            v["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    // a's friend list on the platform: b, c, itself and a stranger
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends/import",
+        Some(&toks[0].0),
+        Some(json!({"provider": "device", "subjects": [d2, d3, d1, "nobody-here"], "add": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let m = v["matches"].as_array().unwrap();
+    assert_eq!(m.len(), 2, "{v}");
+    assert_eq!(m[0]["subject"], json!(d2));
+    assert_eq!(m[0]["account_id"], json!(toks[1].1));
+    assert_eq!(m[1]["account_id"], json!(toks[2].1));
+    assert_eq!(v["added"], 2);
+    // requests went out: b sees a pending request from a
+    let (st, f) = call(&app, "GET", "/v1/friends", Some(&toks[1].0), None).await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert!(f.to_string().contains(&toks[0].1), "{f}");
+    // without add: just the mapping
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends/import",
+        Some(&toks[1].0),
+        Some(json!({"provider": "device", "subjects": [d3]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(v["added"], 0);
+    // limits
+    let many: Vec<String> = (0..501).map(|i| format!("x{i}")).collect();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends/import",
+        Some(&toks[1].0),
+        Some(json!({"provider": "device", "subjects": many})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
