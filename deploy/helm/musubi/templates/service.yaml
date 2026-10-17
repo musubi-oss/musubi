@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "musubi.fullname" . }}
+  labels:
+    {{- include "musubi.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "musubi.selectorLabels" . | nindent 4 }}
+{{- if .Values.edge.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "musubi.fullname" . }}-udp
+  labels:
+    {{- include "musubi.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.edge.serviceType }}
+  ports:
+    - name: udp
+      port: {{ .Values.service.udpPort }}
+      targetPort: udp
+      protocol: UDP
+  selector:
+    {{- include "musubi.selectorLabels" . | nindent 4 }}
+{{- end }}

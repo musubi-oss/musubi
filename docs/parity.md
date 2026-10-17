@@ -120,7 +120,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Админ-API: аккаунты (поиск по identity, patch, ban, sessions, export), storage, chat-модерация, worlds/matches, конфиг | ✅ | ✅ portal | 🟡 | ✅ | ✅ |
 | Контент-каталоги с версиями / item definitions | 🟡 items/products/tables через server API, без версий и промоушена | ✅ | ❌ | ✅ | ✅ |
 | OpenAPI, CLI, миграция с Nakama | ✅ `openapi.json`, `musubi migrate-nakama` | 🟡 | 🟡 | ✅ | ✅ |
-| IaC (Helm / Terraform) | ❌ | — | 🟡 | — | — |
+| IaC (Helm / Terraform) | ✅ Helm-чарт `deploy/helm/musubi` (ConfigMap TOML + секреты env, Service http/udp, HPA, PDB) и Dockerfile; Terraform — нет | — | 🟡 | — | — |
 | Prometheus, OpenTelemetry, trace_id в ошибках | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Бенчи: criterion + A/B-ворота в CI, `musubi bench/soak` | ✅ | ❌ | ❌ | ❌ | ❌ |
 | SDK клиентов | 🟡 Unreal-скаффолд (`sdk/unreal`), остальные нет | Unreal/Unity | большинство | Unreal/Unity/JS | Unreal/Unity |
@@ -165,7 +165,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 13. ~~**Схемы player data и миграции**, live-подписки на объекты, вторичные индексы~~ ✅.
 14. ~~**Брекеты турниров**, крафт, UGC~~ ✅.
 15. ~~**Античит-сигналы**~~ ✅ (валидация ввода, флаги серверов/модулей, очки + авто-кик, EAC/BattlEye verify).
-16. **Dev-инструменты**: фикстуры, запись/воспроизведение запросов, канареечный rollout модулей, Helm.
+16. ~~**Dev-инструменты**: фикстуры, запись/воспроизведение запросов, канареечный rollout модулей, Helm~~ ✅.
 17. ~~**Геороутинг**, scale-to-zero флотов, Edgegap/GameLift как провайдеры~~ ✅.
 
 Клиентские SDK и GDK намеренно после: wire-протокол мира меняется пунктами 6–8, писать SDK до них —

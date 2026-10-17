@@ -1,0 +1,6 @@
+apiVersion: v2
+name: musubi
+description: Musubi game backend — one binary per node, Postgres behind it.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

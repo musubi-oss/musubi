@@ -27,6 +27,26 @@ pub fn routes() -> Router<AppState> {
                     crate::modules::MAX_MODULE_BYTES,
                 )),
         )
+        .route(
+            "/v1/admin/runtime/modules/{name}/canary",
+            post(canary_put)
+                .delete(canary_delete)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::modules::MAX_MODULE_BYTES,
+                )),
+        )
+        .route(
+            "/v1/admin/runtime/modules/{name}/canary/promote",
+            post(canary_promote),
+        )
+        .route(
+            "/v1/admin/runtime/modules/{name}/versions",
+            get(module_versions),
+        )
+        .route(
+            "/v1/admin/runtime/modules/{name}/versions/{version}/rollback",
+            post(module_rollback),
+        )
         .route("/v1/admin/cluster/matches", get(cluster_matches))
         .route("/v1/admin/cluster/worlds", get(cluster_worlds))
         .route(
@@ -960,4 +980,74 @@ async fn schema_migrate(
     Ok(Json(
         json!({ "migrated": migrated, "remaining": remaining }),
     ))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CanaryQuery {
+    percent: i32,
+    /// Comma-separated account ids always routed to the canary.
+    accounts: String,
+    note: String,
+}
+
+/// Upload a canary build of a module (`?percent=10&accounts=a,b`): those accounts' RPCs run on it
+/// cluster-wide while everyone else stays on the active build.
+async fn canary_put(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<CanaryQuery>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let mut accounts = Vec::new();
+    for a in q
+        .accounts
+        .split(',')
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        accounts.push(
+            uuid::Uuid::parse_str(a)
+                .map_err(|_| Error::InvalidArgument(format!("bad account id {a}")))?,
+        );
+    }
+    Ok(Json(
+        crate::modules::put_canary(&s, &name, &body, q.percent, accounts, &q.note).await?,
+    ))
+}
+
+async fn canary_delete(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !crate::modules::drop_canary(&s, &name).await? {
+        return Err(Error::NotFound(format!("module {name} has no canary")).into());
+    }
+    Ok(Json(json!({ "name": name, "canary": false })))
+}
+
+async fn canary_promote(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::modules::promote_canary(&s, &name).await?))
+}
+
+async fn module_versions(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::modules::versions(&s, &name).await?))
+}
+
+async fn module_rollback(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path((name, version)): Path<(String, i32)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::modules::rollback(&s, &name, version).await?))
 }

@@ -1,0 +1,3 @@
+Musubi is starting. HTTP API inside the cluster:
+  http://{{ include "musubi.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+Server key and database URL come from the secret {{ .Values.secrets.existingSecret | default (include "musubi.fullname" .) }}.

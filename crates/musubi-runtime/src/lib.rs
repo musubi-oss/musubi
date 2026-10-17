@@ -387,6 +387,33 @@ pub struct Runtime {
     /// every function export → module (for `invoke_sync`)
     exports: RwLock<HashMap<String, Arc<Loaded>>>,
     modules: RwLock<HashMap<String, Arc<Loaded>>>,
+    /// module name → canary build (see `load_shadow`)
+    shadows: RwLock<HashMap<String, Shadow>>,
+}
+
+struct Shadow {
+    loaded: Arc<Loaded>,
+    percent: u8,
+    accounts: std::collections::HashSet<musubi_core::AccountId>,
+}
+
+impl Shadow {
+    fn picks(&self, account: Option<musubi_core::AccountId>, module: &str) -> bool {
+        let Some(a) = account else {
+            return false;
+        };
+        if self.accounts.contains(&a) {
+            return true;
+        }
+        if self.percent == 0 {
+            return false;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        a.0.hash(&mut h);
+        module.hash(&mut h);
+        (h.finish() % 100) < self.percent as u64
+    }
 }
 
 impl Runtime {
@@ -473,6 +500,7 @@ impl Runtime {
             hooks: RwLock::new(HashMap::new()),
             exports: RwLock::new(HashMap::new()),
             modules: RwLock::new(HashMap::new()),
+            shadows: RwLock::new(HashMap::new()),
         })
     }
 
@@ -482,7 +510,7 @@ impl Runtime {
     }
 
     /// Compile and register a module (`.wasm` or `.wat`). Re-loading a name replaces its RPCs (hot reload).
-    pub fn load_bytes(&self, name: &str, bytes: &[u8]) -> Result<Vec<String>> {
+    fn build(&self, name: &str, bytes: &[u8]) -> Result<(Arc<Loaded>, Vec<String>, Vec<String>)> {
         let (kind, names) = if is_component(bytes) {
             let component = wasmtime::component::Component::new(&self.engine, bytes)
                 .map_err(|e| Error::InvalidArgument(format!("component {name}: {e}")))?;
@@ -519,6 +547,50 @@ impl Runtime {
             kind,
             exports,
         });
+        Ok((loaded, ids, hooks))
+    }
+
+    /// Load a canary build of `name` next to the active one: RPCs of accounts in `accounts`, or a
+    /// stable `percent` of all accounts, run on it; everything else stays on the active module.
+    pub fn load_shadow(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        percent: u8,
+        accounts: Vec<musubi_core::AccountId>,
+    ) -> Result<Vec<String>> {
+        if !self.modules.read().contains_key(name) {
+            return Err(Error::InvalidArgument(format!(
+                "module {name} has no active build to shadow"
+            )));
+        }
+        let (loaded, ids, _hooks) = self.build(name, bytes)?;
+        self.shadows.write().insert(
+            name.to_string(),
+            Shadow {
+                loaded,
+                percent: percent.min(100),
+                accounts: accounts.into_iter().collect(),
+            },
+        );
+        tracing::info!(module = name, percent, rpcs = ?ids, "runtime canary loaded");
+        Ok(ids)
+    }
+
+    pub fn unload_shadow(&self, name: &str) -> bool {
+        self.shadows.write().remove(name).is_some()
+    }
+
+    /// `(percent, pinned accounts)` of the canary for `name`, if any.
+    pub fn shadow_info(&self, name: &str) -> Option<(u8, usize)> {
+        self.shadows
+            .read()
+            .get(name)
+            .map(|s| (s.percent, s.accounts.len()))
+    }
+
+    pub fn load_bytes(&self, name: &str, bytes: &[u8]) -> Result<Vec<String>> {
+        let (loaded, ids, hooks) = self.build(name, bytes)?;
         let mut rpcs = self.rpcs.write();
         let mut hooks_map = self.hooks.write();
         let mut exports_map = self.exports.write();
@@ -572,6 +644,7 @@ impl Runtime {
         let mut hooks_map = self.hooks.write();
         let mut exports_map = self.exports.write();
         let mut modules = self.modules.write();
+        self.shadows.write().remove(name);
         let Some(old) = modules.remove(name) else {
             return false;
         };
@@ -615,6 +688,18 @@ impl Runtime {
             .get(id)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("rpc {id}")))?;
+        let loaded = {
+            let shadows = self.shadows.read();
+            match shadows.get(&loaded.name) {
+                Some(sh)
+                    if sh.picks(ctx.account_id, &loaded.name)
+                        && sh.loaded.exports.contains(&format!("rpc_{id}")) =>
+                {
+                    sh.loaded.clone()
+                }
+                _ => loaded,
+            }
+        };
         let payload = match self
             .hook(&format!("before_rpc_{id}"), ctx.clone(), payload.clone())
             .await

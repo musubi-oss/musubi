@@ -77,6 +77,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     });
     let state = AppState {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
+        dev: Arc::new(musubi_server::dev::DevTools::new()),
         audit: musubi_server::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
         auth,

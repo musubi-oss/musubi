@@ -106,6 +106,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
     ));
     let state = AppState {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
+        dev: Arc::new(musubi_server::dev::DevTools::new()),
         audit: musubi_server::audit::Sink::new(&db),
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()).with_limits(
@@ -12409,4 +12410,410 @@ async fn regions_routed_allocation_cold_start_and_external_providers() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(terminated, "gamelift session terminated with the fleet");
+}
+
+fn ping_module(reply: &str) -> String {
+    format!(
+        r#"(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 1024))
+  (func (export "alloc") (param $n i32) (result i32) (local $p i32)
+    global.get $heap local.set $p
+    global.get $heap local.get $n i32.add global.set $heap
+    local.get $p)
+  (data (i32.const 16) "{reply}")
+  (func (export "rpc_ping") (param i32 i32 i32 i32) (result i64)
+    i64.const 16 i64.const 32 i64.shl i64.const {} i64.or))"#,
+        reply.len()
+    )
+}
+
+#[tokio::test]
+async fn dev_tools_fixtures_recording_replay_and_module_canary() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let srv = |method: &str, path: &str, ct: &str, body: Vec<u8>| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-musubi-server-key", "defaultkey")
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let as_json = |b: axum::body::Bytes| serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null);
+
+    // fixtures: created once, re-apply finds the same accounts, drop purges them
+    let ore = format!("ore-{sfx}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/items",
+        None,
+        true,
+        Some(json!({"id": ore, "name": "Ore", "stackable": true, "max_stack": 1000})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let fx = format!("fx-{sfx}");
+    let manifest = json!({"name": fx, "accounts": [
+        {"username": format!("alice-{}", &sfx[..8]), "display_name": "Alice", "inventory": [{"item_id": ore, "quantity": 3}],
+         "storage": [{"collection": "profile", "key": "main", "value": {"lvl": 3}}]},
+        {"username": format!("bob-{}", &sfx[..8])}
+    ]});
+    let (st, a1) = http_json(
+        &router,
+        "POST",
+        "/v1/admin/dev/fixtures",
+        None,
+        true,
+        Some(manifest.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{a1}");
+    assert_eq!(a1["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(a1["accounts"][0]["created"], true);
+    assert_eq!(a1["accounts"][0]["granted"][0]["quantity"], 3, "{a1}");
+    let alice = a1["accounts"][0]["account_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, a2) = http_json(
+        &router,
+        "POST",
+        "/v1/admin/dev/fixtures",
+        None,
+        true,
+        Some(manifest.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{a2}");
+    assert_eq!(
+        a2["accounts"][0]["account_id"], alice,
+        "same identity on re-apply"
+    );
+    assert_eq!(a2["accounts"][0]["created"], false);
+    assert_eq!(
+        a2["accounts"][0]["seeded"], false,
+        "inventory not granted twice"
+    );
+    let (_, l) = http_json(&router, "GET", "/v1/admin/dev/fixtures", None, true, None).await;
+    assert!(
+        l["fixtures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["name"] == fx && f["accounts"] == 2),
+        "{l}"
+    );
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/admin/dev/fixtures",
+        None,
+        true,
+        Some(json!({"name": "bad name!", "accounts": []})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+
+    // recording + replay
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/admin/dev/recording",
+        None,
+        true,
+        Some(json!({"enabled": true, "path_prefix": "/v1/storage"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["enabled"], true);
+    let (ta, acc_a) = token(&router).await;
+    let (st, w) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "notes", "key": "n1", "value": {"t": 1}}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let (_, _) = http_json(&router, "GET", "/v1/account", Some(&ta), false, None).await;
+    let mut recs = Value::Null;
+    for _ in 0..30 {
+        let (_, l) = http_json(
+            &router,
+            "GET",
+            "/v1/admin/dev/recordings?path=/v1/storage/write",
+            None,
+            true,
+            None,
+        )
+        .await;
+        if l["recordings"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            recs = l;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let rec = recs["recordings"]
+        .as_array()
+        .and_then(|a| a.iter().find(|r| r["account_id"] == json!(acc_a)))
+        .cloned()
+        .expect("storage write recorded");
+    assert_eq!(rec["status"], 200);
+    assert_eq!(rec["method"], "POST");
+    let rid = rec["id"].as_str().unwrap().to_string();
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/admin/dev/recordings?path=/v1/account",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        l["recordings"].as_array().unwrap().is_empty(),
+        "outside the prefix: {l}"
+    );
+    let (st, one) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/dev/recordings/{rid}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{one}");
+    assert_eq!(one["body"]["objects"][0]["key"], "n1");
+    assert!(
+        one["headers"].get("authorization").is_none(),
+        "secrets stripped: {one}"
+    );
+    let (st, rp) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/dev/recordings/{rid}/replay"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{rp}");
+    assert_eq!(rp["status"], 200, "{rp}");
+    assert_eq!(rp["same_status"], true);
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/admin/dev/recordings?path=/v1/storage/write",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(
+        l["recordings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["account_id"] == json!(acc_a))
+            .count(),
+        1,
+        "replays are not recorded"
+    );
+    http_json(
+        &router,
+        "PUT",
+        "/v1/admin/dev/recording",
+        None,
+        true,
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    let (_, d) = http_json(
+        &router,
+        "DELETE",
+        "/v1/admin/dev/recordings",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert!(d["deleted"].as_u64().unwrap() >= 1);
+
+    // module canary: pinned account on v2, everyone else on v1; promote; rollback
+    let name = format!("ping{}", &sfx[..8]);
+    let res = router
+        .clone()
+        .oneshot(srv(
+            "PUT",
+            &format!("/v1/admin/runtime/modules/{name}"),
+            "application/wasm",
+            ping_module("v1").into_bytes(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        200,
+        "{:?}",
+        as_json(res.into_body().collect().await.unwrap().to_bytes())
+    );
+    let (tb, acc_b) = token(&router).await;
+    let rpc = |t: &str| {
+        Request::post("/v1/rpc/ping")
+            .header(header::AUTHORIZATION, format!("Bearer {t}"))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("hi"))
+            .unwrap()
+    };
+    let call = |req: Request<Body>| {
+        let r = router.clone();
+        async move {
+            let res = r.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            (
+                st,
+                String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes())
+                    .to_string(),
+            )
+        }
+    };
+    assert_eq!(call(rpc(&ta)).await, (200, "v1".to_string()));
+    let res = router
+        .clone()
+        .oneshot(srv(
+            "POST",
+            &format!(
+                "/v1/admin/runtime/modules/{name}/canary?percent=0&accounts={acc_a}&note=try+v2"
+            ),
+            "application/wasm",
+            ping_module("v2").into_bytes(),
+        ))
+        .await
+        .unwrap();
+    let st = res.status().as_u16();
+    let c = as_json(res.into_body().collect().await.unwrap().to_bytes());
+    assert_eq!(st, 200, "{c}");
+    assert_eq!(c["version"], 2);
+    assert_eq!(c["accounts"], 1);
+    assert_eq!(call(rpc(&ta)).await.1, "v2", "pinned account on the canary");
+    assert_eq!(
+        call(rpc(&tb)).await.1,
+        "v1",
+        "others stay on the active build ({acc_b})"
+    );
+    let (_, v) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/runtime/modules/{name}/versions"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(v["versions"][0]["state"], "canary");
+    assert_eq!(v["versions"][0]["note"], "try v2");
+    assert_eq!(v["versions"][1]["state"], "active");
+    assert_eq!(v["canary_loaded"]["accounts"], 1);
+    let (st, p) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/runtime/modules/{name}/canary/promote"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    assert_eq!(call(rpc(&tb)).await.1, "v2", "promoted for everyone");
+    let (_, v) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/runtime/modules/{name}/versions"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(v["versions"][0]["state"], "active");
+    assert_eq!(v["versions"][1]["state"], "retired");
+    assert!(v["canary_loaded"].is_null());
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/admin/runtime/modules/{name}/canary"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, rb) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/runtime/modules/{name}/versions/1/rollback"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{rb}");
+    assert_eq!(rb["rolled_back_to"], 1);
+    assert_eq!(call(rpc(&ta)).await.1, "v1");
+    let (_, v) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/runtime/modules/{name}/versions"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(v["versions"][0]["version"], 3);
+    assert_eq!(v["versions"][0]["note"], "rollback to v1");
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/runtime/modules/{name}/versions/9/rollback"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+
+    // drop the fixture → its accounts are gone
+    let (st, d) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/admin/dev/fixtures/{fx}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{d}");
+    assert_eq!(d["purged"], 2);
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/admin/dev/fixtures/{fx}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
 }

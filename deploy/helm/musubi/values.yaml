@@ -1,0 +1,58 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/musubi-oss/musubi
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  httpPort: 7350
+  # UDP edge proxy / realtime; set edge.enabled to expose it (LoadBalancer recommended).
+  udpPort: 7351
+
+edge:
+  enabled: false
+  serviceType: LoadBalancer
+
+# Secrets are passed as MUSUBI__<SECTION>__<KEY> environment variables (they override the TOML).
+secrets:
+  databaseUrl: "postgres://musubi:musubi@postgres:5432/musubi"
+  serverKey: "change-me"
+  # existingSecret: musubi-secrets   # keys: MUSUBI__DATABASE__URL, MUSUBI__HTTP__SERVER_KEY
+
+# Rendered verbatim into /etc/musubi/musubi.toml
+config: |
+  [http]
+  listen = "0.0.0.0:7350"
+
+  [database]
+  run_migrations = true
+
+  [cluster]
+  # nodes discover each other through Postgres; nothing to configure for a single region
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceAccount:
+  create: true
+  name: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

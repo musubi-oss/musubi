@@ -5,6 +5,7 @@ mod auth;
 mod chat;
 mod cluster;
 pub mod content;
+mod dev;
 pub mod economy;
 pub mod entitlements;
 pub(crate) mod error;
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ugc::routes())
         .merge(anticheat::routes())
         .merge(regions::routes())
+        .merge(dev::routes())
         .merge(match_results::routes())
         .merge(content::routes())
         .merge(fleets::routes())
@@ -97,6 +99,10 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::audit::record,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::dev::record,
         ))
         .with_state(state)
 }
