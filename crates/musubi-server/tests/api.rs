@@ -9535,13 +9535,14 @@ async fn account_bans_message_expiry_and_shadow() {
         "POST",
         &format!("/v1/admin/accounts/{aid}/ban"),
         k,
-        Some(json!({"until_secs": 1})),
+        Some(json!({"until_secs": 3})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+    // a loaded CI runner may take most of a second between the ban and this check
     let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3300)).await;
     let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
     assert_eq!(st, StatusCode::OK);
     let (st, b) = call_server(
