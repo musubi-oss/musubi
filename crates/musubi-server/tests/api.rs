@@ -66,6 +66,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         &cfg.runtime,
     ));
     let state = AppState {
+        audit: musubi_server::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
         auth,
         storage,

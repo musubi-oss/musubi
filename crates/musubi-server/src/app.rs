@@ -25,6 +25,7 @@ use crate::{db, http};
 
 #[derive(Clone)]
 pub struct AppState {
+    pub audit: crate::audit::Sink,
     pub cfg: Arc<Config>,
     pub db: PgPool,
     pub auth: AuthService,
@@ -457,6 +458,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         None => None,
     };
     let state = AppState {
+        audit: crate::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
         events: Arc::new(crate::events::Events::new(db.clone())),
         banned: Arc::new(crate::bans::Bans::default()),

@@ -105,6 +105,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
         &cfg.runtime,
     ));
     Some(AppState {
+        audit: musubi_server::audit::Sink::new(&db),
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()).with_limits(
             cfg.storage.max_objects_per_user,

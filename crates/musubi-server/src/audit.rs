@@ -53,9 +53,13 @@ struct Row {
 /// One writer for the whole process: rows queue on a bounded channel and are written over a
 /// single connection, so a burst of audited calls never takes the pool from the request path;
 /// when the queue is full the row is dropped with a warning rather than slowing the request.
-fn sink(db: &sqlx::PgPool) -> &'static tokio::sync::mpsc::Sender<Row> {
-    static SINK: std::sync::OnceLock<tokio::sync::mpsc::Sender<Row>> = std::sync::OnceLock::new();
-    SINK.get_or_init(|| {
+#[derive(Clone)]
+pub struct Sink(tokio::sync::mpsc::Sender<Row>);
+
+impl Sink {
+    /// One writer task per app instance (a process-wide static would bind the writer to the first
+    /// runtime that touched it — fatal under a test binary with one runtime per test).
+    pub fn new(db: &sqlx::PgPool) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Row>(10_000);
         let db = db.clone();
         tokio::spawn(async move {
@@ -96,8 +100,8 @@ fn sink(db: &sqlx::PgPool) -> &'static tokio::sync::mpsc::Sender<Row> {
                 }
             }
         });
-        tx
-    })
+        Sink(tx)
+    }
 }
 
 pub fn redact(v: &mut Value) {
@@ -204,7 +208,7 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
         body: body_json,
         duration_ms,
     };
-    if sink(&s.db).try_send(row).is_err() {
+    if s.audit.0.try_send(row).is_err() {
         tracing::warn!(route, "audit queue full: entry dropped");
     }
     res
