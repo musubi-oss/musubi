@@ -58,6 +58,135 @@ pub struct WriteOp {
     /// Time to live in seconds; the object disappears from reads and is purged after it elapses.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    /// Cloud-save conflict resolution: when `version` does not match any more, merge instead of
+    /// failing — three-way against `base` (the value this client last read) when given, else
+    /// two-way: a field changed by one side only keeps that change, a field changed by both goes
+    /// to the policy. The ack then carries `merged` with the conflicting paths.
+    #[serde(default)]
+    pub merge: Option<MergePolicy>,
+    #[serde(default)]
+    pub base: Option<serde_json::Value>,
+}
+
+/// What wins when both sides changed the same field: the client's value, the stored value, or
+/// for numbers the larger / smaller one (non-numbers fall back to `ours` / `theirs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergePolicy {
+    Ours,
+    Theirs,
+    Max,
+    Min,
+}
+
+/// How a write was reconciled when its `version` was stale.
+#[derive(Debug, Clone, Serialize)]
+pub struct Merged {
+    /// The stored version the write was merged with.
+    pub with_version: String,
+    /// JSON-pointer paths where both sides had changed the value (resolved by the policy).
+    pub conflicts: Vec<String>,
+}
+
+fn pick(
+    policy: MergePolicy,
+    ours: &serde_json::Value,
+    theirs: &serde_json::Value,
+) -> serde_json::Value {
+    match policy {
+        MergePolicy::Ours => ours.clone(),
+        MergePolicy::Theirs => theirs.clone(),
+        MergePolicy::Max | MergePolicy::Min => match (ours.as_f64(), theirs.as_f64()) {
+            (Some(o), Some(t)) => {
+                let take_ours = if policy == MergePolicy::Max {
+                    o >= t
+                } else {
+                    o <= t
+                };
+                if take_ours {
+                    ours.clone()
+                } else {
+                    theirs.clone()
+                }
+            }
+            _ if policy == MergePolicy::Max => ours.clone(),
+            _ => theirs.clone(),
+        },
+    }
+}
+
+/// Three-way merge of `ours` (the write) and `theirs` (the stored value) over `base` (what the
+/// client read). Objects merge field by field; anything else is one value: unchanged on one
+/// side → the other side's change, changed on both → `policy`, and the path is a conflict.
+/// Without `base` every differing field is a conflict decided by the policy.
+pub fn three_way(
+    base: Option<&serde_json::Value>,
+    ours: &serde_json::Value,
+    theirs: &serde_json::Value,
+    policy: MergePolicy,
+    path: &str,
+    conflicts: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    if ours == theirs {
+        return ours.clone();
+    }
+    if let (Value::Object(o), Value::Object(t)) = (ours, theirs) {
+        let b = base.and_then(|b| b.as_object());
+        let mut out = serde_json::Map::new();
+        let mut keys: Vec<&String> = o.keys().chain(t.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for k in keys {
+            let at = format!("{path}/{k}");
+            let bv = b.and_then(|b| b.get(k));
+            match (o.get(k), t.get(k)) {
+                (Some(ov), Some(tv)) => {
+                    out.insert(k.clone(), three_way(bv, ov, tv, policy, &at, conflicts));
+                }
+                // only we have it: we added it, or they deleted it
+                (Some(ov), None) => match bv {
+                    None => {
+                        out.insert(k.clone(), ov.clone());
+                    }
+                    Some(bv) if bv == ov => {}
+                    Some(_) => {
+                        conflicts.push(at);
+                        if policy != MergePolicy::Theirs {
+                            out.insert(k.clone(), ov.clone());
+                        }
+                    }
+                },
+                // only they have it: they added it, or we deleted it
+                (None, Some(tv)) => match bv {
+                    None => {
+                        out.insert(k.clone(), tv.clone());
+                    }
+                    Some(bv) if bv == tv => {}
+                    Some(_) => {
+                        conflicts.push(at);
+                        if policy != MergePolicy::Ours {
+                            out.insert(k.clone(), tv.clone());
+                        }
+                    }
+                },
+                (None, None) => {}
+            }
+        }
+        return Value::Object(out);
+    }
+    match base {
+        Some(b) if b == ours => theirs.clone(),
+        Some(b) if b == theirs => ours.clone(),
+        _ => {
+            conflicts.push(if path.is_empty() {
+                "/".into()
+            } else {
+                path.into()
+            });
+            pick(policy, ours, theirs)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +211,9 @@ pub struct Ack {
     pub key: String,
     pub owner_id: Uuid,
     pub version: String,
+    /// Set when a stale `version` was reconciled by `WriteOp::merge`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged: Option<Merged>,
 }
 
 /// Who performs the operation. `Server` bypasses permission checks.
@@ -412,6 +544,7 @@ impl StorageService {
                 key: op.key.clone(),
                 owner_id: owner,
                 version: new_version,
+                merged: None,
             });
         }
         self.enforce_quota(&mut tx, owner).await?;
@@ -579,19 +712,14 @@ impl StorageService {
             if !op.value.is_object() {
                 return Err(Error::InvalidArgument("value must be a JSON object".into()));
             }
-            let bytes = serde_json::to_vec(&op.value)?;
-            if bytes.len() > MAX_VALUE_BYTES {
-                return Err(Error::InvalidArgument("value exceeds 1 MiB".into()));
-            }
             if !(0..=2).contains(&op.read_permission) || !(0..=1).contains(&op.write_permission) {
                 return Err(Error::InvalidArgument("invalid permission code".into()));
             }
-            let new_version = version_of(&bytes);
-            let schema_version = self.check_schema(&op.collection, &op.value)?;
-            let changed_value = &op.value;
+            let mut merged: Option<Merged> = None;
+            let mut owned: Option<serde_json::Value> = None;
 
-            let current = sqlx::query_as::<_, (String, i16)>(
-                "select version, write_permission from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 for update",
+            let current = sqlx::query_as::<_, (String, i16, serde_json::Value)>(
+                "select version, write_permission, value from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 for update",
             )
             .bind(&op.collection)
             .bind(&op.key)
@@ -600,7 +728,7 @@ impl StorageService {
             .await
             .map_err(Error::internal)?;
 
-            if let Some((cur_version, cur_write)) = &current {
+            if let Some((cur_version, cur_write, cur_value)) = &current {
                 if caller != Caller::Server && *cur_write == 0 {
                     return Err(Error::PermissionDenied(format!(
                         "{}/{} is read-only",
@@ -614,12 +742,30 @@ impl StorageService {
                             op.collection, op.key
                         )))
                     }
-                    Some(v) if v != cur_version => {
-                        return Err(Error::Conflict(format!(
-                            "{}/{} version mismatch",
-                            op.collection, op.key
-                        )))
-                    }
+                    Some(v) if v != cur_version => match op.merge {
+                        Some(policy) => {
+                            let mut conflicts = Vec::new();
+                            let value = three_way(
+                                op.base.as_ref(),
+                                &op.value,
+                                cur_value,
+                                policy,
+                                "",
+                                &mut conflicts,
+                            );
+                            owned = Some(value);
+                            merged = Some(Merged {
+                                with_version: cur_version.clone(),
+                                conflicts,
+                            });
+                        }
+                        None => {
+                            return Err(Error::Conflict(format!(
+                                "{}/{} version mismatch",
+                                op.collection, op.key
+                            )))
+                        }
+                    },
                     _ => {}
                 }
             } else if matches!(op.version.as_deref(), Some(v) if v != "*") {
@@ -629,6 +775,14 @@ impl StorageService {
                 )));
             }
 
+            let value = owned.as_ref().unwrap_or(&op.value);
+            let bytes = serde_json::to_vec(value)?;
+            if bytes.len() > MAX_VALUE_BYTES {
+                return Err(Error::InvalidArgument("value exceeds 1 MiB".into()));
+            }
+            let new_version = version_of(&bytes);
+            let schema_version = self.check_schema(&op.collection, value)?;
+            let changed_value = value;
             let expires = op.ttl_secs.map(|t| {
                 OffsetDateTime::now_utc()
                     + time::Duration::seconds(t.min(100 * 365 * 86_400) as i64)
@@ -644,7 +798,7 @@ impl StorageService {
             .bind(&op.collection)
             .bind(&op.key)
             .bind(owner)
-            .bind(&op.value)
+            .bind(value)
             .bind(&new_version)
             .bind(op.read_permission)
             .bind(op.write_permission)
@@ -667,6 +821,7 @@ impl StorageService {
                 key: op.key.clone(),
                 owner_id: owner,
                 version: new_version,
+                merged,
             });
         }
         self.enforce_quota(&mut tx, owner).await?;
@@ -1091,6 +1246,115 @@ fn one() -> i16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn three_way_merges_cloud_saves() {
+        use super::{three_way, MergePolicy};
+        use serde_json::json;
+        let base =
+            json!({"gold": 10, "level": 3, "pos": {"x": 1, "y": 1}, "quests": ["a"], "old": true});
+        // disjoint changes: both survive, deletions of unchanged fields stick
+        let ours =
+            json!({"gold": 10, "level": 4, "pos": {"x": 1, "y": 1}, "quests": ["a"], "new": 1});
+        let theirs = json!({"gold": 25, "level": 3, "pos": {"x": 1, "y": 7}, "quests": ["a", "b"], "old": true});
+        let mut c = Vec::new();
+        let m = three_way(Some(&base), &ours, &theirs, MergePolicy::Ours, "", &mut c);
+        assert_eq!(
+            m,
+            json!({"gold": 25, "level": 4, "pos": {"x": 1, "y": 7}, "quests": ["a", "b"], "new": 1})
+        );
+        assert!(c.is_empty(), "{c:?}");
+        // both changed gold: policy decides and the path is reported
+        let ours = json!({"gold": 12, "level": 3});
+        let theirs = json!({"gold": 30, "level": 3});
+        let b = json!({"gold": 10, "level": 3});
+        let mut c = Vec::new();
+        assert_eq!(
+            three_way(Some(&b), &ours, &theirs, MergePolicy::Max, "", &mut c)["gold"],
+            30
+        );
+        assert_eq!(c, vec!["/gold"]);
+        assert_eq!(
+            three_way(
+                Some(&b),
+                &ours,
+                &theirs,
+                MergePolicy::Min,
+                "",
+                &mut Vec::new()
+            )["gold"],
+            12
+        );
+        assert_eq!(
+            three_way(
+                Some(&b),
+                &ours,
+                &theirs,
+                MergePolicy::Ours,
+                "",
+                &mut Vec::new()
+            )["gold"],
+            12
+        );
+        assert_eq!(
+            three_way(
+                Some(&b),
+                &ours,
+                &theirs,
+                MergePolicy::Theirs,
+                "",
+                &mut Vec::new()
+            )["gold"],
+            30
+        );
+        // we changed what they deleted / they changed what we deleted
+        let b = json!({"a": 1, "b": 1});
+        let mut c = Vec::new();
+        let m = three_way(
+            Some(&b),
+            &json!({"a": 2}),
+            &json!({"b": 2}),
+            MergePolicy::Ours,
+            "",
+            &mut c,
+        );
+        assert_eq!(m, json!({"a": 2}));
+        assert_eq!(c, vec!["/a", "/b"]);
+        let m = three_way(
+            Some(&b),
+            &json!({"a": 2}),
+            &json!({"b": 2}),
+            MergePolicy::Theirs,
+            "",
+            &mut Vec::new(),
+        );
+        assert_eq!(m, json!({"b": 2}));
+        // no base: every difference is a conflict, decided by the policy; identical fields pass
+        let mut c = Vec::new();
+        let m = three_way(
+            None,
+            &json!({"gold": 5, "name": "x", "s": 1}),
+            &json!({"gold": 9, "name": "y", "s": 1}),
+            MergePolicy::Max,
+            "",
+            &mut c,
+        );
+        assert_eq!(m, json!({"gold": 9, "name": "x", "s": 1}));
+        assert_eq!(c, vec!["/gold", "/name"]);
+        // nested arrays are one value
+        let b = json!({"inv": [1]});
+        let mut c = Vec::new();
+        let m = three_way(
+            Some(&b),
+            &json!({"inv": [1, 2]}),
+            &json!({"inv": [1, 3]}),
+            MergePolicy::Theirs,
+            "",
+            &mut c,
+        );
+        assert_eq!(m, json!({"inv": [1, 3]}));
+        assert_eq!(c, vec!["/inv"]);
+    }
+
     use super::*;
 
     #[test]

@@ -579,6 +579,8 @@ async fn storage_put(
             Caller::Server,
             Some(b.owner_id.unwrap_or(Uuid::nil())),
             &[WriteOp {
+                merge: None,
+                base: None,
                 collection,
                 key,
                 value: b.value,

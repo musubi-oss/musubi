@@ -14957,3 +14957,203 @@ async fn limits_per_account_and_per_key() {
         .unwrap();
     assert!(mine["limit"].is_null(), "{mine}");
 }
+
+/// Cloud save: a write with a stale version fails with 409 unless it asks to merge; then the
+/// stored and the written value are reconciled three-way against the client's base.
+#[tokio::test]
+async fn cloud_save_merges_on_conflict() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _) = token(&router).await;
+    let write = |value: Value, version: Option<&str>, merge: Option<&str>, base: Option<Value>| {
+        let mut op = json!({"collection": "saves", "key": "main", "value": value});
+        if let Some(v) = version {
+            op["version"] = json!(v);
+        }
+        if let Some(m) = merge {
+            op["merge"] = json!(m);
+        }
+        if let Some(b) = base {
+            op["base"] = b;
+        }
+        json!({"objects": [op]})
+    };
+    let base = json!({"gold": 10, "level": 3, "pos": {"x": 1, "y": 1}});
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(base.clone(), None, None, None)),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let v0 = r["acks"][0]["version"].as_str().unwrap().to_string();
+    assert!(r["acks"][0].get("merged").is_none());
+    // device A levels up from v0
+    let a = json!({"gold": 10, "level": 4, "pos": {"x": 1, "y": 1}});
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(a, Some(&v0), None, None)),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let v1 = r["acks"][0]["version"].as_str().unwrap().to_string();
+    // device B, still on v0, earned gold and moved: plain CAS fails …
+    let b = json!({"gold": 25, "level": 3, "pos": {"x": 1, "y": 7}});
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(b.clone(), Some(&v0), None, None)),
+    )
+    .await;
+    assert_eq!(st, 409, "{r}");
+    // … merging keeps both devices' changes
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(b, Some(&v0), Some("max"), Some(base.clone()))),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let m = &r["acks"][0]["merged"];
+    assert_eq!(m["with_version"], v1, "{r}");
+    assert_eq!(m["conflicts"], json!([]), "{r}");
+    let v2 = r["acks"][0]["version"].as_str().unwrap().to_string();
+    let (st, read) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/read",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "main"}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        read["objects"][0]["value"],
+        json!({"gold": 25, "level": 4, "pos": {"x": 1, "y": 7}})
+    );
+    assert_eq!(read["objects"][0]["version"], v2);
+    // both spent gold from v2: max keeps the larger balance and names the conflict
+    let cur = json!({"gold": 25, "level": 4, "pos": {"x": 1, "y": 7}});
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(
+            json!({"gold": 30, "level": 4, "pos": {"x": 1, "y": 7}}),
+            Some(&v2),
+            None,
+            None,
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(
+            json!({"gold": 27, "level": 5, "pos": {"x": 1, "y": 7}}),
+            Some(&v2),
+            Some("max"),
+            Some(cur),
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["acks"][0]["merged"]["conflicts"], json!(["/gold"]), "{r}");
+    let (_, read) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/read",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "main"}]})),
+    )
+    .await;
+    assert_eq!(
+        read["objects"][0]["value"],
+        json!({"gold": 30, "level": 5, "pos": {"x": 1, "y": 7}})
+    );
+    // no base: every difference is a conflict, "theirs" keeps the stored side
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(
+            json!({"gold": 1, "level": 5, "pos": {"x": 9, "y": 7}}),
+            Some(&v0),
+            Some("theirs"),
+            None,
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(
+        r["acks"][0]["merged"]["conflicts"],
+        json!(["/gold", "/pos/x"]),
+        "{r}"
+    );
+    let (_, read) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/read",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "main"}]})),
+    )
+    .await;
+    assert_eq!(
+        read["objects"][0]["value"],
+        json!({"gold": 30, "level": 5, "pos": {"x": 1, "y": 7}})
+    );
+    // a matching version never merges
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(
+            json!({"gold": 0}),
+            Some(read["objects"][0]["version"].as_str().unwrap()),
+            Some("max"),
+            None,
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(r["acks"][0].get("merged").is_none(), "{r}");
+    // bad policy → 400
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(write(json!({"gold": 0}), Some(&v0), Some("coinflip"), None)),
+    )
+    .await;
+    assert!(st == 400 || st == 422, "{st}");
+}

@@ -146,6 +146,8 @@ impl ServerHost {
                         Caller::Server,
                         Some(owner(&req, ctx)?),
                         &[WriteOp {
+                            merge: None,
+                            base: None,
                             collection: str_field(&req, "collection")?.into(),
                             key: str_field(&req, "key")?.into(),
                             value: req.get("value").cloned().unwrap_or(Value::Null),
