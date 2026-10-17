@@ -11151,3 +11151,43 @@ async fn admin_patch_account_profile() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
 }
+
+#[tokio::test]
+async fn admin_finds_account_by_identity() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let dev = unique("dev-lookup");
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    let acc = s["account_id"].as_str().unwrap().to_string();
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts?identity=device:{dev}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let list = v["accounts"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{v}");
+    assert_eq!(list[0]["id"], json!(acc));
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/accounts?identity=device:nobody-has-this",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["accounts"].as_array().unwrap().len(), 0);
+    let (st, _) = call_server(&app, "GET", "/v1/admin/accounts?identity=garbage", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}

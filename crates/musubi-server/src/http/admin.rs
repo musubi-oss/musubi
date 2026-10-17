@@ -78,6 +78,8 @@ pub fn routes() -> Router<AppState> {
 #[derive(Deserialize)]
 struct SearchQ {
     q: Option<String>,
+    /// `provider:subject` of a linked identity (device, email, steam, google, apple, oidc:<name>, passkey).
+    identity: Option<String>,
     #[serde(default)]
     include_deleted: bool,
     limit: Option<i64>,
@@ -91,8 +93,9 @@ async fn accounts(
 ) -> Result<Json<Value>, ApiError> {
     let items = s
         .accounts
-        .search(
+        .search_by(
             q.q.as_deref(),
+            q.identity.as_deref(),
             q.include_deleted,
             q.limit.unwrap_or(50),
             q.cursor,

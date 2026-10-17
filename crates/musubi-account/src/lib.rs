@@ -555,18 +555,43 @@ impl AccountService {
         limit: i64,
         cursor: Option<Uuid>,
     ) -> Result<Vec<AccountSummary>> {
+        self.search_by(q, None, include_deleted, limit, cursor)
+            .await
+    }
+
+    /// `search` narrowed to accounts holding a linked identity `provider:subject` (device id,
+    /// e-mail, Steam id, `oidc:<name>` subject, passkey credential id …) when `identity` is set.
+    pub async fn search_by(
+        &self,
+        q: Option<&str>,
+        identity: Option<&str>,
+        include_deleted: bool,
+        limit: i64,
+        cursor: Option<Uuid>,
+    ) -> Result<Vec<AccountSummary>> {
         let limit = limit.clamp(1, 200);
         let q = q.unwrap_or("").trim();
+        let (provider, subject) = match identity.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => {
+                let (p, sub) = s.rsplit_once(':').ok_or_else(|| {
+                    Error::InvalidArgument("identity must be provider:subject".into())
+                })?;
+                (Some(p.to_string()), Some(sub.to_string()))
+            }
+            None => (None, None),
+        };
         let by_id = Uuid::parse_str(q).ok();
         let pattern = format!(
             "{}%",
             q.to_lowercase().replace('%', "\\%").replace('_', "\\_")
         );
         let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, OffsetDateTime, Option<OffsetDateTime>, Option<OffsetDateTime>)>(
-            "select id, username, display_name, created_at, disabled_at, deleted_at from musubi.accounts
+            "select id, username, display_name, created_at, disabled_at, deleted_at from musubi.accounts a
              where ($1 = '' or lower(username) like $2 or id = $3)
                and ($4 or deleted_at is null)
                and ($5::uuid is null or id > $5)
+               and ($7::text is null or exists (select 1 from musubi.identities i
+                      where i.account_id = a.id and i.provider = $7 and i.subject = $8))
              order by id limit $6",
         )
         .bind(q)
@@ -575,6 +600,8 @@ impl AccountService {
         .bind(include_deleted)
         .bind(cursor)
         .bind(limit)
+        .bind(provider)
+        .bind(subject)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
