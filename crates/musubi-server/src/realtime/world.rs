@@ -23,6 +23,8 @@ use uuid::Uuid;
 use crate::fanout::Fanout;
 
 pub const TICK_HZ: u64 = 30;
+/// Ticks between re-reads of the alive peer set that cell replicas are picked from.
+const PEER_REFRESH_TICKS: u64 = 30;
 pub const MAX_SIM_EVENTS: usize = 4096;
 /// Persistent entities are snapshotted this often (ticks); 30 Hz → every 5 s.
 const SNAPSHOT_EVERY: u64 = 150;
@@ -218,6 +220,12 @@ struct WorldState {
     ghost_send: HashMap<CellId, musubi_mesh::GhostSendState>,
     /// Entities whose next handover must carry the full state (the receiver had no ghost of them).
     full_resend: std::collections::HashSet<EntityId>,
+    /// Per hosted cell: what its standby replicas hold (replication stream, see `repl_delta`).
+    repl_send: HashMap<CellId, musubi_mesh::GhostSendState>,
+    /// Per hosted cell: the replicas it streams to; a change restarts the stream with a keyframe.
+    repl_targets: HashMap<CellId, Vec<Uuid>>,
+    /// Per hosted cell: replica node → last tick it acknowledged.
+    repl_acks: HashMap<CellId, HashMap<Uuid, u64>>,
     /// Cross-cell transactions this node coordinates (by tx id).
     txs: HashMap<Uuid, TxRecord>,
     /// Entities held by a prepared transaction: no writes until commit, abort or the deadline.
@@ -456,6 +464,10 @@ pub struct WorldRegistry {
     cell_hosts: DashMap<(String, CellId), Uuid>,
     /// Fencing term this node holds per world (`musubi.world_hosts`); absent = may not persist.
     host_terms: DashMap<String, i64>,
+    /// Standby mirrors of cells hosted elsewhere: this node is one of their replicas.
+    mirrors: DashMap<(String, CellId), Mirror>,
+    /// Alive nodes other than this one (refreshed by the ticker); replicas are picked among them.
+    peers: std::sync::RwLock<Vec<Uuid>>,
     /// (world, cell, previous host) shards already merged after a hand-back, so a later
     /// reconciliation round does not resurrect entities despawned since.
     adopted_from: DashSet<(String, CellId, Uuid)>,
@@ -490,6 +502,22 @@ pub struct WorldCmdEnv {
     pub cmd: WorldCmd,
 }
 
+/// A standby copy of one cell hosted on `from`, mirrored from its replication stream.
+struct Mirror {
+    from: Uuid,
+    cache: musubi_mesh::GhostCache,
+    /// Host tick the mirror is complete up to.
+    tick: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicaInfo {
+    pub cell: CellId,
+    pub node: Uuid,
+    /// Host tick the replica has acknowledged.
+    pub tick: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldInfo {
     pub name: String,
@@ -500,6 +528,12 @@ pub struct WorldInfo {
     pub orphaned: Vec<CellId>,
     /// Hibernated cells whose persistent entities live in `world_cold_cells`, not in memory.
     pub cold_cells: Vec<CellId>,
+    /// Standby replicas of the cells hosted here and how far they have caught up.
+    #[serde(default)]
+    pub replicas: Vec<ReplicaInfo>,
+    /// Cells hosted elsewhere that this node mirrors (`node` = their host).
+    #[serde(default)]
+    pub mirrors: Vec<ReplicaInfo>,
     pub sims: Vec<SimInfo>,
     pub config: WorldConfig,
 }
@@ -569,6 +603,8 @@ impl WorldRegistry {
             shard_home: DashMap::new(),
             interest: DashMap::new(),
             cell_hosts: DashMap::new(),
+            mirrors: DashMap::new(),
+            peers: std::sync::RwLock::new(Vec::new()),
             host_terms: DashMap::new(),
             adopted_from: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
@@ -752,6 +788,9 @@ impl WorldRegistry {
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
                     ghost_send: HashMap::new(),
+                    repl_send: HashMap::new(),
+                    repl_targets: HashMap::new(),
+                    repl_acks: HashMap::new(),
                     full_resend: std::collections::HashSet::new(),
                     txs: HashMap::new(),
                     tx_locks: HashMap::new(),
@@ -1479,6 +1518,9 @@ impl WorldRegistry {
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
+                repl_send: HashMap::new(),
+                repl_targets: HashMap::new(),
+                repl_acks: HashMap::new(),
                 full_resend: std::collections::HashSet::new(),
                 txs: HashMap::new(),
                 tx_locks: HashMap::new(),
@@ -1753,6 +1795,7 @@ impl WorldRegistry {
             .collect();
         let mut out = Vec::new();
         let mut restored: Vec<(String, Uuid)> = Vec::new();
+        let mut mirrored_cells: Vec<(String, CellId)> = Vec::new();
         for (name, cell, dead) in orphaned {
             if self.home_of(&name).await? != Some(self.node_id) {
                 continue;
@@ -1791,6 +1834,26 @@ impl WorldRegistry {
                     }
                 }
             }
+            // a mirror of the cell fed by the dead host up to its last tick beats the shard
+            // restore: nothing to read, no ticks lost since the last journal flush, ephemeral
+            // entities included
+            let mut mirrored = false;
+            if let Some((_, mut m)) = self.mirrors.remove(&(name.clone(), cell)) {
+                if m.from == dead {
+                    if let Ok(w) = self.get(&name) {
+                        let mut st = w.lock();
+                        let mut ents = m.cache.drain();
+                        ents.retain(|e| st.world.get(e.id).is_none());
+                        let n = ents.len();
+                        st.world.restore(ents);
+                        tracing::info!(world = %name, ?cell, node = %dead, tick = m.tick, entities = n, "cell taken over from its replica mirror");
+                        mirrored = true;
+                    }
+                }
+            }
+            if mirrored {
+                mirrored_cells.push((name.clone(), cell));
+            }
             if !restored.contains(&(name.clone(), dead)) {
                 if let (Some(db), Ok(w)) = (&self.db, self.get(&name)) {
                     let cfg = w.lock().world.cfg.clone();
@@ -1803,6 +1866,8 @@ impl WorldRegistry {
                         // an entity that already lives here (handed over before the host died, or
                         // journaled on both sides) keeps its live copy
                         ents.retain(|e| st.world.get(e.id).is_none());
+                        // cells restored from a mirror are complete and newer than the shard
+                        ents.retain(|e| !mirrored_cells.contains(&(name.clone(), e.cell)));
                         st.world.restore(ents);
                     }
                     tracing::info!(world = %name, node = %dead, replayed = n, "dead cell host's shard restored");
@@ -1924,6 +1989,9 @@ impl WorldRegistry {
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
+                repl_send: HashMap::new(),
+                repl_targets: HashMap::new(),
+                repl_acks: HashMap::new(),
                 full_resend: std::collections::HashSet::new(),
                 txs: HashMap::new(),
                 tx_locks: HashMap::new(),
@@ -1976,6 +2044,35 @@ impl WorldRegistry {
             cells,
             orphaned: st.world.orphaned_cells(),
             cold_cells: st.world.unloaded_cells(),
+            replicas: {
+                let mut v: Vec<ReplicaInfo> = st
+                    .repl_acks
+                    .iter()
+                    .flat_map(|(c, acks)| {
+                        acks.iter().map(|(n, t)| ReplicaInfo {
+                            cell: *c,
+                            node: *n,
+                            tick: *t,
+                        })
+                    })
+                    .collect();
+                v.sort_by_key(|r| (r.cell.x, r.cell.y, r.node));
+                v
+            },
+            mirrors: {
+                let mut v: Vec<ReplicaInfo> = self
+                    .mirrors
+                    .iter()
+                    .filter(|m| m.key().0 == name)
+                    .map(|m| ReplicaInfo {
+                        cell: m.key().1,
+                        node: m.value().from,
+                        tick: m.value().tick,
+                    })
+                    .collect();
+                v.sort_by_key(|r| (r.cell.x, r.cell.y));
+                v
+            },
             sims: st.controller.sims(),
             config: st.world.cfg.clone(),
         })
@@ -2497,6 +2594,92 @@ impl WorldRegistry {
             .entry(cell)
             .or_default()
             .apply(delta, local);
+    }
+
+    /// Replica side of the replication stream: a cell host sent this tick's delta of the whole
+    /// cell to the nodes in `replicas`. A listed node merges it into its mirror and acks the
+    /// tick; a keyframe from a new host replaces a mirror of the old one; everyone else ignores it.
+    pub fn accept_repl(
+        &self,
+        name: &str,
+        from_node: Uuid,
+        replicas: &[Uuid],
+        delta: musubi_mesh::GhostDelta,
+        fanout: &Fanout,
+    ) {
+        if from_node == self.node_id || !replicas.contains(&self.node_id) {
+            return;
+        }
+        let key = (name.to_string(), delta.cell);
+        if self
+            .cell_hosts
+            .get(&key)
+            .is_some_and(|h| *h == self.node_id)
+        {
+            return;
+        }
+        let (cell, tick) = (delta.cell, delta.tick);
+        let mut m = self.mirrors.entry(key).or_insert_with(|| Mirror {
+            from: from_node,
+            cache: musubi_mesh::GhostCache::default(),
+            tick: 0,
+        });
+        if m.from != from_node {
+            if !delta.keyframe {
+                return;
+            }
+            *m = Mirror {
+                from: from_node,
+                cache: musubi_mesh::GhostCache::default(),
+                tick: 0,
+            };
+        }
+        if m.cache.apply(delta, tick) {
+            m.tick = tick;
+            drop(m);
+            fanout.world_repl_ack(name, cell, self.node_id, tick);
+        }
+    }
+
+    /// Host side: a replica reports its mirror of `cell` complete up to `tick`.
+    pub fn accept_repl_ack(&self, name: &str, cell: CellId, node: Uuid, tick: u64) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        if !st
+            .repl_targets
+            .get(&cell)
+            .is_some_and(|t| t.contains(&node))
+        {
+            return;
+        }
+        let t = st
+            .repl_acks
+            .entry(cell)
+            .or_default()
+            .entry(node)
+            .or_default();
+        *t = (*t).max(tick);
+    }
+
+    /// The replicas of `cell`: `n` alive peers, spread by hash so neighbouring cells do not all
+    /// land on the same node, stable while the peer set is.
+    fn pick_replicas(peers: &[Uuid], name: &str, cell: CellId, n: usize) -> Vec<Uuid> {
+        if n == 0 || peers.is_empty() {
+            return Vec::new();
+        }
+        let mut ranked: Vec<(u64, Uuid)> = peers
+            .iter()
+            .map(|p| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (name, cell.x, cell.y, p).hash(&mut h);
+                (h.finish(), *p)
+            })
+            .collect();
+        ranked.sort();
+        ranked.into_iter().take(n).map(|(_, p)| p).collect()
     }
 
     /// An entity handed over from another node into a cell hosted here. Taken when a local
@@ -3353,6 +3536,47 @@ impl WorldRegistry {
 
     /// One tick of one world: simulation step, handovers, admission, decay, then the per-client
     /// delta fan-out. Worlds are independent, so the ticker runs these concurrently.
+    /// Stream every hosted cell to its standby replicas (`WorldConfig::replicas`): one delta per
+    /// tick per cell, a keyframe when the replica set changes.
+    fn ship_replication(&self, name: &str, st: &mut WorldState, fanout: &Fanout) {
+        let n = st.world.cfg.replicas as usize;
+        if n == 0 {
+            st.repl_send.clear();
+            st.repl_targets.clear();
+            st.repl_acks.clear();
+            return;
+        }
+        let peers = self.peers.read().map(|p| p.clone()).unwrap_or_default();
+        let hosted: Vec<CellId> = st
+            .world
+            .occupied_cells()
+            .into_iter()
+            .filter(|c| self.hosts_cell(st, name, *c))
+            .collect();
+        st.repl_send.retain(|c, _| hosted.contains(c));
+        st.repl_targets.retain(|c, _| hosted.contains(c));
+        st.repl_acks.retain(|c, _| hosted.contains(c));
+        for cell in hosted {
+            let targets = Self::pick_replicas(&peers, name, cell, n);
+            let mut gs = st.repl_send.remove(&cell).unwrap_or_default();
+            if st.repl_targets.get(&cell) != Some(&targets) {
+                gs.reset();
+                st.repl_acks.remove(&cell);
+                st.repl_targets.insert(cell, targets.clone());
+            }
+            if targets.is_empty() {
+                continue;
+            }
+            if let Some(acks) = st.repl_acks.get_mut(&cell) {
+                acks.retain(|n, _| targets.contains(n));
+            }
+            if let Some(d) = st.world.repl_delta(cell, &mut gs) {
+                fanout.world_repl(name, self.node_id, targets, d);
+            }
+            st.repl_send.insert(cell, gs);
+        }
+    }
+
     pub fn tick_world(&self, name: &str, fanout: &Fanout) {
         let Some(w) = self.worlds.get(name).map(|w| w.clone()) else {
             return;
@@ -3435,6 +3659,7 @@ impl WorldRegistry {
                 }
                 let (now, stale) = (st.world.tick, st.world.config().ghost_stale_ticks);
                 st.remote_ghosts.retain(|_, g| !g.stale(now, stale));
+                self.ship_replication(&name, st, fanout);
                 st.tx_locks.retain(|_, (_, until)| *until > now);
                 let timed_out: Vec<Uuid> = st
                     .txs
@@ -3775,6 +4000,25 @@ impl WorldRegistry {
 
     /// Starts a ticker thread for every world on this node (and for worlds that arrive later)
     /// and publishes the node tick number at `TICK_HZ` for simulator streams.
+    /// Re-read the alive peers replicas are picked from (`PEER_REFRESH_TICKS`).
+    pub async fn refresh_peers(&self) {
+        let Some(c) = self.cluster.get() else {
+            return;
+        };
+        let Ok(nodes) = c.nodes().await else {
+            return;
+        };
+        let mut peers: Vec<Uuid> = nodes
+            .iter()
+            .filter(|n| n.alive && n.id.0 != self.node_id)
+            .map(|n| n.id.0)
+            .collect();
+        peers.sort();
+        if let Ok(mut p) = self.peers.write() {
+            *p = peers;
+        }
+    }
+
     pub fn spawn_ticker(self: Arc<Self>, fanout: Fanout) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_millis(1000 / TICK_HZ));
@@ -3786,6 +4030,9 @@ impl WorldRegistry {
                     .tick_no
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
+                if t % PEER_REFRESH_TICKS == 1 {
+                    self.refresh_peers().await;
+                }
                 let _ = self.ticks.send(t);
             }
         })

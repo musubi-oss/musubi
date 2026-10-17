@@ -88,15 +88,39 @@ impl World {
     /// Entities closest to the border come first; past `ghost_budget_bytes` the rest wait for
     /// the next tick (never on a keyframe, which must be complete).
     pub fn ghost_delta(&self, cell: CellId, st: &mut GhostSendState) -> Option<GhostDelta> {
+        let border = self.border_entities(cell);
+        self.delta_of(
+            cell,
+            st,
+            border,
+            self.cfg.ghost_budget_bytes,
+            self.cfg.ghost_keyframe_ticks,
+        )
+    }
+
+    /// Replication stream for the standby replicas of `cell`: every entity of the cell
+    /// (persistent and ephemeral), component-level, never budget-cut, keyframe every
+    /// `repl_keyframe_ticks`. A replica that applied the stream up to tick `t` can take the cell
+    /// over at `t` without touching snapshots or the journal.
+    pub fn repl_delta(&self, cell: CellId, st: &mut GhostSendState) -> Option<GhostDelta> {
+        let mut ents = self.entities_of(cell);
+        ents.sort_by_key(|e| e.id);
+        self.delta_of(cell, st, ents, 0, self.cfg.repl_keyframe_ticks)
+    }
+
+    fn delta_of(
+        &self,
+        cell: CellId,
+        st: &mut GhostSendState,
+        border: Vec<&Entity>,
+        budget: usize,
+        keyframe_ticks: u64,
+    ) -> Option<GhostDelta> {
         let tick = self.tick;
         let keyframe = match st.last_keyframe {
             None => true,
-            Some(k) => {
-                self.cfg.ghost_keyframe_ticks > 0
-                    && tick.saturating_sub(k) >= self.cfg.ghost_keyframe_ticks
-            }
+            Some(k) => keyframe_ticks > 0 && tick.saturating_sub(k) >= keyframe_ticks,
         };
-        let border = self.border_entities(cell);
         let removed: Vec<EntityId> = if keyframe {
             Vec::new()
         } else {
@@ -117,13 +141,14 @@ impl World {
                         .is_none_or(|(rev, pos)| *rev != e.rev || *pos != e.pos)
             })
             .collect();
-        changed.sort_by(|a, b| {
-            self.border_distance(cell, a.pos)
-                .abs()
-                .total_cmp(&self.border_distance(cell, b.pos).abs())
-                .then(a.id.cmp(&b.id))
-        });
-        let budget = self.cfg.ghost_budget_bytes;
+        if budget > 0 {
+            changed.sort_by(|a, b| {
+                self.border_distance(cell, a.pos)
+                    .abs()
+                    .total_cmp(&self.border_distance(cell, b.pos).abs())
+                    .then(a.id.cmp(&b.id))
+            });
+        }
         let mut bytes = 0usize;
         let mut upserts = Vec::new();
         let mut deferred = 0usize;
@@ -241,6 +266,12 @@ impl GhostCache {
     }
 
     /// Remove and return a ghost: it is being promoted to an owned entity by a handover.
+    /// Every entity held, leaving the cache empty (a replica taking its cell over).
+    pub fn drain(&mut self) -> Vec<Entity> {
+        let mut v: Vec<Entity> = self.entities.drain().map(|(_, e)| e).collect();
+        v.sort_by_key(|e| e.id);
+        v
+    }
     pub fn take(&mut self, id: EntityId) -> Option<Entity> {
         self.entities.remove(&id)
     }
@@ -285,6 +316,44 @@ mod tests {
     }
     fn p(x: f64, y: f64) -> Pos {
         Pos { x, y }
+    }
+
+    #[test]
+    fn repl_delta_mirrors_the_whole_cell_and_a_mirror_can_take_it_over() {
+        let mut w = world(0, 30);
+        let cell = w.cell_of(p(50.0, 50.0));
+        let border = w.spawn(p(95.0, 50.0), comps(&[("hp", json!(100))]), true);
+        let interior = w.spawn(p(50.0, 50.0), comps(&[("hp", json!(1))]), false);
+        let _elsewhere = w.spawn(p(150.0, 50.0), comps(&[("hp", json!(9))]), false);
+        let mut st = GhostSendState::default();
+        let d = w.repl_delta(cell, &mut st).expect("first delta");
+        assert!(d.keyframe);
+        let mut ids: Vec<_> = d.upserts.iter().map(|u| u.id).collect();
+        ids.sort();
+        let mut want = vec![border, interior];
+        want.sort();
+        assert_eq!(ids, want, "every entity of the cell, interior included");
+        let mut mirror = GhostCache::default();
+        assert!(mirror.apply(d, 0));
+        assert!(w.repl_delta(cell, &mut st).is_none(), "nothing changed");
+
+        w.force_apply(interior, None, comps(&[("hp", json!(2))]))
+            .unwrap();
+        let d = w.repl_delta(cell, &mut st).expect("hp changed");
+        assert!(!d.keyframe);
+        assert_eq!(d.upserts.len(), 1);
+        assert_eq!(d.upserts[0].id, interior);
+        assert!(mirror.apply(d, 1));
+
+        let taken = mirror.drain();
+        assert!(mirror.is_empty());
+        assert_eq!(taken.len(), 2);
+        let i = taken.iter().find(|e| e.id == interior).unwrap();
+        assert_eq!(i.components["hp"].value, json!(2));
+        assert!(!i.persistent);
+        let b = taken.iter().find(|e| e.id == border).unwrap();
+        assert_eq!(b.components["hp"].value, json!(100));
+        assert!(b.persistent);
     }
 
     #[test]

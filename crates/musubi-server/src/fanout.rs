@@ -84,6 +84,21 @@ enum Wire {
         world: String,
         delta: musubi_mesh::GhostDelta,
     },
+    /// Cell host → its standby replicas (`replicas`): this tick's component-level delta of the
+    /// whole cell (keyframe every `repl_keyframe_ticks`). Nodes not listed ignore it.
+    WorldRepl {
+        world: String,
+        from_node: uuid::Uuid,
+        replicas: Vec<uuid::Uuid>,
+        delta: musubi_mesh::GhostDelta,
+    },
+    /// Replica → cell host: the mirror is complete up to `tick`.
+    WorldReplAck {
+        world: String,
+        cell: musubi_mesh::CellId,
+        node: uuid::Uuid,
+        tick: u64,
+    },
     /// Cell host → host of `entity.cell`: the entity crossed into a cell that lives on another
     /// node; full state plus inputs buffered so far.
     WorldHandover {
@@ -384,6 +399,36 @@ impl Fanout {
         self.publish(Wire::WorldGhosts {
             world: world.to_string(),
             delta,
+        });
+    }
+
+    pub fn world_repl(
+        &self,
+        world: &str,
+        from_node: uuid::Uuid,
+        replicas: Vec<uuid::Uuid>,
+        delta: musubi_mesh::GhostDelta,
+    ) {
+        self.publish(Wire::WorldRepl {
+            world: world.to_string(),
+            from_node,
+            replicas,
+            delta,
+        });
+    }
+
+    pub fn world_repl_ack(
+        &self,
+        world: &str,
+        cell: musubi_mesh::CellId,
+        node: uuid::Uuid,
+        tick: u64,
+    ) {
+        self.publish(Wire::WorldReplAck {
+            world: world.to_string(),
+            cell,
+            node,
+            tick,
         });
     }
 
@@ -748,6 +793,26 @@ impl Fanout {
             Ok(Wire::WorldGhosts { world, delta }) => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_ghosts(&world, delta);
+                }
+            }
+            Ok(Wire::WorldRepl {
+                world,
+                from_node,
+                replicas,
+                delta,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_repl(&world, from_node, &replicas, delta, self);
+                }
+            }
+            Ok(Wire::WorldReplAck {
+                world,
+                cell,
+                node,
+                tick,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_repl_ack(&world, cell, node, tick);
                 }
             }
             Ok(Wire::WorldHandover {

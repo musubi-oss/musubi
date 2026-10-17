@@ -12817,3 +12817,176 @@ async fn dev_tools_fixtures_recording_replay_and_module_canary() {
     .await;
     assert_eq!(st, 404);
 }
+
+/// Meshing III: the host of a cell streams the whole cell to a standby replica every tick; when
+/// the host dies the home takes the cell over from its mirror at the last replicated tick —
+/// no snapshot was ever written, ephemeral entities survive too.
+#[tokio::test]
+async fn world_replica_takes_over_without_snapshot() {
+    let group = format!("xrepl-{}", uuid::Uuid::now_v7().simple());
+    let Some(state1) = build_state(true, &group).await else {
+        return;
+    };
+    let Some(state2) = build_state(false, &group).await else {
+        return;
+    };
+    // replicas are picked among the alive peers the cluster knows (production wires this up)
+    state1.worlds.set_cluster(state1.cluster.clone().unwrap());
+    state2.worlds.set_cluster(state2.cluster.clone().unwrap());
+    let router1 = musubi_server::http::router(state1.clone());
+    let router2 = musubi_server::http::router(state2.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": name, "config": {"cell_size": 100.0, "replicas": 1}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let node1 = state1.worlds.node_id();
+    let node2 = state2.worlds.node_id();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let sim_b = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    let (st, e) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "x": 150.0, "y": 50.0, "components": {"hp": 7}, "persistent": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let chest = e["id"].as_str().unwrap().to_string();
+    let (st, e) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "x": 160.0, "y": 50.0, "components": {"kind": "fx"}, "persistent": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let fx = e["id"].as_str().unwrap().to_string();
+    let (st, a) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_b, "entity": chest, "components": {"hp": 8}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    let applied_tick = state2.worlds.info(&name).unwrap().tick;
+    // the host picks node 1 as the replica of (1,0) and node 1 acks the ticks
+    let mut info = state2.worlds.info(&name).unwrap();
+    let mut acked = false;
+    for _ in 0..100 {
+        info = state2.worlds.info(&name).unwrap();
+        if info.replicas.iter().any(|x| {
+            x.cell == musubi_mesh::CellId { x: 1, y: 0 }
+                && x.node == node1
+                && x.tick >= applied_tick
+        }) {
+            acked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(acked, "replica never caught up: {:?}", info.replicas);
+    let info1 = state1.worlds.info(&name).unwrap();
+    assert!(
+        info1
+            .mirrors
+            .iter()
+            .any(|m| m.cell == musubi_mesh::CellId { x: 1, y: 0 } && m.node == node2),
+        "home mirrors the cell hosted on node 2: {:?}",
+        info1.mirrors
+    );
+    let rows: Vec<(uuid::Uuid,)> =
+        sqlx::query_as("select node_id from musubi.world_snapshots where name = $1")
+            .bind(&name)
+            .fetch_all(&state2.db)
+            .await
+            .unwrap();
+    assert!(
+        !rows.iter().any(|r| r.0 == node2),
+        "no snapshot of B's shard was written: {rows:?}"
+    );
+    // B is gone: the home takes the cell over from the mirror
+    let cells = state1
+        .worlds
+        .recover_cells(&[node2], &state1.fanout)
+        .await
+        .unwrap();
+    assert_eq!(
+        cells,
+        vec![(name.clone(), musubi_mesh::CellId { x: 1, y: 0 })]
+    );
+    let (st, va) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/1/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{va}");
+    let owned = va["owned"].as_array().unwrap();
+    let comp = |id: &str, key: &str| -> Option<serde_json::Value> {
+        let e = owned.iter().find(|g| g["id"].as_str() == Some(id))?;
+        match &e["components"] {
+            serde_json::Value::Array(cs) => cs
+                .iter()
+                .find(|c| c["name"] == key)
+                .map(|c| c["value"].clone()),
+            serde_json::Value::Object(m) => m
+                .get(key)
+                .map(|c| c.get("value").cloned().unwrap_or(c.clone())),
+            _ => None,
+        }
+    };
+    assert_eq!(
+        comp(&chest, "hp"),
+        Some(serde_json::json!(8)),
+        "the last replicated write survives: {va}"
+    );
+    assert_eq!(
+        comp(&fx, "kind"),
+        Some(serde_json::json!("fx")),
+        "ephemeral entities come from the mirror, not a snapshot: {va}"
+    );
+    let info1 = state1.worlds.info(&name).unwrap();
+    assert!(
+        !info1.mirrors.iter().any(|m| m.cell.x == 1),
+        "the mirror is consumed by the takeover: {:?}",
+        info1.mirrors
+    );
+}

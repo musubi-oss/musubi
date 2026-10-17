@@ -182,6 +182,14 @@ pub struct WorldConfig {
     /// entities leave memory for the cold-cell store and come back when interest, a lease or a
     /// spawn reaches the cell (0 = never).
     pub unload_after_ticks: u64,
+    /// Standby replicas per hosted cell: other nodes that mirror the cell's entities tick by
+    /// tick (`repl_delta`) and take it over at the last replicated tick when the host dies,
+    /// without a snapshot/journal restore. 0 = off.
+    #[serde(default = "one_replica")]
+    pub replicas: u8,
+    /// Complete picture to the replicas every N ticks (0 = only the first).
+    #[serde(default = "repl_keyframe")]
+    pub repl_keyframe_ticks: u64,
 }
 
 impl Default for WorldConfig {
@@ -206,6 +214,8 @@ impl Default for WorldConfig {
             ghost_keyframe_ticks: 30,
             ghost_stale_ticks: 60,
             unload_after_ticks: 0,
+            replicas: 1,
+            repl_keyframe_ticks: 60,
         }
     }
 }
@@ -323,6 +333,12 @@ pub struct Interest {
 
 fn one_tick() -> u64 {
     1
+}
+fn one_replica() -> u8 {
+    1
+}
+fn repl_keyframe() -> u64 {
+    60
 }
 
 /// Entities per cell plus the tick each cell last changed (membership or any entity in it),
@@ -865,6 +881,19 @@ impl World {
     }
 
     /// Entities currently in `cell` (any state).
+    /// Cells that hold at least one entity, sorted.
+    pub fn occupied_cells(&self) -> Vec<CellId> {
+        let mut v: Vec<CellId> = self
+            .by_cell
+            .map
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(c, _)| *c)
+            .collect();
+        v.sort_by_key(|c| (c.x, c.y));
+        v
+    }
+
     pub fn entities_of(&self, cell: CellId) -> Vec<&Entity> {
         self.by_cell
             .get(&cell)
