@@ -4143,19 +4143,25 @@ async fn audit_log_records_admin_and_server_mutations_with_redaction() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let res = app
-        .clone()
-        .oneshot(
-            srv(Request::get(format!("/v1/admin/audit?actor={actor}")))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    let v: Value =
-        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    // audit rows are written asynchronously; poll instead of guessing a delay
+    let mut v = Value::Null;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let res = app
+            .clone()
+            .oneshot(
+                srv(Request::get(format!("/v1/admin/audit?actor={actor}")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        v = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        if v["entries"].as_array().is_some_and(|e| e.len() >= 2) {
+            break;
+        }
+    }
     let entries = v["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2, "{v}");
     let ban = &entries[0];
