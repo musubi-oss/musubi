@@ -5,6 +5,7 @@
 
 pub mod query;
 pub mod queue;
+pub mod ready;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -15,6 +16,7 @@ use parking_lot::Mutex;
 pub use query::{Properties, Query};
 use queue::{assign_teams, quality};
 pub use queue::{CandidateMatch, MmrRule, PingRule, Quality, QueueConfig, Recent, Scorer, Teams};
+pub use ready::{Pending, ReadyExpired, ReadyStart};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -211,6 +213,12 @@ pub struct Matchmaker {
     scorer: Option<Arc<dyn Scorer>>,
     /// Why queue candidates were kept apart, per (queue, reason) — the operator's expansion view.
     rejections: Mutex<HashMap<(String, &'static str), u64>>,
+    /// Formed groups waiting for every member to confirm (leader only).
+    pending: Mutex<Vec<Pending>>,
+    penalties: Mutex<ready::Penalties>,
+    /// Default ready-check length (zero = off) and dodge keep-out for queues that do not set one.
+    ready_check: Duration,
+    dodge_penalty: Duration,
     /// How long a seed waits for `max_count` before settling for `min_count`.
     min_wait: Duration,
     /// Tickets older than this are dropped by `expire` (the client gets `MatchmakerExpired`).
@@ -235,6 +243,10 @@ impl Matchmaker {
             recent: Mutex::new(Recent::default()),
             scorer: None,
             rejections: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Vec::new()),
+            penalties: Mutex::new(ready::Penalties::default()),
+            ready_check: Duration::ZERO,
+            dodge_penalty: Duration::from_secs(60),
             min_wait,
             backfill_ttl: None,
             ttl: DEFAULT_TICKET_TTL,
@@ -247,6 +259,142 @@ impl Matchmaker {
         }
         Ok(self)
     }
+    /// Ready-check every formed group for `check` (zero = off); members who do not confirm are
+    /// kept out for `penalty` (doubling per repeat within 24 h, up to 8×). Queues may override.
+    pub fn with_ready_check(mut self, check: Duration, penalty: Duration) -> Self {
+        self.ready_check = check;
+        self.dodge_penalty = penalty;
+        self
+    }
+
+    /// Leader: turn a formed group into a pending ready-check if its queue (or the default) asks
+    /// for one. `None` means deliver straight away.
+    pub fn start_ready_check(&self, m: Matched, match_id: &str) -> ReadyStart {
+        let (check, penalty) = {
+            let queues = self.queues.read();
+            let q = m.queue.as_ref().and_then(|n| queues.get(n));
+            (
+                q.and_then(|q| q.ready_check_secs)
+                    .map_or(self.ready_check, Duration::from_secs),
+                q.and_then(|q| q.dodge_penalty_secs)
+                    .map_or(self.dodge_penalty, Duration::from_secs),
+            )
+        };
+        if check.is_zero() {
+            return ReadyStart::Deliver(m);
+        }
+        let p = Pending {
+            token: m.token.clone(),
+            match_id: match_id.to_string(),
+            matched: m,
+            deadline: Instant::now() + check,
+            ready: HashSet::new(),
+            penalty,
+        };
+        self.pending.lock().push(p.clone());
+        ReadyStart::Check(p)
+    }
+
+    /// Leader: a member of `ticket` confirmed. Returns the match (with its id) once every ticket
+    /// of the group has; `Err` names the problem (unknown ticket, foreign session).
+    pub fn mark_ready(
+        &self,
+        ticket: &str,
+        session: SessionId,
+    ) -> Result<Option<(Matched, String)>> {
+        let mut pending = self.pending.lock();
+        let Some(i) = pending
+            .iter()
+            .position(|p| p.matched.tickets.iter().any(|t| t.id == ticket))
+        else {
+            return Err(Error::NotFound(format!(
+                "ticket {ticket} is not in a ready-check"
+            )));
+        };
+        let p = &mut pending[i];
+        let t = p.matched.tickets.iter().find(|t| t.id == ticket).unwrap();
+        if !t.members.iter().any(|m| m.presence.session_id == session) {
+            return Err(Error::PermissionDenied("not your ticket".into()));
+        }
+        p.ready.insert(ticket.to_string());
+        if !p.all_ready() {
+            return Ok(None);
+        }
+        let p = pending.remove(i);
+        Ok(Some((p.matched, p.match_id)))
+    }
+
+    /// Leader: expire ready-checks past their deadline. Confirmed tickets return to the pool with
+    /// their original wait; the others' accounts are penalised. Also forgets stale penalties.
+    pub fn expire_ready(&self) -> Vec<ReadyExpired> {
+        let now = Instant::now();
+        let due: Vec<Pending> = {
+            let mut pending = self.pending.lock();
+            let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+                .into_iter()
+                .partition(|p| p.deadline <= now);
+            *pending = keep;
+            due
+        };
+        let mut out = Vec::new();
+        for p in due {
+            let (requeued, dodged): (Vec<Ticket>, Vec<Ticket>) = p
+                .matched
+                .tickets
+                .into_iter()
+                .partition(|t| p.ready.contains(&t.id));
+            self.requeue(requeued.clone());
+            let mut penalty = Duration::ZERO;
+            {
+                let mut pen = self.penalties.lock();
+                for t in &dodged {
+                    for m in &t.members {
+                        penalty = penalty.max(pen.strike(m.presence.account_id, p.penalty, now));
+                    }
+                }
+                pen.prune(now);
+            }
+            out.push(ReadyExpired {
+                token: p.token,
+                requeued,
+                dodged,
+                penalty,
+            });
+        }
+        out
+    }
+
+    /// Put tickets back into the pool unchanged (same id, same `created`), skipping ids present.
+    pub fn requeue(&self, tickets: Vec<Ticket>) {
+        let mut pool = self.pool.lock();
+        for t in tickets {
+            if pool.tickets.iter().any(|x| x.id == t.id) {
+                continue;
+            }
+            for m in &t.members {
+                pool.by_session
+                    .entry(m.presence.session_id)
+                    .or_default()
+                    .push(t.id.clone());
+            }
+            pool.tickets.push(t);
+        }
+    }
+
+    /// Replica: adopt a keep-out decided by the leader.
+    pub fn penalize_until(&self, account: AccountId, until: Instant) {
+        self.penalties.lock().set(account, until);
+    }
+
+    /// How much longer the account is kept out of the matchmaker, if at all.
+    pub fn penalty_remaining(&self, account: AccountId) -> Option<Duration> {
+        self.penalties.lock().remaining(account, Instant::now())
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().len()
+    }
+
     pub fn with_scorer(mut self, scorer: Arc<dyn Scorer>) -> Self {
         self.scorer = Some(scorer);
         self
@@ -399,6 +547,19 @@ impl Matchmaker {
             return Err(Error::InvalidArgument(
                 "ticket needs at least one member".into(),
             ));
+        }
+        {
+            let pen = self.penalties.lock();
+            let now = Instant::now();
+            for m in &t.members {
+                if let Some(left) = pen.remaining(m.presence.account_id, now) {
+                    return Err(Error::PermissionDenied(format!(
+                        "{} dodged a ready-check: matchmaking blocked for {} s",
+                        m.presence.username,
+                        left.as_secs().max(1)
+                    )));
+                }
+            }
         }
         if t.min_count < 2 || t.max_count < t.min_count || t.max_count > MAX_COUNT {
             return Err(Error::InvalidArgument(format!(

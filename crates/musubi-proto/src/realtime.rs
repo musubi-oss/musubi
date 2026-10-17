@@ -69,6 +69,10 @@ pub enum ClientMessage {
     MatchmakerRemove {
         ticket: String,
     },
+    /// Confirm a `MatchmakerReadyCheck`; the match is delivered once every ticket confirmed.
+    MatchmakerReady {
+        ticket: String,
+    },
     /// Parties: small realtime groups with a leader. Closed parties admit members via join requests.
     PartyCreate {
         #[serde(default)]
@@ -295,6 +299,21 @@ pub enum ServerMessage {
         /// Dedicated server allocated for the group (tickets carried `fleet=<name>`).
         #[serde(default)]
         server: Option<MatchmakerServer>,
+    },
+    /// A group was formed but must confirm: answer `MatchmakerReady` within `deadline_ms`.
+    MatchmakerReadyCheck {
+        ticket: String,
+        token: String,
+        deadline_ms: u64,
+        users: Vec<MatchmakerUser>,
+    },
+    /// The ready-check ran out. `requeued`: this ticket confirmed and is back in the queue with
+    /// its wait kept; otherwise it dodged and its account is blocked for `penalty_secs`.
+    MatchmakerReadyFailed {
+        ticket: String,
+        token: String,
+        requeued: bool,
+        penalty_secs: u64,
     },
     /// Reply to create/join/accept: the party as the receiver sees it.
     Party {

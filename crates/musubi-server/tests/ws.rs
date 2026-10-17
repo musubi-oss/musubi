@@ -88,6 +88,17 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
     worlds.set_region(region);
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
+    // production runs matchmaking::spawn_ticker; here a plain loop (no lease) so ready-checks
+    // and ticket TTLs expire in tests too
+    {
+        let (relayed, mm, fanout) = (relayed.clone(), matchmaker.clone(), fanout.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                musubi_server::realtime::matchmaking::process_and_deliver(&relayed, &mm, &fanout);
+            }
+        });
+    }
     let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
     let schedules = Arc::new(musubi_server::schedules::Schedules::from_config(
         &cfg.runtime,
@@ -7603,4 +7614,145 @@ async fn matchmaker_queue_forms_balanced_teams() {
     assert_eq!(teams[1].len(), 2);
     let sum = |t: &Vec<f64>| t.iter().sum::<f64>();
     assert_eq!(sum(&teams[0]), sum(&teams[1]), "{teams:?}");
+}
+
+#[tokio::test]
+async fn matchmaker_ready_check_delivers_requeues_and_penalises_dodgers() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let queue = format!("rc-{}", uuid::Uuid::now_v7().simple());
+    let body = serde_json::json!({
+        "name": queue, "min_count": 2, "max_count": 2,
+        "ready_check_secs": 1, "dodge_penalty_secs": 30
+    });
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/v1/server/matchmaker/queues")
+        .header("x-musubi-server-key", "defaultkey")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+    let add = ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: "*".into(),
+        string_properties: [("queue".to_string(), queue.clone())].into(),
+        numeric_properties: Default::default(),
+        count_multiple: 1,
+    };
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let ticket_of = |m: ServerMessage| match m {
+        ServerMessage::MatchmakerTicket { ticket } => ticket,
+        m => panic!("{m:?}"),
+    };
+    // round 1: both confirm → matched
+    send(&mut a, f, None, add.clone()).await;
+    let ticket_a = ticket_of(recv(&mut a).await.msg);
+    send(&mut b, f, None, add.clone()).await;
+    let ticket_b = ticket_of(recv(&mut b).await.msg);
+    for (s, t) in [(&mut a, &ticket_a), (&mut b, &ticket_b)] {
+        match recv(s).await.msg {
+            ServerMessage::MatchmakerReadyCheck {
+                ticket,
+                deadline_ms,
+                users,
+                ..
+            } => {
+                assert_eq!(&ticket, t);
+                assert!(deadline_ms > 0 && deadline_ms <= 1000);
+                assert_eq!(users.len(), 2);
+            }
+            m => panic!("{m:?}"),
+        }
+        send(
+            s,
+            f,
+            None,
+            ClientMessage::MatchmakerReady { ticket: t.clone() },
+        )
+        .await;
+    }
+    let tok = match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerMatched { ticket, token, .. } => {
+            assert_eq!(ticket, ticket_a);
+            token
+        }
+        m => panic!("{m:?}"),
+    };
+    match recv(&mut b).await.msg {
+        ServerMessage::MatchmakerMatched { token, .. } => assert_eq!(token, tok),
+        m => panic!("{m:?}"),
+    }
+    // round 2: only A confirms → A back in the queue with its wait, B penalised
+    send(&mut a, f, None, add.clone()).await;
+    let ticket_a = ticket_of(recv(&mut a).await.msg);
+    send(&mut b, f, None, add.clone()).await;
+    let ticket_b = ticket_of(recv(&mut b).await.msg);
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchmakerReadyCheck { .. }
+    ));
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerReadyCheck { .. }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchmakerReady {
+            ticket: ticket_a.clone(),
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerReadyFailed {
+            ticket,
+            requeued,
+            penalty_secs,
+            ..
+        } => {
+            assert_eq!(ticket, ticket_a);
+            assert!(requeued);
+            assert_eq!(penalty_secs, 0);
+        }
+        m => panic!("{m:?}"),
+    }
+    match recv(&mut b).await.msg {
+        ServerMessage::MatchmakerReadyFailed {
+            ticket,
+            requeued,
+            penalty_secs,
+            ..
+        } => {
+            assert_eq!(ticket, ticket_b);
+            assert!(!requeued);
+            assert_eq!(penalty_secs, 30);
+        }
+        m => panic!("{m:?}"),
+    }
+    // B is kept out; A's requeued ticket is still live and can be removed
+    send(&mut b, f, None, add.clone()).await;
+    match recv(&mut b).await.msg {
+        ServerMessage::Error { message, .. } => assert!(message.contains("dodged"), "{message}"),
+        m => panic!("{m:?}"),
+    }
+    send(
+        &mut a,
+        f,
+        Some("rm"),
+        ClientMessage::MatchmakerRemove {
+            ticket: ticket_a.clone(),
+        },
+    )
+    .await;
+    send(&mut a, f, Some("p"), ClientMessage::Ping).await;
+    let r = recv(&mut a).await;
+    assert_eq!(r.cid.as_deref(), Some("p"), "{:?}", r.msg);
 }

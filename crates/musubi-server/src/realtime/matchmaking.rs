@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use musubi_cluster::Cluster;
-use musubi_matchmaker::{Matched, Matchmaker};
+use musubi_matchmaker::{Matched, Matchmaker, ReadyStart};
 
 use crate::fanout::Fanout;
 use musubi_proto::realtime::MatchmakerServer;
@@ -42,6 +42,54 @@ pub fn deliver(
     }
 }
 
+/// Every node: ask its local members of a formed group to confirm.
+pub fn deliver_ready_check(hub: &Hub, w: &crate::fanout::ReadyCheckWire) {
+    let users: Vec<musubi_matchmaker::Candidate> =
+        w.tickets.iter().flat_map(|t| t.members.clone()).collect();
+    for t in &w.tickets {
+        for member in &t.members {
+            hub.send_to_session(
+                member.presence.session_id,
+                ServerMessage::MatchmakerReadyCheck {
+                    ticket: t.id.clone(),
+                    token: w.token.clone(),
+                    deadline_ms: w.deadline_ms,
+                    users: users.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// Every node: tell its local members how a ready-check ended; dodged party tickets are cleared
+/// in the party, requeued ones stay.
+pub fn deliver_ready_failed(
+    hub: &Hub,
+    parties: &PartyRegistry,
+    w: &crate::fanout::ReadyExpiredWire,
+) {
+    for (tickets, requeued) in [(&w.requeued, true), (&w.dodged, false)] {
+        for t in tickets {
+            if !requeued {
+                if let Some(pid) = &t.party_id {
+                    parties.ticket_consumed(pid, &t.id);
+                }
+            }
+            for member in &t.members {
+                hub.send_to_session(
+                    member.presence.session_id,
+                    ServerMessage::MatchmakerReadyFailed {
+                        ticket: t.id.clone(),
+                        token: w.token.clone(),
+                        requeued,
+                        penalty_secs: if requeued { 0 } else { w.penalty_secs },
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Tell the local member sessions of expired tickets; party tickets are also cleared in the party.
 pub fn deliver_expired(
     hub: &Hub,
@@ -71,8 +119,24 @@ pub fn process_and_deliver(relayed: &RelayedRegistry, mm: &Matchmaker, fanout: &
     for m in mm.process() {
         observe(&m);
         let match_id = relayed.new_match_id();
-        mm.register_open(&match_id, &m);
-        fanout.deliver_matched(m, match_id);
+        match mm.start_ready_check(m, &match_id) {
+            ReadyStart::Deliver(m) => {
+                mm.register_open(&match_id, &m);
+                fanout.deliver_matched(m, match_id);
+            }
+            ReadyStart::Check(p) => fanout.mm_ready_check(&p),
+        }
+    }
+    for e in mm.expire_ready() {
+        let queue = e
+            .requeued
+            .iter()
+            .chain(&e.dodged)
+            .find_map(|t| t.queue.clone())
+            .unwrap_or_else(|| "free".into());
+        metrics::counter!("musubi_matchmaker_dodges_total", "queue" => queue)
+            .increment(e.dodged.len() as u64);
+        fanout.mm_ready_expired(&e);
     }
     for (queue, reason, n) in mm.take_rejections() {
         metrics::counter!("musubi_matchmaker_rejections_total", "queue" => queue, "reason" => reason)

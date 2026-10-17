@@ -521,6 +521,10 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                 Err(e) => Some(ServerMessage::error(&e)),
             }
         }
+        ClientMessage::MatchmakerReady { ticket } => {
+            ctx.fanout.mm_ready(&ticket, sid);
+            None
+        }
         ClientMessage::MatchmakerRemove { ticket } => match ctx.matchmaker.remove(sid, &ticket) {
             Ok(()) => {
                 ctx.fanout.mm_remove(&ticket);

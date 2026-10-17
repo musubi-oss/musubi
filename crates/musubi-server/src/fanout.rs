@@ -19,6 +19,21 @@ use crate::realtime::relayed::RelayedCmdEnv;
 use crate::realtime::world::{WorldCmd, WorldCmdEnv, WorldRegistry};
 use crate::realtime::{Hub, PartyRegistry, RelayedRegistry};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyCheckWire {
+    pub token: String,
+    pub deadline_ms: u64,
+    pub tickets: Vec<TicketWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyExpiredWire {
+    pub token: String,
+    pub requeued: Vec<TicketWire>,
+    pub dodged: Vec<TicketWire>,
+    pub penalty_secs: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 enum Wire {
     Account {
@@ -37,6 +52,15 @@ enum Wire {
     MmAdd(TicketWire),
     MmRemove(String),
     MmMatched(MatchedWire),
+    /// Leader: a formed group must confirm; replicas drop the tickets and tell their sessions.
+    MmReadyCheck(ReadyCheckWire),
+    /// A member confirmed; only the leader acts.
+    MmReady {
+        ticket: String,
+        session: SessionId,
+    },
+    /// Leader: a ready-check ran out; confirmed tickets come back, dodgers are penalised.
+    MmReadyExpired(ReadyExpiredWire),
     Session {
         session_id: SessionId,
         msg: ServerMessage,
@@ -398,6 +422,76 @@ impl Fanout {
         });
     }
 
+    /// The bus does not echo to the publisher, so every matchmaker message is handled here first
+    /// and then sent to the other nodes.
+    pub fn mm_ready(&self, ticket: &str, session: SessionId) {
+        self.handle_ready(ticket, session);
+        self.publish(Wire::MmReady {
+            ticket: ticket.to_string(),
+            session,
+        });
+    }
+
+    pub fn mm_ready_check(&self, p: &musubi_matchmaker::Pending) {
+        let w = ReadyCheckWire {
+            token: p.token.clone(),
+            deadline_ms: p
+                .deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64,
+            tickets: p.matched.tickets.iter().map(TicketWire::from).collect(),
+        };
+        self.handle_ready_check(&w);
+        self.publish(Wire::MmReadyCheck(w));
+    }
+
+    pub fn mm_ready_expired(&self, e: &musubi_matchmaker::ReadyExpired) {
+        let w = ReadyExpiredWire {
+            token: e.token.clone(),
+            requeued: e.requeued.iter().map(TicketWire::from).collect(),
+            dodged: e.dodged.iter().map(TicketWire::from).collect(),
+            penalty_secs: e.penalty.as_secs(),
+        };
+        self.handle_ready_expired(&w);
+        self.publish(Wire::MmReadyExpired(w));
+    }
+
+    fn handle_ready_check(&self, w: &ReadyCheckWire) {
+        for t in &w.tickets {
+            self.mm.cancel(&t.id);
+        }
+        crate::realtime::matchmaking::deliver_ready_check(&self.hub, w);
+    }
+
+    fn handle_ready(&self, ticket: &str, session: SessionId) {
+        if !self.is_leader() {
+            return;
+        }
+        match self.mm.mark_ready(ticket, session) {
+            Ok(Some((m, match_id))) => {
+                self.mm.register_open(&match_id, &m);
+                self.deliver_matched(m, match_id);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(error = %e, ticket, "ready ignored"),
+        }
+    }
+
+    fn handle_ready_expired(&self, w: &ReadyExpiredWire) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(w.penalty_secs);
+        for t in &w.dodged {
+            for m in &t.members {
+                self.mm.penalize_until(m.presence.account_id, until);
+            }
+        }
+        for t in &w.requeued {
+            if let Err(e) = self.mm.add_replica(t.clone()) {
+                tracing::warn!(error = %e, "bad requeued ticket");
+            }
+        }
+        crate::realtime::matchmaking::deliver_ready_failed(&self.hub, &self.parties, w);
+    }
+
     fn mm_matched(&self, m: &Matched, match_id: &str, server: Option<MatchmakerServer>) {
         self.publish(Wire::MmMatched(m.to_wire(match_id, server)));
     }
@@ -500,6 +594,9 @@ impl Fanout {
             Ok(Wire::MmRemove(id)) => {
                 self.mm.cancel(&id);
             }
+            Ok(Wire::MmReadyCheck(w)) => self.handle_ready_check(&w),
+            Ok(Wire::MmReady { ticket, session }) => self.handle_ready(&ticket, session),
+            Ok(Wire::MmReadyExpired(w)) => self.handle_ready_expired(&w),
             Ok(Wire::MmMatched(w)) => {
                 let match_id = w.match_id.clone();
                 let server = w.server.clone();

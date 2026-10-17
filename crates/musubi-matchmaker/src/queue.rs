@@ -34,6 +34,11 @@ pub struct QueueConfig {
     pub crossplay: Vec<Vec<String>>,
     /// Tickets that waited this long are seeded first regardless of arrival order (0 = off).
     pub priority_after_secs: u64,
+    /// Members must confirm within this many seconds after the group forms (None = the
+    /// matchmaker's default, 0 = no ready-check).
+    pub ready_check_secs: Option<u64>,
+    /// Base keep-out for a member who did not confirm (None = the matchmaker's default).
+    pub dodge_penalty_secs: Option<u64>,
 }
 
 impl Default for QueueConfig {
@@ -49,6 +54,8 @@ impl Default for QueueConfig {
             no_repeat_secs: 0,
             crossplay: Vec::new(),
             priority_after_secs: 0,
+            ready_check_secs: None,
+            dodge_penalty_secs: None,
         }
     }
 }

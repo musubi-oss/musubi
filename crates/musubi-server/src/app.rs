@@ -128,6 +128,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .with_ttl(std::time::Duration::from_secs(
                 cfg.matchmaker.ticket_ttl_secs,
             ))
+            .with_ready_check(
+                std::time::Duration::from_secs(cfg.matchmaker.ready_check_secs),
+                std::time::Duration::from_secs(cfg.matchmaker.dodge_penalty_secs),
+            )
             .with_scorer(Arc::new(crate::realtime::matchmaking::RuntimeScorer(
                 runtime.clone(),
             )))

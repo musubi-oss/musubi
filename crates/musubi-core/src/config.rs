@@ -807,6 +807,10 @@ pub struct MatchmakerConfig {
     pub min_wait_secs: u64,
     /// Tickets older than this are dropped with `MatchmakerExpired`.
     pub ticket_ttl_secs: u64,
+    /// Members must confirm a formed group within this many seconds (0 = no ready-check).
+    pub ready_check_secs: u64,
+    /// Base keep-out for a member who did not confirm; doubles per repeat within 24 h, up to 8×.
+    pub dodge_penalty_secs: u64,
     /// Formed matches with free slots accept compatible later tickets (backfill) for this long; 0 = off.
     pub backfill_secs: u64,
     /// Named queues (`[[matchmaker.queues]]`, see `musubi_matchmaker::QueueConfig`): match size,
@@ -820,6 +824,8 @@ impl Default for MatchmakerConfig {
             min_wait_secs: 15,
             backfill_secs: 60,
             ticket_ttl_secs: 180,
+            ready_check_secs: 0,
+            dodge_penalty_secs: 60,
             queues: Vec::new(),
         }
     }
