@@ -20,6 +20,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/tournaments/{id}/around/{owner}", get(around))
         .route("/v1/server/tournaments", post(create))
         .route("/v1/server/tournaments/{id}", delete(delete_one))
+        .route("/v1/server/tournaments/{id}/end", post(end))
         .route(
             "/v1/server/tournaments/{id}/records/{owner}",
             post(write_as),
@@ -199,4 +200,94 @@ async fn write_as(
             .write(&s.leaderboards, &id, owner, u.as_deref(), w, true)
             .await?,
     ))
+}
+
+/// Pay the prizes of one finished window: every record in a rank band gets a mail carrying the
+/// band's reward table. Claimed once per (tournament, window), so the leader sweep and a manual
+/// `end` never pay twice. Returns how many mails went out.
+pub async fn pay_prizes(s: &AppState, id: &str, expiry: i64) -> Result<usize, musubi_core::Error> {
+    let prizes = s.tournaments.prizes(id).await?;
+    if prizes.is_empty() || !s.tournaments.claim_payout(id, expiry).await? {
+        return Ok(0);
+    }
+    let limit = prizes.iter().map(|p| p.to_rank).max().unwrap_or(0) as usize;
+    let records = s
+        .leaderboards
+        .records(id, &[], limit, None, Some(expiry), None)
+        .await?
+        .records;
+    let now = time::OffsetDateTime::now_utc();
+    let mut paid = 0;
+    for (i, r) in records.iter().enumerate() {
+        let rank = i as i32 + 1;
+        let Some(p) = prizes
+            .iter()
+            .find(|p| p.from_rank <= rank && rank <= p.to_rank)
+        else {
+            continue;
+        };
+        let title = if p.title.is_empty() {
+            format!("Tournament {id}: rank {rank}")
+        } else {
+            p.title.clone()
+        };
+        s.economy
+            .send_mail(
+                musubi_economy::SendMail {
+                    account_ids: vec![r.owner_id.0],
+                    all: false,
+                    title,
+                    body: p.body.clone(),
+                    metadata: json!({
+                        "tournament_id": id, "rank": rank, "score": r.score,
+                        "subscore": r.subscore, "expiry": expiry,
+                    }),
+                    rewards: Some(p.reward_table.clone()),
+                    expires_in_seconds: None,
+                },
+                now,
+            )
+            .await?;
+        s.events
+            .emit(
+                "tournament.prize",
+                Some(r.owner_id),
+                json!({ "tournament_id": id, "rank": rank, "reward_table": p.reward_table, "expiry": expiry }),
+            )
+            .await;
+        paid += 1;
+    }
+    s.tournaments.record_payout(id, expiry, paid as i32).await?;
+    Ok(paid)
+}
+
+/// Close the active window by hand: fires `tournament_end` to modules (once) and pays the prizes.
+async fn end(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // records of the running window are keyed by its expiry (`next_reset`), as in the sweep
+    let t = s.tournaments.get(&id).await?;
+    let expiry = t.next_reset;
+    if s.leaderboards.claim_end(&id, expiry).await? {
+        let records = s
+            .leaderboards
+            .records(&id, &[], 100, None, Some(expiry), None)
+            .await?
+            .records;
+        let ctx = musubi_runtime::CallContext {
+            server: true,
+            ..Default::default()
+        };
+        s.runtime
+            .event(
+                "tournament_end",
+                ctx,
+                json!({ "id": id, "expiry": expiry, "size": records.len(), "records": records }),
+            )
+            .await;
+    }
+    let paid = pay_prizes(&s, &id, expiry).await?;
+    Ok(Json(json!({ "expiry": expiry, "paid": paid })))
 }

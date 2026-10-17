@@ -694,6 +694,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                                     "leaderboard_reset"
                                 };
                                 st.runtime.event(event, ctx, payload).await;
+                                if is_t {
+                                    if let Err(e) =
+                                        crate::http::tournaments::pay_prizes(&st, &id, expiry).await
+                                    {
+                                        tracing::warn!(error = %e, id, "tournament prizes");
+                                    }
+                                }
                             }
                         }
                         Err(e) => tracing::warn!(error = %e, "end-of-window scan failed"),

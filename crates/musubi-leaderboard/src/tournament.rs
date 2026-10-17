@@ -9,6 +9,18 @@ use crate::{
     parse_cron, validate_id, window, Operator, Record, RecordList, SortOrder, WriteRecord,
 };
 
+/// A rank band of a tournament window and the reward table every owner in it receives by mail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Prize {
+    pub from_rank: i32,
+    pub to_rank: i32,
+    pub reward_table: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Tournament {
     pub id: String,
@@ -38,6 +50,9 @@ pub struct Tournament {
     pub end_active: i64,
     pub next_reset: i64,
     pub prev_reset: i64,
+    /// Filled by `get` and `create`; empty in listings.
+    #[serde(default)]
+    pub prizes: Vec<Prize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +91,8 @@ pub struct CreateTournament {
     pub join_required: bool,
     #[serde(default)]
     pub authoritative: bool,
+    #[serde(default)]
+    pub prizes: Vec<Prize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -208,6 +225,7 @@ fn to_tournament(r: Row, p: &Phase, size: i64) -> Tournament {
         },
         next_reset: ts(p.expiry),
         prev_reset: ts(p.window_start),
+        prizes: Vec::new(),
     }
 }
 
@@ -226,6 +244,7 @@ impl TournamentService {
                 "title ≤ 256, description ≤ 1024 chars".into(),
             ));
         }
+        Self::validate_prizes(&c.prizes)?;
         if c.duration < 0 || c.max_size < 0 || c.max_num_score < 0 {
             return Err(Error::InvalidArgument(
                 "duration, max_size, max_num_score must be ≥ 0".into(),
@@ -291,9 +310,11 @@ impl TournamentService {
             }
             Err(e) => return Err(Error::internal(e)),
         };
+        self.insert_prizes(&c.id, &c.prizes).await?;
         let p = phase(&row, OffsetDateTime::now_utc())?;
         let mut t = to_tournament(row, &p, 0);
         t.private = c.join_code.is_some();
+        t.prizes = c.prizes;
         Ok(t)
     }
 
@@ -323,10 +344,106 @@ impl TournamentService {
     pub async fn get(&self, id: &str) -> Result<Tournament> {
         let r = self.row(id).await?;
         let p = phase(&r, OffsetDateTime::now_utc())?;
+        let prizes = self.prizes(id).await?;
         let size = size_of(&self.db, id, p.expiry).await?;
         let mut t = to_tournament(r, &p, size);
         t.private = self.join_code(id).await?.is_some();
+        t.prizes = prizes;
         Ok(t)
+    }
+
+    pub async fn prizes(&self, id: &str) -> Result<Vec<Prize>> {
+        let rows: Vec<(i32, i32, String, String, String)> = sqlx::query_as(
+            "select from_rank, to_rank, reward_table, title, body from musubi.tournament_prizes
+             where tournament_id = $1 order by from_rank",
+        )
+        .bind(id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(from_rank, to_rank, reward_table, title, body)| Prize {
+                from_rank,
+                to_rank,
+                reward_table,
+                title,
+                body,
+            })
+            .collect())
+    }
+
+    fn validate_prizes(prizes: &[Prize]) -> Result<()> {
+        let mut sorted: Vec<&Prize> = prizes.iter().collect();
+        sorted.sort_by_key(|p| p.from_rank);
+        let mut last_to = 0;
+        for p in sorted {
+            if p.from_rank < 1 || p.to_rank < p.from_rank {
+                return Err(Error::InvalidArgument(format!(
+                    "prize band {}..{} is invalid",
+                    p.from_rank, p.to_rank
+                )));
+            }
+            if p.from_rank <= last_to {
+                return Err(Error::InvalidArgument(format!(
+                    "prize band {}..{} overlaps the previous one",
+                    p.from_rank, p.to_rank
+                )));
+            }
+            if p.reward_table.is_empty() {
+                return Err(Error::InvalidArgument("prize needs a reward_table".into()));
+            }
+            last_to = p.to_rank;
+        }
+        Ok(())
+    }
+
+    async fn insert_prizes(&self, id: &str, prizes: &[Prize]) -> Result<()> {
+        for p in prizes {
+            sqlx::query(
+                "insert into musubi.tournament_prizes (tournament_id, from_rank, to_rank, reward_table, title, body)
+                 values ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(id)
+            .bind(p.from_rank)
+            .bind(p.to_rank)
+            .bind(&p.reward_table)
+            .bind(&p.title)
+            .bind(&p.body)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve the payout of one finished window; false when it was already claimed (another
+    /// node, an earlier sweep, or a manual `end`).
+    pub async fn claim_payout(&self, id: &str, expiry: i64) -> Result<bool> {
+        let exp = OffsetDateTime::from_unix_timestamp(expiry)
+            .map_err(|_| Error::InvalidArgument("bad expiry".into()))?;
+        let r = sqlx::query(
+            "insert into musubi.tournament_payouts (tournament_id, expiry_time) values ($1, $2) on conflict do nothing",
+        )
+        .bind(id)
+        .bind(exp)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn record_payout(&self, id: &str, expiry: i64, paid: i32) -> Result<()> {
+        let exp = OffsetDateTime::from_unix_timestamp(expiry)
+            .map_err(|_| Error::InvalidArgument("bad expiry".into()))?;
+        sqlx::query("update musubi.tournament_payouts set paid = $3 where tournament_id = $1 and expiry_time = $2")
+            .bind(id)
+            .bind(exp)
+            .bind(paid)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
     }
 
     /// Join code of a private tournament (sqlx tuples stop at 16 columns, so it is read apart).

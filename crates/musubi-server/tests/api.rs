@@ -10827,3 +10827,115 @@ async fn groups_inventory_deposit_and_withdraw() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn tournaments_prizes_paid_by_mail() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("tp")})),
+        )
+        .await;
+        users.push(s["access_token"].as_str().unwrap().to_string());
+    }
+    let medal = unique("medal");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": medal, "name": "Medal", "category": "trophy", "max_stack": 99})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let table = unique("podium");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({"id": table, "name": "Podium", "kind": "weighted",
+            "entries": [{"weight": 1, "item_id": medal, "amount": 1}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let id = unique("cup");
+    // overlapping bands are refused
+    let (st, v) = call_server(&app, "POST", "/v1/server/tournaments", k, Some(json!({
+        "id": id, "title": "Cup", "duration": 3600,
+        "prizes": [{"from_rank": 1, "to_rank": 2, "reward_table": table}, {"from_rank": 2, "to_rank": 3, "reward_table": table}]
+    }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, t) = call_server(
+        &app,
+        "POST",
+        "/v1/server/tournaments",
+        k,
+        Some(json!({
+            "id": id, "title": "Cup", "duration": 3600,
+            "prizes": [{"from_rank": 1, "to_rank": 1, "reward_table": table, "title": "Champion"},
+                       {"from_rank": 2, "to_rank": 3, "reward_table": table}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["prizes"].as_array().unwrap().len(), 2);
+    let (_, g) = call(
+        &app,
+        "GET",
+        &format!("/v1/tournaments/{id}"),
+        Some(&users[0]),
+        None,
+    )
+    .await;
+    assert_eq!(g["prizes"][0]["title"], "Champion");
+    for (i, tok) in users.iter().enumerate() {
+        let (st, v) = call(
+            &app,
+            "POST",
+            &format!("/v1/tournaments/{id}/records"),
+            Some(tok),
+            Some(json!({"score": 30 - 10 * i as i64})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, e) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/tournaments/{id}/end"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    assert_eq!(e["paid"], 3, "{e}");
+    for (i, tok) in users.iter().enumerate() {
+        let (st, m) = call(&app, "GET", "/v1/mail", Some(tok), None).await;
+        assert_eq!(st, StatusCode::OK, "{m}");
+        let mail = m["mail"].as_array().unwrap();
+        assert_eq!(mail.len(), 1, "{m}");
+        assert_eq!(mail[0]["rewards"], json!(table));
+        assert_eq!(mail[0]["metadata"]["rank"], i as i64 + 1);
+        if i == 0 {
+            assert_eq!(mail[0]["title"], "Champion");
+        }
+    }
+    // a second close of the same window pays nothing
+    let (st, e) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/tournaments/{id}/end"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    assert_eq!(e["paid"], 0);
+}

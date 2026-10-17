@@ -20,7 +20,7 @@ pub mod rating;
 mod rpc;
 mod rtc;
 mod storage;
-mod tournaments;
+pub mod tournaments;
 mod worlds;
 mod ws;
 
