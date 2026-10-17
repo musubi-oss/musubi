@@ -12,8 +12,8 @@ pub mod token;
 pub mod totp;
 
 pub use service::{
-    AuthService, Authenticated, CaptchaFuture, CaptchaVerifier, CaptchaVerifyFn, Login, Session,
-    SessionInfo, MFA_TOKEN_SECS,
+    AuthService, Authenticated, CaptchaFuture, CaptchaVerifier, CaptchaVerifyFn, Login, LoginQueue,
+    QueueStats, Session, SessionInfo, MFA_TOKEN_SECS, QUEUE_TICKET_SECS,
 };
 pub use token::{Claims, TokenSigner};
 

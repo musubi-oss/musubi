@@ -9276,3 +9276,144 @@ async fn match_fenced_node_cannot_persist_after_takeover() {
     other.get(&mid).unwrap().terminate(0);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 }
+
+/// Login queue (5.1): with capacity 1 and one account online, the next verified login gets a
+/// 202 ticket; polling stays 202 until the socket goes away, then turns into a session.
+#[tokio::test]
+async fn login_queue_holds_logins_until_a_slot_frees() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let f = state.fanout.clone();
+    state.auth.set_login_queue(Some(musubi_auth::LoginQueue {
+        capacity: 1,
+        admit_per_sec: 50,
+        ttl_secs: 60,
+        online: Arc::new(move || f.online_accounts()),
+    }));
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+
+    async fn call(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        key: bool,
+    ) -> (u16, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        if key {
+            req = req.header("x-musubi-server-key", "defaultkey");
+        }
+        let req = req
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let st = res.status().as_u16();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (st, v)
+    }
+    async fn wait_online(f: &musubi_server::fanout::Fanout, n: usize) {
+        for _ in 0..100 {
+            if f.online_accounts() == n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        panic!(
+            "online count never reached {n} (now {})",
+            f.online_accounts()
+        );
+    }
+    let dev = |p: &str| json!({"id": format!("{p}-{}", uuid::Uuid::now_v7().simple())});
+
+    // nobody online → straight in
+    let (tok_a, _) = token(&router).await;
+    let mut ws_a = connect(&addr, &tok_a, "json").await;
+    wait_online(&state.fanout, 1).await;
+
+    // capacity reached → ticket instead of session
+    let (st, v) = call(&router, "POST", "/v1/auth/device", Some(dev("lq-b")), false).await;
+    assert_eq!(st, 202, "{v}");
+    assert_eq!(v["code"], "login_queued");
+    assert_eq!(v["queued"], true);
+    assert_eq!(v["position"], 0);
+    assert!(v["eta_secs"].as_i64().unwrap() >= 1, "{v}");
+    let ticket = v["ticket"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &router,
+        "POST",
+        "/v1/auth/queue",
+        Some(json!({"ticket": ticket})),
+        false,
+    )
+    .await;
+    assert_eq!(st, 202, "{v}");
+    assert_eq!(v["position"], 0);
+    // a third login lines up behind
+    let (st, v) = call(&router, "POST", "/v1/auth/device", Some(dev("lq-c")), false).await;
+    assert_eq!(st, 202, "{v}");
+    assert_eq!(v["position"], 1);
+    let ticket_c = v["ticket"].as_str().unwrap().to_string();
+    let (st, v) = call(&router, "GET", "/v1/admin/auth/queue", None, true).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["capacity"], 1);
+    assert_eq!(v["online"], 1);
+    assert_eq!(v["waiting"], 2);
+
+    // the online player leaves → first in line gets the session, the next still waits
+    ws_a.close(None).await.unwrap();
+    drop(ws_a);
+    wait_online(&state.fanout, 0).await;
+    let (st, v) = call(
+        &router,
+        "POST",
+        "/v1/auth/queue",
+        Some(json!({"ticket": ticket})),
+        false,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert!(v["access_token"].is_string(), "{v}");
+    assert!(v["account_id"].is_string(), "{v}");
+    let (st, v) = call(
+        &router,
+        "POST",
+        "/v1/auth/queue",
+        Some(json!({"ticket": ticket_c})),
+        false,
+    )
+    .await;
+    assert_eq!(st, 202, "{v}");
+    assert_eq!(v["position"], 0);
+
+    // garbage and flushed tickets → log in again
+    let (st, _) = call(
+        &router,
+        "POST",
+        "/v1/auth/queue",
+        Some(json!({"ticket": "nope"})),
+        false,
+    )
+    .await;
+    assert_eq!(st, 401);
+    let (st, v) = call(&router, "DELETE", "/v1/admin/auth/queue", None, true).await;
+    assert_eq!(st, 200, "{v}");
+    assert!(v["dropped"].as_u64().unwrap() >= 1, "{v}");
+    let (st, v) = call(
+        &router,
+        "POST",
+        "/v1/auth/queue",
+        Some(json!({"ticket": ticket_c})),
+        false,
+    )
+    .await;
+    assert_eq!(st, 401, "{v}");
+}

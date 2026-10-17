@@ -281,6 +281,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         parties.clone(),
     );
     fanout.set_fleets(fleets.clone());
+    if cfg.session.login_queue_capacity > 0 {
+        let f = fanout.clone();
+        auth.set_login_queue(Some(musubi_auth::LoginQueue {
+            capacity: cfg.session.login_queue_capacity,
+            admit_per_sec: cfg.session.login_queue_admit_per_sec,
+            ttl_secs: cfg.session.login_queue_ttl_secs.max(5),
+            online: std::sync::Arc::new(move || f.online_accounts()),
+        }));
+    }
     let worlds = Arc::new(
         crate::realtime::WorldRegistry::new(cluster.node_id().0, Some(db.clone()))
             .with_group(&cfg.node.cluster_group),

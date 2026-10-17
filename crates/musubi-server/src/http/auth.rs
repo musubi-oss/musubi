@@ -14,6 +14,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/email", post(email))
         .route("/v1/auth/mfa", post(mfa))
         .route("/v1/auth/refresh", post(refresh))
+        .route("/v1/auth/queue", post(queue))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/steam", post(steam))
         .route("/v1/auth/google", post(google))
@@ -198,6 +199,24 @@ async fn mfa(
     let sess = s.auth.mfa_complete(&r.mfa_token, &r.code).await?;
     authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0);
     Ok(Json(sess))
+}
+
+/// Login queue (5.1): a login past the online capacity answered 202 with a ticket; the client
+/// polls here and gets the session the moment its place is reached.
+async fn queue(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<QueueReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let sess = s.auth.queue_poll(&r.ticket).await?;
+    authenticated(&s, &sess, "queue", &ip.0);
+    Ok(Json(sess))
+}
+
+#[derive(Deserialize)]
+struct QueueReq {
+    ticket: String,
 }
 
 async fn refresh(

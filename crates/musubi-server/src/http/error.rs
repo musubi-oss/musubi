@@ -25,6 +25,19 @@ impl IntoResponse for ApiError {
             other => other.to_string(),
         };
         let mut body = json!({ "code": self.0.code(), "message": message });
+        if let Error::LoginQueued {
+            ticket,
+            position,
+            eta_secs,
+            expires_in,
+        } = &self.0
+        {
+            body["queued"] = json!(true);
+            body["ticket"] = json!(ticket);
+            body["position"] = json!(position);
+            body["eta_secs"] = json!(eta_secs);
+            body["expires_in"] = json!(expires_in);
+        }
         if let Some(id) = crate::telemetry::current_trace_id() {
             body["trace_id"] = json!(id);
         }

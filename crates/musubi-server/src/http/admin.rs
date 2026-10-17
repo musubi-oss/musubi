@@ -43,6 +43,7 @@ pub fn routes() -> Router<AppState> {
             "/v1/admin/runtime/schedules/{name}/run",
             post(schedules_run),
         )
+        .route("/v1/admin/auth/queue", get(queue_stats).delete(queue_flush))
         .route(
             "/v1/admin/auth/locks/{email}",
             get(login_lock).delete(clear_login_lock),
@@ -847,4 +848,16 @@ async fn world_cell_host(
     Ok(Json(
         json!({ "world": w, "cell": cell, "node_id": r.node_id, "hosted_here": hosted }),
     ))
+}
+
+/// Login queue health for the console: capacity, online, waiting, recently admitted.
+async fn queue_stats(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let st = s.auth.queue_stats().await?;
+    Ok(Json(serde_json::to_value(st).map_err(Error::internal)?))
+}
+
+/// Drop every queue ticket (waiting clients are told to log in again).
+async fn queue_flush(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let dropped = s.auth.queue_flush().await?;
+    Ok(Json(json!({ "dropped": dropped })))
 }

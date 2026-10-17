@@ -80,6 +80,33 @@ pub struct AuthService {
     refresh_ttl_secs: u64,
     lockout: Lockout,
     captcha: Arc<std::sync::RwLock<Option<CaptchaVerifier>>>,
+    queue: Arc<std::sync::RwLock<Option<LoginQueue>>>,
+}
+
+/// Login queue (plan 5.1): once `online()` reports `capacity` players, further logins get a
+/// ticket and wait in arrival order; `admit_per_sec` paces the drain when room frees up.
+#[derive(Clone)]
+pub struct LoginQueue {
+    pub capacity: usize,
+    pub admit_per_sec: u32,
+    pub ttl_secs: u64,
+    /// Accounts with a live socket anywhere in the cluster.
+    pub online: Arc<dyn Fn() -> usize + Send + Sync>,
+}
+
+/// How long a queue ticket stays valid regardless of polling.
+pub const QUEUE_TICKET_SECS: i64 = 3600;
+/// An admitted ticket counts against the capacity for this long, so the newly admitted player's
+/// socket has time to show up in `online()` before the slot is handed to someone else.
+const ADMITTED_HOLD_SECS: i64 = 10;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStats {
+    pub capacity: usize,
+    pub online: usize,
+    pub waiting: i64,
+    pub admitted_recently: i64,
+    pub admit_per_sec: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -129,7 +156,204 @@ impl AuthService {
                 captcha_after: cfg.captcha_after,
             },
             captcha: Arc::new(std::sync::RwLock::new(None)),
+            queue: Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    pub fn set_login_queue(&self, q: Option<LoginQueue>) {
+        *self.queue.write().unwrap() = q;
+    }
+
+    fn login_queue(&self) -> Option<LoginQueue> {
+        self.queue
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|q| q.capacity > 0)
+    }
+
+    async fn queue_prune(&self, q: &LoginQueue) -> Result<()> {
+        sqlx::query(
+            "delete from musubi.login_queue
+             where (admitted_at is null and polled_at < now() - make_interval(secs => $1))
+                or admitted_at < now() - make_interval(secs => $2)",
+        )
+        .bind(q.ttl_secs as f64)
+        .bind(ADMITTED_HOLD_SECS as f64)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    async fn queue_counts(&self) -> Result<(i64, i64, i64)> {
+        sqlx::query_as(
+            "select count(*) filter (where admitted_at is null),
+                    count(*) filter (where admitted_at is not null),
+                    count(*) filter (where admitted_at > now() - interval '1 second')
+             from musubi.login_queue",
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
+    fn queue_eta(q: &LoginQueue, position: i64) -> i64 {
+        let rate = q.admit_per_sec.max(1) as i64;
+        ((position + 1) + rate - 1) / rate
+    }
+
+    fn queued(&self, q: &LoginQueue, ticket: String, position: i64, exp: i64) -> Error {
+        Error::LoginQueued {
+            ticket,
+            position,
+            eta_secs: Self::queue_eta(q, position),
+            expires_in: (exp - OffsetDateTime::now_utc().unix_timestamp()).max(0),
+        }
+    }
+
+    /// Park a verified login: a row keeps the place in line, the signed ticket carries what
+    /// `issue` needs so the poll can finish the login without re-authenticating.
+    async fn queue_enter(
+        &self,
+        q: &LoginQueue,
+        account_id: AccountId,
+        created: bool,
+        vars: serde_json::Map<String, serde_json::Value>,
+        dev: &Device<'_>,
+    ) -> Result<Error> {
+        let id = Uuid::now_v7();
+        sqlx::query("insert into musubi.login_queue (id, account_id) values ($1, $2)")
+            .bind(id)
+            .bind(account_id.0)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        let position: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.login_queue where admitted_at is null and id < $1",
+        )
+        .bind(id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut pending = serde_json::Map::new();
+        pending.insert("queue".into(), serde_json::Value::String("pending".into()));
+        pending.insert("created".into(), serde_json::Value::Bool(created));
+        pending.insert("pending_vars".into(), serde_json::Value::Object(vars));
+        if let Some(d) = dev.device_id {
+            pending.insert("device_id".into(), serde_json::Value::String(d.into()));
+        }
+        if let Some(u) = dev.user_agent {
+            pending.insert("user_agent".into(), serde_json::Value::String(u.into()));
+        }
+        let exp = now + QUEUE_TICKET_SECS;
+        let ticket = self.signer.sign(&Claims {
+            sub: account_id,
+            sid: SessionId(id),
+            iat: now,
+            exp,
+            vars: pending,
+            name: None,
+        })?;
+        Ok(self.queued(q, ticket, position, exp))
+    }
+
+    /// Poll a queue ticket: the session once the place is reached (and the admit rate allows),
+    /// otherwise `Error::LoginQueued` again with the fresh position.
+    pub async fn queue_poll(&self, ticket: &str) -> Result<Session> {
+        let c = self.signer.verify(ticket)?;
+        if c.vars.get("queue").and_then(|v| v.as_str()) != Some("pending") {
+            return Err(Error::Unauthenticated("not a queue ticket".into()));
+        }
+        let id = c.sid.0;
+        let created = c
+            .vars
+            .get("created")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let vars = c
+            .vars
+            .get("pending_vars")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let dev = Device {
+            device_id: c.vars.get("device_id").and_then(|v| v.as_str()),
+            user_agent: c.vars.get("user_agent").and_then(|v| v.as_str()),
+        };
+        let Some(q) = self.login_queue() else {
+            // queue switched off while waiting: everyone goes straight in
+            let _ = sqlx::query("delete from musubi.login_queue where id = $1")
+                .bind(id)
+                .execute(&self.db)
+                .await;
+            return self.issue(c.sub, None, created, vars, dev).await;
+        };
+        self.queue_prune(&q).await?;
+        let row: Option<(Option<OffsetDateTime>,)> = sqlx::query_as(
+            "update musubi.login_queue set polled_at = now() where id = $1 returning admitted_at",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let admitted = match row {
+            None => {
+                return Err(Error::Unauthenticated(
+                    "queue ticket expired: log in again".into(),
+                ))
+            }
+            Some((admitted,)) => admitted.is_some(),
+        };
+        if !admitted {
+            let position: i64 = sqlx::query_scalar(
+                "select count(*) from musubi.login_queue where admitted_at is null and id < $1",
+            )
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::internal)?;
+            let (_, held, last_second) = self.queue_counts().await?;
+            let online = (q.online)() as i64 + held;
+            let free = (q.capacity as i64 - online).max(0);
+            if position >= free || last_second >= q.admit_per_sec as i64 {
+                return Err(self.queued(&q, ticket.to_string(), position, c.exp));
+            }
+            let n = sqlx::query(
+                "update musubi.login_queue set admitted_at = now() where id = $1 and admitted_at is null",
+            )
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+            if n == 0 {
+                return Err(self.queued(&q, ticket.to_string(), position, c.exp));
+            }
+        }
+        self.issue(c.sub, None, created, vars, dev).await
+    }
+
+    pub async fn queue_stats(&self) -> Result<QueueStats> {
+        let q = self.login_queue();
+        let (waiting, held, _) = self.queue_counts().await?;
+        Ok(QueueStats {
+            capacity: q.as_ref().map_or(0, |q| q.capacity),
+            online: q.as_ref().map_or(0, |q| (q.online)()),
+            waiting,
+            admitted_recently: held,
+            admit_per_sec: q.as_ref().map_or(0, |q| q.admit_per_sec),
+        })
+    }
+
+    /// Drop every ticket: waiting clients get "log in again" on their next poll.
+    pub async fn queue_flush(&self) -> Result<u64> {
+        sqlx::query("delete from musubi.login_queue")
+            .execute(&self.db)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(Error::internal)
     }
 
     /// Install the captcha verifier (module hook or provider siteverify). Without one, the
@@ -980,6 +1204,15 @@ impl AuthService {
     ) -> Result<Session> {
         if serde_json::to_vec(&vars).map(|v| v.len()).unwrap_or(0) > 4096 {
             return Err(Error::InvalidArgument("session vars exceed 4 KB".into()));
+        }
+        if let Some(q) = self.login_queue() {
+            self.queue_prune(&q).await?;
+            let (waiting, held, _) = self.queue_counts().await?;
+            if waiting > 0 || (q.online)() + held as usize >= q.capacity {
+                return Err(self
+                    .queue_enter(&q, account_id, created, vars, &dev)
+                    .await?);
+            }
         }
         self.issue(account_id, None, created, vars, dev).await
     }

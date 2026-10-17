@@ -21,6 +21,15 @@ pub enum Error {
     Unavailable(String),
     #[error("internal: {0}")]
     Internal(String),
+    /// The login is valid but the cluster is at its online capacity: the caller holds a queue
+    /// ticket and polls `POST /v1/auth/queue` until it turns into a session.
+    #[error("login queued at position {position}")]
+    LoginQueued {
+        ticket: String,
+        position: i64,
+        eta_secs: i64,
+        expires_in: i64,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -38,6 +47,7 @@ pub enum Code {
     ResourceExhausted,
     Unavailable,
     Internal,
+    LoginQueued,
 }
 
 impl Error {
@@ -52,6 +62,7 @@ impl Error {
             Error::ResourceExhausted(_) => Code::ResourceExhausted,
             Error::Unavailable(_) => Code::Unavailable,
             Error::Internal(_) => Code::Internal,
+            Error::LoginQueued { .. } => Code::LoginQueued,
         }
     }
 
@@ -65,6 +76,7 @@ impl Error {
             Code::ResourceExhausted => 429,
             Code::Unavailable => 503,
             Code::Internal => 500,
+            Code::LoginQueued => 202,
         }
     }
 

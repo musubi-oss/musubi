@@ -113,6 +113,13 @@ pub struct SessionConfig {
     pub captcha_after: u32,
     pub captcha_verify_url: Option<String>,
     pub captcha_secret: Option<String>,
+    /// Online players (accounts with a live socket anywhere in the cluster) above which new
+    /// logins are queued instead of served; 0 disables the login queue.
+    pub login_queue_capacity: usize,
+    /// How many queued logins may be admitted per second once room frees up.
+    pub login_queue_admit_per_sec: u32,
+    /// A queued client that has not polled for this long loses its place.
+    pub login_queue_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +178,9 @@ impl Default for SessionConfig {
             captcha_after: 3,
             captcha_verify_url: None,
             captcha_secret: None,
+            login_queue_capacity: 0,
+            login_queue_admit_per_sec: 50,
+            login_queue_ttl_secs: 120,
         }
     }
 }

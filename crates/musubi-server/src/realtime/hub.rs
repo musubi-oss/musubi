@@ -137,6 +137,14 @@ impl Hub {
         self.sessions.len()
     }
 
+    /// Distinct accounts with at least one live socket on this node.
+    pub fn online_accounts(&self) -> usize {
+        self.by_account
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .count()
+    }
+
     pub fn join(&self, handle: SessionHandle) {
         let p = handle.presence.clone();
         self.by_account

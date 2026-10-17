@@ -256,6 +256,16 @@ impl Fanout {
         });
     }
 
+    /// Distinct accounts online anywhere in the cluster (local sockets plus what the bus told us).
+    pub fn online_accounts(&self) -> usize {
+        self.hub.online_accounts()
+            + self
+                .online_remote
+                .iter()
+                .filter(|e| self.hub.presences_of(*e.key()).is_empty())
+                .count()
+    }
+
     /// Online on this node or, as far as the bus has told us, on any other node.
     pub fn is_online_anywhere(&self, account_id: AccountId) -> bool {
         !self.hub.presences_of(account_id).is_empty()
