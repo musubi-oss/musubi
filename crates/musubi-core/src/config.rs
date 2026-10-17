@@ -38,6 +38,7 @@ pub struct Config {
     pub quic: QuicConfig,
     pub webtransport: WebTransportConfig,
     pub webrtc: WebRtcConfig,
+    pub udp: UdpConfig,
     pub zanshin: ZanshinConfig,
     pub aurix: AurixConfig,
     pub iap: IapConfig,
@@ -442,6 +443,17 @@ pub struct WebRtcConfig {
     /// Address browsers reach the UDP socket at (ICE host candidate); defaults to `listen`,
     /// or loopback when `listen` is an unspecified IP.
     pub public_addr: Option<SocketAddr>,
+}
+
+/// Raw UDP realtime transport (dedicated servers ↔ core, private networks: no encryption).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct UdpConfig {
+    /// UDP listen address; unset = disabled.
+    pub listen: Option<SocketAddr>,
+    /// 32-byte hex key for the connection cookies; unset = random per boot (clients then
+    /// re-handshake after a restart, which they do anyway).
+    pub secret: Option<String>,
 }
 
 /// Zanshin LiveOps (flags, experiments, analytics). Unset `url` = disabled.

@@ -7458,3 +7458,60 @@ async fn webrtc_datachannel_ping() {
     assert_eq!(r.cid.as_deref(), Some("1"));
     assert!(matches!(r.msg, ServerMessage::Pong), "{r:?}");
 }
+
+#[tokio::test]
+async fn udp_transport_ping_and_bad_token() {
+    use musubi_transport::{Connection, Frame};
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let addr = musubi_server::realtime::udp::start(state, "127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let (ta, _) = token(&router).await;
+
+    let mut c = musubi_transport::udp::UdpClient::connect(addr, 1 << 20)
+        .await
+        .unwrap();
+    c.send(Frame::Text(
+        json!({"token": ta, "format": "json"}).to_string(),
+    ))
+    .await
+    .unwrap();
+    c.send(Frame::Text(
+        serde_json::to_string(&Envelope {
+            cid: Some("1".into()),
+            msg: ClientMessage::Ping,
+        })
+        .unwrap(),
+    ))
+    .await
+    .unwrap();
+    let Frame::Text(t) = tokio::time::timeout(std::time::Duration::from_secs(5), c.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert_eq!(r.cid.as_deref(), Some("1"));
+    assert!(matches!(r.msg, ServerMessage::Pong), "{r:?}");
+
+    let mut bad = musubi_transport::udp::UdpClient::connect(addr, 1 << 20)
+        .await
+        .unwrap();
+    bad.send(Frame::Text(json!({"token": "nope"}).to_string()))
+        .await
+        .unwrap();
+    let Frame::Text(t) = tokio::time::timeout(std::time::Duration::from_secs(5), bad.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert!(matches!(r.msg, ServerMessage::Error { .. }));
+}

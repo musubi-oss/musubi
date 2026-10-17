@@ -619,6 +619,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(listen) = state.cfg.webtransport.listen {
         crate::realtime::webtransport::start(state.clone(), listen).await?;
     }
+    if let Some(listen) = state.cfg.udp.listen {
+        let secret = match &state.cfg.udp.secret {
+            Some(hex) => {
+                let bytes = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16))
+                    .collect::<Result<Vec<u8>, _>>()
+                    .ok()
+                    .filter(|b| b.len() == 32)
+                    .ok_or_else(|| anyhow::anyhow!("udp.secret must be 32 bytes of hex"))?;
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                Some(key)
+            }
+            None => None,
+        };
+        crate::realtime::udp::start(state.clone(), listen, secret).await?;
+    }
     let draining = state.clone();
     axum::serve(
         listener,
