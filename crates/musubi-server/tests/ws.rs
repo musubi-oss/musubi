@@ -8547,3 +8547,135 @@ async fn spectator_watches_without_playing() {
         ServerMessage::MatchData { op_code: 6, .. }
     ));
 }
+
+#[tokio::test]
+async fn match_recording_produces_replay() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"module": "echo", "params": {"tick_rate": 50, "record": true, "label": "rec", "empty_ticks": 5}}).to_string()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+
+    let (ta, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+            spectator: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Match {
+            authoritative: true,
+            ..
+        }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 7,
+            data: vec![4, 2],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchData { op_code: 7, .. }
+    ));
+    // ~1 s of ticks at 50 Hz: several journal chunks (every 5 ticks) and a snapshot (every 50).
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let get = |router: axum::Router| {
+        let mid = mid.clone();
+        let ta = ta.clone();
+        async move {
+            let req = Request::get(format!("/v1/matches/{mid}/replay"))
+                .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), 200);
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            v
+        }
+    };
+    let live = get(router.clone()).await;
+    assert_eq!(live["live"], true);
+    assert_eq!(live["label"], "rec");
+    assert!(live["ended_at"].is_null());
+    let frames = live["frames"].as_array().unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| f["kind"] == "snapshot" && f["state"].is_string()));
+    let journal: Vec<&Value> = frames.iter().filter(|f| f["kind"] == "journal").collect();
+    assert!(!journal.is_empty());
+    let input_logged = journal.iter().any(|f| {
+        f["entries"]
+            .as_array()
+            .map(|es| es.iter().any(|e| e.to_string().contains("\"op_code\":7")))
+            .unwrap_or(false)
+    });
+    assert!(input_logged, "{journal:?}");
+    let mut ticks: Vec<i64> = frames
+        .iter()
+        .map(|f| f["tick_from"].as_i64().unwrap())
+        .collect();
+    let sorted = ticks.clone();
+    ticks.sort();
+    assert_eq!(ticks, sorted);
+
+    // Leaving empties the match: it ends after `empty_ticks` and the recording is closed.
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    let mut ended = None;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let v = get(router.clone()).await;
+        if v["ended_at"].is_string() {
+            ended = Some(v);
+            break;
+        }
+    }
+    let ended = ended.expect("recording closed");
+    assert_eq!(ended["live"], false);
+
+    let req = Request::delete(format!("/v1/server/matches/{mid}/replay"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+    let req = Request::get(format!("/v1/matches/{mid}/replay"))
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
+}

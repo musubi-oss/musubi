@@ -34,6 +34,8 @@ pub struct MatchRegistry {
     /// Set by `release_all`: no snapshot may re-own a row this node has just disowned.
     draining: Arc<std::sync::atomic::AtomicBool>,
     epoch: i64,
+    /// Matches created with `params.record = true`: every journal chunk is also kept for replay.
+    recording: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
 }
 
 impl Default for MatchRegistry {
@@ -56,6 +58,7 @@ impl MatchRegistry {
             journal_every: 5,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch: 0,
+            recording: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
         r
@@ -93,11 +96,65 @@ impl MatchRegistry {
         let events = self.events.get().cloned();
         let draining = self.draining.clone();
         let epoch = self.epoch;
+        let recording = self.recording.clone();
         Some(Arc::new(move |id: MatchId, snap: Option<Snapshot>| {
             let db = db.clone();
             let group = group.clone();
             let events = events.clone();
             let tick_for_journal = snap.as_ref().map(|s| s.tick);
+            match &snap {
+                Some(s) if recorded(&s.params) => {
+                    let db = db.clone();
+                    let (module, label, params, state, tick) = (
+                        s.module.clone(),
+                        s.label.clone(),
+                        s.params.clone(),
+                        s.state.clone(),
+                        s.tick as i64,
+                    );
+                    tokio::spawn(async move {
+                        let r = sqlx::query(
+                            "insert into musubi.match_recordings (match_id, module, label, params, last_tick)
+                             values ($1, $2, $3, $4, $5)
+                             on conflict (match_id) do update set label = excluded.label, last_tick = greatest(musubi.match_recordings.last_tick, excluded.last_tick)",
+                        )
+                        .bind(id.0)
+                        .bind(&module)
+                        .bind(&label)
+                        .bind(&params)
+                        .bind(tick)
+                        .execute(&db)
+                        .await;
+                        let r = match r {
+                            Ok(_) => sqlx::query(
+                                "insert into musubi.match_recording_frames (match_id, kind, tick_from, tick_to, state)
+                                 values ($1, 'snapshot', $2, $2, $3) on conflict do nothing",
+                            )
+                            .bind(id.0)
+                            .bind(tick)
+                            .bind(&state)
+                            .execute(&db)
+                            .await,
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = r {
+                            tracing::warn!(match_id = %id, error = %e, "replay snapshot write failed");
+                        }
+                    });
+                }
+                None if recording.lock().unwrap().remove(&id.0) => {
+                    let db = db.clone();
+                    tokio::spawn(async move {
+                        let _ = sqlx::query(
+                            "update musubi.match_recordings set ended_at = now() where match_id = $1 and ended_at is null",
+                        )
+                        .bind(id.0)
+                        .execute(&db)
+                        .await;
+                    });
+                }
+                _ => {}
+            }
             if snap.is_none() {
                 if let Some(ev) = events {
                     tokio::spawn(async move {
@@ -166,6 +223,7 @@ impl MatchRegistry {
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("match module {module}")))?;
         let matches = self.matches.clone();
+        let record = recorded(&params);
         let handle = musubi_actor::spawn_with(
             handler,
             Spawn {
@@ -183,6 +241,9 @@ impl MatchRegistry {
                 journal_every: self.journal_every,
             },
         )?;
+        if record {
+            self.recording.lock().unwrap().insert(handle.id.0);
+        }
         self.matches.insert(handle.id.to_string(), handle.clone());
         Ok(handle)
     }
@@ -268,8 +329,10 @@ impl MatchRegistry {
         if self.journal_every == 0 {
             return None;
         }
+        let recording = self.recording.clone();
         Some(Arc::new(move |id: MatchId, chunk: JournalChunk| {
             let db = db.clone();
+            let record = recording.lock().unwrap().contains(&id.0);
             tokio::spawn(async move {
                 let entries = match serde_json::to_value(&chunk.entries) {
                     Ok(v) => v,
@@ -278,6 +341,21 @@ impl MatchRegistry {
                         return;
                     }
                 };
+                if record {
+                    let r = sqlx::query(
+                        "insert into musubi.match_recording_frames (match_id, kind, tick_from, tick_to, entries)
+                         values ($1, 'journal', $2, $3, $4) on conflict do nothing",
+                    )
+                    .bind(id.0)
+                    .bind(chunk.tick_from as i64)
+                    .bind(chunk.tick_to as i64)
+                    .bind(&entries)
+                    .execute(&db)
+                    .await;
+                    if let Err(e) = r {
+                        tracing::warn!(match_id = %id, error = %e, "replay journal write failed");
+                    }
+                }
                 let r = sqlx::query(
                     "insert into musubi.match_journal (match_id, tick_from, tick_to, entries) values ($1, $2, $3, $4)
                      on conflict (match_id, tick_from) do update set tick_to = excluded.tick_to, entries = excluded.entries",
@@ -493,6 +571,14 @@ pub fn label_props(label: &str) -> musubi_matchmaker::Properties {
         }
     }
     p
+}
+
+/// `params.record == true` keeps every snapshot and journal chunk of the match for replay.
+fn recorded(params: &serde_json::Value) -> bool {
+    params
+        .get("record")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
