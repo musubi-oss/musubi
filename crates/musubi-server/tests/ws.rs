@@ -11354,3 +11354,401 @@ async fn crafting_recipes_consume_and_grant_atomically() {
     .await;
     assert_eq!(d["deleted"], true);
 }
+
+async fn http_raw(
+    router: &axum::Router,
+    method: &str,
+    path: &str,
+    bearer: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (u16, Vec<u8>, axum::http::HeaderMap) {
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let st = res.status().as_u16();
+    let headers = res.headers().clone();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (st, bytes.to_vec(), headers)
+}
+
+#[tokio::test]
+async fn ugc_registry_moderation_ratings_subscriptions() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _acc_a) = token(&router).await;
+    let (tb, _acc_b) = token(&router).await;
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/ugc",
+        Some(&ta),
+        false,
+        Some(json!({"kind": "dance", "title": "x"})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(&router, "POST", "/v1/ugc", Some(&ta), false, Some(json!({
+        "kind": "map", "title": " Dust ", "description": "a small arena", "tags": ["PvP", " small ", "pvp"]
+    }))).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["status"], "draft");
+    assert_eq!(r["version"], 0);
+    assert_eq!(r["tags"], json!(["pvp", "small"]));
+    assert_eq!(r["title"], "Dust");
+    let id = r["id"].as_str().unwrap().to_string();
+    let (_, l) = http_json(&router, "GET", "/v1/ugc?kind=map", Some(&tb), false, None).await;
+    assert!(
+        !l["items"].as_array().unwrap().iter().any(|i| i["id"] == id),
+        "draft is not browsable"
+    );
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{id}/submit"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 400, "needs a blob or url");
+    let (st, body, _) = http_raw(
+        &router,
+        "PUT",
+        &format!("/v1/ugc/{id}/blob"),
+        &tb,
+        "application/octet-stream",
+        b"MAPDATA v1".to_vec(),
+    )
+    .await;
+    assert_eq!(st, 403, "{}", String::from_utf8_lossy(&body));
+    let (st, body, _) = http_raw(
+        &router,
+        "PUT",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "application/x-map",
+        b"MAPDATA v1".to_vec(),
+    )
+    .await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    let up: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(up["version"], 1);
+    assert_eq!(up["size"], 10);
+    assert_eq!(up["sha256"].as_str().unwrap().len(), 64);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{id}/submit"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["status"], "pending");
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404, "pending is still hidden");
+    let (st, q) = http_json(&router, "GET", "/v1/admin/ugc", None, true, None).await;
+    assert_eq!(st, 200, "{q}");
+    assert!(
+        q["items"].as_array().unwrap().iter().any(|i| i["id"] == id),
+        "{q}"
+    );
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/ugc/{id}"),
+        None,
+        true,
+        Some(json!({"status": "approved", "by": "mod1"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["status"], "approved");
+    assert_eq!(r["moderation"]["by"], "mod1");
+
+    // browsable, searchable, downloadable
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/ugc?kind=map&tag=PvP",
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        l["items"].as_array().unwrap().iter().any(|i| i["id"] == id),
+        "{l}"
+    );
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/ugc?q=dus&sort=top",
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        l["items"].as_array().unwrap().iter().any(|i| i["id"] == id),
+        "{l}"
+    );
+    let (_, l) = http_json(&router, "GET", "/v1/ugc?tag=nope", Some(&tb), false, None).await;
+    assert!(!l["items"].as_array().unwrap().iter().any(|i| i["id"] == id));
+    let (st, _) = http_json(&router, "GET", "/v1/ugc?sort=weird", Some(&tb), false, None).await;
+    assert_eq!(st, 400);
+    let (st, body, h) = http_raw(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}/blob"),
+        &tb,
+        "text/plain",
+        vec![],
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(body, b"MAPDATA v1");
+    assert_eq!(h["content-type"], "application/x-map");
+    assert_eq!(h["x-ugc-version"], "1");
+    let (_, g) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(g["downloads"], 1, "{g}");
+    assert_eq!(g["subscribed"], false);
+
+    // ratings: one per account, replaced on repeat
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{id}/rate"),
+        Some(&tb),
+        false,
+        Some(json!({"stars": 7})),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{id}/rate"),
+        Some(&tb),
+        false,
+        Some(json!({"stars": 5})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["rating"]["count"], 1);
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{id}/rate"),
+        Some(&tb),
+        false,
+        Some(json!({"stars": 3})),
+    )
+    .await;
+    assert_eq!(r["rating"]["count"], 1);
+    assert_eq!(r["rating"]["average"], 3.0);
+    let (_, g) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(g["my_rating"], 3);
+
+    // subscriptions follow moderated versions only
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{id}/subscribe"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, subs) = http_json(
+        &router,
+        "GET",
+        "/v1/ugc/subscriptions",
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(subs["items"][0]["id"], id, "{subs}");
+    assert_eq!(subs["items"][0]["version"], 1);
+    let (st, body, _) = http_raw(
+        &router,
+        "PUT",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "application/x-map",
+        b"MAPDATA v2!".to_vec(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let up: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(up["version"], 2);
+    assert_eq!(up["status"], "pending", "a new revision is re-moderated");
+    let (_, subs) = http_json(
+        &router,
+        "GET",
+        "/v1/ugc/subscriptions",
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert!(subs["items"].as_array().unwrap().is_empty(), "{subs}");
+    let (st, _, _) = http_raw(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}/blob"),
+        &tb,
+        "text/plain",
+        vec![],
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _, _) = http_raw(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "text/plain",
+        vec![],
+    )
+    .await;
+    assert_eq!(st, 200, "owner always sees own item");
+    http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/ugc/{id}"),
+        None,
+        true,
+        Some(json!({"status": "approved"})),
+    )
+    .await;
+    let (_, subs) = http_json(
+        &router,
+        "GET",
+        "/v1/ugc/subscriptions",
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(subs["items"][0]["version"], 2, "{subs}");
+    let (_, body, _) = http_raw(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}/blob"),
+        &tb,
+        "text/plain",
+        vec![],
+    )
+    .await;
+    assert_eq!(body, b"MAPDATA v2!");
+
+    // hide → gone for others, still the owner's; unsubscribe; delete
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/ugc/{id}"),
+        None,
+        true,
+        Some(json!({"status": "hidden", "reason": "dmca"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (_, mine) = http_json(&router, "GET", "/v1/ugc/mine", Some(&ta), false, None).await;
+    assert_eq!(mine["items"][0]["moderation"]["reason"], "dmca", "{mine}");
+    let (_, r) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/ugc/{id}/subscribe"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(r["removed"], true);
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/ugc/{id}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/ugc/{id}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+}

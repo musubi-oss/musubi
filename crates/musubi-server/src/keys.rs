@@ -45,6 +45,7 @@ pub enum Role {
 const SUPPORT_WRITES: &[&str] = &[
     "/v1/admin/accounts/",
     "/v1/admin/reports",
+    "/v1/admin/ugc",
     "/v1/admin/auth/queue",
     "/v1/admin/chat/",
     "/v1/server/chat/",
