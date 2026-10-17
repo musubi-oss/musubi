@@ -49,13 +49,38 @@ async fn build_state(leader: bool, group: &str) -> Option<AppState> {
 /// A node of `group` in `region` (multi-region placement tests).
 async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppState> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
+    build_state_url(leader, group, region, url, false).await
+}
+
+/// A node on an explicit database (multi-project tests); `fresh` runs the migrations on it.
+async fn build_state_url(
+    leader: bool,
+    group: &str,
+    region: &str,
+    url: String,
+    fresh: bool,
+) -> Option<AppState> {
     let mut cfg = Config::default();
     cfg.database.url = url;
+    build_state_cfg(leader, group, region, cfg, fresh).await
+}
+
+async fn build_state_cfg(
+    leader: bool,
+    group: &str,
+    region: &str,
+    mut cfg: Config,
+    fresh: bool,
+) -> Option<AppState> {
     // a node runs world ticks, snapshots, journals, match loops and failover rounds on this
     // pool at once; 3 starved them into 30 s acquire timeouts on the 4-thread CI runner
     cfg.database.max_connections = 5;
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
-    migrate_once(&db).await;
+    if fresh {
+        musubi_server::db::migrate(&db).await.unwrap();
+    } else {
+        migrate_once(&db).await;
+    }
     let hub = Arc::new(Hub::new());
     let runtime = test_runtime();
     let cluster = test_cluster_in(&db, group, region).await;
@@ -13548,4 +13573,191 @@ async fn operator_sso_mints_scoped_keys() {
         .body(axum::body::Body::empty())
         .unwrap();
     assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
+}
+
+/// Two projects in one process: separate databases behind one router, picked by the
+/// `x-musubi-project` header or the `Host`; accounts, tokens and catalogs of one are invisible
+/// to the other, and `GET /v1/projects` lists them.
+#[tokio::test]
+async fn multi_project_router_isolates_projects() {
+    let Some(state1) = build_state(true, &test_group()).await else {
+        return;
+    };
+    // a second database next to the test one
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let (prefix, db1) = url.rsplit_once('/').unwrap();
+    let db1 = db1.split('?').next().unwrap();
+    let db2 = format!("{db1}_p2");
+    let r = sqlx::query(&format!("create database {db2}"))
+        .execute(&state1.db)
+        .await;
+    if let Err(e) = r {
+        assert!(e.to_string().contains("already exists"), "{e}");
+    }
+    let p: musubi_core::config::ProjectConfig = serde_json::from_value(json!({
+        "name": "game2", "database": {"url": format!("{prefix}/{db2}")}
+    }))
+    .unwrap();
+    // the overlay derives a session secret of its own, so tokens do not cross projects
+    let cfg2 = Config::default().for_project(&p).unwrap();
+    let Some(state2) =
+        build_state_cfg(true, &format!("{}-p2", test_group()), "local", cfg2, true).await
+    else {
+        return;
+    };
+    let multi = musubi_server::http::multi_router(
+        (
+            "default".into(),
+            musubi_server::http::router(state1.clone()),
+        ),
+        vec![(
+            "game2".into(),
+            vec!["game2.example.com".into(), "*.g2.example.com".into()],
+            musubi_server::http::router(state2.clone()),
+        )],
+    );
+    let call = |method: &'static str,
+                uri: &'static str,
+                headers: Vec<(&'static str, String)>,
+                body: Option<Value>| {
+        let multi = multi.clone();
+        async move {
+            let mut req = Request::builder().method(method).uri(uri);
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let req = req
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                .unwrap();
+            let resp = multi.oneshot(req).await.unwrap();
+            let st = resp.status().as_u16();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (
+                st,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (st, r) = call("GET", "/v1/projects", vec![], None).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["projects"].as_array().unwrap().len(), 2);
+    assert_eq!(r["projects"][0]["name"], "default");
+    assert_eq!(r["projects"][1]["hosts"][0], "game2.example.com");
+    let (st, r) = call(
+        "GET",
+        "/healthz",
+        vec![("x-musubi-project", "nope".into())],
+        None,
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+    // an account of the base project…
+    let dev = json!({"id": format!("mp-{}", uuid::Uuid::now_v7().simple())});
+    let (st, a) = call("POST", "/v1/auth/device", vec![], Some(dev.clone())).await;
+    assert_eq!(st, 200, "{a}");
+    let tok = a["access_token"].as_str().unwrap().to_string();
+    let (st, me) = call(
+        "GET",
+        "/v1/account",
+        vec![("authorization", format!("Bearer {tok}"))],
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{me}");
+    // …does not exist in game2 (same device id gets a different account, the token is foreign)
+    let (st, r) = call(
+        "GET",
+        "/v1/account",
+        vec![
+            ("authorization", format!("Bearer {tok}")),
+            ("x-musubi-project", "game2".into()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st, 401, "{r}");
+    let (st, b) = call(
+        "POST",
+        "/v1/auth/device",
+        vec![("host", "game2.example.com".into())],
+        Some(dev.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    assert_ne!(a["account_id"], b["account_id"]);
+    let (st, c) = call(
+        "POST",
+        "/v1/auth/device",
+        vec![("host", "eu.g2.example.com:443".into())],
+        Some(dev.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{c}");
+    assert_eq!(
+        b["account_id"], c["account_id"],
+        "wildcard host is the same project"
+    );
+    let (st, d) = call(
+        "POST",
+        "/v1/auth/device",
+        vec![("host", "api.example.com".into())],
+        Some(dev),
+    )
+    .await;
+    assert_eq!(st, 200, "{d}");
+    assert_eq!(
+        a["account_id"], d["account_id"],
+        "unknown hosts fall back to the base project"
+    );
+    // catalogs are separate too
+    let item = format!("mp-item-{}", uuid::Uuid::now_v7().simple());
+    let (st, r) = call(
+        "POST",
+        "/v1/server/items",
+        vec![("x-musubi-server-key", "defaultkey".into())],
+        Some(json!({"id": item, "name": "x"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = call(
+        "GET",
+        "/v1/server/items",
+        vec![
+            ("x-musubi-server-key", "defaultkey".into()),
+            ("x-musubi-project", "game2".into()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(
+        !r["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"] == item),
+        "{r}"
+    );
+    let (st, r) = call(
+        "GET",
+        "/v1/server/items",
+        vec![
+            ("x-musubi-server-key", "defaultkey".into()),
+            ("x-musubi-project", "default".into()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(
+        r["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"] == item),
+        "{r}"
+    );
 }

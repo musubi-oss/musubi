@@ -46,6 +46,111 @@ use crate::app::AppState;
 pub use error::ApiError;
 pub use extract::{Bearer, ClientIp, ServerKey};
 
+/// Several projects behind one listener: `x-musubi-project: <name>` picks one explicitly, else
+/// the `Host` header is matched against each project's `hosts` (exact or `*.suffix`), else the
+/// base project answers. `GET /v1/projects` lists them.
+pub fn multi_router(
+    base: (String, Router),
+    projects: Vec<(String, Vec<String>, Router)>,
+) -> Router {
+    let mut info = vec![serde_json::json!({"name": base.0, "hosts": [], "default": true})];
+    let mut by_name = std::collections::HashMap::new();
+    let mut by_host = Vec::new();
+    for (name, hosts, router) in projects {
+        info.push(serde_json::json!({"name": name, "hosts": hosts, "default": false}));
+        for h in hosts {
+            by_host.push((h.to_ascii_lowercase(), name.clone()));
+        }
+        by_name.insert(name, router);
+    }
+    let dispatch = ProjectDispatch {
+        base_name: base.0,
+        base: base.1,
+        by_name: std::sync::Arc::new(by_name),
+        by_host: std::sync::Arc::new(by_host),
+        info: std::sync::Arc::new(serde_json::json!({"projects": info})),
+    };
+    Router::new().fallback_service(dispatch)
+}
+
+#[derive(Clone)]
+struct ProjectDispatch {
+    base_name: String,
+    base: Router,
+    by_name: std::sync::Arc<std::collections::HashMap<String, Router>>,
+    by_host: std::sync::Arc<Vec<(String, String)>>,
+    info: std::sync::Arc<serde_json::Value>,
+}
+
+impl ProjectDispatch {
+    fn pick(&self, req: &axum::http::Request<axum::body::Body>) -> Result<Router, Box<Response>> {
+        if let Some(name) = req
+            .headers()
+            .get("x-musubi-project")
+            .and_then(|v| v.to_str().ok())
+        {
+            if name == self.base_name {
+                return Ok(self.base.clone());
+            }
+            return self.by_name.get(name).cloned().ok_or_else(|| {
+                Box::new(
+                    ApiError::from(musubi_core::Error::NotFound(format!(
+                        "unknown project {name}"
+                    )))
+                    .into_response(),
+                )
+            });
+        }
+        let host = req
+            .headers()
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase())
+            .unwrap_or_default();
+        for (pattern, name) in self.by_host.iter() {
+            let hit = match pattern.strip_prefix("*.") {
+                Some(suffix) => host.ends_with(suffix) && host.len() > suffix.len(),
+                None => *pattern == host,
+            };
+            if hit {
+                if let Some(r) = self.by_name.get(name) {
+                    return Ok(r.clone());
+                }
+            }
+        }
+        Ok(self.base.clone())
+    }
+}
+
+impl tower::Service<axum::http::Request<axum::body::Body>> for ProjectDispatch {
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response, std::convert::Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
+        if req.uri().path() == "/v1/projects" && req.method() == axum::http::Method::GET {
+            let info = self.info.clone();
+            return Box::pin(async move { Ok(Json((*info).clone()).into_response()) });
+        }
+        match self.pick(&req) {
+            Ok(router) => Box::pin(async move {
+                use tower::ServiceExt;
+                router.oneshot(req).await
+            }),
+            Err(resp) => Box::pin(async move { Ok(*resp) }),
+        }
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))

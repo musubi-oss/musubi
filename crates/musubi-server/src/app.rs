@@ -94,6 +94,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             errors.join("; ")
         );
     }
+    serve(cfg).await
+}
+
+/// Everything one project needs: services, registries, cluster membership and background loops.
+/// Called once for the base configuration and once per `[[projects]]` entry.
+pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     let db = db::connect(&cfg.database).await?;
     if cfg.database.run_migrations {
         db::migrate(&db).await?;
@@ -785,6 +791,34 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         });
     }
+    Ok(state)
+}
+
+/// The base project plus every `[[projects]]` entry behind one HTTP listener; each project also
+/// gets its own QUIC / WebTransport / UDP / edge listeners when it configures distinct addresses.
+async fn serve(cfg: Config) -> anyhow::Result<()> {
+    let projects = cfg.projects.clone();
+    let main = build(cfg).await?;
+    let mut extra: Vec<(String, Vec<String>, AppState)> = Vec::new();
+    for p in &projects {
+        let pc = main
+            .cfg
+            .for_project(p)
+            .map_err(|e| anyhow::anyhow!("[[projects]] {}: {e}", p.name))?;
+        if extra.iter().any(|(n, _, _)| *n == p.name) {
+            anyhow::bail!("[[projects]] {}: duplicate name", p.name);
+        }
+        let st = build(pc).await?;
+        info!(project = %p.name, hosts = ?p.hosts, "project started");
+        // draining any project drains the node
+        let (from, to) = (st.shutdown.clone(), main.shutdown.clone());
+        tokio::spawn(async move {
+            from.notified().await;
+            to.notify_one();
+        });
+        extra.push((p.name.clone(), p.hosts.clone(), st));
+    }
+    let state = &main;
     let socket = match state.cfg.http.listen {
         std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
         std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
@@ -795,13 +829,73 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // reset by the default accept backlog; the kernel caps this at somaxconn.
     let listener = socket.listen(4096)?;
     info!(addr = %state.cfg.http.listen, "http listening");
-    if let Some(listen) = state.cfg.quic.listen {
+    start_listeners(state, None).await?;
+    for (_, _, st) in &extra {
+        start_listeners(st, Some(&main.cfg)).await?;
+    }
+    let router = if extra.is_empty() {
+        http::router(main.clone())
+    } else {
+        http::multi_router(
+            (main.cfg.node.project.clone(), http::router(main.clone())),
+            extra
+                .iter()
+                .map(|(n, h, s)| (n.clone(), h.clone(), http::router(s.clone())))
+                .collect(),
+        )
+    };
+    let draining = main.clone();
+    let others: Vec<AppState> = extra.iter().map(|(_, _, s)| s.clone()).collect();
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown(draining.shutdown.clone()).await;
+        drain(&draining).await;
+        for s in &others {
+            drain(s).await;
+        }
+    })
+    .await?;
+    for s in std::iter::once(&main).chain(extra.iter().map(|(_, _, s)| s)) {
+        if let Some(c) = &s.cluster {
+            c.stop().await;
+        }
+    }
+    info!("stopped");
+    Ok(())
+}
+
+/// Datagram/stream listeners of one project. An extra project only gets the ones whose address
+/// differs from the base configuration's — a shared address would just be the base project's.
+async fn start_listeners(state: &AppState, base: Option<&Config>) -> anyhow::Result<()> {
+    let own =
+        |what: &str, mine: Option<std::net::SocketAddr>, theirs: Option<std::net::SocketAddr>| {
+            match (mine, base) {
+                (Some(a), Some(_)) if theirs == Some(a) => {
+                    tracing::warn!(project = %state.cfg.node.project, listener = what, addr = %a,
+                    "same address as the base project: set a distinct one to serve this project");
+                    None
+                }
+                (a, _) => a,
+            }
+        };
+    if let Some(listen) = own(
+        "quic",
+        state.cfg.quic.listen,
+        base.and_then(|b| b.quic.listen),
+    ) {
         crate::realtime::quic::start(state.clone(), listen).await?;
     }
-    if let Some(listen) = state.cfg.webtransport.listen {
+    if let Some(listen) = own(
+        "webtransport",
+        state.cfg.webtransport.listen,
+        base.and_then(|b| b.webtransport.listen),
+    ) {
         crate::realtime::webtransport::start(state.clone(), listen).await?;
     }
-    if let Some(listen) = state.cfg.udp.listen {
+    if let Some(listen) = own("udp", state.cfg.udp.listen, base.and_then(|b| b.udp.listen)) {
         let secret = match &state.cfg.udp.secret {
             Some(hex) => {
                 let bytes = (0..hex.len())
@@ -819,7 +913,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         };
         crate::realtime::udp::start(state.clone(), listen, secret).await?;
     }
-    if let Some(listen) = state.cfg.edge.listen {
+    if let Some(listen) = own(
+        "edge",
+        state.cfg.edge.listen,
+        base.and_then(|b| b.edge.listen),
+    ) {
         let proxy = musubi_edge::UdpProxy::start(
             listen,
             Arc::new(crate::edge::FleetRouter(state.fleets.clone())),
@@ -829,24 +927,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tracing::info!(listen = %proxy.local_addr(), public = ?state.fleets.edge(), "udp edge proxy listening");
         std::mem::forget(proxy);
     }
-    if let Some(listen) = state.cfg.regions.echo_listen {
+    if let Some(listen) = own(
+        "regions.echo",
+        state.cfg.regions.echo_listen,
+        base.and_then(|b| b.regions.echo_listen),
+    ) {
         let local = crate::regions::spawn_echo(listen).await?;
         tracing::info!(listen = %local, "region latency echo listening");
     }
-    let draining = state.clone();
-    axum::serve(
-        listener,
-        http::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown(draining.shutdown.clone()).await;
-        drain(&draining).await;
-    })
-    .await?;
-    if let Some(c) = &state.cluster {
-        c.stop().await;
-    }
-    info!("stopped");
     Ok(())
 }
 

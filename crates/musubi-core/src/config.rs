@@ -58,6 +58,9 @@ pub struct Config {
     pub anticheat: AntiCheatConfig,
     pub regions: RegionsConfig,
     pub operators: OperatorsConfig,
+    /// Further games/environments served by this same process, each on its own database and
+    /// cluster group; requests pick one by `x-musubi-project` or `Host`.
+    pub projects: Vec<ProjectConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +77,8 @@ pub struct NodeConfig {
     pub bus_advertise: String,
     /// Cluster group: independent clusters can share one Postgres.
     pub cluster_group: String,
+    /// Name of the project this node's base configuration serves (`[[projects]]` add more).
+    pub project: String,
     /// Upper bound for the SIGTERM drain (hand off matches/worlds, leave the cluster, close sessions).
     pub drain_timeout_secs: u64,
     /// Let the server start with the built-in `server_key` / JWT secret. `musubi dev` sets it;
@@ -142,6 +147,7 @@ impl Default for NodeConfig {
             bus_listen: String::new(),
             bus_advertise: String::new(),
             cluster_group: "default".into(),
+            project: "default".into(),
             drain_timeout_secs: 20,
             allow_insecure_defaults: false,
             data_dir: "./data".into(),
@@ -380,6 +386,90 @@ impl Config {
     }
 }
 
+/// One more project in the same process: `name`, the `Host`s that select it, and any config
+/// keys that differ from the base configuration (its own `database.url` is required; the
+/// cluster group and data dir default to `<base>-<name>` / `<base>/<name>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectConfig {
+    pub name: String,
+    pub hosts: Vec<String>,
+    #[serde(flatten)]
+    pub overrides: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Config {
+    /// The full configuration of an extra project: this one with the project's overrides on top.
+    pub fn for_project(&self, p: &ProjectConfig) -> Result<Config, String> {
+        if p.name.is_empty()
+            || p.name.len() > 32
+            || !p
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err("project name: 1..=32 of [A-Za-z0-9_-]".into());
+        }
+        if p.name == self.node.project {
+            return Err(format!(
+                "project {} is the base configuration itself",
+                p.name
+            ));
+        }
+        let mut base = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        base["projects"] = serde_json::Value::Array(Vec::new());
+        let has = |path: &[&str]| {
+            let mut v: Option<&serde_json::Value> = None;
+            for (i, k) in path.iter().enumerate() {
+                v = if i == 0 {
+                    p.overrides.get(*k)
+                } else {
+                    v.and_then(|v| v.get(*k))
+                };
+                v?;
+            }
+            v
+        };
+        if has(&["node", "cluster_group"]).is_none() {
+            base["node"]["cluster_group"] =
+                serde_json::Value::String(format!("{}-{}", self.node.cluster_group, p.name));
+        }
+        if has(&["node", "data_dir"]).is_none() {
+            base["node"]["data_dir"] = serde_json::Value::String(format!(
+                "{}/{}",
+                self.node.data_dir.trim_end_matches('/'),
+                p.name
+            ));
+        }
+        // tokens of one project must not verify in another: derive a secret unless one is given
+        if has(&["session", "secret"]).is_none() {
+            base["session"]["secret"] =
+                serde_json::Value::String(format!("{}/{}", self.session.secret, p.name));
+        }
+        merge_json(&mut base, &serde_json::Value::Object(p.overrides.clone()));
+        base["node"]["project"] = serde_json::Value::String(p.name.clone());
+        // one HTTP listener serves every project
+        base["http"]["listen"] =
+            serde_json::to_value(self.http.listen).map_err(|e| e.to_string())?;
+        let cfg: Config = serde_json::from_value(base).map_err(|e| e.to_string())?;
+        if cfg.database.url == self.database.url {
+            return Err(format!("project {} needs its own database.url", p.name));
+        }
+        Ok(cfg)
+    }
+}
+
+fn merge_json(a: &mut serde_json::Value, b: &serde_json::Value) {
+    match (a, b) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            for (k, v) in b {
+                merge_json(a.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (a, b) => *a = b.clone(),
+    }
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -390,6 +480,51 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_overlay_keeps_the_base_and_separates_what_must_differ() {
+        let mut base = Config::default();
+        base.database.url = "postgres://x/base".into();
+        base.node.region = "eu".into();
+        let p: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "name": "game2", "hosts": ["g2.example.com"],
+            "database": {"url": "postgres://x/game2", "max_connections": 3},
+            "session": {"secret": "other-secret"}
+        }))
+        .unwrap();
+        let c = base.for_project(&p).unwrap();
+        assert_eq!(c.node.project, "game2");
+        assert_eq!(c.node.region, "eu", "untouched keys come from the base");
+        assert_eq!(c.database.url, "postgres://x/game2");
+        assert_eq!(c.database.max_connections, 3);
+        assert_eq!(c.session.secret, "other-secret");
+        assert_eq!(c.node.cluster_group, "default-game2");
+        let q: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "name": "game3", "database": {"url": "postgres://x/game3"}
+        }))
+        .unwrap();
+        let c3 = base.for_project(&q).unwrap();
+        assert_ne!(
+            c3.session.secret, base.session.secret,
+            "derived per project"
+        );
+        assert_eq!(c.node.data_dir, "./data/game2");
+        assert_eq!(c.http.listen, base.http.listen);
+        assert!(c.projects.is_empty());
+        let same_db = ProjectConfig {
+            name: "game3".into(),
+            ..Default::default()
+        };
+        assert!(base
+            .for_project(&same_db)
+            .unwrap_err()
+            .contains("database.url"));
+        let bad = ProjectConfig {
+            name: "default".into(),
+            ..Default::default()
+        };
+        assert!(base.for_project(&bad).is_err());
+    }
 
     #[test]
     fn defaults_load_without_file() {
