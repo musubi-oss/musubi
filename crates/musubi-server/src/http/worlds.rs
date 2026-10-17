@@ -155,6 +155,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/stream", get(stream))
         .route("/v1/server/worlds/{w}/handover/ack", post(handover_ack))
         .route("/v1/server/worlds/{w}/interact", post(interact))
+        .route("/v1/server/worlds/{w}/tx", post(tx_begin))
+        .route("/v1/server/worlds/{w}/tx/{id}", get(tx_status))
         .route("/v1/server/worlds/{w}/rewind", post(rewind))
         .route("/v1/server/worlds/{w}/colocate", post(colocate))
 }
@@ -890,4 +892,48 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
 
 fn bad(e: serde_json::Error) -> Error {
     Error::InvalidArgument(e.to_string())
+}
+
+#[derive(Deserialize)]
+struct TxReq {
+    /// Caller-chosen id for idempotent retries (default: generated).
+    id: Option<uuid::Uuid>,
+    ops: Vec<crate::realtime::world::TxOp>,
+    /// Ticks the coordinator waits for every host to prepare before aborting (default 30).
+    ttl_ticks: Option<u64>,
+}
+
+/// Cross-cell transaction: writes to entities that may live on different nodes, applied
+/// everywhere or nowhere. Entities on this node are applied at once when all are here;
+/// otherwise `state: pending` and `GET …/tx/{id}` tells how it ended.
+async fn tx_begin(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<TxReq>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let res: Result<Json<Value>, ApiError> = async {
+        Ok(Json(s.worlds.begin_tx(
+            &w,
+            r.id,
+            r.ops,
+            r.ttl_ticks,
+            &s.fanout,
+        )?))
+    }
+    .await;
+    res.map_err(IntoResponse::into_response)
+}
+
+async fn tx_status(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path((w, id)): Path<(String, uuid::Uuid)>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let res: Result<Json<Value>, ApiError> = async { Ok(Json(s.worlds.tx_status(&w, id)?)) }.await;
+    res.map_err(IntoResponse::into_response)
 }

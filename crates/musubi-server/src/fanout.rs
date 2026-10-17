@@ -109,6 +109,33 @@ enum Wire {
         #[serde(default)]
         resend_full: bool,
     },
+    /// Cross-cell transaction, coordinator → cluster: hold the listed entities you own and vote.
+    WorldTxPrepare {
+        world: String,
+        tx: uuid::Uuid,
+        coordinator: uuid::Uuid,
+        ops: Vec<crate::realtime::world::TxOp>,
+        ttl_ticks: u64,
+    },
+    /// Participant → coordinator: the entities it now holds for `tx`, or why it refuses.
+    WorldTxVote {
+        world: String,
+        tx: uuid::Uuid,
+        coordinator: uuid::Uuid,
+        node: uuid::Uuid,
+        entities: Vec<musubi_mesh::EntityId>,
+        reason: Option<String>,
+    },
+    WorldTxCommit {
+        world: String,
+        tx: uuid::Uuid,
+        ops: Vec<crate::realtime::world::TxOp>,
+    },
+    WorldTxAbort {
+        world: String,
+        tx: uuid::Uuid,
+        reason: String,
+    },
     /// Input for an entity that lives on another node (e.g. buffered during a handover).
     WorldInput {
         world: String,
@@ -395,6 +422,63 @@ impl Fanout {
             from_node,
             accepted,
             resend_full,
+        });
+    }
+
+    pub fn world_tx_prepare(
+        &self,
+        world: &str,
+        tx: uuid::Uuid,
+        coordinator: uuid::Uuid,
+        ops: Vec<crate::realtime::world::TxOp>,
+        ttl_ticks: u64,
+    ) {
+        self.publish(Wire::WorldTxPrepare {
+            world: world.to_string(),
+            tx,
+            coordinator,
+            ops,
+            ttl_ticks,
+        });
+    }
+
+    pub fn world_tx_vote(
+        &self,
+        world: &str,
+        tx: uuid::Uuid,
+        coordinator: uuid::Uuid,
+        node: uuid::Uuid,
+        entities: Vec<musubi_mesh::EntityId>,
+        reason: Option<String>,
+    ) {
+        self.publish(Wire::WorldTxVote {
+            world: world.to_string(),
+            tx,
+            coordinator,
+            node,
+            entities,
+            reason,
+        });
+    }
+
+    pub fn world_tx_commit(
+        &self,
+        world: &str,
+        tx: uuid::Uuid,
+        ops: Vec<crate::realtime::world::TxOp>,
+    ) {
+        self.publish(Wire::WorldTxCommit {
+            world: world.to_string(),
+            tx,
+            ops,
+        });
+    }
+
+    pub fn world_tx_abort(&self, world: &str, tx: uuid::Uuid, reason: String) {
+        self.publish(Wire::WorldTxAbort {
+            world: world.to_string(),
+            tx,
+            reason,
         });
     }
 
@@ -703,6 +787,39 @@ impl Fanout {
                     if from_node == w.node_id() {
                         w.handover_acked(&world, entity, accepted, resend_full, self);
                     }
+                }
+            }
+            Ok(Wire::WorldTxPrepare {
+                world,
+                tx,
+                coordinator,
+                ops,
+                ttl_ticks,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_tx_prepare(&world, tx, coordinator, ops, ttl_ticks, self);
+                }
+            }
+            Ok(Wire::WorldTxVote {
+                world,
+                tx,
+                coordinator,
+                entities,
+                reason,
+                ..
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_tx_vote(&world, tx, coordinator, entities, reason, self);
+                }
+            }
+            Ok(Wire::WorldTxCommit { world, tx, ops }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_tx_commit(&world, tx, ops);
+                }
+            }
+            Ok(Wire::WorldTxAbort { world, tx, reason }) => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_tx_abort(&world, tx, reason);
                 }
             }
             Ok(Wire::WorldInput {

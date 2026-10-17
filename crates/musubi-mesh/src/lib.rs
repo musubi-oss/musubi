@@ -674,6 +674,17 @@ impl World {
         (owner, ephemeral.len())
     }
 
+    /// No handover of `id` before `until_tick` (a cross-cell transaction holds it).
+    pub fn defer_handover(&mut self, id: EntityId, until_tick: u64) -> bool {
+        match self.entities.get_mut(&id) {
+            Some(e) => {
+                e.handover_retry_tick = e.handover_retry_tick.max(until_tick);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn is_hibernated(&self, cell: CellId) -> bool {
         self.hibernated.contains(&cell)
     }

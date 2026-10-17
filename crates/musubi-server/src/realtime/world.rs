@@ -29,6 +29,155 @@ const SNAPSHOT_EVERY: u64 = 150;
 /// Controller pass every N ticks (1 s at 30 Hz).
 pub const CONTROL_EVERY: u64 = 30;
 
+/// One write of a cross-cell transaction: components to set on `entity`, guarded by the
+/// component versions the caller read (`expect`) so a concurrent write aborts the whole thing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxOp {
+    pub entity: EntityId,
+    #[serde(default)]
+    pub components: std::collections::BTreeMap<String, Value>,
+    #[serde(default)]
+    pub expect: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TxState {
+    Pending,
+    Committed,
+    Aborted { reason: String },
+}
+
+/// Coordinator-side record of a cross-cell transaction.
+struct TxRecord {
+    ops: Vec<TxOp>,
+    /// Entities whose host has not voted yet.
+    pending: std::collections::HashSet<EntityId>,
+    state: TxState,
+    deadline_tick: u64,
+    /// Local tick after which the record is forgotten (finished ones stay for idempotent reads).
+    forget_tick: u64,
+}
+
+/// Default ticks a transaction may stay in prepare before the coordinator aborts it.
+const TX_TTL_TICKS: u64 = 30;
+/// Finished transactions are kept this many ticks for `GET …/tx/{id}` and duplicate begins.
+const TX_KEEP_TICKS: u64 = 30 * 600;
+
+fn tx_json(tx: Uuid, s: &TxState, replayed: bool) -> Value {
+    let mut v = json!({
+        "tx": tx,
+        "state": match s {
+            TxState::Pending => "pending",
+            TxState::Committed => "committed",
+            TxState::Aborted { .. } => "aborted",
+        },
+    });
+    if let TxState::Aborted { reason } = s {
+        v["reason"] = json!(reason);
+    }
+    if replayed {
+        v["replayed"] = json!(true);
+    }
+    v
+}
+
+/// Participant-side check of the ops whose entities live here: present, not in transit, not held
+/// by another transaction, every expected component version still current. Returns those ids.
+fn tx_check_local(
+    st: &WorldState,
+    tx: Uuid,
+    ops: &[TxOp],
+) -> std::result::Result<Vec<EntityId>, String> {
+    let mut mine = Vec::new();
+    for op in ops {
+        let Some(e) = st.world.get(op.entity) else {
+            continue;
+        };
+        if e.transit.is_some() {
+            return Err(format!("entity {} is in transit", op.entity));
+        }
+        if let Some((holder, _)) = st.tx_locks.get(&op.entity) {
+            if *holder != tx {
+                return Err(format!(
+                    "entity {} is held by transaction {holder}",
+                    op.entity
+                ));
+            }
+        }
+        for (k, v) in &op.expect {
+            let have = e.components.get(k).map(|c| c.version).unwrap_or(0);
+            if have != *v {
+                return Err(format!(
+                    "entity {} component {k}: expected version {v}, have {have}",
+                    op.entity
+                ));
+            }
+        }
+        mine.push(op.entity);
+    }
+    Ok(mine)
+}
+
+fn tx_lock_local(st: &mut WorldState, tx: Uuid, ids: &[EntityId], until_tick: u64) {
+    for id in ids {
+        st.tx_locks.insert(*id, (tx, until_tick));
+        st.world.defer_handover(*id, until_tick);
+    }
+}
+
+fn tx_release(st: &mut WorldState, tx: Uuid) -> Vec<EntityId> {
+    let ids: Vec<EntityId> = st
+        .tx_locks
+        .iter()
+        .filter(|(_, (t, _))| *t == tx)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &ids {
+        st.tx_locks.remove(id);
+    }
+    ids
+}
+
+/// Commit the ops whose entities live here: write, journal persistent ones, tell the owning
+/// simulator. An entity that left meanwhile is skipped — its new host applies the same commit.
+fn tx_apply_local(st: &mut WorldState, tx: Uuid, ops: &[TxOp]) -> Vec<EntityId> {
+    let mut applied = Vec::new();
+    for op in ops {
+        if st.world.get(op.entity).is_none()
+            || st
+                .world
+                .force_apply(op.entity, None, op.components.clone())
+                .is_err()
+        {
+            continue;
+        }
+        let (persistent, cell) = match st.world.get(op.entity) {
+            Some(e) => (e.persistent, e.cell),
+            None => continue,
+        };
+        if persistent {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Apply {
+                    id: op.entity,
+                    pos: None,
+                    components: Value::Object(op.components.clone().into_iter().collect()),
+                },
+            });
+        }
+        let owner = st.world.owner(cell);
+        if let Some(owner) = owner {
+            push_event(
+                st,
+                owner,
+                json!({"type": "tx_committed", "tx": tx, "entity": op.entity}),
+            );
+        }
+        applied.push(op.entity);
+    }
+    applied
+}
+
 /// Ship an entity to the node hosting its new cell. When the neighbours already hold it as a
 /// ghost, only the components newer than the revision they have travel (`base_rev`); the
 /// receiver merges them onto its ghost. After a `resend_full` refusal the full state goes.
@@ -69,6 +218,10 @@ struct WorldState {
     ghost_send: HashMap<CellId, musubi_mesh::GhostSendState>,
     /// Entities whose next handover must carry the full state (the receiver had no ghost of them).
     full_resend: std::collections::HashSet<EntityId>,
+    /// Cross-cell transactions this node coordinates (by tx id).
+    txs: HashMap<Uuid, TxRecord>,
+    /// Entities held by a prepared transaction: no writes until commit, abort or the deadline.
+    tx_locks: HashMap<EntityId, (Uuid, u64)>,
     /// This shard exists only for cells assigned to this node (it is not the world's home).
     hosted_only: bool,
     /// The world's home node as of shard creation: cells without an explicit host live there.
@@ -594,6 +747,8 @@ impl WorldRegistry {
                     remote_ghosts: HashMap::new(),
                     ghost_send: HashMap::new(),
                     full_resend: std::collections::HashSet::new(),
+                    txs: HashMap::new(),
+                    tx_locks: HashMap::new(),
                     sub_opts: HashMap::new(),
                     hosted_only: true,
                     home_node: home,
@@ -1308,6 +1463,8 @@ impl WorldRegistry {
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
                 full_resend: std::collections::HashSet::new(),
+                txs: HashMap::new(),
+                tx_locks: HashMap::new(),
             sub_opts: HashMap::new(),
                     hosted_only: false,
                     home_node: None,
@@ -1749,6 +1906,8 @@ impl WorldRegistry {
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
                 full_resend: std::collections::HashSet::new(),
+                txs: HashMap::new(),
+                tx_locks: HashMap::new(),
                 sub_opts: HashMap::new(),
                 hosted_only: false,
                 home_node: None,
@@ -2195,6 +2354,11 @@ impl WorldRegistry {
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
+        if let Some((tx, _)) = st.tx_locks.get(&id) {
+            return Err(Error::Conflict(format!(
+                "entity {id} is held by transaction {tx}"
+            )));
+        }
         st.world
             .apply(sim, id, pos, comps.clone())
             .map_err(mesh_err)?;
@@ -2488,6 +2652,229 @@ impl WorldRegistry {
                 t.from,
                 json!({"type": "handover_cancelled", "entity": id, "reason": format!("node {} refused: no simulator owns the cell", t.to)}),
             );
+        }
+    }
+
+    /// Begin a cross-cell transaction: every op is applied on every host involved, or none is.
+    /// All entities here → applied now. Otherwise the entities here are held (no writes, no
+    /// handover) and the other hosts are asked to prepare (`WorldTxPrepare`); their votes decide
+    /// (`accept_tx_vote`), a missing vote aborts at the deadline. Idempotent by `tx`.
+    pub fn begin_tx(
+        &self,
+        name: &str,
+        tx: Option<Uuid>,
+        ops: Vec<TxOp>,
+        ttl_ticks: Option<u64>,
+        fanout: &Fanout,
+    ) -> Result<Value> {
+        if ops.is_empty() {
+            return Err(Error::InvalidArgument("ops: at least one".into()));
+        }
+        if ops.len() > 64 {
+            return Err(Error::InvalidArgument("ops: at most 64".into()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for op in &ops {
+            if !seen.insert(op.entity) {
+                return Err(Error::InvalidArgument(format!(
+                    "entity {} listed twice",
+                    op.entity
+                )));
+            }
+        }
+        let tx = tx.unwrap_or_else(Uuid::now_v7);
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        if let Some(r) = st.txs.get(&tx) {
+            return Ok(tx_json(tx, &r.state, true));
+        }
+        let now = st.world.tick;
+        let ttl = ttl_ticks.unwrap_or(TX_TTL_TICKS).clamp(1, 3000);
+        let deadline = now + ttl;
+        let record = |state: TxState, pending, ops| TxRecord {
+            ops,
+            pending,
+            state,
+            deadline_tick: deadline,
+            forget_tick: deadline + TX_KEEP_TICKS,
+        };
+        let mine = match tx_check_local(st, tx, &ops) {
+            Ok(m) => m,
+            Err(reason) => {
+                let state = TxState::Aborted { reason };
+                st.txs
+                    .insert(tx, record(state.clone(), Default::default(), ops));
+                return Ok(tx_json(tx, &state, false));
+            }
+        };
+        let remote: std::collections::HashSet<EntityId> = ops
+            .iter()
+            .map(|o| o.entity)
+            .filter(|id| !mine.contains(id))
+            .collect();
+        if !remote.is_empty() && !self.is_split(name) {
+            let mut missing: Vec<String> = remote.iter().map(|i| i.to_string()).collect();
+            missing.sort();
+            let state = TxState::Aborted {
+                reason: format!("unknown entities: {}", missing.join(", ")),
+            };
+            st.txs
+                .insert(tx, record(state.clone(), Default::default(), ops));
+            return Ok(tx_json(tx, &state, false));
+        }
+        if remote.is_empty() {
+            tx_apply_local(st, tx, &ops);
+            st.txs
+                .insert(tx, record(TxState::Committed, Default::default(), ops));
+            return Ok(tx_json(tx, &TxState::Committed, false));
+        }
+        tx_lock_local(st, tx, &mine, deadline);
+        st.txs
+            .insert(tx, record(TxState::Pending, remote, ops.clone()));
+        fanout.world_tx_prepare(name, tx, self.node_id, ops, ttl);
+        Ok(tx_json(tx, &TxState::Pending, false))
+    }
+
+    pub fn tx_status(&self, name: &str, tx: Uuid) -> Result<Value> {
+        let w = self.get(name)?;
+        let st = w.lock();
+        match st.txs.get(&tx) {
+            Some(r) => Ok(tx_json(tx, &r.state, false)),
+            None => Err(Error::NotFound(format!("transaction {tx}"))),
+        }
+    }
+
+    /// Another node coordinates `tx`: hold the entities of `ops` that live here and vote. Nodes
+    /// holding none of them stay silent.
+    pub fn accept_tx_prepare(
+        &self,
+        name: &str,
+        tx: Uuid,
+        coordinator: Uuid,
+        ops: Vec<TxOp>,
+        ttl_ticks: u64,
+        fanout: &Fanout,
+    ) {
+        if coordinator == self.node_id {
+            return;
+        }
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        if !ops.iter().any(|o| st.world.get(o.entity).is_some()) {
+            return;
+        }
+        match tx_check_local(st, tx, &ops) {
+            Ok(mine) => {
+                // the coordinator aborts after its ttl; hold a little longer so its commit lands
+                let until = st.world.tick + ttl_ticks + 5;
+                tx_lock_local(st, tx, &mine, until);
+                fanout.world_tx_vote(name, tx, coordinator, self.node_id, mine, None);
+            }
+            Err(reason) => {
+                fanout.world_tx_vote(
+                    name,
+                    tx,
+                    coordinator,
+                    self.node_id,
+                    Vec::new(),
+                    Some(reason),
+                );
+            }
+        }
+    }
+
+    /// A vote for a transaction this node coordinates: a refusal aborts it everywhere, the vote
+    /// covering the last missing entity commits it.
+    pub fn accept_tx_vote(
+        &self,
+        name: &str,
+        tx: Uuid,
+        coordinator: Uuid,
+        entities: Vec<EntityId>,
+        reason: Option<String>,
+        fanout: &Fanout,
+    ) {
+        if coordinator != self.node_id {
+            return;
+        }
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        let decision = {
+            let Some(r) = st.txs.get_mut(&tx) else {
+                return;
+            };
+            if r.state != TxState::Pending {
+                return;
+            }
+            match reason {
+                Some(reason) => {
+                    r.state = TxState::Aborted {
+                        reason: reason.clone(),
+                    };
+                    Err(reason)
+                }
+                None => {
+                    for id in entities {
+                        r.pending.remove(&id);
+                    }
+                    if !r.pending.is_empty() {
+                        return;
+                    }
+                    r.state = TxState::Committed;
+                    Ok(r.ops.clone())
+                }
+            }
+        };
+        match decision {
+            Err(reason) => {
+                tx_release(st, tx);
+                fanout.world_tx_abort(name, tx, reason);
+            }
+            Ok(ops) => {
+                tx_release(st, tx);
+                tx_apply_local(st, tx, &ops);
+                fanout.world_tx_commit(name, tx, ops);
+            }
+        }
+    }
+
+    /// Commit from the coordinator: apply the ops whose entities live here and release them.
+    pub fn accept_tx_commit(&self, name: &str, tx: Uuid, ops: Vec<TxOp>) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        if st.txs.contains_key(&tx) {
+            return; // we coordinate it: applied when the last vote came in
+        }
+        tx_release(st, tx);
+        tx_apply_local(st, tx, &ops);
+    }
+
+    /// Abort from the coordinator: release the held entities, tell their simulators.
+    pub fn accept_tx_abort(&self, name: &str, tx: Uuid, reason: String) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        for id in tx_release(st, tx) {
+            let owner = st.world.get(id).and_then(|e| st.world.owner(e.cell));
+            if let Some(owner) = owner {
+                push_event(
+                    st,
+                    owner,
+                    json!({"type": "tx_aborted", "tx": tx, "entity": id, "reason": reason}),
+                );
+            }
         }
     }
 
@@ -2820,6 +3207,24 @@ impl WorldRegistry {
                 }
                 let (now, stale) = (st.world.tick, st.world.config().ghost_stale_ticks);
                 st.remote_ghosts.retain(|_, g| !g.stale(now, stale));
+                st.tx_locks.retain(|_, (_, until)| *until > now);
+                let timed_out: Vec<Uuid> = st
+                    .txs
+                    .iter()
+                    .filter(|(_, r)| r.state == TxState::Pending && r.deadline_tick <= now)
+                    .map(|(t, _)| *t)
+                    .collect();
+                for tx in timed_out {
+                    if let Some(r) = st.txs.get_mut(&tx) {
+                        r.state = TxState::Aborted {
+                            reason: "timeout: not every host voted".into(),
+                        };
+                        r.forget_tick = now + TX_KEEP_TICKS;
+                    }
+                    tx_release(&mut *st, tx);
+                    fanout.world_tx_abort(&name, tx, "timeout: not every host voted".into());
+                }
+                st.txs.retain(|_, r| r.forget_tick > now);
             }
             if st.world.tick % JOURNAL_EVERY == 0 && !st.journal.is_empty() {
                 if let Some(db) = self.db.clone() {

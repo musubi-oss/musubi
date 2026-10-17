@@ -9417,3 +9417,270 @@ async fn login_queue_holds_logins_until_a_slot_frees() {
     .await;
     assert_eq!(st, 401, "{v}");
 }
+
+/// Cross-cell transaction: an exchange between entities hosted on two nodes lands on both or on
+/// neither — a stale expected version aborts it everywhere; all-local ops commit at once.
+#[tokio::test]
+async fn world_tx_cross_nodes() {
+    let group = format!("xtx-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(
+            serde_json::json!({"name": name, "config": {"cell_size": 100.0, "ghost_margin": 20.0}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let sim_a = uuid::Uuid::now_v7();
+    let sim_b = uuid::Uuid::now_v7();
+    for (router, sim, cell) in [(&router1, sim_a, (0, 0)), (&router2, sim_b, (1, 0))] {
+        let (st, l) = http_json(
+            router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/lease"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "cells": [{"x": cell.0, "y": cell.1}]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{l}");
+    }
+    let mut ids = Vec::new();
+    for (router, sim, x, gold) in [(&router1, sim_a, 50.0, 10), (&router2, sim_b, 150.0, 0)] {
+        let (st, e) = http_json(
+            router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/spawn"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "x": x, "y": 50.0, "components": {"gold": gold}, "persistent": false})),
+        )
+        .await;
+        assert_eq!(st, 200, "{e}");
+        ids.push(e["id"].as_str().unwrap().to_string());
+    }
+    let gold = |v: &Value, id: &str| -> Value {
+        v["owned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .and_then(|e| {
+                e["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["name"] == "gold")
+                    .map(|c| c["value"].clone())
+            })
+            .unwrap_or(Value::Null)
+    };
+    let views = |router1: axum::Router, router2: axum::Router, name: String| async move {
+        let (_, va) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, vb) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        (va, vb)
+    };
+    let wait_state = |router: axum::Router, name: String, tx: String| async move {
+        let mut last = Value::Null;
+        for _ in 0..50 {
+            let (st, s) = http_json(
+                &router,
+                "GET",
+                &format!("/v1/server/worlds/{name}/tx/{tx}"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{s}");
+            if s["state"] != "pending" {
+                return s;
+            }
+            last = s;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("transaction still pending: {last}");
+    };
+
+    // A on node 1 pays B on node 2: lands on both
+    let (st, t) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/tx"),
+        None,
+        true,
+        Some(serde_json::json!({"ops": [
+            {"entity": ids[0], "components": {"gold": 0}, "expect": {"gold": 1}},
+            {"entity": ids[1], "components": {"gold": 10}, "expect": {"gold": 1}},
+        ]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{t}");
+    assert_eq!(t["state"], "pending", "{t}");
+    let tx1 = t["tx"].as_str().unwrap().to_string();
+    let s = wait_state(router1.clone(), name.clone(), tx1.clone()).await;
+    assert_eq!(s["state"], "committed", "{s}");
+    let (va, vb) = views(router1.clone(), router2.clone(), name.clone()).await;
+    assert_eq!(gold(&va, &ids[0]), 0, "{va}");
+    assert_eq!(gold(&vb, &ids[1]), 10, "{vb}");
+    // replaying the same id applies nothing and reports the stored outcome
+    let (st, t) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/tx"),
+        None,
+        true,
+        Some(serde_json::json!({"id": tx1, "ops": [
+            {"entity": ids[0], "components": {"gold": 99}},
+        ]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{t}");
+    assert_eq!(t["state"], "committed", "{t}");
+    assert_eq!(t["replayed"], true, "{t}");
+
+    // stale expectation (versions are 2 now) on the remote entity: aborted everywhere
+    let (st, t) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/tx"),
+        None,
+        true,
+        Some(serde_json::json!({"ops": [
+            {"entity": ids[0], "components": {"gold": 5}, "expect": {"gold": 2}},
+            {"entity": ids[1], "components": {"gold": 5}, "expect": {"gold": 1}},
+        ]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{t}");
+    let s = wait_state(
+        router1.clone(),
+        name.clone(),
+        t["tx"].as_str().unwrap().to_string(),
+    )
+    .await;
+    assert_eq!(s["state"], "aborted", "{s}");
+    assert!(
+        s["reason"].as_str().unwrap().contains("expected version 1"),
+        "{s}"
+    );
+    let (va, vb) = views(router1.clone(), router2.clone(), name.clone()).await;
+    assert_eq!(gold(&va, &ids[0]), 0, "{va}");
+    assert_eq!(gold(&vb, &ids[1]), 10, "{vb}");
+    // the held entity is writable again after the abort
+    let (st, a) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim_a, "entity": ids[0], "components": {"gold": 1}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+
+    // all-local ops commit at once
+    let (st, t) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/tx"),
+        None,
+        true,
+        Some(serde_json::json!({"ops": [
+            {"entity": ids[0], "components": {"gold": 3}, "expect": {"gold": 3}},
+        ]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{t}");
+    assert_eq!(t["state"], "committed", "{t}");
+    let (va, _) = views(router1.clone(), router2.clone(), name.clone()).await;
+    assert_eq!(gold(&va, &ids[0]), 3, "{va}");
+    // unknown id → 404, empty ops → 400
+    let (st, _) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/tx/{}", uuid::Uuid::now_v7()),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/tx"),
+        None,
+        true,
+        Some(serde_json::json!({"ops": []})),
+    )
+    .await;
+    assert_eq!(st, 400);
+}
