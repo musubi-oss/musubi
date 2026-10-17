@@ -1,5 +1,5 @@
 //! Envelope encode/decode in both wire encodings (plan 6.2).
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use musubi_proto::Encoding;
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +10,23 @@ struct Input {
     tick: u64,
     data: Vec<u8>,
     presences: Vec<String>,
+}
+
+/// Code-independent probe of the machine the benches run on (FNV-1a over 64 KiB): CI runners differ
+/// in speed from run to run, so `scripts/bench-compare.py` divides every change by this one.
+fn calibrate(c: &mut Criterion) {
+    let buf: Vec<u8> = (0..65_536u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    c.bench_function("calibrate", |b| {
+        b.iter(|| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &x in black_box(&buf) {
+                h = (h ^ x as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            black_box(h)
+        })
+    });
 }
 
 fn bench(c: &mut Criterion) {
@@ -32,5 +49,5 @@ fn bench(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench);
+criterion_group!(benches, calibrate, bench);
 criterion_main!(benches);

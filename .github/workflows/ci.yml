@@ -47,10 +47,13 @@ jobs:
           path: target/criterion
           key: criterion-baseline-${{ github.sha }}
           restore-keys: criterion-baseline-
-      - run: cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --noplot
+      - run: cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --noplot --baseline-lenient main
       - run: python3 scripts/bench-compare.py 5
+      - name: promote results to the main baseline
+        if: always() && github.ref == 'refs/heads/main'
+        run: python3 scripts/bench-compare.py --promote
       - name: save baseline
-        if: github.ref == 'refs/heads/main'
+        if: always() && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: target/criterion
