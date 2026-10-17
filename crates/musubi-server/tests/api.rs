@@ -11613,3 +11613,216 @@ async fn friends_import_maps_platform_ids_to_accounts() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+/// Entitlements (5.11): Steam DLC ownership from a mock publisher API → reward table once,
+/// refund → revoked, re-own → granted again; console entitlements via the server routes.
+#[tokio::test]
+async fn entitlements_sync_grants_once_and_revokes() {
+    use axum::extract::Query as AxQuery;
+    use axum::routing::get as ax_get;
+    let owned: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::new(
+        std::sync::Mutex::new(["1001".to_string()].into_iter().collect()),
+    );
+    let o2 = owned.clone();
+    let mock = Router::new()
+        .route(
+            "/ISteamUserAuth/AuthenticateUserTicket/v1/",
+            ax_get(|AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| async move {
+                match q.get("ticket").map(String::as_str) {
+                    Some("0e0e") => axum::Json(json!({"response": {"params": {"result": "OK", "steamid": "76561198000000777", "ownersteamid": "76561198000000777", "vacbanned": false, "publisherbanned": false}}})),
+                    _ => axum::Json(json!({"response": {"error": {"errorcode": 101, "errordesc": "Invalid ticket"}}})),
+                }
+            }),
+        )
+        .route(
+            "/ISteamUser/CheckAppOwnership/v4/",
+            ax_get(move |AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| {
+                let o = o2.clone();
+                async move {
+                    assert_eq!(q.get("key").map(String::as_str), Some("pubkey"));
+                    assert_eq!(q.get("steamid").map(String::as_str), Some("76561198000000777"));
+                    let owns = o.lock().unwrap().contains(q.get("appid").unwrap());
+                    axum::Json(json!({"appownership": {"ownsapp": owns, "permanent": owns, "result": "OK"}}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        c.social.steam.url = b.clone();
+        c.social.steam.web_api_key = "k".into();
+        c.social.steam.app_id = 480;
+        c.iap.steam.url = b.clone();
+        c.iap.steam.key = "pubkey".into();
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let (dlc1, dlc2) = (unique("dlc1-"), unique("dlc2-"));
+    for (it, t) in [(&dlc1, "t1"), (&dlc2, "t2")] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/items",
+            k,
+            Some(json!({"id": it, "name": it, "category": "dlc", "stackable": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/rewards/tables",
+            k,
+            Some(json!({
+                "id": format!("{it}-{t}"), "name": t, "kind": "weighted",
+                "entries": [{"weight": 1, "rarity": "common", "item_id": it, "amount": 1}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/entitlements",
+        k,
+        Some(json!({"provider": "steam", "external_id": "1001", "reward_table": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    for (ext, it, t) in [("1001", &dlc1, "t1"), ("1002", &dlc2, "t2")] {
+        let (st, v) = call_server(&app, "PUT", "/v1/server/entitlements", k, Some(json!({"provider": "steam", "external_id": ext, "reward_table": format!("{it}-{t}"), "label": "DLC"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, v) = call_server(&app, "PUT", "/v1/server/entitlements", k, Some(json!({"provider": "xbox", "external_id": "9NBLGGH-SEASON", "reward_table": format!("{dlc2}-t2")}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/entitlements", k, None).await;
+    assert!(v["entitlements"].as_array().unwrap().len() >= 3, "{v}");
+
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/steam",
+        None,
+        Some(json!({"ticket": "0e0e"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/entitlements/sync",
+        Some(&tok),
+        Some(json!({"provider": "steam"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["owned"], json!(["1001"]));
+    assert_eq!(v["granted"], json!(["1001"]));
+    assert_eq!(v["revoked"], json!([]));
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    assert!(inv.to_string().contains(&dlc1), "{inv}");
+    assert!(!inv.to_string().contains(&dlc2), "{inv}");
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/entitlements/sync",
+        Some(&tok),
+        Some(json!({"provider": "steam"})),
+    )
+    .await;
+    assert_eq!(v["granted"], json!([]), "{v}");
+    let (_, inv2) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    assert_eq!(inv2, inv);
+    {
+        let mut o = owned.lock().unwrap();
+        o.remove("1001");
+        o.insert("1002".into());
+    }
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/entitlements/sync",
+        Some(&tok),
+        Some(json!({"provider": "steam"})),
+    )
+    .await;
+    assert_eq!(v["granted"], json!(["1002"]), "{v}");
+    assert_eq!(v["revoked"], json!(["1001"]), "{v}");
+    let (_, mine) = call(&app, "GET", "/v1/entitlements", Some(&tok), None).await;
+    let m = mine["entitlements"].as_array().unwrap();
+    assert_eq!(m.len(), 2, "{mine}");
+    assert_eq!(
+        m.iter().find(|e| e["external_id"] == "1001").unwrap()["active"],
+        false
+    );
+    assert_eq!(
+        m.iter().find(|e| e["external_id"] == "1002").unwrap()["active"],
+        true
+    );
+    owned.lock().unwrap().insert("1001".into());
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/entitlements/sync",
+        Some(&tok),
+        Some(json!({"provider": "steam"})),
+    )
+    .await;
+    assert_eq!(v["granted"], json!(["1001"]), "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/entitlements/grant",
+        k,
+        Some(json!({"account_id": acc, "provider": "xbox", "external_id": "9NBLGGH-SEASON"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["granted"], true);
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/entitlements/grant",
+        k,
+        Some(json!({"account_id": acc, "provider": "xbox", "external_id": "9NBLGGH-SEASON"})),
+    )
+    .await;
+    assert_eq!(v["granted"], false);
+    let (_, v) = call_server(&app, "POST", "/v1/server/entitlements/revoke", k, Some(json!({"account_id": acc, "provider": "xbox", "external_id": "9NBLGGH-SEASON", "reason": "refund"}))).await;
+    assert_eq!(v["revoked"], true);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/entitlements/grant",
+        k,
+        Some(json!({"account_id": acc, "provider": "psn", "external_id": "UNKNOWN"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/entitlements/sync",
+        Some(&tok),
+        Some(json!({"provider": "xbox"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        "/v1/server/entitlements/xbox/9NBLGGH-SEASON",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}

@@ -4,6 +4,7 @@ mod auth;
 mod chat;
 mod cluster;
 pub mod economy;
+pub mod entitlements;
 pub(crate) mod error;
 pub(crate) mod extract;
 mod fleets;
@@ -62,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .merge(matches::routes())
         .merge(matchmaker::routes())
         .merge(rating::routes())
+        .merge(entitlements::routes())
         .merge(fleets::routes())
         .merge(worlds::routes())
         .merge(integrations::routes())
