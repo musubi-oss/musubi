@@ -1,7 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use musubi_chat::{Channel, ChannelSettings, Filter, History, Moderation, Report};
+use musubi_chat::{Channel, ChannelSettings, Filter, History, Moderation, Report, Unread};
 use musubi_core::AccountId;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,6 +34,12 @@ pub fn routes() -> Router<AppState> {
             delete(delete_message),
         )
         .route("/v1/channel/{id}/report", post(report))
+        .route("/v1/channel/unread", get(unread))
+        .route("/v1/channel/{id}/read", post(mark_read))
+        .route(
+            "/v1/channel/{id}/messages/{message_id}/replies",
+            get(replies),
+        )
         .route(
             "/v1/admin/chat/filters",
             get(list_filters).put(upsert_filter),
@@ -48,6 +54,66 @@ pub fn routes() -> Router<AppState> {
             "/v1/admin/chat/reports/{report_id}",
             get(get_report).post(resolve_report),
         )
+}
+
+#[derive(Deserialize)]
+struct UnreadQuery {
+    /// Comma-separated channel ids.
+    channels: String,
+}
+
+async fn unread(
+    Bearer(me): Bearer,
+    State(s): State<AppState>,
+    Query(q): Query<UnreadQuery>,
+) -> Result<Json<Vec<Unread>>, ApiError> {
+    let channels: Vec<String> = q
+        .channels
+        .split(',')
+        .filter(|c| !c.is_empty())
+        .take(100)
+        .map(str::to_string)
+        .collect();
+    for c in &channels {
+        s.chat.authorize(me.account_id, &Channel::parse(c)?).await?;
+    }
+    Ok(Json(s.chat.unread(me.account_id, &channels).await?))
+}
+
+#[derive(Deserialize, Default)]
+struct ReadRequest {
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+async fn mark_read(
+    Bearer(me): Bearer,
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<ReadRequest>>,
+) -> Result<Json<Value>, ApiError> {
+    let channel = Channel::parse(&id)?;
+    s.chat.authorize(me.account_id, &channel).await?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    s.chat
+        .mark_read(&channel, me.account_id, req.message_id.as_deref())
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn replies(
+    Bearer(me): Bearer,
+    State(s): State<AppState>,
+    Path((id, message_id)): Path<(String, String)>,
+    Query(q): Query<HistoryQuery>,
+) -> Result<Json<History>, ApiError> {
+    let channel = Channel::parse(&id)?;
+    s.chat.authorize(me.account_id, &channel).await?;
+    Ok(Json(
+        s.chat
+            .replies(&channel, &message_id, q.limit, q.cursor.as_deref())
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]

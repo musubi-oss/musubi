@@ -102,6 +102,15 @@ pub fn validate_content(content: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Per-channel unread counters for one viewer.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Unread {
+    pub channel_id: String,
+    pub count: u64,
+    pub mentions: u64,
+    pub last_read: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct History {
     pub messages: Vec<ChannelMessage>,
@@ -125,7 +134,10 @@ type Row = (
     serde_json::Value,
     OffsetDateTime,
     OffsetDateTime,
+    Option<Uuid>,
+    Vec<Uuid>,
 );
+const MSG_COLS: &str = "id, channel_id, kind, sender_id, username, code, content, created_at, updated_at, reply_to, mentions";
 
 fn to_msg(r: Row) -> ChannelMessage {
     ChannelMessage {
@@ -140,6 +152,8 @@ fn to_msg(r: Row) -> ChannelMessage {
         update_time: r.8.unix_timestamp(),
         persistent: true,
         reactions: Vec::new(),
+        reply_to: r.9.map(|u| u.to_string()),
+        mentions: r.10.into_iter().map(AccountId).collect(),
     }
 }
 
@@ -210,11 +224,58 @@ impl ChatService {
         content: serde_json::Value,
         persistent: bool,
     ) -> Result<ChannelMessage> {
+        self.append_ext(
+            channel,
+            sender,
+            username,
+            content,
+            persistent,
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// `append` with a thread parent and resolved mentions. `reply_to` must be a persisted message
+    /// of the same channel.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_ext(
+        &self,
+        channel: &Channel,
+        sender: AccountId,
+        username: &str,
+        content: serde_json::Value,
+        persistent: bool,
+        reply_to: Option<&str>,
+        mentions: Vec<AccountId>,
+    ) -> Result<ChannelMessage> {
         validate_content(&content)?;
+        let reply_to = match reply_to {
+            Some(r) => {
+                let rid: Uuid = r
+                    .parse()
+                    .map_err(|_| Error::InvalidArgument("bad reply_to".into()))?;
+                let ok: bool = sqlx::query_scalar(
+                    "select exists(select 1 from musubi.chat_messages where id = $1 and channel_id = $2 and reply_to is null)",
+                )
+                .bind(rid)
+                .bind(channel.id())
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::internal)?;
+                if !ok {
+                    return Err(Error::NotFound(
+                        "reply_to: no such top-level message in this channel".into(),
+                    ));
+                }
+                Some(rid)
+            }
+            None => None,
+        };
         let id = Uuid::now_v7();
         let now = OffsetDateTime::now_utc();
         if persistent {
-            sqlx::query("insert into musubi.chat_messages (id, channel_id, kind, sender_id, username, code, content, created_at, updated_at) values ($1, $2, $3, $4, $5, 0, $6, $7, $7)")
+            sqlx::query("insert into musubi.chat_messages (id, channel_id, kind, sender_id, username, code, content, created_at, updated_at, reply_to, mentions) values ($1, $2, $3, $4, $5, 0, $6, $7, $7, $8, $9)")
                 .bind(id)
                 .bind(channel.id())
                 .bind(channel.kind() as i16)
@@ -222,6 +283,8 @@ impl ChatService {
                 .bind(username)
                 .bind(&content)
                 .bind(now)
+                .bind(reply_to)
+                .bind(mentions.iter().map(|a| a.0).collect::<Vec<_>>())
                 .execute(&self.db)
                 .await
                 .map_err(Error::internal)?;
@@ -238,7 +301,150 @@ impl ChatService {
             update_time: now.unix_timestamp(),
             persistent,
             reactions: Vec::new(),
+            reply_to: reply_to.map(|u| u.to_string()),
+            mentions,
         })
+    }
+
+    /// Accounts @-mentioned in the message text (`@name`, 2..=32 chars of `[A-Za-z0-9_.-]`),
+    /// resolved case-insensitively; unknown names are ignored.
+    pub async fn resolve_mentions(&self, content: &serde_json::Value) -> Result<Vec<AccountId>> {
+        fn collect<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(a) => a.iter().for_each(|x| collect(x, out)),
+                serde_json::Value::Object(o) => o.values().for_each(|x| collect(x, out)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        collect(content, &mut texts);
+        let mut names: Vec<String> = Vec::new();
+        for t in texts {
+            let mut rest = t;
+            while let Some(i) = rest.find('@') {
+                let after = &rest[i + 1..];
+                let end = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+                    .unwrap_or(after.len());
+                let name = &after[..end];
+                if (2..=32).contains(&name.len()) {
+                    let l = name.to_ascii_lowercase();
+                    if !names.contains(&l) {
+                        names.push(l);
+                    }
+                }
+                rest = &after[end..];
+            }
+        }
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        names.truncate(20);
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select id from musubi.accounts where lower(username) = any($1) and deleted_at is null",
+        )
+        .bind(&names)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(ids.into_iter().map(AccountId).collect())
+    }
+
+    /// Replies to `message_id` in `channel`, oldest first.
+    pub async fn replies(
+        &self,
+        channel: &Channel,
+        message_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<History> {
+        let parent: Uuid = message_id
+            .parse()
+            .map_err(|_| Error::InvalidArgument("bad message id".into()))?;
+        let cursor = cursor
+            .map(|c| {
+                c.parse::<Uuid>()
+                    .map_err(|_| Error::InvalidArgument("bad cursor".into()))
+            })
+            .transpose()?;
+        let limit = limit.clamp(1, 100) as i64;
+        let rows: Vec<Row> = sqlx::query_as(&format!(
+            "select {MSG_COLS} from musubi.chat_messages where channel_id = $1 and reply_to = $2 and ($3::uuid is null or id > $3) order by id asc limit $4"
+        ))
+        .bind(channel.id())
+        .bind(parent)
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let next_cursor = (rows.len() as i64 == limit).then(|| rows.last().unwrap().0.to_string());
+        Ok(History {
+            messages: rows.into_iter().map(to_msg).collect(),
+            next_cursor,
+            prev_cursor: None,
+        })
+    }
+
+    /// Move `me`'s read cursor in `channel` to `message_id` (or to "now" when omitted).
+    pub async fn mark_read(
+        &self,
+        channel: &Channel,
+        me: AccountId,
+        message_id: Option<&str>,
+    ) -> Result<()> {
+        let at = match message_id {
+            Some(m) => m
+                .parse::<Uuid>()
+                .map_err(|_| Error::InvalidArgument("bad message id".into()))?,
+            None => Uuid::now_v7(),
+        };
+        sqlx::query(
+            "insert into musubi.chat_read_cursors (channel_id, account_id, last_read) values ($1, $2, $3)
+             on conflict (channel_id, account_id) do update
+                 set last_read = greatest(musubi.chat_read_cursors.last_read, excluded.last_read), updated_at = now()",
+        )
+        .bind(channel.id())
+        .bind(me.0)
+        .bind(at)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Unread counters for `me` in each of `channels`: messages after the read cursor that were
+    /// not sent by `me`, and how many of them mention `me`.
+    pub async fn unread(&self, me: AccountId, channels: &[String]) -> Result<Vec<Unread>> {
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, i64, i64, Option<Uuid>)> = sqlx::query_as(
+            "select c.channel_id,
+                    count(m.id),
+                    count(m.id) filter (where $2 = any(m.mentions)),
+                    r.last_read
+             from unnest($1::text[]) as c(channel_id)
+             left join musubi.chat_read_cursors r on r.channel_id = c.channel_id and r.account_id = $2
+             left join musubi.chat_messages m on m.channel_id = c.channel_id and m.code = 0
+                  and (m.sender_id is distinct from $2) and (r.last_read is null or m.id > r.last_read)
+             group by c.channel_id, r.last_read",
+        )
+        .bind(channels)
+        .bind(me.0)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(channel_id, count, mentions, last_read)| Unread {
+                channel_id,
+                count: count as u64,
+                mentions: mentions as u64,
+                last_read: last_read.map(|u| u.to_string()),
+            })
+            .collect())
     }
 
     /// Only the author may edit; code 1 marks the message as updated.
@@ -343,11 +549,11 @@ impl ChatService {
         let id: Uuid = message_id
             .parse()
             .map_err(|_| Error::InvalidArgument("bad message id".into()))?;
-        let row = sqlx::query_as::<_, Row>(
+        let row = sqlx::query_as::<_, Row>(&format!(
             "update musubi.chat_messages set content = $4, code = 1, updated_at = now()
              where id = $1 and channel_id = $2 and sender_id = $3
-             returning id, channel_id, kind, sender_id, username, code, content, created_at, updated_at",
-        )
+             returning {MSG_COLS}"
+        ))
         .bind(id)
         .bind(channel.id())
         .bind(sender.0)
@@ -369,11 +575,11 @@ impl ChatService {
         let id: Uuid = message_id
             .parse()
             .map_err(|_| Error::InvalidArgument("bad message id".into()))?;
-        let row = sqlx::query_as::<_, Row>(
-            "update musubi.chat_messages set content = '{}'::jsonb, code = 2, updated_at = now()
+        let row = sqlx::query_as::<_, Row>(&format!(
+            "update musubi.chat_messages set content = '{{}}'::jsonb, code = 2, updated_at = now()
              where id = $1 and channel_id = $2 and sender_id = $3
-             returning id, channel_id, kind, sender_id, username, code, content, created_at, updated_at",
-        )
+             returning {MSG_COLS}"
+        ))
         .bind(id)
         .bind(channel.id())
         .bind(sender.0)
@@ -402,9 +608,9 @@ impl ChatService {
             None => None,
         };
         let sql = if forward {
-            "select id, channel_id, kind, sender_id, username, code, content, created_at, updated_at from musubi.chat_messages where channel_id = $1 and ($2::uuid is null or id > $2) order by id asc limit $3"
+            &format!("select {MSG_COLS} from musubi.chat_messages where channel_id = $1 and ($2::uuid is null or id > $2) order by id asc limit $3")
         } else {
-            "select id, channel_id, kind, sender_id, username, code, content, created_at, updated_at from musubi.chat_messages where channel_id = $1 and ($2::uuid is null or id < $2) order by id desc limit $3"
+            &format!("select {MSG_COLS} from musubi.chat_messages where channel_id = $1 and ($2::uuid is null or id < $2) order by id desc limit $3")
         };
         let rows = sqlx::query_as::<_, Row>(sql)
             .bind(channel.id())

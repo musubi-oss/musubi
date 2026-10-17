@@ -34,6 +34,7 @@ pub struct ConnectParams {
     pub restore: Option<super::resume::ResumeRecord>,
     pub limits: Limits,
     pub chat: ChatService,
+    pub notify: crate::notify::Notifier,
     pub ratings: musubi_leaderboard::RatingService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
@@ -58,6 +59,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         restore,
         limits,
         chat,
+        notify,
         ratings,
         matchmaker,
         parties,
@@ -81,6 +83,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     let ctx = Ctx {
         hub: &hub,
         chat: &chat,
+        notify: &notify,
         ratings: &ratings,
         matchmaker: &matchmaker,
         parties: &parties,
@@ -258,6 +261,7 @@ enum Exit {
 struct Ctx<'a> {
     hub: &'a Hub,
     chat: &'a ChatService,
+    notify: &'a crate::notify::Notifier,
     ratings: &'a musubi_leaderboard::RatingService,
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
@@ -468,8 +472,9 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
         ClientMessage::ChannelMessageSend {
             channel_id,
             content,
+            reply_to,
         } => Some(
-            channel_send(ctx, &channel_id, content)
+            channel_send(ctx, &channel_id, content, reply_to.as_deref())
                 .await
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
@@ -860,10 +865,14 @@ fn joined_channel(ctx: &Ctx<'_>, channel_id: &str) -> musubi_core::Result<Channe
     Ok(channel)
 }
 
+/// Notification code for an @-mention in chat.
+pub const CODE_MENTION: i32 = 10;
+
 async fn channel_send(
     ctx: &Ctx<'_>,
     channel_id: &str,
     content: serde_json::Value,
+    reply_to: Option<&str>,
 ) -> musubi_core::Result<ServerMessage> {
     let channel = joined_channel(ctx, channel_id)?;
     let me = ctx.presence.account_id;
@@ -875,17 +884,45 @@ async fn channel_send(
     let mut content = before_chat_message(ctx, channel_id, content).await?;
     ctx.chat.filter_content(&mut content, None).await?;
     let persistent = !matches!(channel, Channel::Room(_));
+    let mentions = ctx.chat.resolve_mentions(&content).await?;
     let msg = ctx
         .chat
-        .append(
+        .append_ext(
             &channel,
             ctx.presence.account_id,
             &ctx.presence.username,
             content,
             persistent,
+            reply_to,
+            mentions,
         )
         .await?;
     let ack = ack_of(&msg);
+    if restriction.as_deref() != Some("shadow") && !msg.mentions.is_empty() {
+        let batch: Vec<_> = msg
+            .mentions
+            .iter()
+            .filter(|&&a| a != me)
+            .map(|&a| musubi_social::NewNotification {
+                user_id: a,
+                sender_id: Some(me),
+                subject: "mention".into(),
+                content: serde_json::json!({
+                    "channel_id": msg.channel_id,
+                    "message_id": msg.message_id,
+                    "username": msg.username,
+                    "content": msg.content,
+                }),
+                code: CODE_MENTION,
+                persistent: true,
+            })
+            .collect();
+        if !batch.is_empty() {
+            if let Err(e) = ctx.notify.send(batch).await {
+                warn!(error = %e, "mention notification failed");
+            }
+        }
+    }
     if restriction.as_deref() == Some("shadow") {
         // shadow-banned: the sender sees their own message, nobody else does
         ctx.fanout

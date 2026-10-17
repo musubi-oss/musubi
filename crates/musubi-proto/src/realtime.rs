@@ -42,6 +42,9 @@ pub enum ClientMessage {
         channel_id: String,
         #[serde(with = "crate::json_in_binary")]
         content: serde_json::Value,
+        /// Thread: id of the message this one answers (same channel).
+        #[serde(default)]
+        reply_to: Option<String>,
     },
     ChannelMessageUpdate {
         channel_id: String,
@@ -514,6 +517,12 @@ pub struct ChannelMessage {
     /// Emoji reactions aggregated per emoji (history only; live messages start empty).
     #[serde(default)]
     pub reactions: Vec<Reaction>,
+    /// Thread parent, when this message is a reply.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Accounts @-mentioned in the content (resolved server-side).
+    #[serde(default)]
+    pub mentions: Vec<AccountId>,
 }
 
 /// One emoji on a message: how many accounts reacted with it, and whether the viewer did.

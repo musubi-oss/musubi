@@ -365,6 +365,7 @@ async fn chat_room_and_direct_with_history_and_blocks() {
         ClientMessage::ChannelMessageSend {
             channel_id: room_id.clone(),
             content: serde_json::json!({"text": "hi"}),
+            reply_to: None,
         },
     )
     .await;
@@ -398,6 +399,7 @@ async fn chat_room_and_direct_with_history_and_blocks() {
         ClientMessage::ChannelMessageSend {
             channel_id: "2.other".into(),
             content: serde_json::json!({}),
+            reply_to: None,
         },
     )
     .await;
@@ -433,6 +435,7 @@ async fn chat_room_and_direct_with_history_and_blocks() {
         ClientMessage::ChannelMessageSend {
             channel_id: dm.clone(),
             content: serde_json::json!({"text": "secret"}),
+            reply_to: None,
         },
     )
     .await;
@@ -1263,6 +1266,7 @@ async fn cross_node_chat_and_notification_fanout() {
         ClientMessage::ChannelMessageSend {
             channel_id: rid,
             content: json!({"text": "across"}),
+            reply_to: None,
         },
     )
     .await;
@@ -4315,6 +4319,7 @@ async fn say(a: &mut Ws, f: &str, room_id: &str, text: &str) -> bool {
         ClientMessage::ChannelMessageSend {
             channel_id: room_id.to_string(),
             content: serde_json::json!({"text": text}),
+            reply_to: None,
         },
     )
     .await;
@@ -4594,6 +4599,252 @@ async fn chat_filters_slow_mode_shadow_and_reports() {
     assert!(state.chat.delete_filter(&fid("mask")).await.is_err());
 }
 
+/// Threads (`reply_to`), @-mentions resolved server-side with a notification to the mentioned
+/// account, and per-channel unread counters that move with the read cursor.
+#[tokio::test]
+async fn chat_threads_mentions_and_unread() {
+    let group = test_group();
+    let Some(state) = build_state(true, &group).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let addr = router_addr(&state).await;
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let acc_a_id = musubi_core::AccountId(acc_a.parse().unwrap());
+    let acc_b_id = musubi_core::AccountId(acc_b.parse().unwrap());
+    let f = "json";
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    for (c, other) in [(&mut a, &acc_b), (&mut b, &acc_a)] {
+        send(
+            c,
+            f,
+            Some("j"),
+            ClientMessage::ChannelJoin {
+                target: other.clone(),
+                kind: ChannelKind::Direct,
+                persistence: true,
+                hidden: false,
+            },
+        )
+        .await;
+        assert!(matches!(recv(c).await.msg, ServerMessage::Channel { .. }));
+    }
+    for c in [&mut a, &mut b] {
+        while tokio::time::timeout(std::time::Duration::from_millis(300), c.next())
+            .await
+            .is_ok()
+        {}
+    }
+    let dm = musubi_chat::Channel::Direct(acc_a_id, acc_b_id);
+    let dm_id = dm.id();
+    let http = |method: &str, path: String, tok: &str, body: Option<Value>| {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"));
+        if body.is_some() {
+            req = req.header(header::CONTENT_TYPE, "application/json");
+        }
+        req.body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap()
+    };
+    async fn json_of(res: axum::response::Response) -> (u16, Value) {
+        let status = res.status().as_u16();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    // b says hello; a learns b's username from the live message.
+    assert!(say(&mut b, f, &dm_id, "hello").await);
+    let got = serde_json::to_value(recv(&mut a).await.msg).unwrap();
+    let b_name = got["channel_message"]["username"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hello_id = got["channel_message"]["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // a replies in a thread and mentions b (mixed case, with punctuation after the name).
+    send(
+        &mut a,
+        f,
+        Some("r"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: dm_id.clone(),
+            content: json!({"text": format!("hi @{}! and @nobody_here", b_name.to_uppercase())}),
+            reply_to: Some(hello_id.clone()),
+        },
+    )
+    .await;
+    let ack = recv(&mut a).await;
+    assert!(!matches!(ack.msg, ServerMessage::Error { .. }), "{ack:?}");
+    let _echo = recv(&mut a).await;
+    // b gets the message (with reply_to + mentions) and a mention notification, in some order.
+    let mut saw_msg = false;
+    let mut saw_notif = false;
+    for _ in 0..2 {
+        let v = serde_json::to_value(recv(&mut b).await.msg).unwrap();
+        if let Some(m) = v.get("channel_message") {
+            assert_eq!(m["reply_to"], hello_id);
+            assert_eq!(m["mentions"], json!([acc_b]));
+            saw_msg = true;
+        } else if let Some(n) = v.get("notification") {
+            assert_eq!(n["subject"], "mention");
+            assert_eq!(n["code"], 10);
+            assert_eq!(n["content"]["channel_id"], dm_id);
+            saw_notif = true;
+        } else {
+            panic!("{v}");
+        }
+    }
+    assert!(saw_msg && saw_notif);
+    // Replying to a reply (nested thread) and to a foreign id is rejected.
+    let reply_id = state
+        .chat
+        .replies(&dm, &hello_id, 10, None)
+        .await
+        .unwrap()
+        .messages[0]
+        .message_id
+        .clone();
+    send(
+        &mut a,
+        f,
+        Some("r2"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: dm_id.clone(),
+            content: json!({"text": "nested?"}),
+            reply_to: Some(reply_id.clone()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Error { .. }
+    ));
+
+    // Thread listing over HTTP.
+    let (st, v) = json_of(
+        router
+            .clone()
+            .oneshot(http(
+                "GET",
+                format!("/v1/channel/{dm_id}/messages/{hello_id}/replies"),
+                &tb,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(v["messages"][0]["message_id"], reply_id);
+
+    // Unread: b has 1 unread (the reply) with 1 mention; a has 1 (hello) with 0 mentions.
+    let (st, v) = json_of(
+        router
+            .clone()
+            .oneshot(http(
+                "GET",
+                format!("/v1/channel/unread?channels={dm_id},2.nowhere"),
+                &tb,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let mine = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["channel_id"] == dm_id)
+        .unwrap();
+    assert_eq!(mine["count"], 1);
+    assert_eq!(mine["mentions"], 1);
+    assert_eq!(v.as_array().unwrap().len(), 2);
+    let ua = state
+        .chat
+        .unread(acc_a_id, std::slice::from_ref(&dm_id))
+        .await
+        .unwrap();
+    assert_eq!((ua[0].count, ua[0].mentions), (1, 0));
+    // Mark read up to the reply: everything is read; an older cursor never moves it back.
+    let (st, _) = json_of(
+        router
+            .clone()
+            .oneshot(http(
+                "POST",
+                format!("/v1/channel/{dm_id}/read"),
+                &tb,
+                Some(json!({"message_id": reply_id})),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let ub = state
+        .chat
+        .unread(acc_b_id, std::slice::from_ref(&dm_id))
+        .await
+        .unwrap();
+    assert_eq!((ub[0].count, ub[0].mentions), (0, 0));
+    state
+        .chat
+        .mark_read(&dm, acc_b_id, Some(&hello_id))
+        .await
+        .unwrap();
+    let ub = state
+        .chat
+        .unread(acc_b_id, std::slice::from_ref(&dm_id))
+        .await
+        .unwrap();
+    assert_eq!(ub[0].count, 0);
+    assert_eq!(ub[0].last_read.as_deref(), Some(reply_id.as_str()));
+    // A new message is unread again; mark_read without an id reads "now".
+    assert!(say(&mut a, f, &dm_id, "one more").await);
+    let _ = recv(&mut b).await;
+    let ub = state
+        .chat
+        .unread(acc_b_id, std::slice::from_ref(&dm_id))
+        .await
+        .unwrap();
+    assert_eq!(ub[0].count, 1);
+    state.chat.mark_read(&dm, acc_b_id, None).await.unwrap();
+    let ub = state
+        .chat
+        .unread(acc_b_id, std::slice::from_ref(&dm_id))
+        .await
+        .unwrap();
+    assert_eq!(ub[0].count, 0);
+    // Stranger cannot read unread counters of a DM they are not part of.
+    let (tc, _) = token(&router).await;
+    let (st, _) = json_of(
+        router
+            .clone()
+            .oneshot(http(
+                "GET",
+                format!("/v1/channel/unread?channels={dm_id}"),
+                &tc,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(st, 200);
+}
+
 /// A node that leaves the cluster takes its sessions out of the cluster-wide online set.
 #[tokio::test]
 async fn presence_purged_when_node_leaves() {
@@ -4792,6 +5043,7 @@ async fn chat_message_reactions() {
         ClientMessage::ChannelMessageSend {
             channel_id: room.clone(),
             content: serde_json::json!({"text": "react to me"}),
+            reply_to: None,
         },
     )
     .await;
