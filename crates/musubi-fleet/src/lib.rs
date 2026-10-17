@@ -19,7 +19,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod docker;
+pub mod edgegap;
 pub mod firecracker;
+pub mod gamelift;
 pub mod kubernetes;
 
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -186,6 +188,8 @@ pub struct Fleet {
     pub name: String,
     pub provider: String,
     pub region: String,
+    /// Routing group: `allocate_routed` picks any fleet of the pool, nearest region first.
+    pub pool: String,
     pub spec: FleetSpec,
     pub buffer: i32,
     pub max_servers: i32,
@@ -203,6 +207,7 @@ pub struct CreateFleet {
     pub name: String,
     pub provider: String,
     pub region: String,
+    pub pool: String,
     pub spec: FleetSpec,
     pub buffer: i32,
     pub max_servers: i32,
@@ -218,6 +223,7 @@ impl Default for CreateFleet {
             name: String::new(),
             provider: "local".into(),
             region: String::new(),
+            pool: String::new(),
             spec: FleetSpec::default(),
             buffer: 0,
             max_servers: 1,
@@ -442,7 +448,7 @@ impl Provider for LocalProcessProvider {
 pub struct FleetService {
     db: PgPool,
     node_id: Uuid,
-    providers: Arc<HashMap<String, Arc<dyn Provider>>>,
+    providers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn Provider>>>>,
     api_url: String,
     server_key: String,
     /// Public address of the UDP edge proxy; when set, allocations hand clients this address
@@ -463,6 +469,7 @@ type FleetRow = (
     OffsetDateTime,
     i32,
     serde_json::Value,
+    String,
 );
 
 fn row_to_fleet(r: FleetRow) -> Fleet {
@@ -479,6 +486,7 @@ fn row_to_fleet(r: FleetRow) -> Fleet {
         created_at: r.9,
         min_servers: r.10,
         policy: serde_json::from_value(r.11).unwrap_or_default(),
+        pool: r.12,
     }
 }
 
@@ -521,7 +529,7 @@ fn row_to_server(r: ServerRow) -> GameServer {
 }
 
 const FLEET_COLS: &str =
-    "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy";
+    "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
     "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version";
 
@@ -533,7 +541,7 @@ impl FleetService {
         Self {
             db,
             node_id,
-            providers: Arc::new(providers),
+            providers: Arc::new(std::sync::RwLock::new(providers)),
             api_url: api_url.to_string(),
             server_key: server_key.to_string(),
             edge: None,
@@ -569,22 +577,115 @@ impl FleetService {
     }
 
     /// Register an extra provider under `name` (e.g. `kubernetes` / `agones` when configured).
-    pub fn with_provider(mut self, name: &str, provider: Arc<dyn Provider>) -> Self {
-        let mut m: HashMap<String, Arc<dyn Provider>> = (*self.providers).clone();
-        m.insert(name.to_string(), provider);
-        self.providers = Arc::new(m);
+    pub fn with_provider(self, name: &str, provider: Arc<dyn Provider>) -> Self {
+        self.register_provider(name, provider);
         self
     }
 
+    /// Add (or replace) a provider at runtime.
+    pub fn register_provider(&self, name: &str, provider: Arc<dyn Provider>) {
+        self.providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), provider);
+    }
+
+    fn provider_of(&self, name: &str) -> Option<Arc<dyn Provider>> {
+        self.providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    /// Allocate from a pool (or a fleet name): fleets in the hinted `region` first, then the
+    /// rest; with `wait` > 0 and nothing ready anywhere, a server is started in the best fleet
+    /// that has room and the call waits for it (scale-to-zero cold start).
+    pub async fn allocate_routed(
+        &self,
+        target: &str,
+        region: Option<&str>,
+        payload: serde_json::Value,
+        backfill: bool,
+        wait: std::time::Duration,
+    ) -> Result<Allocation> {
+        let mut fleets: Vec<Fleet> = self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|f| f.name == target || (!f.pool.is_empty() && f.pool == target))
+            .collect();
+        if fleets.is_empty() {
+            return Err(Error::NotFound(format!("no fleet or pool {target}")));
+        }
+        if let Some(r) = region {
+            fleets.sort_by_key(|f| if f.region == r { 0 } else { 1 });
+        }
+        for f in &fleets {
+            match self.allocate(f.id, payload.clone(), backfill).await {
+                Ok(a) => return Ok(a),
+                Err(Error::ResourceExhausted(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if wait.is_zero() {
+            return Err(Error::ResourceExhausted(format!(
+                "no ready server in {target}"
+            )));
+        }
+        for f in &fleets {
+            let live = self
+                .servers(f.id, None)
+                .await?
+                .into_iter()
+                .filter(|s| {
+                    matches!(
+                        s.state.as_str(),
+                        "starting" | "ready" | "allocated" | "in_game"
+                    )
+                })
+                .count() as i32;
+            if live >= f.max_servers {
+                continue;
+            }
+            let started = self.start_one(f).await?;
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                match self.allocate(f.id, payload.clone(), backfill).await {
+                    Ok(a) => return Ok(a),
+                    Err(Error::ResourceExhausted(_)) => {}
+                    Err(e) => return Err(e),
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::ResourceExhausted(format!(
+                        "no ready server in {target}: started {} in fleet {}, not ready after {}s",
+                        started.id,
+                        f.name,
+                        wait.as_secs()
+                    )));
+                }
+            }
+        }
+        Err(Error::ResourceExhausted(format!(
+            "no ready server in {target} and every fleet is at max_servers"
+        )))
+    }
+
     pub fn providers(&self) -> Vec<&'static str> {
-        self.providers.values().map(|p| p.name()).collect()
+        self.providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|p| p.name())
+            .collect()
     }
 
     pub async fn create(&self, c: CreateFleet) -> Result<Fleet> {
         if c.name.is_empty() || c.name.len() > 64 {
             return Err(Error::InvalidArgument("fleet name 1..=64 chars".into()));
         }
-        if !self.providers.contains_key(&c.provider) {
+        if self.provider_of(&c.provider).is_none() {
             return Err(Error::InvalidArgument(format!(
                 "unknown provider {}",
                 c.provider
@@ -596,8 +697,8 @@ impl FleetService {
         }
         let id = Uuid::now_v7();
         let r = sqlx::query_as::<_, FleetRow>(&format!(
-            "insert into musubi.fleets (id, name, provider, region, spec, buffer, max_servers, port_start, port_end, min_servers, policy)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning {FLEET_COLS}"
+            "insert into musubi.fleets (id, name, provider, region, spec, buffer, max_servers, port_start, port_end, min_servers, policy, pool)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {FLEET_COLS}"
         ))
         .bind(id)
         .bind(&c.name)
@@ -610,6 +711,7 @@ impl FleetService {
         .bind(c.port_end)
         .bind(c.min_servers)
         .bind(serde_json::to_value(&c.policy)?)
+        .bind(&c.pool)
         .fetch_one(&self.db)
         .await
         .map_err(|e| match e {
@@ -987,7 +1089,7 @@ impl FleetService {
     }
 
     pub async fn terminate(&self, fleet: &Fleet, id: Uuid) {
-        if let Some(p) = self.providers.get(&fleet.provider) {
+        if let Some(p) = self.provider_of(&fleet.provider) {
             p.stop(id).await;
         }
         let _ = sqlx::query(
@@ -1015,10 +1117,9 @@ impl FleetService {
 
     /// Start one server of the fleet on this node.
     pub async fn start_one(&self, f: &Fleet) -> Result<GameServer> {
-        let provider =
-            self.providers.get(&f.provider).cloned().ok_or_else(|| {
-                Error::InvalidArgument(format!("unknown provider {}", f.provider))
-            })?;
+        let provider = self
+            .provider_of(&f.provider)
+            .ok_or_else(|| Error::InvalidArgument(format!("unknown provider {}", f.provider)))?;
         let id = Uuid::now_v7();
         let port = self.free_port(f).await?;
         let build = self.pick_build(f).await?;
@@ -1255,7 +1356,7 @@ impl FleetService {
         let mut started = 0;
         let mut reaped = 0;
         for f in self.list().await? {
-            let provider = self.providers.get(&f.provider).cloned();
+            let provider = self.provider_of(&f.provider);
             let servers = self.servers(f.id, None).await?;
             let now = OffsetDateTime::now_utc();
             for s in servers.iter().filter(|s| s.state != "terminated") {

@@ -21,6 +21,7 @@ mod matchmaker;
 mod notifications;
 mod passkeys;
 pub mod rating;
+mod regions;
 pub mod reports;
 mod rpc;
 mod rtc;
@@ -72,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .merge(reports::routes())
         .merge(ugc::routes())
         .merge(anticheat::routes())
+        .merge(regions::routes())
         .merge(match_results::routes())
         .merge(content::routes())
         .merge(fleets::routes())

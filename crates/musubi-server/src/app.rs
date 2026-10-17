@@ -210,6 +210,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         }
     }
+    if !cfg.fleet.edgegap.token.is_empty() {
+        tracing::info!(provider = "edgegap", url = %cfg.fleet.edgegap.url, "fleet provider registered");
+        fleets = fleets.with_provider(
+            "edgegap",
+            Arc::new(musubi_fleet::edgegap::EdgegapProvider::new(
+                cfg.fleet.edgegap.clone(),
+            )),
+        );
+    }
+    if !cfg.fleet.gamelift.access_key.is_empty() {
+        tracing::info!(provider = "gamelift", region = %cfg.fleet.gamelift.region, "fleet provider registered");
+        fleets = fleets.with_provider(
+            "gamelift",
+            Arc::new(musubi_fleet::gamelift::GameLiftProvider::new(
+                cfg.fleet.gamelift.clone(),
+            )),
+        );
+    }
     let fleets = Arc::new(fleets);
     fleets
         .clone()
@@ -808,6 +826,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .await?;
         tracing::info!(listen = %proxy.local_addr(), public = ?state.fleets.edge(), "udp edge proxy listening");
         std::mem::forget(proxy);
+    }
+    if let Some(listen) = state.cfg.regions.echo_listen {
+        let local = crate::regions::spawn_echo(listen).await?;
+        tracing::info!(listen = %local, "region latency echo listening");
     }
     let draining = state.clone();
     axum::serve(

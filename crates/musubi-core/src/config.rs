@@ -56,6 +56,7 @@ pub struct Config {
     pub push: PushConfig,
     pub email: EmailConfig,
     pub anticheat: AntiCheatConfig,
+    pub regions: RegionsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -553,6 +554,8 @@ impl Default for LimitsConfig {
 pub struct FleetConfig {
     pub kubernetes: KubernetesConfig,
     pub firecracker: FirecrackerConfig,
+    pub edgegap: EdgegapConfig,
+    pub gamelift: GameLiftConfig,
 }
 
 /// Firecracker microVM fleet provider; registered when `binary` is set. Needs KVM, a kernel
@@ -1239,4 +1242,88 @@ impl Default for AntiCheatConfig {
             vendor_timeout_secs: 5,
         }
     }
+}
+
+/// Edgegap as a fleet provider (`provider = "edgegap"`); registered when `token` is set. A fleet's
+/// `spec.image` of the form `app:version` overrides `app`/`version`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EdgegapConfig {
+    pub url: String,
+    pub token: String,
+    pub app: String,
+    pub version: String,
+    pub poll_secs: u64,
+    pub ready_timeout_secs: u64,
+}
+
+impl Default for EdgegapConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://api.edgegap.com".into(),
+            token: String::new(),
+            app: String::new(),
+            version: String::new(),
+            poll_secs: 2,
+            ready_timeout_secs: 180,
+        }
+    }
+}
+
+/// Amazon GameLift as a fleet provider (`provider = "gamelift"`); registered when `access_key` is
+/// set. Each Musubi game server is a GameLift game session on `fleet_id` (or `alias_id`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameLiftConfig {
+    /// Endpoint override (tests / local emulators); default `https://gamelift.{region}.amazonaws.com`.
+    pub url: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: String,
+    pub fleet_id: String,
+    pub alias_id: String,
+    pub max_players: u32,
+    pub poll_secs: u64,
+    pub ready_timeout_secs: u64,
+}
+
+impl Default for GameLiftConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            region: "us-east-1".into(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            session_token: String::new(),
+            fleet_id: String::new(),
+            alias_id: String::new(),
+            max_players: 64,
+            poll_secs: 2,
+            ready_timeout_secs: 120,
+        }
+    }
+}
+
+/// Client georouting: the regions clients may probe and a country → region fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RegionsConfig {
+    /// UDP echo for latency probes on this node (datagrams ≤ 64 bytes are echoed back).
+    pub echo_listen: Option<SocketAddr>,
+    /// Regions to advertise in `GET /v1/regions` (fleet regions are added automatically).
+    pub regions: Vec<RegionEntry>,
+    /// ISO country code → region, used as `suggested` when the client sends `cf-ipcountry` /
+    /// `x-country`.
+    pub country_map: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RegionEntry {
+    pub name: String,
+    /// `host:port` of a UDP echo in that region.
+    pub echo: String,
+    /// HTTP(S) URL to time a request against in that region.
+    pub http: String,
 }

@@ -11964,3 +11964,449 @@ async fn anticheat_flags_score_queue_kick_and_vendor_verify() {
     assert_eq!(a["signals"][0]["kind"], "vendor_rejected");
     assert_eq!(a["signals"][0]["source"], "battleye");
 }
+
+type MockHandler = Arc<dyn Fn(&str, &str, &str, &str) -> (u16, String) + Send + Sync>;
+
+/// Tiny HTTP/1.1 mock: `handler(method, path, request_head, request_body)`; every request is
+/// logged as `"METHOD path\nhead\nbody"`.
+async fn mock_http(handler: MockHandler) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let l2 = log.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let (h, log) = (handler.clone(), l2.clone());
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(hl) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= hl + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+                let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                let method = first.next().unwrap_or("").to_string();
+                let path = first
+                    .next()
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                log.lock()
+                    .unwrap()
+                    .push(format!("{method} {path}\n{head}\n{body}"));
+                let (st, out) = h(&method, &path, head, body);
+                let resp = format!("HTTP/1.1 {st} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}", out.len());
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    (base, log)
+}
+
+#[tokio::test]
+async fn regions_routed_allocation_cold_start_and_external_providers() {
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    {
+        let cfg = Arc::make_mut(&mut state.cfg);
+        cfg.regions.country_map.insert("DE".into(), "eu".into());
+        cfg.regions.regions.push(musubi_core::config::RegionEntry {
+            name: "eu".into(),
+            echo: "eu.example:7000".into(),
+            http: String::new(),
+        });
+    }
+    let router = musubi_server::http::router(state.clone());
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (ta, _) = token(&router).await;
+    let req = Request::get("/v1/regions")
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .header("cf-ipcountry", "de")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let regions: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(regions["suggested"], "eu", "{regions}");
+    assert_eq!(regions["country"], "DE");
+    assert!(regions["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == "eu" && r["echo"] == "eu.example:7000"));
+
+    // two fleets in one pool, different regions
+    let pool = format!("dm-{sfx}");
+    let mk = |name: String,
+              region: &str,
+              pool: &str,
+              buffer: i64,
+              ports: (i64, i64),
+              extra: Value| {
+        let mut v = json!({"name": name, "region": region, "pool": pool, "buffer": buffer, "max_servers": 1, "port_start": ports.0, "port_end": ports.1, "spec": {"command": ["sleep", "60"]}});
+        if let Some(o) = extra.as_object() {
+            for (k, x) in o {
+                v[k] = x.clone();
+            }
+        }
+        v
+    };
+    let (st, eu) = http_json(
+        &router,
+        "POST",
+        "/v1/server/fleets",
+        None,
+        true,
+        Some(mk(
+            format!("eu-{sfx}"),
+            "eu",
+            &pool,
+            1,
+            (48200, 48299),
+            json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{eu}");
+    let (st, us) = http_json(
+        &router,
+        "POST",
+        "/v1/server/fleets",
+        None,
+        true,
+        Some(mk(
+            format!("us-{sfx}"),
+            "us",
+            &pool,
+            1,
+            (48300, 48399),
+            json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{us}");
+    assert_eq!(us["pool"], pool);
+    let (eu_id, us_id) = (
+        uuid::Uuid::parse_str(eu["id"].as_str().unwrap()).unwrap(),
+        uuid::Uuid::parse_str(us["id"].as_str().unwrap()).unwrap(),
+    );
+    state.fleets.reconcile().await.unwrap();
+    for fid in [eu_id, us_id] {
+        for s in state.fleets.servers(fid, None).await.unwrap() {
+            state.fleets.sdk_ready(s.id).await.unwrap();
+        }
+    }
+    let (_, l) = http_json(&router, "GET", "/v1/regions", Some(&ta), false, None).await;
+    assert!(
+        l["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "us"),
+        "fleet regions are advertised: {l}"
+    );
+    let (st, a) = http_json(
+        &router,
+        "POST",
+        "/v1/server/allocate",
+        None,
+        true,
+        Some(json!({"pool": pool, "region": "us", "payload": {"m": 1}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    assert_eq!(a["fleet_id"], us_id.to_string());
+    let (st, a) = http_json(
+        &router,
+        "POST",
+        "/v1/server/allocate",
+        None,
+        true,
+        Some(json!({"pool": pool, "region": "eu", "payload": {}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    assert_eq!(a["fleet_id"], eu_id.to_string());
+    let (st, a) = http_json(
+        &router,
+        "POST",
+        "/v1/server/allocate",
+        None,
+        true,
+        Some(json!({"pool": pool, "payload": {}})),
+    )
+    .await;
+    assert_eq!(st, 429, "both fleets full: {a}");
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/allocate",
+        None,
+        true,
+        Some(json!({"pool": format!("nope-{sfx}"), "payload": {}})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/allocate",
+        None,
+        true,
+        Some(json!({"payload": {}})),
+    )
+    .await;
+    assert_eq!(st, 400);
+
+    // scale-to-zero: an empty fleet cold-starts on demand when the caller is willing to wait
+    let cold_pool = format!("cold-{sfx}");
+    let (st, cold) = http_json(
+        &router,
+        "POST",
+        "/v1/server/fleets",
+        None,
+        true,
+        Some(mk(
+            format!("cold-{sfx}"),
+            "eu",
+            &cold_pool,
+            0,
+            (48400, 48499),
+            json!({"min_servers": 0}),
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{cold}");
+    let cold_id = uuid::Uuid::parse_str(cold["id"].as_str().unwrap()).unwrap();
+    let fleets = state.fleets.clone();
+    tokio::spawn(async move {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(servers) = fleets.servers(cold_id, Some("starting")).await {
+                if let Some(s) = servers.first() {
+                    let _ = fleets.sdk_ready(s.id).await;
+                    return;
+                }
+            }
+        }
+    });
+    let (st, a) = http_json(
+        &router,
+        "POST",
+        "/v1/server/allocate",
+        None,
+        true,
+        Some(json!({"pool": cold_pool, "payload": {}, "wait_secs": 10})),
+    )
+    .await;
+    assert_eq!(st, 200, "cold start: {a}");
+    assert_eq!(a["fleet_id"], cold_id.to_string());
+    let (st, a) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/fleets/{cold_id}/allocate"),
+        None,
+        true,
+        Some(json!({"payload": {}, "wait_secs": 1})),
+    )
+    .await;
+    assert_eq!(st, 429, "max_servers 1 reached: {a}");
+
+    // Edgegap provider against a mock API
+    let (eg_base, eg_log) = mock_http(Arc::new(|method: &str, path: &str, _head: &str, _body: &str| match (method, path) {
+        ("POST", "/v1/deploy") => (200, r#"{"request_id":"req-1"}"#.to_string()),
+        ("GET", "/v1/status/req-1") => (200, r#"{"current_status":"Status.READY","fqdn":"gs.edgegap.net","ports":{"game":{"external":31001,"internal":7777,"protocol":"UDP"}}}"#.to_string()),
+        ("DELETE", "/v1/stop/req-1") => (200, "{}".to_string()),
+        _ => (404, "{}".to_string()),
+    })).await;
+    state.fleets.register_provider(
+        "edgegap",
+        Arc::new(musubi_fleet::edgegap::EdgegapProvider::new(
+            musubi_core::config::EdgegapConfig {
+                url: eg_base,
+                token: "eg-token".into(),
+                app: "shooter".into(),
+                version: "v1".into(),
+                poll_secs: 1,
+                ..Default::default()
+            },
+        )),
+    );
+    let (st, egf) = http_json(
+        &router,
+        "POST",
+        "/v1/server/fleets",
+        None,
+        true,
+        Some(mk(
+            format!("eg-{sfx}"),
+            "eu",
+            "",
+            1,
+            (48500, 48599),
+            json!({"provider": "edgegap"}),
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{egf}");
+    let eg_id = uuid::Uuid::parse_str(egf["id"].as_str().unwrap()).unwrap();
+    state.fleets.reconcile().await.unwrap();
+    let servers = state.fleets.servers(eg_id, None).await.unwrap();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    assert_eq!(servers[0].address, "gs.edgegap.net");
+    assert_eq!(servers[0].port, 31001);
+    {
+        let log = eg_log.lock().unwrap();
+        let deploy = log
+            .iter()
+            .find(|l| l.starts_with("POST /v1/deploy"))
+            .expect("deploy call");
+        assert!(
+            deploy.contains("\"app_name\":\"shooter\"")
+                && deploy.contains("MUSUBI_SERVER_KEY")
+                && deploy
+                    .to_ascii_lowercase()
+                    .contains("authorization: eg-token"),
+            "{deploy}"
+        );
+    }
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/server/fleets/{eg_id}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let mut stopped = false;
+    for _ in 0..30 {
+        if eg_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("DELETE /v1/stop/req-1"))
+        {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(stopped, "edgegap deployment stopped with the fleet");
+
+    // GameLift provider against a mock API (SigV4-signed JSON calls)
+    let (gl_base, gl_log) = mock_http(Arc::new(|_m: &str, _p: &str, head: &str, _body: &str| {
+        let target = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("x-amz-target:").map(|v| v.trim().to_string())).unwrap_or_default();
+        match target.as_str() {
+            "gamelift.creategamesession" => (200, r#"{"GameSession":{"GameSessionId":"arn:aws:gamelift:us-east-1::gamesession/fleet-1/gs-1","Status":"ACTIVATING"}}"#.to_string()),
+            "gamelift.describegamesessions" => (200, r#"{"GameSessions":[{"GameSessionId":"arn:aws:gamelift:us-east-1::gamesession/fleet-1/gs-1","Status":"ACTIVE","IpAddress":"203.0.113.9","Port":7777}]}"#.to_string()),
+            "gamelift.terminategamesession" => (200, "{}".to_string()),
+            _ => (400, r#"{"__type":"UnknownOperation"}"#.to_string()),
+        }
+    })).await;
+    state.fleets.register_provider(
+        "gamelift",
+        Arc::new(musubi_fleet::gamelift::GameLiftProvider::new(
+            musubi_core::config::GameLiftConfig {
+                url: gl_base,
+                access_key: "AKIDEXAMPLE".into(),
+                secret_key: "secret".into(),
+                fleet_id: "fleet-1".into(),
+                poll_secs: 1,
+                ..Default::default()
+            },
+        )),
+    );
+    let (st, glf) = http_json(
+        &router,
+        "POST",
+        "/v1/server/fleets",
+        None,
+        true,
+        Some(mk(
+            format!("gl-{sfx}"),
+            "us",
+            "",
+            1,
+            (48600, 48699),
+            json!({"provider": "gamelift"}),
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{glf}");
+    let gl_id = uuid::Uuid::parse_str(glf["id"].as_str().unwrap()).unwrap();
+    state.fleets.reconcile().await.unwrap();
+    let servers = state.fleets.servers(gl_id, None).await.unwrap();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    assert_eq!(servers[0].address, "203.0.113.9");
+    assert_eq!(servers[0].port, 7777);
+    {
+        let log = gl_log.lock().unwrap();
+        let create = log
+            .iter()
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .contains("x-amz-target: gamelift.creategamesession")
+            })
+            .expect("create call");
+        assert!(
+            create.contains("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
+                && create.contains("\"FleetId\":\"fleet-1\"")
+                && create.contains("MUSUBI_SERVER_ID"),
+            "{create}"
+        );
+        assert!(log.iter().any(|l| l
+            .to_ascii_lowercase()
+            .contains("gamelift.describegamesessions")));
+    }
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/server/fleets/{gl_id}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let mut terminated = false;
+    for _ in 0..30 {
+        if gl_log.lock().unwrap().iter().any(|l| {
+            l.to_ascii_lowercase()
+                .contains("gamelift.terminategamesession")
+        }) {
+            terminated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(terminated, "gamelift session terminated with the fleet");
+}

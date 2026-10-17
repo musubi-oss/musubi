@@ -24,6 +24,7 @@ pub mod notify;
 pub mod openapi;
 pub mod push;
 pub mod realtime;
+pub mod regions;
 pub mod retention;
 pub mod runtime_host;
 pub mod schedules;

@@ -322,6 +322,7 @@ mod tests {
             name: "fc".into(),
             provider: "firecracker".into(),
             region: "local".into(),
+            pool: String::new(),
             spec: FleetSpec {
                 env: [("GAME_MODE".to_string(), "ctf".to_string())].into(),
                 ..Default::default()

@@ -20,6 +20,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets/{id}", get(get_one).delete(delete))
         .route("/v1/server/fleets/{id}/scale", post(scale))
         .route("/v1/server/fleets/{id}/allocate", post(allocate))
+        .route("/v1/server/allocate", post(allocate_routed))
         .route("/v1/server/fleets/{id}/servers", get(servers))
         .route("/v1/server/fleets/{id}/demand", get(demand))
         .route("/v1/server/fleets/{id}/builds", get(builds).post(add_build))
@@ -124,6 +125,43 @@ struct AllocateReq {
     payload: Value,
     /// Prefer a live server with free player slots (backfill) over a fresh one.
     backfill: bool,
+    /// With nothing ready, start a server and wait up to this long for it (scale-to-zero).
+    wait_secs: u64,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RoutedAllocateReq {
+    /// A pool name or a fleet name.
+    pool: String,
+    /// Region hint (from the matchmaker's best region or the client's probes).
+    region: Option<String>,
+    payload: Value,
+    backfill: bool,
+    wait_secs: u64,
+}
+
+/// Allocate across a pool of fleets: the hinted region first, then any; `wait_secs` cold-starts a
+/// server when every fleet is empty.
+async fn allocate_routed(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<RoutedAllocateReq>,
+) -> Result<Json<Allocation>, ApiError> {
+    if r.pool.is_empty() {
+        return Err(Error::InvalidArgument("pool is required".into()).into());
+    }
+    Ok(Json(
+        s.fleets
+            .allocate_routed(
+                &r.pool,
+                r.region.as_deref(),
+                r.payload,
+                r.backfill,
+                std::time::Duration::from_secs(r.wait_secs.min(300)),
+            )
+            .await?,
+    ))
 }
 
 async fn allocate(
@@ -132,9 +170,16 @@ async fn allocate(
     Path(id): Path<String>,
     Json(r): Json<AllocateReq>,
 ) -> Result<Json<Allocation>, ApiError> {
+    let fleet = s.fleets.get(parse(&id)?).await?;
     Ok(Json(
         s.fleets
-            .allocate(parse(&id)?, r.payload, r.backfill)
+            .allocate_routed(
+                &fleet.name,
+                None,
+                r.payload,
+                r.backfill,
+                std::time::Duration::from_secs(r.wait_secs.min(300)),
+            )
             .await?,
     ))
 }

@@ -108,6 +108,7 @@ fn fleet() -> Fleet {
         name: "k8s".into(),
         provider: "kubernetes".into(),
         region: "eu".into(),
+        pool: String::new(),
         spec: FleetSpec {
             command: vec!["--map".into(), "dust".into()],
             image: Some("ghcr.io/example/gs:1".into()),

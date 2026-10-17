@@ -603,29 +603,25 @@ impl Fanout {
         let me = self.clone();
         tokio::spawn(async move {
             let server = match (fleet, me.fleets.get()) {
-                (Some(name), Some(fleets)) => match fleets.get_by_name(&name).await {
-                    Ok(f) => match fleets
-                        .allocate(
-                            f.id,
-                            serde_json::json!({ "token": m.token, "users": m.users() }),
-                            false,
-                        )
-                        .await
-                    {
-                        Ok(a) => Some(MatchmakerServer {
-                            server_id: a.server_id.to_string(),
-                            fleet_id: a.fleet_id.to_string(),
-                            address: a.address,
-                            port: a.port as u16,
-                            connect_token: a.connect_token,
-                        }),
-                        Err(e) => {
-                            tracing::warn!(fleet = %name, error = %e, "no server for matched group; delivering without one");
-                            None
-                        }
-                    },
+                (Some(name), Some(fleets)) => match fleets
+                    .allocate_routed(
+                        &name,
+                        m.region.as_deref(),
+                        serde_json::json!({ "token": m.token, "users": m.users() }),
+                        false,
+                        std::time::Duration::ZERO,
+                    )
+                    .await
+                {
+                    Ok(a) => Some(MatchmakerServer {
+                        server_id: a.server_id.to_string(),
+                        fleet_id: a.fleet_id.to_string(),
+                        address: a.address,
+                        port: a.port as u16,
+                        connect_token: a.connect_token,
+                    }),
                     Err(e) => {
-                        tracing::warn!(fleet = %name, error = %e, "matched group asked for an unknown fleet");
+                        tracing::warn!(fleet = %name, region = ?m.region, error = %e, "no server for matched group; delivering without one");
                         None
                     }
                 },
