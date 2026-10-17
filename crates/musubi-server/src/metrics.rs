@@ -37,7 +37,12 @@ pub fn install() -> PrometheusHandle {
 
 /// Per-request counter + latency histogram, labelled by matched route (not the raw path, so
 /// ids never explode the cardinality).
-pub async fn track_http(req: Request, next: Next) -> Response {
+pub async fn track_http(
+    axum::extract::State(s): axum::extract::State<crate::app::AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let project = s.cfg.node.project.clone();
     let method = req.method().as_str().to_owned();
     let route = req
         .extensions()
@@ -47,9 +52,9 @@ pub async fn track_http(req: Request, next: Next) -> Response {
     let started = Instant::now();
     let res = next.run(req).await;
     let status = res.status().as_u16().to_string();
-    counter!("musubi_http_requests_total", "method" => method.clone(), "route" => route.clone(), "status" => status)
+    counter!("musubi_http_requests_total", "project" => project.clone(), "method" => method.clone(), "route" => route.clone(), "status" => status)
         .increment(1);
-    histogram!("musubi_http_request_duration_seconds", "method" => method, "route" => route)
+    histogram!("musubi_http_request_duration_seconds", "project" => project, "method" => method, "route" => route)
         .record(started.elapsed().as_secs_f64());
     res
 }
@@ -75,28 +80,38 @@ pub async fn render(
             return crate::http::error::ApiError(e).into_response();
         }
     }
-    gauge!("musubi_uptime_seconds").set(s.started_at.elapsed().as_secs_f64());
-    gauge!("musubi_realtime_sessions").set(s.hub.session_count() as f64);
-    gauge!("musubi_authoritative_matches").set(s.matches.count() as f64);
-    gauge!("musubi_relayed_matches").set(s.relayed.match_count() as f64);
-    gauge!("musubi_parties").set(s.parties.party_count() as f64);
-    gauge!("musubi_matchmaker_tickets").set(s.matchmaker.ticket_count() as f64);
-    gauge!("musubi_worlds").set(s.worlds.list().len() as f64);
-    gauge!("musubi_runtime_modules").set(s.runtime.module_names().len() as f64);
+    let p = s.cfg.node.project.clone();
+    gauge!("musubi_uptime_seconds", "project" => p.clone())
+        .set(s.started_at.elapsed().as_secs_f64());
+    gauge!("musubi_realtime_sessions", "project" => p.clone()).set(s.hub.session_count() as f64);
+    gauge!("musubi_authoritative_matches", "project" => p.clone()).set(s.matches.count() as f64);
+    gauge!("musubi_relayed_matches", "project" => p.clone()).set(s.relayed.match_count() as f64);
+    gauge!("musubi_parties", "project" => p.clone()).set(s.parties.party_count() as f64);
+    gauge!("musubi_matchmaker_tickets", "project" => p.clone())
+        .set(s.matchmaker.ticket_count() as f64);
+    gauge!("musubi_worlds", "project" => p.clone()).set(s.worlds.list().len() as f64);
+    gauge!("musubi_runtime_modules", "project" => p.clone())
+        .set(s.runtime.module_names().len() as f64);
     if let Some(c) = &s.cluster {
         if let Ok(nodes) = c.nodes().await {
             let alive = nodes.iter().filter(|n| n.alive).count();
-            gauge!("musubi_cluster_nodes", "state" => "alive").set(alive as f64);
-            gauge!("musubi_cluster_nodes", "state" => "dead").set((nodes.len() - alive) as f64);
+            gauge!("musubi_cluster_nodes", "project" => p.clone(), "state" => "alive")
+                .set(alive as f64);
+            gauge!("musubi_cluster_nodes", "project" => p.clone(), "state" => "dead")
+                .set((nodes.len() - alive) as f64);
         }
-        gauge!("musubi_raft_member").set(if c.raft_id() == 0 { 0.0 } else { 1.0 });
+        gauge!("musubi_raft_member", "project" => p.clone()).set(if c.raft_id() == 0 {
+            0.0
+        } else {
+            1.0
+        });
     }
     if let Ok(fleets) = s.fleets.list().await {
         for f in fleets {
             if let Ok(servers) = s.fleets.servers(f.id, None).await {
                 for state in ["starting", "ready", "allocated", "shutdown", "unhealthy"] {
                     let n = servers.iter().filter(|g| g.state == state).count();
-                    gauge!("musubi_fleet_servers", "fleet" => f.name.clone(), "state" => state)
+                    gauge!("musubi_fleet_servers", "project" => p.clone(), "fleet" => f.name.clone(), "state" => state)
                         .set(n as f64);
                 }
             }
