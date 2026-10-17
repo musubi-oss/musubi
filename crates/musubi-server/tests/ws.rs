@@ -9172,3 +9172,107 @@ async fn world_fenced_host_cannot_persist() {
     r2.snapshot_now(&name).await.unwrap();
     r2.delete(&name).await.unwrap();
 }
+
+#[tokio::test]
+async fn match_fenced_node_cannot_persist_after_takeover() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"module": "echo", "params": {"tick_rate": 20, "label": "fence", "empty_ticks": 1000}}).to_string()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+    let muid = uuid::Uuid::parse_str(&mid).unwrap();
+    let (ta, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, "json").await;
+    send(
+        &mut a,
+        "json",
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+            spectator: false,
+        },
+    )
+    .await;
+    recv(&mut a).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (n1,): (Option<uuid::Uuid>,) =
+        sqlx::query_as("select node_id from musubi.match_snapshots where match_id = $1")
+            .bind(muid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    let n1 = n1.expect("owner recorded");
+
+    // the first node is declared dead while still running: another node claims the match
+    sqlx::query("update musubi.match_snapshots set node_id = null where match_id = $1")
+        .bind(muid)
+        .execute(&db)
+        .await
+        .unwrap();
+    let n2 = uuid::Uuid::now_v7();
+    let other = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), n2);
+    let hub2 = Arc::new(Hub::new());
+    assert_eq!(other.recover(hub2, &[]).await.unwrap(), vec![mid.clone()]);
+    let stale_journal: Option<i64> = sqlx::query_scalar(
+        "select max(tick_to) from musubi.match_journal where match_id = $1 and node_id = $2",
+    )
+    .bind(muid)
+    .bind(n1)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    // the old node keeps ticking, snapshotting and journaling, but nothing of it lands any more
+    for _ in 0..3 {
+        send(
+            &mut a,
+            "json",
+            None,
+            ClientMessage::MatchDataSend {
+                match_id: mid.clone(),
+                op_code: 1,
+                reliable: true,
+                data: b"x".to_vec(),
+                presences: vec![],
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let (owner, snap_tick): (Option<uuid::Uuid>, i64) =
+        sqlx::query_as("select node_id, tick from musubi.match_snapshots where match_id = $1")
+            .bind(muid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(owner, Some(n2), "the old node did not take the row back");
+    let n2_tick = other.get(&mid).unwrap().info().await.tick as i64;
+    assert!(
+        snap_tick <= n2_tick,
+        "snapshot tick {snap_tick} is the new owner's, not the old node's"
+    );
+    let still_stale: Option<i64> = sqlx::query_scalar(
+        "select max(tick_to) from musubi.match_journal where match_id = $1 and node_id = $2",
+    )
+    .bind(muid)
+    .bind(n1)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_stale, stale_journal,
+        "no journal chunk from the fenced node"
+    );
+    other.get(&mid).unwrap().terminate(0);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+}

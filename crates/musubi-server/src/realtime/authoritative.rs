@@ -171,7 +171,8 @@ impl MatchRegistry {
                     Some(s) => sqlx::query(
                         "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group, node_epoch)
                          values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
-                         on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, node_epoch = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_epoch else musubi.match_snapshots.node_epoch end, updated_at = now()",
+                         on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, node_epoch = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_epoch else musubi.match_snapshots.node_epoch end, updated_at = now()
+                         where musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id",
                     )
                     .bind(id.0)
                     .bind(&s.module)
@@ -184,21 +185,36 @@ impl MatchRegistry {
                     .bind(epoch)
                     .execute(&db)
                     .await,
-                    None => sqlx::query("delete from musubi.match_snapshots where match_id = $1").bind(id.0).execute(&db).await,
+                    None => sqlx::query("delete from musubi.match_snapshots where match_id = $1 and (node_id is null or node_id = $2)").bind(id.0).bind(node).execute(&db).await,
                 };
+                // a node that lost the match to another one (its row was claimed) must not touch it
+                let fenced = match &res {
+                    Ok(r) => r.rows_affected() == 0,
+                    Err(_) => false,
+                };
+                if fenced {
+                    tracing::warn!(match_id = %id, node = %node, "match snapshot fenced: another node owns the match");
+                    return;
+                }
                 let _ = match tick_for_journal {
                     Some(t) => sqlx::query(
-                        "delete from musubi.match_journal where match_id = $1 and tick_to <= $2",
+                        "delete from musubi.match_journal where match_id = $1 and tick_to <= $2
+                         and not exists (select 1 from musubi.match_snapshots s where s.match_id = $1 and s.node_id <> $3)",
                     )
                     .bind(id.0)
                     .bind(t as i64)
+                    .bind(node)
                     .execute(&db)
                     .await,
                     None => {
-                        sqlx::query("delete from musubi.match_journal where match_id = $1")
-                            .bind(id.0)
-                            .execute(&db)
-                            .await
+                        sqlx::query(
+                            "delete from musubi.match_journal where match_id = $1
+                             and not exists (select 1 from musubi.match_snapshots s where s.match_id = $1 and s.node_id <> $2)",
+                        )
+                        .bind(id.0)
+                        .bind(node)
+                        .execute(&db)
+                        .await
                     }
                 };
                 if let Err(e) = res {
@@ -330,6 +346,7 @@ impl MatchRegistry {
             return None;
         }
         let recording = self.recording.clone();
+        let node = self.node_id;
         Some(Arc::new(move |id: MatchId, chunk: JournalChunk| {
             let db = db.clone();
             let record = recording.lock().unwrap().contains(&id.0);
@@ -343,13 +360,16 @@ impl MatchRegistry {
                 };
                 if record {
                     let r = sqlx::query(
-                        "insert into musubi.match_recording_frames (match_id, kind, tick_from, tick_to, entries)
-                         values ($1, 'journal', $2, $3, $4) on conflict do nothing",
+                        "insert into musubi.match_recording_frames (match_id, kind, tick_from, tick_to, entries, node_id)
+                         select $1, 'journal', $2, $3, $4, $5
+                         where not exists (select 1 from musubi.match_snapshots s where s.match_id = $1 and s.node_id <> $5)
+                         on conflict do nothing",
                     )
                     .bind(id.0)
                     .bind(chunk.tick_from as i64)
                     .bind(chunk.tick_to as i64)
                     .bind(&entries)
+                    .bind(node)
                     .execute(&db)
                     .await;
                     if let Err(e) = r {
@@ -357,17 +377,26 @@ impl MatchRegistry {
                     }
                 }
                 let r = sqlx::query(
-                    "insert into musubi.match_journal (match_id, tick_from, tick_to, entries) values ($1, $2, $3, $4)
-                     on conflict (match_id, tick_from) do update set tick_to = excluded.tick_to, entries = excluded.entries",
+                    "insert into musubi.match_journal (match_id, tick_from, tick_to, entries, node_id)
+                     select $1, $2, $3, $4, $5
+                     where not exists (select 1 from musubi.match_snapshots s where s.match_id = $1 and s.node_id <> $5)
+                     on conflict (match_id, tick_from) do update set tick_to = excluded.tick_to, entries = excluded.entries, node_id = excluded.node_id",
                 )
                 .bind(id.0)
                 .bind(chunk.tick_from as i64)
                 .bind(chunk.tick_to as i64)
                 .bind(entries)
+                .bind(node)
                 .execute(&db)
                 .await;
-                if let Err(e) = r {
-                    tracing::warn!(match_id = %id, error = %e, "match journal write failed");
+                match r {
+                    Err(e) => {
+                        tracing::warn!(match_id = %id, error = %e, "match journal write failed")
+                    }
+                    Ok(r) if r.rows_affected() == 0 => {
+                        tracing::warn!(match_id = %id, node = %node, "match journal fenced: another node owns the match")
+                    }
+                    Ok(_) => {}
                 }
             });
         }))
