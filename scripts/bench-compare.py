@@ -17,6 +17,10 @@ PACKAGES = ["musubi-mesh", "musubi-proto", "musubi-auth"]
 root = pathlib.Path("target/criterion")
 args = [a for a in sys.argv[1:] if a != "--promote"]
 threshold = float(args[0]) if args else 5.0
+# Sub-100 ns differences are below what shared runners can resolve (CPU model, cache placement and
+# code alignment move a 300 ns bench by ±25 % with no code change), so a bench must also move by at
+# least this many nanoseconds before it counts as a regression.
+floor_ns = float(args[1]) if len(args) > 1 else 100.0
 
 
 def benches():
@@ -51,12 +55,14 @@ def compare():
         pct = ((1.0 + point) / scale - 1.0) * 100.0
         low_pct = ((1.0 + low) / scale - 1.0) * 100.0
         now = json.load(open(bench / "new" / "estimates.json"))["mean"]["point_estimate"]
-        rows.append((bench_id(bench), now / (1.0 + point), now, pct))
-        if low_pct > threshold:
+        before = now / (1.0 + point)
+        rows.append((bench_id(bench), before, now, pct))
+        if low_pct > threshold and now - before > floor_ns:
             failing.append(bench_id(bench))
     rows.sort(key=lambda r: -r[3])
     for name, before, now, pct in rows:
-        print(f"{pct:+7.2f}%  {before/1e3:10.2f} µs → {now/1e3:10.2f} µs  {name}")
+        note = "  (below noise floor)" if pct > threshold and now - before <= floor_ns else ""
+        print(f"{pct:+7.2f}%  {before/1e3:10.2f} µs → {now/1e3:10.2f} µs  {name}{note}")
     if not rows:
         print("no `main` baseline to compare against (first run)")
     return failing

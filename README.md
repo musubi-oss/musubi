@@ -52,7 +52,7 @@ delta at 1k / 10k entities), `musubi-proto` (envelope encode/decode in JSON and 
 `musubi-auth` (argon2 hash/verify, password policy). The last `main` run is the baseline (restored
 from the Actions cache); `scripts/bench-compare.py 5` fails the job when any bench's mean is more
 than 5 % slower after dividing by the change of the code-independent `calibrate` bench (shared runners
-differ in speed from run to run) and even the optimistic end of the 95 % interval is above the threshold. Suspects are re-run once before failing. Locally: `cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --save-baseline main`
+differ in speed from run to run) and even the optimistic end of the 95 % interval is above the threshold, and the mean moved by at least 100 ns (sub-microsecond benches such as postcard decode shift ±25 % between shared runners with no code change — a smaller absolute move is reported but cannot be gated; `bench-compare.py 5 0` disables the floor on a dedicated runner). Suspects are re-run once before failing. Locally: `cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --save-baseline main`
 on the old code, `cargo bench … -- --baseline-lenient main` on the new code, then `python3 scripts/bench-compare.py`.
 
 ### Chaos stand (`musubi soak`)
