@@ -11826,3 +11826,178 @@ async fn entitlements_sync_grants_once_and_revokes() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn player_reports_queue_and_ban_from_decision() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut acc = vec![];
+    for p in ["rep-a-", "rep-b-", "rep-c-"] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(p)})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        acc.push((
+            v["access_token"].as_str().unwrap().to_string(),
+            v["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (a, b, c) = (&acc[0], &acc[1], &acc[2]);
+    // self / bad category / ok
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/reports",
+        Some(&a.0),
+        Some(json!({"target_id": a.1, "category": "cheating"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/reports",
+        Some(&a.0),
+        Some(json!({"target_id": b.1, "category": "being_rude"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r1) = call(
+        &app,
+        "POST",
+        "/v1/reports",
+        Some(&a.0),
+        Some(json!({
+            "target_id": b.1, "category": "cheating", "details": "aimbot in match",
+            "evidence": {"match_id": "m-123", "tick": 4410, "url": "https://clips.example/1"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r1}");
+    let r1 = r1["id"].as_str().unwrap().to_string();
+    // duplicate open report → 409; second reporter fine
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/reports",
+        Some(&a.0),
+        Some(json!({"target_id": b.1, "category": "griefing"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, r2) = call(
+        &app,
+        "POST",
+        "/v1/reports",
+        Some(&c.0),
+        Some(json!({"target_id": b.1, "category": "harassment"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r2}");
+    let r2 = r2["id"].as_str().unwrap().to_string();
+    // queue + summary
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/reports?status=open&target_id={}", b.1),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["reports"].as_array().unwrap().len(), 2, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{}/reports", b.1),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["distinct_reporters"], 2, "{v}");
+    let (st, v) = call_server(&app, "GET", &format!("/v1/admin/reports/{r1}"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["evidence"]["match_id"], "m-123");
+    // ban requires actioned
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/reports/{r1}"),
+        k,
+        Some(json!({"status": "reviewing", "ban": {"until_secs": 60}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/reports/{r1}"),
+        k,
+        Some(json!({"status": "reviewing", "by": "mod1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "reviewing");
+    // actioned with a timed ban: target locked out, the other open report closed too
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/reports/{r1}"),
+        k,
+        Some(json!({
+            "status": "actioned", "decision": "confirmed aimbot", "by": "mod1",
+            "ban": {"until_secs": 3600, "reason": "report", "message": "Cheating"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "actioned");
+    assert_eq!(v["ban"]["banned"], true, "{v}");
+    assert_eq!(v["also_closed"], 1, "{v}");
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&b.0), None).await;
+    assert_ne!(st, StatusCode::OK);
+    let (_, v) = call_server(&app, "GET", &format!("/v1/admin/reports/{r2}"), k, None).await;
+    assert_eq!(v["status"], "actioned", "{v}");
+    assert!(v["decision"].as_str().unwrap().contains(&r1), "{v}");
+    // reporter sees outcome, not the moderator
+    let (_, mine) = call(&app, "GET", "/v1/reports", Some(&a.0), None).await;
+    let m = mine["reports"].as_array().unwrap();
+    assert_eq!(m.len(), 1, "{mine}");
+    assert_eq!(m[0]["status"], "actioned");
+    assert!(m[0]["decided_by"].is_null());
+    // dismiss path
+    let (_, r3) = call(
+        &app,
+        "POST",
+        "/v1/reports",
+        Some(&c.0),
+        Some(json!({"target_id": a.1, "category": "spam"})),
+    )
+    .await;
+    let r3 = r3["id"].as_str().unwrap().to_string();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/reports/{r3}"),
+        k,
+        Some(json!({"status": "dismissed", "decision": "no evidence"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "dismissed");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/reports/{}", uuid::Uuid::now_v7()),
+        k,
+        Some(json!({"status": "dismissed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

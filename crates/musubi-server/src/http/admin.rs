@@ -192,13 +192,18 @@ async fn ban(
     body: Option<Json<BanBody>>,
 ) -> Result<Json<Value>, ApiError> {
     let b = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(apply_ban(&s, AccountId(id), b).await?))
+}
+
+/// Apply (or replace) a ban: the row, the account flag, kicks, voice and the cluster-wide cache.
+/// Shared with player-report decisions.
+pub(crate) async fn apply_ban(s: &AppState, id: AccountId, b: BanBody) -> Result<Value, ApiError> {
     if b.until_secs.is_some_and(|u| u <= 0) {
         return Err(Error::InvalidArgument("until_secs must be positive".into()).into());
     }
     if b.message.as_ref().is_some_and(|m| m.chars().count() > 512) {
         return Err(Error::InvalidArgument("message over 512 chars".into()).into());
     }
-    let id = AccountId(id);
     let until = b
         .until_secs
         .map(|u| time::OffsetDateTime::now_utc().unix_timestamp() + u);
@@ -232,11 +237,11 @@ async fn ban(
     if b.shadow {
         // a previous hard ban on the same account becomes a shadow one
         s.accounts.set_disabled(id, false).await?;
-        voice_ban(&s, id, false);
+        voice_ban(s, id, false);
     } else {
         s.accounts.set_disabled(id, true).await?;
-        kicked = kick_everywhere(&s, id).await;
-        voice_ban(&s, id, true);
+        kicked = kick_everywhere(s, id).await;
+        voice_ban(s, id, true);
     }
     s.banned.set(id, Some(info), s.cluster.as_ref()).await;
     s.events
@@ -246,9 +251,9 @@ async fn ban(
             json!({ "reason": b.reason, "until": until, "shadow": b.shadow }),
         )
         .await;
-    Ok(Json(json!({
+    Ok(json!({
         "banned": true, "shadow": b.shadow, "until": until, "kicked_local": kicked
-    })))
+    }))
 }
 
 /// Lift a ban: used by `unban` and by the leader sweep for expired ones.
