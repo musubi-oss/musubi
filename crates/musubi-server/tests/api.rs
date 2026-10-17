@@ -4417,15 +4417,35 @@ async fn webhooks_deliver_signed_events_with_backoff_and_pull() {
     assert_eq!(d["attempts"], 1);
     assert_eq!(d["last_status"], 500);
     assert_eq!(d["dead"], false);
-    // not due again yet → a second dispatch does nothing for it
-    let (_, v) = read(
+    // not due again yet → a second dispatch leaves it alone (the global counters may include
+    // other tests' events landing on this all-kinds hook, so check the row itself)
+    let (_, _) = read(
         app.clone()
             .oneshot(post("/v1/server/webhooks/dispatch".into(), json!({})))
             .await
             .unwrap(),
     )
     .await;
-    assert_eq!(v["failed"], 0, "{v}");
+    let (_, v) = read(
+        app.clone()
+            .oneshot(
+                srv(Request::get(format!("/v1/admin/webhooks/{bad}/deliveries")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let d = v["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["kind"] == "account.banned")
+        .unwrap()
+        .clone();
+    assert_eq!(d["attempts"], 1, "{d}");
+    assert!(d["delivered_at"].is_null());
 
     // listing hides secrets; test endpoint delivers immediately; pull returns the event
     let (_, v) = read(
@@ -11195,17 +11215,36 @@ async fn admin_finds_account_by_identity() {
 #[tokio::test]
 async fn webhooks_redeliver_resets_a_delivery() {
     let Some(app) = app().await else { return };
+    let Ok(url) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
     let k = "defaultkey";
     let (st, h) = call_server(
         &app,
         "POST",
         "/v1/admin/webhooks",
         k,
-        Some(json!({"name": unique("rd"), "url": "http://127.0.0.1:9/nobody", "secret": "s3cret-s3cret-s3cret-16"})),
+        Some(json!({
+            "name": unique("rd"),
+            "url": "http://127.0.0.1:9/nobody",
+            "secret": "s3cret-s3cret-s3cret-16",
+            "kinds": ["account.updated"]
+        })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{h}");
     let hook = h["id"].as_str().unwrap().to_string();
+    // disabled: neither fan-out nor the dispatcher touch it, so nothing races with other tests
+    let (st, _) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/admin/webhooks/{hook}"),
+        k,
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
     let (_, sess) = call(
         &app,
         "POST",
@@ -11217,22 +11256,27 @@ async fn webhooks_redeliver_resets_a_delivery() {
     let acc = sess["account_id"].as_str().unwrap().to_string();
     let (st, _) = call_server(
         &app,
-        "POST",
-        &format!("/v1/admin/accounts/{acc}/ban"),
+        "PATCH",
+        &format!("/v1/admin/accounts/{acc}"),
         k,
-        None,
+        Some(json!({"display_name": "Redeliver"})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let (st, _) = call_server(
-        &app,
-        "POST",
-        "/v1/server/webhooks/dispatch",
-        k,
-        Some(json!({})),
+    // a dead-lettered delivery of this account's latest event, as twelve failed retries leave it
+    let hid: uuid::Uuid = hook.parse().unwrap();
+    let aid: uuid::Uuid = acc.parse().unwrap();
+    let event: uuid::Uuid = sqlx::query_scalar(
+        "insert into musubi.webhook_deliveries (webhook_id, event_id, attempts, dead, next_at, last_status, last_error)
+         select $1, id, 12, true, now() + interval '1 day', 500, 'boom'
+         from musubi.events where account_id = $2 order by id desc limit 1
+         returning event_id",
     )
-    .await;
-    assert_eq!(st, StatusCode::OK);
+    .bind(hid)
+    .bind(aid)
+    .fetch_one(&db)
+    .await
+    .unwrap();
     let (st, v) = call_server(
         &app,
         "GET",
@@ -11242,10 +11286,18 @@ async fn webhooks_redeliver_resets_a_delivery() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    let d = v["deliveries"].as_array().unwrap();
-    assert!(!d.is_empty(), "{v}");
-    let event = d[0]["event_id"].as_str().unwrap().to_string();
-    assert!(d[0]["attempts"].as_i64().unwrap() >= 1, "{v}");
+    let row = |v: &serde_json::Value| {
+        v["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["event_id"] == json!(event.to_string()))
+            .cloned()
+            .unwrap()
+    };
+    let d = row(&v);
+    assert_eq!(d["dead"], true, "{d}");
+    assert_eq!(d["attempts"], 12, "{d}");
     let (st, r) = call_server(
         &app,
         "POST",
@@ -11264,16 +11316,13 @@ async fn webhooks_redeliver_resets_a_delivery() {
         None,
     )
     .await;
-    let d = v["deliveries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|x| x["event_id"] == json!(event))
-        .cloned()
-        .unwrap();
+    let d = row(&v);
     assert_eq!(d["attempts"], 0, "{d}");
     assert_eq!(d["dead"], false, "{d}");
-    assert!(d["last_error"].is_null(), "{d}");
+    assert!(
+        d["last_error"].is_null() && d["last_status"].is_null(),
+        "{d}"
+    );
     let (st, _) = call_server(
         &app,
         "POST",
@@ -11286,4 +11335,13 @@ async fn webhooks_redeliver_resets_a_delivery() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/webhooks/{hook}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
 }
