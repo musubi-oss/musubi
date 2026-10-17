@@ -16,8 +16,56 @@ use crate::app::AppState;
 pub struct ServerHost {
     state: AppState,
     handle: tokio::runtime::Handle,
-    /// LiveOps answers per (account, op, names), good for `LIVEOPS_TTL`.
-    liveops_cache: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
+}
+
+/// LiveOps answers per (account, op, names), good for `LIVEOPS_TTL`; shared by the module host
+/// and the HTTP proxy so `POST /v1/server/liveops/changed` can drop them all at once.
+pub type LiveopsCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>>;
+
+pub const LIVEOPS_CHANGED_TOPIC: &str = "liveops.changed";
+
+/// A flag / live-event change arrived (webhook or bus): forget cached answers on this node and
+/// tell modules (`hook_liveops_changed`). `broadcast` also informs the other nodes.
+pub async fn liveops_changed(state: &AppState, payload: Value, broadcast: bool) {
+    state.liveops_cache.lock().unwrap().clear();
+    if broadcast {
+        if let Some(c) = &state.cluster {
+            if let Err(e) = c.publish(LIVEOPS_CHANGED_TOPIC, &payload).await {
+                tracing::warn!(error = %e, "liveops change broadcast failed");
+            }
+        }
+    }
+    if state.runtime.has_hook("hook_liveops_changed") {
+        let rt = state.runtime.clone();
+        tokio::spawn(async move {
+            rt.event(
+                "liveops_changed",
+                musubi_runtime::CallContext::default(),
+                payload,
+            )
+            .await
+        });
+    }
+}
+
+/// Apply `liveops.changed` messages from other nodes.
+pub fn start_liveops_sync(state: &AppState, cluster: &Arc<musubi_cluster::Cluster>) {
+    let st = state.clone();
+    let mut rx = cluster.subscribe();
+    let self_id = cluster.node_id();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(m) if m.topic == LIVEOPS_CHANGED_TOPIC && m.origin != self_id => {
+                    liveops_changed(&st, m.payload, false).await;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// How long a module sees the same flags / live events for one account.
@@ -28,7 +76,6 @@ pub fn install(state: &AppState) {
     state.runtime.set_host(Arc::new(ServerHost {
         state: state.clone(),
         handle: tokio::runtime::Handle::current(),
-        liveops_cache: Default::default(),
     }));
 }
 
@@ -175,7 +222,7 @@ impl ServerHost {
                     .unwrap_or_default();
                 let key = format!("{op}|{acc}|{}", names.join(","));
                 let now = std::time::Instant::now();
-                if let Some((at, v)) = self.liveops_cache.lock().unwrap().get(&key) {
+                if let Some((at, v)) = self.state.liveops_cache.lock().unwrap().get(&key) {
                     if now.duration_since(*at) < LIVEOPS_TTL {
                         return Ok(v.clone());
                     }
@@ -185,7 +232,7 @@ impl ServerHost {
                 } else {
                     l.live_events(&acc.to_string()).await?
                 };
-                let mut cache = self.liveops_cache.lock().unwrap();
+                let mut cache = self.state.liveops_cache.lock().unwrap();
                 cache.retain(|_, (at, _)| now.duration_since(*at) < LIVEOPS_TTL);
                 cache.insert(key, (now, v.clone()));
                 Ok(v)

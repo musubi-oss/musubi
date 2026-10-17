@@ -150,6 +150,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
         cfg: Arc::new(cfg),
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        liveops_cache: Default::default(),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),

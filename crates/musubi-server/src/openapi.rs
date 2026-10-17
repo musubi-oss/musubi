@@ -218,6 +218,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/leaderboards/{id}/records", "leaderboards"),
     ("GET", "/v1/liveops/flags", "integrations"),
     ("GET", "/v1/liveops/live-events", "integrations"),
+    ("POST", "/v1/server/liveops/changed", "integrations"),
     ("GET", "/v1/mail", "economy"),
     ("DELETE", "/v1/mail/{id}", "economy"),
     ("POST", "/v1/mail/{id}/claim", "economy"),

@@ -63,6 +63,7 @@ pub struct AppState {
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
+    pub liveops_cache: crate::runtime_host::LiveopsCache,
     pub keys: Arc<crate::keys::ServerKeys>,
     pub logins: Arc<crate::logins::Social>,
     /// Set on SIGTERM: `/readyz` answers 503 so load balancers stop routing here.
@@ -468,6 +469,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Arc::new(e)
         },
         banned: Arc::new(crate::bans::Bans::default()),
+        liveops_cache: Default::default(),
         keys: Arc::new(crate::keys::ServerKeys::default()),
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -543,6 +545,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     if let Some(c) = &state.cluster {
         state.banned.start(c);
+        crate::runtime_host::start_liveops_sync(&state, c);
     }
     if let Some(c) = state.cluster.clone() {
         let ev = state.events.clone();

@@ -122,6 +122,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
             Arc::new(e)
         },
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        liveops_cache: Default::default(),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9967,4 +9968,70 @@ async fn gameserver_watch_and_backfill() {
     assert_eq!(w["changed"], true);
     assert_eq!(w["server"]["labels"]["map"], "dust");
     let (_, _) = sdk("POST", "/v1/gameserver/shutdown", None).await;
+}
+
+/// `POST /v1/server/liveops/changed` drops the cached flag answers: the next read goes to Zanshin.
+#[tokio::test]
+async fn liveops_changed_drops_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+    let hits: StdArc<AtomicUsize> = Default::default();
+    let hits2 = hits.clone();
+    let mock = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let hits = hits2.clone();
+        async move {
+            if uri.path().ends_with("/flags") {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({ "flags": [{ "name": "x", "enabled": true }] }))
+            } else {
+                axum::Json(json!({ "accepted": true }))
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let Some(app) = app_with(|c| {
+        c.zanshin.url = Some(url.clone());
+        c.zanshin.server_key = "k".into();
+    })
+    .await
+    else {
+        return;
+    };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("loc")})),
+    )
+    .await;
+    let t = s["access_token"].as_str().unwrap().to_string();
+    for _ in 0..2 {
+        let (st, v) = call(&app, "GET", "/v1/liveops/flags?names=x", Some(&t), None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["flags"][0]["name"], "x");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "second read served from cache"
+    );
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/liveops/changed",
+        "defaultkey",
+        Some(json!({"flags": ["x"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call(&app, "GET", "/v1/liveops/flags?names=x", Some(&t), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "cache dropped by the change webhook"
+    );
 }

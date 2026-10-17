@@ -9,13 +9,17 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::app::AppState;
-use crate::http::extract::Bearer;
+use crate::http::extract::{Bearer, ServerKey};
 use crate::http::ApiError;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/liveops/flags", get(flags))
         .route("/v1/liveops/live-events", get(live_events))
+        .route(
+            "/v1/server/liveops/changed",
+            axum::routing::post(liveops_changed),
+        )
         .route("/v1/voice/token", post(voice_token))
         .route("/v1/voice/report", post(voice_report))
 }
@@ -44,9 +48,28 @@ async fn flags(
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Json(
-        json!({ "flags": l.flags(&me.account_id.to_string(), &names).await? }),
-    ))
+    let key = format!("liveops.flags|{}|{}", me.account_id, names.join(","));
+    if let Some(v) = cached(&s, &key) {
+        return Ok(Json(json!({ "flags": v })));
+    }
+    let v = l.flags(&me.account_id.to_string(), &names).await?;
+    remember(&s, key, v.clone());
+    Ok(Json(json!({ "flags": v })))
+}
+
+/// Same cache and key format as the module host ops, so one `liveops/changed` clears both.
+fn cached(s: &AppState, key: &str) -> Option<Value> {
+    let cache = s.liveops_cache.lock().unwrap();
+    cache
+        .get(key)
+        .filter(|(at, _)| at.elapsed() < crate::runtime_host::LIVEOPS_TTL)
+        .map(|(_, v)| v.clone())
+}
+
+fn remember(s: &AppState, key: String, v: Value) {
+    let mut cache = s.liveops_cache.lock().unwrap();
+    cache.retain(|_, (at, _)| at.elapsed() < crate::runtime_host::LIVEOPS_TTL);
+    cache.insert(key, (std::time::Instant::now(), v));
 }
 
 async fn live_events(
@@ -57,7 +80,13 @@ async fn live_events(
         .liveops
         .as_ref()
         .ok_or_else(|| Error::NotFound("liveops (zanshin) not configured".into()))?;
-    Ok(Json(l.live_events(&me.account_id.to_string()).await?))
+    let key = format!("liveops.live_events|{}|", me.account_id);
+    if let Some(v) = cached(&s, &key) {
+        return Ok(Json(v));
+    }
+    let v = l.live_events(&me.account_id.to_string()).await?;
+    remember(&s, key, v.clone());
+    Ok(Json(v))
 }
 
 #[derive(Deserialize, Default)]
@@ -203,4 +232,16 @@ async fn voice_report(
         )
         .await;
     Ok(Json(out))
+}
+
+/// `POST /v1/server/liveops/changed` — Zanshin's change webhook (any body): cached flags / live
+/// events are dropped on every node and modules get `hook_liveops_changed` with the body.
+async fn liveops_changed(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let payload = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
+    crate::runtime_host::liveops_changed(&s, payload, true).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
