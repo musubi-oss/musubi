@@ -69,7 +69,7 @@ async fn device(
 }
 
 /// Fire the `authenticated` runtime event without delaying the response.
-fn authenticated(s: &AppState, sess: &Session, provider: &str) {
+pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str) {
     let provider = provider.to_string();
     {
         let (ev, acc, created) = (s.events.clone(), sess.account_id, sess.created);

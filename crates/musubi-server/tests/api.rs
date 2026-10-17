@@ -9242,3 +9242,150 @@ async fn generic_oidc_login_and_link() {
         "after unlink the sub is a new account"
     );
 }
+
+/// Passkeys: register a P-256 credential (attestation `none`), sign in with it, replayed
+/// assertion (counter did not advance) and a removed key are refused.
+#[tokio::test]
+async fn passkeys_register_and_login() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use base64::Engine;
+    use musubi_auth::passkey::{
+        build_assertion_auth_data, build_none_attestation, FLAG_UP, FLAG_UV,
+    };
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    use sha2::{Digest, Sha256};
+    let Some(app) = app_with(|c| {
+        c.social.passkeys.rp_id = "localhost".into();
+        c.social.passkeys.origins = vec!["http://localhost:3000".into()];
+    })
+    .await
+    else {
+        return;
+    };
+    let (st, dev) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("pk-dev-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{dev}");
+    let dt = dev["access_token"].as_str().unwrap();
+
+    let (st, opts) = call(&app, "POST", "/v1/account/passkeys/options", Some(dt), None).await;
+    assert_eq!(st, StatusCode::OK, "{opts}");
+    assert_eq!(opts["publicKey"]["rp"]["id"], "localhost");
+    let reg_token = opts["token"].as_str().unwrap().to_string();
+    let challenge = opts["publicKey"]["challenge"].as_str().unwrap().to_string();
+    // the challenge token is not an access token
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&reg_token), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let kp =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let cred_id = unique("cred-").into_bytes();
+    let client_data = |kind: &str, ch: &str| {
+        B64.encode(
+            json!({"type": kind, "challenge": ch, "origin": "http://localhost:3000"}).to_string(),
+        )
+    };
+    let att = build_none_attestation(
+        "localhost",
+        &cred_id,
+        kp.public_key().as_ref(),
+        0,
+        FLAG_UP | FLAG_UV,
+    );
+    let credential = json!({
+        "id": B64.encode(&cred_id),
+        "response": {"clientDataJSON": client_data("webauthn.create", &challenge), "attestationObject": B64.encode(&att)}
+    });
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/account/passkeys",
+        Some(dt),
+        Some(json!({"token": reg_token, "name": "YubiKey", "credential": credential})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["id"], B64.encode(&cred_id));
+    // the same challenge cannot register twice (credential already linked)
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/passkeys",
+        Some(dt),
+        Some(json!({"token": reg_token, "credential": credential})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK);
+    let (st, l) = call(&app, "GET", "/v1/account/passkeys", Some(dt), None).await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["passkeys"].as_array().unwrap().len(), 1);
+    assert_eq!(l["passkeys"][0]["name"], "YubiKey");
+
+    // sign in with the key
+    async fn assertion(
+        app: &Router,
+        kp: &EcdsaKeyPair,
+        cred_id: &[u8],
+        count: u32,
+    ) -> serde_json::Value {
+        let (st, o) = call(app, "POST", "/v1/auth/passkey/options", None, None).await;
+        assert_eq!(st, StatusCode::OK, "{o}");
+        let cdj = B64.encode(
+            json!({"type": "webauthn.get", "challenge": o["publicKey"]["challenge"], "origin": "http://localhost:3000"}).to_string(),
+        );
+        let ad = build_assertion_auth_data("localhost", count, FLAG_UP);
+        let mut msg = ad.clone();
+        msg.extend_from_slice(&Sha256::digest(B64.decode(&cdj).unwrap()));
+        let sig = kp.sign(&ring::rand::SystemRandom::new(), &msg).unwrap();
+        json!({
+            "token": o["token"],
+            "credential": {"id": B64.encode(cred_id), "response": {"clientDataJSON": cdj, "authenticatorData": B64.encode(&ad), "signature": B64.encode(sig.as_ref())}}
+        })
+    }
+    let body = assertion(&app, &kp, &cred_id, 1).await;
+    let (st, s1) = call(&app, "POST", "/v1/auth/passkey", None, Some(body.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    assert_eq!(s1["account_id"], dev["account_id"]);
+    // replay: same assertion, counter did not advance
+    let (st, _) = call(&app, "POST", "/v1/auth/passkey", None, Some(body)).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/passkey",
+        None,
+        Some(assertion(&app, &kp, &cred_id, 2).await),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    let (st, l) = call(&app, "GET", "/v1/account/passkeys", Some(dt), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(l["passkeys"][0]["sign_count"], 2);
+
+    // remove → the key no longer signs in
+    let (st, r) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/account/passkeys/{}", B64.encode(&cred_id)),
+        Some(dt),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/passkey",
+        None,
+        Some(assertion(&app, &kp, &cred_id, 3).await),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

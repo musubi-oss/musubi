@@ -15,6 +15,7 @@ mod lobbies;
 mod matches;
 mod matchmaker;
 mod notifications;
+mod passkeys;
 pub mod rating;
 mod rpc;
 mod rtc;
@@ -48,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::events::routes())
         .merge(auth::routes())
         .merge(account::routes())
+        .merge(passkeys::routes())
         .merge(friends::routes())
         .merge(groups::routes())
         .merge(notifications::routes())

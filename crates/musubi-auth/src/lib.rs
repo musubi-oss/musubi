@@ -5,6 +5,7 @@
 //! token stored hashed in `musubi.sessions`. Refresh tokens rotate; reuse of a rotated
 //! token revokes the whole family.
 
+pub mod passkey;
 pub mod password;
 mod service;
 pub mod token;
@@ -23,6 +24,8 @@ pub mod provider {
     pub const STEAM: &str = "steam";
     pub const GOOGLE: &str = "google";
     pub const APPLE: &str = "apple";
+    /// WebAuthn credential; `subject` is the base64url credential id.
+    pub const PASSKEY: &str = "passkey";
     pub const CUSTOM: &str = "custom";
 }
 

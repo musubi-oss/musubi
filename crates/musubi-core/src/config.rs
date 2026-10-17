@@ -870,6 +870,28 @@ pub struct SocialConfig {
     /// Any other OpenID Connect issuer (Discord, Twitch, Epic, Xbox, Keycloak, …) keyed by a
     /// short name: `POST /v1/auth/oidc/{name}` with its ID token; identities are `oidc:<name>`.
     pub oidc: std::collections::HashMap<String, OidcLoginConfig>,
+    pub passkeys: PasskeyConfig,
+}
+
+/// Passkeys / WebAuthn relying party. Empty `rp_id` = passkeys disabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PasskeyConfig {
+    /// Relying-party id: the site's registrable domain, e.g. `example.com`.
+    pub rp_id: String,
+    pub rp_name: String,
+    /// Allowed `origin`s in clientDataJSON, e.g. `https://play.example.com`.
+    pub origins: Vec<String>,
+}
+
+impl Default for PasskeyConfig {
+    fn default() -> Self {
+        Self {
+            rp_id: String::new(),
+            rp_name: "Musubi".into(),
+            origins: vec![],
+        }
+    }
 }
 
 impl Default for SocialConfig {
@@ -879,6 +901,7 @@ impl Default for SocialConfig {
             google: Self::google_defaults(),
             apple: Self::apple_defaults(),
             oidc: Default::default(),
+            passkeys: PasskeyConfig::default(),
         }
     }
 }
