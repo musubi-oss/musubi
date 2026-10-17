@@ -4,6 +4,7 @@ pub mod app;
 pub mod audit;
 pub mod bans;
 pub mod db;
+pub mod edge;
 pub mod events;
 pub mod fanout;
 pub mod http;

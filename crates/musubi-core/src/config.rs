@@ -39,6 +39,7 @@ pub struct Config {
     pub webtransport: WebTransportConfig,
     pub webrtc: WebRtcConfig,
     pub udp: UdpConfig,
+    pub edge: EdgeConfig,
     pub zanshin: ZanshinConfig,
     pub aurix: AurixConfig,
     pub iap: IapConfig,
@@ -443,6 +444,30 @@ pub struct WebRtcConfig {
     /// Address browsers reach the UDP socket at (ICE host candidate); defaults to `listen`,
     /// or loopback when `listen` is an unspecified IP.
     pub public_addr: Option<SocketAddr>,
+}
+
+/// UDP edge proxy in front of fleet game servers (plan 05, Quilkin-like token routing): clients
+/// get the proxy's address from allocations and prefix datagrams with their connect token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EdgeConfig {
+    /// UDP listen address of the proxy on this node; unset = no proxy here.
+    pub listen: Option<SocketAddr>,
+    /// Address clients should use (defaults to `listen`); allocations advertise it instead of
+    /// the game server's own when set or when `listen` is set.
+    pub public_addr: Option<SocketAddr>,
+    /// Drop a client's proxy session after this long without packets.
+    pub idle_secs: u64,
+}
+
+impl Default for EdgeConfig {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            public_addr: None,
+            idle_secs: 60,
+        }
+    }
 }
 
 /// Raw UDP realtime transport (dedicated servers ↔ core, private networks: no encryption).

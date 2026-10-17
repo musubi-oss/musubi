@@ -2374,6 +2374,12 @@ dependencies = [
 [[package]]
 name = "musubi-edge"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "musubi-fleet"
@@ -2476,6 +2482,7 @@ name = "musubi-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -2498,6 +2505,7 @@ dependencies = [
  "musubi-cluster",
  "musubi-core",
  "musubi-economy",
+ "musubi-edge",
  "musubi-fleet",
  "musubi-integrations",
  "musubi-leaderboard",

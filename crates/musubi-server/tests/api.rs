@@ -6407,3 +6407,109 @@ async fn storage_list_by_key_prefix() {
         .collect();
     assert_eq!(keys, vec!["save_x"], "underscore is literal: {v}");
 }
+
+#[tokio::test]
+async fn edge_proxy_routes_allocations_by_connect_token() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("edge-fleet");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "local", "buffer": 1, "max_servers": 2,
+            "port_start": 48000, "port_end": 48100,
+            "spec": {"command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fuid = uuid::Uuid::parse_str(f["id"].as_str().unwrap()).unwrap();
+
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let plain =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let proxy = musubi_edge::UdpProxy::start(
+        "127.0.0.1:0".parse().unwrap(),
+        std::sync::Arc::new(musubi_server::edge::FleetRouter(std::sync::Arc::new(
+            plain.clone(),
+        ))),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let edge = proxy.local_addr();
+    let svc = plain.clone().with_edge(Some(edge));
+    assert_eq!(svc.edge(), Some(edge));
+    svc.reconcile().await.unwrap();
+    for s in svc.servers(fuid, Some("starting")).await.unwrap() {
+        svc.sdk_ready(s.id).await.unwrap();
+    }
+    assert!(svc.route_token("not-a-token").await.is_none());
+
+    // clients are told the proxy's address, never the game server's
+    let alloc = svc.allocate(fuid, json!({"match": "edge"})).await.unwrap();
+    assert_eq!(alloc.address, edge.ip().to_string());
+    assert_eq!(alloc.port, edge.port() as i32);
+    let real = svc.server(alloc.server_id).await.unwrap();
+    assert_ne!(
+        (real.address.as_str(), real.port),
+        (alloc.address.as_str(), alloc.port)
+    );
+    let routed = svc.route_token(&alloc.connect_token).await.unwrap();
+    assert_eq!(
+        routed.to_string(),
+        format!("{}:{}", real.address, real.port)
+    );
+
+    // the "game server" (the local provider only runs `sleep`): a UDP echo on its advertised port
+    let gs = tokio::net::UdpSocket::bind(routed).await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = gs.recv_from(&mut buf).await.unwrap();
+            let mut out = b"gs:".to_vec();
+            out.extend_from_slice(&buf[..n]);
+            gs.send_to(&out, from).await.unwrap();
+        }
+    });
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(edge).await.unwrap();
+    client
+        .send(&musubi_edge::with_header(
+            alloc.connect_token.as_bytes(),
+            b"hello",
+        ))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"gs:hello");
+    // a stranger's token goes nowhere
+    client
+        .send(&musubi_edge::with_header(b"stranger", b"hello"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), client.recv(&mut buf))
+            .await
+            .is_err()
+    );
+    assert_eq!(proxy.counters(), (1, 1));
+
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/{fuid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}

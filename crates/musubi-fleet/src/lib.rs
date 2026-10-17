@@ -7,6 +7,7 @@
 //! (GameServer CRs); edgegap/gamelift plug into the same trait.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -366,6 +367,9 @@ pub struct FleetService {
     providers: Arc<HashMap<String, Arc<dyn Provider>>>,
     api_url: String,
     server_key: String,
+    /// Public address of the UDP edge proxy; when set, allocations hand clients this address
+    /// instead of the game server's own (the proxy routes by connect token).
+    edge: Option<SocketAddr>,
 }
 
 type FleetRow = (
@@ -446,7 +450,36 @@ impl FleetService {
             providers: Arc::new(providers),
             api_url: api_url.to_string(),
             server_key: server_key.to_string(),
+            edge: None,
         }
+    }
+
+    /// Hide game servers behind the UDP edge proxy reachable at `addr` (plan 05: clients never see
+    /// server IPs).
+    pub fn with_edge(mut self, addr: Option<SocketAddr>) -> Self {
+        self.edge = addr;
+        self
+    }
+
+    pub fn edge(&self) -> Option<SocketAddr> {
+        self.edge
+    }
+
+    /// Edge proxy routing: the game server an allocated/in-game connect token belongs to.
+    pub async fn route_token(&self, token: &str) -> Option<SocketAddr> {
+        let r: (String, i32) = sqlx::query_as(
+            "select address, port from musubi.game_servers
+             where connect_token = $1 and state in ('allocated', 'in_game') and address <> ''
+             order by updated_at desc limit 1",
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "edge route lookup failed"))
+        .ok()
+        .flatten()?;
+        let ip: std::net::IpAddr = r.0.parse().ok()?;
+        Some(SocketAddr::new(ip, u16::try_from(r.1).ok()?))
     }
 
     /// Register an extra provider under `name` (e.g. `kubernetes` / `agones` when configured).
@@ -710,11 +743,15 @@ impl FleetService {
         {
             tracing::warn!(fleet = %fleet_id, error = %e, "fleet demand not recorded");
         }
+        let (address, port) = match self.edge {
+            Some(e) => (e.ip().to_string(), e.port() as i32),
+            None => (r.1, r.2),
+        };
         Ok(Allocation {
             server_id: r.0,
             fleet_id,
-            address: r.1,
-            port: r.2,
+            address,
+            port,
             connect_token: token,
         })
     }

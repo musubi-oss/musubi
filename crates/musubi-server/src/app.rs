@@ -152,7 +152,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cluster.node_id().0,
         &format!("http://{}", cfg.http.listen),
         &cfg.http.server_key,
-    );
+    )
+    .with_edge(cfg.edge.public_addr.or(cfg.edge.listen));
     if let Some(bin) = &cfg.fleet.firecracker.binary {
         match firecracker_settings(bin, &cfg.fleet.firecracker)
             .and_then(musubi_fleet::firecracker::FirecrackerProvider::new)
@@ -636,6 +637,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             None => None,
         };
         crate::realtime::udp::start(state.clone(), listen, secret).await?;
+    }
+    if let Some(listen) = state.cfg.edge.listen {
+        let proxy = musubi_edge::UdpProxy::start(
+            listen,
+            Arc::new(crate::edge::FleetRouter(state.fleets.clone())),
+            std::time::Duration::from_secs(state.cfg.edge.idle_secs.max(1)),
+        )
+        .await?;
+        tracing::info!(listen = %proxy.local_addr(), public = ?state.fleets.edge(), "udp edge proxy listening");
+        std::mem::forget(proxy);
     }
     let draining = state.clone();
     axum::serve(

@@ -7,3 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+dashmap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
