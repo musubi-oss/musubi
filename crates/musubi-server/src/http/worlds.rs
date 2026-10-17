@@ -147,6 +147,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/renew", post(renew))
         .route("/v1/server/worlds/{w}/spawn", post(spawn))
         .route("/v1/server/worlds/{w}/despawn", post(despawn))
+        .route("/v1/server/worlds/{w}/attach", post(attach))
+        .route("/v1/server/worlds/{w}/detach", post(detach))
         .route("/v1/server/worlds/{w}/apply", post(apply))
         .route("/v1/server/worlds/{w}/view/{x}/{y}", get(view))
         .route("/v1/server/worlds/{w}/events", get(events))
@@ -220,6 +222,13 @@ struct SpawnReq {
 struct EntityReq {
     sim: Uuid,
     entity: String,
+}
+
+#[derive(Deserialize)]
+struct AttachReq {
+    sim: Uuid,
+    entity: String,
+    root: String,
 }
 
 #[derive(Deserialize)]
@@ -493,6 +502,38 @@ async fn despawn(
     ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         s.worlds.despawn(&w, r.sim, &r.entity)?;
+        Ok(Json(json!({ "ok": true })))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
+}
+
+async fn attach(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<AttachReq>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        s.worlds.attach(&w, r.sim, &r.entity, &r.root)?;
+        Ok(Json(json!({ "ok": true })))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
+}
+
+async fn detach(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<EntityReq>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        s.worlds.detach(&w, r.sim, &r.entity)?;
         Ok(Json(json!({ "ok": true })))
     }
     .await;
@@ -773,6 +814,18 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             "despawn" => {
                 let r: EntityReq = serde_json::from_value(cmd).map_err(bad)?;
                 s.worlds.despawn(w, sim, &r.entity)?;
+                reply["ok"] = json!(true);
+                Ok(reply)
+            }
+            "attach" => {
+                let r: AttachReq = serde_json::from_value(cmd).map_err(bad)?;
+                s.worlds.attach(w, sim, &r.entity, &r.root)?;
+                reply["ok"] = json!(true);
+                Ok(reply)
+            }
+            "detach" => {
+                let r: EntityReq = serde_json::from_value(cmd).map_err(bad)?;
+                s.worlds.detach(w, sim, &r.entity)?;
                 reply["ok"] = json!(true);
                 Ok(reply)
             }

@@ -8931,3 +8931,152 @@ async fn shadow_ban_mutes_chat_and_matchmaking() {
         waited.map(|r| r.msg)
     );
 }
+
+#[tokio::test]
+async fn world_attached_entities_hand_over_with_their_root() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let k = "defaultkey";
+    let world = format!("w{}", uuid::Uuid::now_v7().simple());
+    let post = |path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::post(&path)
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, _) = post(
+        "/v1/server/worlds".into(),
+        json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 5.0}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let s1 = uuid::Uuid::now_v7();
+    let s2 = uuid::Uuid::now_v7();
+    for (sim, x) in [(s1, 0), (s2, 1)] {
+        let (st, _) = post(
+            format!("/v1/server/worlds/{world}/lease"),
+            json!({"sim": sim, "cells": [{"x": x, "y": 0}]}),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    let spawn = |sim: uuid::Uuid, x: f64| {
+        let world = world.clone();
+        async move {
+            let (st, v) = post(
+                format!("/v1/server/worlds/{world}/spawn"),
+                json!({"sim": sim, "x": x, "y": 50.0}),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+            v["entity"]["id"]
+                .as_str()
+                .or(v["id"].as_str())
+                .unwrap()
+                .to_string()
+        }
+    };
+    let vehicle = spawn(s1, 90.0).await;
+    let passenger = spawn(s1, 90.0).await;
+    let foreign = spawn(s2, 150.0).await;
+    // only the owner of both may attach; self-attachment is refused
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/attach"),
+        json!({"sim": s1, "entity": foreign, "root": vehicle}),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/attach"),
+        json!({"sim": s1, "entity": vehicle, "root": vehicle}),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, v) = post(
+        format!("/v1/server/worlds/{world}/attach"),
+        json!({"sim": s1, "entity": passenger, "root": vehicle}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    // the vehicle crosses; s2 is offered the vehicle with the passenger in `group`
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s1, "entity": vehicle, "x": 110.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let mut group = None;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let req = Request::get(format!("/v1/server/worlds/{world}/events?sim={s2}"))
+            .header("x-musubi-server-key", k)
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let ev: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        if let Some(e) = ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == "handover_request" && e["entity"] == json!(vehicle))
+        {
+            group = Some(e["group"].clone());
+            break;
+        }
+    }
+    let group = group.expect("s2 never got the handover request");
+    let parts = group.as_array().unwrap();
+    assert_eq!(parts.len(), 1, "{group}");
+    assert_eq!(parts[0]["id"], json!(passenger), "{group}");
+    // nobody owns the passenger's new side before the ack …
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s2, "entity": passenger, "x": 111.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, a) = post(
+        format!("/v1/server/worlds/{world}/handover/ack"),
+        json!({"sim": s2, "entity": vehicle}),
+    )
+    .await;
+    assert_eq!(st, 200, "{a}");
+    // … and one ack moves both: s2 owns the passenger, s1 no longer does
+    let (st, v) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s2, "entity": passenger, "x": 111.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": s1, "entity": passenger, "x": 90.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, v) = post(
+        format!("/v1/server/worlds/{world}/detach"),
+        json!({"sim": s2, "entity": passenger}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/detach"),
+        json!({"sim": s2, "entity": passenger}),
+    )
+    .await;
+    assert_eq!(st, 400, "already detached");
+}

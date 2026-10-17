@@ -154,6 +154,13 @@ pub enum WorldMutation {
         pos: Option<Pos>,
         components: Value,
     },
+    Attach {
+        id: Uuid,
+        root: Uuid,
+    },
+    Detach {
+        id: Uuid,
+    },
 }
 
 /// Replays `node`'s journal over a world merged from several shards. `src` remembers which node's
@@ -200,6 +207,16 @@ fn replay(
             } => {
                 if src.get(id).is_none_or(|s| *s == node) {
                     let _ = world.force_apply(*id, *pos, comps(components));
+                }
+            }
+            WorldMutation::Attach { id, root } => {
+                if src.get(id).is_none_or(|s| *s == node) {
+                    let _ = world.attach(*id, *root);
+                }
+            }
+            WorldMutation::Detach { id } => {
+                if src.get(id).is_none_or(|s| *s == node) {
+                    world.detach(*id);
                 }
             }
         }
@@ -1986,6 +2003,60 @@ impl WorldRegistry {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
                 op: WorldMutation::Despawn { id },
+            });
+        }
+        Ok(())
+    }
+
+    /// `entity` rides with `root` from now on (plan 4.5): both must be owned by `sim`.
+    pub fn attach(&self, name: &str, sim: Uuid, entity: &str, root: &str) -> Result<()> {
+        let id = parse_entity(entity)?;
+        let root = parse_entity(root)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        for e in [id, root] {
+            let cell = st
+                .world
+                .get(e)
+                .ok_or_else(|| Error::NotFound("entity".into()))?
+                .cell;
+            if st.world.owner(cell) != Some(sim) {
+                return Err(Error::PermissionDenied("not the owner".into()));
+            }
+        }
+        st.world
+            .attach(id, root)
+            .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if st.world.get(id).is_some_and(|e| e.persistent) {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Attach { id, root },
+            });
+        }
+        Ok(())
+    }
+
+    pub fn detach(&self, name: &str, sim: Uuid, entity: &str) -> Result<()> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        let e = st
+            .world
+            .get(id)
+            .ok_or_else(|| Error::NotFound("entity".into()))?;
+        let (cell, persistent) = (e.cell, e.persistent);
+        if st.world.owner(cell) != Some(sim) {
+            return Err(Error::PermissionDenied("not the owner".into()));
+        }
+        if !st.world.detach(id) {
+            return Err(Error::InvalidArgument("entity is not attached".into()));
+        }
+        if persistent {
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                op: WorldMutation::Detach { id },
             });
         }
         Ok(())
