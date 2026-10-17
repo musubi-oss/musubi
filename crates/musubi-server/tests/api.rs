@@ -10183,7 +10183,7 @@ async fn groups_roles_bitmask_and_ranks() {
     .await;
     assert_eq!(st, StatusCode::OK, "{r}");
     assert_eq!(r["roles"].as_array().unwrap().len(), 8);
-    assert_eq!(r["roles"][2]["permissions"], 64);
+    assert_eq!(r["roles"][2]["permissions"], 64 | 256);
     let (st, _) = call(
         &app,
         "POST",
@@ -10619,4 +10619,211 @@ async fn groups_xp_levels_and_alliances() {
     )
     .await;
     assert!(v["alliance"].is_null(), "{v}");
+}
+
+#[tokio::test]
+async fn groups_inventory_deposit_and_withdraw() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut users = vec![];
+    for _ in 0..2 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("gi")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, a) = &users[0];
+    let (tb, b) = &users[1];
+    let ore = unique("ore");
+    let relic = unique("relic");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": ore, "name": "Ore", "category": "material", "max_stack": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": relic, "name": "Relic", "category": "artifact", "stackable": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, ore_entry) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": b, "item_id": ore, "quantity": 50})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ore_entry}");
+    let ore_entry = ore_entry["id"].as_str().unwrap().to_string();
+    let (_, relic_entry) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": b, "item_id": relic})),
+    )
+    .await;
+    let relic_entry = relic_entry["id"].as_str().unwrap().to_string();
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(ta),
+        Some(json!({"name": unique("depot"), "open": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // a member pools from their own entry; more than they hold and non-stackables are refused
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/deposit"),
+        Some(tb),
+        Some(json!({"entry_id": ore_entry, "quantity": 30, "reason": "mining"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entry"]["quantity_after"], 30);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/deposit"),
+        Some(tb),
+        Some(json!({"entry_id": ore_entry, "quantity": 100})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/deposit"),
+        Some(tb),
+        Some(json!({"entry_id": relic_entry, "quantity": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(tb), None).await;
+    let left = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item_id"] == json!(ore))
+        .map(|x| x["quantity"].clone());
+    assert_eq!(left, Some(json!(20)), "{inv}");
+    let (st, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/inventory"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["items"][0]["item_id"], json!(ore));
+    assert_eq!(t["items"][0]["quantity"], 30);
+    // members may not hand out; the owner hands out to a member, never below the stock
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/withdraw"),
+        Some(tb),
+        Some(json!({"item_id": ore, "quantity": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/withdraw"),
+        Some(ta),
+        Some(json!({"item_id": ore, "quantity": 10, "to": a, "reason": "crafting"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entry"]["quantity_after"], 20);
+    assert_eq!(v["entry"]["delta"], -10);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/withdraw"),
+        Some(ta),
+        Some(json!({"item_id": ore, "quantity": 100})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(ta), None).await;
+    let got = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["item_id"] == json!(ore))
+        .map(|x| x["quantity"].clone());
+    assert_eq!(got, Some(json!(10)), "{inv}");
+    let (st, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/inventory/ledger"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(l["entries"][0]["delta"], -10);
+    assert_eq!(l["entries"][1]["delta"], 30);
+    // hand-outs go to any member, not to outsiders
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/withdraw"),
+        Some(ta),
+        Some(json!({"item_id": ore, "quantity": 5, "to": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entry"]["quantity_after"], 15);
+    let (_, s3) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("gi-out")})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/inventory/withdraw"),
+        Some(ta),
+        Some(json!({"item_id": ore, "quantity": 5, "to": s3["account_id"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
 }

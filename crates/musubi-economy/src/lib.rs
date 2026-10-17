@@ -21,10 +21,12 @@ pub use market::{
     Settled, Trade, TradeSide, WantItem,
 };
 pub use orderbook::{Book, Fill, NewOrder, Order, Placed, Side};
+pub mod group_inventory;
 pub mod progression;
 pub mod quests;
 pub mod seasons;
 pub mod treasury;
+pub use group_inventory::{GroupInventoryEntry, GroupItem};
 pub use iap::{IapProduct, Receipt, ReceiptInput, SteamOrder};
 pub use quests::Quest;
 pub use seasons::Season;

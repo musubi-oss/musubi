@@ -142,12 +142,14 @@ pub mod perm {
     pub const PROMOTE: i64 = 32;
     pub const TREASURY_DEPOSIT: i64 = 64;
     pub const TREASURY_WITHDRAW: i64 = 128;
-    pub const ALL: i64 = 255;
+    pub const INVENTORY_DEPOSIT: i64 = 256;
+    pub const INVENTORY_WITHDRAW: i64 = 512;
+    pub const ALL: i64 = 1023;
     /// Defaults when a group has not customised the role: admins do everything, members may pay in.
     pub fn default_for(rank: i16) -> i64 {
         match rank {
             0 | 1 => ALL,
-            2 => TREASURY_DEPOSIT,
+            2 => TREASURY_DEPOSIT | INVENTORY_DEPOSIT,
             _ => 0,
         }
     }
@@ -1095,6 +1097,27 @@ impl GroupService {
         require_perm(&mut tx, group, me, bit).await?;
         tx.commit().await.map_err(Error::internal)?;
         Ok(())
+    }
+
+    /// `who` is a full member of the group (any rank; a pending join request does not count).
+    pub async fn require_member(&self, who: AccountId, group: GroupId) -> Result<()> {
+        let row: Option<(i16,)> = sqlx::query_as(
+            "select state from musubi.group_members where group_id = $1 and user_id = $2",
+        )
+        .bind(group.0)
+        .bind(who.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        match row {
+            Some((state,))
+                if MemberState::try_from(state).map_err(Error::Internal)?
+                    != MemberState::JoinRequest =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::PermissionDenied("not a member".into())),
+        }
     }
 
     /// The group's role table: every rank 0..=7 with its name and permission bits (defaults for

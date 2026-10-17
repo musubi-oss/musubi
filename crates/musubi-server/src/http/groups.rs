@@ -34,6 +34,13 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/groups/{id}/treasury/ledger", get(treasury_ledger))
         .route("/v1/groups/{id}/treasury/deposit", post(treasury_deposit))
         .route("/v1/groups/{id}/treasury/withdraw", post(treasury_withdraw))
+        .route("/v1/groups/{id}/inventory", get(inventory))
+        .route("/v1/groups/{id}/inventory/ledger", get(inventory_ledger))
+        .route("/v1/groups/{id}/inventory/deposit", post(inventory_deposit))
+        .route(
+            "/v1/groups/{id}/inventory/withdraw",
+            post(inventory_withdraw),
+        )
         .route("/v1/groups/{id}/demote", post(demote))
         .route("/v1/groups/{id}/members", get(members))
         .route("/v1/groups/{id}/ban", post(ban).delete(unban))
@@ -637,4 +644,117 @@ async fn events(
         .await?;
     let cursor = events.last().map(|e| e.id.clone());
     Ok(Json(json!({ "events": events, "cursor": cursor })))
+}
+
+#[derive(Deserialize)]
+struct InventoryDepositReq {
+    /// The caller's own inventory entry to take from.
+    entry_id: uuid::Uuid,
+    quantity: i64,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct InventoryWithdrawReq {
+    item_id: String,
+    quantity: i64,
+    #[serde(default)]
+    reason: String,
+    /// Who receives the items (default: the caller).
+    #[serde(default)]
+    to: Option<AccountId>,
+}
+
+async fn inventory(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::INVENTORY_DEPOSIT,
+        )
+        .await?;
+    Ok(Json(
+        json!({ "items": s.economy.group_inventory(id.0).await? }),
+    ))
+}
+
+async fn inventory_ledger(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Query(q): Query<PageQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::INVENTORY_DEPOSIT,
+        )
+        .await?;
+    let entries = s
+        .economy
+        .group_inventory_ledger(id.0, q.limit as i64)
+        .await?;
+    Ok(Json(json!({ "entries": entries })))
+}
+
+async fn inventory_deposit(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(r): Json<InventoryDepositReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::INVENTORY_DEPOSIT,
+        )
+        .await?;
+    let e = s
+        .economy
+        .group_inventory_deposit(id.0, me.account_id, r.entry_id, r.quantity, &r.reason)
+        .await?;
+    s.events
+        .emit(
+            "group.inventory_deposit",
+            Some(me.account_id),
+            json!({ "group_id": id, "item_id": e.item_id, "quantity": r.quantity }),
+        )
+        .await;
+    Ok(Json(json!({ "entry": e })))
+}
+
+async fn inventory_withdraw(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(r): Json<InventoryWithdrawReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::INVENTORY_WITHDRAW,
+        )
+        .await?;
+    let to = r.to.unwrap_or(me.account_id);
+    groups(&s).require_member(to, id).await?;
+    let e = s
+        .economy
+        .group_inventory_withdraw(id.0, to, &r.item_id, r.quantity, &r.reason)
+        .await?;
+    s.events
+        .emit(
+            "group.inventory_withdraw",
+            Some(me.account_id),
+            json!({ "group_id": id, "to": to, "item_id": r.item_id, "quantity": r.quantity }),
+        )
+        .await;
+    Ok(Json(json!({ "entry": e })))
 }
