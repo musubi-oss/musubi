@@ -68,6 +68,8 @@ pub struct AppState {
     pub liveops_cache: crate::runtime_host::LiveopsCache,
     pub keys: Arc<crate::keys::ServerKeys>,
     pub logins: Arc<crate::logins::Social>,
+    /// UGC blobs in object storage (`[ugc.s3]`); `None` keeps them in Postgres.
+    pub blobs: Option<Arc<crate::blobstore::S3Store>>,
     /// Set on SIGTERM: `/readyz` answers 503 so load balancers stop routing here.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
     /// Fired by `POST /v1/admin/cluster/nodes/{id}/drain`: same path as SIGTERM.
@@ -502,7 +504,12 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     };
     let mailer = (!cfg.email.host.is_empty())
         .then(|| Arc::new(musubi_integrations::Mailer::new(cfg.email.clone())));
+    let blobs = crate::blobstore::S3Store::new(&cfg.ugc.s3).map(Arc::new);
+    if let Some(b) = &blobs {
+        tracing::info!(bucket = b.bucket(), "ugc blobs in object storage");
+    }
     let state = AppState {
+        blobs,
         audit: crate::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
         events: {

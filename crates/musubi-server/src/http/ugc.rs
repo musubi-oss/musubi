@@ -404,11 +404,17 @@ async fn delete_one(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     owned(&s, id, me.account_id).await?;
-    sqlx::query("delete from musubi.ugc_items where id = $1")
-        .bind(id)
-        .execute(&s.db)
-        .await
-        .map_err(Error::internal)?;
+    let gone: Option<String> =
+        sqlx::query_scalar("delete from musubi.ugc_items where id = $1 returning blob_key")
+            .bind(id)
+            .fetch_one(&s.db)
+            .await
+            .map_err(Error::internal)?;
+    if let (Some(store), Some(key)) = (&s.blobs, gone) {
+        if let Err(e) = store.delete(&key).await {
+            tracing::warn!(error = %e, key, "ugc blob not deleted from object storage");
+        }
+    }
     s.events
         .emit("ugc.deleted", Some(me.account_id), json!({ "id": id }))
         .await;
@@ -442,19 +448,35 @@ async fn blob_put(
     } else {
         status.as_str()
     };
-    let version: i32 = sqlx::query_scalar(
-        "update musubi.ugc_items set blob = $2, mime = $3, size = $4, sha256 = $5, version = version + 1,
-           status = $6, updated_at = now() where id = $1 returning version",
+    // object storage when configured: the row keeps only the key
+    let (stored, key): (Option<&[u8]>, Option<String>) = match &s.blobs {
+        Some(store) => {
+            let key = format!("{}ugc/{id}/{sha}", s.cfg.ugc.s3.prefix);
+            store.put(&key, body.to_vec(), &mime).await?;
+            (None, Some(key))
+        }
+        None => (Some(body.as_ref()), None),
+    };
+    let (version, old_key): (i32, Option<String>) = sqlx::query_as(
+        "with old as (select blob_key from musubi.ugc_items where id = $1)
+         update musubi.ugc_items set blob = $2, blob_key = $7, mime = $3, size = $4, sha256 = $5, version = version + 1,
+           status = $6, updated_at = now() where id = $1 returning version, (select blob_key from old)",
     )
     .bind(id)
-    .bind(body.as_ref())
+    .bind(stored)
     .bind(&mime)
     .bind(body.len() as i64)
     .bind(&sha)
     .bind(next)
+    .bind(&key)
     .fetch_one(&s.db)
     .await
     .map_err(Error::internal)?;
+    if let (Some(store), Some(old)) = (&s.blobs, old_key.filter(|o| Some(o) != key.as_ref())) {
+        if let Err(e) = store.delete(&old).await {
+            tracing::warn!(error = %e, key = old, "previous ugc blob not deleted");
+        }
+    }
     s.events
         .emit(
             "ugc.updated",
@@ -479,14 +501,24 @@ async fn blob_get(
     if !visible(&row, me.account_id) {
         return Err(Error::NotFound(format!("ugc item {id}")).into());
     }
-    let blob: Option<Vec<u8>> =
-        sqlx::query_scalar("select blob from musubi.ugc_items where id = $1")
+    let (blob, key): (Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as("select blob, blob_key from musubi.ugc_items where id = $1")
             .bind(id)
             .fetch_one(&s.db)
             .await
             .map_err(Error::internal)?;
-    let Some(blob) = blob else {
-        return Err(Error::NotFound(format!("ugc item {id} has no blob (see url)")).into());
+    let blob = match (blob, key, &s.blobs) {
+        (Some(b), _, _) => b,
+        (None, Some(key), Some(store)) => store.get(&key).await?,
+        (None, Some(_), None) => {
+            return Err(Error::Unavailable(
+                "ugc blob is in object storage but [ugc.s3] is not configured on this node".into(),
+            )
+            .into())
+        }
+        (None, None, _) => {
+            return Err(Error::NotFound(format!("ugc item {id} has no blob (see url)")).into())
+        }
     };
     if row.get::<Uuid, _>("owner_id") != me.account_id.0 {
         sqlx::query("update musubi.ugc_items set downloads = downloads + 1 where id = $1")

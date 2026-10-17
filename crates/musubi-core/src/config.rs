@@ -58,6 +58,7 @@ pub struct Config {
     pub anticheat: AntiCheatConfig,
     pub regions: RegionsConfig,
     pub operators: OperatorsConfig,
+    pub ugc: UgcConfig,
     /// Further games/environments served by this same process, each on its own database and
     /// cluster group; requests pick one by `x-musubi-project` or `Host`.
     pub projects: Vec<ProjectConfig>,
@@ -1531,6 +1532,46 @@ impl Default for OperatorSsoConfig {
             default_role: String::new(),
             allowed_domains: Vec::new(),
             session_hours: 12,
+        }
+    }
+}
+
+/// User-generated content storage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UgcConfig {
+    /// Where blobs go; unset = inside Postgres (fine for small mods, not for gigabytes).
+    pub s3: S3Config,
+}
+
+/// An S3-compatible bucket (AWS S3, MinIO, R2, B2, GCS interop).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct S3Config {
+    /// `https://s3.eu-central-1.amazonaws.com`, `http://minio:9000`…; empty = off.
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: String,
+    /// `endpoint/bucket/key` (MinIO, R2) instead of `bucket.endpoint/key`.
+    pub path_style: bool,
+    /// Key prefix inside the bucket.
+    pub prefix: String,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: "us-east-1".into(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            session_token: String::new(),
+            path_style: true,
+            prefix: String::new(),
         }
     }
 }

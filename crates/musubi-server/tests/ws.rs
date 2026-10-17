@@ -175,6 +175,7 @@ async fn build_state_cfg(
         fanout,
         hub,
         cfg: Arc::new(cfg),
+        blobs: None,
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
         liveops_cache: Default::default(),
@@ -14105,4 +14106,188 @@ async fn iap_subscription_sweep_marks_grace_and_expired() {
     .await
     .unwrap();
     assert_eq!(expired, 2);
+}
+
+/// With `[ugc.s3]` configured, UGC blobs go to the bucket (SigV4-signed), the row keeps only the
+/// key, downloads are served from the bucket, and a new version or a deleted item removes the
+/// old object.
+#[tokio::test]
+async fn ugc_blobs_live_in_object_storage() {
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    type Objects = Arc<std::sync::Mutex<(std::collections::HashMap<String, Vec<u8>>, Vec<String>)>>;
+    let objects: Objects = Arc::new(std::sync::Mutex::new((Default::default(), Vec::new())));
+    let mock = {
+        use axum::extract::{Path as AxPath, State as AxState};
+        async fn put(
+            AxState(o): AxState<Objects>,
+            AxPath((bucket, key)): AxPath<(String, String)>,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> axum::http::StatusCode {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let mut g = o.lock().unwrap();
+            g.1.push(format!("PUT {bucket} {auth}"));
+            g.0.insert(key, body.to_vec());
+            axum::http::StatusCode::OK
+        }
+        async fn get(
+            AxState(o): AxState<Objects>,
+            AxPath((_bucket, key)): AxPath<(String, String)>,
+            headers: axum::http::HeaderMap,
+        ) -> axum::response::Response {
+            let mut g = o.lock().unwrap();
+            g.1.push(format!(
+                "GET {}",
+                headers
+                    .get("x-amz-content-sha256")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+            ));
+            match g.0.get(&key) {
+                Some(b) => axum::response::IntoResponse::into_response(b.clone()),
+                None => {
+                    axum::response::IntoResponse::into_response(axum::http::StatusCode::NOT_FOUND)
+                }
+            }
+        }
+        async fn del(
+            AxState(o): AxState<Objects>,
+            AxPath((_bucket, key)): AxPath<(String, String)>,
+        ) -> axum::http::StatusCode {
+            let mut g = o.lock().unwrap();
+            g.1.push(format!("DELETE {key}"));
+            g.0.remove(&key);
+            axum::http::StatusCode::NO_CONTENT
+        }
+        axum::Router::new()
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::put(put).get(get).delete(del),
+            )
+            .with_state(objects.clone())
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+    {
+        let cfg = Arc::make_mut(&mut state.cfg);
+        cfg.ugc.s3 = musubi_core::config::S3Config {
+            endpoint: format!("http://{addr}"),
+            bucket: "ugc-bucket".into(),
+            access_key: "AKIDEXAMPLE".into(),
+            secret_key: "s3cr3t".into(),
+            prefix: "game1/".into(),
+            ..Default::default()
+        };
+    }
+    state.blobs = Some(Arc::new(
+        musubi_server::blobstore::S3Store::new(&state.cfg.ugc.s3).unwrap(),
+    ));
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _) = token(&router).await;
+    let (st, item) = http_json(
+        &router,
+        "POST",
+        "/v1/ugc",
+        Some(&ta),
+        false,
+        Some(json!({"kind": "mod", "title": "Big mod"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{item}");
+    let id = item["id"].as_str().unwrap().to_string();
+    let (st, body, _) = http_raw(
+        &router,
+        "PUT",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "application/zip",
+        b"PK mod v1".to_vec(),
+    )
+    .await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    let up: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(up["version"], 1);
+    let sha1 = up["sha256"].as_str().unwrap().to_string();
+    let (blob, key): (Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as("select blob, blob_key from musubi.ugc_items where id = $1")
+            .bind(uuid::Uuid::parse_str(&id).unwrap())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert!(blob.is_none(), "row carries no bytes");
+    assert_eq!(
+        key.as_deref(),
+        Some(format!("game1/ugc/{id}/{sha1}").as_str())
+    );
+    {
+        let g = objects.lock().unwrap();
+        assert_eq!(g.0.len(), 1);
+        assert_eq!(g.0.get(key.as_ref().unwrap()).unwrap(), b"PK mod v1");
+        assert!(
+            g.1[0].starts_with("PUT ugc-bucket AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
+                && g.1[0].contains("/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="),
+            "{}",
+            g.1[0]
+        );
+    }
+    // served from the bucket
+    let (st, body, headers) = http_raw(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "application/octet-stream",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(body, b"PK mod v1");
+    assert_eq!(headers.get("etag").unwrap(), &format!("\"{sha1}\""));
+    assert_eq!(headers.get("content-type").unwrap(), "application/zip");
+    assert!(
+        objects
+            .lock()
+            .unwrap()
+            .1
+            .iter()
+            .any(|l| l.starts_with("GET e3b0c442")),
+        "GET signed with the empty-payload hash"
+    );
+    // a new version replaces the object
+    let (st, body, _) = http_raw(
+        &router,
+        "PUT",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "application/zip",
+        b"PK mod v2 bigger".to_vec(),
+    )
+    .await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    {
+        let g = objects.lock().unwrap();
+        assert_eq!(g.0.len(), 1, "old object deleted: {:?}", g.1);
+        assert!(g.0.values().next().unwrap() == b"PK mod v2 bigger");
+    }
+    // deleting the item empties the bucket
+    let (st, r) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/ugc/{id}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(objects.lock().unwrap().0.is_empty());
 }

@@ -80,6 +80,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         dev: Arc::new(musubi_server::dev::DevTools::new()),
         audit: musubi_server::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
+        blobs: None,
         auth,
         storage,
         accounts: musubi_account::AccountService::new(db.clone()),
