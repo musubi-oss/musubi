@@ -205,6 +205,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("DELETE", "/v1/server/fleets/{id}", "fleets"),
     ("GET", "/v1/server/fleets/{id}", "fleets"),
     ("POST", "/v1/server/fleets/{id}/allocate", "fleets"),
+    ("GET", "/v1/server/fleets/{id}/demand", "fleets"),
     ("POST", "/v1/server/fleets/{id}/scale", "fleets"),
     ("GET", "/v1/server/fleets/{id}/servers", "fleets"),
     ("DELETE", "/v1/server/gameservers/{id}", "fleets"),
