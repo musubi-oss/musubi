@@ -63,6 +63,7 @@ pub struct AppState {
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
+    pub anticheat: Arc<crate::anticheat::AntiCheat>,
     pub liveops_cache: crate::runtime_host::LiveopsCache,
     pub keys: Arc<crate::keys::ServerKeys>,
     pub logins: Arc<crate::logins::Social>,
@@ -490,6 +491,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Arc::new(e)
         },
         banned: Arc::new(crate::bans::Bans::default()),
+        anticheat: Arc::new(crate::anticheat::AntiCheat::new()),
         liveops_cache: Default::default(),
         keys: Arc::new(crate::keys::ServerKeys::default()),
         logins,
@@ -560,6 +562,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(c) = &state.cluster {
         state.keys.start(c, state.db.clone());
     }
+    state.anticheat.bind(&state);
     match state.banned.load(&state.db).await {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),

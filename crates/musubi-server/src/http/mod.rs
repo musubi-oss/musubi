@@ -1,5 +1,6 @@
 mod account;
 pub mod admin;
+mod anticheat;
 mod auth;
 mod chat;
 mod cluster;
@@ -70,6 +71,7 @@ pub fn router(state: AppState) -> Router {
         .merge(entitlements::routes())
         .merge(reports::routes())
         .merge(ugc::routes())
+        .merge(anticheat::routes())
         .merge(match_results::routes())
         .merge(content::routes())
         .merge(fleets::routes())

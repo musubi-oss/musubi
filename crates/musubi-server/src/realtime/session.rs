@@ -44,6 +44,7 @@ pub struct ConnectParams {
     pub matches: Arc<MatchRegistry>,
     pub worlds: Arc<super::WorldRegistry>,
     pub banned: Arc<crate::bans::Bans>,
+    pub anticheat: Arc<crate::anticheat::AntiCheat>,
     pub runtime: Arc<Runtime>,
     pub fanout: Fanout,
     pub rate: Arc<crate::limits::RateLimiter>,
@@ -75,6 +76,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         fanout,
         rate,
         banned,
+        anticheat,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -103,6 +105,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         presence: &presence,
         rate: &rate,
         banned: &banned,
+        anticheat: &anticheat,
         resume: None,
     };
     let resume_token = given_token.or_else(|| {
@@ -285,6 +288,7 @@ struct Ctx<'a> {
     presence: &'a UserPresence,
     rate: &'a crate::limits::RateLimiter,
     banned: &'a crate::bans::Bans,
+    anticheat: &'a Arc<crate::anticheat::AntiCheat>,
     resume: Option<Arc<super::resume::ResumeTracker>>,
 }
 
@@ -784,6 +788,34 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                     return Some(ServerMessage::error(&Error::PermissionDenied(
                         "spectators cannot send match data".into(),
                     )));
+                }
+                if let Some(v) = ctx
+                    .anticheat
+                    .observe_input(ctx.presence.session_id.0, data.len())
+                {
+                    let (ac, acc, sid, mid) = (
+                        ctx.anticheat.clone(),
+                        ctx.presence.account_id,
+                        ctx.presence.session_id.0,
+                        match_id.clone(),
+                    );
+                    let kind = v.kind;
+                    tokio::spawn(async move {
+                        let _ = ac
+                            .flag(
+                                acc,
+                                Some(sid),
+                                Some(&mid),
+                                "server",
+                                kind,
+                                v.severity,
+                                v.details,
+                            )
+                            .await;
+                    });
+                    return Some(ServerMessage::error(&Error::ResourceExhausted(format!(
+                        "match input rejected: {kind}"
+                    ))));
                 }
                 return h
                     .data(musubi_actor::Input {

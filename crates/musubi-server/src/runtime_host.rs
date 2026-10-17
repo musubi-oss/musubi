@@ -111,6 +111,20 @@ impl ServerHost {
     async fn dispatch(&self, ctx: &CallContext, req: Value) -> Result<Value> {
         let s = &self.state;
         match str_field(&req, "op")? {
+            "anticheat.flag" => {
+                let account = musubi_core::AccountId(owner(&req, ctx)?);
+                s.anticheat
+                    .flag(
+                        account,
+                        None,
+                        req.get("match_id").and_then(|v| v.as_str()),
+                        "module",
+                        str_field(&req, "kind")?,
+                        req.get("severity").and_then(|v| v.as_i64()).unwrap_or(10) as i32,
+                        req.get("details").cloned().unwrap_or(Value::Null),
+                    )
+                    .await
+            }
             "storage.read" => {
                 let mut objs = s
                     .storage

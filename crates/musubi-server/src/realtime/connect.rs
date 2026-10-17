@@ -105,6 +105,7 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         matches: s.matches.clone(),
         worlds: s.worlds.clone(),
         banned: s.banned.clone(),
+        anticheat: s.anticheat.clone(),
         runtime: s.runtime.clone(),
         fanout: s.fanout.clone(),
     }

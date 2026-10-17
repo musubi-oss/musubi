@@ -105,6 +105,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
         &cfg.runtime,
     ));
     let state = AppState {
+        anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
         audit: musubi_server::audit::Sink::new(&db),
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()).with_limits(
@@ -165,6 +166,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
             },
         )),
     };
+    state.anticheat.bind(&state);
     musubi_server::app::wire_storage_live(&state.storage, &state.fanout);
     Some(state)
 }
@@ -11751,4 +11753,214 @@ async fn ugc_registry_moderation_ratings_subscriptions() {
     )
     .await;
     assert_eq!(st, 404);
+}
+
+#[tokio::test]
+async fn anticheat_flags_score_queue_kick_and_vendor_verify() {
+    // mock vendor: {"ok": true} for tickets containing "good"
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vendor = format!("http://{}/verify", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                assert!(
+                    text.contains("authorization: Bearer be-key")
+                        || text.contains("Authorization: Bearer be-key"),
+                    "{text}"
+                );
+                let body = if text.contains("good") {
+                    r#"{"ok":true}"#
+                } else {
+                    r#"{"ok":false,"reason":"banned"}"#
+                };
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body);
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    {
+        let cfg = Arc::make_mut(&mut state.cfg);
+        cfg.anticheat.kick_score = 60;
+        cfg.anticheat.battleye_url = vendor;
+        cfg.anticheat.battleye_key = "be-key".into();
+    }
+    state.anticheat = Arc::new(musubi_server::anticheat::AntiCheat::new());
+    state.anticheat.bind(&state);
+    let router = musubi_server::http::router(state.clone());
+    let (_ta, acc) = token(&router).await;
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/flag",
+        None,
+        true,
+        Some(json!({"account_id": acc, "kind": "", "severity": 10})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/flag",
+        None,
+        true,
+        Some(json!({"account_id": acc, "kind": "speedhack", "severity": 0})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(&router, "POST", "/v1/server/anticheat/flag", None, true, Some(json!({"account_id": acc, "kind": "speedhack", "severity": 30, "match_id": "m1", "details": {"speed": 42}}))).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["score"], 30);
+    assert_eq!(r["kicked"], false);
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/flag",
+        None,
+        true,
+        Some(json!({"account_id": acc, "kind": "impossible_shot", "severity": 20})),
+    )
+    .await;
+    assert_eq!(r["score"], 50);
+    let (st, q) = http_json(
+        &router,
+        "GET",
+        "/v1/admin/anticheat?min_score=40",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{q}");
+    let me = q["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["account_id"] == json!(acc))
+        .cloned()
+        .expect("in queue");
+    assert_eq!(me["score"], 50);
+    assert_eq!(me["signals"], 2);
+    let (_, a) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{acc}/anticheat"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(a["score"], 50);
+    assert_eq!(a["signals"].as_array().unwrap().len(), 2);
+    assert_eq!(a["signals"][1]["details"]["speed"], 42);
+    assert_eq!(a["signals"][1]["match_id"], "m1");
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{}/anticheat", uuid::Uuid::now_v7()),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    // threshold 60 → kicked
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/flag",
+        None,
+        true,
+        Some(json!({"account_id": acc, "kind": "speedhack", "severity": 10})),
+    )
+    .await;
+    assert_eq!(r["score"], 60);
+    assert_eq!(r["kicked"], true);
+    // vendor checks
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/verify",
+        None,
+        true,
+        Some(json!({"provider": "nope", "account_id": acc, "ticket": "x"})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/verify",
+        None,
+        true,
+        Some(json!({"provider": "eac", "account_id": acc, "ticket": "x"})),
+    )
+    .await;
+    assert_eq!(st, 503, "{r}");
+    let (_tb, acc_b) = token(&router).await;
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/verify",
+        None,
+        true,
+        Some(json!({"provider": "battleye", "account_id": acc_b, "ticket": "good-ticket"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["verified"], true);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/anticheat/verify",
+        None,
+        true,
+        Some(json!({"provider": "battleye", "account_id": acc_b, "ticket": "forged"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["verified"], false);
+    assert_eq!(r["score"], 50);
+    let (_, a) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{acc_b}/anticheat"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(a["signals"][0]["kind"], "vendor_rejected");
+    assert_eq!(a["signals"][0]["source"], "battleye");
 }

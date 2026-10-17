@@ -55,6 +55,7 @@ pub struct Config {
     pub tracing: TracingConfig,
     pub push: PushConfig,
     pub email: EmailConfig,
+    pub anticheat: AntiCheatConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1199,5 +1200,43 @@ mod validate_tests {
         assert_eq!(errs(&cfg), 0, "{:?}", cfg.validate());
         cfg.session.access_ttl_secs = cfg.session.refresh_ttl_secs;
         assert_eq!(errs(&cfg), 1);
+    }
+}
+
+/// Server-side anti-cheat signals (see `anticheat.rs` in the server).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AntiCheatConfig {
+    pub enabled: bool,
+    /// Match inputs per second per session before an `input_rate` signal (0 = off).
+    pub max_inputs_per_sec: u32,
+    /// Largest accepted match input in bytes (0 = off).
+    pub max_input_bytes: usize,
+    /// Scoring window for `anticheat` queue and the kick threshold.
+    pub window_hours: i64,
+    /// Kick the account from every node when its windowed score reaches this (0 = never).
+    pub kick_score: i64,
+    /// Vendor endpoints that receive `{provider, account_id, ticket}` and answer `{ok: bool}`.
+    pub eac_url: String,
+    pub eac_key: String,
+    pub battleye_url: String,
+    pub battleye_key: String,
+    pub vendor_timeout_secs: u64,
+}
+
+impl Default for AntiCheatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_inputs_per_sec: 120,
+            max_input_bytes: 4096,
+            window_hours: 24,
+            kick_score: 0,
+            eac_url: String::new(),
+            eac_key: String::new(),
+            battleye_url: String::new(),
+            battleye_key: String::new(),
+            vendor_timeout_secs: 5,
+        }
     }
 }
