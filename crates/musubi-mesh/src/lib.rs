@@ -417,6 +417,8 @@ pub struct World {
     /// Co-located entities: authoritative cell forced to a partner's cell until `expires_tick`,
     /// whatever the position says (plan 4.6 `co-locate`).
     pins: HashMap<EntityId, (CellId, u64)>,
+    /// root -> entities attached to it (index over `Entity::attached_to`)
+    children: HashMap<EntityId, Vec<EntityId>>,
     /// Cells running slower than real time (EVE-style time dilation); absent = 1.0.
     cell_scale: HashMap<CellId, f64>,
 }
@@ -427,6 +429,7 @@ impl World {
             cfg,
             tick: 0,
             entities: HashMap::new(),
+            children: HashMap::new(),
             by_cell: CellIndex::default(),
             hibernated: HashSet::new(),
             last_owners: HashMap::new(),
@@ -778,6 +781,12 @@ impl World {
         self.buffered_inputs.remove(&id);
         self.history.remove(&id);
         self.pins.remove(&id);
+        self.unindex_child(e.attached_to, id);
+        for c in self.children.remove(&id).unwrap_or_default() {
+            if let Some(ce) = self.entities.get_mut(&c) {
+                ce.attached_to = None;
+            }
+        }
         true
     }
 
@@ -1195,14 +1204,25 @@ impl World {
         let mut out = Vec::new();
         let mut frontier = vec![root];
         while let Some(r) = frontier.pop() {
-            for e in self.entities.values() {
-                if e.attached_to == Some(r) && !out.contains(&e.id) {
-                    out.push(e.id);
-                    frontier.push(e.id);
+            for c in self.children.get(&r).into_iter().flatten() {
+                if !out.contains(c) {
+                    out.push(*c);
+                    frontier.push(*c);
                 }
             }
         }
         out
+    }
+
+    fn unindex_child(&mut self, root: Option<EntityId>, id: EntityId) {
+        if let Some(r) = root {
+            if let Some(v) = self.children.get_mut(&r) {
+                v.retain(|c| *c != id);
+                if v.is_empty() {
+                    self.children.remove(&r);
+                }
+            }
+        }
     }
 
     /// Make `id` travel with `root` (vehicle, construction): it moves to the root's cell now and
@@ -1219,10 +1239,14 @@ impl World {
             return Err(MeshError::NotAuthoritative("attachment cycle".into()));
         }
         let (cell, tick) = (r.cell, self.tick);
-        let e = self.entities.get_mut(&id).unwrap();
-        e.attached_to = Some(root);
-        e.touched_tick = tick;
-        if e.cell != cell {
+        let (prev, cell_now) = {
+            let e = self.entities.get_mut(&id).unwrap();
+            e.touched_tick = tick;
+            (e.attached_to.replace(root), e.cell)
+        };
+        self.unindex_child(prev, id);
+        self.children.entry(root).or_default().push(id);
+        if cell_now != cell {
             self.move_cell(id, cell);
         }
         Ok(())
@@ -1230,13 +1254,12 @@ impl World {
 
     /// `id` travels on its own again (its cell is re-evaluated by the next `detect_handovers`).
     pub fn detach(&mut self, id: EntityId) -> bool {
-        match self.entities.get_mut(&id) {
-            Some(e) if e.attached_to.is_some() => {
-                e.attached_to = None;
-                true
-            }
-            _ => false,
-        }
+        let prev = match self.entities.get_mut(&id) {
+            Some(e) if e.attached_to.is_some() => e.attached_to.take(),
+            _ => return false,
+        };
+        self.unindex_child(prev, id);
+        true
     }
 
     /// Inputs buffered while `id` was in transit.
@@ -1468,6 +1491,11 @@ impl World {
         for mut e in entities {
             if let Some(old) = self.entities.get(&e.id) {
                 self.by_cell.remove(&old.cell, &e.id, self.tick);
+                let prev = old.attached_to;
+                self.unindex_child(prev, e.id);
+            }
+            if let Some(root) = e.attached_to {
+                self.children.entry(root).or_default().push(e.id);
             }
             e.transit = None;
             e.cell = match self.pins.get(&e.id) {
