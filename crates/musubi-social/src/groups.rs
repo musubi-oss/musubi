@@ -113,10 +113,49 @@ pub struct UpdateGroup {
     pub max_count: Option<i32>,
 }
 
+/// Permission bits a group role may hold (plan 5.4). The owner (rank 0) holds all of them.
+pub mod perm {
+    pub const INVITE: i64 = 1;
+    pub const KICK: i64 = 2;
+    pub const BAN: i64 = 4;
+    pub const ANNOUNCE: i64 = 8;
+    pub const EDIT: i64 = 16;
+    pub const PROMOTE: i64 = 32;
+    pub const TREASURY_DEPOSIT: i64 = 64;
+    pub const TREASURY_WITHDRAW: i64 = 128;
+    pub const ALL: i64 = 255;
+    /// Defaults when a group has not customised the role: admins do everything, members may pay in.
+    pub fn default_for(rank: i16) -> i64 {
+        match rank {
+            0 | 1 => ALL,
+            2 => TREASURY_DEPOSIT,
+            _ => 0,
+        }
+    }
+    pub fn default_name(rank: i16) -> &'static str {
+        match rank {
+            0 => "owner",
+            1 => "admin",
+            2 => "member",
+            _ => "custom",
+        }
+    }
+}
+
+/// A rank in the group's hierarchy: lower rank = more senior. Ranks 0..=2 double as the legacy
+/// superadmin/admin/member states; 3..=7 are extra tiers a group defines itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupRole {
+    pub rank: i16,
+    pub name: String,
+    pub permissions: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupMember {
     pub user: User,
     pub state: MemberState,
+    pub rank: i16,
     #[serde(with = "time::serde::rfc3339")]
     pub update_time: OffsetDateTime,
 }
@@ -277,7 +316,7 @@ impl GroupService {
             Err(e) => return Err(Error::internal(e)),
         };
         sqlx::query(
-            "insert into musubi.group_members (group_id, user_id, state) values ($1, $2, 0)",
+            "insert into musubi.group_members (group_id, user_id, state, rank) values ($1, $2, 0, 0)",
         )
         .bind(id.0)
         .bind(me.0)
@@ -314,7 +353,7 @@ impl GroupService {
             }
         }
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        require_perm(&mut tx, group, me, perm::EDIT).await?;
         let res = sqlx::query_as::<_, GroupRow>(&format!(
             "update musubi.groups g set name = coalesce($2, name), description = coalesce($3, description),
                 avatar_url = coalesce($4, avatar_url), lang = coalesce($5, lang), metadata = coalesce($6, metadata),
@@ -476,7 +515,7 @@ impl GroupService {
         check_users(users)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let g = lock_group(&mut tx, group).await?;
-        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        require_perm(&mut tx, group, me, perm::INVITE).await?;
         let mut edge = g.edge_count;
         for u in users {
             match member_state(&mut tx, group, *u).await? {
@@ -513,12 +552,12 @@ impl GroupService {
         check_users(users)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         lock_group(&mut tx, group).await?;
-        let mine = require_role(&mut tx, group, me, MemberState::Admin).await?;
+        require_perm(&mut tx, group, me, perm::KICK).await?;
         for u in users {
             let Some(theirs) = member_state(&mut tx, group, *u).await? else {
                 continue;
             };
-            if *u == me || theirs <= mine {
+            if *u == me || !outranks(&mut tx, group, me, *u).await? {
                 return Err(Error::PermissionDenied(format!("cannot kick {u}")));
             }
             remove_member(&mut tx, group, *u, theirs).await?;
@@ -551,13 +590,13 @@ impl GroupService {
         }
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         lock_group(&mut tx, group).await?;
-        let mine = require_role(&mut tx, group, me, MemberState::Admin).await?;
+        require_perm(&mut tx, group, me, perm::BAN).await?;
         for u in users {
             if *u == me {
                 return Err(Error::PermissionDenied("cannot ban yourself".into()));
             }
             if let Some(theirs) = member_state(&mut tx, group, *u).await? {
-                if theirs <= mine {
+                if !outranks(&mut tx, group, me, *u).await? {
                     return Err(Error::PermissionDenied(format!("cannot ban {u}")));
                 }
                 remove_member(&mut tx, group, *u, theirs).await?;
@@ -592,7 +631,7 @@ impl GroupService {
         check_users(users)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         lock_group(&mut tx, group).await?;
-        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        require_perm(&mut tx, group, me, perm::BAN).await?;
         for u in users {
             let n =
                 sqlx::query("delete from musubi.group_bans where group_id = $1 and user_id = $2")
@@ -620,7 +659,7 @@ impl GroupService {
     /// Admin+: current bans, newest first.
     pub async fn bans(&self, me: AccountId, group: GroupId, limit: usize) -> Result<Vec<GroupBan>> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        require_perm(&mut tx, group, me, perm::BAN).await?;
         let rows: Vec<BanRow> = sqlx::query_as(
             "select b.user_id, a.username, b.banned_by, b.reason, b.until, b.created_at
                  from musubi.group_bans b join musubi.accounts a on a.id = b.user_id
@@ -660,7 +699,7 @@ impl GroupService {
         }
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         lock_group(&mut tx, group).await?;
-        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        require_perm(&mut tx, group, me, perm::ANNOUNCE).await?;
         sqlx::query(
             "update musubi.groups set announcement = $2, announcement_at = case when $2 is null then null else now() end, updated_at = now() where id = $1",
         )
@@ -734,11 +773,155 @@ impl GroupService {
     }
 
     /// Admin+: raise users one rank (member → admin, admin → superadmin), never above the caller.
+    /// The group's role table: every rank 0..=7 with its name and permission bits (defaults for
+    /// ranks the group has not customised).
+    pub async fn roles(&self, group: GroupId) -> Result<Vec<GroupRole>> {
+        let rows: Vec<(i16, String, i64)> = sqlx::query_as(
+            "select rank, name, permissions from musubi.group_roles where group_id = $1",
+        )
+        .bind(group.0)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok((0..=7i16)
+            .map(|rank| {
+                rows.iter()
+                    .find(|r| r.0 == rank)
+                    .map(|r| GroupRole {
+                        rank,
+                        name: r.1.clone(),
+                        permissions: r.2,
+                    })
+                    .unwrap_or(GroupRole {
+                        rank,
+                        name: perm::default_name(rank).into(),
+                        permissions: perm::default_for(rank),
+                    })
+            })
+            .collect())
+    }
+
+    /// Owner only: define names and permissions for ranks 1..=7 (rank 0 always holds everything).
+    pub async fn set_roles(
+        &self,
+        me: AccountId,
+        group: GroupId,
+        roles: &[GroupRole],
+    ) -> Result<Vec<GroupRole>> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        require_role(&mut tx, group, me, MemberState::Superadmin).await?;
+        for r in roles {
+            if !(1..=7).contains(&r.rank) {
+                return Err(Error::InvalidArgument("rank must be 1..=7".into()));
+            }
+            if r.name.is_empty() || r.name.len() > 32 {
+                return Err(Error::InvalidArgument(
+                    "role name must be 1..=32 chars".into(),
+                ));
+            }
+            if r.permissions & !perm::ALL != 0 {
+                return Err(Error::InvalidArgument("unknown permission bits".into()));
+            }
+            sqlx::query(
+                "insert into musubi.group_roles (group_id, rank, name, permissions) values ($1, $2, $3, $4)
+                 on conflict (group_id, rank) do update set name = $3, permissions = $4",
+            )
+            .bind(group.0)
+            .bind(r.rank)
+            .bind(&r.name)
+            .bind(r.permissions)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        }
+        log_event(
+            &mut tx,
+            group,
+            "roles_updated",
+            Some(me),
+            None,
+            serde_json::json!({ "ranks": roles.iter().map(|r| r.rank).collect::<Vec<_>>() }),
+        )
+        .await?;
+        tx.commit().await.map_err(Error::internal)?;
+        self.roles(group).await
+    }
+
+    /// Move members to `rank` (1..=7). Needs PROMOTE; the caller can only hand out ranks junior
+    /// to their own and only touch members junior to them. Ranks 1..=2 also set the legacy state.
+    pub async fn set_rank(
+        &self,
+        me: AccountId,
+        group: GroupId,
+        users: &[AccountId],
+        rank: i16,
+    ) -> Result<()> {
+        if !(1..=7).contains(&rank) {
+            return Err(Error::InvalidArgument("rank must be 1..=7".into()));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        require_perm(&mut tx, group, me, perm::PROMOTE).await?;
+        let my_rank: i16 = sqlx::query_scalar(
+            "select rank from musubi.group_members where group_id = $1 and user_id = $2",
+        )
+        .bind(group.0)
+        .bind(me.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if rank <= my_rank {
+            return Err(Error::PermissionDenied(
+                "cannot grant a rank at or above your own".into(),
+            ));
+        }
+        for u in users {
+            let theirs: Option<(i16, i16)> = sqlx::query_as(
+                "select state, rank from musubi.group_members where group_id = $1 and user_id = $2 for update",
+            )
+            .bind(group.0)
+            .bind(u.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            let Some((state, their_rank)) = theirs else {
+                return Err(Error::NotFound("member".into()));
+            };
+            if state == i16::from(MemberState::JoinRequest) {
+                return Err(Error::InvalidArgument("member has not joined".into()));
+            }
+            if their_rank <= my_rank {
+                return Err(Error::PermissionDenied(
+                    "cannot change a senior member".into(),
+                ));
+            }
+            sqlx::query(
+                "update musubi.group_members set rank = $3, state = least($3, 2), updated_at = now() where group_id = $1 and user_id = $2",
+            )
+            .bind(group.0)
+            .bind(u.0)
+            .bind(rank)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            log_event(
+                &mut tx,
+                group,
+                "rank_changed",
+                Some(me),
+                Some(*u),
+                serde_json::json!({ "rank": rank, "from": their_rank }),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(())
+    }
+
     pub async fn promote(&self, me: AccountId, group: GroupId, users: &[AccountId]) -> Result<()> {
         check_users(users)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         lock_group(&mut tx, group).await?;
-        let mine = require_role(&mut tx, group, me, MemberState::Admin).await?;
+        let mine = require_perm(&mut tx, group, me, perm::PROMOTE).await?;
         for u in users {
             let theirs = member_state(&mut tx, group, *u)
                 .await?
@@ -769,7 +952,7 @@ impl GroupService {
         check_users(users)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         lock_group(&mut tx, group).await?;
-        let mine = require_role(&mut tx, group, me, MemberState::Admin).await?;
+        let mine = require_perm(&mut tx, group, me, perm::PROMOTE).await?;
         for u in users {
             let theirs = member_state(&mut tx, group, *u)
                 .await?
@@ -870,7 +1053,7 @@ impl GroupService {
             None => None,
         };
         let rows = sqlx::query_as::<_, MemberRow>(
-            "select a.id, a.username, a.display_name, a.avatar_url, a.lang, a.location, a.metadata, a.created_at, m.state, m.updated_at
+            "select a.id, a.username, a.display_name, a.avatar_url, a.lang, a.location, a.metadata, a.created_at, m.state, m.updated_at, m.rank
              from musubi.group_members m join musubi.accounts a on a.id = m.user_id
              where m.group_id = $1 and a.deleted_at is null
                and ($2::smallint is null or m.state = $2)
@@ -902,6 +1085,7 @@ impl GroupService {
                     created_at: r.7,
                 },
                 state: MemberState::try_from(r.8).unwrap_or(MemberState::JoinRequest),
+                rank: r.10,
                 update_time: r.9,
             })
             .collect();
@@ -967,6 +1151,7 @@ type MemberRow = (
     OffsetDateTime,
     i16,
     OffsetDateTime,
+    i16,
 );
 
 struct Locked {
@@ -1060,10 +1245,12 @@ async fn insert_member(
     user: AccountId,
     state: MemberState,
 ) -> Result<()> {
-    sqlx::query("insert into musubi.group_members (group_id, user_id, state) values ($1, $2, $3)")
-        .bind(group.0)
-        .bind(user.0)
-        .bind(i16::from(state))
+    sqlx::query(
+        "insert into musubi.group_members (group_id, user_id, state, rank) values ($1, $2, $3, least($3, 2))",
+    )
+    .bind(group.0)
+    .bind(user.0)
+    .bind(i16::from(state))
         .execute(&mut **tx)
         .await
         .map_err(Error::internal)?;
@@ -1073,13 +1260,97 @@ async fn insert_member(
     Ok(())
 }
 
+/// Caller must be a member whose role holds `bit` (the owner always does). Returns the caller's
+/// legacy state so rank comparisons keep working.
+async fn require_perm(
+    tx: &mut Transaction<'_, Postgres>,
+    group: GroupId,
+    me: AccountId,
+    bit: i64,
+) -> Result<MemberState> {
+    let row: Option<(i16, i16)> = sqlx::query_as(
+        "select m.state, m.rank from musubi.group_members m where m.group_id = $1 and m.user_id = $2 for update",
+    )
+    .bind(group.0)
+    .bind(me.0)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    let Some((state, rank)) = row else {
+        let exists: Option<i64> =
+            sqlx::query_scalar("select 1::bigint from musubi.groups where id = $1")
+                .bind(group.0)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(Error::internal)?;
+        return Err(if exists.is_none() {
+            Error::NotFound("group".into())
+        } else {
+            Error::PermissionDenied("not a member".into())
+        });
+    };
+    let state = MemberState::try_from(state).map_err(Error::Internal)?;
+    if state == MemberState::JoinRequest {
+        return Err(Error::PermissionDenied("not a member".into()));
+    }
+    if rank == 0
+        || state == MemberState::Superadmin
+        || role_permissions(tx, group, rank).await? & bit != 0
+    {
+        Ok(state)
+    } else {
+        Err(Error::PermissionDenied("role lacks permission".into()))
+    }
+}
+
+/// `me` is strictly senior to `other` in the rank hierarchy (lower rank wins; the owner beats all).
+async fn outranks(
+    tx: &mut Transaction<'_, Postgres>,
+    group: GroupId,
+    me: AccountId,
+    other: AccountId,
+) -> Result<bool> {
+    let rank = |u: AccountId| {
+        sqlx::query_scalar::<_, i16>(
+            "select rank from musubi.group_members where group_id = $1 and user_id = $2",
+        )
+        .bind(group.0)
+        .bind(u.0)
+    };
+    let mine: i16 = rank(me)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    let theirs: Option<i16> = rank(other)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    Ok(theirs.is_none_or(|t| t > mine))
+}
+
+async fn role_permissions(
+    tx: &mut Transaction<'_, Postgres>,
+    group: GroupId,
+    rank: i16,
+) -> Result<i64> {
+    let p: Option<i64> = sqlx::query_scalar(
+        "select permissions from musubi.group_roles where group_id = $1 and rank = $2",
+    )
+    .bind(group.0)
+    .bind(rank)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(p.unwrap_or_else(|| perm::default_for(rank)))
+}
+
 async fn set_state(
     tx: &mut Transaction<'_, Postgres>,
     group: GroupId,
     user: AccountId,
     state: MemberState,
 ) -> Result<()> {
-    let prev: i16 = sqlx::query_scalar("update musubi.group_members m set state = $3, updated_at = now() from (select state from musubi.group_members where group_id = $1 and user_id = $2) o where m.group_id = $1 and m.user_id = $2 returning o.state")
+    let prev: i16 = sqlx::query_scalar("update musubi.group_members m set state = $3, rank = case when $3 < 2 then $3 else greatest(m.rank, 2) end, updated_at = now() from (select state from musubi.group_members where group_id = $1 and user_id = $2) o where m.group_id = $1 and m.user_id = $2 returning o.state")
         .bind(group.0)
         .bind(user.0)
         .bind(i16::from(state))

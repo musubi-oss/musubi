@@ -21,6 +21,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/groups/{id}/add", post(add))
         .route("/v1/groups/{id}/kick", post(kick))
         .route("/v1/groups/{id}/promote", post(promote))
+        .route("/v1/groups/{id}/roles", get(roles).put(set_roles))
+        .route("/v1/groups/{id}/rank", post(set_rank))
         .route("/v1/groups/{id}/demote", post(demote))
         .route("/v1/groups/{id}/members", get(members))
         .route("/v1/groups/{id}/ban", post(ban).delete(unban))
@@ -192,6 +194,54 @@ moderation!(add);
 moderation!(kick);
 moderation!(promote);
 moderation!(demote);
+
+async fn roles(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+    Path(id): Path<GroupId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(json!({ "roles": groups(&s).roles(id).await? })))
+}
+
+#[derive(Deserialize)]
+struct RolesReq {
+    roles: Vec<musubi_social::groups::GroupRole>,
+}
+
+async fn set_roles(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(r): Json<RolesReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let roles = groups(&s).set_roles(me.account_id, id, &r.roles).await?;
+    Ok(Json(json!({ "roles": roles })))
+}
+
+#[derive(Deserialize)]
+struct RankReq {
+    ids: Vec<AccountId>,
+    rank: i16,
+}
+
+async fn set_rank(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(r): Json<RankReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .set_rank(me.account_id, id, &r.ids, r.rank)
+        .await?;
+    s.events
+        .emit(
+            "group.rank",
+            Some(me.account_id),
+            json!({ "group_id": id, "ids": r.ids, "rank": r.rank }),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true })))
+}
 
 async fn members(
     State(s): State<AppState>,

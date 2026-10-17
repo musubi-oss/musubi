@@ -10129,3 +10129,178 @@ async fn email_login_captcha_gate_and_session_ips() {
         "{ips:?}"
     );
 }
+
+#[tokio::test]
+async fn groups_roles_bitmask_and_ranks() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("gr")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, _a) = &users[0];
+    let (tb, b) = &users[1];
+    let (tc, c) = &users[2];
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(ta),
+        Some(json!({"name": unique("clan"), "open": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    for t in [tb, tc] {
+        let (st, _) = call(
+            &app,
+            "POST",
+            &format!("/v1/groups/{gid}/join"),
+            Some(t),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    // defaults: eight ranks, members may only pay into the treasury
+    let (st, r) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/roles"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["roles"].as_array().unwrap().len(), 8);
+    assert_eq!(r["roles"][2]["permissions"], 64);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/kick"),
+        Some(tb),
+        Some(json!({"ids": [c]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "plain member cannot kick");
+    // only the owner defines roles: members may kick and announce, a junior "recruit" tier (3) may do nothing
+    let officer = json!({"roles": [{"rank": 2, "name": "member", "permissions": 2 | 8}, {"rank": 3, "name": "recruit", "permissions": 0}]});
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("/v1/groups/{gid}/roles"),
+        Some(tb),
+        Some(officer.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, r) = call(
+        &app,
+        "PUT",
+        &format!("/v1/groups/{gid}/roles"),
+        Some(ta),
+        Some(officer),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["roles"][3]["name"], "recruit");
+    assert_eq!(r["roles"][2]["permissions"], 10);
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("/v1/groups/{gid}/roles"),
+        Some(ta),
+        Some(json!({"roles": [{"rank": 0, "name": "x", "permissions": 1}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/rank"),
+        Some(ta),
+        Some(json!({"ids": [c], "rank": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/members"),
+        Some(ta),
+        None,
+    )
+    .await;
+    let rank_b = m["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["user"]["id"] == json!(c))
+        .map(|x| x["rank"].clone());
+    assert_eq!(rank_b, Some(json!(3)), "{m}");
+    // a member may kick the junior recruit now, but cannot hand out ranks (no PROMOTE)
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/rank"),
+        Some(tb),
+        Some(json!({"ids": [c], "rank": 4})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/kick"),
+        Some(tb),
+        Some(json!({"ids": [c]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // the owner cannot be out-ranked: rank 0 is not grantable, and nobody can change the owner
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/rank"),
+        Some(ta),
+        Some(json!({"ids": [b], "rank": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // rank 1 also makes an admin in the legacy sense
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/rank"),
+        Some(ta),
+        Some(json!({"ids": [b], "rank": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/members?state=1"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert!(
+        m["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["user"]["id"] == json!(b)),
+        "{m}"
+    );
+}
