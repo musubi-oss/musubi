@@ -371,11 +371,12 @@ impl MatchRegistry {
         me: &UserPresence,
         match_id: &str,
         metadata: HashMap<String, String>,
+        spectator: bool,
     ) -> Result<ServerMessage> {
         let h = self
             .get(match_id)
             .ok_or_else(|| Error::NotFound("match".into()))?;
-        let snap = h.join(me.clone(), metadata).await?;
+        let snap = h.join(me.clone(), metadata, spectator).await?;
         self.by_session
             .entry(me.session_id)
             .or_default()

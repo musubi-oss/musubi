@@ -148,6 +148,9 @@ pub enum ClientMessage {
         token: Option<String>,
         #[serde(default)]
         metadata: std::collections::HashMap<String, String>,
+        /// Watch only (authoritative matches): not a player, inputs refused.
+        #[serde(default)]
+        spectator: bool,
     },
     MatchLeave {
         match_id: String,

@@ -982,6 +982,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1074,6 +1075,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             match_id: Some(mid),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1112,6 +1114,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             match_id: None,
             token: Some(tok.clone()),
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1127,6 +1130,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             match_id: None,
             token: Some(tok),
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1141,6 +1145,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             match_id: None,
             token: Some("bogus".into()),
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1337,6 +1342,7 @@ async fn authoritative_echo_match_lifecycle() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1356,6 +1362,7 @@ async fn authoritative_echo_match_lifecycle() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1379,6 +1386,7 @@ async fn authoritative_echo_match_lifecycle() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1489,6 +1497,7 @@ async fn match_snapshots_persist_and_resume_on_another_registry() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1606,6 +1615,7 @@ async fn wasm_match_module_runs_as_authoritative_match() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -1973,6 +1983,7 @@ async fn quic_unreliable_match_data_uses_datagrams() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         }),
     )
     .await
@@ -2047,6 +2058,7 @@ async fn cross_node_relayed_match() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -5009,6 +5021,7 @@ async fn match_join_records_recent_players() {
             match_id: Some(mid.clone()),
             token: None,
             metadata: Default::default(),
+            spectator: false,
         },
     )
     .await;
@@ -8404,4 +8417,133 @@ async fn matchmaker_ready_check_delivers_requeues_and_penalises_dodgers() {
     send(&mut a, f, Some("p"), ClientMessage::Ping).await;
     let r = recv(&mut a).await;
     assert_eq!(r.cid.as_deref(), Some("p"), "{:?}", r.msg);
+}
+
+#[tokio::test]
+async fn spectator_watches_without_playing() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"module": "echo", "params": {"tick_rate": 20, "max_players": 1, "label": "spec", "empty_ticks": 100}}).to_string()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    let join = |spectator: bool| ClientMessage::MatchJoin {
+        match_id: Some(mid.clone()),
+        token: None,
+        metadata: Default::default(),
+        spectator,
+    };
+    send(&mut a, f, None, join(false)).await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Match {
+            authoritative: true,
+            size: 1,
+            ..
+        }
+    ));
+    // the spectator gets in although the match is full, and is not counted
+    send(&mut b, f, None, join(true)).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Match {
+            authoritative: true,
+            size: 1,
+            ..
+        }
+    ));
+    send(&mut c, f, None, join(false)).await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::ResourceExhausted,
+            ..
+        }
+    ));
+    // spectator input is refused
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 1,
+            data: vec![9],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::PermissionDenied,
+            ..
+        }
+    ));
+    // the player's input, echoed by the handler, reaches the spectator too
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 5,
+            data: vec![1, 2],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::MatchData { op_code, data, .. } => {
+                assert_eq!(op_code, 5);
+                assert_eq!(data, vec![1, 2]);
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    // the spectator leaving does not disturb the players
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 6,
+            data: vec![3],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchData { op_code: 6, .. }
+    ));
 }

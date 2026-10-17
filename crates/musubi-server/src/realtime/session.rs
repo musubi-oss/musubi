@@ -701,6 +701,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             match_id,
             token,
             metadata,
+            spectator,
         } => {
             if let Some(id) = match_id
                 .as_deref()
@@ -708,7 +709,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             {
                 return Some(
                     ctx.matches
-                        .join(ctx.presence, id, metadata)
+                        .join(ctx.presence, id, metadata, spectator)
                         .await
                         .unwrap_or_else(|e| ServerMessage::error(&e)),
                 );
@@ -749,6 +750,11 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             reliable,
         } => {
             if let Some(h) = ctx.matches.get(&match_id) {
+                if h.info().await.spectators.contains(&ctx.presence.session_id) {
+                    return Some(ServerMessage::error(&Error::PermissionDenied(
+                        "spectators cannot send match data".into(),
+                    )));
+                }
                 return h
                     .data(musubi_actor::Input {
                         presence: ctx.presence.clone(),

@@ -217,12 +217,15 @@ pub struct MatchInfo {
     pub tick_rate: u32,
     pub tick: u64,
     pub state_bytes: usize,
+    /// Sessions watching without playing.
+    pub spectators: Vec<SessionId>,
 }
 
 enum Cmd {
     Join {
         presence: UserPresence,
         metadata: HashMap<String, String>,
+        spectator: bool,
         reply: oneshot::Sender<Result<ServerMessage>>,
     },
     Leave {
@@ -242,16 +245,20 @@ pub struct MatchHandle {
 }
 
 impl MatchHandle {
+    /// `spectator`: watch only — receives match data and presence events, is not counted as a
+    /// player, never reaches the handler, and its own inputs are refused.
     pub async fn join(
         &self,
         presence: UserPresence,
         metadata: HashMap<String, String>,
+        spectator: bool,
     ) -> Result<ServerMessage> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Cmd::Join {
                 presence,
                 metadata,
+                spectator,
                 reply,
             })
             .await
@@ -340,6 +347,7 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
     }
     let id = sp.id.unwrap_or_default();
     let info = Arc::new(RwLock::new(MatchInfo {
+        spectators: Vec::new(),
         match_id: id.to_string(),
         module: sp.module.clone(),
         label: init.label.clone(),
@@ -423,6 +431,7 @@ async fn run(
     let mut state = init.state;
     let mut label = init.label;
     let mut members: Vec<UserPresence> = Vec::new();
+    let mut spectators: Vec<UserPresence> = Vec::new();
     let mut inputs: Vec<Input> = Vec::new();
     let mut tick: u64 = persist.start_tick;
     let mut interval = tokio::time::interval(Duration::from_millis(1000 / init.tick_rate as u64));
@@ -436,7 +445,16 @@ async fn run(
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    Cmd::Join { presence, metadata, reply } => {
+                    Cmd::Join { presence, metadata, spectator, reply } => {
+                        if spectator {
+                            if !spectators.iter().any(|p| p.session_id == presence.session_id) {
+                                spectators.push(presence.clone());
+                            }
+                            let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
+                            let mut i = info.write().await;
+                            i.spectators = spectators.iter().map(|p| p.session_id).collect();
+                            continue;
+                        }
                         if members.iter().any(|p| p.session_id == presence.session_id) {
                             let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
                             continue;
@@ -465,6 +483,12 @@ async fn run(
                         }
                     }
                     Cmd::Leave { session } => {
+                        if let Some(idx) = spectators.iter().position(|p| p.session_id == session) {
+                            spectators.remove(idx);
+                            let mut i = info.write().await;
+                            i.spectators = spectators.iter().map(|p| p.session_id).collect();
+                            continue;
+                        }
                         if let Some(idx) = members.iter().position(|p| p.session_id == session) {
                             let gone = members.remove(idx);
                             if journaling {
@@ -474,7 +498,7 @@ async fn run(
                                 Ok(s) => state = s,
                                 Err(e) => tracing::error!(%match_id, error = %e, "leave handler failed"),
                             }
-                            deliver(sessions(&members), ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![], leaves: vec![gone] });
+                            deliver(watchers(&members, &spectators), ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![], leaves: vec![gone] });
                         }
                     }
                     Cmd::Data(input) => {
@@ -513,7 +537,7 @@ async fn run(
                 state = res.state;
                 if let Some(l) = res.label { label = l; }
                 for out in res.outbound {
-                    let to = if out.to.is_empty() { sessions(&members) } else { out.to };
+                    let to = if out.to.is_empty() { watchers(&members, &spectators) } else { out.to };
                     deliver(to, ServerMessage::MatchData { match_id: match_id.clone(), presence: None, op_code: out.op_code, data: out.data, reliable: out.reliable });
                 }
                 {
@@ -536,7 +560,7 @@ async fn run(
     if let Err(e) = handler.terminate(std::mem::take(&mut state), 0) {
         tracing::warn!(%match_id, error = %e, "terminate handler failed");
     }
-    let all = sessions(&members);
+    let all = watchers(&members, &spectators);
     if !all.is_empty() {
         deliver(
             all,
@@ -549,6 +573,15 @@ async fn run(
     }
     persist.clear(id);
     on_end(id);
+}
+
+/// Players plus spectators: everyone who receives what the match sends.
+fn watchers(members: &[UserPresence], spectators: &[UserPresence]) -> Vec<SessionId> {
+    members
+        .iter()
+        .chain(spectators.iter())
+        .map(|p| p.session_id)
+        .collect()
 }
 
 fn snapshot(
