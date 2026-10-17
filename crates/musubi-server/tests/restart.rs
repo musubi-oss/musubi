@@ -601,3 +601,184 @@ async fn killed_node_rejoins_with_same_identity() {
     assert_eq!(back[0], ids[victim]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A node that freezes (SIGSTOP: a long GC-like pause, a frozen VM, a one-way partition) is
+/// declared dead and its world moves; when it thaws it must not take the world back — the
+/// directory and the epoch-checked ownership row are the fence — and it rejoins as a live member.
+#[tokio::test]
+async fn stalled_node_is_fenced_and_rejoins_after_thaw() {
+    let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("musubi-stall-{}", uuid::Uuid::now_v7().simple()));
+    let group = format!("stall-{}", uuid::Uuid::now_v7().simple());
+    let mut nodes: Vec<Node> = (0..3)
+        .map(|i| Node {
+            http: free_port(false),
+            bus: free_port(true),
+            dir: root.join(format!("n{i}")),
+            child: None,
+        })
+        .collect();
+    for (i, n) in nodes.iter_mut().enumerate() {
+        spawn(n, &db, &group, &format!("n{i}"));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    wait_quorum(&client, &nodes).await;
+    let ids = node_ids(&client, &nodes).await;
+
+    let mut victim = 0;
+    for (i, n) in nodes.iter().enumerate() {
+        let r = get(&client, n, "/v1/server/cluster/raft").await.unwrap();
+        if r["is_leader"] != true {
+            victim = i;
+            break;
+        }
+    }
+    let other = (victim + 1) % 3;
+    let world = format!("w-{}", uuid::Uuid::now_v7().simple());
+    let res = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/server/worlds",
+            nodes[victim].http
+        ))
+        .header("x-musubi-server-key", KEY)
+        .json(&serde_json::json!({ "name": world, "config": {}, "controller": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let key = format!("world:{world}");
+    let home = |n: usize| {
+        let client = client.clone();
+        let key = key.clone();
+        let nodes: Vec<u16> = nodes.iter().map(|n| n.http).collect();
+        async move {
+            let n = Node {
+                http: nodes[n],
+                bus: 0,
+                dir: Default::default(),
+                child: None,
+            };
+            get(&client, &n, &format!("/v1/server/cluster/directory/{key}"))
+                .await
+                .and_then(|v| v["value"]["node_id"].as_str().map(String::from))
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while home(other).await.as_deref() != Some(ids[victim].as_str()) {
+        assert!(Instant::now() < deadline, "directory not replicated");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let r = get(&client, &nodes[victim], "/v1/server/cluster/raft")
+        .await
+        .unwrap();
+    assert_ne!(
+        r["is_leader"], true,
+        "victim became leader; test picks followers"
+    );
+
+    let pid = nodes[victim]
+        .child
+        .as_ref()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+    let signal = |sig: &str| {
+        assert!(std::process::Command::new("kill")
+            .args([sig, &pid])
+            .status()
+            .unwrap()
+            .success());
+    };
+    let frozen = Instant::now();
+    signal("-STOP");
+
+    // the survivors declare it dead and re-home the world
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let new_home = loop {
+        if let Some(h) = home(other).await {
+            if h != ids[victim] && ids.contains(&h) {
+                break h;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "world not re-homed while victim frozen"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    eprintln!("re-homed after {:?}", frozen.elapsed());
+    // and mark it dead (the database heartbeat fence lags SWIM by a few seconds)
+    let victim_alive = |n: usize| {
+        let client = client.clone();
+        let http = nodes[n].http;
+        let vid = ids[victim].clone();
+        async move {
+            let n = Node {
+                http,
+                bus: 0,
+                dir: Default::default(),
+                child: None,
+            };
+            get(&client, &n, "/v1/server/cluster/nodes")
+                .await
+                .and_then(|v| {
+                    v["nodes"]
+                        .as_array()?
+                        .iter()
+                        .find(|n| n["id"].as_str() == Some(vid.as_str()))
+                        .map(|n| n["alive"] == true)
+                })
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while victim_alive(other).await != Some(false) {
+        assert!(
+            Instant::now() < deadline,
+            "frozen node still alive in the listing"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    eprintln!("marked dead after {:?}", frozen.elapsed());
+
+    signal("-CONT");
+    // thawed: it rejoins, agrees on the directory, and does not take the world back
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let back = victim_alive(other).await;
+        let seen = home(victim).await;
+        if back == Some(true) && seen.as_deref() == Some(new_home.as_str()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "thawed node did not rejoin: alive {back:?}, its view {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        home(other).await.as_deref(),
+        Some(new_home.as_str()),
+        "world stolen back"
+    );
+    assert_eq!(home(victim).await.as_deref(), Some(new_home.as_str()));
+    // the thawed node still serves: it can create a world of its own
+    let res = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/server/worlds",
+            nodes[victim].http
+        ))
+        .header("x-musubi-server-key", KEY)
+        .json(&serde_json::json!({ "name": format!("{world}-b"), "config": {}, "controller": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.status());
+    let _ = std::fs::remove_dir_all(&root);
+}

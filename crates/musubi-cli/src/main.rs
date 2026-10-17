@@ -139,7 +139,7 @@ enum Cmd {
         /// seconds to wait before restarting a killed node
         #[arg(long, default_value_t = 0)]
         rejoin_delay_secs: u64,
-        /// kill | drain | mixed
+        /// kill | drain | mixed | stall (SIGSTOP until the survivors recover, then SIGCONT)
         #[arg(long, default_value = "mixed")]
         mode: String,
         /// random | leader

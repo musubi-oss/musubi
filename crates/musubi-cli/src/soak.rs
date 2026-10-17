@@ -152,6 +152,14 @@ fn spawn(bin: &PathBuf, n: &mut Node, db: &str, group: &str) -> anyhow::Result<(
 
 /// Node stdout/stderr go to `$MUSUBI_SOAK_NODE_LOG_DIR/<name>.log` when set (appended across restarts),
 /// otherwise it is discarded.
+fn freeze(child: &tokio::process::Child, sig: &str) {
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .status();
+    }
+}
+
 fn node_log(n: &Node) -> Stdio {
     match std::env::var("MUSUBI_SOAK_NODE_LOG_DIR") {
         Ok(dir) => std::fs::OpenOptions::new()
@@ -597,8 +605,8 @@ async fn storage_client(
 pub async fn run(o: Opts) -> anyhow::Result<()> {
     anyhow::ensure!(o.nodes >= 3, "need at least 3 nodes for a Raft quorum");
     anyhow::ensure!(
-        matches!(o.mode.as_str(), "kill" | "drain" | "mixed"),
-        "mode must be kill | drain | mixed"
+        matches!(o.mode.as_str(), "kill" | "drain" | "mixed" | "stall"),
+        "mode must be kill | drain | mixed | stall"
     );
     let bin = match o.server_bin {
         Some(b) => b,
@@ -788,6 +796,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let action: &'static str = match o.mode.as_str() {
             "kill" => "kill",
             "drain" => "drain",
+            "stall" => "stall",
             _ => {
                 toggle = !toggle;
                 if toggle {
@@ -826,6 +835,9 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let mut child = nodes[victim].child.take().unwrap();
         if action == "kill" {
             let _ = child.kill().await;
+        } else if action == "stall" {
+            // a frozen process: SIGSTOP until the survivors have recovered, then SIGCONT
+            freeze(&child, "-STOP");
         } else {
             let res = client
                 .post(format!(
@@ -839,7 +851,9 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                 let _ = child.kill().await;
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        if action != "stall" {
+            let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        }
         let budget = Duration::from_secs(60);
         let mut timed_out = false;
         // detected: every survivor stopped listing the victim
@@ -1000,7 +1014,12 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         // restart on the same ports/data dir
         tokio::time::sleep(o.rejoin_delay).await;
         let t1 = Instant::now();
-        spawn(&bin, &mut nodes[victim], &o.database_url, &group)?;
+        if action == "stall" {
+            freeze(&child, "-CONT");
+            nodes[victim].child = Some(child);
+        } else {
+            spawn(&bin, &mut nodes[victim], &o.database_url, &group)?;
+        }
         let rejoined_ms = match tokio::time::timeout(budget, async {
             let id = node_id(&client, &nodes[victim]).await?;
             loop {
