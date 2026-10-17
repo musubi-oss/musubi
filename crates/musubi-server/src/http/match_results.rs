@@ -50,8 +50,17 @@ struct Report {
     quest_event: Option<QuestEvent>,
     /// XP per rank on a progression track.
     progression: Option<Progression>,
+    /// Decide a tournament bracket match with this result: the rank-1 team's participant wins.
+    #[serde(default)]
+    bracket_match: Option<BracketRef>,
     #[serde(default)]
     metadata: Value,
+}
+
+#[derive(Deserialize)]
+struct BracketRef {
+    tournament_id: String,
+    match_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -195,6 +204,61 @@ async fn report(
             }
             pj["stats"] = p.stats.clone();
             out["players"].as_array_mut().unwrap().push(pj);
+        }
+    }
+    if let Some(bm) = &r.bracket_match {
+        let best = ranks
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, rk)| **rk)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let ids: Vec<Uuid> = r.teams[best].players.iter().map(|p| p.account_id).collect();
+        let res = s
+            .tournaments
+            .bracket_update(&bm.tournament_id, |b| {
+                use musubi_leaderboard::bracket::Slot;
+                let m = b
+                    .matches
+                    .iter()
+                    .find(|m| m.id == bm.match_id)
+                    .ok_or_else(|| Error::NotFound(format!("bracket match {}", bm.match_id)))?;
+                let winner = [m.a, m.b]
+                    .into_iter()
+                    .find_map(|sl| match sl {
+                        Slot::Player(p) if ids.contains(&p) => Some(p),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(
+                            "the winning team has no participant of this bracket match".into(),
+                        )
+                    })?;
+                musubi_leaderboard::bracket::report(
+                    b,
+                    bm.match_id,
+                    winner,
+                    json!({ "ranks": ranks }),
+                    Some(id.clone()),
+                )
+                .map(|ready| (winner, ready))
+            })
+            .await;
+        match res {
+            Ok((b, (winner, ready))) => {
+                super::tournaments::emit_bracket(
+                    &s,
+                    &bm.tournament_id,
+                    bm.match_id,
+                    winner,
+                    &ready,
+                    b.champion,
+                )
+                .await;
+                out["bracket"] = json!({ "tournament_id": bm.tournament_id, "match": bm.match_id,
+                    "winner": winner, "ready": ready, "champion": b.champion });
+            }
+            Err(e) => out["bracket_error"] = json!(e.to_string()),
         }
     }
     sqlx::query("update musubi.match_results set result = $2 where match_id = $1")

@@ -139,7 +139,7 @@ pub struct TournamentFilter {
 
 #[derive(Clone)]
 pub struct TournamentService {
-    db: PgPool,
+    pub(crate) db: PgPool,
 }
 
 type Row = (

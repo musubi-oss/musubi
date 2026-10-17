@@ -1,5 +1,6 @@
 //! Leaderboards: definitions, score submission with operators, ranked listing and reset windows.
 
+pub mod bracket;
 pub mod rating;
 pub mod tournament;
 pub use rating::{

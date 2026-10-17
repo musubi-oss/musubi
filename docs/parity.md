@@ -66,7 +66,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Лидерборды: операторы, сброс по cron, around | ✅ | 🟡 | ✅ | ✅ | ✅ |
 | Лиги / дивизионы (promote/demote по тирам) | ✅ `League` в `musubi-leaderboard` | ❌ | ❌ | ❌ | ❌ |
 | Турниры: окно, join_code, призы по рангам, командные | ✅ | 🟡 | ✅ | 🟡 | 🟡 |
-| Брекеты (single/double elimination, swiss) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Брекеты (single/double elimination, swiss) | ✅ `POST /v1/server/tournaments/{id}/bracket`: сид по счёту/порядку/рандому/списку, byes, double elim с losers bracket, swiss без рематчей; результат через end-game report (`bracket_match`) | ❌ | ❌ | ❌ | ❌ |
 | Рейтинги Elo / Glicko-2 / OpenSkill, сезоны, decay | ✅ `rating.rs` | 🟡 | ❌ | ❌ | 🟡 |
 | Достижения, квесты, стрики, энергия, прогрессия | ✅ `musubi-economy` | 🟡 | Hiro платно | ✅ | ✅ |
 | Сезоны / баттл-пасс | ✅ | ❌ | Hiro | ✅ | ✅ |
@@ -163,7 +163,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 11. ~~**RBAC операторов**~~ ✅ (роли ключей); мультипроект и SSO операторов — открыто.
 12. ~~**Подписки IAP** (продление, grace), WebPush, SMTP-провайдер~~ ✅.
 13. ~~**Схемы player data и миграции**, live-подписки на объекты, вторичные индексы~~ ✅.
-14. **Брекеты турниров**, крафт, UGC.
+14. ~~**Брекеты турниров**~~ ✅; крафт, UGC — открыто.
 15. **Античит-сигналы**: серверная валидация ввода в authoritative-матчах, интеграция EAC/BattlEye.
 16. **Dev-инструменты**: фикстуры, запись/воспроизведение запросов, канареечный rollout модулей, Helm.
 17. **Геороутинг**, scale-to-zero флотов, Edgegap/GameLift как провайдеры.

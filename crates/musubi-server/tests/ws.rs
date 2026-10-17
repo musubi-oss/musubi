@@ -10759,3 +10759,321 @@ async fn storage_schemas_validate_migrate_index_and_stream() {
     let (st, _) = http_json(&router, "GET", &schema_path, None, true, None).await;
     assert_eq!(st, 404);
 }
+
+#[tokio::test]
+async fn tournament_bracket_single_and_swiss() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let make = |suffix: &str| format!("cup-{}-{suffix}", uuid::Uuid::now_v7().simple());
+    let tid = make("single");
+    let (st, r) = http_json(&router, "POST", "/v1/server/tournaments", None, true, Some(json!({
+        "id": tid, "title": "Cup", "duration": 3600, "max_size": 16, "max_num_score": 10, "join_required": true
+    }))).await;
+    assert_eq!(st, 200, "{r}");
+    let mut players = Vec::new();
+    for i in 0..5 {
+        let (t, acc) = token(&router).await;
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/tournaments/{tid}/join"),
+            Some(&t),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/tournaments/{tid}/records"),
+            Some(&t),
+            false,
+            Some(json!({"score": (5 - i) * 10})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        players.push(acc.to_string());
+    }
+    let bpath = format!("/v1/server/tournaments/{tid}/bracket");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &bpath,
+        None,
+        true,
+        Some(json!({"format": "single"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["rounds"], 3);
+    assert_eq!(r["matches"].as_array().unwrap().len(), 7);
+    assert_eq!(r["participants"][0]["id"], players[0], "seeded by score");
+    assert_eq!(r["ready"].as_array().unwrap().len(), 2, "{r}");
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &bpath,
+        None,
+        true,
+        Some(json!({"format": "single"})),
+    )
+    .await;
+    assert_eq!(st, 409);
+    let (ta, _) = token(&router).await;
+    let (st, g) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/tournaments/{tid}/bracket"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{g}");
+    assert_eq!(g["matches"], r["matches"]);
+
+    // the only playable round-1 game is seed 4 v seed 5; decide it through the end-game report
+    let m = r["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["round"] == 1 && m["status"] == "ready")
+        .unwrap()
+        .clone();
+    let (a, b) = (
+        m["a"]["player"].as_str().unwrap().to_string(),
+        m["b"]["player"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(a, players[3]);
+    assert_eq!(b, players[4]);
+    let (st, out) = http_json(&router, "POST", &format!("/v1/server/matches/{}/results", make("m")), None, true, Some(json!({
+        "teams": [{"rank": 1, "players": [{"account_id": a}]}, {"rank": 2, "players": [{"account_id": b}]}],
+        "bracket_match": {"tournament_id": tid, "match_id": m["id"]}
+    }))).await;
+    assert_eq!(st, 200, "{out}");
+    assert_eq!(out["bracket"]["winner"], a, "{out}");
+    assert_eq!(out["bracket"]["ready"].as_array().unwrap().len(), 1);
+    // a stranger cannot win; same winner again is a no-op
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("{bpath}/matches/{}", m["id"].as_str().unwrap()),
+        None,
+        true,
+        Some(json!({"winner": players[0]})),
+    )
+    .await;
+    assert_eq!(st, 400, "{e}");
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("{bpath}/matches/{}", m["id"].as_str().unwrap()),
+        None,
+        true,
+        Some(json!({"winner": a})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("{bpath}/matches/{}", m["id"].as_str().unwrap()),
+        None,
+        true,
+        Some(json!({"winner": b})),
+    )
+    .await;
+    assert_eq!(st, 409, "{e}");
+    // play out: the `a` side always wins
+    let mut champion = Value::Null;
+    for _ in 0..8 {
+        let (_, g) = http_json(
+            &router,
+            "GET",
+            &format!("/v1/tournaments/{tid}/bracket"),
+            Some(&ta),
+            false,
+            None,
+        )
+        .await;
+        if !g["champion"].is_null() {
+            champion = g["champion"].clone();
+            break;
+        }
+        let m = g["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["status"] == "ready")
+            .expect("a ready match")
+            .clone();
+        let (st, e) = http_json(
+            &router,
+            "POST",
+            &format!("{bpath}/matches/{}", m["id"].as_str().unwrap()),
+            None,
+            true,
+            Some(json!({"winner": m["a"]["player"], "score": {"a": 3, "b": 1}})),
+        )
+        .await;
+        assert_eq!(st, 200, "{e}");
+    }
+    assert!(champion.is_string(), "champion decided");
+    let (_, g) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/tournaments/{tid}/bracket"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(g["standings"][0]["id"], champion);
+    assert_eq!(
+        g["standings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["eliminated"] == true)
+            .count(),
+        4
+    );
+    assert!(g["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["status"] == "done" || m["status"] == "void"));
+
+    // swiss: 5 players, 2 rounds
+    let sid = make("swiss");
+    let (st, r) = http_json(&router, "POST", "/v1/server/tournaments", None, true, Some(json!({
+        "id": sid, "title": "Swiss", "duration": 3600, "max_size": 16, "max_num_score": 10, "join_required": true
+    }))).await;
+    assert_eq!(st, 200, "{r}");
+    for _ in 0..5 {
+        let (t, _) = token(&router).await;
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/tournaments/{sid}/join"),
+            Some(&t),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let spath = format!("/v1/server/tournaments/{sid}/bracket");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &spath,
+        None,
+        true,
+        Some(json!({"format": "swiss", "seeding": "join", "swiss_rounds": 2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["round"], 1);
+    assert_eq!(r["matches"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        r["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["status"] == "void" || m["bye"] == true)
+            .count(),
+        1
+    );
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("{spath}/rounds"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 409, "{e}");
+    for m in r["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["status"] == "ready")
+    {
+        let (st, e) = http_json(
+            &router,
+            "POST",
+            &format!("{spath}/matches/{}", m["id"].as_str().unwrap()),
+            None,
+            true,
+            Some(json!({"winner": m["a"]["player"]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{e}");
+    }
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{spath}/rounds"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["round"], 2);
+    assert_eq!(r["bracket"]["matches"].as_array().unwrap().len(), 6);
+    for m in r["bracket"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["status"] == "ready")
+    {
+        http_json(
+            &router,
+            "POST",
+            &format!("{spath}/matches/{}", m["id"].as_str().unwrap()),
+            None,
+            true,
+            Some(json!({"winner": m["a"]["player"]})),
+        )
+        .await;
+    }
+    let (st, e) = http_json(
+        &router,
+        "POST",
+        &format!("{spath}/rounds"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 409, "all rounds played: {e}");
+    let (_, g) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/tournaments/{sid}/bracket"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert!(g["champion"].is_string(), "{g}");
+    assert_eq!(g["standings"][0]["id"], g["champion"]);
+    let (_, d) = http_json(&router, "DELETE", &spath, None, true, None).await;
+    assert_eq!(d["deleted"], true);
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/tournaments/{sid}/bracket"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+}

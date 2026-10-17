@@ -21,6 +21,19 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/tournaments", post(create))
         .route("/v1/server/tournaments/{id}", delete(delete_one))
         .route("/v1/server/tournaments/{id}/end", post(end))
+        .route("/v1/tournaments/{id}/bracket", get(bracket_get))
+        .route(
+            "/v1/server/tournaments/{id}/bracket",
+            post(bracket_create).delete(bracket_delete),
+        )
+        .route(
+            "/v1/server/tournaments/{id}/bracket/matches/{mid}",
+            post(bracket_report),
+        )
+        .route(
+            "/v1/server/tournaments/{id}/bracket/rounds",
+            post(bracket_round),
+        )
         .route(
             "/v1/server/tournaments/{id}/records/{owner}",
             post(write_as),
@@ -359,4 +372,199 @@ async fn end(
     }
     let paid = pay_prizes(&s, &id, expiry).await?;
     Ok(Json(json!({ "expiry": expiry, "paid": paid })))
+}
+
+#[derive(serde::Deserialize)]
+struct BracketReq {
+    format: musubi_leaderboard::bracket::Format,
+    /// `score` (current standings, default), `join` (arrival order), `random`, or `list`
+    /// (`participants` as given — e.g. team ids for team tournaments).
+    #[serde(default)]
+    seeding: Option<String>,
+    #[serde(default)]
+    participants: Vec<uuid::Uuid>,
+    /// Cap on the number of participants taken from the standings.
+    #[serde(default)]
+    size: Option<usize>,
+    /// Swiss only; defaults to ⌈log2 n⌉.
+    #[serde(default)]
+    swiss_rounds: Option<i32>,
+}
+
+fn bracket_json(b: &musubi_leaderboard::bracket::Bracket) -> serde_json::Value {
+    let mut v = serde_json::to_value(b).unwrap_or(serde_json::Value::Null);
+    if let Some(arr) = v["matches"].as_array_mut() {
+        for (m, mv) in b.matches.iter().zip(arr.iter_mut()) {
+            mv["status"] = json!(m.status());
+        }
+    }
+    v["ready"] = json!(b
+        .matches
+        .iter()
+        .filter(|m| m.ready())
+        .map(|m| m.id)
+        .collect::<Vec<_>>());
+    v["standings"] = serde_json::to_value(musubi_leaderboard::bracket::standings(b))
+        .unwrap_or(serde_json::Value::Null);
+    v
+}
+
+/// Build the bracket from the tournament's current participants (one per tournament; 409 if it
+/// exists). Byes are resolved immediately; a Swiss bracket comes with round 1 paired.
+async fn bracket_create(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(r): Json<BracketReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use musubi_leaderboard::bracket::{generate, Participant, MAX_PARTICIPANTS};
+    let t = s.tournaments.get(&id).await?;
+    let seeding = r.seeding.as_deref().unwrap_or("score");
+    let participants: Vec<Participant> = if seeding == "list" {
+        r.participants
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Participant {
+                id: *p,
+                name: String::new(),
+                seed: i as i32 + 1,
+            })
+            .collect()
+    } else {
+        let mut recs = s
+            .leaderboards
+            .records(&id, &[], MAX_PARTICIPANTS, None, Some(t.next_reset), None)
+            .await?
+            .records;
+        match seeding {
+            "score" => {}
+            "join" => recs.sort_by_key(|r| r.create_time),
+            "random" => {
+                let salt = uuid::Uuid::now_v7().as_u128();
+                recs.sort_by_key(|r| r.owner_id.0.as_u128() ^ salt);
+            }
+            other => {
+                return Err(musubi_core::Error::InvalidArgument(format!(
+                    "seeding {other:?}: expected score|join|random|list"
+                ))
+                .into())
+            }
+        }
+        if let Some(n) = r.size {
+            recs.truncate(n);
+        }
+        recs.iter()
+            .enumerate()
+            .map(|(i, rec)| Participant {
+                id: rec.owner_id.0,
+                name: rec.username.clone().unwrap_or_default(),
+                seed: i as i32 + 1,
+            })
+            .collect()
+    };
+    let b = generate(r.format, participants, r.swiss_rounds)?;
+    s.tournaments.bracket_create(&id, &b).await?;
+    s.events
+        .emit(
+            "tournament.bracket_created",
+            None,
+            json!({ "tournament_id": id, "format": r.format, "participants": b.participants.len(),
+                "rounds": b.rounds }),
+        )
+        .await;
+    Ok(Json(bracket_json(&b)))
+}
+
+async fn bracket_get(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match s.tournaments.bracket_get(&id).await? {
+        Some(b) => Ok(Json(bracket_json(&b))),
+        None => Err(musubi_core::Error::NotFound(format!("tournament {id} has no bracket")).into()),
+    }
+}
+
+async fn bracket_delete(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let deleted = s.tournaments.bracket_delete(&id).await?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+#[derive(serde::Deserialize)]
+struct BracketResult {
+    winner: uuid::Uuid,
+    #[serde(default)]
+    score: serde_json::Value,
+    #[serde(default)]
+    match_id: Option<String>,
+}
+
+/// Decide a bracket match directly (the end-game report can do the same via `bracket_match`).
+async fn bracket_report(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, mid)): Path<(String, uuid::Uuid)>,
+    Json(r): Json<BracketResult>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (b, ready) = s
+        .tournaments
+        .bracket_update(&id, |b| {
+            musubi_leaderboard::bracket::report(b, mid, r.winner, r.score, r.match_id)
+        })
+        .await?;
+    emit_bracket(&s, &id, mid, r.winner, &ready, b.champion).await;
+    Ok(Json(
+        json!({ "ready": ready, "champion": b.champion, "bracket": bracket_json(&b) }),
+    ))
+}
+
+pub(crate) async fn emit_bracket(
+    s: &AppState,
+    id: &str,
+    mid: uuid::Uuid,
+    winner: uuid::Uuid,
+    ready: &[uuid::Uuid],
+    champion: Option<uuid::Uuid>,
+) {
+    s.events
+        .emit(
+            "tournament.bracket_match",
+            None,
+            json!({ "tournament_id": id, "match": mid, "winner": winner, "ready": ready }),
+        )
+        .await;
+    if let Some(c) = champion {
+        s.events
+            .emit(
+                "tournament.bracket_done",
+                None,
+                json!({ "tournament_id": id, "champion": c }),
+            )
+            .await;
+    }
+}
+
+/// Swiss: pair the next round (409 while the current one has unfinished matches).
+async fn bracket_round(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (b, round) = s
+        .tournaments
+        .bracket_update(&id, musubi_leaderboard::bracket::swiss_next_round)
+        .await?;
+    s.events
+        .emit(
+            "tournament.bracket_round",
+            None,
+            json!({ "tournament_id": id, "round": round }),
+        )
+        .await;
+    Ok(Json(json!({ "round": round, "bracket": bracket_json(&b) })))
 }
