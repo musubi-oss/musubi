@@ -51,7 +51,31 @@ pub struct Friend {
     pub state: FriendState,
     #[serde(with = "time::serde::rfc3339")]
     pub update_time: OffsetDateTime,
+    /// Private note about this friend (only the owner sees it).
+    pub note: Option<String>,
+    pub favorite: bool,
 }
+
+/// Someone the viewer recently shared a match with.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentPlayer {
+    pub user: User,
+    pub match_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub seen_at: OffsetDateTime,
+}
+
+/// A friend suggestion: friends of friends ranked by mutual friends, then recent teammates.
+#[derive(Debug, Clone, Serialize)]
+pub struct Suggestion {
+    pub user: User,
+    pub mutual_friends: i64,
+    /// `mutual` or `recent`.
+    pub reason: String,
+}
+
+/// How many recent players are kept per account.
+pub const RECENT_PLAYERS: i64 = 50;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FriendList {
@@ -78,7 +102,34 @@ type FriendRow = (
     OffsetDateTime,
     i16,
     OffsetDateTime,
+    Option<String>,
+    bool,
 );
+type UserRow = (
+    Uuid,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    serde_json::Value,
+    OffsetDateTime,
+);
+const USER_COLS: &str =
+    "a.id, a.username, a.display_name, a.avatar_url, a.lang, a.location, a.metadata, a.created_at";
+
+fn to_user(r: UserRow) -> User {
+    User {
+        id: AccountId(r.0),
+        username: r.1,
+        display_name: r.2,
+        avatar_url: r.3,
+        lang: r.4,
+        location: r.5,
+        metadata: r.6,
+        created_at: r.7,
+    }
+}
 
 impl SocialService {
     pub fn new(db: PgPool) -> Self {
@@ -229,7 +280,7 @@ impl SocialService {
             None => (None, None),
         };
         let rows = sqlx::query_as::<_, FriendRow>(
-            "select a.id, a.username, a.display_name, a.avatar_url, a.lang, a.location, a.metadata, a.created_at, f.state, f.updated_at
+            "select a.id, a.username, a.display_name, a.avatar_url, a.lang, a.location, a.metadata, a.created_at, f.state, f.updated_at, f.note, f.favorite
              from musubi.friends f join musubi.accounts a on a.id = f.friend_id
              where f.user_id = $1 and a.deleted_at is null
                and ($2::smallint is null or f.state = $2)
@@ -261,6 +312,8 @@ impl SocialService {
                 },
                 state: FriendState::try_from(r.8).unwrap_or(FriendState::Blocked),
                 update_time: r.9,
+                note: r.10,
+                favorite: r.11,
             })
             .collect();
         let cursor = if more {
@@ -277,6 +330,168 @@ impl SocialService {
             None
         };
         Ok(FriendList { friends, cursor })
+    }
+    /// Set the private note / favourite flag on an accepted friend.
+    pub async fn annotate(
+        &self,
+        me: AccountId,
+        friend: AccountId,
+        note: Option<Option<String>>,
+        favorite: Option<bool>,
+    ) -> Result<()> {
+        if let Some(Some(n)) = &note {
+            if n.chars().count() > 256 {
+                return Err(Error::InvalidArgument("note must be <= 256 chars".into()));
+            }
+        }
+        let n = sqlx::query(
+            "update musubi.friends set note = case when $3 then $4 else note end,
+                    favorite = coalesce($5, favorite)
+             where user_id = $1 and friend_id = $2 and state = 0",
+        )
+        .bind(me.0)
+        .bind(friend.0)
+        .bind(note.is_some())
+        .bind(note.flatten())
+        .bind(favorite)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::NotFound("not a friend".into()));
+        }
+        Ok(())
+    }
+
+    /// Remember that `me` shared `match_id` with `others` (both directions), keeping the newest
+    /// [`RECENT_PLAYERS`] per account.
+    pub async fn recent_seen(
+        &self,
+        me: AccountId,
+        others: &[AccountId],
+        match_id: &str,
+    ) -> Result<()> {
+        let others: Vec<Uuid> = others.iter().map(|a| a.0).filter(|o| *o != me.0).collect();
+        if others.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        sqlx::query(
+            "insert into musubi.recent_players (user_id, other_id, match_id)
+             select $1, o, $3 from unnest($2::uuid[]) as o
+             union all
+             select o, $1, $3 from unnest($2::uuid[]) as o
+             on conflict (user_id, other_id) do update set match_id = excluded.match_id, seen_at = now()",
+        )
+        .bind(me.0)
+        .bind(&others)
+        .bind(match_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let mut touched = others.clone();
+        touched.push(me.0);
+        sqlx::query(
+            "delete from musubi.recent_players r where r.user_id = any($1) and r.other_id in (
+                 select other_id from musubi.recent_players x where x.user_id = r.user_id
+                 order by seen_at desc offset $2)",
+        )
+        .bind(&touched)
+        .bind(RECENT_PLAYERS)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Recently played with, newest first; accounts `me` blocked are hidden.
+    pub async fn recent(&self, me: AccountId, limit: usize) -> Result<Vec<RecentPlayer>> {
+        let rows: Vec<(UserRow, String, OffsetDateTime)> = sqlx::query_as::<_, (
+            Uuid,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            serde_json::Value,
+            OffsetDateTime,
+            String,
+            OffsetDateTime,
+        )>(&format!(
+            "select {USER_COLS}, r.match_id, r.seen_at
+             from musubi.recent_players r join musubi.accounts a on a.id = r.other_id
+             where r.user_id = $1 and a.deleted_at is null
+               and not exists (select 1 from musubi.friends b where b.user_id = $1 and b.friend_id = r.other_id and b.state = 3)
+             order by r.seen_at desc limit $2"
+        ))
+        .bind(me.0)
+        .bind(limit.clamp(1, RECENT_PLAYERS as usize) as i64)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .into_iter()
+        .map(|r| ((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7), r.8, r.9))
+        .collect();
+        Ok(rows
+            .into_iter()
+            .map(|(u, match_id, seen_at)| RecentPlayer {
+                user: to_user(u),
+                match_id,
+                seen_at,
+            })
+            .collect())
+    }
+
+    /// Friend suggestions: friends of friends ranked by mutual friends, then recent teammates;
+    /// never anyone already related to `me` (any state) or who blocked `me`.
+    pub async fn suggestions(&self, me: AccountId, limit: usize) -> Result<Vec<Suggestion>> {
+        let limit = limit.clamp(1, 50) as i64;
+        let rows = sqlx::query_as::<_, (
+            Uuid,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            serde_json::Value,
+            OffsetDateTime,
+            i64,
+            String,
+        )>(&format!(
+            "with mutual as (
+                 select f2.friend_id as id, count(*) as n
+                 from musubi.friends f1 join musubi.friends f2 on f2.user_id = f1.friend_id
+                 where f1.user_id = $1 and f1.state = 0 and f2.state = 0 and f2.friend_id <> $1
+                 group by f2.friend_id
+             ), recent as (
+                 select other_id as id from musubi.recent_players where user_id = $1
+             ), cand as (
+                 select id, n, 'mutual' as reason from mutual
+                 union all
+                 select id, 0, 'recent' from recent where id not in (select id from mutual)
+             )
+             select {USER_COLS}, c.n, c.reason
+             from cand c join musubi.accounts a on a.id = c.id
+             where a.deleted_at is null
+               and not exists (select 1 from musubi.friends x where x.user_id = $1 and x.friend_id = c.id)
+               and not exists (select 1 from musubi.friends y where y.user_id = c.id and y.friend_id = $1 and y.state = 3)
+             order by c.n desc, a.username limit $2"
+        ))
+        .bind(me.0)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Suggestion {
+                user: to_user((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7)),
+                mutual_friends: r.8,
+                reason: r.9,
+            })
+            .collect())
     }
 }
 

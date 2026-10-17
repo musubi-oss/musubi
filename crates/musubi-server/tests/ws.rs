@@ -73,6 +73,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
         parties.clone(),
         relayed.clone(),
     );
+    fanout.set_social(musubi_social::SocialService::new(db.clone()));
     fanout.set_leader(leader);
     let fleets = Arc::new(musubi_fleet::FleetService::new(
         db.clone(),
@@ -4959,6 +4960,87 @@ async fn chat_room_persistence_flag_and_retention_by_kind() {
         .unwrap();
     assert_eq!(removed["chat_messages"], 1, "{removed}");
     assert!(history(tb, dm_id).await.is_empty());
+}
+
+/// Joining a match records "recently played with" for everyone in it, both directions.
+#[tokio::test]
+async fn match_join_records_recent_players() {
+    let group = test_group();
+    let Some(state) = build_state(true, &group).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let addr = router_addr(&state).await;
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let f = "json";
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    send(
+        &mut a,
+        f,
+        Some("c"),
+        ClientMessage::MatchCreate {
+            name: Some("recent".into()),
+        },
+    )
+    .await;
+    let mid = match recv(&mut a).await.msg {
+        ServerMessage::Match { match_id, .. } => match_id,
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        Some("j"),
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Match { .. }
+    ));
+    let recent = |tok: String| {
+        let router = router.clone();
+        async move {
+            let req = Request::get("/v1/friends/recent")
+                .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), 200);
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            v["players"].as_array().unwrap().clone()
+        }
+    };
+    for _ in 0..20 {
+        if !recent(ta.clone()).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let ra = recent(ta.clone()).await;
+    assert_eq!(ra.len(), 1, "{ra:?}");
+    assert_eq!(ra[0]["user"]["id"], acc_b);
+    assert_eq!(ra[0]["match_id"], mid);
+    let rb = recent(tb.clone()).await;
+    assert_eq!(rb[0]["user"]["id"], acc_a);
+    // B is suggested to A as a recent teammate
+    let req = Request::get("/v1/friends/suggestions")
+        .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["suggestions"][0]["user"]["id"], acc_b, "{v}");
+    assert_eq!(v["suggestions"][0]["reason"], "recent");
 }
 
 /// A node that leaves the cluster takes its sessions out of the cluster-wide online set.

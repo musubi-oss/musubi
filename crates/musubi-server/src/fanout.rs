@@ -140,6 +140,8 @@ pub struct Fanout {
     leader: Arc<AtomicBool>,
     fleets: Arc<OnceLock<Arc<FleetService>>>,
     worlds: Arc<OnceLock<Arc<WorldRegistry>>>,
+    /// Records "recently played with" when a relayed join is executed here for a remote session.
+    social: Arc<OnceLock<musubi_social::SocialService>>,
     /// Bus messages leave in the order they were published: one publisher task per node, fed by
     /// this queue (a task per message would let two inputs from one source overtake each other).
     bus: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<Wire>>>,
@@ -163,6 +165,7 @@ impl Fanout {
             fleets: Arc::new(OnceLock::new()),
             bus: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
+            social: Arc::new(OnceLock::new()),
             online_remote: Arc::new(dashmap::DashMap::new()),
         };
         if let Some(c) = &f.cluster {
@@ -542,6 +545,10 @@ impl Fanout {
         });
     }
 
+    pub fn set_social(&self, social: musubi_social::SocialService) {
+        let _ = self.social.set(social);
+    }
+
     pub fn relayed_cmd(&self, env: RelayedCmdEnv) {
         self.publish(Wire::RelayedCmd(env));
     }
@@ -770,6 +777,26 @@ impl Fanout {
                         &env.match_id,
                         env.cmd,
                     ) {
+                        if let (
+                            Some(social),
+                            ServerMessage::Match {
+                                match_id,
+                                presences,
+                                ..
+                            },
+                        ) = (self.social.get(), &reply)
+                        {
+                            let social = social.clone();
+                            let me = env.me.account_id;
+                            let others: Vec<AccountId> =
+                                presences.iter().map(|p| p.account_id).collect();
+                            let match_id = match_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = social.recent_seen(me, &others, &match_id).await {
+                                    tracing::warn!(error = %e, "recent players not recorded");
+                                }
+                            });
+                        }
                         self.session(env.me.session_id, reply);
                     }
                 }

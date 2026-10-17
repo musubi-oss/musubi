@@ -14,6 +14,62 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/friends", get(list).post(add).delete(remove))
         .route("/v1/friends/block", post(block))
+        .route("/v1/friends/recent", get(recent))
+        .route("/v1/friends/suggestions", get(suggestions))
+        .route("/v1/friends/{id}", axum::routing::patch(annotate))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AnnotateReq {
+    /// Present = set (null clears), absent = keep.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    note: Option<Option<String>>,
+    favorite: Option<bool>,
+}
+
+fn deserialize_some<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
+}
+
+async fn annotate(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<AccountId>,
+    Json(b): Json<AnnotateReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.social
+        .annotate(me.account_id, id, b.note, b.favorite)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+async fn recent(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        json!({ "players": s.social.recent(me.account_id, q.limit).await? }),
+    ))
+}
+
+async fn suggestions(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        json!({ "suggestions": s.social.suggestions(me.account_id, q.limit).await? }),
+    ))
 }
 
 #[derive(Deserialize)]

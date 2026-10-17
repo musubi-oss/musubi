@@ -35,6 +35,7 @@ pub struct ConnectParams {
     pub limits: Limits,
     pub chat: ChatService,
     pub notify: crate::notify::Notifier,
+    pub social: musubi_social::SocialService,
     pub ratings: musubi_leaderboard::RatingService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
@@ -60,6 +61,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         limits,
         chat,
         notify,
+        social,
         ratings,
         matchmaker,
         parties,
@@ -84,6 +86,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         hub: &hub,
         chat: &chat,
         notify: &notify,
+        social: &social,
         ratings: &ratings,
         matchmaker: &matchmaker,
         parties: &parties,
@@ -262,6 +265,7 @@ struct Ctx<'a> {
     hub: &'a Hub,
     chat: &'a ChatService,
     notify: &'a crate::notify::Notifier,
+    social: &'a musubi_social::SocialService,
     ratings: &'a musubi_leaderboard::RatingService,
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
@@ -388,7 +392,9 @@ async fn send(
 /// Dispatch a client message; joins and follows are mirrored into the resume record (if any).
 async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
     let Some(tr) = &ctx.resume else {
-        return handle_inner(ctx, msg).await;
+        let reply = handle_inner(ctx, msg).await;
+        record_recent(ctx, &reply).await;
+        return reply;
     };
     let join = match &msg {
         ClientMessage::ChannelJoin { .. }
@@ -407,6 +413,7 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
         _ => None,
     };
     let reply = handle_inner(ctx, msg).await;
+    record_recent(ctx, &reply).await;
     if matches!(reply, Some(ServerMessage::Error { .. })) {
         return reply;
     }
@@ -448,6 +455,27 @@ async fn handle(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {
         _ => {}
     }
     reply
+}
+
+/// Joining a match (reply `Match` with its presences) marks everyone in it as recently played
+/// with, both directions.
+async fn record_recent(ctx: &Ctx<'_>, reply: &Option<ServerMessage>) {
+    let Some(ServerMessage::Match {
+        match_id,
+        presences,
+        ..
+    }) = reply
+    else {
+        return;
+    };
+    let others: Vec<AccountId> = presences.iter().map(|p| p.account_id).collect();
+    if let Err(e) = ctx
+        .social
+        .recent_seen(ctx.presence.account_id, &others, match_id)
+        .await
+    {
+        warn!(error = %e, "recent players not recorded");
+    }
 }
 
 async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage> {

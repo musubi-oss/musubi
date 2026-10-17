@@ -7843,3 +7843,145 @@ async fn lobbies_lifecycle_teams_password_and_start() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
+
+#[tokio::test]
+async fn friends_notes_favorites_and_suggestions() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..4 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("fs")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let (tc, c) = users[2].clone();
+    let (td, d) = users[3].clone();
+    // A–B, A–C, B–D accepted friendships (invite + accept)
+    for (x, y, yid, xid) in [(&ta, &tb, &b, &a), (&ta, &tc, &c, &a), (&tb, &td, &d, &b)] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/friends",
+            Some(x),
+            Some(json!({"ids": [yid]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/friends",
+            Some(y),
+            Some(json!({"ids": [xid]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    // D is a friend of A's friend B → suggested to A with one mutual friend; C is already a friend
+    let (st, v) = call(&app, "GET", "/v1/friends/suggestions", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let sugg = v["suggestions"].as_array().unwrap();
+    assert_eq!(sugg.len(), 1, "{v}");
+    assert_eq!(sugg[0]["user"]["id"], d);
+    assert_eq!(sugg[0]["mutual_friends"], 1);
+    assert_eq!(sugg[0]["reason"], "mutual");
+    // for D: A (via B)
+    let (_, v) = call(&app, "GET", "/v1/friends/suggestions", Some(&td), None).await;
+    assert_eq!(v["suggestions"][0]["user"]["id"], a, "{v}");
+    // D blocks A → A no longer sees D
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends/block",
+        Some(&td),
+        Some(json!({"ids": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call(&app, "GET", "/v1/friends/suggestions", Some(&ta), None).await;
+    assert!(v["suggestions"].as_array().unwrap().is_empty(), "{v}");
+
+    // note + favourite on B; not on a stranger
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/friends/{b}"),
+        Some(&ta),
+        Some(json!({"note": "healer main", "favorite": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/friends/{d}"),
+        Some(&ta),
+        Some(json!({"favorite": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(&ta), None).await;
+    let fb = l["friends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["user"]["id"] == b)
+        .unwrap();
+    assert_eq!(fb["note"], "healer main");
+    assert_eq!(fb["favorite"], true);
+    let fc = l["friends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["user"]["id"] == c)
+        .unwrap();
+    assert!(fc["note"].is_null());
+    assert_eq!(fc["favorite"], false);
+    // null clears the note, favourite untouched
+    let (st, _) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/friends/{b}"),
+        Some(&ta),
+        Some(json!({"note": null})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(&ta), None).await;
+    let fb = l["friends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["user"]["id"] == b)
+        .unwrap();
+    assert!(fb["note"].is_null(), "{l}");
+    assert_eq!(fb["favorite"], true);
+    // the note is private: B's view of A carries B's own (empty) note
+    let (_, l) = call(&app, "GET", "/v1/friends", Some(&tb), None).await;
+    assert!(l["friends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|f| f["note"].is_null()));
+    // too long
+    let (st, _) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/friends/{b}"),
+        Some(&ta),
+        Some(json!({"note": "x".repeat(300)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let _ = tc;
+}

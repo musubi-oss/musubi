@@ -264,6 +264,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         parties.clone(),
         relayed.clone(),
     );
+    fanout.set_social(musubi_social::SocialService::new(db.clone()));
     crate::realtime::matchmaking::spawn_ticker(
         relayed.clone(),
         matchmaker.clone(),
