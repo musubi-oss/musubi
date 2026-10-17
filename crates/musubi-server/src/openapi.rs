@@ -183,6 +183,12 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("DELETE", "/v1/server/matchmaker/queues/{name}", "matches"),
     ("GET", "/v1/server/matchmaker/stats", "matches"),
     ("GET", "/v1/rating/{queue}", "leaderboards"),
+    ("GET", "/v1/leaderboards/{id}/tier", "leaderboards"),
+    (
+        "POST",
+        "/v1/server/leaderboards/{id}/rollover",
+        "leaderboards",
+    ),
     ("GET", "/v1/rating/{queue}/top", "leaderboards"),
     ("GET", "/v1/rating/{queue}/{account}", "leaderboards"),
     ("GET", "/v1/server/rating/queues", "leaderboards"),

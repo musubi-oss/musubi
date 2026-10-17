@@ -18,9 +18,11 @@ pub fn routes() -> Router<AppState> {
             get(records).post(write).delete(delete_own),
         )
         .route("/v1/leaderboards/{id}/around/{owner}", get(around))
+        .route("/v1/leaderboards/{id}/tier", get(tier))
         // server-to-server
         .route("/v1/server/leaderboards", post(create))
         .route("/v1/server/leaderboards/{id}", delete(delete_board))
+        .route("/v1/server/leaderboards/{id}/rollover", post(rollover))
         .route(
             "/v1/server/leaderboards/{id}/records/{owner}",
             post(write_as).delete(delete_as),
@@ -83,14 +85,21 @@ async fn get_board(
 
 async fn records(
     State(s): State<AppState>,
-    Bearer(_): Bearer,
+    Bearer(me): Bearer,
     Path(id): Path<String>,
     Query(q): Query<RecordsQuery>,
 ) -> Result<Json<RecordList>, ApiError> {
     let owners = parse_ids(q.owner_ids.as_deref())?;
     Ok(Json(
         s.leaderboards
-            .records(&id, &owners, q.limit, q.cursor.as_deref(), q.expiry)
+            .records(
+                &id,
+                &owners,
+                q.limit,
+                q.cursor.as_deref(),
+                q.expiry,
+                Some(me.account_id),
+            )
             .await?,
     ))
 }
@@ -193,4 +202,42 @@ async fn delete_as(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     s.leaderboards.delete_record(&id, owner, true).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// League tier of the caller on this board (name and index).
+async fn tier(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let board = s.leaderboards.get(&id).await?;
+    let league = board
+        .league
+        .ok_or_else(|| musubi_core::Error::NotFound("leaderboard has no league".into()))?;
+    let tier = s.leaderboards.tier_of(&id, me.account_id).await?;
+    Ok(Json(json!({
+        "tier": tier,
+        "name": league.tiers.get(tier as usize),
+        "tiers": league.tiers,
+    })))
+}
+
+#[derive(Deserialize, Default)]
+struct RolloverBody {
+    #[serde(default)]
+    expiry: Option<i64>,
+}
+
+/// Close a league window now (default: the last finished one; `expiry` of the current window ends
+/// the season early). Returns null when that window was already rolled over.
+async fn rollover(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    body: Option<Json<RolloverBody>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let expiry = body.and_then(|b| b.0.expiry);
+    Ok(Json(
+        json!({ "rollover": s.leaderboards.rollover(&id, expiry).await? }),
+    ))
 }

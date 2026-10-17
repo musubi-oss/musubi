@@ -615,6 +615,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     continue;
                 }
                 n += 1;
+                // league rollovers: every minute, same leader as the market sweep
+                if n % 12 == 0 {
+                    match st.leaderboards.rollover_due().await {
+                        Ok(r) if !r.is_empty() => {
+                            tracing::info!(boards = r.len(), "league rollovers applied")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "league rollover failed"),
+                    }
+                }
                 // rating decay: every ten minutes, same leader as the market sweep
                 if n % 120 == 0 {
                     match st.ratings.decay_all().await {

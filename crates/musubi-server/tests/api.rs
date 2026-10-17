@@ -7184,3 +7184,178 @@ async fn rating_queues_elo_glicko_openskill_seasons_and_decay() {
     let (st, _) = call(&app, "GET", &format!("/v1/rating/{q}"), Some(ta), None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn bucketed_league_leaderboard_scopes_ranks_and_rolls_over() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..4 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("lg")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let key = "defaultkey";
+    let id = unique("league");
+    // invalid shapes
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        key,
+        Some(json!({"id": id, "bucket_size": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        key,
+        Some(
+            json!({"id": id, "league": {"tiers": ["a", "b"], "promote_pct": 10, "demote_pct": 10}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "league without reset schedule");
+    let (st, board) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        key,
+        Some(json!({
+            "id": id, "reset_schedule": "0 0 * * *", "bucket_size": 2,
+            "league": {"tiers": ["bronze", "silver", "gold"], "promote_pct": 50, "demote_pct": 50}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{board}");
+    assert_eq!(board["bucket_size"], 2);
+    assert_eq!(board["league"]["tiers"][1], "silver");
+
+    // four scores → two buckets of two, in order of first score
+    for (i, (tok, _)) in users.iter().enumerate() {
+        let (st, r) = call(
+            &app,
+            "POST",
+            &format!("/v1/leaderboards/{id}/records"),
+            Some(tok),
+            Some(json!({"score": (i as i64 + 1) * 10})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!(r["tier"], 0);
+        assert_eq!(r["bucket"], (i / 2 + 1) as i64, "{r}");
+        assert_eq!(
+            r["rank"], 1,
+            "newest score of the bucket is its best so far: {r}"
+        );
+    }
+    // user 0 sees only bucket 1: user 1 (20) above user 0 (10)
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id}/records?owner_ids={}", users[0].1),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let recs = v["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2, "{v}");
+    assert_eq!(recs[0]["owner_id"], users[1].1);
+    assert_eq!(recs[1]["owner_id"], users[0].1);
+    assert_eq!(v["owner_records"][0]["rank"], 2);
+    // user 3 sees bucket 2 and is first there
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id}/around/{}", users[3].1),
+        Some(&users[3].0),
+        None,
+    )
+    .await;
+    assert_eq!(v["records"][0]["owner_id"], users[3].1, "{v}");
+    assert_eq!(v["records"].as_array().unwrap().len(), 2);
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id}/tier"),
+        Some(&users[1].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "bronze");
+
+    // end the season now: top 50 % of each bucket (users 1 and 3) go up, nobody below bronze
+    let expiry = board["next_reset"].as_i64().unwrap();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/leaderboards/{id}/rollover"),
+        key,
+        Some(json!({"expiry": expiry})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rollover"]["promoted"], 2, "{v}");
+    assert_eq!(v["rollover"]["demoted"], 0, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/leaderboards/{id}/rollover"),
+        key,
+        Some(json!({"expiry": expiry})),
+    )
+    .await;
+    assert!(
+        v["rollover"].is_null(),
+        "second rollover of the same window is a no-op: {v}"
+    );
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id}/tier"),
+        Some(&users[1].0),
+        None,
+    )
+    .await;
+    assert_eq!(v["name"], "silver", "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id}/tier"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(v["name"], "bronze", "{v}");
+    // a rollover on a board without a league is refused
+    let plain = unique("plain");
+    call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        key,
+        Some(json!({"id": plain})),
+    )
+    .await;
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/leaderboards/{plain}/rollover"),
+        key,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}

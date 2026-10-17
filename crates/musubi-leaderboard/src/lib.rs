@@ -43,6 +43,11 @@ pub struct Leaderboard {
     pub operator: Operator,
     pub reset_schedule: Option<String>,
     pub metadata: serde_json::Value,
+    /// Players compete inside buckets of this many (0 = everyone in one scope). A bucket is
+    /// assigned on the first score of a window and kept for that window.
+    pub bucket_size: i32,
+    /// Tiers with promotion/demotion at every reset (needs `reset_schedule`).
+    pub league: Option<League>,
     #[serde(with = "time::serde::rfc3339")]
     pub create_time: OffsetDateTime,
     /// Start of the next reset window (unix seconds), 0 if the board never resets.
@@ -63,6 +68,42 @@ pub struct CreateLeaderboard {
     pub reset_schedule: Option<String>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub bucket_size: i32,
+    #[serde(default)]
+    pub league: Option<League>,
+}
+
+/// League rules: at each reset the top `promote_pct` of every (tier, bucket) group moves one tier
+/// up and the bottom `demote_pct` one tier down; tier 0 is the first name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct League {
+    pub tiers: Vec<String>,
+    pub promote_pct: f64,
+    pub demote_pct: f64,
+}
+
+impl League {
+    fn validate(&self) -> Result<()> {
+        if self.tiers.len() < 2 || self.tiers.len() > 64 {
+            return Err(Error::InvalidArgument("league needs 2..=64 tiers".into()));
+        }
+        if !(0.0..=50.0).contains(&self.promote_pct) || !(0.0..=50.0).contains(&self.demote_pct) {
+            return Err(Error::InvalidArgument(
+                "promote_pct/demote_pct must be in 0..=50".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What one rollover did.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Rollover {
+    pub leaderboard_id: String,
+    pub expiry_time: i64,
+    pub promoted: u32,
+    pub demoted: u32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -79,7 +120,10 @@ pub struct Record {
     #[serde(with = "time::serde::rfc3339")]
     pub update_time: OffsetDateTime,
     pub expiry_time: i64,
-    /// 1-based rank within the current window.
+    /// Scope of the record: league tier and bucket (0/0 on plain boards).
+    pub tier: i16,
+    pub bucket: i32,
+    /// 1-based rank within the current window and scope.
     pub rank: i64,
 }
 
@@ -116,7 +160,11 @@ type BoardRow = (
     Option<String>,
     serde_json::Value,
     OffsetDateTime,
+    i32,
+    Option<serde_json::Value>,
 );
+const BOARD_COLS: &str =
+    "id, authoritative, sort_order, operator, reset_schedule, metadata, created_at, bucket_size, league";
 type RecordRow = (
     String,
     Uuid,
@@ -128,9 +176,11 @@ type RecordRow = (
     OffsetDateTime,
     OffsetDateTime,
     OffsetDateTime,
+    i16,
+    i32,
     i64,
 );
-const RECORD_COLS: &str = "leaderboard_id, owner_id, username, score, subscore, num_score, metadata, created_at, updated_at, expiry_time";
+const RECORD_COLS: &str = "leaderboard_id, owner_id, username, score, subscore, num_score, metadata, created_at, updated_at, expiry_time, tier, bucket";
 
 pub fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
@@ -211,6 +261,12 @@ fn to_board(r: BoardRow, now: OffsetDateTime) -> Result<Leaderboard> {
             _ => Operator::Best,
         },
         reset_schedule: r.4,
+        bucket_size: r.7,
+        league: r
+            .8
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Error::internal)?,
         metadata: r.5,
         create_time: r.6,
         next_reset: if next == OffsetDateTime::UNIX_EPOCH {
@@ -242,7 +298,9 @@ fn to_record(r: RecordRow) -> Record {
         } else {
             r.9.unix_timestamp()
         },
-        rank: r.10,
+        tier: r.10,
+        bucket: r.11,
+        rank: r.12,
     }
 }
 
@@ -261,10 +319,31 @@ impl LeaderboardService {
                 return Err(Error::InvalidArgument("metadata must be an object".into()));
             }
         }
+        if c.bucket_size < 0 || c.bucket_size == 1 {
+            return Err(Error::InvalidArgument(
+                "bucket_size must be 0 (global) or at least 2".into(),
+            ));
+        }
+        if let Some(l) = &c.league {
+            l.validate()?;
+            if c.reset_schedule.is_none() {
+                return Err(Error::InvalidArgument(
+                    "a league needs a reset_schedule to roll over on".into(),
+                ));
+            }
+        }
+        let league_json = c
+            .league
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(Error::internal)?;
         let res = sqlx::query_as::<_, BoardRow>(
-            "insert into musubi.leaderboards (id, authoritative, sort_order, operator, reset_schedule, metadata)
-             values ($1, $2, $3, $4, $5, coalesce($6, '{}'::jsonb))
-             returning id, authoritative, sort_order, operator, reset_schedule, metadata, created_at",
+            &format!(
+                "insert into musubi.leaderboards (id, authoritative, sort_order, operator, reset_schedule, metadata, bucket_size, league)
+                 values ($1, $2, $3, $4, $5, coalesce($6, '{{}}'::jsonb), $7, $8)
+                 returning {BOARD_COLS}"
+            ),
         )
         .bind(&c.id)
         .bind(c.authoritative)
@@ -272,6 +351,8 @@ impl LeaderboardService {
         .bind(c.operator as i16)
         .bind(&c.reset_schedule)
         .bind(&c.metadata)
+        .bind(c.bucket_size)
+        .bind(league_json)
         .fetch_one(&self.db)
         .await;
         match res {
@@ -296,12 +377,14 @@ impl LeaderboardService {
     }
 
     pub async fn get(&self, id: &str) -> Result<Leaderboard> {
-        let r = sqlx::query_as::<_, BoardRow>("select id, authoritative, sort_order, operator, reset_schedule, metadata, created_at from musubi.leaderboards where id = $1")
-            .bind(id)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(Error::internal)?
-            .ok_or_else(|| Error::NotFound("leaderboard".into()))?;
+        let r = sqlx::query_as::<_, BoardRow>(&format!(
+            "select {BOARD_COLS} from musubi.leaderboards where id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(|| Error::NotFound("leaderboard".into()))?;
         to_board(r, OffsetDateTime::now_utc())
     }
 
@@ -311,8 +394,8 @@ impl LeaderboardService {
         cursor: Option<&str>,
     ) -> Result<(Vec<Leaderboard>, Option<String>)> {
         let limit = limit.clamp(1, 100) as i64;
-        let rows = sqlx::query_as::<_, BoardRow>(
-            "select id, authoritative, sort_order, operator, reset_schedule, metadata, created_at from musubi.leaderboards where ($1::text is null or id > $1) order by id limit $2",
+        let rows = sqlx::query_as::<_, BoardRow>(&format!(
+            "select {BOARD_COLS} from musubi.leaderboards where ($1::text is null or id > $1) order by id limit $2"),
         )
         .bind(cursor)
         .bind(limit + 1)
@@ -381,13 +464,15 @@ impl LeaderboardService {
             }
         };
         let sql = format!(
-            "insert into musubi.leaderboard_records as r (leaderboard_id, owner_id, username, score, subscore, num_score, metadata, expiry_time)
-             values ($1, $2, $3, $4, $5, 1, coalesce($6, '{{}}'::jsonb), $7)
+            "insert into musubi.leaderboard_records as r (leaderboard_id, owner_id, username, score, subscore, num_score, metadata, expiry_time, tier, bucket)
+             values ($1, $2, $3, $4, $5, 1, coalesce($6, '{{}}'::jsonb), $7, $8, $9)
              on conflict (leaderboard_id, expiry_time, owner_id) do update set {update},
                  num_score = r.num_score + 1, username = coalesce(excluded.username, r.username),
                  metadata = coalesce($6, r.metadata), updated_at = now()
              returning {RECORD_COLS}, 0::bigint"
         );
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let (tier, bucket) = self.scope_for_write(&mut tx, &board, expiry, owner).await?;
         let row = sqlx::query_as::<_, RecordRow>(&sql)
             .bind(id)
             .bind(owner.0)
@@ -396,9 +481,12 @@ impl LeaderboardService {
             .bind(w.subscore)
             .bind(&w.metadata)
             .bind(expiry)
-            .fetch_one(&self.db)
+            .bind(tier)
+            .bind(bucket)
+            .fetch_one(&mut *tx)
             .await
             .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
         let mut rec = to_record(row);
         rec.rank = self.rank_of(&board, expiry, owner).await?;
         Ok(rec)
@@ -435,7 +523,8 @@ impl LeaderboardService {
         let sql = format!(
             "select 1 + count(*) from musubi.leaderboard_records o, musubi.leaderboard_records r
              where r.leaderboard_id = $1 and r.expiry_time = $2 and r.owner_id = $3
-               and o.leaderboard_id = r.leaderboard_id and o.expiry_time = r.expiry_time and ({cmp})"
+               and o.leaderboard_id = r.leaderboard_id and o.expiry_time = r.expiry_time
+               and o.tier = r.tier and o.bucket = r.bucket and ({cmp})"
         );
         let rank: i64 = sqlx::query_scalar(&sql)
             .bind(&board.id)
@@ -456,6 +545,7 @@ impl LeaderboardService {
         limit: usize,
         cursor: Option<&str>,
         expiry: Option<i64>,
+        viewer: Option<AccountId>,
     ) -> Result<RecordList> {
         let board = self.get(id).await?;
         let limit = limit.clamp(1, 100) as i64;
@@ -474,9 +564,29 @@ impl LeaderboardService {
             SortOrder::Desc => "score desc, subscore desc, updated_at asc, owner_id asc",
             SortOrder::Asc => "score asc, subscore asc, updated_at asc, owner_id asc",
         };
+        // scoped boards page the viewer's (tier, bucket); a viewer without a record this window
+        // sees their tier's first bucket page (or nothing on a bucketed board)
+        let scope = if board.bucket_size > 0 || board.league.is_some() {
+            let viewer = viewer.or_else(|| owners.first().copied());
+            match self.scope_of(&board, expiry, viewer).await? {
+                Some(sc) => Some(sc),
+                None => {
+                    return Ok(RecordList {
+                        records: vec![],
+                        owner_records: vec![],
+                        next_cursor: None,
+                        prev_cursor: None,
+                    })
+                }
+            }
+        } else {
+            None
+        };
+        let (tier, bucket) = scope.unwrap_or((0, 0));
+        let scoped = "and tier = $5 and bucket = $6";
         let sql = format!(
             "select {RECORD_COLS}, row_number() over (order by {order}) as rank
-             from musubi.leaderboard_records where leaderboard_id = $1 and expiry_time = $2
+             from musubi.leaderboard_records where leaderboard_id = $1 and expiry_time = $2 {scoped}
              order by rank offset $3 limit $4"
         );
         let rows = sqlx::query_as::<_, RecordRow>(&sql)
@@ -484,6 +594,8 @@ impl LeaderboardService {
             .bind(expiry)
             .bind(offset)
             .bind(limit + 1)
+            .bind(tier)
+            .bind(bucket)
             .fetch_all(&self.db)
             .await
             .map_err(Error::internal)?;
@@ -498,7 +610,7 @@ impl LeaderboardService {
         } else {
             let ids: Vec<Uuid> = owners.iter().map(|o| o.0).collect();
             let sql = format!(
-                "select * from (select {RECORD_COLS}, row_number() over (order by {order}) as rank
+                "select * from (select {RECORD_COLS}, row_number() over (partition by tier, bucket order by {order}) as rank
                  from musubi.leaderboard_records where leaderboard_id = $1 and expiry_time = $2) x
                  where owner_id = any($3) order by rank"
             );
@@ -554,8 +666,216 @@ impl LeaderboardService {
             limit as usize,
             Some(&offset.to_string()),
             Some(exp.unix_timestamp()),
+            Some(owner),
         )
         .await
+    }
+
+    /// (tier, bucket) of a viewer for a window: their record's scope, else their tier with the
+    /// first bucket (plain league), else None (bucketed board, no record yet).
+    async fn scope_of(
+        &self,
+        board: &Leaderboard,
+        expiry: OffsetDateTime,
+        viewer: Option<AccountId>,
+    ) -> Result<Option<(i16, i32)>> {
+        let Some(viewer) = viewer else {
+            return Ok((board.bucket_size == 0).then_some((0, 0)));
+        };
+        let rec: Option<(i16, i32)> = sqlx::query_as(
+            "select tier, bucket from musubi.leaderboard_records
+             where leaderboard_id = $1 and expiry_time = $2 and owner_id = $3",
+        )
+        .bind(&board.id)
+        .bind(expiry)
+        .bind(viewer.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        if let Some(sc) = rec {
+            return Ok(Some(sc));
+        }
+        if board.bucket_size > 0 {
+            return Ok(None);
+        }
+        Ok(Some((self.tier_of(&board.id, viewer).await?, 0)))
+    }
+
+    /// League tier of a player (0 when unknown or no league).
+    pub async fn tier_of(&self, id: &str, owner: AccountId) -> Result<i16> {
+        let t: Option<i16> = sqlx::query_scalar(
+            "select tier from musubi.leaderboard_tiers where leaderboard_id = $1 and owner_id = $2",
+        )
+        .bind(id)
+        .bind(owner.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(t.unwrap_or(0))
+    }
+
+    /// Scope a new score lands in. An existing record keeps its scope; otherwise the player's tier
+    /// and, on bucketed boards, the newest bucket of that tier with room (under a per-window lock
+    /// so two first scores cannot both open bucket N+1).
+    async fn scope_for_write(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        board: &Leaderboard,
+        expiry: OffsetDateTime,
+        owner: AccountId,
+    ) -> Result<(i16, i32)> {
+        if board.bucket_size == 0 && board.league.is_none() {
+            return Ok((0, 0));
+        }
+        let existing: Option<(i16, i32)> = sqlx::query_as(
+            "select tier, bucket from musubi.leaderboard_records
+             where leaderboard_id = $1 and expiry_time = $2 and owner_id = $3",
+        )
+        .bind(&board.id)
+        .bind(expiry)
+        .bind(owner.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        if let Some(sc) = existing {
+            return Ok(sc);
+        }
+        let tier = if board.league.is_some() {
+            self.tier_of(&board.id, owner).await?
+        } else {
+            0
+        };
+        if board.bucket_size == 0 {
+            return Ok((tier, 0));
+        }
+        sqlx::query("select pg_advisory_xact_lock(hashtext($1), $2)")
+            .bind(format!("{}:{}", board.id, expiry.unix_timestamp()))
+            .bind(tier as i32)
+            .execute(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+        let last: Option<(i32, i64)> = sqlx::query_as(
+            "select bucket, count(*) from musubi.leaderboard_records
+             where leaderboard_id = $1 and expiry_time = $2 and tier = $3
+             group by bucket order by bucket desc limit 1",
+        )
+        .bind(&board.id)
+        .bind(expiry)
+        .bind(tier)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        let bucket = match last {
+            Some((b, n)) if n < board.bucket_size as i64 => b,
+            Some((b, _)) => b + 1,
+            None => 1,
+        };
+        Ok((tier, bucket))
+    }
+
+    /// End-of-window league move. `expiry` names the window to close (default: the last finished
+    /// one); passing the current window's expiry ends the season early. Idempotent per window.
+    pub async fn rollover(&self, id: &str, expiry: Option<i64>) -> Result<Option<Rollover>> {
+        let board = self.get(id).await?;
+        let Some(league) = &board.league else {
+            return Err(Error::InvalidArgument("leaderboard has no league".into()));
+        };
+        let now = OffsetDateTime::now_utc();
+        let exp = match expiry {
+            Some(e) => OffsetDateTime::from_unix_timestamp(e)
+                .map_err(|_| Error::InvalidArgument("bad expiry".into()))?,
+            None => window(board.reset_schedule.as_deref(), now)?.0,
+        };
+        if exp == OffsetDateTime::UNIX_EPOCH {
+            return Ok(None);
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let done = sqlx::query(
+            "insert into musubi.leaderboard_rollovers (leaderboard_id, expiry_time) values ($1, $2)
+             on conflict do nothing",
+        )
+        .bind(id)
+        .bind(exp)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if done.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let order = match board.sort_order {
+            SortOrder::Desc => "score desc, subscore desc, updated_at asc, owner_id asc",
+            SortOrder::Asc => "score asc, subscore asc, updated_at asc, owner_id asc",
+        };
+        let rows: Vec<(Uuid, i16, i64, i64)> = sqlx::query_as(&format!(
+            "select owner_id, tier, row_number() over (partition by tier, bucket order by {order}),
+                    count(*) over (partition by tier, bucket)
+             from musubi.leaderboard_records where leaderboard_id = $1 and expiry_time = $2"
+        ))
+        .bind(id)
+        .bind(exp)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let top = league.tiers.len() as i16 - 1;
+        let (mut promoted, mut demoted) = (0u32, 0u32);
+        for (owner, tier, rn, n) in rows {
+            let up = ((n as f64) * league.promote_pct / 100.0).ceil() as i64;
+            let down = ((n as f64) * league.demote_pct / 100.0).ceil() as i64;
+            let new_tier = if rn <= up && tier < top && league.promote_pct > 0.0 {
+                promoted += 1;
+                tier + 1
+            } else if rn > n - down && tier > 0 && league.demote_pct > 0.0 {
+                demoted += 1;
+                tier - 1
+            } else {
+                continue;
+            };
+            sqlx::query(
+                "insert into musubi.leaderboard_tiers (leaderboard_id, owner_id, tier) values ($1, $2, $3)
+                 on conflict (leaderboard_id, owner_id) do update set tier = excluded.tier, updated_at = now()",
+            )
+            .bind(id)
+            .bind(owner)
+            .bind(new_tier)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        }
+        sqlx::query(
+            "update musubi.leaderboard_rollovers set promoted = $3, demoted = $4
+             where leaderboard_id = $1 and expiry_time = $2",
+        )
+        .bind(id)
+        .bind(exp)
+        .bind(promoted as i32)
+        .bind(demoted as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(Some(Rollover {
+            leaderboard_id: id.to_string(),
+            expiry_time: exp.unix_timestamp(),
+            promoted,
+            demoted,
+        }))
+    }
+
+    /// Roll over every league board whose last window has finished (sweep).
+    pub async fn rollover_due(&self) -> Result<Vec<Rollover>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "select id from musubi.leaderboards where league is not null and reset_schedule is not null",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(r) = self.rollover(&id, None).await? {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 }
 

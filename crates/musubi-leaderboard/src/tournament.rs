@@ -452,7 +452,7 @@ impl TournamentService {
         expiry: Option<i64>,
     ) -> Result<RecordList> {
         self.row(id).await?;
-        lb.records(id, owners, limit, cursor, expiry).await
+        lb.records(id, owners, limit, cursor, expiry, None).await
     }
 
     pub async fn around(
