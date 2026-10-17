@@ -17,23 +17,29 @@ pub const ALPN: &[u8] = b"musubi-rt/1";
 pub struct QuicConnection {
     conn: quinn::Connection,
     send: SendStream,
-    recv: RecvStream,
-    max_frame: usize,
+    /// Frames read off the stream by a dedicated task: `recv` selects between this and
+    /// datagrams, and dropping a half-done `read_frame` future would lose stream bytes.
+    frames: tokio::sync::mpsc::Receiver<Result<Frame, TransportError>>,
 }
 
 impl QuicConnection {
     pub fn new(
         conn: quinn::Connection,
         send: SendStream,
-        recv: RecvStream,
+        mut recv: RecvStream,
         max_frame: usize,
     ) -> Self {
-        Self {
-            conn,
-            send,
-            recv,
-            max_frame,
-        }
+        let (tx, frames) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            loop {
+                let r = Self::read_frame(&mut recv, max_frame).await;
+                let stop = r.is_err();
+                if tx.send(r).await.is_err() || stop {
+                    return;
+                }
+            }
+        });
+        Self { conn, send, frames }
     }
 
     pub fn encode_datagram(frame: &Frame) -> Bytes {
@@ -133,7 +139,7 @@ impl Connection for QuicConnection {
     fn recv(&mut self) -> BoxFuture<'_, Result<Frame, TransportError>> {
         Box::pin(async move {
             tokio::select! {
-                f = Self::read_frame(&mut self.recv, self.max_frame) => f,
+                f = self.frames.recv() => f.unwrap_or(Err(TransportError::Closed)),
                 d = self.conn.read_datagram() => match d {
                     Ok(d) => Self::decode_datagram(d),
                     Err(e) => Err(TransportError::Io(e.to_string())),
@@ -211,6 +217,65 @@ pub fn client_config(
     }
     let mut tls = rustls::ClientConfig::builder()
         .with_root_certificates(store)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    Ok(quinn::ClientConfig::new(Arc::new(crypto)))
+}
+
+/// Client config that accepts ANY server certificate (benchmarks and local experiments only —
+/// never for a real client).
+pub fn insecure_client_config() -> Result<quinn::ClientConfig, TransportError> {
+    #[derive(Debug)]
+    struct NoVerify(rustls::crypto::CryptoProvider);
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls_pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls_pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| TransportError::Io(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)

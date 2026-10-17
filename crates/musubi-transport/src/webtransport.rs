@@ -11,23 +11,28 @@ use crate::{framing, Connection, Frame, TransportError};
 pub struct WtConnection {
     conn: wtransport::Connection,
     send: SendStream,
-    recv: RecvStream,
-    max_frame: usize,
+    /// See `QuicConnection::frames`: stream reads must not be cancelled mid-frame.
+    frames: tokio::sync::mpsc::Receiver<Result<Frame, TransportError>>,
 }
 
 impl WtConnection {
     pub fn new(
         conn: wtransport::Connection,
         send: SendStream,
-        recv: RecvStream,
+        mut recv: RecvStream,
         max_frame: usize,
     ) -> Self {
-        Self {
-            conn,
-            send,
-            recv,
-            max_frame,
-        }
+        let (tx, frames) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            loop {
+                let r = framing::read_frame(&mut recv, max_frame).await;
+                let stop = r.is_err();
+                if tx.send(r).await.is_err() || stop {
+                    return;
+                }
+            }
+        });
+        Self { conn, send, frames }
     }
 }
 
@@ -50,7 +55,7 @@ impl Connection for WtConnection {
     fn recv(&mut self) -> BoxFuture<'_, Result<Frame, TransportError>> {
         Box::pin(async move {
             tokio::select! {
-                f = framing::read_frame(&mut self.recv, self.max_frame) => f,
+                f = self.frames.recv() => f.unwrap_or(Err(TransportError::Closed)),
                 d = self.conn.receive_datagram() => match d {
                     Ok(d) => QuicConnection::decode_datagram(bytes::Bytes::copy_from_slice(d.payload().as_ref())),
                     Err(e) => Err(TransportError::Io(e.to_string())),

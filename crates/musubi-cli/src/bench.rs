@@ -25,6 +25,11 @@ pub struct Opts {
     pub max_hz: Option<u32>,
     /// Wire encoding for the world players: `json` or `binary` (postcard).
     pub wire: String,
+    /// `ws` or `quic` (+ `quic_addr`); QUIC skips certificate verification (bench only).
+    pub transport: String,
+    pub quic_addr: Option<String>,
+    /// `WorldSubscribe.unreliable_updates`.
+    pub unreliable: bool,
     pub json: bool,
 }
 
@@ -232,11 +237,15 @@ async fn world_sim(
 
 /// First frames of a world run that are not deltas are printed (encoding/subscription problems).
 static FRAME_DEBUG: AtomicU64 = AtomicU64::new(0);
+static STREAM_DEBUG: AtomicU64 = AtomicU64::new(0);
 static CONNECT_DEBUG: AtomicU64 = AtomicU64::new(0);
 
 struct Player {
     url: String,
     wire: String,
+    transport: String,
+    quic_addr: Option<String>,
+    unreliable: bool,
     token: String,
     arena: Arc<Arena>,
     radius: f64,
@@ -253,6 +262,9 @@ async fn world_loop(p: Player) {
     let Player {
         url,
         wire,
+        transport,
+        quic_addr,
+        unreliable,
         token,
         arena,
         radius,
@@ -263,12 +275,7 @@ async fn world_loop(p: Player) {
         totals,
     } = p;
     let enc = musubi_proto::Encoding::parse(&wire).unwrap_or_default();
-    let (mut ws, _) = match tokio_tungstenite::connect_async(format!(
-        "{}?token={token}&format={wire}",
-        ws_url(&url)
-    ))
-    .await
-    {
+    let mut ws = match Link::connect(&transport, &url, quic_addr.as_deref(), &token, &wire).await {
         Ok(c) => c,
         Err(e) => {
             if CONNECT_DEBUG.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -299,7 +306,7 @@ async fn world_loop(p: Player) {
                 budget_bytes: None,
                 filter: None,
                 max_hz,
-                unreliable_updates: false,
+                unreliable_updates: unreliable,
             },
         };
         match enc {
@@ -363,7 +370,13 @@ async fn world_loop(p: Player) {
                 }
             }
             Ok(Some(Ok(_))) => {}
-            Ok(_) => {
+            Ok(other) => {
+                if STREAM_DEBUG.fetch_add(1, Ordering::Relaxed) < 3 {
+                    match other {
+                        Some(Err(e)) => eprintln!("world: stream error: {e}"),
+                        _ => eprintln!("world: stream ended by the server"),
+                    }
+                }
                 totals.err_stream.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(sample("world", Instant::now(), false, false));
                 return;
@@ -679,6 +692,9 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let arena = arenas.get(i % arenas.len().max(1)).cloned();
         let (radius, totals) = (o.radius, totals.clone());
         let max_hz = o.max_hz;
+        let transport = o.transport.clone();
+        let quic_addr = o.quic_addr.clone();
+        let unreliable = o.unreliable;
         let wire = o.wire.clone();
         tasks.push(tokio::spawn(async move {
             match sc {
@@ -688,6 +704,9 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                     world_loop(Player {
                         url,
                         wire,
+                        transport: transport.clone(),
+                        quic_addr: quic_addr.clone(),
+                        unreliable,
                         token,
                         arena: arena.unwrap(),
                         radius,
@@ -804,6 +823,137 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The player's link to the node: WebSocket (the default) or QUIC with the same `Hello` as the
+/// native SDKs; keeps the tungstenite `Message` shape so the loop above is transport-agnostic.
+enum Link {
+    Ws(
+        Box<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ),
+    Quic {
+        conn: quinn::Connection,
+        send: quinn::SendStream,
+        /// Stream frames via a reader task: a `select!` over a half-read frame would lose bytes.
+        frames: tokio::sync::mpsc::Receiver<Result<musubi_transport::Frame, String>>,
+    },
+}
+
+type Msg = tokio_tungstenite::tungstenite::Message;
+
+impl Link {
+    async fn connect(
+        transport: &str,
+        url: &str,
+        quic_addr: Option<&str>,
+        token: &str,
+        wire: &str,
+    ) -> Result<Link, String> {
+        use musubi_transport::quic::QuicConnection as Q;
+        use musubi_transport::Frame;
+        match transport {
+            "quic" => {
+                let addr: std::net::SocketAddr = quic_addr
+                    .ok_or("--quic-addr required for --transport quic")?
+                    .parse()
+                    .map_err(|e| format!("quic addr: {e}"))?;
+                let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+                    .map_err(|e| e.to_string())?;
+                ep.set_default_client_config(
+                    musubi_transport::quic::insecure_client_config().map_err(|e| e.to_string())?,
+                );
+                let conn = ep
+                    .connect(addr, "localhost")
+                    .map_err(|e| e.to_string())?
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+                let (ftx, frames) = tokio::sync::mpsc::channel(256);
+                tokio::spawn(async move {
+                    loop {
+                        let r = Q::read_frame(&mut recv, 1 << 20)
+                            .await
+                            .map_err(|e| e.to_string());
+                        let stop = r.is_err();
+                        if ftx.send(r).await.is_err() || stop {
+                            return;
+                        }
+                    }
+                });
+                Q::write_frame(
+                    &mut send,
+                    Frame::Text(serde_json::json!({"token": token, "format": wire}).to_string()),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(Link::Quic { conn, send, frames })
+            }
+            _ => {
+                let (ws, _) = tokio_tungstenite::connect_async(format!(
+                    "{}?token={token}&format={wire}",
+                    ws_url(url)
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(Link::Ws(Box::new(ws)))
+            }
+        }
+    }
+
+    async fn send(&mut self, m: Msg) -> Result<(), String> {
+        use musubi_transport::quic::QuicConnection as Q;
+        use musubi_transport::Frame;
+        match self {
+            Link::Ws(ws) => ws.send(m).await.map_err(|e| e.to_string()),
+            Link::Quic { send, .. } => {
+                let f = match m {
+                    Msg::Text(t) => Frame::Text(t.to_string()),
+                    Msg::Binary(b) => Frame::Binary(bytes::Bytes::from(b)),
+                    _ => return Ok(()),
+                };
+                Q::write_frame(send, f).await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    async fn next(&mut self) -> Option<Result<Msg, String>> {
+        use musubi_transport::quic::QuicConnection as Q;
+        use musubi_transport::Frame;
+        match self {
+            Link::Ws(ws) => ws.next().await.map(|r| r.map_err(|e| e.to_string())),
+            Link::Quic { conn, frames, .. } => {
+                let f = tokio::select! {
+                    f = frames.recv() => f.unwrap_or(Err("stream closed".to_string())),
+                    d = conn.read_datagram() => match d {
+                        Ok(d) => Q::decode_datagram(d).map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    },
+                };
+                match f {
+                    Ok(Frame::Text(t)) => Some(Ok(Msg::Text(t))),
+                    Ok(Frame::Binary(b)) => Some(Ok(Msg::Binary(b.to_vec()))),
+                    Ok(Frame::Close) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        }
+    }
+
+    async fn close(&mut self, _reason: Option<()>) -> Result<(), String> {
+        match self {
+            Link::Ws(ws) => futures::SinkExt::close(ws.as_mut())
+                .await
+                .map_err(|e| e.to_string()),
+            Link::Quic { conn, .. } => {
+                conn.close(0u32.into(), b"bye");
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

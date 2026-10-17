@@ -85,6 +85,15 @@ enum Cmd {
         /// Wire encoding for world players: json or binary.
         #[arg(long, default_value = "json")]
         wire: String,
+        /// Transport for the world players: `ws` or `quic` (server cert NOT verified; bench only).
+        #[arg(long, default_value = "ws")]
+        transport: String,
+        /// QUIC address of the node for `--transport quic`, e.g. `127.0.0.1:7362`.
+        #[arg(long)]
+        quic_addr: Option<String>,
+        /// Subscribe with `unreliable_updates`: position deltas as sequenced unreliable frames.
+        #[arg(long)]
+        unreliable: bool,
         #[arg(long)]
         json: bool,
     },
@@ -208,6 +217,9 @@ async fn main() -> anyhow::Result<()> {
             radius,
             max_hz,
             wire,
+            transport,
+            quic_addr,
+            unreliable,
             json,
         } => {
             bench::run(bench::Opts {
@@ -220,6 +232,9 @@ async fn main() -> anyhow::Result<()> {
                 radius,
                 max_hz,
                 wire,
+                transport,
+                quic_addr,
+                unreliable,
                 json,
             })
             .await

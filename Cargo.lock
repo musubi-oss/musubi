@@ -2302,11 +2302,14 @@ name = "musubi-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "futures",
  "musubi-core",
  "musubi-proto",
  "musubi-server",
+ "musubi-transport",
+ "quinn",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
