@@ -8,14 +8,13 @@ The benches run with `--baseline-lenient main` and criterion writes the change a
   * flags a bench only when even the optimistic end of its 95% interval is above the threshold,
   * re-runs the flagged benches once (a busy neighbour on one core hits single benches), and fails
     only if they regress again.
-`--promote` copies the fresh results over the `main` baseline (run on main after the comparison).
-Usage: bench-compare.py [threshold_percent=5] [--promote]
+Usage: bench-compare.py [threshold_percent=5] [floor_ns=100].
 """
-import json, pathlib, re, shutil, subprocess, sys
+import json, pathlib, re, subprocess, sys
 
 PACKAGES = ["musubi-mesh", "musubi-proto", "musubi-auth"]
 root = pathlib.Path("target/criterion")
-args = [a for a in sys.argv[1:] if a != "--promote"]
+args = sys.argv[1:]
 threshold = float(args[0]) if args else 5.0
 # Sub-100 ns differences are below what shared runners can resolve (CPU model, cache placement and
 # code alignment move a 300 ns bench by ±25 % with no code change), so a bench must also move by at
@@ -67,13 +66,6 @@ def compare():
         print("no `main` baseline to compare against (first run)")
     return failing
 
-
-if "--promote" in sys.argv:
-    for bench in benches():
-        shutil.rmtree(bench / "main", ignore_errors=True)
-        shutil.copytree(bench / "new", bench / "main")
-    print(f"promoted {len(benches())} benches to the `main` baseline")
-    sys.exit(0)
 
 failing = compare()
 if failing:

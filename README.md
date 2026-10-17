@@ -49,10 +49,7 @@ the ones that matter.
 Hot paths have criterion benches that run on every push and pull request (`bench` job in
 `.github/workflows/ci.yml`): `musubi-mesh` (handover detection, per-tick advance, cell view, client
 delta at 1k / 10k entities), `musubi-proto` (envelope encode/decode in JSON and postcard) and
-`musubi-auth` (argon2 hash/verify, password policy). The last `main` run is the baseline (restored
-from the Actions cache); `scripts/bench-compare.py 5` fails the job when any bench's mean is more
-than 5 % slower after dividing by the change of the code-independent `calibrate` bench (shared runners
-differ in speed from run to run) and even the optimistic end of the 95 % interval is above the threshold, and the mean moved by at least 100 ns (sub-microsecond benches such as postcard decode shift ±25 % between shared runners with no code change — a smaller absolute move is reported but cannot be gated; `bench-compare.py 5 0` disables the floor on a dedicated runner). Suspects are re-run once before failing. Locally: `cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --save-baseline main`
+`musubi-auth` (argon2 hash/verify, password policy). The job benches the base commit (PR base, or the previous push) on the same runner first, then HEAD against it — comparing across GitHub's shared runners is meaningless, their CPU models differ by 2× on the same code — and `scripts/bench-compare.py 5` fails when a bench's mean is more than 5 % slower after dividing out the drift of the code-independent `calibrate` bench, even at the optimistic end of the 95 % interval, and by at least 100 ns (sub-microsecond benches still shift by a few tens of ns within one machine; `bench-compare.py 5 0` disables the floor). Suspects are re-run once before failing. Locally: `cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --save-baseline main`
 on the old code, `cargo bench … -- --baseline-lenient main` on the new code, then `python3 scripts/bench-compare.py`.
 
 ### Chaos stand (`musubi soak`)

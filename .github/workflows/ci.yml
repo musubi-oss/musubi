@@ -35,26 +35,21 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
   bench:
-    # criterion micro-benches (plan 6.2): the last main run is the baseline, >5% slower fails
+    # criterion micro-benches (plan 6.2): the base commit (PR base / previous push) is benched on the
+    # same runner right before HEAD, so the comparison never crosses machines; >5% slower fails
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: restore baseline
-        uses: actions/cache/restore@v4
-        with:
-          path: target/criterion
-          key: criterion-baseline-${{ github.sha }}
-          restore-keys: criterion-baseline-
+      - name: bench the base commit into the `main` baseline
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          case "$BASE" in ""|0000000000000000000000000000000000000000) BASE=$(git rev-parse HEAD~1 2>/dev/null || true);; esac
+          if [ -z "$BASE" ]; then echo "no base commit, nothing to compare"; exit 0; fi
+          git fetch --depth=1 origin "$BASE"
+          git worktree add ../base "$BASE"
+          (cd ../base && cargo bench --target-dir "$GITHUB_WORKSPACE/target" -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --noplot --save-baseline main)
       - run: cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --noplot --baseline-lenient main
       - run: python3 scripts/bench-compare.py 5
-      - name: promote results to the main baseline
-        if: always() && github.ref == 'refs/heads/main'
-        run: python3 scripts/bench-compare.py --promote
-      - name: save baseline
-        if: always() && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: target/criterion
-          key: criterion-baseline-${{ github.sha }}
