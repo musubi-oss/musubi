@@ -11191,3 +11191,99 @@ async fn admin_finds_account_by_identity() {
     let (st, _) = call_server(&app, "GET", "/v1/admin/accounts?identity=garbage", k, None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn webhooks_redeliver_resets_a_delivery() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, h) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/webhooks",
+        k,
+        Some(json!({"name": unique("rd"), "url": "http://127.0.0.1:9/nobody", "secret": "s3cret-s3cret-s3cret-16"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    let hook = h["id"].as_str().unwrap().to_string();
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("rd-dev")})),
+    )
+    .await;
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{acc}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/webhooks/dispatch",
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/webhooks/{hook}/deliveries"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let d = v["deliveries"].as_array().unwrap();
+    assert!(!d.is_empty(), "{v}");
+    let event = d[0]["event_id"].as_str().unwrap().to_string();
+    assert!(d[0]["attempts"].as_i64().unwrap() >= 1, "{v}");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/webhooks/{hook}/deliveries/{event}/redeliver"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["queued"], true);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/webhooks/{hook}/deliveries"),
+        k,
+        None,
+    )
+    .await;
+    let d = v["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["event_id"] == json!(event))
+        .cloned()
+        .unwrap();
+    assert_eq!(d["attempts"], 0, "{d}");
+    assert_eq!(d["dead"], false, "{d}");
+    assert!(d["last_error"].is_null(), "{d}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!(
+            "/v1/admin/webhooks/{hook}/deliveries/{}/redeliver",
+            uuid::Uuid::now_v7()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

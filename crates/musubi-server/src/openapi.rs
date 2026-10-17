@@ -108,6 +108,11 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("PATCH", "/v1/admin/webhooks/{id}", "webhooks"),
     ("GET", "/v1/admin/webhooks/{id}/deliveries", "webhooks"),
     ("POST", "/v1/admin/webhooks/{id}/test", "webhooks"),
+    (
+        "POST",
+        "/v1/admin/webhooks/{id}/deliveries/{event_id}/redeliver",
+        "webhooks",
+    ),
     ("POST", "/v1/auth/device", "auth"),
     ("POST", "/v1/auth/email", "auth"),
     ("POST", "/v1/auth/logout", "auth"),

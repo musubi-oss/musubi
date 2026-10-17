@@ -219,6 +219,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/admin/webhooks/{id}/deliveries", get(deliveries))
         .route("/v1/admin/webhooks/{id}/test", post(test_webhook))
+        .route(
+            "/v1/admin/webhooks/{id}/deliveries/{event_id}/redeliver",
+            post(redeliver),
+        )
         .route("/v1/server/events", get(pull_events))
         .route("/v1/server/webhooks/dispatch", post(dispatch_now))
 }
@@ -311,6 +315,30 @@ async fn delete_webhook(
         return Err(Error::NotFound("webhook".into()).into());
     }
     Ok(Json(json!({ "deleted": true })))
+}
+
+/// Put a delivery back in the queue — a dead one after `MAX_ATTEMPTS`, or an already delivered
+/// one the receiver lost; attempts and backoff start over and the next dispatch cycle sends it.
+async fn redeliver(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path((id, event_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let n = sqlx::query(
+        "update musubi.webhook_deliveries
+         set attempts = 0, dead = false, next_at = now(), delivered_at = null, last_status = null, last_error = null
+         where webhook_id = $1 and event_id = $2",
+    )
+    .bind(id)
+    .bind(event_id)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    if n == 0 {
+        return Err(Error::NotFound("delivery not found".into()).into());
+    }
+    Ok(Json(json!({ "queued": true })))
 }
 
 async fn deliveries(
