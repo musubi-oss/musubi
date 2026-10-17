@@ -43,6 +43,7 @@ impl FromRequestParts<AppState> for ServerKey {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let caller = check_server_key(state, &parts.headers)?;
+        state.limits.key(&caller)?;
         if !caller.role.allows(parts.method.as_str(), parts.uri.path()) {
             return Err(Error::PermissionDenied(format!(
                 "key '{}' has role {}: {} {} is outside its scope",

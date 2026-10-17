@@ -19,7 +19,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Мультипроект (несколько игр на кластере) | ✅ `[[projects]]`: своя база и cluster group на проект в одном процессе, выбор по `x-musubi-project`/`Host`, `GET /v1/projects` | ✅ | ❌ | ✅ (titles) | ✅ (namespaces) |
 | Скоуп-ключи сервер/админ | ✅ `server_keys` role server\|admin, аудит мутаций | ✅ | 🟡 один HTTP key | ✅ | ✅ |
 | RBAC операторов консоли (роли, SSO операторов) | ✅ роли ключей server / admin / support / liveops / ops (чтение всем, запись по области, 403 с маршрутом); SSO операторов через любой OIDC (`[operators.sso]`: группы → роль, домены, короткоживущие ключи) | ✅ | ❌ / ✅ | ✅ | ✅ |
-| Квоты и rate-limit per key / per account | 🟡 лимиты auth/ip, storage per-user; per-key нет | ✅ | ❌ | ✅ | ✅ |
+| Квоты и rate-limit per key / per account | ✅ лимиты auth/ip, http/rpc/socket per account с переопределениями и дневным бюджетом (`PUT /v1/admin/accounts/{id}/limits`), per server key (`[limits] key_*`, `PUT /v1/admin/keys/{id}/limits`), cluster-wide через шину | ✅ | ❌ | ✅ | ✅ |
 | Бэкап / restore данных игрока точечно | ✅ export JSON (`/v1/admin/accounts/{id}/export`) + `POST …/restore {export, tables?, mode: replace|merge, create_missing}` — построчный restore тех же таблиц в одной транзакции, воссоздание purged-аккаунта | 🟡 | ❌ | ✅ | 🟡 |
 
 ## 2. Идентичность, данные, социалка

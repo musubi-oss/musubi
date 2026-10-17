@@ -85,6 +85,13 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/accounts/{id}/kick", post(kick))
         .route("/v1/admin/accounts/{id}/export", get(export))
         .route("/v1/admin/accounts/{id}/restore", post(restore))
+        .route(
+            "/v1/admin/accounts/{id}/limits",
+            get(account_limits_get)
+                .put(account_limits_put)
+                .delete(account_limits_delete),
+        )
+        .route("/v1/admin/keys/{id}/limits", put(key_limits_put))
         .route("/v1/admin/accounts/{id}/sessions", get(sessions))
         .route(
             "/v1/admin/accounts/{id}/identities/{provider}/{subject}",
@@ -779,6 +786,110 @@ async fn keys_issue(
     Ok(Json(
         json!({ "id": caller.id, "name": caller.name, "role": caller.role, "secret": secret }),
     ))
+}
+
+#[derive(Deserialize)]
+struct AccountLimitBody {
+    #[serde(flatten)]
+    limit: crate::limits::AccountLimit,
+    #[serde(default)]
+    note: String,
+}
+
+/// The account's rate-limit override (404 when it runs on the `[limits]` defaults).
+async fn account_limits_get(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i64>, String, time::OffsetDateTime)> = sqlx::query_as(
+        "select http_per_second, http_burst, rpc_per_second, rpc_burst, daily, note, updated_at from musubi.account_limits where account_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let Some((hp, hb, rp, rb, d, note, at)) = row else {
+        return Err(Error::NotFound("no limit override for this account".into()).into());
+    };
+    Ok(Json(json!({
+        "account_id": id, "http_per_second": hp, "http_burst": hb, "rpc_per_second": rp,
+        "rpc_burst": rb, "daily": d, "note": note, "updated_at": at.unix_timestamp(),
+        "defaults": {
+            "http_per_second": s.cfg.limits.http_per_second_per_account, "http_burst": s.cfg.limits.http_burst,
+            "rpc_per_second": s.cfg.limits.rpc_per_second_per_account, "rpc_burst": s.cfg.limits.rpc_burst,
+        },
+    })))
+}
+
+/// Override the account's budgets (`http_per_second`, `http_burst`, `rpc_per_second`,
+/// `rpc_burst`, `daily`; omitted = default). Takes effect on every node at once.
+async fn account_limits_put(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(b): Json<AccountLimitBody>,
+) -> Result<Json<Value>, ApiError> {
+    if b.limit.is_empty() {
+        return Err(Error::InvalidArgument(
+            "set at least one of http_per_second, http_burst, rpc_per_second, rpc_burst, daily (or DELETE to clear)".into(),
+        )
+        .into());
+    }
+    let exists: bool =
+        sqlx::query_scalar("select exists(select 1 from musubi.accounts where id = $1)")
+            .bind(id)
+            .fetch_one(&s.db)
+            .await
+            .map_err(Error::internal)?;
+    if !exists {
+        return Err(Error::NotFound("account".into()).into());
+    }
+    s.limits.set_override(&s.db, id, b.limit, &b.note).await?;
+    if let Some(c) = &s.cluster {
+        let _ = c.publish(crate::limits::LIMITS_TOPIC, &id).await;
+    }
+    s.events
+        .emit(
+            "account.limits",
+            Some(AccountId(id)),
+            json!({ "limit": b.limit, "note": b.note }),
+        )
+        .await;
+    Ok(Json(
+        json!({ "account_id": id, "limit": b.limit, "note": b.note }),
+    ))
+}
+
+async fn account_limits_delete(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let cleared = s.limits.clear_override(&s.db, id).await?;
+    if let Some(c) = &s.cluster {
+        let _ = c.publish(crate::limits::LIMITS_TOPIC, &id).await;
+    }
+    Ok(Json(json!({ "account_id": id, "cleared": cleared })))
+}
+
+/// Budget of one issued server key: `per_second`, `burst`, `daily` (omitted = the
+/// `[limits] key_*` defaults; an empty body clears the override).
+async fn key_limits_put(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(l): Json<crate::keys::KeyLimit>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = (l != crate::keys::KeyLimit::default()).then_some(l);
+    if !s.keys.set_limit(&s.db, id, limit).await? {
+        return Err(Error::NotFound("key".into()).into());
+    }
+    if let Some(c) = &s.cluster {
+        let _ = c.publish(crate::keys::KEYS_TOPIC, &id).await;
+    }
+    Ok(Json(json!({ "id": id, "limit": limit })))
 }
 
 async fn keys_revoke(

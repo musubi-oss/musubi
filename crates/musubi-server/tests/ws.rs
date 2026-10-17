@@ -14746,3 +14746,214 @@ async fn account_export_restore_roundtrip() {
         "old token may be invalid after purge: {st}"
     );
 }
+
+/// Per-account overrides (rate + daily budget) and per-key budgets: set through the admin API,
+/// enforced on the next request, cleared again.
+#[tokio::test]
+async fn limits_per_account_and_per_key() {
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    // tests run with rate limiting off; this one needs it on
+    let mut lc = state.cfg.limits.clone();
+    lc.enabled = true;
+    lc.cluster_wide = false;
+    state.limits = Arc::new(musubi_server::limits::RateLimiter::new(&lc));
+    let router = musubi_server::http::router(state.clone());
+    let (ta, aid) = token(&router).await;
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/limits"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &format!("/v1/admin/accounts/{aid}/limits"),
+        None,
+        true,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &format!("/v1/admin/accounts/{}/limits", uuid::Uuid::now_v7()),
+        None,
+        true,
+        Some(json!({"daily": 3})),
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+    // a daily budget of 3 requests
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &format!("/v1/admin/accounts/{aid}/limits"),
+        None,
+        true,
+        Some(json!({"daily": 3, "note": "trial"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["limit"]["daily"], 3);
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/limits"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["daily"], 3);
+    assert_eq!(r["note"], "trial");
+    assert!(r["http_per_second"].is_null());
+    assert_eq!(r["defaults"]["http_per_second"], 50);
+    let mut statuses = Vec::new();
+    for _ in 0..4 {
+        let (st, _) = http_json(&router, "GET", "/v1/account", Some(&ta), false, None).await;
+        statuses.push(st);
+    }
+    assert_eq!(statuses, vec![200, 200, 200, 429], "{statuses:?}");
+    let (st, r) = http_json(&router, "GET", "/v1/account", Some(&ta), false, None).await;
+    assert_eq!(st, 429);
+    assert!(r.to_string().contains("daily budget"), "{r}");
+    // tighter rate for another account: burst 2 then 429
+    let (tb, bid) = token(&router).await;
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &format!("/v1/admin/accounts/{bid}/limits"),
+        None,
+        true,
+        Some(json!({"http_per_second": 1, "http_burst": 2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let (st, _) = http_json(&router, "GET", "/v1/account", Some(&tb), false, None).await;
+        statuses.push(st);
+    }
+    assert_eq!(statuses, vec![200, 200, 429], "{statuses:?}");
+    // clearing restores the defaults
+    let (st, r) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/admin/accounts/{aid}/limits"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["cleared"], true);
+    let (st, _) = http_json(&router, "GET", "/v1/account", Some(&ta), false, None).await;
+    assert_eq!(st, 200, "no daily budget any more");
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/limits"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    assert!(state
+        .limits
+        .override_of(uuid::Uuid::parse_str(&aid).unwrap())
+        .is_none());
+    // per-key budget
+    let (st, k) = http_json(
+        &router,
+        "POST",
+        "/v1/admin/keys",
+        None,
+        true,
+        Some(json!({"name": "limited-gs", "role": "server"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{k}");
+    let kid = k["id"].as_str().unwrap().to_string();
+    let secret = k["secret"].as_str().unwrap().to_string();
+    async fn with_key(router: &axum::Router, secret: &str, path: &str) -> u16 {
+        let req = Request::get(path)
+            .header("x-musubi-server-key", secret)
+            .body(Body::empty())
+            .unwrap();
+        router.clone().oneshot(req).await.unwrap().status().as_u16()
+    }
+    assert_eq!(
+        with_key(&router, &secret, "/v1/server/matchmaker/queues").await,
+        200
+    );
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &format!("/v1/admin/keys/{}/limits", uuid::Uuid::now_v7()),
+        None,
+        true,
+        Some(json!({"per_second": 1})),
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &format!("/v1/admin/keys/{kid}/limits"),
+        None,
+        true,
+        Some(json!({"per_second": 1, "burst": 2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["limit"]["per_second"], 1);
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        statuses.push(with_key(&router, &secret, "/v1/server/matchmaker/queues").await);
+    }
+    assert_eq!(statuses, vec![200, 200, 429], "{statuses:?}");
+    let (st, list) = http_json(&router, "GET", "/v1/admin/keys", None, true, None).await;
+    assert_eq!(st, 200);
+    let mine = list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == kid)
+        .unwrap();
+    assert_eq!(mine["limit"]["burst"], 2, "{mine}");
+    // the config bootstrap key is never limited
+    for _ in 0..5 {
+        let (st, _) = http_json(&router, "GET", "/v1/admin/keys", None, true, None).await;
+        assert_eq!(st, 200);
+    }
+    // empty body clears the key's override
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &format!("/v1/admin/keys/{kid}/limits"),
+        None,
+        true,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(r["limit"].is_null());
+    let (_, list) = http_json(&router, "GET", "/v1/admin/keys", None, true, None).await;
+    let mine = list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == kid)
+        .unwrap();
+    assert!(mine["limit"].is_null(), "{mine}");
+}

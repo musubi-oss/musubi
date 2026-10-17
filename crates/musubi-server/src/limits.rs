@@ -7,6 +7,34 @@ use std::time::Instant;
 use dashmap::DashMap;
 use musubi_core::config::LimitsConfig;
 use musubi_core::{AccountId, Error, Result};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// Bus topic: an account's limit override changed somewhere in the cluster.
+pub const LIMITS_TOPIC: &str = "admin.limits";
+
+/// Per-account override of the `[limits]` defaults plus a daily request budget
+/// (`None` = default, `daily` 0/None = unlimited).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccountLimit {
+    #[serde(default)]
+    pub http_per_second: Option<u32>,
+    #[serde(default)]
+    pub http_burst: Option<u32>,
+    #[serde(default)]
+    pub rpc_per_second: Option<u32>,
+    #[serde(default)]
+    pub rpc_burst: Option<u32>,
+    #[serde(default)]
+    pub daily: Option<u64>,
+}
+
+impl AccountLimit {
+    pub fn is_empty(&self) -> bool {
+        *self == AccountLimit::default()
+    }
+}
 
 struct Bucket {
     tokens: f64,
@@ -14,6 +42,7 @@ struct Bucket {
 }
 
 pub struct RateLimiter {
+    overrides: DashMap<Uuid, AccountLimit>,
     cfg: LimitsConfig,
     buckets: DashMap<String, Bucket>,
     /// Tokens consumed locally since the last gossip flush, per `scope:key`.
@@ -30,6 +59,7 @@ const SWEEP_AT: usize = 100_000;
 impl RateLimiter {
     pub fn new(cfg: &LimitsConfig) -> Self {
         Self {
+            overrides: DashMap::new(),
             cfg: cfg.clone(),
             buckets: DashMap::new(),
             pending: DashMap::new(),
@@ -198,26 +228,155 @@ impl RateLimiter {
             .map_err(|r| Self::limited("auth", r))
     }
 
-    /// Authenticated HTTP requests per account.
+    /// Authenticated HTTP requests per account: the `[limits]` defaults unless the account has
+    /// an override, plus its daily budget when it has one.
     pub fn account(&self, id: AccountId) -> Result<()> {
+        let o = self.override_of(id.0).unwrap_or_default();
         self.check(
             "http",
             &id.0.to_string(),
-            self.cfg.http_per_second_per_account as f64,
-            self.cfg.http_burst as f64,
+            o.http_per_second
+                .unwrap_or(self.cfg.http_per_second_per_account) as f64,
+            o.http_burst.unwrap_or(self.cfg.http_burst) as f64,
         )
-        .map_err(|r| Self::limited("http", r))
+        .map_err(|r| Self::limited("http", r))?;
+        self.daily("quota", &id.0.to_string(), o.daily.unwrap_or(0))
     }
 
     /// Runtime RPCs per account (on top of the HTTP budget).
     pub fn rpc(&self, id: AccountId) -> Result<()> {
+        let o = self.override_of(id.0).unwrap_or_default();
         self.check(
             "rpc",
             &id.0.to_string(),
-            self.cfg.rpc_per_second_per_account as f64,
-            self.cfg.rpc_burst as f64,
+            o.rpc_per_second
+                .unwrap_or(self.cfg.rpc_per_second_per_account) as f64,
+            o.rpc_burst.unwrap_or(self.cfg.rpc_burst) as f64,
         )
         .map_err(|r| Self::limited("rpc", r))
+    }
+
+    /// Requests of one server key: its own `KeyLimit` or the `[limits] key_*` defaults
+    /// (0 = unlimited). The bootstrap config key is never limited.
+    pub fn key(&self, caller: &crate::keys::Caller) -> Result<()> {
+        if caller.id.is_nil() {
+            return Ok(());
+        }
+        let l = caller.limit.unwrap_or_default();
+        let per_sec = l.per_second.unwrap_or(self.cfg.key_per_second);
+        let burst = l.burst.unwrap_or(self.cfg.key_burst).max(per_sec);
+        let key = caller.id.to_string();
+        if per_sec > 0 {
+            self.check("key", &key, per_sec as f64, burst as f64)
+                .map_err(|r| Self::limited("key", r))?;
+        }
+        self.daily("key_quota", &key, l.daily.unwrap_or(self.cfg.key_daily))
+    }
+
+    /// A daily budget as a slow bucket: `daily` tokens that refill over 24 h, so a subject can
+    /// spend its whole day's budget at once and then waits for it to come back gradually.
+    /// Cluster-wide like every other bucket when `cluster_wide` is on.
+    fn daily(&self, scope: &str, key: &str, daily: u64) -> Result<()> {
+        if daily == 0 {
+            return Ok(());
+        }
+        self.check(scope, key, daily as f64 / 86_400.0, daily as f64)
+            .map_err(|r| {
+                Error::ResourceExhausted(format!(
+                    "daily budget of {daily} requests spent ({scope}); next in {:.0}s",
+                    r.max(1.0)
+                ))
+            })
+    }
+
+    pub fn override_of(&self, id: Uuid) -> Option<AccountLimit> {
+        self.overrides.get(&id).map(|o| *o)
+    }
+
+    /// Load every account override from the database (startup and `admin.limits`).
+    pub async fn load_overrides(&self, db: &PgPool) -> Result<usize> {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(Uuid, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i64>)> =
+            sqlx::query_as(
+                "select account_id, http_per_second, http_burst, rpc_per_second, rpc_burst, daily from musubi.account_limits",
+            )
+            .fetch_all(db)
+            .await
+            .map_err(Error::internal)?;
+        self.overrides.clear();
+        for (id, hp, hb, rp, rb, d) in &rows {
+            self.overrides.insert(
+                *id,
+                AccountLimit {
+                    http_per_second: hp.map(|v| v.max(0) as u32),
+                    http_burst: hb.map(|v| v.max(0) as u32),
+                    rpc_per_second: rp.map(|v| v.max(0) as u32),
+                    rpc_burst: rb.map(|v| v.max(0) as u32),
+                    daily: d.map(|v| v.max(0) as u64),
+                },
+            );
+        }
+        Ok(rows.len())
+    }
+
+    pub async fn set_override(
+        &self,
+        db: &PgPool,
+        id: Uuid,
+        l: AccountLimit,
+        note: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into musubi.account_limits (account_id, http_per_second, http_burst, rpc_per_second, rpc_burst, daily, note, updated_at)
+             values ($1, $2, $3, $4, $5, $6, $7, now())
+             on conflict (account_id) do update set http_per_second = $2, http_burst = $3, rpc_per_second = $4, rpc_burst = $5, daily = $6, note = $7, updated_at = now()",
+        )
+        .bind(id)
+        .bind(l.http_per_second.map(|v| v as i32))
+        .bind(l.http_burst.map(|v| v as i32))
+        .bind(l.rpc_per_second.map(|v| v as i32))
+        .bind(l.rpc_burst.map(|v| v as i32))
+        .bind(l.daily.map(|v| v as i64))
+        .bind(note)
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+        self.overrides.insert(id, l);
+        Ok(())
+    }
+
+    pub async fn clear_override(&self, db: &PgPool, id: Uuid) -> Result<bool> {
+        let r = sqlx::query("delete from musubi.account_limits where account_id = $1")
+            .bind(id)
+            .execute(db)
+            .await
+            .map_err(Error::internal)?;
+        self.overrides.remove(&id);
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Reload overrides on `admin.limits` from any node.
+    pub fn start(
+        self: &std::sync::Arc<Self>,
+        cluster: &std::sync::Arc<musubi_cluster::Cluster>,
+        db: PgPool,
+    ) {
+        let me = self.clone();
+        let mut rx = cluster.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(m) if m.topic == LIMITS_TOPIC => {
+                        if let Err(e) = me.load_overrides(&db).await {
+                            tracing::warn!(error = %e, "account limits reload failed");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
     }
 
     /// Inbound realtime messages per account.

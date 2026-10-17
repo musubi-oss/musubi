@@ -505,6 +505,7 @@ mod tests {
 pub const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("identities", "account_id"),
     ("sessions", "account_id"),
+    ("account_limits", "account_id"),
     ("storage_objects", "owner_id"),
     ("friends", "user_id"),
     ("group_members", "user_id"),

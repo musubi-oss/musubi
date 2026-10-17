@@ -588,12 +588,16 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     if let Some(c) = &state.cluster {
         crate::jwt::start(c, state.db.clone(), state.auth.clone());
     }
+    if let Err(e) = state.limits.load_overrides(&state.db).await {
+        tracing::warn!(error = %e, "account limits not loaded");
+    }
     match state.keys.load(&state.db).await {
         Ok(n) => info!(keys = n, "server keys loaded"),
         Err(e) => tracing::warn!(error = %e, "server keys load failed"),
     }
     if let Some(c) = &state.cluster {
         state.keys.start(c, state.db.clone());
+        state.limits.start(c, state.db.clone());
     }
     state.anticheat.bind(&state);
     match state.banned.load(&state.db).await {

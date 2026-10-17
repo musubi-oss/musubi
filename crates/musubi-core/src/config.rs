@@ -671,6 +671,12 @@ pub struct LimitsConfig {
     pub socket_burst: u32,
     /// Share consumption between nodes over the bus so a budget is cluster-wide, not per node.
     pub cluster_wide: bool,
+    /// Default budget of an issued server key (requests/s, burst, per day); 0 = unlimited. A key
+    /// can carry its own via `PUT /v1/admin/keys/{id}/limits`. The config bootstrap key is never
+    /// limited.
+    pub key_per_second: u32,
+    pub key_burst: u32,
+    pub key_daily: u64,
 }
 
 impl Default for LimitsConfig {
@@ -685,6 +691,9 @@ impl Default for LimitsConfig {
             socket_per_second: 60,
             socket_burst: 120,
             cluster_wide: true,
+            key_per_second: 0,
+            key_burst: 0,
+            key_daily: 0,
         }
     }
 }

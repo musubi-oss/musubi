@@ -25,7 +25,35 @@ type KeyRow = (
     Option<time::OffsetDateTime>,
     Option<time::OffsetDateTime>,
     Option<String>,
+    Option<i32>,
+    Option<i32>,
+    Option<i64>,
 );
+
+/// Rate limit of one server key: requests per second with a burst, plus a daily budget
+/// (0 / None = the `[limits] key_*` defaults).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyLimit {
+    #[serde(default)]
+    pub per_second: Option<u32>,
+    #[serde(default)]
+    pub burst: Option<u32>,
+    #[serde(default)]
+    pub daily: Option<u64>,
+}
+
+impl KeyLimit {
+    fn from_row(p: Option<i32>, b: Option<i32>, d: Option<i64>) -> Option<Self> {
+        if p.is_none() && b.is_none() && d.is_none() {
+            return None;
+        }
+        Some(KeyLimit {
+            per_second: p.map(|v| v.max(0) as u32),
+            burst: b.map(|v| v.max(0) as u32),
+            daily: d.map(|v| v.max(0) as u64),
+        })
+    }
+}
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +163,8 @@ pub struct Caller {
     pub id: Uuid,
     pub name: String,
     pub role: Role,
+    /// Per-key rate limit override (see `KeyLimit`).
+    pub limit: Option<KeyLimit>,
 }
 
 impl Caller {
@@ -143,6 +173,7 @@ impl Caller {
             id: Uuid::nil(),
             name: "config".into(),
             role: Role::Admin,
+            limit: None,
         }
     }
 }
@@ -160,17 +191,26 @@ pub(crate) fn hash(secret: &str) -> String {
 
 impl ServerKeys {
     pub async fn load(&self, db: &PgPool) -> Result<usize> {
-        let rows: Vec<(Uuid, String, String, String, Option<time::OffsetDateTime>)> =
-            sqlx::query_as(
-                "select id, name, role, hash, expires_at from musubi.server_keys
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            String,
+            String,
+            String,
+            Option<time::OffsetDateTime>,
+            Option<i32>,
+            Option<i32>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "select id, name, role, hash, expires_at, per_second, burst, daily from musubi.server_keys
              where revoked_at is null and (expires_at is null or expires_at > now())",
-            )
-            .fetch_all(db)
-            .await
-            .map_err(Error::internal)?;
+        )
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
         self.by_hash.clear();
         self.expires.clear();
-        for (id, name, role, h, exp) in &rows {
+        for (id, name, role, h, exp, p, b, d) in &rows {
             if let Some(role) = Role::parse(role) {
                 self.by_hash.insert(
                     h.clone(),
@@ -178,6 +218,7 @@ impl ServerKeys {
                         id: *id,
                         name: name.clone(),
                         role,
+                        limit: KeyLimit::from_row(*p, *b, *d),
                     },
                 );
                 if let Some(exp) = exp {
@@ -265,6 +306,7 @@ impl ServerKeys {
             id,
             name: name.to_string(),
             role,
+            limit: None,
         };
         if let Some(exp) = expires_at {
             self.expires.insert(id, exp);
@@ -287,14 +329,14 @@ impl ServerKeys {
 
     pub async fn list(db: &PgPool) -> Result<Vec<Value>> {
         let rows: Vec<KeyRow> = sqlx::query_as(
-            "select id, name, role, created_at, revoked_at, last_used_at, expires_at, subject from musubi.server_keys order by created_at desc",
+            "select id, name, role, created_at, revoked_at, last_used_at, expires_at, subject, per_second, burst, daily from musubi.server_keys order by created_at desc",
         )
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, role, c, r, u, e, subject)| {
+            .map(|(id, name, role, c, r, u, e, subject, p, b, d)| {
                 json!({
                     "id": id, "name": name, "role": role,
                     "created_at": c.unix_timestamp(),
@@ -302,9 +344,35 @@ impl ServerKeys {
                     "last_used_at": u.map(|t| t.unix_timestamp()),
                     "expires_at": e.map(|t| t.unix_timestamp()),
                     "subject": subject,
+                    "limit": KeyLimit::from_row(p, b, d),
                 })
             })
             .collect())
+    }
+
+    /// Set (or with `None` clear) the per-key rate limit; live callers on this node are updated
+    /// at once, other nodes on `admin.keys`.
+    pub async fn set_limit(&self, db: &PgPool, id: Uuid, limit: Option<KeyLimit>) -> Result<bool> {
+        let l = limit.unwrap_or_default();
+        let r = sqlx::query(
+            "update musubi.server_keys set per_second = $2, burst = $3, daily = $4 where id = $1 and revoked_at is null",
+        )
+        .bind(id)
+        .bind(l.per_second.map(|v| v as i32))
+        .bind(l.burst.map(|v| v as i32))
+        .bind(l.daily.map(|v| v as i64))
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+        if r.rows_affected() == 0 {
+            return Ok(false);
+        }
+        for mut c in self.by_hash.iter_mut() {
+            if c.id == id {
+                c.limit = limit;
+            }
+        }
+        Ok(true)
     }
 
     /// Reload on `admin.keys` from any node (issue/revoke elsewhere).
