@@ -56,6 +56,25 @@ pub struct Group {
     /// Pinned announcement from an admin, if any.
     pub announcement: Option<String>,
     pub announcement_at: Option<i64>,
+    pub xp: i64,
+    pub level: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AllianceMember {
+    pub group_id: GroupId,
+    pub name: String,
+    /// 0 member, 1 invited
+    pub state: i16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Alliance {
+    pub id: Uuid,
+    pub name: String,
+    pub leader_group: GroupId,
+    pub members: Vec<AllianceMember>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +205,7 @@ pub const MAX_GROUPS_PER_USER: i64 = 100;
 #[derive(Clone)]
 pub struct GroupService {
     db: PgPool,
+    level_xp: Vec<i64>,
 }
 
 type GroupRow = (
@@ -203,6 +223,8 @@ type GroupRow = (
     OffsetDateTime,
     Option<String>,
     Option<OffsetDateTime>,
+    i64,
+    i32,
 );
 
 type BanRow = (
@@ -222,7 +244,7 @@ type EventRow = (
     OffsetDateTime,
 );
 
-const GROUP_COLS: &str = "g.id, g.creator_id, g.name, g.description, g.avatar_url, g.lang, g.metadata, g.open, g.edge_count, g.max_count, g.created_at, g.updated_at, g.announcement, g.announcement_at";
+const GROUP_COLS: &str = "g.id, g.creator_id, g.name, g.description, g.avatar_url, g.lang, g.metadata, g.open, g.edge_count, g.max_count, g.created_at, g.updated_at, g.announcement, g.announcement_at, g.xp, g.level";
 
 fn to_group(r: GroupRow) -> Group {
     Group {
@@ -240,6 +262,8 @@ fn to_group(r: GroupRow) -> Group {
         update_time: r.11,
         announcement: r.12,
         announcement_at: r.13.map(|t| t.unix_timestamp()),
+        xp: r.14,
+        level: r.15,
     }
 }
 
@@ -266,7 +290,12 @@ fn validate_metadata(m: &Option<serde_json::Value>) -> Result<()> {
 
 impl GroupService {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            level_xp: vec![
+                1_000, 3_000, 6_000, 10_000, 15_000, 21_000, 28_000, 36_000, 45_000,
+            ],
+        }
     }
 
     pub async fn create(&self, me: AccountId, c: CreateGroup) -> Result<Group> {
@@ -773,6 +802,292 @@ impl GroupService {
     }
 
     /// Admin+: raise users one rank (member → admin, admin → superadmin), never above the caller.
+    /// XP thresholds for levels 2, 3, … (`[social] group_level_xp`).
+    pub fn with_level_xp(mut self, level_xp: Vec<i64>) -> Self {
+        self.level_xp = level_xp;
+        self
+    }
+
+    fn level_for(&self, xp: i64) -> i32 {
+        1 + self.level_xp.iter().filter(|t| xp >= **t).count() as i32
+    }
+
+    /// Server-side XP grant for a group (quests, wars, events); returns the group with its level
+    /// recomputed from the thresholds and whether it went up.
+    pub async fn grant_xp(
+        &self,
+        group: GroupId,
+        delta: i64,
+        reason: &str,
+    ) -> Result<(Group, bool)> {
+        if delta <= 0 {
+            return Err(Error::InvalidArgument("delta must be positive".into()));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let before: Option<(i64, i32)> =
+            sqlx::query_as("select xp, level from musubi.groups where id = $1 for update")
+                .bind(group.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+        let Some((xp, level)) = before else {
+            return Err(Error::NotFound("group".into()));
+        };
+        let xp = xp.saturating_add(delta);
+        let new_level = self.level_for(xp);
+        let row: GroupRow = sqlx::query_as(&format!(
+            "update musubi.groups g set xp = $2, level = $3, updated_at = now() where g.id = $1 returning {GROUP_COLS}"
+        ))
+        .bind(group.0)
+        .bind(xp)
+        .bind(new_level)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if new_level > level {
+            log_event(
+                &mut tx,
+                group,
+                "level_up",
+                None,
+                None,
+                serde_json::json!({ "level": new_level, "xp": xp, "reason": reason }),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok((to_group(row), new_level > level))
+    }
+
+    /// Owner of `group` founds an alliance; the group becomes its leader and first member.
+    pub async fn create_alliance(
+        &self,
+        me: AccountId,
+        group: GroupId,
+        name: &str,
+    ) -> Result<Alliance> {
+        if name.is_empty() || name.len() > 64 {
+            return Err(Error::InvalidArgument(
+                "alliance name must be 1..=64 chars".into(),
+            ));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        require_role(&mut tx, group, me, MemberState::Superadmin).await?;
+        let id = Uuid::now_v7();
+        sqlx::query("insert into musubi.alliances (id, name, leader_group) values ($1, $2, $3)")
+            .bind(id)
+            .bind(name)
+            .bind(group.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref d) if d.is_unique_violation() => {
+                    Error::AlreadyExists("alliance name taken".into())
+                }
+                e => Error::internal(e),
+            })?;
+        sqlx::query(
+            "insert into musubi.alliance_members (alliance_id, group_id, state) values ($1, $2, 0)",
+        )
+        .bind(id)
+        .bind(group.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref d) if d.is_unique_violation() => {
+                Error::AlreadyExists("group is already in an alliance".into())
+            }
+            e => Error::internal(e),
+        })?;
+        log_event(
+            &mut tx,
+            group,
+            "alliance_founded",
+            Some(me),
+            None,
+            serde_json::json!({ "alliance_id": id, "name": name }),
+        )
+        .await?;
+        tx.commit().await.map_err(Error::internal)?;
+        self.alliance(id).await
+    }
+
+    /// Owner of the leader group invites another group (its owner accepts).
+    pub async fn invite_to_alliance(
+        &self,
+        me: AccountId,
+        alliance: Uuid,
+        group: GroupId,
+    ) -> Result<Alliance> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let leader = alliance_leader(&mut tx, alliance).await?;
+        require_role(&mut tx, leader, me, MemberState::Superadmin).await?;
+        sqlx::query(
+            "insert into musubi.alliance_members (alliance_id, group_id, state) values ($1, $2, 1)",
+        )
+        .bind(alliance)
+        .bind(group.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref d) if d.is_unique_violation() => {
+                Error::AlreadyExists("group is already in or invited to an alliance".into())
+            }
+            sqlx::Error::Database(ref d) if d.is_foreign_key_violation() => {
+                Error::NotFound("group".into())
+            }
+            e => Error::internal(e),
+        })?;
+        log_event(
+            &mut tx,
+            group,
+            "alliance_invited",
+            Some(me),
+            None,
+            serde_json::json!({ "alliance_id": alliance }),
+        )
+        .await?;
+        tx.commit().await.map_err(Error::internal)?;
+        self.alliance(alliance).await
+    }
+
+    /// Owner of an invited group accepts the invitation.
+    pub async fn accept_alliance(
+        &self,
+        me: AccountId,
+        alliance: Uuid,
+        group: GroupId,
+    ) -> Result<Alliance> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        require_role(&mut tx, group, me, MemberState::Superadmin).await?;
+        let n = sqlx::query(
+            "update musubi.alliance_members set state = 0, joined_at = now() where alliance_id = $1 and group_id = $2 and state = 1",
+        )
+        .bind(alliance)
+        .bind(group.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::NotFound("invitation".into()));
+        }
+        log_event(
+            &mut tx,
+            group,
+            "alliance_joined",
+            Some(me),
+            None,
+            serde_json::json!({ "alliance_id": alliance }),
+        )
+        .await?;
+        tx.commit().await.map_err(Error::internal)?;
+        self.alliance(alliance).await
+    }
+
+    /// Owner takes the group out (declining an invitation works the same way). When the leader
+    /// group leaves, the alliance is dissolved.
+    pub async fn leave_alliance(
+        &self,
+        me: AccountId,
+        alliance: Uuid,
+        group: GroupId,
+    ) -> Result<()> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        require_role(&mut tx, group, me, MemberState::Superadmin).await?;
+        let leader = alliance_leader(&mut tx, alliance).await?;
+        if leader == group {
+            sqlx::query("delete from musubi.alliances where id = $1")
+                .bind(alliance)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+            log_event(
+                &mut tx,
+                group,
+                "alliance_dissolved",
+                Some(me),
+                None,
+                serde_json::json!({ "alliance_id": alliance }),
+            )
+            .await?;
+        } else {
+            let n = sqlx::query(
+                "delete from musubi.alliance_members where alliance_id = $1 and group_id = $2",
+            )
+            .bind(alliance)
+            .bind(group.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+            if n == 0 {
+                return Err(Error::NotFound("membership".into()));
+            }
+            log_event(
+                &mut tx,
+                group,
+                "alliance_left",
+                Some(me),
+                None,
+                serde_json::json!({ "alliance_id": alliance }),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(())
+    }
+
+    pub async fn alliance(&self, id: Uuid) -> Result<Alliance> {
+        let head: Option<(String, Uuid, OffsetDateTime)> = sqlx::query_as(
+            "select name, leader_group, created_at from musubi.alliances where id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some((name, leader, created_at)) = head else {
+            return Err(Error::NotFound("alliance".into()));
+        };
+        let members: Vec<(Uuid, String, i16)> = sqlx::query_as(
+            "select m.group_id, g.name, m.state from musubi.alliance_members m join musubi.groups g on g.id = m.group_id
+             where m.alliance_id = $1 order by m.state, m.joined_at",
+        )
+        .bind(id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(Alliance {
+            id,
+            name,
+            leader_group: GroupId(leader),
+            members: members
+                .into_iter()
+                .map(|(g, name, state)| AllianceMember {
+                    group_id: GroupId(g),
+                    name,
+                    state,
+                })
+                .collect(),
+            created_at: created_at.unix_timestamp(),
+        })
+    }
+
+    /// The alliance a group belongs to or is invited to, if any.
+    pub async fn group_alliance(&self, group: GroupId) -> Result<Option<Alliance>> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "select alliance_id from musubi.alliance_members where group_id = $1",
+        )
+        .bind(group.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        match id {
+            Some(id) => Ok(Some(self.alliance(id).await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Does `me`'s role in `group` hold `bit`? (owner always does) — for callers outside the
     /// group service, e.g. the treasury.
     pub async fn check_perm(&self, me: AccountId, group: GroupId, bit: i64) -> Result<()> {
@@ -1119,7 +1434,7 @@ impl GroupService {
             ),
             None => None,
         };
-        let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String, Option<String>, String, serde_json::Value, bool, i32, i32, OffsetDateTime, OffsetDateTime, Option<String>, Option<OffsetDateTime>, i16)>(&format!(
+        let rows = sqlx::query(&format!(
             "select {GROUP_COLS}, m.state from musubi.group_members m join musubi.groups g on g.id = m.group_id
              where m.user_id = $1 and ($2::smallint is null or m.state = $2) and ($3::uuid is null or g.id > $3)
              order by g.id limit $4"
@@ -1132,16 +1447,34 @@ impl GroupService {
         .await
         .map_err(Error::internal)?;
         let more = rows.len() as i64 > limit;
-        let items: Vec<UserGroup> = rows
-            .into_iter()
-            .take(limit as usize)
-            .map(|r| UserGroup {
-                state: MemberState::try_from(r.14).unwrap_or(MemberState::JoinRequest),
-                group: to_group((
-                    r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11, r.12, r.13,
-                )),
-            })
-            .collect();
+        let mut items: Vec<UserGroup> = Vec::with_capacity(rows.len());
+        for r in rows.into_iter().take(limit as usize) {
+            use sqlx::Row;
+            let get = |e: sqlx::Error| Error::internal(e);
+            let state: i16 = r.try_get(16).map_err(get)?;
+            let row: GroupRow = (
+                r.try_get(0).map_err(get)?,
+                r.try_get(1).map_err(get)?,
+                r.try_get(2).map_err(get)?,
+                r.try_get(3).map_err(get)?,
+                r.try_get(4).map_err(get)?,
+                r.try_get(5).map_err(get)?,
+                r.try_get(6).map_err(get)?,
+                r.try_get(7).map_err(get)?,
+                r.try_get(8).map_err(get)?,
+                r.try_get(9).map_err(get)?,
+                r.try_get(10).map_err(get)?,
+                r.try_get(11).map_err(get)?,
+                r.try_get(12).map_err(get)?,
+                r.try_get(13).map_err(get)?,
+                r.try_get(14).map_err(get)?,
+                r.try_get(15).map_err(get)?,
+            );
+            items.push(UserGroup {
+                state: MemberState::try_from(state).unwrap_or(MemberState::JoinRequest),
+                group: to_group(row),
+            });
+        }
         let cursor = more
             .then(|| items.last().map(|g| g.group.id.0.to_string()))
             .flatten();
@@ -1335,6 +1668,17 @@ async fn outranks(
         .await
         .map_err(Error::internal)?;
     Ok(theirs.is_none_or(|t| t > mine))
+}
+
+async fn alliance_leader(tx: &mut Transaction<'_, Postgres>, alliance: Uuid) -> Result<GroupId> {
+    let g: Option<Uuid> =
+        sqlx::query_scalar("select leader_group from musubi.alliances where id = $1")
+            .bind(alliance)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+    g.map(GroupId)
+        .ok_or_else(|| Error::NotFound("alliance".into()))
 }
 
 async fn role_permissions(

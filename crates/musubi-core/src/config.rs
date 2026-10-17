@@ -883,6 +883,8 @@ pub struct SocialConfig {
     /// short name: `POST /v1/auth/oidc/{name}` with its ID token; identities are `oidc:<name>`.
     pub oidc: std::collections::HashMap<String, OidcLoginConfig>,
     pub passkeys: PasskeyConfig,
+    /// Group XP needed to reach level 2, 3, …; the last entry caps the level.
+    pub group_level_xp: Vec<i64>,
 }
 
 /// Passkeys / WebAuthn relying party. Empty `rp_id` = passkeys disabled.
@@ -914,6 +916,9 @@ impl Default for SocialConfig {
             apple: Self::apple_defaults(),
             oidc: Default::default(),
             passkeys: PasskeyConfig::default(),
+            group_level_xp: vec![
+                1_000, 3_000, 6_000, 10_000, 15_000, 21_000, 28_000, 36_000, 45_000,
+            ],
         }
     }
 }

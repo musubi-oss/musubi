@@ -24,6 +24,13 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/groups/{id}/roles", get(roles).put(set_roles))
         .route("/v1/groups/{id}/rank", post(set_rank))
         .route("/v1/groups/{id}/treasury", get(treasury))
+        .route("/v1/groups/{id}/alliance", get(group_alliance))
+        .route("/v1/alliances", post(create_alliance))
+        .route("/v1/alliances/{id}", get(get_alliance))
+        .route("/v1/alliances/{id}/invite", post(invite_alliance))
+        .route("/v1/alliances/{id}/accept", post(accept_alliance))
+        .route("/v1/alliances/{id}/leave", post(leave_alliance))
+        .route("/v1/server/groups/{id}/xp", post(grant_xp))
         .route("/v1/groups/{id}/treasury/ledger", get(treasury_ledger))
         .route("/v1/groups/{id}/treasury/deposit", post(treasury_deposit))
         .route("/v1/groups/{id}/treasury/withdraw", post(treasury_withdraw))
@@ -320,6 +327,141 @@ async fn treasury_withdraw(
         )
         .await;
     Ok(Json(json!({ "entry": e })))
+}
+
+#[derive(Deserialize)]
+struct XpReq {
+    delta: i64,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn grant_xp(
+    State(s): State<AppState>,
+    crate::http::extract::ServerKey: crate::http::extract::ServerKey,
+    Path(id): Path<GroupId>,
+    Json(r): Json<XpReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (g, leveled_up) = groups(&s).grant_xp(id, r.delta, &r.reason).await?;
+    if leveled_up {
+        s.events
+            .emit(
+                "group.level_up",
+                None,
+                json!({ "group_id": id, "level": g.level, "xp": g.xp }),
+            )
+            .await;
+    }
+    Ok(Json(json!({ "group": g, "leveled_up": leveled_up })))
+}
+
+#[derive(Deserialize)]
+struct AllianceReq {
+    group_id: GroupId,
+    #[serde(default)]
+    name: String,
+}
+
+async fn create_alliance(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<AllianceReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let a = groups(&s)
+        .create_alliance(me.account_id, r.group_id, &r.name)
+        .await?;
+    s.events
+        .emit(
+            "alliance.founded",
+            Some(me.account_id),
+            json!({ "alliance_id": a.id, "group_id": r.group_id }),
+        )
+        .await;
+    Ok(Json(
+        serde_json::to_value(a).map_err(musubi_core::Error::internal)?,
+    ))
+}
+
+async fn get_alliance(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let a = groups(&s).alliance(id).await?;
+    Ok(Json(
+        serde_json::to_value(a).map_err(musubi_core::Error::internal)?,
+    ))
+}
+
+async fn group_alliance(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+    Path(id): Path<GroupId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        json!({ "alliance": groups(&s).group_alliance(id).await? }),
+    ))
+}
+
+async fn invite_alliance(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<uuid::Uuid>,
+    Json(r): Json<AllianceReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let a = groups(&s)
+        .invite_to_alliance(me.account_id, id, r.group_id)
+        .await?;
+    s.events
+        .emit(
+            "alliance.invited",
+            Some(me.account_id),
+            json!({ "alliance_id": id, "group_id": r.group_id }),
+        )
+        .await;
+    Ok(Json(
+        serde_json::to_value(a).map_err(musubi_core::Error::internal)?,
+    ))
+}
+
+async fn accept_alliance(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<uuid::Uuid>,
+    Json(r): Json<AllianceReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let a = groups(&s)
+        .accept_alliance(me.account_id, id, r.group_id)
+        .await?;
+    s.events
+        .emit(
+            "alliance.joined",
+            Some(me.account_id),
+            json!({ "alliance_id": id, "group_id": r.group_id }),
+        )
+        .await;
+    Ok(Json(
+        serde_json::to_value(a).map_err(musubi_core::Error::internal)?,
+    ))
+}
+
+async fn leave_alliance(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<uuid::Uuid>,
+    Json(r): Json<AllianceReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .leave_alliance(me.account_id, id, r.group_id)
+        .await?;
+    s.events
+        .emit(
+            "alliance.left",
+            Some(me.account_id),
+            json!({ "alliance_id": id, "group_id": r.group_id }),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

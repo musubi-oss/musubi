@@ -10450,3 +10450,173 @@ async fn groups_treasury_deposit_and_withdraw() {
     assert_eq!(entries[0]["reason"], "salary");
     assert_eq!(entries[1]["delta"], 300);
 }
+
+#[tokio::test]
+async fn groups_xp_levels_and_alliances() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut owners = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("al")})),
+        )
+        .await;
+        let t = s["access_token"].as_str().unwrap().to_string();
+        let (st, g) = call(
+            &app,
+            "POST",
+            "/v1/groups",
+            Some(&t),
+            Some(json!({"name": unique("clan"), "open": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{g}");
+        owners.push((t, g["id"].as_str().unwrap().to_string()));
+    }
+    let (ta, ga) = &owners[0];
+    let (tb, gb) = &owners[1];
+    let (tc, gc) = &owners[2];
+    // XP: 1500 crosses the first threshold (1000), another 100 does not reach the next (3000)
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/groups/{ga}/xp"),
+        k,
+        Some(json!({"delta": 1500, "reason": "war"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["group"]["level"], 2);
+    assert_eq!(v["leveled_up"], true);
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/groups/{ga}/xp"),
+        k,
+        Some(json!({"delta": 100})),
+    )
+    .await;
+    assert_eq!(v["group"]["xp"], 1600);
+    assert_eq!(v["leveled_up"], false);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/groups/{ga}/xp"),
+        k,
+        Some(json!({"delta": -5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // alliance: A founds, invites B; B accepts; C cannot accept without an invitation
+    let (st, a) = call(
+        &app,
+        "POST",
+        "/v1/alliances",
+        Some(ta),
+        Some(json!({"group_id": ga, "name": unique("pact")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let aid = a["id"].as_str().unwrap().to_string();
+    assert_eq!(a["members"].as_array().unwrap().len(), 1);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/alliances/{aid}/invite"),
+        Some(tb),
+        Some(json!({"group_id": gc})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "only the leader's owner invites");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/alliances/{aid}/invite"),
+        Some(ta),
+        Some(json!({"group_id": gb})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["members"][1]["state"], 1);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/alliances/{aid}/accept"),
+        Some(tc),
+        Some(json!({"group_id": gc})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/alliances/{aid}/accept"),
+        Some(tb),
+        Some(json!({"group_id": gb})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["state"] == 0),
+        "{v}"
+    );
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gb}/alliance"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(v["alliance"]["id"], json!(aid));
+    // a group sits in one alliance at a time
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/alliances",
+        Some(tb),
+        Some(json!({"group_id": gb, "name": unique("pact")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // B leaves; the leader leaving dissolves the alliance
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/alliances/{aid}/leave"),
+        Some(tb),
+        Some(json!({"group_id": gb})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call(&app, "GET", &format!("/v1/alliances/{aid}"), Some(ta), None).await;
+    assert_eq!(v["members"].as_array().unwrap().len(), 1, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/alliances/{aid}/leave"),
+        Some(ta),
+        Some(json!({"group_id": ga})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", &format!("/v1/alliances/{aid}"), Some(ta), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{ga}/alliance"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert!(v["alliance"].is_null(), "{v}");
+}

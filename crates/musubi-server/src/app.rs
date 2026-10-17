@@ -103,7 +103,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     );
     let accounts = AccountService::new(db.clone());
     let social = SocialService::new(db.clone());
-    let groups = GroupService::new(db.clone());
+    let groups = GroupService::new(db.clone()).with_level_xp(cfg.social.group_level_xp.clone());
     let chat = ChatService::new(db.clone());
     let leaderboards = LeaderboardService::new(db.clone());
     let economy = musubi_economy::EconomyService::new(db.clone());
