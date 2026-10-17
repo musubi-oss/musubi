@@ -2,8 +2,7 @@
 //! reports that carry the channel's recent messages, and shadow bans (handled by the caller: a
 //! shadowed sender gets an ack but nobody else gets the message).
 
-use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use musubi_core::{AccountId, Error, Result};
@@ -66,7 +65,6 @@ struct Compiled {
 #[derive(Default)]
 pub(crate) struct ModerationState {
     filters: RwLock<Option<(Instant, std::sync::Arc<Vec<Compiled>>)>>,
-    last_sent: Mutex<HashMap<(String, AccountId), Instant>>,
 }
 
 /// Lower-case, fold leet-speak and drop separators so `s.h-1.t` and `5hit` both read `shit`.
@@ -393,32 +391,43 @@ impl ChatService {
 
     /// Enforce the channel's slow mode for `sender` and record this send. ResourceExhausted
     /// carries the seconds left.
+    /// One message per `slow_mode_secs` per sender, enforced in the database so every node
+    /// sees the same window: the row only advances when the window has passed.
     pub async fn slow_mode_gate(&self, channel: &Channel, sender: AccountId) -> Result<()> {
         let secs = self.channel_settings(&channel.id()).await?.slow_mode_secs;
         if secs <= 0 {
             return Ok(());
         }
-        let key = (channel.id(), sender);
-        let mut last = self
-            .moderation
-            .last_sent
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
-        if let Some(t) = last.get(&key) {
-            let left = Duration::from_secs(secs as u64).saturating_sub(now - *t);
-            if !left.is_zero() {
-                return Err(Error::ResourceExhausted(format!(
-                    "slow mode: wait {} s",
-                    left.as_secs().max(1)
-                )));
-            }
+        let advanced: Option<i64> = sqlx::query_scalar(
+            "insert into musubi.chat_slow_mode (channel_id, account_id, last_at) values ($1, $2, now())
+             on conflict (channel_id, account_id) do update set last_at = now()
+               where musubi.chat_slow_mode.last_at <= now() - make_interval(secs => $3)
+             returning 1::bigint",
+        )
+        .bind(channel.id())
+        .bind(sender.0)
+        .bind(secs as f64)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        if advanced.is_some() {
+            return Ok(());
         }
-        if last.len() > 100_000 {
-            last.retain(|_, t| now - *t < Duration::from_secs(86_400));
-        }
-        last.insert(key, now);
-        Ok(())
+        let left: f64 = sqlx::query_scalar(
+            "select greatest(extract(epoch from (last_at + make_interval(secs => $3) - now())), 0)::float8
+             from musubi.chat_slow_mode where channel_id = $1 and account_id = $2",
+        )
+        .bind(channel.id())
+        .bind(sender.0)
+        .bind(secs as f64)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .unwrap_or(0.0);
+        Err(Error::ResourceExhausted(format!(
+            "slow mode: wait {} s",
+            (left.ceil() as i64).max(1)
+        )))
     }
 
     /// File a report on `target` in `channel`, snapshotting the channel's last messages.
