@@ -458,10 +458,10 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
         ClientMessage::ChannelJoin {
             target,
             kind,
-            persistence: _,
+            persistence,
             hidden,
         } => Some(
-            channel_join(ctx, &target, kind, hidden)
+            channel_join(ctx, &target, kind, hidden, persistence)
                 .await
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
@@ -812,6 +812,7 @@ async fn channel_join(
     target: &str,
     kind: ChannelKind,
     hidden: bool,
+    persistence: bool,
 ) -> musubi_core::Result<ServerMessage> {
     let me = ctx.presence.account_id;
     let channel = resolve_channel(me, target, kind)?;
@@ -820,7 +821,9 @@ async fn channel_join(
         return Err(Error::PermissionDenied("banned from this channel".into()));
     }
     let id = channel.id();
-    let presences = ctx.hub.join_channel(&id, ctx.presence.session_id, hidden);
+    let presences = ctx
+        .hub
+        .join_channel(&id, ctx.presence.session_id, hidden, persistence);
     Ok(ServerMessage::Channel {
         id,
         kind,
@@ -883,7 +886,10 @@ async fn channel_send(
     ctx.chat.slow_mode_gate(&channel, me).await?;
     let mut content = before_chat_message(ctx, channel_id, content).await?;
     ctx.chat.filter_content(&mut content, None).await?;
-    let persistent = !matches!(channel, Channel::Room(_));
+    let persistent = !matches!(channel, Channel::Room(_))
+        || ctx
+            .hub
+            .channel_persistent(channel_id, ctx.presence.session_id);
     let mentions = ctx.chat.resolve_mentions(&content).await?;
     let msg = ctx
         .chat

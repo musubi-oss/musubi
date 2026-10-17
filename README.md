@@ -34,7 +34,7 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 Server-to-server keys: `http.server_key` is the bootstrap admin key; issue scoped keys with
 `POST /v1/admin/keys {"name","role":"server"|"admin"}` and revoke them with `DELETE /v1/admin/keys/{id}`.
 Clean-up of events/deliveries/audit/notifications/sessions runs on the `retention` lease
-(`[retention]`, days per table). Nodes drain on SIGTERM or `POST /v1/admin/cluster/nodes/{id}/drain`.
+(`[retention]`, days per table; chat history per channel kind — `chat_room_days` 90, `chat_group_days` / `chat_direct_days` 0 = forever, `chat_days` > 0 overrides all three; room messages are written to history only when the sender joined with `persistence: true`). Nodes drain on SIGTERM or `POST /v1/admin/cluster/nodes/{id}/drain`.
 
 ### Measured (not promised)
 

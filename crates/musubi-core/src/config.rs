@@ -778,6 +778,11 @@ pub struct RetentionConfig {
     pub deliveries_days: u64,
     pub audit_days: u64,
     pub notifications_days: u64,
+    /// Chat history per channel kind: rooms are transient by nature (plan: 90 days), group and
+    /// direct history is kept forever unless set. `chat_days` > 0 applies to every kind at once.
+    pub chat_room_days: u64,
+    pub chat_group_days: u64,
+    pub chat_direct_days: u64,
     pub chat_days: u64,
     /// Expired or revoked refresh sessions.
     pub sessions_days: u64,
@@ -793,6 +798,9 @@ impl Default for RetentionConfig {
             deliveries_days: 7,
             audit_days: 90,
             notifications_days: 30,
+            chat_room_days: 90,
+            chat_group_days: 0,
+            chat_direct_days: 0,
             chat_days: 0,
             sessions_days: 7,
             world_history_days: 7,

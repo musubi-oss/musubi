@@ -4845,6 +4845,115 @@ async fn chat_threads_mentions_and_unread() {
     assert_ne!(st, 200);
 }
 
+/// Room messages are written to history only when the sender joined with `persistence`, and the
+/// retention pass purges chat by channel kind (rooms age out, direct history stays).
+#[tokio::test]
+async fn chat_room_persistence_flag_and_retention_by_kind() {
+    let group = test_group();
+    let Some(state) = build_state(true, &group).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let addr = router_addr(&state).await;
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let f = "json";
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let room = format!("ret-{}", uuid::Uuid::now_v7());
+    for (c, persistence) in [(&mut a, true), (&mut b, false)] {
+        send(
+            c,
+            f,
+            Some("j"),
+            ClientMessage::ChannelJoin {
+                target: room.clone(),
+                kind: ChannelKind::Room,
+                persistence,
+                hidden: false,
+            },
+        )
+        .await;
+        assert!(matches!(recv(c).await.msg, ServerMessage::Channel { .. }));
+    }
+    for c in [&mut a, &mut b] {
+        while tokio::time::timeout(std::time::Duration::from_millis(300), c.next())
+            .await
+            .is_ok()
+        {}
+    }
+    let room_id = musubi_chat::Channel::Room(room.clone()).id();
+    assert!(say(&mut a, f, &room_id, "kept").await);
+    let _ = recv(&mut b).await;
+    assert!(say(&mut b, f, &room_id, "transient").await);
+    let _ = recv(&mut a).await;
+    let history = |tok: String, id: String| {
+        let router = router.clone();
+        async move {
+            let req = Request::get(format!("/v1/channel/{id}/messages"))
+                .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), 200);
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"]["text"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(history(ta.clone(), room_id.clone()).await, vec!["kept"]);
+    // A DM alongside, to prove retention is per kind.
+    send(
+        &mut a,
+        f,
+        Some("d"),
+        ClientMessage::ChannelJoin {
+            target: acc_b.clone(),
+            kind: ChannelKind::Direct,
+            persistence: true,
+            hidden: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Channel { .. }
+    ));
+    let dm_id = musubi_chat::Channel::Direct(
+        musubi_core::AccountId(acc_a.parse().unwrap()),
+        musubi_core::AccountId(acc_b.parse().unwrap()),
+    )
+    .id();
+    assert!(say(&mut a, f, &dm_id, "private").await);
+    // Age everything by 100 days; rooms keep 90, direct forever.
+    sqlx::query("update musubi.chat_messages set created_at = created_at - interval '100 days' where channel_id in ($1, $2)")
+        .bind(&room_id)
+        .bind(&dm_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let removed = musubi_server::retention::run(&state.db, &state.cfg.retention)
+        .await
+        .unwrap();
+    assert_eq!(removed["chat_messages"], 1, "{removed}");
+    assert!(history(ta.clone(), room_id.clone()).await.is_empty());
+    assert_eq!(history(tb.clone(), dm_id.clone()).await, vec!["private"]);
+    // `chat_days` overrides every kind.
+    let mut cfg = state.cfg.retention.clone();
+    cfg.chat_days = 1;
+    let removed = musubi_server::retention::run(&state.db, &cfg)
+        .await
+        .unwrap();
+    assert_eq!(removed["chat_messages"], 1, "{removed}");
+    assert!(history(tb, dm_id).await.is_empty());
+}
+
 /// A node that leaves the cluster takes its sessions out of the cluster-wide online set.
 #[tokio::test]
 async fn presence_purged_when_node_leaves() {

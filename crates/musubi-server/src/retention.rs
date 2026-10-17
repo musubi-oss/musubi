@@ -51,13 +51,25 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
         cfg.notifications_days,
     )
     .await?;
-    let chat = purge(
-        db,
-        "musubi.chat_messages",
-        &age("created_at"),
-        cfg.chat_days,
-    )
-    .await?;
+    let mut chat = 0u64;
+    for (kind, days) in [
+        (2, cfg.chat_room_days),
+        (4, cfg.chat_group_days),
+        (3, cfg.chat_direct_days),
+    ] {
+        let days = if cfg.chat_days > 0 {
+            cfg.chat_days
+        } else {
+            days
+        };
+        chat += purge(
+            db,
+            "musubi.chat_messages",
+            &format!("kind = {kind} and {}", age("created_at")),
+            days,
+        )
+        .await?;
+    }
     let idempotency = purge(db, "musubi.idempotency", &age("created_at"), 1).await?;
     let resumable = crate::realtime::resume::ResumeStore::purge_expired(db).await?;
     let storage = sqlx::query("delete from musubi.storage_objects where expires_at <= now()")

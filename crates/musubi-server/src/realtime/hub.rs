@@ -21,6 +21,14 @@ pub struct Resumed {
     pub encoding: musubi_proto::Encoding,
 }
 
+/// One session's membership in a channel.
+#[derive(Clone, Copy, Debug)]
+struct Member {
+    hidden: bool,
+    /// Room messages are written to history only for senders who joined with `persistence`.
+    persistent: bool,
+}
+
 /// Process-local registry of live realtime sessions.
 #[derive(Default)]
 pub struct Hub {
@@ -36,7 +44,7 @@ pub struct Hub {
     following: DashMap<SessionId, HashSet<AccountId>>,
     remote: std::sync::OnceLock<RemoteHook>,
     /// chat channel id → sessions in it (hidden flag per session)
-    channels: DashMap<String, HashMap<SessionId, bool>>,
+    channels: DashMap<String, HashMap<SessionId, Member>>,
     /// session → channels joined (for cleanup)
     in_channels: DashMap<SessionId, HashSet<String>>,
     /// Set by `close_all`: sessions ending now keep their resume record (parked) for another node.
@@ -173,6 +181,7 @@ impl Hub {
         channel_id: &str,
         session_id: SessionId,
         hidden: bool,
+        persistent: bool,
     ) -> Vec<UserPresence> {
         let Some(h) = self.sessions.get(&session_id) else {
             return vec![];
@@ -180,10 +189,12 @@ impl Hub {
         let me = h.presence.clone();
         drop(h);
         let mut members = self.channels.entry(channel_id.to_string()).or_default();
-        let already = members.insert(session_id, hidden).is_some();
+        let already = members
+            .insert(session_id, Member { hidden, persistent })
+            .is_some();
         let others: Vec<UserPresence> = members
             .iter()
-            .filter(|(sid, hidden)| **sid != session_id && !**hidden)
+            .filter(|(sid, m)| **sid != session_id && !m.hidden)
             .filter_map(|(sid, _)| self.sessions.get(sid).map(|h| h.presence.clone()))
             .collect();
         let targets: Vec<SessionId> = members
@@ -225,7 +236,7 @@ impl Hub {
         let Some(mut members) = self.channels.get_mut(channel_id) else {
             return;
         };
-        let Some(hidden) = members.remove(&me.session_id) else {
+        let Some(Member { hidden, .. }) = members.remove(&me.session_id) else {
             return;
         };
         let targets: Vec<SessionId> = members.keys().copied().collect();
@@ -250,6 +261,14 @@ impl Hub {
         self.channels
             .get(channel_id)
             .is_some_and(|m| m.contains_key(&session_id))
+    }
+
+    /// Whether `session_id` joined `channel_id` asking for its messages to be written to history.
+    pub fn channel_persistent(&self, channel_id: &str, session_id: SessionId) -> bool {
+        self.channels
+            .get(channel_id)
+            .and_then(|m| m.get(&session_id).map(|m| m.persistent))
+            .unwrap_or(false)
     }
 
     /// Deliver to every session in the channel (including the sender). Returns the count reached.
