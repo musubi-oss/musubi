@@ -68,6 +68,14 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/server/worlds/{w}/colocate", "server"),
     ("GET", "/v1/server/presence/{account_id}", "server"),
     ("GET", "/v1/admin/chat/{id}/moderation", "admin"),
+    ("GET", "/v1/admin/chat/filters", "admin"),
+    ("PUT", "/v1/admin/chat/filters", "admin"),
+    ("DELETE", "/v1/admin/chat/filters/{filter_id}", "admin"),
+    ("GET", "/v1/admin/chat/{id}/settings", "admin"),
+    ("PUT", "/v1/admin/chat/{id}/settings", "admin"),
+    ("GET", "/v1/admin/chat/reports", "admin"),
+    ("GET", "/v1/admin/chat/reports/{report_id}", "admin"),
+    ("POST", "/v1/admin/chat/reports/{report_id}", "admin"),
     ("POST", "/v1/admin/chat/{id}/moderation", "admin"),
     (
         "DELETE",
@@ -104,6 +112,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/auth/email/reset", "auth"),
     ("POST", "/v1/auth/refresh", "auth"),
     ("GET", "/v1/channel/{id}/messages", "chat"),
+    ("POST", "/v1/channel/{id}/report", "chat"),
     (
         "POST",
         "/v1/channel/{id}/messages/{message_id}/reactions",

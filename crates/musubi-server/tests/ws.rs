@@ -4408,6 +4408,192 @@ async fn chat_moderation_mutes_and_bans() {
     ));
 }
 
+/// Word filters mask or block, slow mode throttles a sender, a shadow-banned sender gets their own
+/// echo but nobody else does, and reports carry the channel's last 20 messages.
+#[tokio::test]
+async fn chat_filters_slow_mode_shadow_and_reports() {
+    let group = test_group();
+    let Some(state) = build_state(true, &group).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let addr = router_addr(&state).await;
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let acc_a = musubi_core::AccountId(acc_a.parse().unwrap());
+    let acc_b = musubi_core::AccountId(acc_b.parse().unwrap());
+    let f = "json";
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let room = format!("filt-{}", uuid::Uuid::now_v7().simple());
+    let mut room_id = String::new();
+    for c in [&mut a, &mut b] {
+        send(
+            c,
+            f,
+            Some("j"),
+            ClientMessage::ChannelJoin {
+                target: room.clone(),
+                kind: ChannelKind::Room,
+                persistence: false,
+                hidden: false,
+            },
+        )
+        .await;
+        room_id = match recv(c).await.msg {
+            ServerMessage::Channel { id, .. } => id,
+            m => panic!("{m:?}"),
+        };
+    }
+    // Drain presence events of the joins on both sides.
+    for c in [&mut a, &mut b] {
+        while tokio::time::timeout(std::time::Duration::from_millis(300), c.next())
+            .await
+            .is_ok()
+        {}
+    }
+    let channel = musubi_chat::Channel::parse(&room_id).unwrap();
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let fid = |n: &str| format!("{n}-{suffix}");
+    let filt = |id: String, pattern: &str, regex: bool, action: musubi_chat::FilterAction| {
+        musubi_chat::Filter {
+            id,
+            lang: None,
+            pattern: pattern.into(),
+            regex,
+            action,
+        }
+    };
+    state
+        .chat
+        .upsert_filter(filt(
+            fid("mask"),
+            "darn",
+            false,
+            musubi_chat::FilterAction::Mask,
+        ))
+        .await
+        .unwrap();
+    state
+        .chat
+        .upsert_filter(filt(
+            fid("block"),
+            r"\bkys\b",
+            true,
+            musubi_chat::FilterAction::Block,
+        ))
+        .await
+        .unwrap();
+    assert!(state
+        .chat
+        .upsert_filter(filt(
+            fid("bad"),
+            "(unclosed",
+            true,
+            musubi_chat::FilterAction::Block
+        ))
+        .await
+        .is_err());
+
+    // Leet-spelled word is masked for everyone, the rest of the line survives.
+    assert!(say(&mut a, f, &room_id, "oh d4rn again").await);
+    let got = serde_json::to_value(recv(&mut b).await.msg).unwrap();
+    assert_eq!(
+        got["channel_message"]["content"]["text"], "oh **** again",
+        "{got}"
+    );
+    // Block filter rejects the whole message; b hears nothing.
+    assert!(!say(&mut a, f, &room_id, "just kys").await);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), b.next())
+            .await
+            .is_err(),
+        "blocked message leaked"
+    );
+
+    // Slow mode: second send within the window is rejected with the seconds left.
+    state.chat.set_channel_settings(&room_id, 60).await.unwrap();
+    assert!(say(&mut a, f, &room_id, "first").await);
+    let _ = recv(&mut b).await;
+    assert!(!say(&mut a, f, &room_id, "too fast").await);
+    assert!(state.chat.set_channel_settings(&room_id, -1).await.is_err());
+    state.chat.set_channel_settings(&room_id, 0).await.unwrap();
+    assert_eq!(
+        state
+            .chat
+            .channel_settings(&room_id)
+            .await
+            .unwrap()
+            .slow_mode_secs,
+        0
+    );
+
+    // Shadow ban: a still gets an ack and their own echo, b gets nothing.
+    state
+        .chat
+        .moderate(&channel, acc_a, "shadow", Some("bot"), Some("test"), None)
+        .await
+        .unwrap();
+    assert!(say(&mut a, f, &room_id, "anyone there?").await);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), b.next())
+            .await
+            .is_err(),
+        "shadow-banned message leaked"
+    );
+    assert!(state.chat.unmoderate(&channel, acc_a).await.unwrap());
+    assert!(say(&mut a, f, &room_id, "back").await);
+    let _ = recv(&mut b).await;
+
+    // Report over HTTP: context is the channel's last 20 messages (a persistent DM here).
+    let dm = musubi_chat::Channel::Direct(acc_a, acc_b);
+    for i in 0..25 {
+        state
+            .chat
+            .append(&dm, acc_a, "a", json!({"text": format!("m{i}")}), true)
+            .await
+            .unwrap();
+    }
+    let body = json!({"account_id": acc_a.0, "reason": "spam"}).to_string();
+    let req = Request::post(format!("/v1/channel/{}/report", dm.id()))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {tb}"))
+        .body(Body::from(body))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let rep: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(rep["status"], "open");
+    assert_eq!(rep["context"].as_array().unwrap().len(), 20);
+    assert_eq!(rep["context"][19]["content"]["text"], "m24");
+    assert!(state
+        .chat
+        .report(&dm, acc_a, acc_a, None, "me")
+        .await
+        .is_err());
+    let open = state.chat.reports(Some("open"), 50).await.unwrap();
+    assert!(open.iter().any(|r| r.id == rep["id"]));
+    let done = state
+        .chat
+        .resolve_report(rep["id"].as_str().unwrap(), "resolved", Some("mod"))
+        .await
+        .unwrap();
+    assert_eq!(done.status, "resolved");
+    assert!(done.resolved_at.is_some());
+    assert!(!state
+        .chat
+        .reports(Some("open"), 50)
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.id == rep["id"]));
+    for n in ["mask", "block"] {
+        state.chat.delete_filter(&fid(n)).await.unwrap();
+    }
+    assert!(state.chat.delete_filter(&fid("mask")).await.is_err());
+}
+
 /// A node that leaves the cluster takes its sessions out of the cluster-wide online set.
 #[tokio::test]
 async fn presence_purged_when_node_leaves() {

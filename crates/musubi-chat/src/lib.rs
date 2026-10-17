@@ -1,6 +1,9 @@
 //! Chat channels: rooms (ad-hoc, by name), direct messages and group chat. Delivery is the realtime
 //! layer's job; this crate owns channel identity, authorization rules and persisted history.
 
+pub mod moderation;
+pub use moderation::{ChannelSettings, Filter, FilterAction, Report};
+
 use musubi_core::{AccountId, Error, GroupId, Result};
 use musubi_proto::realtime::{ChannelKind, ChannelMessage, Reaction};
 use serde::Serialize;
@@ -109,6 +112,7 @@ pub struct History {
 #[derive(Clone)]
 pub struct ChatService {
     db: PgPool,
+    moderation: std::sync::Arc<moderation::ModerationState>,
 }
 
 type Row = (
@@ -141,7 +145,10 @@ fn to_msg(r: Row) -> ChannelMessage {
 
 impl ChatService {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            moderation: Default::default(),
+        }
     }
 
     /// Can `me` take part in `channel`? Direct: neither side blocked the other. Group: must be a member (rank < 3).
@@ -478,7 +485,7 @@ impl ChatService {
         by: Option<&str>,
         until_secs: Option<u64>,
     ) -> Result<()> {
-        if !matches!(kind, "mute" | "ban") {
+        if !matches!(kind, "mute" | "ban" | "shadow") {
             return Err(Error::InvalidArgument("kind must be mute or ban".into()));
         }
         let until = until_secs.map(|s| {

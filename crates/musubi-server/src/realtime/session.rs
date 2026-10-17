@@ -867,10 +867,13 @@ async fn channel_send(
 ) -> musubi_core::Result<ServerMessage> {
     let channel = joined_channel(ctx, channel_id)?;
     let me = ctx.presence.account_id;
-    if let Some(kind) = ctx.chat.restriction(&channel, me).await? {
+    let restriction = ctx.chat.restriction(&channel, me).await?;
+    if let Some(kind) = restriction.as_deref().filter(|k| *k != "shadow") {
         return Err(Error::PermissionDenied(format!("{kind}d in this channel")));
     }
-    let content = before_chat_message(ctx, channel_id, content).await?;
+    ctx.chat.slow_mode_gate(&channel, me).await?;
+    let mut content = before_chat_message(ctx, channel_id, content).await?;
+    ctx.chat.filter_content(&mut content, None).await?;
     let persistent = !matches!(channel, Channel::Room(_));
     let msg = ctx
         .chat
@@ -883,8 +886,14 @@ async fn channel_send(
         )
         .await?;
     let ack = ack_of(&msg);
-    ctx.fanout
-        .channel(channel_id, ServerMessage::ChannelMessage(msg));
+    if restriction.as_deref() == Some("shadow") {
+        // shadow-banned: the sender sees their own message, nobody else does
+        ctx.fanout
+            .session(ctx.presence.session_id, ServerMessage::ChannelMessage(msg));
+    } else {
+        ctx.fanout
+            .channel(channel_id, ServerMessage::ChannelMessage(msg));
+    }
     Ok(ack)
 }
 
