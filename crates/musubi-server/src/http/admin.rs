@@ -55,7 +55,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/accounts", get(accounts))
         .route(
             "/v1/admin/accounts/{id}",
-            get(account).delete(purge_account),
+            get(account).patch(patch_account).delete(purge_account),
         )
         .route("/v1/admin/accounts/{id}/ban", post(ban).get(get_ban))
         .route("/v1/admin/accounts/{id}/unban", post(unban))
@@ -100,6 +100,25 @@ async fn accounts(
         .await?;
     let cursor = items.last().map(|a| a.id.0);
     Ok(Json(json!({ "accounts": items, "cursor": cursor })))
+}
+
+/// Console edit of a player's profile: any subset of username / display_name / avatar_url / lang /
+/// timezone / location / metadata; the same validation as the player's own PATCH /v1/account.
+async fn patch_account(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(u): Json<musubi_account::UpdateAccount>,
+) -> Result<Json<Value>, ApiError> {
+    let id = AccountId(id);
+    s.accounts.update(id, u).await?;
+    let account = s.accounts.get(id).await?;
+    s.events
+        .emit("account.updated", Some(id), json!({ "by": "admin" }))
+        .await;
+    Ok(Json(
+        serde_json::to_value(account).map_err(Error::internal)?,
+    ))
 }
 
 async fn account(

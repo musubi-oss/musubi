@@ -11101,3 +11101,53 @@ async fn tournaments_team_records_and_treasury_prizes() {
     .await;
     assert_eq!(tr["balances"][0]["balance"], 100, "{tr}");
 }
+
+#[tokio::test]
+async fn admin_patch_account_profile() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut ids = vec![];
+    for _ in 0..2 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("ap")})),
+        )
+        .await;
+        ids.push(s["account_id"].as_str().unwrap().to_string());
+    }
+    let name = format!("adm_{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/admin/accounts/{}", ids[0]),
+        k,
+        Some(json!({"username": name, "display_name": "Ren", "metadata": {"vip": true}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["username"], json!(name));
+    let (st, a) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{}", ids[0]),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["account"]["display_name"], "Ren", "{a}");
+    assert_eq!(a["account"]["metadata"]["vip"], true, "{a}");
+    // a taken username is refused
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/admin/accounts/{}", ids[1]),
+        k,
+        Some(json!({"username": name})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+}
