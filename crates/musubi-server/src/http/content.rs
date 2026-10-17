@@ -16,16 +16,100 @@ use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
 
 /// Tables of a bundle, parents before children (foreign keys).
-const TABLES: &[&str] = &[
-    "currencies",
-    "items",
-    "reward_tables",
-    "progression_tracks",
-    "quests",
-    "store_items",
-    "store_coupons",
-    "rating_queues",
+/// Bundle sections, each a list of tables in dependency order (parents first).
+pub const SECTIONS: &[(&str, &[&str])] = &[
+    (
+        "content",
+        &[
+            "currencies",
+            "items",
+            "reward_tables",
+            "progression_tracks",
+            "quests",
+            "store_items",
+            "store_coupons",
+            "rating_queues",
+            "achievements",
+            "crafting_recipes",
+            "seasons",
+            "streaks",
+            "energies",
+            "entitlements",
+            "iap_products",
+            "leaderboards",
+        ],
+    ),
+    (
+        "config",
+        &[
+            "storage_schemas",
+            "grant_limits",
+            "webhooks",
+            "chat_filters",
+        ],
+    ),
 ];
+
+fn all_tables() -> Vec<&'static str> {
+    SECTIONS
+        .iter()
+        .flat_map(|(_, t)| t.iter().copied())
+        .collect()
+}
+
+fn section_of(table: &str) -> Option<&'static str> {
+    SECTIONS
+        .iter()
+        .find(|(_, t)| t.contains(&table))
+        .map(|(n, _)| *n)
+}
+
+fn tables_of(sections: &[String]) -> Result<Vec<&'static str>, Error> {
+    for sc in sections {
+        if !SECTIONS.iter().any(|(n, _)| n == sc) {
+            return Err(Error::InvalidArgument(format!(
+                "unknown section {sc} (known: {})",
+                SECTIONS
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Ok(SECTIONS
+        .iter()
+        .filter(|(n, _)| sections.iter().any(|sc| sc == n))
+        .flat_map(|(_, t)| t.iter().copied())
+        .collect())
+}
+
+/// The sections a bundle covers: its `sections` field, else inferred from its tables.
+fn sections_of(bundle: &Value) -> Vec<String> {
+    if let Some(a) = bundle.get("sections").and_then(Value::as_array) {
+        let v: Vec<String> = a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let mut v: Vec<String> = Vec::new();
+    if let Some(t) = bundle.get("tables").and_then(Value::as_object) {
+        for name in t.keys() {
+            if let Some(sc) = section_of(name) {
+                if !v.iter().any(|x| x == sc) {
+                    v.push(sc.to_string());
+                }
+            }
+        }
+    }
+    if v.is_empty() {
+        v.push("content".into());
+    }
+    v
+}
 /// Bookkeeping columns that are neither exported nor compared.
 const SKIP_COLS: &[&str] = &["created_at", "updated_at"];
 pub const FORMAT: u64 = 1;
@@ -40,6 +124,10 @@ pub fn routes() -> Router<AppState> {
 }
 
 type Tx<'a> = Transaction<'a, Postgres>;
+/// id, created_at, source, note, counts, environment, sections
+type VersionRow = (i64, String, String, String, Value, String, Vec<String>);
+/// created_at, source, note, counts, bundle, environment, sections
+type VersionFull = (String, String, String, Value, Value, String, Vec<String>);
 
 struct Shape {
     cols: Vec<String>,
@@ -97,9 +185,13 @@ async fn rows(tx: &mut Tx<'_>, table: &str, sh: &Shape) -> Result<Vec<Value>, Er
     Ok(v.into_iter().map(|(r,)| r).collect())
 }
 
-async fn export_bundle(tx: &mut Tx<'_>) -> Result<Value, Error> {
+async fn export_bundle(
+    tx: &mut Tx<'_>,
+    sections: &[String],
+    environment: &str,
+) -> Result<Value, Error> {
     let mut tables = Map::new();
-    for t in TABLES {
+    for t in tables_of(sections)? {
         let sh = shape(tx, t).await?;
         tables.insert(t.to_string(), Value::Array(rows(tx, t, &sh).await?));
     }
@@ -107,7 +199,10 @@ async fn export_bundle(tx: &mut Tx<'_>) -> Result<Value, Error> {
         .fetch_one(&mut **tx)
         .await
         .map_err(Error::internal)?;
-    Ok(json!({"format": FORMAT, "exported_at": at, "tables": tables}))
+    Ok(json!({
+        "format": FORMAT, "exported_at": at, "environment": environment,
+        "sections": sections, "tables": tables,
+    }))
 }
 
 fn key_of(row: &Value, pk: &[String]) -> String {
@@ -233,18 +328,19 @@ async fn apply(tx: &mut Tx<'_>, bundle: &Value, prune: bool) -> Result<Map<Strin
         .get("tables")
         .and_then(Value::as_object)
         .ok_or_else(|| Error::InvalidArgument("bundle.tables: object of table → rows".into()))?;
+    let all = all_tables();
     for name in tables.keys() {
-        if !TABLES.contains(&name.as_str()) {
+        if !all.contains(&name.as_str()) {
             return Err(Error::InvalidArgument(format!(
                 "unknown content table {name} (known: {})",
-                TABLES.join(", ")
+                all.join(", ")
             )));
         }
     }
     let mut diffs = Map::new();
     let mut shapes = BTreeMap::new();
     let mut removed: Vec<(&str, Vec<Value>)> = Vec::new();
-    for t in TABLES {
+    for t in &all {
         let Some(wanted) = tables.get(*t) else {
             continue;
         };
@@ -290,17 +386,28 @@ fn counts(bundle: &Value) -> Value {
 }
 
 async fn run_import(
-    db: &PgPool,
+    s: &AppState,
     bundle: &Value,
     dry_run: bool,
     prune: bool,
     note: &str,
     source: &str,
+    target_environment: Option<&str>,
 ) -> Result<Value, Error> {
+    let env = s.cfg.node.environment.as_str();
+    if let Some(t) = target_environment.filter(|t| !t.is_empty()) {
+        if t != env {
+            return Err(Error::Conflict(format!(
+                "this cluster is the {env} environment, the import targets {t}"
+            )));
+        }
+    }
+    let sections = sections_of(bundle);
+    let db = &s.db;
     let mut tx = db.begin().await.map_err(Error::internal)?;
-    let before = export_bundle(&mut tx).await?;
+    let before = export_bundle(&mut tx, &sections, env).await?;
     let diff = apply(&mut tx, bundle, prune).await?;
-    let after = export_bundle(&mut tx).await?;
+    let after = export_bundle(&mut tx, &sections, env).await?;
     let changed = before["tables"] != after["tables"];
     if dry_run {
         tx.rollback().await.map_err(Error::internal)?;
@@ -315,36 +422,85 @@ async fn run_import(
                 .map_err(Error::internal)?;
         if latest.is_none_or(|(b,)| b["tables"] != before["tables"]) {
             sqlx::query(
-                "insert into musubi.content_versions (source, note, counts, bundle) values ('before', $1, $2, $3)",
+                "insert into musubi.content_versions (source, note, counts, bundle, environment, sections)
+                 values ('before', $1, $2, $3, $4, $5)",
             )
             .bind(format!("state before {source}"))
             .bind(counts(&before))
             .bind(&before)
+            .bind(env)
+            .bind(&sections)
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?;
         }
         let (id,): (i64,) = sqlx::query_as(
-            "insert into musubi.content_versions (source, note, counts, bundle) values ($1, $2, $3, $4) returning id",
+            "insert into musubi.content_versions (source, note, counts, bundle, environment, sections)
+             values ($1, $2, $3, $4, $5, $6) returning id",
         )
         .bind(source)
         .bind(note)
         .bind(counts(&after))
         .bind(&after)
+        .bind(env)
+        .bind(&sections)
         .fetch_one(&mut *tx)
         .await
         .map_err(Error::internal)?;
         version = json!(id);
     }
     tx.commit().await.map_err(Error::internal)?;
+    if changed {
+        after_import(s, &after).await;
+    }
     Ok(
         json!({"applied": changed, "dry_run": false, "changes": changed, "version": version, "diff": diff}),
     )
 }
 
-async fn export(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+/// Config tables with in-memory state: collection schemas re-create their expression indexes
+/// and refresh the cache (chat filters re-read on their own cache TTL).
+async fn after_import(s: &AppState, after: &Value) {
+    if let Some(rows) = after["tables"]["storage_schemas"].as_array() {
+        for r in rows {
+            match serde_json::from_value::<musubi_storage::CollectionSchema>(r.clone()) {
+                Ok(sc) => {
+                    if let Err(e) = s.storage.put_schema(sc).await {
+                        tracing::warn!(error = %e, "imported collection schema: indexes not applied");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "imported collection schema row"),
+            }
+        }
+        if let Err(e) = s.storage.load_schemas().await {
+            tracing::warn!(error = %e, "collection schemas reload after import");
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ExportQuery {
+    /// Comma-separated sections (`content`, `config`); default `content`.
+    sections: String,
+}
+
+async fn export(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Query(q): Query<ExportQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let sections: Vec<String> = if q.sections.trim().is_empty() {
+        vec!["content".into()]
+    } else {
+        q.sections
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    };
     let mut tx = s.db.begin().await.map_err(Error::internal)?;
-    let b = export_bundle(&mut tx).await?;
+    let b = export_bundle(&mut tx, &sections, &s.cfg.node.environment).await?;
     tx.rollback().await.map_err(Error::internal)?;
     Ok(Json(b))
 }
@@ -359,6 +515,9 @@ struct ImportBody {
     prune: bool,
     #[serde(default)]
     note: String,
+    /// Environment this import is meant for; refused (409) when this cluster is another one.
+    #[serde(default)]
+    environment: Option<String>,
 }
 
 async fn import(
@@ -370,7 +529,16 @@ async fn import(
         return Err(Error::InvalidArgument("note: at most 500 chars".into()).into());
     }
     Ok(Json(
-        run_import(&s.db, &b.bundle, b.dry_run, b.prune, &b.note, "import").await?,
+        run_import(
+            &s,
+            &b.bundle,
+            b.dry_run,
+            b.prune,
+            &b.note,
+            "import",
+            b.environment.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -385,33 +553,37 @@ async fn versions(
     Query(qr): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = qr.limit.unwrap_or(50).clamp(1, 500);
-    let rows: Vec<(i64, String, String, String, Value)> = sqlx::query_as(
-        "select id, created_at::text, source, note, counts from musubi.content_versions order by id desc limit $1",
+    let rows: Vec<VersionRow> = sqlx::query_as(
+        "select id, created_at::text, source, note, counts, environment, sections
+         from musubi.content_versions order by id desc limit $1",
     )
     .bind(limit)
     .fetch_all(&s.db)
     .await
     .map_err(Error::internal)?;
     Ok(Json(
-        json!({"versions": rows.into_iter().map(|(id, at, source, note, counts)| {
-        json!({"id": id, "created_at": at, "source": source, "note": note, "counts": counts})
+        json!({"versions": rows.into_iter().map(|(id, at, source, note, counts, env, sections)| {
+        json!({"id": id, "created_at": at, "source": source, "note": note, "counts": counts,
+            "environment": env, "sections": sections})
     }).collect::<Vec<_>>()}),
     ))
 }
 
 async fn load_version(db: &PgPool, id: i64) -> Result<Value, Error> {
-    let row: Option<(String, String, String, Value, Value)> = sqlx::query_as(
-        "select created_at::text, source, note, counts, bundle from musubi.content_versions where id = $1",
+    let row: Option<VersionFull> = sqlx::query_as(
+        "select created_at::text, source, note, counts, bundle, environment, sections
+         from musubi.content_versions where id = $1",
     )
     .bind(id)
     .fetch_optional(db)
     .await
     .map_err(Error::internal)?;
-    let (at, source, note, counts, bundle) =
+    let (at, source, note, counts, bundle, env, sections) =
         row.ok_or_else(|| Error::NotFound(format!("content version {id}")))?;
-    Ok(
-        json!({"id": id, "created_at": at, "source": source, "note": note, "counts": counts, "bundle": bundle}),
-    )
+    Ok(json!({
+        "id": id, "created_at": at, "source": source, "note": note, "counts": counts,
+        "environment": env, "sections": sections, "bundle": bundle,
+    }))
 }
 
 async fn version(
@@ -447,6 +619,15 @@ async fn rollback(
         b.note
     };
     Ok(Json(
-        run_import(&s.db, &v["bundle"], b.dry_run, b.prune, &note, "rollback").await?,
+        run_import(
+            &s,
+            &v["bundle"],
+            b.dry_run,
+            b.prune,
+            &note,
+            "rollback",
+            None,
+        )
+        .await?,
     ))
 }

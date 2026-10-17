@@ -269,6 +269,8 @@ async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "name": s.cfg.node.name,
         "region": s.cfg.node.region,
+        "project": s.cfg.node.project,
+        "environment": s.cfg.node.environment,
         "roles": s.cfg.node.roles,
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": s.started_at.elapsed().as_secs(),

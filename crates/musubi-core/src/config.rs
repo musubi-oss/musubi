@@ -79,6 +79,9 @@ pub struct NodeConfig {
     pub cluster_group: String,
     /// Name of the project this node's base configuration serves (`[[projects]]` add more).
     pub project: String,
+    /// Environment this cluster is (`dev`, `stage`, `prod`…): stamped on exported content/config
+    /// bundles and checked on import when the caller names the target environment.
+    pub environment: String,
     /// Upper bound for the SIGTERM drain (hand off matches/worlds, leave the cluster, close sessions).
     pub drain_timeout_secs: u64,
     /// Let the server start with the built-in `server_key` / JWT secret. `musubi dev` sets it;
@@ -148,6 +151,7 @@ impl Default for NodeConfig {
             bus_advertise: String::new(),
             cluster_group: "default".into(),
             project: "default".into(),
+            environment: "dev".into(),
             drain_timeout_secs: 20,
             allow_insecure_defaults: false,
             data_dir: "./data".into(),

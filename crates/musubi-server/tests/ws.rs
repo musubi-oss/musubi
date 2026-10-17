@@ -13761,3 +13761,180 @@ async fn multi_project_router_isolates_projects() {
         "{r}"
     );
 }
+
+/// Environments: the cluster knows which one it is, config bundles (collection schemas, grant
+/// limits, webhooks, chat filters) travel like content bundles, an import naming another
+/// environment is refused, and imported collection schemas take effect at once.
+#[tokio::test]
+async fn environments_promote_config_bundles() {
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    {
+        let cfg = Arc::make_mut(&mut state.cfg);
+        cfg.node.environment = "stage".into();
+    }
+    let router = musubi_server::http::router(state.clone());
+    let (st, node) = http_json(&router, "GET", "/v1/node", None, false, None).await;
+    assert_eq!(st, 200, "{node}");
+    assert_eq!(node["environment"], "stage");
+    // default export: content only, stamped with the environment
+    let (st, b) = http_json(&router, "GET", "/v1/admin/content", None, true, None).await;
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(b["environment"], "stage");
+    assert_eq!(b["sections"], json!(["content"]));
+    assert!(b["tables"].get("achievements").is_some(), "{b}");
+    assert!(b["tables"].get("storage_schemas").is_none(), "{b}");
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        "/v1/admin/content?sections=nope",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, cfgb) = http_json(
+        &router,
+        "GET",
+        "/v1/admin/content?sections=config",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{cfgb}");
+    assert_eq!(cfgb["sections"], json!(["config"]));
+    for t in [
+        "storage_schemas",
+        "grant_limits",
+        "webhooks",
+        "chat_filters",
+    ] {
+        assert!(
+            cfgb["tables"].get(t).is_some(),
+            "{t} in config section: {cfgb}"
+        );
+    }
+    assert!(cfgb["tables"].get("items").is_none());
+    // a config bundle "from dev": a collection schema and a grant limit
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let coll = format!("env_{sfx}");
+    let bundle = json!({"format": 1, "environment": "dev", "sections": ["config"], "tables": {
+        "storage_schemas": [{"collection": coll, "version": 1,
+            "schema": {"type": "object", "required": ["level"], "properties": {"level": {"type": "integer", "maximum": 10}}},
+            "migrations": [], "indexes": [{"field": "level", "kind": "number", "unique": false}]}],
+        "grant_limits": [{"kind": "item", "key": format!("sword-{sfx}"), "window_secs": 86400, "max_per_account": 3}],
+    }});
+    // meant for prod → refused here
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/admin/content/import",
+        None,
+        true,
+        Some(json!({"bundle": bundle, "environment": "prod"})),
+    )
+    .await;
+    assert_eq!(st, 409, "{r}");
+    assert!(r["message"].as_str().unwrap().contains("stage"), "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/admin/content/import",
+        None,
+        true,
+        Some(json!({"bundle": bundle, "environment": "stage", "note": "promote dev → stage"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["applied"], true);
+    assert_eq!(r["diff"]["storage_schemas"]["added"], 1);
+    assert_eq!(r["diff"]["grant_limits"]["added"], 1);
+    assert!(
+        r["diff"].get("items").is_none(),
+        "content tables untouched by a config import: {r}"
+    );
+    // the imported schema is live: writes are validated and the expression index exists
+    let (ta, _) = token(&router).await;
+    let (st, w) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": coll, "key": "me", "value": {"level": 50}}]})),
+    )
+    .await;
+    assert_eq!(st, 400, "schema enforced right after import: {w}");
+    let (st, w) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": coll, "key": "me", "value": {"level": 5}}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let idx_name = musubi_storage::schema::index_name(
+        &coll,
+        &musubi_storage::schema::IndexDef {
+            field: "level".into(),
+            kind: "number".into(),
+            unique: false,
+        },
+    );
+    let idx: i64 = sqlx::query_scalar(
+        "select count(*) from pg_indexes where schemaname = 'musubi' and indexname = $1",
+    )
+    .bind(&idx_name)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(idx, 1, "expression index created by the import");
+    // history carries the environment and sections
+    let (st, v) = http_json(
+        &router,
+        "GET",
+        "/v1/admin/content/versions",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let latest = &v["versions"][0];
+    assert_eq!(latest["environment"], "stage");
+    assert_eq!(latest["sections"], json!(["config"]));
+    assert_eq!(latest["note"], "promote dev → stage");
+    let (st, one) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/content/versions/{}", latest["id"]),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{one}");
+    assert_eq!(one["bundle"]["sections"], json!(["config"]));
+    assert!(one["bundle"]["tables"]["storage_schemas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["collection"] == coll));
+    // the same bundle again is a no-op
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/admin/content/import",
+        None,
+        true,
+        Some(json!({"bundle": bundle})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["applied"], false);
+}
