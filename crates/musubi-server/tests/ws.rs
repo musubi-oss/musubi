@@ -14108,33 +14108,86 @@ async fn iap_subscription_sweep_marks_grace_and_expired() {
     assert_eq!(expired, 2);
 }
 
-/// With `[ugc.s3]` configured, UGC blobs go to the bucket (SigV4-signed), the row keeps only the
-/// key, downloads are served from the bucket, and a new version or a deleted item removes the
-/// old object.
+/// With `[ugc.s3]` configured, UGC blobs go to the bucket (SigV4-signed; one PUT when the body
+/// fits a part, multipart otherwise), the row keeps only the key, downloads stream from the
+/// bucket, a new version or a deleted item removes the old object, and `max_blob_bytes` caps
+/// the upload.
 #[tokio::test]
 async fn ugc_blobs_live_in_object_storage() {
     let Some(mut state) = build_state(true, &test_group()).await else {
         return;
     };
-    type Objects = Arc<std::sync::Mutex<(std::collections::HashMap<String, Vec<u8>>, Vec<String>)>>;
-    let objects: Objects = Arc::new(std::sync::Mutex::new((Default::default(), Vec::new())));
+    #[derive(Default)]
+    struct Bucket {
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        parts: std::collections::HashMap<String, Vec<(u32, Vec<u8>)>>,
+        log: Vec<String>,
+    }
+    type Objects = Arc<std::sync::Mutex<Bucket>>;
+    let objects: Objects = Arc::new(std::sync::Mutex::new(Bucket::default()));
     let mock = {
-        use axum::extract::{Path as AxPath, State as AxState};
+        use axum::extract::{Path as AxPath, Query as AxQuery, State as AxState};
+        use axum::response::IntoResponse;
+        type Q = std::collections::HashMap<String, String>;
         async fn put(
             AxState(o): AxState<Objects>,
             AxPath((bucket, key)): AxPath<(String, String)>,
+            AxQuery(q): AxQuery<Q>,
             headers: axum::http::HeaderMap,
             body: axum::body::Bytes,
-        ) -> axum::http::StatusCode {
+        ) -> axum::response::Response {
             let auth = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
             let mut g = o.lock().unwrap();
-            g.1.push(format!("PUT {bucket} {auth}"));
-            g.0.insert(key, body.to_vec());
-            axum::http::StatusCode::OK
+            if let (Some(n), Some(u)) = (q.get("partNumber"), q.get("uploadId")) {
+                let n: u32 = n.parse().unwrap();
+                g.log.push(format!("PART {n} {} {auth}", body.len()));
+                g.parts
+                    .entry(u.clone())
+                    .or_default()
+                    .push((n, body.to_vec()));
+                return ([("etag", format!("\"etag-{n}\""))], "").into_response();
+            }
+            g.log.push(format!("PUT {bucket} {auth}"));
+            g.objects.insert(key, body.to_vec());
+            axum::http::StatusCode::OK.into_response()
+        }
+        async fn post(
+            AxState(o): AxState<Objects>,
+            AxPath((_bucket, key)): AxPath<(String, String)>,
+            AxQuery(q): AxQuery<Q>,
+            headers: axum::http::HeaderMap,
+            body: String,
+        ) -> axum::response::Response {
+            let mut g = o.lock().unwrap();
+            if q.contains_key("uploads") {
+                let id = format!("up-{}", g.log.len());
+                g.log.push(format!(
+                    "BEGIN {id} {}",
+                    headers
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                ));
+                return format!(
+                    "<InitiateMultipartUploadResult><Key>{key}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>"
+                )
+                .into_response();
+            }
+            let u = q.get("uploadId").cloned().unwrap_or_default();
+            let mut parts = g.parts.remove(&u).unwrap_or_default();
+            parts.sort_by_key(|(n, _)| *n);
+            let listed = body.matches("<PartNumber>").count();
+            g.log.push(format!(
+                "COMPLETE {u} parts={} listed={listed}",
+                parts.len()
+            ));
+            let joined: Vec<u8> = parts.into_iter().flat_map(|(_, b)| b).collect();
+            g.objects.insert(key, joined);
+            axum::http::StatusCode::OK.into_response()
         }
         async fn get(
             AxState(o): AxState<Objects>,
@@ -14142,33 +14195,37 @@ async fn ugc_blobs_live_in_object_storage() {
             headers: axum::http::HeaderMap,
         ) -> axum::response::Response {
             let mut g = o.lock().unwrap();
-            g.1.push(format!(
+            g.log.push(format!(
                 "GET {}",
                 headers
                     .get("x-amz-content-sha256")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
             ));
-            match g.0.get(&key) {
-                Some(b) => axum::response::IntoResponse::into_response(b.clone()),
-                None => {
-                    axum::response::IntoResponse::into_response(axum::http::StatusCode::NOT_FOUND)
-                }
+            match g.objects.get(&key) {
+                Some(b) => b.clone().into_response(),
+                None => axum::http::StatusCode::NOT_FOUND.into_response(),
             }
         }
         async fn del(
             AxState(o): AxState<Objects>,
             AxPath((_bucket, key)): AxPath<(String, String)>,
+            AxQuery(q): AxQuery<Q>,
         ) -> axum::http::StatusCode {
             let mut g = o.lock().unwrap();
-            g.1.push(format!("DELETE {key}"));
-            g.0.remove(&key);
+            if let Some(u) = q.get("uploadId") {
+                g.log.push(format!("ABORT {u}"));
+                g.parts.remove(u);
+                return axum::http::StatusCode::NO_CONTENT;
+            }
+            g.log.push(format!("DELETE {key}"));
+            g.objects.remove(&key);
             axum::http::StatusCode::NO_CONTENT
         }
         axum::Router::new()
             .route(
                 "/{bucket}/{*key}",
-                axum::routing::put(put).get(get).delete(del),
+                axum::routing::put(put).get(get).delete(del).post(post),
             )
             .with_state(objects.clone())
     };
@@ -14179,12 +14236,14 @@ async fn ugc_blobs_live_in_object_storage() {
     });
     {
         let cfg = Arc::make_mut(&mut state.cfg);
+        cfg.ugc.max_blob_bytes = 64;
         cfg.ugc.s3 = musubi_core::config::S3Config {
             endpoint: format!("http://{addr}"),
             bucket: "ugc-bucket".into(),
             access_key: "AKIDEXAMPLE".into(),
             secret_key: "s3cr3t".into(),
             prefix: "game1/".into(),
+            part_bytes: 16,
             ..Default::default()
         };
     }
@@ -14204,6 +14263,7 @@ async fn ugc_blobs_live_in_object_storage() {
     .await;
     assert_eq!(st, 200, "{item}");
     let id = item["id"].as_str().unwrap().to_string();
+    // fits one part: a single signed PUT
     let (st, body, _) = http_raw(
         &router,
         "PUT",
@@ -14216,6 +14276,7 @@ async fn ugc_blobs_live_in_object_storage() {
     assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
     let up: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(up["version"], 1);
+    assert_eq!(up["size"], 9);
     let sha1 = up["sha256"].as_str().unwrap().to_string();
     let (blob, key): (Option<Vec<u8>>, Option<String>) =
         sqlx::query_as("select blob, blob_key from musubi.ugc_items where id = $1")
@@ -14224,22 +14285,20 @@ async fn ugc_blobs_live_in_object_storage() {
             .await
             .unwrap();
     assert!(blob.is_none(), "row carries no bytes");
-    assert_eq!(
-        key.as_deref(),
-        Some(format!("game1/ugc/{id}/{sha1}").as_str())
-    );
+    let key = key.unwrap();
+    assert!(key.starts_with(&format!("game1/ugc/{id}/")), "{key}");
     {
         let g = objects.lock().unwrap();
-        assert_eq!(g.0.len(), 1);
-        assert_eq!(g.0.get(key.as_ref().unwrap()).unwrap(), b"PK mod v1");
+        assert_eq!(g.objects.len(), 1);
+        assert_eq!(g.objects.get(&key).unwrap(), b"PK mod v1");
         assert!(
-            g.1[0].starts_with("PUT ugc-bucket AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
-                && g.1[0].contains("/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="),
+            g.log[0].starts_with("PUT ugc-bucket AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
+                && g.log[0].contains("/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="),
             "{}",
-            g.1[0]
+            g.log[0]
         );
     }
-    // served from the bucket
+    // served (streamed) from the bucket
     let (st, body, headers) = http_raw(
         &router,
         "GET",
@@ -14253,31 +14312,106 @@ async fn ugc_blobs_live_in_object_storage() {
     assert_eq!(body, b"PK mod v1");
     assert_eq!(headers.get("etag").unwrap(), &format!("\"{sha1}\""));
     assert_eq!(headers.get("content-type").unwrap(), "application/zip");
+    assert_eq!(headers.get("content-length").unwrap(), "9");
     assert!(
         objects
             .lock()
             .unwrap()
-            .1
+            .log
             .iter()
             .any(|l| l.starts_with("GET e3b0c442")),
         "GET signed with the empty-payload hash"
     );
-    // a new version replaces the object
+    // a bigger version goes up in parts and replaces the object
+    let v2: Vec<u8> = (0..40u8).map(|i| b'a' + i % 26).collect();
     let (st, body, _) = http_raw(
         &router,
         "PUT",
         &format!("/v1/ugc/{id}/blob"),
         &ta,
         "application/zip",
-        b"PK mod v2 bigger".to_vec(),
+        v2.clone(),
     )
     .await;
     assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    let up: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(up["version"], 2);
+    assert_eq!(up["size"], 40);
+    let expect_sha: String = ring::digest::digest(&ring::digest::SHA256, &v2)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(up["sha256"], expect_sha);
     {
         let g = objects.lock().unwrap();
-        assert_eq!(g.0.len(), 1, "old object deleted: {:?}", g.1);
-        assert!(g.0.values().next().unwrap() == b"PK mod v2 bigger");
+        assert_eq!(g.objects.len(), 1, "old object deleted: {:?}", g.log);
+        assert_eq!(g.objects.values().next().unwrap(), &v2);
+        assert!(g.parts.is_empty());
+        let parts: Vec<&String> = g.log.iter().filter(|l| l.starts_with("PART ")).collect();
+        assert_eq!(parts.len(), 3, "{:?}", g.log);
+        assert!(
+            parts[0].starts_with("PART 1 16 AWS4-HMAC-SHA256 "),
+            "{}",
+            parts[0]
+        );
+        assert!(parts[1].starts_with("PART 2 16 "), "{}", parts[1]);
+        assert!(parts[2].starts_with("PART 3 8 "), "{}", parts[2]);
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l.starts_with("BEGIN up-") && l.ends_with(" application/zip")),
+            "{:?}",
+            g.log
+        );
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l.contains("COMPLETE") && l.ends_with("parts=3 listed=3")),
+            "{:?}",
+            g.log
+        );
     }
+    let (st, body, _) = http_raw(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "application/octet-stream",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(body, v2);
+    // over max_blob_bytes: refused, nothing left behind
+    let (st, body, _) = http_raw(
+        &router,
+        "PUT",
+        &format!("/v1/ugc/{id}/blob"),
+        &ta,
+        "application/zip",
+        vec![b'x'; 65],
+    )
+    .await;
+    assert_eq!(st, 400, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("max_blob_bytes"));
+    {
+        let g = objects.lock().unwrap();
+        assert_eq!(g.objects.len(), 1);
+        assert_eq!(g.objects.values().next().unwrap(), &v2, "v2 untouched");
+        assert!(g.parts.is_empty(), "no dangling parts: {:?}", g.log);
+    }
+    let (st, cur) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{id}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(cur["version"], 2);
     // deleting the item empties the bucket
     let (st, r) = http_json(
         &router,
@@ -14289,5 +14423,5 @@ async fn ugc_blobs_live_in_object_storage() {
     )
     .await;
     assert_eq!(st, 200, "{r}");
-    assert!(objects.lock().unwrap().0.is_empty());
+    assert!(objects.lock().unwrap().objects.is_empty());
 }

@@ -86,6 +86,7 @@ impl S3Store {
         method: &str,
         host: &str,
         path: &str,
+        query: &str,
         payload_sha: &str,
         now: time::OffsetDateTime,
     ) -> (String, String) {
@@ -108,8 +109,9 @@ impl S3Store {
             .map(|(k, _)| k.as_str())
             .collect::<Vec<_>>()
             .join(";");
-        let canonical =
-            format!("{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_sha}");
+        let canonical = format!(
+            "{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_sha}"
+        );
         let scope = format!("{date}/{}/s3/aws4_request", self.cfg.region);
         let to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz}\n{scope}\n{}",
@@ -136,14 +138,19 @@ impl S3Store {
         &self,
         method: reqwest::Method,
         key: &str,
+        query: &str,
         body: Option<(Vec<u8>, &str)>,
     ) -> Result<reqwest::Response> {
-        let (url, host, path) = self.url_and_path(key);
+        let (mut url, host, path) = self.url_and_path(key);
+        if !query.is_empty() {
+            url = format!("{url}?{query}");
+        }
         let payload_sha = sha256_hex(body.as_ref().map(|(b, _)| b.as_slice()).unwrap_or(&[]));
         let (auth, amz) = self.sign(
             method.as_str(),
             &host,
             &path,
+            query,
             &payload_sha,
             time::OffsetDateTime::now_utc(),
         );
@@ -178,21 +185,118 @@ impl S3Store {
     }
 
     pub async fn put(&self, key: &str, bytes: Vec<u8>, mime: &str) -> Result<()> {
-        self.send(reqwest::Method::PUT, key, Some((bytes, mime)))
+        self.send(reqwest::Method::PUT, key, "", Some((bytes, mime)))
             .await?;
         Ok(())
     }
 
     pub async fn get(&self, key: &str) -> Result<Vec<u8>> {
-        let resp = self.send(reqwest::Method::GET, key, None).await?;
+        let resp = self.send(reqwest::Method::GET, key, "", None).await?;
         resp.bytes()
             .await
             .map(|b| b.to_vec())
             .map_err(|e| Error::Unavailable(format!("object storage: {e}")))
     }
 
+    /// The object as a byte stream (plus its length when the store reports one) — downloads are
+    /// proxied without buffering.
+    pub async fn get_stream(
+        &self,
+        key: &str,
+    ) -> Result<(
+        Option<u64>,
+        impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>,
+    )> {
+        use futures::TryStreamExt;
+        let resp = self.send(reqwest::Method::GET, key, "", None).await?;
+        let len = resp.content_length();
+        Ok((len, resp.bytes_stream().map_err(std::io::Error::other)))
+    }
+
+    /// Multipart upload: begin → `upload_part` (≥ 5 MiB each on AWS, any size on the last) →
+    /// `complete`; `abort` drops the parts of an upload that will not be completed.
+    pub async fn begin_multipart(&self, key: &str, mime: &str) -> Result<String> {
+        let resp = self
+            .send(
+                reqwest::Method::POST,
+                key,
+                "uploads=",
+                Some((Vec::new(), mime)),
+            )
+            .await?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::Unavailable(format!("object storage: {e}")))?;
+        let start = text.find("<UploadId>").map(|i| i + "<UploadId>".len());
+        let end = text.find("</UploadId>");
+        match (start, end) {
+            (Some(a), Some(b)) if a <= b => Ok(text[a..b].trim().to_string()),
+            _ => Err(Error::Unavailable(
+                "object storage: multipart begin without UploadId".into(),
+            )),
+        }
+    }
+
+    pub async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        number: u32,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
+        let query = format!("partNumber={number}&uploadId={}", uri_encode(upload_id));
+        let resp = self
+            .send(
+                reqwest::Method::PUT,
+                key,
+                &query,
+                Some((bytes, "application/octet-stream")),
+            )
+            .await?;
+        Ok(resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub async fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<()> {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (n, etag) in parts {
+            let etag = etag.replace('&', "&amp;").replace('<', "&lt;");
+            xml.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let query = format!("uploadId={}", uri_encode(upload_id));
+        self.send(
+            reqwest::Method::POST,
+            key,
+            &query,
+            Some((xml.into_bytes(), "application/xml")),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
+        let query = format!("uploadId={}", uri_encode(upload_id));
+        match self.send(reqwest::Method::DELETE, key, &query, None).await {
+            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn delete(&self, key: &str) -> Result<()> {
-        match self.send(reqwest::Method::DELETE, key, None).await {
+        match self.send(reqwest::Method::DELETE, key, "", None).await {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
@@ -219,8 +323,8 @@ mod tests {
         assert_eq!(url, "http://127.0.0.1:9000/ugc/ugc/a%20b/x");
         assert_eq!(host, "127.0.0.1:9000");
         assert_eq!(path, "/ugc/ugc/a%20b/x");
-        let (a1, amz) = s.sign("PUT", &host, &path, &sha256_hex(b"hi"), now);
-        let (a2, _) = s.sign("PUT", &host, &path, &sha256_hex(b"hi"), now);
+        let (a1, amz) = s.sign("PUT", &host, &path, "", &sha256_hex(b"hi"), now);
+        let (a2, _) = s.sign("PUT", &host, &path, "", &sha256_hex(b"hi"), now);
         assert_eq!(a1, a2);
         assert_eq!(amz, "20231114T221320Z");
         assert!(a1.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="));

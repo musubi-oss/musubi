@@ -17,7 +17,6 @@ use crate::app::AppState;
 use crate::http::extract::Bearer;
 use crate::http::{ApiError, ServerKey};
 
-pub const MAX_UGC_BYTES: usize = 16 << 20;
 const KINDS: &[&str] = &[
     "map",
     "mod",
@@ -42,7 +41,7 @@ pub fn routes() -> Router<AppState> {
             "/v1/ugc/{id}/blob",
             get(blob_get)
                 .put(blob_put)
-                .layer(axum::extract::DefaultBodyLimit::max(MAX_UGC_BYTES)),
+                .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route("/v1/ugc/{id}/submit", post(submit))
         .route("/v1/ugc/{id}/rate", post(rate))
@@ -428,11 +427,8 @@ async fn blob_put(
     Bearer(me): Bearer,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Result<Json<Value>, ApiError> {
-    if body.is_empty() {
-        return Err(Error::InvalidArgument("empty body".into()).into());
-    }
     let row = owned(&s, id, me.account_id).await?;
     let mime = headers
         .get(header::CONTENT_TYPE)
@@ -440,22 +436,47 @@ async fn blob_put(
         .filter(|m| !m.is_empty() && m.len() <= 128)
         .unwrap_or("application/octet-stream")
         .to_string();
-    let digest = ring::digest::digest(&ring::digest::SHA256, &body);
-    let sha: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let max = s.cfg.ugc.max_blob_bytes.max(1);
+    if let Some(len) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if len > max {
+            return Err(too_large(len, max).into());
+        }
+    }
+    let key = s
+        .blobs
+        .as_ref()
+        .map(|_| format!("{}ugc/{id}/{}", s.cfg.ugc.s3.prefix, Uuid::now_v7()));
+    // The body is consumed as it arrives: hashed on the fly and, with object storage, shipped in
+    // `part_bytes` pieces (one plain PUT when it fits in a single piece), so the node never holds
+    // more than one part of a large mod.
+    let streamed = match stream_blob(&s, body, key.as_deref(), &mime, max).await {
+        Ok(v) => v,
+        Err(e) => {
+            if let (Some(store), Some(key), Some(upload)) = (&s.blobs, &key, e.upload.as_deref()) {
+                if let Err(e) = store.abort_multipart(key, upload).await {
+                    tracing::warn!(error = %e, key, "ugc multipart upload not aborted");
+                }
+            }
+            return Err(e.error.into());
+        }
+    };
+    if streamed.size == 0 {
+        if let (Some(store), Some(key)) = (&s.blobs, &key) {
+            let _ = store.delete(key).await;
+        }
+        return Err(Error::InvalidArgument("empty body".into()).into());
+    }
+    let sha = streamed.sha256;
+    let size = streamed.size;
     let status: String = row.get("status");
     let next = if status == "approved" {
         "pending"
     } else {
         status.as_str()
-    };
-    // object storage when configured: the row keeps only the key
-    let (stored, key): (Option<&[u8]>, Option<String>) = match &s.blobs {
-        Some(store) => {
-            let key = format!("{}ugc/{id}/{sha}", s.cfg.ugc.s3.prefix);
-            store.put(&key, body.to_vec(), &mime).await?;
-            (None, Some(key))
-        }
-        None => (Some(body.as_ref()), None),
     };
     let (version, old_key): (i32, Option<String>) = sqlx::query_as(
         "with old as (select blob_key from musubi.ugc_items where id = $1)
@@ -463,9 +484,9 @@ async fn blob_put(
            status = $6, updated_at = now() where id = $1 returning version, (select blob_key from old)",
     )
     .bind(id)
-    .bind(stored)
+    .bind(streamed.inline.as_deref())
     .bind(&mime)
-    .bind(body.len() as i64)
+    .bind(size as i64)
     .bind(&sha)
     .bind(next)
     .bind(&key)
@@ -481,12 +502,127 @@ async fn blob_put(
         .emit(
             "ugc.updated",
             Some(me.account_id),
-            json!({ "id": id, "version": version, "size": body.len(), "sha256": sha, "status": next }),
+            json!({ "id": id, "version": version, "size": size, "sha256": sha, "status": next }),
         )
         .await;
     Ok(Json(
-        json!({ "id": id, "version": version, "size": body.len(), "sha256": sha, "mime": mime, "status": next }),
+        json!({ "id": id, "version": version, "size": size, "sha256": sha, "mime": mime, "status": next }),
     ))
+}
+
+fn too_large(len: u64, max: u64) -> Error {
+    Error::InvalidArgument(format!(
+        "blob is {len} bytes, [ugc] max_blob_bytes is {max}"
+    ))
+}
+
+struct Streamed {
+    sha256: String,
+    size: u64,
+    /// The bytes themselves when they stay in Postgres (no object storage configured).
+    inline: Option<Vec<u8>>,
+}
+
+struct StreamFailed {
+    error: Error,
+    /// A multipart upload that was begun and must be aborted.
+    upload: Option<String>,
+}
+
+async fn stream_blob(
+    s: &AppState,
+    body: axum::body::Body,
+    key: Option<&str>,
+    mime: &str,
+    max: u64,
+) -> Result<Streamed, StreamFailed> {
+    use futures::StreamExt;
+    use sha2::Digest;
+    let mut stream = body.into_data_stream();
+    let mut hasher = sha2::Sha256::new();
+    let mut size: u64 = 0;
+    let mut buf: Vec<u8> = Vec::new();
+    let part_bytes = s.cfg.ugc.s3.part_bytes.max(1) as usize;
+    let mut upload: Option<String> = None;
+    let mut parts: Vec<(u32, String)> = Vec::new();
+    let fail = |error: Error, upload: &Option<String>| StreamFailed {
+        error,
+        upload: upload.clone(),
+    };
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            fail(
+                Error::InvalidArgument(format!("body read failed: {e}")),
+                &upload,
+            )
+        })?;
+        size += chunk.len() as u64;
+        if size > max {
+            return Err(fail(too_large(size, max), &upload));
+        }
+        hasher.update(&chunk);
+        buf.extend_from_slice(&chunk);
+        if let (Some(store), Some(key)) = (&s.blobs, key) {
+            while buf.len() >= part_bytes {
+                let id = match &upload {
+                    Some(u) => u.clone(),
+                    None => {
+                        let u = store
+                            .begin_multipart(key, mime)
+                            .await
+                            .map_err(|e| fail(e, &None))?;
+                        upload = Some(u.clone());
+                        u
+                    }
+                };
+                let rest = buf.split_off(part_bytes);
+                let part = std::mem::replace(&mut buf, rest);
+                let n = parts.len() as u32 + 1;
+                let etag = store
+                    .upload_part(key, &id, n, part)
+                    .await
+                    .map_err(|e| fail(e, &upload))?;
+                parts.push((n, etag));
+            }
+        }
+    }
+    let sha256: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let inline = match (&s.blobs, key) {
+        (Some(store), Some(key)) => {
+            match &upload {
+                Some(id) => {
+                    if !buf.is_empty() {
+                        let n = parts.len() as u32 + 1;
+                        let etag = store
+                            .upload_part(key, id, n, std::mem::take(&mut buf))
+                            .await
+                            .map_err(|e| fail(e, &upload))?;
+                        parts.push((n, etag));
+                    }
+                    store
+                        .complete_multipart(key, id, &parts)
+                        .await
+                        .map_err(|e| fail(e, &upload))?;
+                }
+                None if size > 0 => store
+                    .put(key, std::mem::take(&mut buf), mime)
+                    .await
+                    .map_err(|e| fail(e, &None))?,
+                None => {}
+            }
+            None
+        }
+        _ => Some(buf),
+    };
+    Ok(Streamed {
+        sha256,
+        size,
+        inline,
+    })
 }
 
 /// Download the content; counts a download for anyone but the owner.
@@ -507,9 +643,12 @@ async fn blob_get(
             .fetch_one(&s.db)
             .await
             .map_err(Error::internal)?;
-    let blob = match (blob, key, &s.blobs) {
-        (Some(b), _, _) => b,
-        (None, Some(key), Some(store)) => store.get(&key).await?,
+    let (len, body) = match (blob, key, &s.blobs) {
+        (Some(b), _, _) => (Some(b.len() as u64), axum::body::Body::from(b)),
+        (None, Some(key), Some(store)) => {
+            let (len, stream) = store.get_stream(&key).await?;
+            (len, axum::body::Body::from_stream(stream))
+        }
         (None, Some(_), None) => {
             return Err(Error::Unavailable(
                 "ugc blob is in object storage but [ugc.s3] is not configured on this node".into(),
@@ -530,7 +669,7 @@ async fn blob_get(
     let mime: String = row.get("mime");
     let version: i32 = row.get("version");
     let sha: String = row.get("sha256");
-    Ok((
+    let mut res = (
         [
             (header::CONTENT_TYPE, mime),
             (header::ETAG, format!("\"{sha}\"")),
@@ -539,9 +678,14 @@ async fn blob_get(
                 version.to_string(),
             ),
         ],
-        blob,
+        body,
     )
-        .into_response())
+        .into_response();
+    if let Some(len) = len {
+        res.headers_mut()
+            .insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+    }
+    Ok(res)
 }
 
 /// Hand a draft (or a rejected item) to moderation; it needs a blob or a URL.

@@ -1537,11 +1537,22 @@ impl Default for OperatorSsoConfig {
 }
 
 /// User-generated content storage.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UgcConfig {
+    /// Largest blob a `PUT /v1/ugc/{id}/blob` accepts (bytes); 16 MiB unless set.
+    pub max_blob_bytes: u64,
     /// Where blobs go; unset = inside Postgres (fine for small mods, not for gigabytes).
     pub s3: S3Config,
+}
+
+impl Default for UgcConfig {
+    fn default() -> Self {
+        Self {
+            max_blob_bytes: 16 << 20,
+            s3: S3Config::default(),
+        }
+    }
 }
 
 /// An S3-compatible bucket (AWS S3, MinIO, R2, B2, GCS interop).
@@ -1559,6 +1570,8 @@ pub struct S3Config {
     pub path_style: bool,
     /// Key prefix inside the bucket.
     pub prefix: String,
+    /// Uploads larger than this go up in parts of this size (AWS needs ≥ 5 MiB; default 8 MiB).
+    pub part_bytes: u64,
 }
 
 impl Default for S3Config {
@@ -1572,6 +1585,7 @@ impl Default for S3Config {
             session_token: String::new(),
             path_style: true,
             prefix: String::new(),
+            part_bytes: 8 << 20,
         }
     }
 }
