@@ -11077,3 +11077,280 @@ async fn tournament_bracket_single_and_swiss() {
     .await;
     assert_eq!(st, 404);
 }
+
+#[tokio::test]
+async fn crafting_recipes_consume_and_grant_atomically() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (ore, ingot, blueprint) = (
+        format!("ore-{sfx}"),
+        format!("ingot-{sfx}"),
+        format!("bp-{sfx}"),
+    );
+    for (id, stackable) in [(&ore, true), (&ingot, true), (&blueprint, false)] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            "/v1/server/items",
+            None,
+            true,
+            Some(json!({"id": id, "name": id, "stackable": stackable, "max_stack": 100000})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let recipe = format!("smelt-{sfx}");
+    // bad definitions
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/crafting/recipes",
+        None,
+        true,
+        Some(json!({"id": recipe, "inputs": [{"item_id": ore, "amount": 2}], "outputs": []})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(&router, "PUT", "/v1/server/crafting/recipes", None, true, Some(json!({"id": recipe, "inputs": [{"item_id": "nope", "amount": 2}], "outputs": [{"item_id": ingot}]}))).await;
+    assert_eq!(st, 404, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/crafting/recipes",
+        None,
+        true,
+        Some(json!({
+            "id": recipe, "name": "Smelt", "category": "metal",
+            "inputs": [{"item_id": ore, "amount": 2}],
+            "outputs": [{"item_id": ingot, "amount": 1}],
+            "requires_item": blueprint, "max_batch": 5, "max_per_account": 4, "enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["max_batch"], 5);
+    let (ta, acc) = token(&router).await;
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/crafting/recipes",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        l["recipes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["id"] == recipe),
+        "{l}"
+    );
+
+    // no blueprint → denied; nothing consumed
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(json!({"account_id": acc, "item_id": ore, "quantity": 7})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&ta),
+        false,
+        Some(json!({"recipe_id": recipe, "count": 1})),
+    )
+    .await;
+    assert_eq!(st, 403, "{r}");
+    http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(json!({"account_id": acc, "item_id": blueprint, "quantity": 1})),
+    )
+    .await;
+    // too many at once / short on ore → 400 / 429, inventory untouched
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&ta),
+        false,
+        Some(json!({"recipe_id": recipe, "count": 6})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&ta),
+        false,
+        Some(json!({"recipe_id": recipe, "count": 4})),
+    )
+    .await;
+    assert_eq!(st, 429, "{r}");
+    assert!(r.to_string().contains("have 7, need 8"), "{r}");
+    let qty = |inv: &Value, item: &str| -> i64 {
+        inv["items"]
+            .as_array()
+            .or(inv.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|e| e["item_id"] == item)
+                    .map(|e| e["quantity"].as_i64().unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    assert_eq!(qty(&inv, &ore), 7, "{inv}");
+    assert_eq!(qty(&inv, &ingot), 0);
+    // craft 3 (6 ore) with an idempotency key; replay returns the same without crafting again
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&ta),
+        false,
+        Some(json!({"recipe_id": recipe, "count": 3, "idempotency_key": "k1"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["replayed"], false);
+    assert_eq!(r["consumed"][0]["quantity"], 6);
+    assert_eq!(r["granted"][0]["quantity"], 3);
+    let (st, r2) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&ta),
+        false,
+        Some(json!({"recipe_id": recipe, "count": 3, "idempotency_key": "k1"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r2}");
+    assert_eq!(r2["replayed"], true);
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    assert_eq!(qty(&inv, &ore), 1, "{inv}");
+    assert_eq!(qty(&inv, &ingot), 3, "{inv}");
+    assert_eq!(qty(&inv, &blueprint), 1, "required item is kept");
+    // lifetime cap 4: one more is fine, the next exceeds
+    http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(json!({"account_id": acc, "item_id": ore, "quantity": 10})),
+    )
+    .await;
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&ta),
+        false,
+        Some(json!({"recipe_id": recipe, "count": 2})),
+    )
+    .await;
+    assert_eq!(st, 429, "cap: {r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&ta),
+        false,
+        Some(json!({"recipe_id": recipe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (_, log) = http_json(&router, "GET", "/v1/crafting/log", Some(&ta), false, None).await;
+    assert_eq!(log["crafts"].as_array().unwrap().len(), 2, "{log}");
+    // a limited grant on the output item blocks before anything is consumed
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/grant_limits",
+        None,
+        true,
+        Some(json!({"kind": "item", "key": ingot, "window_secs": 3600, "max_per_account": 4})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (tb, acc_b) = token(&router).await;
+    for (item, q) in [(&ore, 20), (&blueprint, 1)] {
+        http_json(
+            &router,
+            "POST",
+            "/v1/server/inventory/grant",
+            None,
+            true,
+            Some(json!({"account_id": acc_b, "item_id": item, "quantity": q})),
+        )
+        .await;
+    }
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&tb),
+        false,
+        Some(json!({"recipe_id": recipe, "count": 5})),
+    )
+    .await;
+    assert_eq!(st, 429, "grant limit: {r}");
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&tb), false, None).await;
+    assert_eq!(qty(&inv, &ore), 20, "{inv}");
+    // disable → gone from the player list and refused
+    let (st, _) = http_json(&router, "PUT", "/v1/server/crafting/recipes", None, true, Some(json!({
+        "id": recipe, "inputs": [{"item_id": ore, "amount": 2}], "outputs": [{"item_id": ingot, "amount": 1}], "enabled": false
+    }))).await;
+    assert_eq!(st, 200);
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/crafting/recipes",
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert!(!l["recipes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["id"] == recipe));
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/crafting/craft",
+        Some(&tb),
+        false,
+        Some(json!({"recipe_id": recipe})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (_, d) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/server/crafting/recipes/{recipe}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(d["deleted"], true);
+}

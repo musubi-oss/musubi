@@ -118,6 +118,17 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/items", get(items).post(upsert_item))
         .route("/v1/server/inventory/grant", post(grant_item))
         .route(
+            "/v1/server/crafting/recipes",
+            get(recipes_all).put(put_recipe),
+        )
+        .route(
+            "/v1/server/crafting/recipes/{id}",
+            axum::routing::delete(delete_recipe),
+        )
+        .route("/v1/crafting/recipes", get(recipes))
+        .route("/v1/crafting/craft", post(craft))
+        .route("/v1/crafting/log", get(crafting_log))
+        .route(
             "/v1/server/grant_limits",
             get(grant_limits).put(put_grant_limit),
         )
@@ -1964,4 +1975,128 @@ async fn trade_close(
     )
     .await;
     Ok(Json(serde_json::to_value(t).map_err(Error::internal)?))
+}
+
+/// Define a recipe: `inputs` (item_id|currency + amount) are consumed, `outputs`
+/// (item_id|currency|reward_table + amount) granted, atomically per craft.
+async fn put_recipe(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Json(r): Json<musubi_economy::Recipe>,
+) -> Result<Json<Value>, ApiError> {
+    let r = s.economy.upsert_recipe(r).await?;
+    Ok(Json(serde_json::to_value(r).map_err(Error::internal)?))
+}
+
+async fn recipes_all(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "recipes": s.economy.recipes(true).await? })))
+}
+
+async fn delete_recipe(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "deleted": s.economy.delete_recipe(&id).await? }),
+    ))
+}
+
+/// Enabled recipes, for the crafting UI.
+async fn recipes(State(s): State<AppState>, Bearer(_me): Bearer) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "recipes": s.economy.recipes(false).await? })))
+}
+
+#[derive(Deserialize)]
+struct CraftReq {
+    recipe_id: String,
+    #[serde(default = "one_i64")]
+    count: i64,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+fn one_i64() -> i64 {
+    1
+}
+
+/// Craft `count` units: 429 when a limited grant on an output would be exceeded, 429 with the
+/// missing amount when inputs are short, idempotent per `idempotency_key`.
+async fn craft(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<CraftReq>,
+) -> Result<Json<Value>, ApiError> {
+    let recipe = s
+        .economy
+        .recipes(false)
+        .await?
+        .into_iter()
+        .find(|x| x.id == r.recipe_id)
+        .ok_or_else(|| Error::NotFound(format!("recipe {}", r.recipe_id)))?;
+    if r.count <= 0 || r.count > recipe.max_batch.max(1) {
+        return Err(Error::InvalidArgument(format!(
+            "count must be 1..={}",
+            recipe.max_batch.max(1)
+        ))
+        .into());
+    }
+    for o in &recipe.outputs {
+        let amount = o.amount * r.count;
+        if let Some(i) = &o.item_id {
+            crate::grant_limits::check(&s.db, me.account_id, "item", i, amount).await?;
+        }
+        if let Some(c) = &o.currency {
+            crate::grant_limits::check(&s.db, me.account_id, "currency", c, amount).await?;
+        }
+    }
+    let out = s
+        .economy
+        .craft(
+            me.account_id,
+            &r.recipe_id,
+            r.count,
+            r.idempotency_key.as_deref(),
+        )
+        .await?;
+    if !out.replayed {
+        for o in &recipe.outputs {
+            let amount = o.amount * r.count;
+            if let Some(i) = &o.item_id {
+                crate::grant_limits::record(&s.db, me.account_id, "item", i, amount).await?;
+            }
+            if let Some(c) = &o.currency {
+                crate::grant_limits::record(&s.db, me.account_id, "currency", c, amount).await?;
+            }
+        }
+        s.events
+            .emit(
+                "economy.crafted",
+                Some(me.account_id),
+                json!({ "recipe_id": out.recipe_id, "count": out.count, "consumed": out.consumed,
+                    "granted": out.granted }),
+            )
+            .await;
+    }
+    Ok(Json(serde_json::to_value(out).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default = "default_log_limit")]
+    limit: i64,
+}
+
+fn default_log_limit() -> i64 {
+    50
+}
+
+async fn crafting_log(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<LogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "crafts": s.economy.crafting_log(me.account_id, q.limit).await? }),
+    ))
 }

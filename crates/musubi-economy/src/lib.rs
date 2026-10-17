@@ -31,7 +31,9 @@ pub use iap::{IapProduct, Receipt, ReceiptInput, SteamOrder};
 pub use quests::Quest;
 pub use seasons::Season;
 pub use treasury::TreasuryEntry;
+pub mod crafting;
 pub mod rewards;
+pub use crafting::{Crafted, Ingredient, Output, Recipe};
 pub use progression::{EnergyDef, Level, StreakDef, Track};
 pub use rewards::{Pity, RewardEntry, RewardTable, Roll};
 
