@@ -6,6 +6,9 @@ use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -76,6 +79,7 @@ pub struct AuthService {
     signer: TokenSigner,
     refresh_ttl_secs: u64,
     lockout: Lockout,
+    captcha: Arc<std::sync::RwLock<Option<CaptchaVerifier>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +87,19 @@ struct Lockout {
     threshold: u32,
     base_secs: u64,
     max_secs: u64,
+    captcha_after: u32,
+}
+
+/// Captcha backend for the brute-force gate. `configured` says whether anything can verify a
+/// token right now (module hook loaded or provider set); when it is false the gate is skipped and
+/// only the lockout applies. `verify(token, client_ip)` → `Ok(true)` lets the login proceed.
+pub type CaptchaFuture = Pin<Box<dyn Future<Output = Result<bool>> + Send>>;
+pub type CaptchaVerifyFn = Arc<dyn Fn(String, Option<String>) -> CaptchaFuture + Send + Sync>;
+
+#[derive(Clone)]
+pub struct CaptchaVerifier {
+    pub configured: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub verify: CaptchaVerifyFn,
 }
 
 /// Current lock on an email address after too many failed logins.
@@ -109,8 +126,55 @@ impl AuthService {
                 threshold: cfg.lockout_threshold,
                 base_secs: cfg.lockout_base_secs.max(1),
                 max_secs: cfg.lockout_max_secs.max(cfg.lockout_base_secs.max(1)),
+                captcha_after: cfg.captcha_after,
             },
+            captcha: Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    /// Install the captcha verifier (module hook or provider siteverify). Without one, the
+    /// captcha gate is logged and skipped: lockout still applies.
+    pub fn set_captcha_verifier(&self, v: Option<CaptchaVerifier>) {
+        *self.captcha.write().unwrap() = v;
+    }
+
+    /// Failed logins counted against an address in the last day (0 for unknown addresses).
+    pub async fn login_failures(&self, email: &str) -> Result<u32> {
+        let email = normalize_email(email)?;
+        let n: Option<i32> = sqlx::query_scalar(
+            "select failures from musubi.login_attempts where email = $1 and updated_at > now() - interval '1 day'",
+        )
+        .bind(&email)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(n.unwrap_or(0).max(0) as u32)
+    }
+
+    /// Stamp the client IP on a freshly opened session and say whether this login came from an
+    /// address the account has never been seen at (accounts with no history are never suspicious).
+    pub async fn note_login(&self, session: SessionId, ip: &str) -> Result<bool> {
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            return Ok(false);
+        }
+        let (history, seen): (bool, bool) = sqlx::query_as(
+            "select exists(select 1 from musubi.sessions s where s.account_id = x.account_id and s.id <> x.id),
+                    exists(select 1 from musubi.sessions s where s.account_id = x.account_id and s.id <> x.id and s.ip = $2::inet)
+             from musubi.sessions x where x.id = $1",
+        )
+        .bind(session.0)
+        .bind(ip)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .unwrap_or((false, false));
+        sqlx::query("update musubi.sessions set ip = $2::inet where id = $1")
+            .bind(session.0)
+            .bind(ip)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(history && !seen)
     }
 
     pub fn signer(&self) -> &TokenSigner {
@@ -143,6 +207,7 @@ impl AuthService {
         email: &str,
         pass: &str,
         opts: AuthOptions,
+        client_ip: Option<&str>,
     ) -> Result<Login> {
         let email = normalize_email(email)?;
         password::validate(pass)?;
@@ -153,6 +218,24 @@ impl AuthService {
             return Err(Error::ResourceExhausted(format!(
                 "too many failed logins; retry in {secs}s"
             )));
+        }
+        if self.lockout.captcha_after > 0
+            && self.login_failures(&email).await? >= self.lockout.captcha_after
+        {
+            let verifier = self.captcha.read().unwrap().clone();
+            match verifier.filter(|v| (v.configured)()) {
+                None => tracing::warn!(
+                    "captcha gate reached but no verifier is configured (hook_auth_captcha or captcha_verify_url)"
+                ),
+                Some(v) => {
+                    let Some(token) = opts.captcha.clone().filter(|t| !t.is_empty()) else {
+                        return Err(Error::PermissionDenied("captcha_required".into()));
+                    };
+                    if !(v.verify)(token, client_ip.map(str::to_string)).await? {
+                        return Err(Error::PermissionDenied("captcha_invalid".into()));
+                    }
+                }
+            }
         }
         let existing = sqlx::query_as::<_, (Uuid, Option<String>)>(
             "select account_id, secret_hash from musubi.identities where provider = $1 and subject = $2",

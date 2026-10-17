@@ -120,6 +120,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let (m, r) = runtime.load_dir(dir)?;
         tracing::info!(modules = m, rpcs = r, dir = %dir.display(), "runtime modules loaded");
     }
+    auth.set_captcha_verifier(Some(captcha_verifier(runtime.clone(), &cfg.session)));
     let queues: Vec<musubi_matchmaker::QueueConfig> = cfg
         .matchmaker
         .queues
@@ -1036,4 +1037,66 @@ fn firecracker_settings(
         boot_args: c.boot_args.clone(),
         network,
     })
+}
+
+/// Captcha check behind the email-login gate: a `hook_auth_captcha` module (`{token, ip}` →
+/// `{ok}` or a bare bool) wins; otherwise the configured siteverify endpoint (Turnstile, hCaptcha,
+/// reCAPTCHA all take `secret` + `response` [+ `remoteip`] and answer `{success}`). With neither
+/// the gate logs and lets the attempt through — lockout still applies.
+pub fn captcha_verifier(
+    runtime: Arc<Runtime>,
+    cfg: &musubi_core::config::SessionConfig,
+) -> musubi_auth::CaptchaVerifier {
+    let provider = match (&cfg.captcha_verify_url, &cfg.captcha_secret) {
+        (Some(u), Some(s)) if !u.is_empty() && !s.is_empty() => Some((u.clone(), s.clone())),
+        _ => None,
+    };
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("reqwest client");
+    let configured = {
+        let (runtime, has_provider) = (runtime.clone(), provider.is_some());
+        Arc::new(move || has_provider || runtime.has_hook("hook_auth_captcha"))
+    };
+    let verify = Arc::new(move |token: String, ip: Option<String>| {
+        let (runtime, provider, http) = (runtime.clone(), provider.clone(), http.clone());
+        Box::pin(async move {
+            if runtime.has_hook("hook_auth_captcha") {
+                let payload = serde_json::to_vec(&serde_json::json!({ "token": token, "ip": ip }))
+                    .unwrap_or_default();
+                let out = runtime
+                    .hook(
+                        "hook_auth_captcha",
+                        musubi_runtime::CallContext::default(),
+                        payload,
+                    )
+                    .await
+                    .unwrap_or(Ok(Vec::new()))?;
+                let v: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+                return Ok(v
+                    .as_bool()
+                    .unwrap_or_else(|| v["ok"].as_bool().unwrap_or(false)));
+            }
+            let Some((url, secret)) = provider else {
+                tracing::warn!("captcha gate reached but no verifier is configured (hook_auth_captcha or captcha_verify_url)");
+                return Ok(true);
+            };
+            let mut form = vec![("secret", secret), ("response", token)];
+            if let Some(ip) = ip {
+                form.push(("remoteip", ip));
+            }
+            let v: serde_json::Value = http
+                .post(&url)
+                .form(&form)
+                .send()
+                .await
+                .map_err(musubi_core::Error::internal)?
+                .json()
+                .await
+                .map_err(musubi_core::Error::internal)?;
+            Ok(v["success"].as_bool().unwrap_or(false))
+        }) as musubi_auth::CaptchaFuture
+    });
+    musubi_auth::CaptchaVerifier { configured, verify }
 }

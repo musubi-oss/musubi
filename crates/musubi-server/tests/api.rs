@@ -32,6 +32,10 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     );
     let hub = Arc::new(musubi_server::realtime::Hub::new());
     let runtime = test_runtime();
+    auth.set_captcha_verifier(Some(musubi_server::app::captcha_verifier(
+        runtime.clone(),
+        &cfg.session,
+    )));
     let cluster = test_cluster(&db, &unique("grp")).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
     let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
@@ -10033,5 +10037,95 @@ async fn liveops_changed_drops_cache() {
         hits.load(Ordering::SeqCst),
         2,
         "cache dropped by the change webhook"
+    );
+}
+
+#[tokio::test]
+async fn email_login_captcha_gate_and_session_ips() {
+    // siteverify stand-in: Turnstile/hCaptcha/reCAPTCHA shape, "good" is the only valid token
+    let mock = axum::Router::new().fallback(
+        |axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+            let ok = f.get("secret").map(String::as_str) == Some("s")
+                && f.get("response").map(String::as_str) == Some("good");
+            axum::Json(json!({ "success": ok, "remoteip": f.get("remoteip") }))
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let Some(app) = app_with(|c| {
+        c.session.captcha_after = 2;
+        c.session.captcha_verify_url = Some(url.clone());
+        c.session.captcha_secret = Some("s".into());
+    })
+    .await
+    else {
+        return;
+    };
+    let from = |ip: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/auth/email")
+                .header("x-forwarded-for", ip)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, v)
+        }
+    };
+    let email = format!("{}@example.com", unique("cap"));
+    let good = json!({ "email": email, "password": "Str0ngPassw0rd!" });
+    let (st, v) = from("10.0.0.1", good.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    for _ in 0..2 {
+        let (st, _) = from(
+            "10.0.0.1",
+            json!({ "email": email, "password": "wrong-password-1", "create": false }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    // two failures: the right password alone is no longer enough
+    let (st, v) = from("10.0.0.1", good.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(v.to_string().contains("captcha_required"), "{v}");
+    let mut with_bad = good.clone();
+    with_bad["captcha"] = json!("bad");
+    let (st, v) = from("10.0.0.1", with_bad).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(v.to_string().contains("captcha_invalid"), "{v}");
+    let mut with_good = good.clone();
+    with_good["captcha"] = json!("good");
+    let (st, v) = from("10.0.0.1", with_good).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // success clears the counter: plain password works again, now from a new address
+    let (st, v) = from("10.0.0.2", good.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let t = v["access_token"].as_str().unwrap().to_string();
+    // IPs are stamped on sessions (asynchronously) and show in the device list
+    let mut ips = Vec::new();
+    for _ in 0..40 {
+        let (st, v) = call(&app, "GET", "/v1/account/sessions", Some(&t), None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        ips = v["sessions"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|s| s["ip"].as_str().map(str::to_string))
+            .collect();
+        if ips.iter().any(|i| i == "10.0.0.2") && ips.iter().any(|i| i == "10.0.0.1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        ips.iter().any(|i| i == "10.0.0.2") && ips.iter().any(|i| i == "10.0.0.1"),
+        "{ips:?}"
     );
 }

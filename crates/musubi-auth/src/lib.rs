@@ -11,7 +11,10 @@ mod service;
 pub mod token;
 pub mod totp;
 
-pub use service::{AuthService, Authenticated, Login, Session, SessionInfo, MFA_TOKEN_SECS};
+pub use service::{
+    AuthService, Authenticated, CaptchaFuture, CaptchaVerifier, CaptchaVerifyFn, Login, Session,
+    SessionInfo, MFA_TOKEN_SECS,
+};
 pub use token::{Claims, TokenSigner};
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +43,9 @@ pub struct AuthOptions {
     /// Arbitrary session variables embedded in the access token (≤ 4 KB).
     #[serde(default)]
     pub vars: serde_json::Map<String, serde_json::Value>,
+    /// Captcha response token, required once an address has `captcha_after` failed logins.
+    #[serde(default)]
+    pub captcha: Option<String>,
 }
 
 impl Default for AuthOptions {
@@ -48,6 +54,7 @@ impl Default for AuthOptions {
             create: true,
             username: None,
             vars: Default::default(),
+            captcha: None,
         }
     }
 }

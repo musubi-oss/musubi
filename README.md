@@ -108,7 +108,7 @@ id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.
 | route | auth | purpose |
 |---|---|---|
 | `GET /healthz`, `GET /readyz`, `GET /v1/node` | — | liveness, DB readiness, node info |
-| `POST /v1/auth/device`, `POST /v1/auth/email` | — | authenticate / create account, returns JWT access + refresh |
+| `POST /v1/auth/device`, `POST /v1/auth/email` | — | authenticate / create account, returns JWT access + refresh. Brute force (5.1): failed email logins per address → exponential lockout (`[session] lockout_threshold/base_secs/max_secs`); after `captcha_after` (3) failures the request must carry `captcha` — verified by a `hook_auth_captcha` module (`{token, ip}` → `{ok}`) or by `captcha_verify_url` + `captcha_secret` (Turnstile / hCaptcha / reCAPTCHA siteverify), otherwise `403 captcha_required` / `captcha_invalid`. Every login stamps the client IP on its session; a login from an address the account was never seen at emits `account.suspicious_login` on the event bus and `hook_suspicious_login` to modules |
 | `POST /v1/auth/refresh` | — | rotate refresh token (reuse revokes the family) |
 | `POST /v1/auth/logout`, `GET /v1/account/me` | bearer | |
 | `GET\|PATCH\|DELETE /v1/account` | bearer | own account: profile fields, metadata, identities (masked), soft delete |

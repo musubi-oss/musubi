@@ -64,13 +64,30 @@ async fn device(
 ) -> Result<Json<Session>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
     let sess = s.auth.authenticate_device(&r.id, r.opts).await?;
-    authenticated(&s, &sess, musubi_auth::provider::DEVICE);
+    authenticated(&s, &sess, musubi_auth::provider::DEVICE, &ip.0);
     Ok(Json(sess))
 }
 
 /// Fire the `authenticated` runtime event without delaying the response.
-pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str) {
+pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str, ip: &str) {
     let provider = provider.to_string();
+    {
+        // stamp the IP and flag a login from an address this account was never seen at
+        let (st, sid, acc, ip, provider) = (
+            s.clone(),
+            sess.session_id,
+            sess.account_id,
+            ip.to_string(),
+            provider.clone(),
+        );
+        tokio::spawn(async move {
+            match st.auth.note_login(sid, &ip).await {
+                Ok(true) => suspicious_login(&st, acc, sid, &provider, &ip).await,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = %e, "note_login failed"),
+            }
+        });
+    }
     {
         let (ev, acc, created) = (s.events.clone(), sess.account_id, sess.created);
         let provider = provider.clone();
@@ -96,6 +113,29 @@ pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str) {
     tokio::spawn(async move { rt.event("authenticated", ctx, payload).await });
 }
 
+/// Plan 5.1 "suspicious login" hook: bus event for webhooks/LiveOps plus the module hook, which
+/// may e.g. force a re-verification or notify the player.
+async fn suspicious_login(
+    s: &AppState,
+    account: musubi_core::AccountId,
+    session: musubi_core::SessionId,
+    provider: &str,
+    ip: &str,
+) {
+    let payload = serde_json::json!({ "provider": provider, "ip": ip, "session_id": session });
+    s.events
+        .emit("account.suspicious_login", Some(account), payload.clone())
+        .await;
+    if s.runtime.has_hook("hook_suspicious_login") {
+        let ctx = musubi_runtime::CallContext {
+            account_id: Some(account),
+            session_id: Some(session),
+            ..Default::default()
+        };
+        s.runtime.event("suspicious_login", ctx, payload).await;
+    }
+}
+
 async fn email(
     State(s): State<AppState>,
     ip: super::ClientIp,
@@ -104,7 +144,7 @@ async fn email(
     s.limits.auth_ip(&ip.0)?;
     let login = match s
         .auth
-        .authenticate_email(&r.email, &r.password, r.opts)
+        .authenticate_email(&r.email, &r.password, r.opts, Some(&ip.0))
         .await
     {
         Ok(sess) => sess,
@@ -125,7 +165,7 @@ async fn email(
     };
     match login {
         musubi_auth::Login::Session(sess) => {
-            authenticated(&s, &sess, musubi_auth::provider::EMAIL);
+            authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0);
             Ok(Json(
                 serde_json::to_value(sess).map_err(musubi_core::Error::internal)?,
             ))
@@ -156,7 +196,7 @@ async fn mfa(
 ) -> Result<Json<Session>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
     let sess = s.auth.mfa_complete(&r.mfa_token, &r.code).await?;
-    authenticated(&s, &sess, musubi_auth::provider::EMAIL);
+    authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0);
     Ok(Json(sess))
 }
 
@@ -381,7 +421,7 @@ async fn steam(
         .auth
         .authenticate_external(musubi_auth::provider::STEAM, &steam_id, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::STEAM);
+    authenticated(&s, &sess, musubi_auth::provider::STEAM, &ip.0);
     Ok(Json(sess))
 }
 
@@ -396,7 +436,7 @@ async fn google(
         .auth
         .authenticate_external(musubi_auth::provider::GOOGLE, &claims.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::GOOGLE);
+    authenticated(&s, &sess, musubi_auth::provider::GOOGLE, &ip.0);
     Ok(Json(sess))
 }
 
@@ -411,7 +451,7 @@ async fn apple(
         .auth
         .authenticate_external(musubi_auth::provider::APPLE, &claims.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::APPLE);
+    authenticated(&s, &sess, musubi_auth::provider::APPLE, &ip.0);
     Ok(Json(sess))
 }
 
@@ -432,7 +472,7 @@ async fn oidc(
         .auth
         .authenticate_external(&p, &claims.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, &p);
+    authenticated(&s, &sess, &p, &ip.0);
     Ok(Json(sess))
 }
 

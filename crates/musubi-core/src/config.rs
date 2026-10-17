@@ -107,6 +107,12 @@ pub struct SessionConfig {
     /// First lock lasts this long; every further failure doubles it up to `lockout_max_secs`.
     pub lockout_base_secs: u64,
     pub lockout_max_secs: u64,
+    /// Failed email logins (per address) after which a captcha token is required with the next
+    /// attempts; 0 disables. Verified by the `hook_auth_captcha` module hook when present, else by
+    /// `captcha_verify_url` + `captcha_secret` (Turnstile / hCaptcha / reCAPTCHA siteverify).
+    pub captcha_after: u32,
+    pub captcha_verify_url: Option<String>,
+    pub captcha_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +168,9 @@ impl Default for SessionConfig {
             lockout_threshold: 5,
             lockout_base_secs: 30,
             lockout_max_secs: 15 * 60,
+            captcha_after: 3,
+            captcha_verify_url: None,
+            captcha_secret: None,
         }
     }
 }
