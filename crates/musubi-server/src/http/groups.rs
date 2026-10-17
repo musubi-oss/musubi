@@ -3,8 +3,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, GroupId};
 use musubi_social::{
-    CreateGroup, Group, GroupFilter, GroupMember, GroupService, MemberState, Page, UpdateGroup,
-    UserGroup,
+    CreateGroup, Group, GroupBan, GroupEvent, GroupFilter, GroupMember, GroupService, MemberState,
+    NewNotification, Page, UpdateGroup, UserGroup,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -23,6 +23,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/groups/{id}/promote", post(promote))
         .route("/v1/groups/{id}/demote", post(demote))
         .route("/v1/groups/{id}/members", get(members))
+        .route("/v1/groups/{id}/ban", post(ban).delete(unban))
+        .route("/v1/groups/{id}/bans", get(bans))
+        .route("/v1/groups/{id}/announcement", post(announce))
+        .route("/v1/groups/{id}/events", get(events))
         .route("/v1/users/{id}/groups", get(user_groups))
 }
 
@@ -219,4 +223,122 @@ async fn user_groups(
             .user_groups(id, state_of(q.state)?, q.limit, q.cursor.as_deref())
             .await?,
     ))
+}
+
+/// Notification code for a group announcement.
+pub const CODE_GROUP_ANNOUNCEMENT: i32 = 30;
+
+#[derive(Deserialize)]
+struct BanReq {
+    ids: Vec<AccountId>,
+    #[serde(default)]
+    reason: String,
+    /// Ban length in seconds; absent = permanent.
+    #[serde(default)]
+    until_secs: Option<i64>,
+}
+
+async fn ban(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(b): Json<BanReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let until = match b.until_secs {
+        Some(secs) if secs > 0 => {
+            Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(secs))
+        }
+        Some(_) => {
+            return Err(musubi_core::Error::InvalidArgument("until_secs must be > 0".into()).into())
+        }
+        None => None,
+    };
+    groups(&s)
+        .ban(me.account_id, id, &b.ids, &b.reason, until)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct UnbanReq {
+    ids: Vec<AccountId>,
+}
+
+async fn unban(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(b): Json<UnbanReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s).unban(me.account_id, id, &b.ids).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LimitCursor {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+async fn bans(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Query(q): Query<LimitCursor>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let bans: Vec<GroupBan> = groups(&s).bans(me.account_id, id, q.limit).await?;
+    Ok(Json(json!({ "bans": bans })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AnnounceReq {
+    /// `null` clears the announcement.
+    text: Option<String>,
+}
+
+async fn announce(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(b): Json<AnnounceReq>,
+) -> Result<Json<Group>, ApiError> {
+    let members = groups(&s)
+        .announce(me.account_id, id, b.text.as_deref())
+        .await?;
+    if let Some(text) = &b.text {
+        let batch = members
+            .into_iter()
+            .map(|user_id| NewNotification {
+                user_id,
+                sender_id: Some(me.account_id),
+                subject: "group_announcement".into(),
+                content: json!({ "group_id": id, "text": text }),
+                code: CODE_GROUP_ANNOUNCEMENT,
+                persistent: true,
+            })
+            .collect::<Vec<_>>();
+        if !batch.is_empty() {
+            s.notify.send(batch).await?;
+        }
+    }
+    let mut g = groups(&s).get(&[id]).await?;
+    g.pop()
+        .map(Json)
+        .ok_or_else(|| musubi_core::Error::NotFound("group".into()).into())
+}
+
+async fn events(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Query(q): Query<LimitCursor>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let events: Vec<GroupEvent> = groups(&s)
+        .events(me.account_id, id, q.limit, q.cursor.as_deref())
+        .await?;
+    let cursor = events.last().map(|e| e.id.clone());
+    Ok(Json(json!({ "events": events, "cursor": cursor })))
 }

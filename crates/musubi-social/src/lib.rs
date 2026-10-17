@@ -3,8 +3,8 @@
 pub mod groups;
 pub mod notifications;
 pub use groups::{
-    CreateGroup, Group, GroupFilter, GroupMember, GroupService, MemberState, Page, UpdateGroup,
-    UserGroup,
+    CreateGroup, Group, GroupBan, GroupEvent, GroupFilter, GroupMember, GroupService, MemberState,
+    Page, UpdateGroup, UserGroup,
 };
 pub use notifications::{NewNotification, Notification, NotificationList, NotificationService};
 

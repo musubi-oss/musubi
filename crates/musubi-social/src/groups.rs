@@ -53,6 +53,32 @@ pub struct Group {
     pub create_time: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub update_time: OffsetDateTime,
+    /// Pinned announcement from an admin, if any.
+    pub announcement: Option<String>,
+    pub announcement_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupBan {
+    pub user_id: AccountId,
+    pub username: String,
+    pub banned_by: Option<AccountId>,
+    pub reason: String,
+    /// Unix seconds; `None` = permanent.
+    pub until: Option<i64>,
+    pub created_at: i64,
+}
+
+/// One line of a group's journal (`joined`, `join_requested`, `kicked`, `banned`, `unbanned`,
+/// `announcement`, …).
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupEvent {
+    pub id: String,
+    pub kind: String,
+    pub actor_id: Option<AccountId>,
+    pub subject_id: Option<AccountId>,
+    pub payload: serde_json::Value,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,9 +162,28 @@ type GroupRow = (
     i32,
     OffsetDateTime,
     OffsetDateTime,
+    Option<String>,
+    Option<OffsetDateTime>,
 );
 
-const GROUP_COLS: &str = "g.id, g.creator_id, g.name, g.description, g.avatar_url, g.lang, g.metadata, g.open, g.edge_count, g.max_count, g.created_at, g.updated_at";
+type BanRow = (
+    Uuid,
+    String,
+    Option<Uuid>,
+    String,
+    Option<OffsetDateTime>,
+    OffsetDateTime,
+);
+type EventRow = (
+    Uuid,
+    String,
+    Option<Uuid>,
+    Option<Uuid>,
+    serde_json::Value,
+    OffsetDateTime,
+);
+
+const GROUP_COLS: &str = "g.id, g.creator_id, g.name, g.description, g.avatar_url, g.lang, g.metadata, g.open, g.edge_count, g.max_count, g.created_at, g.updated_at, g.announcement, g.announcement_at";
 
 fn to_group(r: GroupRow) -> Group {
     Group {
@@ -154,6 +199,8 @@ fn to_group(r: GroupRow) -> Group {
         max_count: r.9,
         create_time: r.10,
         update_time: r.11,
+        announcement: r.12,
+        announcement_at: r.13.map(|t| t.unix_timestamp()),
     }
 }
 
@@ -321,6 +368,29 @@ impl GroupService {
         if let Some(s) = existing {
             return MemberState::try_from(s).map_err(Error::Internal);
         }
+        if let Some(until) = sqlx::query_scalar::<_, Option<OffsetDateTime>>(
+            "select until from musubi.group_bans where group_id = $1 and user_id = $2",
+        )
+        .bind(group.0)
+        .bind(me.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?
+        {
+            match until {
+                Some(t) if t <= OffsetDateTime::now_utc() => {
+                    sqlx::query(
+                        "delete from musubi.group_bans where group_id = $1 and user_id = $2",
+                    )
+                    .bind(group.0)
+                    .bind(me.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(Error::internal)?;
+                }
+                _ => return Err(Error::PermissionDenied("banned from this group".into())),
+            }
+        }
         let count: i64 = sqlx::query_scalar(
             "select count(*) from musubi.group_members where user_id = $1 and state < 3",
         )
@@ -342,6 +412,20 @@ impl GroupService {
             MemberState::JoinRequest
         };
         insert_member(&mut tx, group, me, state).await?;
+        let kind = if state == MemberState::Member {
+            "joined"
+        } else {
+            "join_requested"
+        };
+        log_event(
+            &mut tx,
+            group,
+            kind,
+            Some(me),
+            Some(me),
+            serde_json::json!({}),
+        )
+        .await?;
         tx.commit().await.map_err(Error::internal)?;
         Ok(state)
     }
@@ -438,8 +522,215 @@ impl GroupService {
                 return Err(Error::PermissionDenied(format!("cannot kick {u}")));
             }
             remove_member(&mut tx, group, *u, theirs).await?;
+            log_event(
+                &mut tx,
+                group,
+                "kicked",
+                Some(me),
+                Some(*u),
+                serde_json::json!({}),
+            )
+            .await?;
         }
         tx.commit().await.map_err(Error::internal)
+    }
+
+    /// Admin+: ban users (kicking them if they are in); a banned account cannot join or request to
+    /// join until `until` passes (`None` = permanent). Nobody of equal or higher rank can be banned.
+    pub async fn ban(
+        &self,
+        me: AccountId,
+        group: GroupId,
+        users: &[AccountId],
+        reason: &str,
+        until: Option<OffsetDateTime>,
+    ) -> Result<()> {
+        check_users(users)?;
+        if reason.chars().count() > 512 {
+            return Err(Error::InvalidArgument("reason must be <= 512 chars".into()));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        lock_group(&mut tx, group).await?;
+        let mine = require_role(&mut tx, group, me, MemberState::Admin).await?;
+        for u in users {
+            if *u == me {
+                return Err(Error::PermissionDenied("cannot ban yourself".into()));
+            }
+            if let Some(theirs) = member_state(&mut tx, group, *u).await? {
+                if theirs <= mine {
+                    return Err(Error::PermissionDenied(format!("cannot ban {u}")));
+                }
+                remove_member(&mut tx, group, *u, theirs).await?;
+            }
+            sqlx::query(
+                "insert into musubi.group_bans (group_id, user_id, banned_by, reason, until) values ($1, $2, $3, $4, $5)
+                 on conflict (group_id, user_id) do update set banned_by = $3, reason = $4, until = $5, created_at = now()",
+            )
+            .bind(group.0)
+            .bind(u.0)
+            .bind(me.0)
+            .bind(reason)
+            .bind(until)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            log_event(
+                &mut tx,
+                group,
+                "banned",
+                Some(me),
+                Some(*u),
+                serde_json::json!({ "reason": reason, "until": until.map(|t| t.unix_timestamp()) }),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(Error::internal)
+    }
+
+    /// Admin+: lift bans.
+    pub async fn unban(&self, me: AccountId, group: GroupId, users: &[AccountId]) -> Result<()> {
+        check_users(users)?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        lock_group(&mut tx, group).await?;
+        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        for u in users {
+            let n =
+                sqlx::query("delete from musubi.group_bans where group_id = $1 and user_id = $2")
+                    .bind(group.0)
+                    .bind(u.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(Error::internal)?
+                    .rows_affected();
+            if n > 0 {
+                log_event(
+                    &mut tx,
+                    group,
+                    "unbanned",
+                    Some(me),
+                    Some(*u),
+                    serde_json::json!({}),
+                )
+                .await?;
+            }
+        }
+        tx.commit().await.map_err(Error::internal)
+    }
+
+    /// Admin+: current bans, newest first.
+    pub async fn bans(&self, me: AccountId, group: GroupId, limit: usize) -> Result<Vec<GroupBan>> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        let rows: Vec<BanRow> = sqlx::query_as(
+            "select b.user_id, a.username, b.banned_by, b.reason, b.until, b.created_at
+                 from musubi.group_bans b join musubi.accounts a on a.id = b.user_id
+                 where b.group_id = $1 and (b.until is null or b.until > now())
+                 order by b.created_at desc limit $2",
+        )
+        .bind(group.0)
+        .bind(limit.clamp(1, 100) as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| GroupBan {
+                user_id: AccountId(r.0),
+                username: r.1,
+                banned_by: r.2.map(AccountId),
+                reason: r.3,
+                until: r.4.map(|t| t.unix_timestamp()),
+                created_at: r.5.unix_timestamp(),
+            })
+            .collect())
+    }
+
+    /// Admin+: pin (or clear with `None`) the group announcement. Returns the members to notify.
+    pub async fn announce(
+        &self,
+        me: AccountId,
+        group: GroupId,
+        text: Option<&str>,
+    ) -> Result<Vec<AccountId>> {
+        if text.is_some_and(|t| t.chars().count() > 2048) {
+            return Err(Error::InvalidArgument(
+                "announcement must be <= 2048 chars".into(),
+            ));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        lock_group(&mut tx, group).await?;
+        require_role(&mut tx, group, me, MemberState::Admin).await?;
+        sqlx::query(
+            "update musubi.groups set announcement = $2, announcement_at = case when $2 is null then null else now() end, updated_at = now() where id = $1",
+        )
+        .bind(group.0)
+        .bind(text)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        log_event(
+            &mut tx,
+            group,
+            "announcement",
+            Some(me),
+            None,
+            serde_json::json!({ "text": text }),
+        )
+        .await?;
+        let members: Vec<Uuid> = sqlx::query_scalar(
+            "select user_id from musubi.group_members where group_id = $1 and state < 3 and user_id <> $2",
+        )
+        .bind(group.0)
+        .bind(me.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(members.into_iter().map(AccountId).collect())
+    }
+
+    /// Members only: the group's journal, newest first; `cursor` = id of the last event seen.
+    pub async fn events(
+        &self,
+        me: AccountId,
+        group: GroupId,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<GroupEvent>> {
+        let cursor: Option<Uuid> = cursor
+            .map(|c| {
+                c.parse()
+                    .map_err(|_| Error::InvalidArgument("bad cursor".into()))
+            })
+            .transpose()?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        match member_state(&mut tx, group, me).await? {
+            Some(st) if st != MemberState::JoinRequest => {}
+            _ => return Err(Error::PermissionDenied("members only".into())),
+        }
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "select id, kind, actor_id, subject_id, payload, created_at from musubi.group_events
+                 where group_id = $1 and ($2::uuid is null or id < $2) order by id desc limit $3",
+        )
+        .bind(group.0)
+        .bind(cursor)
+        .bind(limit.clamp(1, 100) as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| GroupEvent {
+                id: r.0.to_string(),
+                kind: r.1,
+                actor_id: r.2.map(AccountId),
+                subject_id: r.3.map(AccountId),
+                payload: r.4,
+                created_at: r.5.unix_timestamp(),
+            })
+            .collect())
     }
 
     /// Admin+: raise users one rank (member → admin, admin → superadmin), never above the caller.
@@ -635,7 +926,7 @@ impl GroupService {
             ),
             None => None,
         };
-        let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String, Option<String>, String, serde_json::Value, bool, i32, i32, OffsetDateTime, OffsetDateTime, i16)>(&format!(
+        let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String, Option<String>, String, serde_json::Value, bool, i32, i32, OffsetDateTime, OffsetDateTime, Option<String>, Option<OffsetDateTime>, i16)>(&format!(
             "select {GROUP_COLS}, m.state from musubi.group_members m join musubi.groups g on g.id = m.group_id
              where m.user_id = $1 and ($2::smallint is null or m.state = $2) and ($3::uuid is null or g.id > $3)
              order by g.id limit $4"
@@ -652,8 +943,10 @@ impl GroupService {
             .into_iter()
             .take(limit as usize)
             .map(|r| UserGroup {
-                state: MemberState::try_from(r.12).unwrap_or(MemberState::JoinRequest),
-                group: to_group((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11)),
+                state: MemberState::try_from(r.14).unwrap_or(MemberState::JoinRequest),
+                group: to_group((
+                    r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11, r.12, r.13,
+                )),
             })
             .collect();
         let cursor = more
@@ -680,6 +973,29 @@ struct Locked {
     open: bool,
     edge_count: i32,
     max_count: i32,
+}
+
+async fn log_event(
+    tx: &mut Transaction<'_, Postgres>,
+    group: GroupId,
+    kind: &str,
+    actor: Option<AccountId>,
+    subject: Option<AccountId>,
+    payload: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        "insert into musubi.group_events (id, group_id, kind, actor_id, subject_id, payload) values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(group.0)
+    .bind(kind)
+    .bind(actor.map(|a| a.0))
+    .bind(subject.map(|a| a.0))
+    .bind(&payload)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
 }
 
 async fn lock_group(tx: &mut Transaction<'_, Postgres>, group: GroupId) -> Result<Locked> {

@@ -7985,3 +7985,267 @@ async fn friends_notes_favorites_and_suggestions() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     let _ = tc;
 }
+
+#[tokio::test]
+async fn groups_bans_announcements_and_events() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("gb")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, _a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let (tc, _c) = users[2].clone();
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(&ta),
+        Some(json!({"name": unique("clan"), "open": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    assert!(g["announcement"].is_null());
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // member cannot ban; admin bans B with a reason → B is out and cannot rejoin
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/ban"),
+        Some(&tb),
+        Some(json!({"ids": [b], "reason": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/ban"),
+        Some(&ta),
+        Some(json!({"ids": [b], "reason": "toxic"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/members"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert!(!m["items"].to_string().contains(&b), "{m}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/bans"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["bans"][0]["user_id"], b);
+    assert_eq!(v["bans"][0]["reason"], "toxic");
+    assert!(v["bans"][0]["until"].is_null());
+    // lift → join works again; a timed ban blocks too
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/groups/{gid}/ban"),
+        Some(&ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/ban"),
+        Some(&ta),
+        Some(json!({"ids": [b], "until_secs": 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/bans"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert!(v["bans"][0]["until"].is_i64(), "{v}");
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/groups/{gid}/ban"),
+        Some(&ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // announcement: shown on the group, members notified
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/announcement"),
+        Some(&tb),
+        Some(json!({"text": "raid at 8"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/announcement"),
+        Some(&ta),
+        Some(json!({"text": "raid at 8"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["announcement"], "raid at 8");
+    assert!(v["announcement_at"].is_i64());
+    let (_, n) = call(&app, "GET", "/v1/notifications", Some(&tb), None).await;
+    let got = n["notifications"].as_array().unwrap().iter().any(|n| {
+        n["subject"] == "group_announcement"
+            && n["code"] == 30
+            && n["content"]["text"] == "raid at 8"
+            && n["content"]["group_id"] == gid
+    });
+    assert!(got, "{n}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/announcement"),
+        Some(&ta),
+        Some(json!({"text": null})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["announcement"].is_null());
+
+    // journal: members only, newest first
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/events"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/events"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let kinds: Vec<&str> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "announcement",
+            "announcement",
+            "joined",
+            "unbanned",
+            "banned",
+            "joined",
+            "unbanned",
+            "banned",
+            "joined"
+        ],
+        "{v}"
+    );
+    let banned = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "banned" && e["payload"]["reason"] == "toxic")
+        .unwrap();
+    assert_eq!(banned["subject_id"], b);
+    // cursor pages
+    let (_, p) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/events?limit=2"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(p["events"].as_array().unwrap().len(), 2);
+    let cur = p["cursor"].as_str().unwrap();
+    let (_, p2) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/events?limit=2&cursor={cur}"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(p2["events"][0]["kind"], "joined", "{p2}");
+}
