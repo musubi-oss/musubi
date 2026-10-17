@@ -95,10 +95,51 @@ pub struct StoreItem {
     pub id: String,
     pub item_id: String,
     pub quantity: i64,
-    /// currency code → price
+    /// currency code → list price
     pub prices: Value,
     pub enabled: bool,
     pub max_per_account: Option<i32>,
+    /// Unix seconds; outside `[available_from, available_until)` the listing is hidden and unbuyable.
+    #[serde(default)]
+    pub available_from: Option<i64>,
+    #[serde(default)]
+    pub available_until: Option<i64>,
+    /// Extra items granted with the purchase (the main `item_id` is always granted).
+    #[serde(default)]
+    pub bundle: Vec<BundleEntry>,
+    /// Requires this level on `level_track` (or on any track when unset).
+    #[serde(default)]
+    pub min_level: Option<i32>,
+    #[serde(default)]
+    pub level_track: Option<String>,
+    /// 0..=100, applied while `discount_until` has not passed (or forever when unset).
+    #[serde(default)]
+    pub discount_percent: i32,
+    #[serde(default)]
+    pub discount_until: Option<i64>,
+    /// Daily rotation group: of all enabled listings sharing a `rotation`, only `rotation_slots`
+    /// are on sale each UTC day, chosen deterministically from the date.
+    #[serde(default)]
+    pub rotation: Option<String>,
+    #[serde(default)]
+    pub rotation_slots: i32,
+    /// Filled for a viewer: prices after the current discount.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub effective_prices: Value,
+    /// Filled for a viewer: why they cannot buy it right now (`level`), listing still shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BundleEntry {
+    pub item_id: String,
+    #[serde(default = "one")]
+    pub quantity: i64,
+}
+
+fn one() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,6 +151,140 @@ pub struct CreateStoreItem {
     pub prices: Value,
     pub enabled: Option<bool>,
     pub max_per_account: Option<i32>,
+    pub available_from: Option<i64>,
+    pub available_until: Option<i64>,
+    pub bundle: Vec<BundleEntry>,
+    pub min_level: Option<i32>,
+    pub level_track: Option<String>,
+    pub discount_percent: Option<i32>,
+    pub discount_until: Option<i64>,
+    pub rotation: Option<String>,
+    pub rotation_slots: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Coupon {
+    pub code: String,
+    /// Restrict to one listing; `None` = any.
+    pub store_item_id: Option<String>,
+    pub percent: i32,
+    /// `None` = unlimited.
+    pub uses_left: Option<i32>,
+    /// Default true: one redemption per account.
+    pub per_account_once: bool,
+    pub expires_at: Option<i64>,
+}
+
+impl Default for Coupon {
+    fn default() -> Self {
+        Self {
+            code: String::new(),
+            store_item_id: None,
+            percent: 0,
+            uses_left: None,
+            per_account_once: true,
+            expires_at: None,
+        }
+    }
+}
+
+const STORE_COLS: &str =
+    "json_build_object('id', id, 'item_id', item_id, 'quantity', quantity, 'prices', prices,
+    'enabled', enabled, 'max_per_account', max_per_account,
+    'available_from', extract(epoch from available_from)::bigint,
+    'available_until', extract(epoch from available_until)::bigint,
+    'bundle', bundle, 'min_level', min_level, 'level_track', level_track,
+    'discount_percent', discount_percent,
+    'discount_until', extract(epoch from discount_until)::bigint,
+    'rotation', rotation, 'rotation_slots', rotation_slots)";
+
+fn now_unix() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+impl StoreItem {
+    fn from_row(v: Value) -> Result<Self> {
+        serde_json::from_value(v).map_err(Error::internal)
+    }
+
+    pub fn in_window(&self, now: i64) -> bool {
+        self.available_from.is_none_or(|f| f <= now) && self.available_until.is_none_or(|u| now < u)
+    }
+
+    pub fn discount_now(&self, now: i64) -> i32 {
+        if self.discount_percent > 0 && self.discount_until.is_none_or(|u| now < u) {
+            self.discount_percent.clamp(0, 100)
+        } else {
+            0
+        }
+    }
+
+    fn fill_effective(&mut self, now: i64) {
+        let d = self.discount_now(now) as i64;
+        self.effective_prices = match self.prices.as_object() {
+            Some(m) => Value::Object(
+                m.iter()
+                    .map(|(k, v)| {
+                        let p = v.as_i64().unwrap_or(0);
+                        (k.clone(), Value::from(p - p * d / 100))
+                    })
+                    .collect(),
+            ),
+            None => Value::Null,
+        };
+    }
+}
+
+/// FNV-1a: stable across builds, so every node agrees on today's rotation.
+fn fnv1a(parts: &[&str]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in parts {
+        for b in p.bytes().chain(std::iter::once(0u8)) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+fn level_ok(
+    levels: &std::collections::HashMap<String, i32>,
+    track: Option<&str>,
+    min: i32,
+) -> bool {
+    match track {
+        Some(t) => levels.get(t).is_some_and(|l| *l >= min),
+        None => levels.values().any(|l| *l >= min),
+    }
+}
+
+/// Which listings of each rotation group are on sale on `day` (UTC day number).
+fn rotation_filter(items: Vec<StoreItem>, day: i64) -> Vec<StoreItem> {
+    let mut groups: std::collections::HashMap<String, Vec<(u64, String)>> = Default::default();
+    for it in &items {
+        if let (Some(r), true) = (&it.rotation, it.rotation_slots > 0) {
+            groups
+                .entry(r.clone())
+                .or_default()
+                .push((fnv1a(&[r, &day.to_string(), &it.id]), it.id.clone()));
+        }
+    }
+    let mut on_sale = std::collections::HashSet::new();
+    for (r, mut v) in groups {
+        v.sort();
+        let slots = items
+            .iter()
+            .filter(|i| i.rotation.as_deref() == Some(&r))
+            .map(|i| i.rotation_slots)
+            .max()
+            .unwrap_or(0) as usize;
+        on_sale.extend(v.into_iter().take(slots).map(|(_, id)| id));
+    }
+    items
+        .into_iter()
+        .filter(|i| i.rotation.is_none() || i.rotation_slots <= 0 || on_sale.contains(&i.id))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +295,9 @@ pub struct Purchase {
     pub amount: i64,
     pub balance: i64,
     pub granted: InventoryEntry,
+    /// Bundle entries granted alongside `granted`.
+    #[serde(default)]
+    pub bundle: Vec<InventoryEntry>,
     pub replayed: bool,
 }
 
@@ -617,6 +795,28 @@ impl EconomyService {
                 )));
             }
         }
+        let discount = c.discount_percent.unwrap_or(0);
+        if !(0..=100).contains(&discount) {
+            return Err(Error::InvalidArgument(
+                "discount_percent must be 0..=100".into(),
+            ));
+        }
+        if c.bundle.len() > 32
+            || c.bundle
+                .iter()
+                .any(|b| b.quantity < 1 || b.item_id.is_empty())
+        {
+            return Err(Error::InvalidArgument(
+                "bundle: up to 32 entries of {item_id, quantity >= 1}".into(),
+            ));
+        }
+        if let (Some(f), Some(u)) = (c.available_from, c.available_until) {
+            if u <= f {
+                return Err(Error::InvalidArgument(
+                    "available_until must be after available_from".into(),
+                ));
+            }
+        }
         let s = StoreItem {
             id: c.id,
             item_id: c.item_id,
@@ -624,11 +824,43 @@ impl EconomyService {
             prices: c.prices,
             enabled: c.enabled.unwrap_or(true),
             max_per_account: c.max_per_account,
+            available_from: c.available_from,
+            available_until: c.available_until,
+            bundle: c.bundle,
+            min_level: c.min_level,
+            level_track: c.level_track,
+            discount_percent: discount,
+            discount_until: c.discount_until,
+            rotation: c.rotation.filter(|r| !r.is_empty()),
+            rotation_slots: c.rotation_slots.unwrap_or(0).max(0),
+            effective_prices: Value::Null,
+            locked: None,
         };
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        for b in &s.bundle {
+            let known: Option<(String,)> =
+                sqlx::query_as("select id from musubi.items where id = $1")
+                    .bind(&b.item_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(Error::internal)?;
+            if known.is_none() {
+                return Err(Error::NotFound(format!("bundle item {}", b.item_id)));
+            }
+        }
         sqlx::query(
-            "insert into musubi.store_items (id, item_id, quantity, prices, enabled, max_per_account) values ($1, $2, $3, $4, $5, $6)
-             on conflict (id) do update set item_id = excluded.item_id, quantity = excluded.quantity, prices = excluded.prices,
-             enabled = excluded.enabled, max_per_account = excluded.max_per_account",
+            "insert into musubi.store_items (id, item_id, quantity, prices, enabled, max_per_account,
+                available_from, available_until, bundle, min_level, level_track, discount_percent,
+                discount_until, rotation, rotation_slots)
+             values ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($8), $9, $10, $11, $12,
+                to_timestamp($13), $14, $15)
+             on conflict (id) do update set item_id = excluded.item_id, quantity = excluded.quantity,
+                prices = excluded.prices, enabled = excluded.enabled,
+                max_per_account = excluded.max_per_account, available_from = excluded.available_from,
+                available_until = excluded.available_until, bundle = excluded.bundle,
+                min_level = excluded.min_level, level_track = excluded.level_track,
+                discount_percent = excluded.discount_percent, discount_until = excluded.discount_until,
+                rotation = excluded.rotation, rotation_slots = excluded.rotation_slots",
         )
         .bind(&s.id)
         .bind(&s.item_id)
@@ -636,43 +868,148 @@ impl EconomyService {
         .bind(&s.prices)
         .bind(s.enabled)
         .bind(s.max_per_account)
-        .execute(&self.db)
+        .bind(s.available_from.map(|v| v as f64))
+        .bind(s.available_until.map(|v| v as f64))
+        .bind(serde_json::to_value(&s.bundle).map_err(Error::internal)?)
+        .bind(s.min_level)
+        .bind(&s.level_track)
+        .bind(s.discount_percent)
+        .bind(s.discount_until.map(|v| v as f64))
+        .bind(&s.rotation)
+        .bind(s.rotation_slots)
+        .execute(&mut *tx)
         .await
         .map_err(|e| match e {
             sqlx::Error::Database(d) if d.is_foreign_key_violation() => Error::NotFound(format!("item {}", s.item_id)),
             e => Error::internal(e),
         })?;
+        tx.commit().await.map_err(Error::internal)?;
         Ok(s)
     }
 
-    pub async fn store(&self, include_disabled: bool) -> Result<Vec<StoreItem>> {
-        let rows: Vec<(String, String, i64, Value, bool, Option<i32>)> = sqlx::query_as(
-            "select id, item_id, quantity, prices, enabled, max_per_account from musubi.store_items where enabled or $1 order by id",
-        )
+    /// Listings on sale now (window + today's rotation). With a `viewer`, discounted prices are
+    /// filled in and level-gated listings are marked `locked` instead of hidden.
+    /// `include_disabled` (server view) skips every filter and shows the raw catalogue.
+    pub async fn store(
+        &self,
+        viewer: Option<AccountId>,
+        include_disabled: bool,
+    ) -> Result<Vec<StoreItem>> {
+        let rows: Vec<(Value,)> = sqlx::query_as(&format!(
+            "select {STORE_COLS} from musubi.store_items where enabled or $1 order by id"
+        ))
         .bind(include_disabled)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut items = rows
+            .into_iter()
+            .map(|(v,)| StoreItem::from_row(v))
+            .collect::<Result<Vec<_>>>()?;
+        if include_disabled {
+            return Ok(items);
+        }
+        let now = now_unix();
+        items.retain(|i| i.in_window(now));
+        items = rotation_filter(items, now.div_euclid(86_400));
+        let levels = match viewer {
+            Some(a) if items.iter().any(|i| i.min_level.is_some()) => Some(self.levels(a).await?),
+            _ => None,
+        };
+        for it in &mut items {
+            it.fill_effective(now);
+            if let (Some(min), Some(levels)) = (it.min_level, &levels) {
+                if !level_ok(levels, it.level_track.as_deref(), min) {
+                    it.locked = Some("level".into());
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// track → level for the account.
+    async fn levels(&self, account: AccountId) -> Result<std::collections::HashMap<String, i32>> {
+        Ok(self
+            .progress(account)
+            .await?
+            .into_iter()
+            .map(|p| (p.track_id, p.level))
+            .collect())
+    }
+
+    pub async fn upsert_coupon(&self, c: Coupon) -> Result<Coupon> {
+        check_code(&c.code)?;
+        if !(1..=100).contains(&c.percent) {
+            return Err(Error::InvalidArgument("percent must be 1..=100".into()));
+        }
+        if c.uses_left.is_some_and(|u| u < 0) {
+            return Err(Error::InvalidArgument("uses_left must be >= 0".into()));
+        }
+        sqlx::query(
+            "insert into musubi.store_coupons (code, store_item_id, percent, uses_left, per_account_once, expires_at)
+             values ($1, $2, $3, $4, $5, to_timestamp($6))
+             on conflict (code) do update set store_item_id = excluded.store_item_id, percent = excluded.percent,
+                uses_left = excluded.uses_left, per_account_once = excluded.per_account_once,
+                expires_at = excluded.expires_at",
+        )
+        .bind(&c.code)
+        .bind(&c.store_item_id)
+        .bind(c.percent)
+        .bind(c.uses_left)
+        .bind(c.per_account_once)
+        .bind(c.expires_at.map(|v| v as f64))
+        .execute(&self.db)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
+                Error::NotFound(format!("store item {}", c.store_item_id.clone().unwrap_or_default()))
+            }
+            e => Error::internal(e),
+        })?;
+        Ok(c)
+    }
+
+    pub async fn coupons(&self) -> Result<Vec<Coupon>> {
+        type Row = (String, Option<String>, i32, Option<i32>, bool, Option<i64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "select code, store_item_id, percent, uses_left, per_account_once,
+                    extract(epoch from expires_at)::bigint from musubi.store_coupons order by code",
+        )
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|r| StoreItem {
-                id: r.0,
-                item_id: r.1,
-                quantity: r.2,
-                prices: r.3,
-                enabled: r.4,
-                max_per_account: r.5,
+            .map(|r| Coupon {
+                code: r.0,
+                store_item_id: r.1,
+                percent: r.2,
+                uses_left: r.3,
+                per_account_once: r.4,
+                expires_at: r.5,
             })
             .collect())
     }
 
+    pub async fn delete_coupon(&self, code: &str) -> Result<bool> {
+        let r = sqlx::query("delete from musubi.store_coupons where code = $1")
+            .bind(code)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(r.rows_affected() > 0)
+    }
+
     /// Debit the price in `currency` and grant the item, atomically; idempotent per key.
+    /// Debit the price in `currency` (after the listing's discount and an optional coupon) and
+    /// grant the item plus its bundle, atomically; idempotent per key.
     pub async fn buy(
         &self,
         account: AccountId,
         store_item_id: &str,
         currency: &str,
         idempotency_key: Option<&str>,
+        coupon: Option<&str>,
     ) -> Result<Purchase> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         if let Some(k) = idempotency_key {
@@ -716,29 +1053,103 @@ impl EconomyService {
                     balance: bal.map(|b| b.0).unwrap_or(0),
                     granted: granted
                         .ok_or_else(|| Error::Internal("purchase without inventory".into()))?,
+                    bundle: vec![],
                     replayed: true,
                 });
             }
         }
-        let s: Option<(String, i64, Value, bool, Option<i32>)> = sqlx::query_as(
-            "select item_id, quantity, prices, enabled, max_per_account from musubi.store_items where id = $1",
-        )
+        let s: Option<(Value,)> = sqlx::query_as(&format!(
+            "select {STORE_COLS} from musubi.store_items where id = $1"
+        ))
         .bind(store_item_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        let Some((item_id, qty, prices, enabled, max_per)) = s else {
+        let Some((row,)) = s else {
             return Err(Error::NotFound(format!("store item {store_item_id}")));
         };
-        if !enabled {
+        let listing = StoreItem::from_row(row)?;
+        let (item_id, qty, max_per) = (
+            listing.item_id.clone(),
+            listing.quantity,
+            listing.max_per_account,
+        );
+        if !listing.enabled {
             return Err(Error::PermissionDenied("store item disabled".into()));
         }
-        let price = prices
+        let now = now_unix();
+        if !listing.in_window(now) {
+            return Err(Error::PermissionDenied(
+                "store item not available now".into(),
+            ));
+        }
+        if listing.rotation.is_some() && listing.rotation_slots > 0 {
+            let on_sale = self.store(None, false).await?;
+            if !on_sale.iter().any(|i| i.id == listing.id) {
+                return Err(Error::PermissionDenied(
+                    "store item not in today's rotation".into(),
+                ));
+            }
+        }
+        if let Some(min) = listing.min_level {
+            let levels = self.levels(account).await?;
+            if !level_ok(&levels, listing.level_track.as_deref(), min) {
+                return Err(Error::PermissionDenied(format!("requires level {min}")));
+            }
+        }
+        let list_price = listing
+            .prices
             .get(currency)
             .and_then(|v| v.as_i64())
             .ok_or_else(|| {
                 Error::InvalidArgument(format!("{store_item_id} is not sold for {currency}"))
             })?;
+        let mut price = list_price - list_price * listing.discount_now(now) as i64 / 100;
+        if let Some(code) = coupon {
+            type CouponRow = (Option<String>, i32, Option<i32>, bool, Option<i64>);
+            let c: Option<CouponRow> = sqlx::query_as(
+                "select store_item_id, percent, uses_left, per_account_once,
+                        extract(epoch from expires_at)::bigint
+                 from musubi.store_coupons where code = $1 for update",
+            )
+            .bind(code)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            let Some((only, percent, uses_left, once, expires)) = c else {
+                return Err(Error::NotFound("coupon".into()));
+            };
+            if only.as_deref().is_some_and(|o| o != store_item_id) {
+                return Err(Error::InvalidArgument(
+                    "coupon does not apply to this item".into(),
+                ));
+            }
+            if expires.is_some_and(|e| e <= now) {
+                return Err(Error::PermissionDenied("coupon expired".into()));
+            }
+            if uses_left.is_some_and(|u| u <= 0) {
+                return Err(Error::ResourceExhausted("coupon used up".into()));
+            }
+            if once {
+                let (used,): (i64,) = sqlx::query_as(
+                    "select count(*) from musubi.store_coupon_uses where code = $1 and account_id = $2",
+                )
+                .bind(code)
+                .bind(account.0)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+                if used > 0 {
+                    return Err(Error::PermissionDenied("coupon already used".into()));
+                }
+            }
+            price -= price * percent as i64 / 100;
+            sqlx::query("update musubi.store_coupons set uses_left = uses_left - 1 where code = $1 and uses_left is not null")
+                .bind(code)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+        }
         if let Some(m) = max_per {
             let (n,): (i64,) = sqlx::query_as(
                 "select count(*) from musubi.purchases where account_id = $1 and store_item_id = $2",
@@ -779,8 +1190,22 @@ impl EconomyService {
             Value::Object(Default::default()),
         )
         .await?;
+        let mut bundle = Vec::with_capacity(listing.bundle.len());
+        for b in &listing.bundle {
+            bundle.push(
+                Self::grant_item_tx(
+                    &mut tx,
+                    account,
+                    &b.item_id,
+                    b.quantity,
+                    Value::Object(Default::default()),
+                )
+                .await?,
+            );
+        }
         sqlx::query(
-            "insert into musubi.purchases (id, account_id, store_item_id, currency, amount, idempotency_key) values ($1, $2, $3, $4, $5, $6)",
+            "insert into musubi.purchases (id, account_id, store_item_id, currency, amount, idempotency_key, coupon)
+             values ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(id)
         .bind(account.0)
@@ -788,9 +1213,21 @@ impl EconomyService {
         .bind(currency)
         .bind(price)
         .bind(idempotency_key)
+        .bind(coupon)
         .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
+        if let Some(code) = coupon {
+            sqlx::query(
+                "insert into musubi.store_coupon_uses (code, account_id, purchase_id) values ($1, $2, $3)",
+            )
+            .bind(code)
+            .bind(account.0)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        }
         tx.commit().await.map_err(Error::internal)?;
         Ok(Purchase {
             id,
@@ -799,6 +1236,7 @@ impl EconomyService {
             amount: price,
             balance,
             granted,
+            bundle,
             replayed: false,
         })
     }

@@ -1,6 +1,6 @@
 //! Economy: wallet / inventory / store for players (bearer) and catalog + grants for the server key.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
@@ -116,6 +116,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/items", get(items).post(upsert_item))
         .route("/v1/server/inventory/grant", post(grant_item))
         .route("/v1/server/store", get(store_all).post(upsert_store_item))
+        .route("/v1/server/store/coupons", get(coupons).put(upsert_coupon))
+        .route(
+            "/v1/server/store/coupons/{code}",
+            axum::routing::delete(delete_coupon),
+        )
 }
 
 fn account(id: &str) -> Result<AccountId, ApiError> {
@@ -174,8 +179,10 @@ async fn consume(
     ))
 }
 
-async fn store(State(s): State<AppState>, Bearer(_me): Bearer) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "items": s.economy.store(false).await? })))
+async fn store(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "items": s.economy.store(Some(me.account_id), false).await? }),
+    ))
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -184,6 +191,8 @@ struct BuyReq {
     currency: String,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    coupon: Option<String>,
 }
 
 async fn buy(
@@ -198,6 +207,7 @@ async fn buy(
             &r.store_item_id,
             &r.currency,
             r.idempotency_key.as_deref(),
+            r.coupon.as_deref(),
         )
         .await?;
     s.events
@@ -322,7 +332,7 @@ async fn store_all(
     State(s): State<AppState>,
     ServerKey: ServerKey,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "items": s.economy.store(true).await? })))
+    Ok(Json(json!({ "items": s.economy.store(None, true).await? })))
 }
 
 async fn upsert_store_item(
@@ -333,6 +343,31 @@ async fn upsert_store_item(
     Ok(Json(
         serde_json::to_value(s.economy.upsert_store_item(r).await?).map_err(Error::internal)?,
     ))
+}
+
+async fn coupons(State(s): State<AppState>, ServerKey: ServerKey) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "coupons": s.economy.coupons().await? })))
+}
+
+async fn upsert_coupon(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(c): Json<musubi_economy::Coupon>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.upsert_coupon(c).await?).map_err(Error::internal)?,
+    ))
+}
+
+async fn delete_coupon(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(code): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !s.economy.delete_coupon(&code).await? {
+        return Err(Error::NotFound("coupon".into()).into());
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ----- rewards -----

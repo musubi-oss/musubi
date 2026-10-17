@@ -9549,3 +9549,258 @@ async fn account_bans_message_expiry_and_shadow() {
     let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 }
+
+/// Store depth: windows, bundles, level gates, timed discounts, coupons and daily rotation.
+#[tokio::test]
+async fn store_windows_bundles_discounts_coupons_and_rotation() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("store")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(json!({"account_id": acc, "currency": gold, "delta": 10_000, "reason": "test", "idempotency_key": unique("g")}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let mk_item = |id: &str| json!({"id": id, "name": id, "category": "misc", "stackable": true});
+    let (potion, gem, key) = (unique("potion"), unique("gem"), unique("key"));
+    for it in [&potion, &gem, &key] {
+        let (st, r) = call_server(&app, "POST", "/v1/server/items", k, Some(mk_item(it))).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    // bundle with a 50 % discount still running
+    let bundle = unique("bundle");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/store",
+        k,
+        Some(json!({
+            "id": bundle, "item_id": potion, "quantity": 2, "prices": {gold.clone(): 1000},
+            "bundle": [{"item_id": gem, "quantity": 3}, {"item_id": key}],
+            "discount_percent": 50, "discount_until": now + 3600
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    // not yet available, and expired
+    let later = unique("later");
+    let (st, _) = call_server(&app, "POST", "/v1/server/store", k, Some(json!({"id": later, "item_id": potion, "prices": {gold.clone(): 1}, "available_from": now + 3600}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let gone = unique("gone");
+    let (st, _) = call_server(&app, "POST", "/v1/server/store", k, Some(json!({"id": gone, "item_id": potion, "prices": {gold.clone(): 1}, "available_from": now - 7200, "available_until": now - 3600}))).await;
+    assert_eq!(st, StatusCode::OK);
+    // level gate
+    let track = unique("track");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/tracks",
+        k,
+        Some(
+            json!({"id": track, "name": "Main", "levels": [{"xp": 100}, {"xp": 200}, {"xp": 300}]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let gated = unique("gated");
+    let (st, _) = call_server(&app, "POST", "/v1/server/store", k, Some(json!({"id": gated, "item_id": potion, "prices": {gold.clone(): 10}, "min_level": 3, "level_track": track}))).await;
+    assert_eq!(st, StatusCode::OK);
+    // rotation: 3 listings, 1 slot per day
+    let rot = unique("rot");
+    let rot_ids: Vec<String> = (0..3).map(|i| format!("{rot}-{i}")).collect();
+    for id in &rot_ids {
+        let (st, _) = call_server(&app, "POST", "/v1/server/store", k, Some(json!({"id": id, "item_id": potion, "prices": {gold.clone(): 5}, "rotation": rot, "rotation_slots": 1}))).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    // validation
+    let (st, _) = call_server(&app, "POST", "/v1/server/store", k, Some(json!({"id": unique("bad"), "item_id": potion, "prices": {}, "bundle": [{"item_id": "nope"}]}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, list) = call(&app, "GET", "/v1/store", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    let items = list["items"].as_array().unwrap();
+    let find = |id: &str| items.iter().find(|i| i["id"] == id);
+    assert!(
+        find(&later).is_none() && find(&gone).is_none(),
+        "windows hide listings"
+    );
+    assert_eq!(find(&bundle).unwrap()["effective_prices"][&gold], 500);
+    assert_eq!(find(&gated).unwrap()["locked"], "level");
+    assert_eq!(
+        rot_ids.iter().filter(|id| find(id).is_some()).count(),
+        1,
+        "one rotation slot"
+    );
+    let on_sale = rot_ids
+        .iter()
+        .find(|id| find(id).is_some())
+        .unwrap()
+        .clone();
+    let off_sale = rot_ids
+        .iter()
+        .find(|id| find(id).is_none())
+        .unwrap()
+        .clone();
+    // server view shows everything
+    let (_, all) = call_server(&app, "GET", "/v1/server/store", k, None).await;
+    assert!(all["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["id"] == gone));
+
+    // buying: window, rotation and level gates bite
+    for (id, code) in [
+        (&later, StatusCode::FORBIDDEN),
+        (&off_sale, StatusCode::FORBIDDEN),
+        (&gated, StatusCode::FORBIDDEN),
+    ] {
+        let (st, r) = call(
+            &app,
+            "POST",
+            "/v1/store/buy",
+            Some(&tok),
+            Some(json!({"store_item_id": id, "currency": gold})),
+        )
+        .await;
+        assert_eq!(st, code, "{id}: {r}");
+    }
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": on_sale, "currency": gold})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    // level up → gated listing opens
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": acc, "track_id": track, "delta": 300, "reason": "test"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": gated, "currency": gold})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+
+    // coupon on top of the discount: 1000 → 500 → 400; once per account; restricted to the bundle
+    let code = unique("SAVE");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/store/coupons",
+        k,
+        Some(json!({"code": code, "store_item_id": bundle, "percent": 20, "uses_left": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": on_sale, "currency": gold, "coupon": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, b) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": bundle, "currency": gold, "coupon": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["amount"], 400);
+    // potion is stackable: 2 from this bundle on top of the two singles bought above
+    assert_eq!(b["granted"]["item_id"], potion);
+    assert_eq!(b["granted"]["quantity"], 4);
+    assert_eq!(b["bundle"].as_array().unwrap().len(), 2);
+    assert_eq!(b["bundle"][0]["quantity"], 3);
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": bundle, "currency": gold, "coupon": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{r}");
+    let (_, cs) = call_server(&app, "GET", "/v1/server/store/coupons", k, None).await;
+    let c = cs["coupons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code"] == code)
+        .unwrap();
+    assert_eq!(c["uses_left"], 4);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": bundle, "currency": gold, "coupon": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/store/coupons/{code}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/store/coupons/{code}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // without the coupon the discount alone applies
+    let (st, b2) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": bundle, "currency": gold})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b2}");
+    assert_eq!(b2["amount"], 500);
+}
