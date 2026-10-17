@@ -12271,3 +12271,193 @@ async fn match_results_report_fans_out_once() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+/// Content bundles: dry-run shows the diff without touching anything, import applies it and
+/// records a version, an unchanged re-import is a no-op, rollback restores the earlier state,
+/// bad bundles are refused and a foreign-key violation rolls the whole import back.
+#[tokio::test]
+async fn content_bundle_export_import_diff_rollback() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let cur = format!("cb{sfx}");
+    let item = format!("sword-{sfx}");
+    let find = |b: &Value, table: &str, key: &str, id: &str| -> Value {
+        b["tables"][table]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r[key] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let bundle1 = json!({"format": 1, "tables": {
+        "currencies": [{"code": cur, "name": "Bundle Gold", "max_balance": 1000}],
+        "items": [{"id": item, "name": "Sword", "category": "weapon"}],
+    }});
+    // dry run: diff only
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": bundle1, "dry_run": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["applied"], false);
+    assert_eq!(r["diff"]["currencies"]["added"], 1, "{r}");
+    assert_eq!(r["diff"]["items"]["added"], 1, "{r}");
+    let (st, b) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b["format"], 1);
+    assert!(
+        find(&b, "currencies", "code", &cur).is_null(),
+        "dry run must not write"
+    );
+    // apply
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": bundle1, "note": "v1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["applied"], true);
+    let v1 = r["version"].as_i64().expect("version id");
+    let (_, b) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    let row = find(&b, "currencies", "code", &cur);
+    assert_eq!(row["name"], "Bundle Gold", "{b}");
+    assert_eq!(row["max_balance"], 1000);
+    assert_eq!(find(&b, "items", "id", &item)["category"], "weapon");
+    // v2 changes one field; the dry run reports a change, not an addition
+    let bundle2 = json!({"format": 1, "tables": {
+        "currencies": [{"code": cur, "name": "Bundle Gold II"}],
+    }});
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": bundle2, "dry_run": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["diff"]["currencies"]["changed"], 1, "{r}");
+    assert_eq!(r["diff"]["currencies"]["added"], 0, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": bundle2, "note": "v2"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["applied"], true);
+    let v2 = r["version"].as_i64().expect("version id");
+    assert!(v2 > v1);
+    let (_, b) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    let row = find(&b, "currencies", "code", &cur);
+    assert_eq!(row["name"], "Bundle Gold II");
+    assert_eq!(row["max_balance"], 1000, "omitted columns keep their value");
+    // same bundle again: nothing to do, no version
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": bundle2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["applied"], false);
+    assert!(r["version"].is_null());
+    // history
+    let (st, l) = call_server(&app, "GET", "/v1/admin/content/versions?limit=100", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let ids: Vec<i64> = l["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["id"].as_i64())
+        .collect();
+    assert!(ids.contains(&v1) && ids.contains(&v2), "{l}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/content/versions/{v1}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["note"], "v1");
+    assert_eq!(
+        find(&v["bundle"], "currencies", "code", &cur)["name"],
+        "Bundle Gold"
+    );
+    // rollback to v1 restores the name
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/content/versions/{v1}/rollback"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["applied"], true);
+    let (_, b) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    assert_eq!(find(&b, "currencies", "code", &cur)["name"], "Bundle Gold");
+    // refusals
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": {"format": 2, "tables": {}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": {"format": 1, "tables": {"wallets": []}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": {"format": 1, "tables": {"items": [{"name": "no key"}]}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // a store item pointing at an unknown item violates a foreign key: 409, nothing applied
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": {"format": 1, "tables": {
+            "currencies": [{"code": format!("{cur}-x"), "name": "Never"}],
+            "store_items": [{"id": format!("si-{sfx}"), "item_id": format!("missing-{sfx}")}],
+        }}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    let (_, b) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    assert!(
+        find(&b, "currencies", "code", &format!("{cur}-x")).is_null(),
+        "rolled back"
+    );
+    let (st, _) = call_server(&app, "GET", "/v1/admin/content/versions/999999999", k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

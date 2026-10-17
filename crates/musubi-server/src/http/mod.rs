@@ -3,6 +3,7 @@ pub mod admin;
 mod auth;
 mod chat;
 mod cluster;
+pub mod content;
 pub mod economy;
 pub mod entitlements;
 pub(crate) mod error;
@@ -68,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .merge(entitlements::routes())
         .merge(reports::routes())
         .merge(match_results::routes())
+        .merge(content::routes())
         .merge(fleets::routes())
         .merge(worlds::routes())
         .merge(integrations::routes())
