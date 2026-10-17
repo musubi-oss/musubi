@@ -7,6 +7,7 @@ pub mod db;
 pub mod edge;
 pub mod events;
 pub mod fanout;
+pub mod hooks;
 pub mod http;
 pub mod idempotency;
 pub mod jwt;

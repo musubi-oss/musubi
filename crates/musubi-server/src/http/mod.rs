@@ -63,6 +63,10 @@ pub fn router(state: AppState) -> Router {
         .merge(ws::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            crate::hooks::before_after,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             crate::idempotency::replay,
         ))
         .layer(axum::middleware::from_fn(crate::telemetry::trace_id_header))

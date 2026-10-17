@@ -773,7 +773,7 @@ pub fn security_for(path: &str) -> Option<&'static str> {
     }
 }
 
-fn operation_id(method: &str, path: &str) -> String {
+pub fn operation_id(method: &str, path: &str) -> String {
     let mut id = method.to_ascii_lowercase();
     for seg in path.trim_start_matches('/').split('/') {
         if seg == "v1" {

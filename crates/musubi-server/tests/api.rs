@@ -6513,3 +6513,79 @@ async fn edge_proxy_routes_allocations_by_connect_token() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn http_hooks_rewrite_and_reject_calls_by_nakama_names() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let hooked = unique("hooked");
+    let rewrite = format!(r#"{{"body":{{"id":"{hooked}"}}}}"#);
+    let escaped = rewrite.replace('"', "\\\"");
+    let wat = format!(
+        r#"(module
+  (import "musubi" "error" (func $error (param i32 i32)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 1024))
+  (func (export "alloc") (param $n i32) (result i32) (local $p i32)
+    global.get $heap local.set $p
+    global.get $heap local.get $n i32.add global.set $heap
+    local.get $p)
+  (data (i32.const 16) "{escaped}")
+  (func (export "before_authenticate_device") (param i32 i32 i32 i32) (result i64)
+    i64.const 16 i64.const 32 i64.shl i64.const {} i64.or)
+  (func (export "after_authenticate_device") (param i32 i32 i32 i32) (result i64) i64.const 0)
+  (data (i32.const 256) "nope")
+  (func (export "before_list_friends") (param i32 i32 i32 i32) (result i64)
+    i32.const 256 i32.const 4 call $error
+    i64.const 0))"#,
+        rewrite.len()
+    );
+    let req = Request::put("/v1/admin/runtime/modules/hooks")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/wasm")
+        .body(Body::from(wat))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let st = res.status();
+    let v: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+        .unwrap_or(Value::Null);
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // the before-hook swaps every device id for the hooked one: two strangers land on one account
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("a")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    assert_eq!(s1["created"], true);
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("b")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    assert_eq!(s2["created"], false, "{s2}");
+    let tok = s1["access_token"].as_str().unwrap();
+    let (st, me) = call(&app, "GET", "/v1/account/me", Some(tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    // the hooked device is the only identity
+    let (st, acc) = call(&app, "GET", "/v1/account", Some(tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{acc}");
+    assert!(acc.to_string().contains(&hooked), "{acc}");
+
+    // a before-hook error rejects the call with the guest's message
+    let (st, v) = call(&app, "GET", "/v1/friends", Some(tok), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().ends_with("nope"), "{v}");
+    // other routes are untouched
+    let (st, v) = call(&app, "GET", "/v1/notifications", Some(tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}

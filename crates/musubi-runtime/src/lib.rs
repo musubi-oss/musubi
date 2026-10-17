@@ -505,11 +505,10 @@ impl Runtime {
         for n in names {
             if let Some(id) = n.strip_prefix("rpc_") {
                 ids.push(id.to_string());
-            } else if n.starts_with("before_rpc_")
-                || n.starts_with("after_rpc_")
+            } else if n.starts_with("before_")
+                || n.starts_with("after_")
                 || n.starts_with("hook_")
                 || n.starts_with("schedule_")
-                || n == "before_chat_message"
             {
                 hooks.push(n.clone());
             }
