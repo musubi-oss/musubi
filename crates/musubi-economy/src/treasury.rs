@@ -88,6 +88,56 @@ impl EconomyService {
             .await
     }
 
+    /// Server-side credit to a group treasury with no member leg (tournament prizes, events).
+    pub async fn treasury_grant(
+        &self,
+        group: Uuid,
+        currency: &str,
+        amount: i64,
+        reason: &str,
+    ) -> Result<TreasuryEntry> {
+        if amount <= 0 {
+            return Err(Error::InvalidArgument("amount must be positive".into()));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let balance_after: i64 = sqlx::query_scalar(
+            "insert into musubi.group_wallets (group_id, currency, balance) values ($1, $2, $3)
+             on conflict (group_id, currency) do update
+             set balance = musubi.group_wallets.balance + $3, updated_at = now()
+             returning balance",
+        )
+        .bind(group)
+        .bind(currency)
+        .bind(amount)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let entry = TreasuryEntry {
+            id: Uuid::now_v7(),
+            account_id: None,
+            currency: currency.to_string(),
+            delta: amount,
+            balance_after,
+            reason: reason.to_string(),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        sqlx::query(
+            "insert into musubi.group_wallet_ledger (id, group_id, account_id, currency, delta, balance_after, reason)
+             values ($1, $2, null, $3, $4, $5, $6)",
+        )
+        .bind(entry.id)
+        .bind(group)
+        .bind(currency)
+        .bind(amount)
+        .bind(balance_after)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(entry)
+    }
+
     async fn treasury_move(
         &self,
         group: Uuid,

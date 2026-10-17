@@ -14,11 +14,39 @@ use crate::{
 pub struct Prize {
     pub from_rank: i32,
     pub to_rank: i32,
+    /// Player tournaments: the reward table mailed to every owner in the band.
+    #[serde(default)]
     pub reward_table: String,
+    /// Team tournaments: currency and amount paid into each group's treasury.
+    #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(default)]
+    pub amount: Option<i64>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub body: String,
+}
+
+type PrizeRow = (
+    i32,
+    i32,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Records of a team tournament are owned by groups; a member needs these role bits to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRules {
+    #[serde(default = "default_team_perm")]
+    pub perm: i64,
+}
+
+fn default_team_perm() -> i64 {
+    8
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +81,9 @@ pub struct Tournament {
     /// Filled by `get` and `create`; empty in listings.
     #[serde(default)]
     pub prizes: Vec<Prize>,
+    /// Set for team tournaments (filled by `get` and `create`).
+    #[serde(default)]
+    pub team: Option<TeamRules>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +124,8 @@ pub struct CreateTournament {
     pub authoritative: bool,
     #[serde(default)]
     pub prizes: Vec<Prize>,
+    #[serde(default)]
+    pub team: Option<TeamRules>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -226,6 +259,7 @@ fn to_tournament(r: Row, p: &Phase, size: i64) -> Tournament {
         next_reset: ts(p.expiry),
         prev_reset: ts(p.window_start),
         prizes: Vec::new(),
+        team: None,
     }
 }
 
@@ -311,10 +345,19 @@ impl TournamentService {
             Err(e) => return Err(Error::internal(e)),
         };
         self.insert_prizes(&c.id, &c.prizes).await?;
+        if let Some(team) = &c.team {
+            sqlx::query("insert into musubi.tournament_team (tournament_id, perm) values ($1, $2)")
+                .bind(&c.id)
+                .bind(team.perm)
+                .execute(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        }
         let p = phase(&row, OffsetDateTime::now_utc())?;
         let mut t = to_tournament(row, &p, 0);
         t.private = c.join_code.is_some();
         t.prizes = c.prizes;
+        t.team = c.team;
         Ok(t)
     }
 
@@ -345,16 +388,18 @@ impl TournamentService {
         let r = self.row(id).await?;
         let p = phase(&r, OffsetDateTime::now_utc())?;
         let prizes = self.prizes(id).await?;
+        let team = self.team(id).await?;
         let size = size_of(&self.db, id, p.expiry).await?;
         let mut t = to_tournament(r, &p, size);
         t.private = self.join_code(id).await?.is_some();
         t.prizes = prizes;
+        t.team = team;
         Ok(t)
     }
 
     pub async fn prizes(&self, id: &str) -> Result<Vec<Prize>> {
-        let rows: Vec<(i32, i32, String, String, String)> = sqlx::query_as(
-            "select from_rank, to_rank, reward_table, title, body from musubi.tournament_prizes
+        let rows: Vec<PrizeRow> = sqlx::query_as(
+            "select from_rank, to_rank, reward_table, title, body, currency, amount from musubi.tournament_prizes
              where tournament_id = $1 order by from_rank",
         )
         .bind(id)
@@ -363,14 +408,28 @@ impl TournamentService {
         .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|(from_rank, to_rank, reward_table, title, body)| Prize {
-                from_rank,
-                to_rank,
-                reward_table,
-                title,
-                body,
-            })
+            .map(
+                |(from_rank, to_rank, reward_table, title, body, currency, amount)| Prize {
+                    from_rank,
+                    to_rank,
+                    reward_table,
+                    currency,
+                    amount,
+                    title,
+                    body,
+                },
+            )
             .collect())
+    }
+
+    pub async fn team(&self, id: &str) -> Result<Option<TeamRules>> {
+        let perm: Option<i64> =
+            sqlx::query_scalar("select perm from musubi.tournament_team where tournament_id = $1")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        Ok(perm.map(|perm| TeamRules { perm }))
     }
 
     fn validate_prizes(prizes: &[Prize]) -> Result<()> {
@@ -390,8 +449,19 @@ impl TournamentService {
                     p.from_rank, p.to_rank
                 )));
             }
-            if p.reward_table.is_empty() {
-                return Err(Error::InvalidArgument("prize needs a reward_table".into()));
+            let money = p.currency.is_some() || p.amount.is_some();
+            if p.reward_table.is_empty() == !money {
+                return Err(Error::InvalidArgument(
+                    "a prize is either a reward_table (players) or currency + amount (teams)"
+                        .into(),
+                ));
+            }
+            if money
+                && (p.currency.as_deref().unwrap_or("").is_empty() || p.amount.unwrap_or(0) <= 0)
+            {
+                return Err(Error::InvalidArgument(
+                    "team prize needs currency and a positive amount".into(),
+                ));
             }
             last_to = p.to_rank;
         }
@@ -401,8 +471,8 @@ impl TournamentService {
     async fn insert_prizes(&self, id: &str, prizes: &[Prize]) -> Result<()> {
         for p in prizes {
             sqlx::query(
-                "insert into musubi.tournament_prizes (tournament_id, from_rank, to_rank, reward_table, title, body)
-                 values ($1, $2, $3, $4, $5, $6)",
+                "insert into musubi.tournament_prizes (tournament_id, from_rank, to_rank, reward_table, title, body, currency, amount)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(id)
             .bind(p.from_rank)
@@ -410,6 +480,8 @@ impl TournamentService {
             .bind(&p.reward_table)
             .bind(&p.title)
             .bind(&p.body)
+            .bind(&p.currency)
+            .bind(p.amount)
             .execute(&self.db)
             .await
             .map_err(Error::internal)?;

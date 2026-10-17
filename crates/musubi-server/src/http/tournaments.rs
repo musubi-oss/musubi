@@ -106,6 +106,8 @@ async fn get_one(
 #[derive(Deserialize, Default)]
 struct JoinBody {
     #[serde(default)]
+    group_id: Option<musubi_core::GroupId>,
+    #[serde(default)]
     code: Option<String>,
 }
 
@@ -115,12 +117,54 @@ async fn join(
     Path(id): Path<String>,
     body: Option<Json<JoinBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let u = username(&s, me.account_id).await?;
     let code = body.as_ref().and_then(|b| b.0.code.as_deref());
+    let group = body.as_ref().and_then(|b| b.0.group_id);
+    let (owner, name) = owner_for(&s, &id, me.account_id, group).await?;
     s.tournaments
-        .join(&id, me.account_id, u.as_deref(), code)
+        .join(&id, owner, name.as_deref(), code)
         .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Who a tournament record belongs to: the caller, or — in a team tournament — the group the
+/// caller names and holds the tournament's role bits in.
+async fn owner_for(
+    s: &AppState,
+    id: &str,
+    me: AccountId,
+    group: Option<musubi_core::GroupId>,
+) -> Result<(AccountId, Option<String>), ApiError> {
+    let t = s.tournaments.get(id).await?;
+    match (t.team, group) {
+        (Some(rules), Some(g)) => {
+            crate::http::groups::groups(s)
+                .check_perm(me, g, rules.perm)
+                .await?;
+            let name = crate::http::groups::groups(s)
+                .get(&[g])
+                .await?
+                .into_iter()
+                .next()
+                .map(|g| g.name);
+            Ok((AccountId(g.0), name))
+        }
+        (Some(_), None) => Err(musubi_core::Error::InvalidArgument(
+            "team tournament: group_id is required".into(),
+        )
+        .into()),
+        (None, Some(_)) => {
+            Err(musubi_core::Error::InvalidArgument("not a team tournament".into()).into())
+        }
+        (None, None) => Ok((me, username(s, me).await?)),
+    }
+}
+
+#[derive(Deserialize)]
+struct TournamentWrite {
+    #[serde(flatten)]
+    record: WriteRecord,
+    #[serde(default)]
+    group_id: Option<musubi_core::GroupId>,
 }
 
 async fn records(
@@ -161,12 +205,19 @@ async fn write(
     State(s): State<AppState>,
     Bearer(me): Bearer,
     Path(id): Path<String>,
-    Json(w): Json<WriteRecord>,
+    Json(w): Json<TournamentWrite>,
 ) -> Result<Json<Record>, ApiError> {
-    let u = username(&s, me.account_id).await?;
+    let (owner, name) = owner_for(&s, &id, me.account_id, w.group_id).await?;
     Ok(Json(
         s.tournaments
-            .write(&s.leaderboards, &id, me.account_id, u.as_deref(), w, false)
+            .write(
+                &s.leaderboards,
+                &id,
+                owner,
+                name.as_deref(),
+                w.record,
+                false,
+            )
             .await?,
     ))
 }
@@ -210,6 +261,7 @@ pub async fn pay_prizes(s: &AppState, id: &str, expiry: i64) -> Result<usize, mu
     if prizes.is_empty() || !s.tournaments.claim_payout(id, expiry).await? {
         return Ok(0);
     }
+    let team = s.tournaments.team(id).await?.is_some();
     let limit = prizes.iter().map(|p| p.to_rank).max().unwrap_or(0) as usize;
     let records = s
         .leaderboards
@@ -231,6 +283,23 @@ pub async fn pay_prizes(s: &AppState, id: &str, expiry: i64) -> Result<usize, mu
         } else {
             p.title.clone()
         };
+        if team {
+            let (Some(cur), Some(amount)) = (&p.currency, p.amount) else {
+                continue;
+            };
+            s.economy
+                .treasury_grant(r.owner_id.0, cur, amount, &title)
+                .await?;
+            s.events
+                .emit(
+                    "tournament.prize",
+                    None,
+                    json!({ "tournament_id": id, "rank": rank, "group_id": r.owner_id.0, "currency": cur, "amount": amount, "expiry": expiry }),
+                )
+                .await;
+            paid += 1;
+            continue;
+        }
         s.economy
             .send_mail(
                 musubi_economy::SendMail {

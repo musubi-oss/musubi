@@ -10939,3 +10939,165 @@ async fn tournaments_prizes_paid_by_mail() {
     assert_eq!(st, StatusCode::OK, "{e}");
     assert_eq!(e["paid"], 0);
 }
+
+#[tokio::test]
+async fn tournaments_team_records_and_treasury_prizes() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("tt")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, _) = &users[0];
+    let (tb, _) = &users[1];
+    let (tc, _) = &users[2];
+    let gold = unique("gold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut groups = vec![];
+    for (tok, nm) in [(ta, "alpha"), (tc, "beta")] {
+        let (st, g) = call(
+            &app,
+            "POST",
+            "/v1/groups",
+            Some(tok),
+            Some(json!({"name": unique(nm), "open": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{g}");
+        groups.push(g["id"].as_str().unwrap().to_string());
+    }
+    // b is a plain member of alpha: deposit-only role, no ANNOUNCE bit
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{}/join", groups[0]),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let id = unique("clan-cup");
+    let (st, v) = call_server(&app, "POST", "/v1/server/tournaments", k, Some(json!({
+        "id": id, "title": "Clan Cup", "duration": 3600, "operator": "incr", "team": {},
+        "prizes": [{"from_rank": 1, "to_rank": 1, "reward_table": "x", "currency": gold, "amount": 500}]
+    }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "mixed prize kinds: {v}");
+    let (st, t) = call_server(
+        &app,
+        "POST",
+        "/v1/server/tournaments",
+        k,
+        Some(json!({
+            "id": id, "title": "Clan Cup", "duration": 3600, "operator": "incr", "team": {},
+            "prizes": [{"from_rank": 1, "to_rank": 1, "currency": gold, "amount": 500},
+                       {"from_rank": 2, "to_rank": 2, "currency": gold, "amount": 100}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["team"]["perm"], 8);
+    // no group → 400; member without the role bit → 403; owner writes for the group
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(ta),
+        Some(json!({"score": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(tb),
+        Some(json!({"score": 10, "group_id": groups[0]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    for score in [10, 15] {
+        let (st, r) = call(
+            &app,
+            "POST",
+            &format!("/v1/tournaments/{id}/records"),
+            Some(ta),
+            Some(json!({"score": score, "group_id": groups[0]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(tc),
+        Some(json!({"score": 20, "group_id": groups[1]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, recs) = call(
+        &app,
+        "GET",
+        &format!("/v1/tournaments/{id}/records"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{recs}");
+    let list = recs["records"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{recs}");
+    assert_eq!(
+        list[0]["owner_id"],
+        json!(groups[0]),
+        "alpha summed 10+15 = 25 leads: {recs}"
+    );
+    assert_eq!(list[0]["score"], 25);
+    let (st, e) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/tournaments/{id}/end"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    assert_eq!(e["paid"], 2);
+    let (st, tr) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{}/treasury", groups[0]),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{tr}");
+    assert_eq!(tr["balances"][0]["balance"], 500, "{tr}");
+    let (_, tr) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{}/treasury", groups[1]),
+        Some(tc),
+        None,
+    )
+    .await;
+    assert_eq!(tr["balances"][0]["balance"], 100, "{tr}");
+}

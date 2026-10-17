@@ -50,7 +50,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/users/{id}/groups", get(user_groups))
 }
 
-fn groups(s: &AppState) -> &GroupService {
+pub(crate) fn groups(s: &AppState) -> &GroupService {
     &s.groups
 }
 
