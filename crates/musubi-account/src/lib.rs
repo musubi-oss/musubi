@@ -58,6 +58,34 @@ pub struct UpdateAccount {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// What `AccountService::merge` moved into the target.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MergeReport {
+    pub identities: u64,
+    pub wallets: u64,
+    pub inventory: u64,
+    pub storage_moved: u64,
+    /// Source objects dropped because the target already had the same collection/key.
+    pub storage_kept: u64,
+    pub friends: u64,
+    pub groups: u64,
+}
+
+async fn exec(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sql: &str,
+    target: Uuid,
+    source: Uuid,
+) -> Result<u64> {
+    Ok(sqlx::query(sql)
+        .bind(target)
+        .bind(source)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected())
+}
+
 #[derive(Clone)]
 pub struct AccountService {
     db: PgPool,
@@ -185,6 +213,195 @@ impl AccountService {
             .map_err(Error::internal)?;
         sqlx::query("update musubi.sessions set revoked_at = now() where account_id = $1 and revoked_at is null").bind(id.0).execute(&mut *tx).await.map_err(Error::internal)?;
         tx.commit().await.map_err(Error::internal)
+    }
+
+    /// Fold `source` into `target` (guest → social login): identities move over (an email stays
+    /// behind if the target already has one), wallets are summed (ledger rows `reason = merge`),
+    /// inventory, friends, group memberships, recent players and notifications are unioned,
+    /// storage objects move unless the target already has the same collection/key (target wins);
+    /// leaderboard records and ratings stay with the target. The source is then closed like
+    /// `delete`. Everything runs in one transaction and is journaled in `account_merges`.
+    pub async fn merge(&self, target: AccountId, source: AccountId) -> Result<MergeReport> {
+        if target == source {
+            return Err(Error::InvalidArgument(
+                "cannot merge an account into itself".into(),
+            ));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let alive: Vec<Uuid> = sqlx::query_scalar(
+            "select id from musubi.accounts where id = any($1) and deleted_at is null for update",
+        )
+        .bind(vec![target.0, source.0])
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if alive.len() != 2 {
+            return Err(Error::NotFound("account".into()));
+        }
+        let t = target.0;
+        let s = source.0;
+        let identities = exec(&mut tx,
+            "update musubi.identities set account_id = $1, updated_at = now()
+             where account_id = $2 and not (provider = 'email' and exists
+               (select 1 from musubi.identities x where x.account_id = $1 and x.provider = 'email'))", t, s).await?;
+        let mut rep = MergeReport {
+            identities,
+            ..MergeReport::default()
+        };
+
+        let wallets: Vec<(String, i64)> = sqlx::query_as(
+            "select currency, balance from musubi.wallets where account_id = $1 and balance <> 0",
+        )
+        .bind(s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        for (currency, delta) in wallets {
+            let after: i64 = sqlx::query_scalar(
+                "insert into musubi.wallets (account_id, currency, balance) values ($1, $2, $3)
+                 on conflict (account_id, currency) do update
+                   set balance = musubi.wallets.balance + excluded.balance, updated_at = now()
+                 returning balance",
+            )
+            .bind(t)
+            .bind(&currency)
+            .bind(delta)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            sqlx::query(
+                "insert into musubi.wallet_ledger (id, account_id, currency, delta, balance_after, reason, ref)
+                 values ($1, $2, $3, $4, $5, 'merge', $6)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(t)
+            .bind(&currency)
+            .bind(delta)
+            .bind(after)
+            .bind(s.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            rep.wallets += 1;
+        }
+        exec(
+            &mut tx,
+            "delete from musubi.wallets where account_id = $2 and $1 = $1",
+            t,
+            s,
+        )
+        .await?;
+
+        rep.inventory = exec(
+            &mut tx,
+            "update musubi.inventory set account_id = $1, updated_at = now() where account_id = $2",
+            t,
+            s,
+        )
+        .await?;
+
+        rep.storage_moved = exec(&mut tx,
+            "update musubi.storage_objects o set owner_id = $1, updated_at = now()
+             where o.owner_id = $2 and not exists
+               (select 1 from musubi.storage_objects x where x.owner_id = $1 and x.collection = o.collection and x.key = o.key)", t, s).await?;
+        rep.storage_kept = exec(
+            &mut tx,
+            "delete from musubi.storage_objects where owner_id = $2 and $1 = $1",
+            t,
+            s,
+        )
+        .await?;
+
+        rep.friends = exec(
+            &mut tx,
+            "update musubi.friends f set user_id = $1, updated_at = now()
+             where f.user_id = $2 and f.friend_id <> $1 and not exists
+               (select 1 from musubi.friends x where x.user_id = $1 and x.friend_id = f.friend_id)",
+            t,
+            s,
+        )
+        .await?;
+        exec(
+            &mut tx,
+            "update musubi.friends f set friend_id = $1, updated_at = now()
+             where f.friend_id = $2 and f.user_id <> $1 and not exists
+               (select 1 from musubi.friends x where x.user_id = f.user_id and x.friend_id = $1)",
+            t,
+            s,
+        )
+        .await?;
+        exec(
+            &mut tx,
+            "delete from musubi.friends where (user_id = $2 or friend_id = $2) and $1 = $1",
+            t,
+            s,
+        )
+        .await?;
+
+        exec(
+            &mut tx,
+            "update musubi.groups set creator_id = $1 where creator_id = $2",
+            t,
+            s,
+        )
+        .await?;
+        rep.groups = exec(&mut tx,
+            "update musubi.group_members m set user_id = $1, updated_at = now()
+             where m.user_id = $2 and not exists
+               (select 1 from musubi.group_members x where x.group_id = m.group_id and x.user_id = $1)", t, s).await?;
+        exec(&mut tx,
+            "update musubi.groups g set edge_count = edge_count - 1
+             where g.id in (select group_id from musubi.group_members where user_id = $2 and state < 3) and $1 = $1", t, s).await?;
+        exec(
+            &mut tx,
+            "delete from musubi.group_members where user_id = $2 and $1 = $1",
+            t,
+            s,
+        )
+        .await?;
+
+        exec(&mut tx,
+            "update musubi.recent_players r set user_id = $1 where r.user_id = $2 and r.other_id <> $1 and not exists
+               (select 1 from musubi.recent_players x where x.user_id = $1 and x.other_id = r.other_id)", t, s).await?;
+        exec(&mut tx,
+            "update musubi.recent_players r set other_id = $1 where r.other_id = $2 and r.user_id <> $1 and not exists
+               (select 1 from musubi.recent_players x where x.user_id = r.user_id and x.other_id = $1)", t, s).await?;
+        exec(
+            &mut tx,
+            "delete from musubi.recent_players where (user_id = $2 or other_id = $2) and $1 = $1",
+            t,
+            s,
+        )
+        .await?;
+        exec(
+            &mut tx,
+            "update musubi.notifications set user_id = $1 where user_id = $2",
+            t,
+            s,
+        )
+        .await?;
+
+        exec(&mut tx,
+            "update musubi.accounts set deleted_at = now(), disabled_at = now(), updated_at = now() where id = $2 and $1 = $1", t, s).await?;
+        exec(
+            &mut tx,
+            "delete from musubi.identities where account_id = $2 and $1 = $1",
+            t,
+            s,
+        )
+        .await?;
+        exec(&mut tx,
+            "update musubi.sessions set revoked_at = now() where account_id = $2 and revoked_at is null and $1 = $1", t, s).await?;
+        sqlx::query("insert into musubi.account_merges (id, target_id, source_id, report) values ($1, $2, $3, $4)")
+            .bind(Uuid::now_v7())
+            .bind(t)
+            .bind(s)
+            .bind(serde_json::to_value(&rep)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(rep)
     }
 
     pub async fn get_users(&self, ids: &[AccountId], usernames: &[String]) -> Result<Vec<User>> {

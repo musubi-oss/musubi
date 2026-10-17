@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/account/unlink/device", delete(unlink_device))
         .route("/v1/account/unlink/email", delete(unlink_email))
         .route("/v1/account/export", get(export_self))
+        .route("/v1/account/merge", post(merge))
         .route("/v1/account/delete", post(delete_self))
         .route("/v1/users", get(get_users))
         .route("/v1/users/search", get(search_users))
@@ -292,4 +293,33 @@ async fn delete_self(
         )
         .await;
     Ok(Json(json!({ "deleted": true })))
+}
+
+#[derive(Deserialize)]
+struct MergeReq {
+    /// Access token of the account to fold into the caller's — proof that the caller owns it too.
+    access_token: String,
+}
+
+/// `POST /v1/account/merge` — absorb another account (typically a guest) into the caller's.
+async fn merge(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<MergeReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let other = s
+        .auth
+        .verify_access(&r.access_token)
+        .map_err(|_| musubi_core::Error::Unauthenticated("invalid access_token".into()))?;
+    if other.account_id == me.account_id {
+        return Err(musubi_core::Error::InvalidArgument(
+            "cannot merge an account into itself".into(),
+        )
+        .into());
+    }
+    let report = s.accounts.merge(me.account_id, other.account_id).await?;
+    super::admin::kick_everywhere(&s, other.account_id).await;
+    Ok(Json(
+        json!({ "merged": other.account_id, "report": report }),
+    ))
 }

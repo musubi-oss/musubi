@@ -8519,3 +8519,145 @@ async fn account_sessions_list_and_revoke_one_device() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     let _ = t2;
 }
+
+#[tokio::test]
+async fn account_merge_folds_guest_into_main() {
+    let Some(app) = app().await else { return };
+    let mut tok = vec![];
+    let mut ids = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("mg")})),
+        )
+        .await;
+        tok.push(s["access_token"].as_str().unwrap().to_string());
+        ids.push(s["account_id"].as_str().unwrap().to_string());
+    }
+    let (ta, tb, tc) = (&tok[0], &tok[1], &tok[2]);
+    let (a, b, c) = (&ids[0], &ids[1], &ids[2]);
+    let guest_dev = unique("gdev");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/link/device",
+        Some(tb),
+        Some(json!({"id": guest_dev})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // guest B: storage (one clashing key, one unique), friend C, a group
+    let col = unique("save");
+    for (t, k, v) in [(tb, "slot1", 1), (tb, "slot2", 2), (ta, "slot1", 10)] {
+        let (st, _) = call(
+            &app,
+            "POST",
+            "/v1/storage/write",
+            Some(t),
+            Some(json!({"objects": [{"collection": col, "key": k, "value": {"v": v}}]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(tb),
+        Some(json!({"ids": [c]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(tc),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(tb),
+        Some(json!({"name": unique("mgrp")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/merge",
+        Some(ta),
+        Some(json!({"access_token": ta})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/merge",
+        Some(ta),
+        Some(json!({"access_token": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/merge",
+        Some(ta),
+        Some(json!({"access_token": tb})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["merged"], *b);
+    assert_eq!(v["report"]["storage_moved"], 1, "{v}");
+    assert_eq!(v["report"]["storage_kept"], 1, "{v}");
+    assert_eq!(v["report"]["friends"], 1, "{v}");
+    assert_eq!(v["report"]["groups"], 1, "{v}");
+    assert!(v["report"]["identities"].as_u64().unwrap() >= 2, "{v}");
+
+    // A now owns slot2, kept its own slot1, is friends with C, owns the group; B's device logs into A
+    let (_, r) = call(&app, "POST", "/v1/storage/read", Some(ta),
+        Some(json!({"objects": [{"collection": col, "key": "slot1"}, {"collection": col, "key": "slot2"}]}))).await;
+    let vals: Vec<i64> = r["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"]["v"].as_i64().unwrap())
+        .collect();
+    assert_eq!(vals.len(), 2, "{r}");
+    assert!(vals.contains(&10) && vals.contains(&2), "{r}");
+    let (_, f) = call(&app, "GET", "/v1/friends", Some(ta), None).await;
+    assert!(f.to_string().contains(c), "{f}");
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/members"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert!(m.to_string().contains(a), "{m}");
+    assert!(!m.to_string().contains(b), "{m}");
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": guest_dev, "create": false})),
+    )
+    .await;
+    assert_eq!(s["account_id"], *a, "{s}");
+    // B is gone
+    let (st, _) = call(&app, "GET", "/v1/account/me", Some(tb), None).await;
+    assert_ne!(st, StatusCode::OK);
+}
