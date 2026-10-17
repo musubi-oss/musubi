@@ -867,6 +867,9 @@ pub struct SocialConfig {
     pub steam: SteamLoginConfig,
     pub google: OidcLoginConfig,
     pub apple: OidcLoginConfig,
+    /// Any other OpenID Connect issuer (Discord, Twitch, Epic, Xbox, Keycloak, …) keyed by a
+    /// short name: `POST /v1/auth/oidc/{name}` with its ID token; identities are `oidc:<name>`.
+    pub oidc: std::collections::HashMap<String, OidcLoginConfig>,
 }
 
 impl Default for SocialConfig {
@@ -875,6 +878,7 @@ impl Default for SocialConfig {
             steam: SteamLoginConfig::default(),
             google: Self::google_defaults(),
             apple: Self::apple_defaults(),
+            oidc: Default::default(),
         }
     }
 }
@@ -903,7 +907,11 @@ impl Default for SteamLoginConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct OidcLoginConfig {
+    /// Explicit JWKS URL; empty = taken from `issuer`'s `/.well-known/openid-configuration`.
     pub jwks_url: String,
+    /// Issuer URL; with an empty `jwks_url` this is where discovery happens (and it is also
+    /// the accepted `iss` when `issuers` is empty).
+    pub issuer: String,
     pub issuers: Vec<String>,
     pub client_ids: Vec<String>,
 }
@@ -912,6 +920,7 @@ impl SocialConfig {
     pub fn google_defaults() -> OidcLoginConfig {
         OidcLoginConfig {
             jwks_url: "https://www.googleapis.com/oauth2/v3/certs".into(),
+            issuer: String::new(),
             issuers: vec![
                 "accounts.google.com".into(),
                 "https://accounts.google.com".into(),
@@ -923,6 +932,7 @@ impl SocialConfig {
     pub fn apple_defaults() -> OidcLoginConfig {
         OidcLoginConfig {
             jwks_url: "https://appleid.apple.com/auth/keys".into(),
+            issuer: String::new(),
             issuers: vec!["https://appleid.apple.com".into()],
             client_ids: vec![],
         }

@@ -9075,3 +9075,170 @@ async fn fleet_builds_canary_promote_and_usage() {
     .await;
     let _ = svc.reconcile().await;
 }
+
+/// Any OIDC issuer from `[social.oidc.<name>]`: JWKS found through discovery, tokens become
+/// `oidc:<name>` identities, link/unlink like the built-in providers.
+#[tokio::test]
+async fn generic_oidc_login_and_link() {
+    use axum::routing::get as ax_get;
+    let jwks: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/google_test_jwks.json")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let issuer = base.clone();
+    let mock = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            ax_get(move || {
+                let iss = issuer.clone();
+                async move { axum::Json(json!({"issuer": iss, "jwks_uri": format!("{iss}/jwks")})) }
+            }),
+        )
+        .route(
+            "/jwks",
+            ax_get(move || {
+                let j = jwks.clone();
+                async move { axum::Json(j) }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        c.social.oidc.insert(
+            "discord".into(),
+            musubi_core::config::OidcLoginConfig {
+                issuer: b.clone(),
+                client_ids: vec!["cid".into()],
+                ..Default::default()
+            },
+        );
+    })
+    .await
+    else {
+        return;
+    };
+    let key =
+        jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!("fixtures/google_test_rsa.pem"))
+            .unwrap();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("t1".into());
+    let exp = time::OffsetDateTime::now_utc().unix_timestamp() + 600;
+    let sign = |aud: &str, sub: &str| {
+        jsonwebtoken::encode(
+            &header,
+            &json!({"iss": base, "aud": aud, "sub": sub, "exp": exp}),
+            &key,
+        )
+        .unwrap()
+    };
+    let sub = unique("dsub-");
+    let tok = sign("cid", &sub);
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/oidc/discord",
+        None,
+        Some(json!({"id_token": tok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/oidc/discord",
+        None,
+        Some(json!({"id_token": tok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    assert_eq!(
+        s1["account_id"], s2["account_id"],
+        "same sub → same account"
+    );
+
+    // wrong audience, unknown provider, bad name
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/oidc/discord",
+        None,
+        Some(json!({"id_token": sign("other", &sub)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/oidc/twitch",
+        None,
+        Some(json!({"id_token": tok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/oidc/Bad%20Name",
+        None,
+        Some(json!({"id_token": tok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // link a fresh subject to a device account, then unlink it
+    let (st, dev) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dev-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{dev}");
+    let dt = dev["access_token"].as_str().unwrap();
+    let sub2 = unique("dsub-");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/account/link/oidc/discord",
+        Some(dt),
+        Some(json!({"id_token": sign("cid", &sub2)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, s3) = call(
+        &app,
+        "POST",
+        "/v1/auth/oidc/discord",
+        None,
+        Some(json!({"id_token": sign("cid", &sub2)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s3}");
+    assert_eq!(
+        s3["account_id"], dev["account_id"],
+        "linked sub signs into the device account"
+    );
+    let (st, r) = call(
+        &app,
+        "DELETE",
+        "/v1/account/unlink/oidc/discord",
+        Some(dt),
+        Some(json!({"subject": sub2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, s4) = call(
+        &app,
+        "POST",
+        "/v1/auth/oidc/discord",
+        None,
+        Some(json!({"id_token": sign("cid", &sub2)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s4}");
+    assert_ne!(
+        s4["account_id"], dev["account_id"],
+        "after unlink the sub is a new account"
+    );
+}

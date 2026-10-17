@@ -18,6 +18,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/steam", post(steam))
         .route("/v1/auth/google", post(google))
         .route("/v1/auth/apple", post(apple))
+        .route("/v1/auth/oidc/{provider}", post(oidc))
         .route("/v1/auth/email/verify/request", post(verify_request))
         .route("/v1/auth/email/verify", post(verify))
         .route("/v1/auth/email/reset/request", post(reset_request))
@@ -68,9 +69,11 @@ async fn device(
 }
 
 /// Fire the `authenticated` runtime event without delaying the response.
-fn authenticated(s: &AppState, sess: &Session, provider: &'static str) {
+fn authenticated(s: &AppState, sess: &Session, provider: &str) {
+    let provider = provider.to_string();
     {
         let (ev, acc, created) = (s.events.clone(), sess.account_id, sess.created);
+        let provider = provider.clone();
         tokio::spawn(async move {
             ev.emit(
                 "account.authenticated",
@@ -409,6 +412,27 @@ async fn apple(
         .authenticate_external(musubi_auth::provider::APPLE, &claims.sub, r.opts)
         .await?;
     authenticated(&s, &sess, musubi_auth::provider::APPLE);
+    Ok(Json(sess))
+}
+
+/// `POST /v1/auth/oidc/{provider}` — ID token from any issuer configured under `[social.oidc]`.
+async fn oidc(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    Json(r): Json<IdTokenReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    if !crate::logins::valid_oidc_name(&provider) {
+        return Err(musubi_core::Error::InvalidArgument("bad provider name".into()).into());
+    }
+    let claims = s.logins.oidc(&provider, &r.id_token).await?;
+    let p = crate::logins::oidc_provider(&provider);
+    let sess = s
+        .auth
+        .authenticate_external(&p, &claims.sub, r.opts)
+        .await?;
+    authenticated(&s, &sess, &p);
     Ok(Json(sess))
 }
 

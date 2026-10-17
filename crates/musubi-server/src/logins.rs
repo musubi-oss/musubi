@@ -1,6 +1,7 @@
 //! Third-party sign-in verification: Steam session tickets through the Steamworks Web API and
-//! Google / Apple ID tokens against their JWKS. Each verifier returns the stable subject that
-//! becomes the identity `subject` (`steam` → steamid64, `google`/`apple` → `sub`).
+//! Google / Apple ID tokens against their JWKS, plus any configured OpenID Connect issuer
+//! (`[social.oidc.<name>]`, JWKS found through discovery). Each verifier returns the stable
+//! subject that becomes the identity `subject` (`steam` → steamid64, OIDC → `sub`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -18,6 +19,21 @@ pub struct Social {
     http: reqwest::Client,
     cfg: SocialConfig,
     jwks: Mutex<HashMap<String, (Instant, JwkSet)>>,
+    /// issuer → discovered `jwks_uri`
+    discovery: Mutex<HashMap<String, (Instant, String)>>,
+}
+
+/// Identity provider name for a configured OIDC issuer.
+pub fn oidc_provider(name: &str) -> String {
+    format!("oidc:{name}")
+}
+
+pub fn valid_oidc_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +54,7 @@ impl Social {
                 .expect("reqwest client"),
             cfg,
             jwks: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(HashMap::new()),
         }
     }
 
@@ -116,20 +133,40 @@ impl Social {
         self.verify_oidc(&self.cfg.apple, id_token).await
     }
 
+    /// A configured generic issuer (`[social.oidc.<name>]`).
+    pub async fn oidc(&self, name: &str, id_token: &str) -> Result<IdClaims> {
+        let c = self
+            .cfg
+            .oidc
+            .get(name)
+            .ok_or_else(|| Error::NotFound(format!("unknown login provider {name}")))?;
+        self.verify_oidc(c, id_token).await
+    }
+
     async fn verify_oidc(&self, c: &OidcLoginConfig, token: &str) -> Result<IdClaims> {
-        if c.jwks_url.is_empty() {
+        if c.jwks_url.is_empty() && c.issuer.is_empty() {
             return Err(Error::InvalidArgument(
                 "this login provider is not configured".into(),
             ));
         }
+        let jwks_url = if c.jwks_url.is_empty() {
+            self.discover_jwks(&c.issuer).await?
+        } else {
+            c.jwks_url.clone()
+        };
+        let issuers: Vec<String> = if c.issuers.is_empty() && !c.issuer.is_empty() {
+            vec![c.issuer.clone()]
+        } else {
+            c.issuers.clone()
+        };
         let header =
             decode_header(token).map_err(|e| Error::Unauthenticated(format!("id token: {e}")))?;
         let kid = header
             .kid
             .ok_or_else(|| Error::Unauthenticated("id token without kid".into()))?;
-        let mut set = self.jwks(&c.jwks_url, false).await?;
+        let mut set = self.jwks(&jwks_url, false).await?;
         if set.find(&kid).is_none() {
-            set = self.jwks(&c.jwks_url, true).await?;
+            set = self.jwks(&jwks_url, true).await?;
         }
         let jwk = set
             .find(&kid)
@@ -137,7 +174,7 @@ impl Social {
         let key =
             DecodingKey::from_jwk(jwk).map_err(|e| Error::Unauthenticated(format!("jwk: {e}")))?;
         let mut v = Validation::new(header.alg);
-        v.set_issuer(&c.issuers);
+        v.set_issuer(&issuers);
         if c.client_ids.is_empty() {
             v.validate_aud = false;
         } else {
@@ -147,6 +184,39 @@ impl Social {
         let data = decode::<IdClaims>(token, &key, &v)
             .map_err(|e| Error::Unauthenticated(format!("id token: {e}")))?;
         Ok(data.claims)
+    }
+
+    /// `<issuer>/.well-known/openid-configuration` → `jwks_uri`, cached for the JWKS TTL.
+    async fn discover_jwks(&self, issuer: &str) -> Result<String> {
+        if let Some((at, uri)) = self.discovery.lock().unwrap().get(issuer) {
+            if at.elapsed() < JWKS_TTL {
+                return Ok(uri.clone());
+            }
+        }
+        #[derive(Deserialize)]
+        struct Doc {
+            jwks_uri: String,
+        }
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        let doc: Doc = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("oidc discovery: {e}")))?
+            .error_for_status()
+            .map_err(|e| Error::Internal(format!("oidc discovery: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::Internal(format!("oidc discovery: {e}")))?;
+        self.discovery
+            .lock()
+            .unwrap()
+            .insert(issuer.to_string(), (Instant::now(), doc.jwks_uri.clone()));
+        Ok(doc.jwks_uri)
     }
 
     async fn jwks(&self, url: &str, refresh: bool) -> Result<JwkSet> {

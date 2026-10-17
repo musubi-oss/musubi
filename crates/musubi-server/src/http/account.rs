@@ -22,6 +22,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/account/link/steam", post(link_steam))
         .route("/v1/account/link/google", post(link_google))
         .route("/v1/account/link/apple", post(link_apple))
+        .route("/v1/account/link/oidc/{provider}", post(link_oidc))
+        .route("/v1/account/unlink/oidc/{provider}", delete(unlink_oidc))
         .route(
             "/v1/account/push_tokens",
             get(push_tokens).post(push_register).delete(push_unregister),
@@ -223,6 +225,47 @@ async fn link_apple(
     let c = s.logins.apple(&b.id_token).await?;
     s.auth
         .link_external(me.account_id, musubi_auth::provider::APPLE, &c.sub)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn link_oidc(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    Json(b): Json<LinkIdTokenBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !crate::logins::valid_oidc_name(&provider) {
+        return Err(musubi_core::Error::InvalidArgument("bad provider name".into()).into());
+    }
+    let c = s.logins.oidc(&provider, &b.id_token).await?;
+    s.auth
+        .link_external(
+            me.account_id,
+            &crate::logins::oidc_provider(&provider),
+            &c.sub,
+        )
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct UnlinkSubjectBody {
+    subject: String,
+}
+
+async fn unlink_oidc(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    Json(b): Json<UnlinkSubjectBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.auth
+        .unlink(
+            me.account_id,
+            &crate::logins::oidc_provider(&provider),
+            &b.subject,
+        )
         .await?;
     Ok(Json(json!({ "ok": true })))
 }
