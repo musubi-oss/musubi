@@ -118,6 +118,8 @@ fn fleet() -> Fleet {
         },
         buffer: 1,
         max_servers: 2,
+        min_servers: 0,
+        policy: Default::default(),
         port_start: 7777,
         port_end: 7800,
         created_at: time::OffsetDateTime::now_utc(),

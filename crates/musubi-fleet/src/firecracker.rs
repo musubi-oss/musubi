@@ -328,6 +328,8 @@ mod tests {
             },
             buffer: 0,
             max_servers: 1,
+            min_servers: 0,
+            policy: Default::default(),
             port_start: 7777,
             port_end: 7777,
             created_at: time::OffsetDateTime::now_utc(),

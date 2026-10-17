@@ -1,6 +1,8 @@
 //! Dedicated-server orchestration v0: fleets describe what to run; the reconciler keeps `buffer`
 //! servers ready (≤ `max_servers`) through a `Provider`; game servers talk back with an Agones-like
-//! SDK surface (ready / health / allocate / shutdown / labels). Providers: `local` (child processes on this
+//! SDK surface (ready / health / allocate / shutdown / labels). Sizing follows `buffer`, a
+//! `min_servers` floor, a weekday/hour schedule and an optional demand forecast (hour-of-week EWMA
+//! of allocations, see `ScalePolicy`); idle ready servers above the target are stopped. Providers: `local` (child processes on this
 //! node), `docker` (containers via the Docker CLI), `kubernetes` (pods) and `agones`
 //! (GameServer CRs); edgegap/gamelift plug into the same trait.
 
@@ -31,6 +33,150 @@ pub struct FleetSpec {
     pub working_dir: Option<String>,
 }
 
+/// Autoscale policy (plan 05): buffer overrides by schedule plus an optional demand forecast.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ScalePolicy {
+    /// Also size the ready pool from allocation history: ready ≈ allocations/hour × `horizon_min`/60.
+    pub forecast: bool,
+    /// How far ahead the forecast must cover, in minutes.
+    pub horizon_min: u32,
+    /// Buffer overrides by weekday/hour (UTC); the first matching window wins over `buffer`.
+    pub schedule: Vec<ScheduleWindow>,
+}
+
+impl Default for ScalePolicy {
+    fn default() -> Self {
+        Self {
+            forecast: false,
+            horizon_min: 10,
+            schedule: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ScheduleWindow {
+    /// Weekdays, 0 = Monday … 6 = Sunday; empty = every day.
+    pub days: Vec<u8>,
+    pub from_hour: u8,
+    /// Exclusive; `to_hour <= from_hour` wraps past midnight (equal = whole day).
+    pub to_hour: u8,
+    pub buffer: i32,
+}
+
+impl ScheduleWindow {
+    pub fn matches(&self, weekday: u8, hour: u8) -> bool {
+        let day_ok = self.days.is_empty() || self.days.contains(&weekday);
+        let hour_ok = if self.from_hour < self.to_hour {
+            hour >= self.from_hour && hour < self.to_hour
+        } else {
+            hour >= self.from_hour || hour < self.to_hour
+        };
+        day_ok && hour_ok
+    }
+}
+
+impl ScalePolicy {
+    /// Buffer in force at `now`: the first matching schedule window, else `default`.
+    pub fn buffer_at(&self, now: OffsetDateTime, default: i32) -> i32 {
+        let wd = now.weekday().number_days_from_monday();
+        self.schedule
+            .iter()
+            .find(|w| w.matches(wd, now.hour()))
+            .map(|w| w.buffer)
+            .unwrap_or(default)
+    }
+
+    fn validate(&self, max_servers: i32) -> Result<()> {
+        if self.horizon_min == 0 || self.horizon_min > 24 * 60 {
+            return Err(Error::InvalidArgument(
+                "policy.horizon_min in 1..=1440".into(),
+            ));
+        }
+        for w in &self.schedule {
+            if w.from_hour > 23 || w.to_hour > 23 || w.days.iter().any(|d| *d > 6) {
+                return Err(Error::InvalidArgument(
+                    "schedule: hours 0..=23, days 0..=6".into(),
+                ));
+            }
+            if w.buffer < 0 || w.buffer > max_servers {
+                return Err(Error::InvalidArgument(
+                    "schedule: 0 <= buffer <= max_servers".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_shape(min: i32, buffer: i32, max: i32, policy: &ScalePolicy) -> Result<()> {
+    if max < 1 || buffer < 0 || buffer > max || min < 0 || min > max {
+        return Err(Error::InvalidArgument(
+            "need 0 <= buffer <= max_servers, 0 <= min_servers <= max_servers, max_servers >= 1"
+                .into(),
+        ));
+    }
+    policy.validate(max)
+}
+
+/// Weight of the latest occurrence of an hour-of-week slot in its EWMA.
+pub const DEMAND_ALPHA: f64 = 0.3;
+
+/// Hour-of-week slot (UTC): weekday × 24 + hour, 0..168.
+pub fn demand_slot(t: OffsetDateTime) -> i16 {
+    t.weekday().number_days_from_monday() as i16 * 24 + t.hour() as i16
+}
+
+/// Allocations/hour expected for a slot. `fresh`: the slot is the one we are in now, so `samples`
+/// is still counting and is a lower bound; otherwise fold the last occurrence into the EWMA.
+pub fn slot_estimate(ewma: f64, samples: i32, fresh: bool) -> f64 {
+    if fresh {
+        ewma.max(samples as f64)
+    } else {
+        ewma * (1.0 - DEMAND_ALPHA) + samples as f64 * DEMAND_ALPHA
+    }
+}
+
+/// Ready servers to hold: the buffer, or enough for `per_hour` allocations over the horizon.
+pub fn target_ready(policy: &ScalePolicy, buffer: i32, per_hour: f64) -> i32 {
+    let forecast = if policy.forecast {
+        (per_hour * policy.horizon_min as f64 / 60.0).ceil() as i32
+    } else {
+        0
+    };
+    buffer.max(forecast)
+}
+
+/// Pure sizing step → (servers to start, idle ready servers to stop). `available` = ready +
+/// starting + scheduled, `live` = everything not terminated. Never below `min`, never above `max`.
+pub fn plan_scale(
+    target: i32,
+    min: i32,
+    max: i32,
+    live: i32,
+    available: i32,
+    idle_ready: i32,
+) -> (i32, i32) {
+    let start = (target - available).max(min - live).min(max - live).max(0);
+    let stop = if start > 0 {
+        0
+    } else {
+        (available - target).min(idle_ready).min(live - min).max(0)
+    };
+    (start, stop)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemandSlot {
+    pub slot: i16,
+    pub ewma: f64,
+    pub samples: i32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fleet {
     pub id: Uuid,
@@ -40,6 +186,8 @@ pub struct Fleet {
     pub spec: FleetSpec,
     pub buffer: i32,
     pub max_servers: i32,
+    pub min_servers: i32,
+    pub policy: ScalePolicy,
     pub port_start: i32,
     pub port_end: i32,
     #[serde(with = "time::serde::rfc3339")]
@@ -55,6 +203,8 @@ pub struct CreateFleet {
     pub spec: FleetSpec,
     pub buffer: i32,
     pub max_servers: i32,
+    pub min_servers: i32,
+    pub policy: ScalePolicy,
     pub port_start: i32,
     pub port_end: i32,
 }
@@ -68,6 +218,8 @@ impl Default for CreateFleet {
             spec: FleetSpec::default(),
             buffer: 0,
             max_servers: 1,
+            min_servers: 0,
+            policy: ScalePolicy::default(),
             port_start: 7777,
             port_end: 7877,
         }
@@ -216,20 +368,22 @@ pub struct FleetService {
     server_key: String,
 }
 
-fn row_to_fleet(
-    r: (
-        Uuid,
-        String,
-        String,
-        String,
-        serde_json::Value,
-        i32,
-        i32,
-        i32,
-        i32,
-        OffsetDateTime,
-    ),
-) -> Fleet {
+type FleetRow = (
+    Uuid,
+    String,
+    String,
+    String,
+    serde_json::Value,
+    i32,
+    i32,
+    i32,
+    i32,
+    OffsetDateTime,
+    i32,
+    serde_json::Value,
+);
+
+fn row_to_fleet(r: FleetRow) -> Fleet {
     Fleet {
         id: r.0,
         name: r.1,
@@ -241,6 +395,8 @@ fn row_to_fleet(
         port_start: r.7,
         port_end: r.8,
         created_at: r.9,
+        min_servers: r.10,
+        policy: serde_json::from_value(r.11).unwrap_or_default(),
     }
 }
 
@@ -275,7 +431,7 @@ fn row_to_server(r: ServerRow) -> GameServer {
 }
 
 const FLEET_COLS: &str =
-    "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at";
+    "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy";
 const SERVER_COLS: &str =
     "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at";
 
@@ -315,18 +471,14 @@ impl FleetService {
                 c.provider
             )));
         }
-        if c.max_servers < 1 || c.buffer < 0 || c.buffer > c.max_servers {
-            return Err(Error::InvalidArgument(
-                "need 0 <= buffer <= max_servers, max_servers >= 1".into(),
-            ));
-        }
+        validate_shape(c.min_servers, c.buffer, c.max_servers, &c.policy)?;
         if c.port_start < 1 || c.port_end < c.port_start || c.port_end > 65535 {
             return Err(Error::InvalidArgument("bad port range".into()));
         }
         let id = Uuid::now_v7();
-        let r = sqlx::query_as::<_, (Uuid, String, String, String, serde_json::Value, i32, i32, i32, i32, OffsetDateTime)>(&format!(
-            "insert into musubi.fleets (id, name, provider, region, spec, buffer, max_servers, port_start, port_end)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) returning {FLEET_COLS}"
+        let r = sqlx::query_as::<_, FleetRow>(&format!(
+            "insert into musubi.fleets (id, name, provider, region, spec, buffer, max_servers, port_start, port_end, min_servers, policy)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning {FLEET_COLS}"
         ))
         .bind(id)
         .bind(&c.name)
@@ -337,6 +489,8 @@ impl FleetService {
         .bind(c.max_servers)
         .bind(c.port_start)
         .bind(c.port_end)
+        .bind(c.min_servers)
+        .bind(serde_json::to_value(&c.policy)?)
         .fetch_one(&self.db)
         .await
         .map_err(|e| match e {
@@ -380,25 +534,29 @@ impl FleetService {
         .ok_or_else(|| Error::NotFound(format!("fleet {name}")))
     }
 
-    /// Change buffer / max_servers; the reconciler follows.
+    /// Change buffer / max_servers / min_servers / policy; the reconciler follows.
     pub async fn scale(
         &self,
         id: Uuid,
         buffer: Option<i32>,
         max_servers: Option<i32>,
+        min_servers: Option<i32>,
+        policy: Option<ScalePolicy>,
     ) -> Result<Fleet> {
         let f = self.get(id).await?;
         let buffer = buffer.unwrap_or(f.buffer);
         let max = max_servers.unwrap_or(f.max_servers);
-        if max < 1 || buffer < 0 || buffer > max {
-            return Err(Error::InvalidArgument(
-                "need 0 <= buffer <= max_servers, max_servers >= 1".into(),
-            ));
-        }
-        sqlx::query("update musubi.fleets set buffer = $2, max_servers = $3, updated_at = now() where id = $1")
+        let min = min_servers.unwrap_or(f.min_servers);
+        let policy = policy.unwrap_or(f.policy);
+        validate_shape(min, buffer, max, &policy)?;
+        sqlx::query(
+            "update musubi.fleets set buffer = $2, max_servers = $3, min_servers = $4, policy = $5, updated_at = now() where id = $1",
+        )
             .bind(id)
             .bind(buffer)
             .bind(max)
+            .bind(min)
+            .bind(serde_json::to_value(&policy)?)
             .execute(&self.db)
             .await
             .map_err(Error::internal)?;
@@ -546,6 +704,12 @@ impl FleetService {
         .await
         .map_err(Error::internal)?
         .ok_or_else(|| Error::ResourceExhausted("no ready server in fleet".into()))?;
+        if let Err(e) = self
+            .record_demand(fleet_id, OffsetDateTime::now_utc())
+            .await
+        {
+            tracing::warn!(fleet = %fleet_id, error = %e, "fleet demand not recorded");
+        }
         Ok(Allocation {
             server_id: r.0,
             fleet_id,
@@ -553,6 +717,66 @@ impl FleetService {
             port: r.2,
             connect_token: token,
         })
+    }
+
+    /// Count one allocation at `at` into its hour-of-week slot. A slot not touched for 23 h is a
+    /// new occurrence: the previous count is folded into the EWMA and counting restarts.
+    pub async fn record_demand(&self, fleet_id: Uuid, at: OffsetDateTime) -> Result<()> {
+        sqlx::query(
+            "insert into musubi.fleet_demand (fleet_id, slot, ewma, samples, updated_at) values ($1, $2, 0, 1, $3)
+             on conflict (fleet_id, slot) do update set
+               ewma = case when musubi.fleet_demand.updated_at < $3 - interval '23 hours'
+                           then musubi.fleet_demand.ewma * $4 + musubi.fleet_demand.samples * $5
+                           else musubi.fleet_demand.ewma end,
+               samples = case when musubi.fleet_demand.updated_at < $3 - interval '23 hours'
+                              then 1 else musubi.fleet_demand.samples + 1 end,
+               updated_at = greatest(musubi.fleet_demand.updated_at, $3)",
+        )
+        .bind(fleet_id)
+        .bind(demand_slot(at))
+        .bind(at)
+        .bind(1.0 - DEMAND_ALPHA)
+        .bind(DEMAND_ALPHA)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Demand history of a fleet (one row per hour-of-week slot that saw allocations).
+    pub async fn demand(&self, fleet_id: Uuid) -> Result<Vec<DemandSlot>> {
+        let rows = sqlx::query_as::<_, (i16, f64, i32, OffsetDateTime)>(
+            "select slot, ewma, samples, updated_at from musubi.fleet_demand where fleet_id = $1 order by slot",
+        )
+        .bind(fleet_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DemandSlot {
+                slot: r.0,
+                ewma: r.1,
+                samples: r.2,
+                updated_at: r.3,
+            })
+            .collect())
+    }
+
+    /// Expected allocations/hour for the slot `now` falls in (0 when the slot has no history).
+    pub async fn forecast_per_hour(&self, fleet_id: Uuid, now: OffsetDateTime) -> Result<f64> {
+        let r = sqlx::query_as::<_, (f64, i32, OffsetDateTime)>(
+            "select ewma, samples, updated_at from musubi.fleet_demand where fleet_id = $1 and slot = $2",
+        )
+        .bind(fleet_id)
+        .bind(demand_slot(now))
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(r.map(|(ewma, samples, at)| {
+            slot_estimate(ewma, samples, now - at < time::Duration::hours(23))
+        })
+        .unwrap_or(0.0))
     }
 
     pub async fn terminate(&self, fleet: &Fleet, id: Uuid) {
@@ -630,8 +854,9 @@ impl FleetService {
         }
     }
 
-    /// One reconcile pass over every fleet: reap dead/unhealthy servers, then top up to `buffer`
-    /// ready+starting servers without exceeding `max_servers`. Returns (started, reaped).
+    /// One reconcile pass over every fleet: reap dead/unhealthy servers, then size the ready pool to
+    /// the target (`buffer`, schedule, forecast; floor `min_servers`, cap `max_servers`): start what is
+    /// missing or stop idle ready servers above it, oldest first. Returns (started, reaped + stopped).
     pub async fn reconcile(&self) -> Result<(usize, usize)> {
         let mut started = 0;
         let mut reaped = 0;
@@ -658,14 +883,38 @@ impl FleetService {
                 .iter()
                 .filter(|s| s.state == "ready" || s.state == "starting" || s.state == "scheduled")
                 .count() as i32;
-            let want = (f.buffer - available).min(f.max_servers - live).max(0);
-            for _ in 0..want {
+            let idle_ready = servers.iter().filter(|s| s.state == "ready").count() as i32;
+            let per_hour = if f.policy.forecast {
+                self.forecast_per_hour(f.id, now).await.unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let target = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour);
+            let (start, stop) = plan_scale(
+                target,
+                f.min_servers,
+                f.max_servers,
+                live,
+                available,
+                idle_ready,
+            );
+            for _ in 0..start {
                 match self.start_one(&f).await {
                     Ok(_) => started += 1,
                     Err(e) => {
                         tracing::warn!(fleet = %f.name, error = %e, "could not start game server");
                         break;
                     }
+                }
+            }
+            if stop > 0 {
+                let mut idle: Vec<&GameServer> =
+                    servers.iter().filter(|s| s.state == "ready").collect();
+                idle.sort_by_key(|s| s.created_at);
+                for s in idle.into_iter().take(stop as usize) {
+                    tracing::info!(server = %s.id, fleet = %f.name, target, "scaling down idle game server");
+                    self.terminate(&f, s.id).await;
+                    reaped += 1;
                 }
             }
         }
@@ -690,5 +939,64 @@ impl FleetService {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn schedule_windows_match_days_and_wrap_midnight() {
+        let w = ScheduleWindow {
+            days: vec![5, 6],
+            from_hour: 22,
+            to_hour: 2,
+            buffer: 9,
+        };
+        assert!(w.matches(5, 23));
+        assert!(w.matches(6, 1));
+        assert!(!w.matches(6, 2));
+        assert!(!w.matches(0, 23));
+        let all_day = ScheduleWindow {
+            from_hour: 0,
+            to_hour: 0,
+            ..Default::default()
+        };
+        assert!(all_day.matches(3, 12));
+        let p = ScalePolicy {
+            schedule: vec![w],
+            ..Default::default()
+        };
+        // 2024-01-06 is a Saturday (weekday 5).
+        assert_eq!(p.buffer_at(datetime!(2024-01-06 23:30 UTC), 1), 9);
+        assert_eq!(p.buffer_at(datetime!(2024-01-06 12:00 UTC), 1), 1);
+        assert_eq!(demand_slot(datetime!(2024-01-06 23:30 UTC)), 5 * 24 + 23);
+    }
+
+    #[test]
+    fn forecast_sizes_ready_pool_from_demand() {
+        let p = ScalePolicy {
+            forecast: true,
+            horizon_min: 10,
+            ..Default::default()
+        };
+        assert_eq!(target_ready(&p, 1, 0.0), 1);
+        assert_eq!(target_ready(&p, 1, 30.0), 5); // 30/h over 10 min = 5
+        assert_eq!(target_ready(&ScalePolicy::default(), 1, 30.0), 1);
+        assert_eq!(slot_estimate(4.0, 2, true), 4.0);
+        assert_eq!(slot_estimate(4.0, 10, true), 10.0);
+        assert!((slot_estimate(4.0, 10, false) - 5.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plan_respects_floor_and_cap_and_stops_only_idle() {
+        assert_eq!(plan_scale(0, 2, 5, 0, 0, 0), (2, 0));
+        assert_eq!(plan_scale(9, 0, 5, 3, 3, 3), (2, 0));
+        assert_eq!(plan_scale(1, 3, 5, 4, 3, 3), (0, 1));
+        assert_eq!(plan_scale(0, 0, 5, 4, 0, 0), (0, 0));
+        assert_eq!(plan_scale(1, 0, 5, 3, 3, 1), (0, 1));
+        assert_eq!(plan_scale(2, 0, 5, 2, 2, 2), (0, 0));
     }
 }

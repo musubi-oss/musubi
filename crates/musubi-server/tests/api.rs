@@ -1586,6 +1586,173 @@ async fn fleet_lifecycle_with_local_process_provider() {
 }
 
 #[tokio::test]
+async fn fleet_autoscale_scales_down_idle_and_forecasts_demand() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("fleet-as");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "local", "buffer": 2, "max_servers": 4,
+            "port_start": 47200, "port_end": 47300,
+            "spec": {"command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["min_servers"], 0);
+    assert_eq!(f["policy"]["forecast"], false);
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    // bad shapes are rejected
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"min_servers": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"policy": {"schedule": [{"from_hour": 25, "to_hour": 2, "buffer": 1}]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile().await.unwrap();
+    let live = |s: &Value| s["state"] != "terminated";
+    let all = svc.servers(fuid, None).await.unwrap();
+    assert!(
+        all.iter().filter(|s| s.state != "terminated").count() >= 2,
+        "{all:?}"
+    );
+    for s in all.iter().filter(|s| s.state == "starting") {
+        svc.sdk_ready(s.id).await.unwrap();
+    }
+    assert!(svc.servers(fuid, Some("ready")).await.unwrap().len() >= 2);
+
+    // buffer → 0: idle ready servers above the target are stopped, oldest first
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"buffer": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let (_, reaped) = svc.reconcile().await.unwrap();
+    assert!(reaped >= 2, "{reaped}");
+    assert!(svc.servers(fuid, Some("ready")).await.unwrap().is_empty());
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(
+        l["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| live(s))
+            .count(),
+        0,
+        "{l}"
+    );
+
+    // min_servers is a floor even with buffer 0
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"min_servers": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (started, _) = svc.reconcile().await.unwrap();
+    assert_eq!(started, 1);
+    for s in svc.servers(fuid, Some("starting")).await.unwrap() {
+        svc.sdk_ready(s.id).await.unwrap();
+    }
+    let (_, reaped) = svc.reconcile().await.unwrap();
+    assert_eq!(reaped, 0); // the floor is never scaled down
+
+    // 12 allocations in this hour-of-week slot → 12/h; a 10-minute horizon wants 2 ready
+    let now = time::OffsetDateTime::now_utc();
+    for _ in 0..12 {
+        svc.record_demand(fuid, now).await.unwrap();
+    }
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"policy": {"forecast": true, "horizon_min": 10}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let (st, d) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/demand"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["per_hour"], 12.0, "{d}");
+    assert_eq!(d["target_ready"], 2, "{d}");
+    assert_eq!(d["slots"].as_array().unwrap().len(), 1);
+    let (started, _) = svc.reconcile().await.unwrap();
+    assert_eq!(started, 1); // 1 ready already
+                            // a week later the same slot folds the last count into its EWMA (0.3 × 12 = 3.6/h → 1 ready)
+    let next_week = now + time::Duration::days(7);
+    svc.record_demand(fuid, next_week).await.unwrap();
+    let per_hour = svc.forecast_per_hour(fuid, next_week).await.unwrap();
+    assert!((per_hour - 3.6).abs() < 1e-9, "{per_hour}");
+
+    // a schedule window overrides the buffer for its hours
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"policy": {"forecast": false, "schedule": [{"from_hour": 0, "to_hour": 0, "buffer": 3}]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let (_, d) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/demand"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(d["buffer"], 3);
+    assert_eq!(d["target_ready"], 3);
+
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn fleet_docker_provider_runs_a_container() {
     let Some(app) = app().await else { return };
     if !musubi_fleet::docker::available().await {

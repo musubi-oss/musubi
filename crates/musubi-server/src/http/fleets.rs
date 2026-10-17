@@ -6,7 +6,7 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
-use musubi_fleet::{Allocation, CreateFleet, Fleet, GameServer};
+use musubi_fleet::{Allocation, CreateFleet, DemandSlot, Fleet, GameServer, ScalePolicy};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -21,6 +21,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets/{id}/scale", post(scale))
         .route("/v1/server/fleets/{id}/allocate", post(allocate))
         .route("/v1/server/fleets/{id}/servers", get(servers))
+        .route("/v1/server/fleets/{id}/demand", get(demand))
         .route(
             "/v1/server/gameservers/{id}",
             get(server_get).delete(server_delete),
@@ -82,6 +83,8 @@ async fn delete(
 struct ScaleReq {
     buffer: Option<i32>,
     max_servers: Option<i32>,
+    min_servers: Option<i32>,
+    policy: Option<ScalePolicy>,
 }
 
 async fn scale(
@@ -91,7 +94,15 @@ async fn scale(
     Json(r): Json<ScaleReq>,
 ) -> Result<Json<Fleet>, ApiError> {
     Ok(Json(
-        s.fleets.scale(parse(&id)?, r.buffer, r.max_servers).await?,
+        s.fleets
+            .scale(
+                parse(&id)?,
+                r.buffer,
+                r.max_servers,
+                r.min_servers,
+                r.policy,
+            )
+            .await?,
     ))
 }
 
@@ -125,6 +136,27 @@ async fn servers(
     Ok(Json(
         json!({ "servers": s.fleets.servers(parse(&id)?, q.state.as_deref()).await? }),
     ))
+}
+
+/// Demand history (hour-of-week EWMA of allocations) and what the autoscaler wants right now.
+async fn demand(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse(&id)?;
+    let f = s.fleets.get(id).await?;
+    let now = time::OffsetDateTime::now_utc();
+    let slots: Vec<DemandSlot> = s.fleets.demand(id).await?;
+    let per_hour = s.fleets.forecast_per_hour(id, now).await?;
+    let buffer = f.policy.buffer_at(now, f.buffer);
+    Ok(Json(json!({
+        "slot": musubi_fleet::demand_slot(now),
+        "per_hour": per_hour,
+        "buffer": buffer,
+        "target_ready": musubi_fleet::target_ready(&f.policy, buffer, per_hour),
+        "slots": slots,
+    })))
 }
 
 async fn server_get(
