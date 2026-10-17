@@ -88,6 +88,38 @@ pub enum Caller {
 #[derive(Clone)]
 pub struct StorageService {
     db: PgPool,
+    max_objects: i64,
+    max_bytes: i64,
+}
+
+/// JSON Merge Patch (RFC 7386) against one object; OCC like `WriteOp::version`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchOp {
+    pub collection: String,
+    pub key: String,
+    pub patch: serde_json::Value,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// RFC 7386: objects merge recursively, `null` removes a member, anything else replaces.
+pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match patch {
+        serde_json::Value::Object(p) => {
+            if !target.is_object() {
+                *target = serde_json::Value::Object(Default::default());
+            }
+            let t = target.as_object_mut().unwrap();
+            for (k, v) in p {
+                if v.is_null() {
+                    t.remove(k);
+                } else {
+                    merge_patch(t.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+                }
+            }
+        }
+        other => *target = other.clone(),
+    }
 }
 
 type Row = (
@@ -114,11 +146,235 @@ pub struct ListFilter<'a> {
     pub filter: Option<&'a serde_json::Value>,
     /// Only keys starting with this prefix (literal match).
     pub key_prefix: Option<&'a str>,
+    /// Order by a field of the value (`score`, nested `stats.wins`), `-field` for descending;
+    /// without it objects come in `(owner, key)` order.
+    pub sort: Option<&'a str>,
+}
+
+fn visibility(caller: Caller, owner_id: Option<Uuid>) -> (Option<Uuid>, i16) {
+    match (caller, owner_id) {
+        (Caller::Server, o) => (o, 0),
+        (Caller::User(a), None) => (Some(a.0), 1),
+        (Caller::User(a), Some(o)) if o == a.0 => (Some(o), 1),
+        (Caller::User(_), Some(o)) => (Some(o), 2),
+    }
+}
+
+fn like_prefix(key_prefix: Option<&str>) -> Option<String> {
+    key_prefix.filter(|p| !p.is_empty()).map(|p| {
+        format!(
+            "{}%",
+            p.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        )
+    })
+}
+
+/// Cursor of a sorted page: the sort value, owner and key of the last row.
+fn encode_sorted_cursor(sort_value: &serde_json::Value, owner: Uuid, key: &str) -> String {
+    use base64::Engine;
+    let v = serde_json::json!([sort_value, owner, key]);
+    format!(
+        "s:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    )
+}
+
+fn decode_sorted_cursor(c: &str) -> Result<(serde_json::Value, Uuid, String)> {
+    use base64::Engine;
+    let bad = || Error::InvalidArgument("bad cursor".into());
+    let raw = c.strip_prefix("s:").ok_or_else(bad)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| bad())?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| bad())?;
+    let arr = v.as_array().filter(|a| a.len() == 3).ok_or_else(bad)?;
+    let owner: Uuid = arr[1]
+        .as_str()
+        .ok_or_else(bad)?
+        .parse()
+        .map_err(|_| bad())?;
+    let key = arr[2].as_str().ok_or_else(bad)?.to_string();
+    Ok((arr[0].clone(), owner, key))
 }
 
 impl StorageService {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            max_objects: 0,
+            max_bytes: 0,
+        }
+    }
+
+    /// Per-user quotas (`0` = unlimited).
+    pub fn with_limits(mut self, max_objects: i64, max_bytes: i64) -> Self {
+        self.max_objects = max_objects;
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Objects and bytes owned by `owner`.
+    pub async fn usage(&self, owner: Uuid) -> Result<(i64, i64)> {
+        let r: Option<(i64, i64)> =
+            sqlx::query_as("select objects, bytes from musubi.storage_usage where owner_id = $1")
+                .bind(owner)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        Ok(r.unwrap_or((0, 0)))
+    }
+
+    async fn enforce_quota(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        owner: Uuid,
+    ) -> Result<()> {
+        if owner == SYSTEM_OWNER || (self.max_objects == 0 && self.max_bytes == 0) {
+            return Ok(());
+        }
+        let (objects, bytes): (i64, i64) =
+            sqlx::query_as("select objects, bytes from musubi.storage_usage where owner_id = $1")
+                .bind(owner)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(Error::internal)?
+                .unwrap_or((0, 0));
+        if self.max_objects > 0 && objects > self.max_objects {
+            return Err(Error::ResourceExhausted(format!(
+                "storage quota: {} objects per user",
+                self.max_objects
+            )));
+        }
+        if self.max_bytes > 0 && bytes > self.max_bytes {
+            return Err(Error::ResourceExhausted(format!(
+                "storage quota: {} bytes per user",
+                self.max_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Count objects the caller may see, with the same filters as `list_where`.
+    pub async fn count(
+        &self,
+        caller: Caller,
+        collection: &str,
+        owner_id: Option<Uuid>,
+        f: ListFilter<'_>,
+    ) -> Result<i64> {
+        validate_name(collection, "collection")?;
+        if let Some(fl) = f.filter {
+            if !fl.is_object() {
+                return Err(Error::InvalidArgument("where must be a JSON object".into()));
+            }
+        }
+        let (owner_id, min_read) = visibility(caller, owner_id);
+        let prefix_like = like_prefix(f.key_prefix);
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from musubi.storage_objects
+             where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
+               and (expires_at is null or expires_at > now())
+               and ($4::jsonb is null or value @> $4)
+               and ($5::text is null or key like $5)",
+        )
+        .bind(collection)
+        .bind(owner_id)
+        .bind(min_read)
+        .bind(f.filter)
+        .bind(prefix_like)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
+    /// Merge-patch existing objects (missing ones are an error) under the write rules of `write`.
+    pub async fn patch(
+        &self,
+        caller: Caller,
+        owner_override: Option<Uuid>,
+        ops: &[PatchOp],
+    ) -> Result<Vec<Ack>> {
+        if ops.len() > MAX_BATCH {
+            return Err(Error::InvalidArgument(format!(
+                "at most {MAX_BATCH} objects per patch"
+            )));
+        }
+        let owner = match (caller, owner_override) {
+            (Caller::Server, o) => o.unwrap_or(SYSTEM_OWNER),
+            (Caller::User(a), Some(o)) if o != a.0 => {
+                return Err(Error::PermissionDenied(
+                    "cannot patch objects owned by another user".into(),
+                ))
+            }
+            (Caller::User(a), _) => a.0,
+        };
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let mut acks = Vec::with_capacity(ops.len());
+        for op in ops {
+            validate_name(&op.collection, "collection")?;
+            validate_name(&op.key, "key")?;
+            if !op.patch.is_object() {
+                return Err(Error::InvalidArgument("patch must be a JSON object".into()));
+            }
+            let current = sqlx::query_as::<_, (serde_json::Value, String, i16)>(
+                "select value, version, write_permission from musubi.storage_objects
+                 where collection = $1 and key = $2 and owner_id = $3
+                   and (expires_at is null or expires_at > now()) for update",
+            )
+            .bind(&op.collection)
+            .bind(&op.key)
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            let Some((mut value, cur_version, cur_write)) = current else {
+                return Err(Error::NotFound(format!(
+                    "{}/{} does not exist",
+                    op.collection, op.key
+                )));
+            };
+            if caller != Caller::Server && cur_write == 0 {
+                return Err(Error::PermissionDenied(format!(
+                    "{}/{} is read-only",
+                    op.collection, op.key
+                )));
+            }
+            if matches!(op.version.as_deref(), Some(v) if v != cur_version) {
+                return Err(Error::Conflict(format!(
+                    "{}/{} version mismatch",
+                    op.collection, op.key
+                )));
+            }
+            merge_patch(&mut value, &op.patch);
+            let bytes = serde_json::to_vec(&value)?;
+            if bytes.len() > MAX_VALUE_BYTES {
+                return Err(Error::InvalidArgument("value exceeds 1 MiB".into()));
+            }
+            let new_version = version_of(&bytes);
+            sqlx::query(
+                "update musubi.storage_objects set value = $4, version = $5, updated_at = now()
+                 where collection = $1 and key = $2 and owner_id = $3",
+            )
+            .bind(&op.collection)
+            .bind(&op.key)
+            .bind(owner)
+            .bind(&value)
+            .bind(&new_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            acks.push(Ack {
+                collection: op.collection.clone(),
+                key: op.key.clone(),
+                owner_id: owner,
+                version: new_version,
+            });
+        }
+        self.enforce_quota(&mut tx, owner).await?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(acks)
     }
 
     pub async fn read(&self, caller: Caller, refs: &[ReadRef]) -> Result<Vec<Object>> {
@@ -190,7 +446,15 @@ impl StorageService {
             cursor,
             filter,
             key_prefix,
+            sort,
         } = f;
+        if let Some(sort) = sort {
+            return self
+                .list_sorted(
+                    caller, collection, owner_id, limit, cursor, filter, key_prefix, sort,
+                )
+                .await;
+        }
         validate_name(collection, "collection")?;
         if let Some(f) = filter {
             if !f.is_object() {
@@ -350,8 +614,79 @@ impl StorageService {
                 version: new_version,
             });
         }
+        self.enforce_quota(&mut tx, owner).await?;
         tx.commit().await.map_err(Error::internal)?;
         Ok(acks)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_sorted(
+        &self,
+        caller: Caller,
+        collection: &str,
+        owner_id: Option<Uuid>,
+        limit: i64,
+        cursor: Option<&str>,
+        filter: Option<&serde_json::Value>,
+        key_prefix: Option<&str>,
+        sort: &str,
+    ) -> Result<(Vec<Object>, Option<String>)> {
+        validate_name(collection, "collection")?;
+        if let Some(f) = filter {
+            if !f.is_object() {
+                return Err(Error::InvalidArgument("where must be a JSON object".into()));
+            }
+        }
+        let (desc, field) = match sort.strip_prefix('-') {
+            Some(f) => (true, f),
+            None => (false, sort),
+        };
+        let path: Vec<String> = field.split('.').map(str::to_string).collect();
+        if path.iter().any(|p| p.is_empty() || p.len() > 64) || path.len() > 8 {
+            return Err(Error::InvalidArgument("bad sort field".into()));
+        }
+        let limit = limit.clamp(1, 100);
+        let after = cursor.map(decode_sorted_cursor).transpose()?;
+        let (owner_id, min_read) = visibility(caller, owner_id);
+        let prefix_like = like_prefix(key_prefix);
+        let (cmp, dir) = if desc { ("<", "desc") } else { (">", "asc") };
+        let rows = sqlx::query_as::<_, Row>(&format!(
+            "select {COLS} from musubi.storage_objects
+             where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
+               and (expires_at is null or expires_at > now())
+               and ($4::jsonb is null or value @> $4)
+               and ($5::text is null or key like $5)
+               and ($7::jsonb is null or (coalesce(value #> $6, 'null'::jsonb), owner_id, key) {cmp} ($7, $8::uuid, $9::text))
+             order by coalesce(value #> $6, 'null'::jsonb) {dir}, owner_id {dir}, key {dir} limit $10"
+        ))
+        .bind(collection)
+        .bind(owner_id)
+        .bind(min_read)
+        .bind(filter)
+        .bind(prefix_like)
+        .bind(&path)
+        .bind(after.as_ref().map(|a| &a.0))
+        .bind(after.as_ref().map(|a| a.1).unwrap_or(SYSTEM_OWNER))
+        .bind(after.as_ref().map(|a| a.2.as_str()).unwrap_or(""))
+        .bind(limit + 1)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut objs: Vec<Object> = rows.into_iter().map(to_object).collect();
+        let next = if objs.len() as i64 > limit {
+            objs.truncate(limit as usize);
+            objs.last().map(|o| {
+                let sv = path
+                    .iter()
+                    .try_fold(&o.value, |v, k| v.get(k))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                encode_sorted_cursor(&sv, o.owner_id, &o.key)
+            })
+        } else {
+            None
+        };
+        Ok((objs, next))
     }
 
     pub async fn delete(

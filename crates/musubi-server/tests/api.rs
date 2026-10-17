@@ -26,7 +26,10 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
-    let storage = StorageService::new(db.clone());
+    let storage = StorageService::new(db.clone()).with_limits(
+        cfg.storage.max_objects_per_user,
+        cfg.storage.max_bytes_per_user,
+    );
     let hub = Arc::new(musubi_server::realtime::Hub::new());
     let runtime = test_runtime();
     let cluster = test_cluster(&db, &unique("grp")).await;
@@ -8248,4 +8251,187 @@ async fn groups_bans_announcements_and_events() {
     )
     .await;
     assert_eq!(p2["events"][0]["kind"], "joined", "{p2}");
+}
+
+#[tokio::test]
+async fn storage_patch_sort_count_and_quota() {
+    let Some(app) = app_with(|c| c.storage.max_objects_per_user = 3).await else {
+        return;
+    };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("st")})),
+    )
+    .await;
+    let t = s["access_token"].as_str().unwrap().to_string();
+    let col = unique("scores");
+    let objects: Vec<Value> = [("a", 10, "x"), ("b", 30, "y"), ("c", 20, "x")]
+        .iter()
+        .map(|(k, score, tag)| {
+            json!({"collection": col, "key": k, "value": {"score": score, "tag": tag, "stats": {"wins": score / 10}}})
+        })
+        .collect();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&t),
+        Some(json!({"objects": objects})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // a 4th object breaks the quota of 3 and nothing of the batch lands
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "d", "value": {"score": 1}}]})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    assert!(v.to_string().contains("quota"), "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}/count"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(v["count"], 3, "{v}");
+    // deleting frees the slot
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/storage/delete",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "c"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "c", "value": {"score": 20, "tag": "x", "stats": {"wins": 2}}}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // sort asc / desc / nested, with a cursor
+    let keys = |v: &Value| -> Vec<String> {
+        v["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["key"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}?sort=score"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(keys(&v), vec!["a", "c", "b"]);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}?sort=-score"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(keys(&v), vec!["b", "c", "a"]);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}?sort=-stats.wins&limit=2"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(keys(&v), vec!["b", "c"]);
+    let cur = v["cursor"].as_str().unwrap().to_string();
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}?sort=-stats.wins&limit=2&cursor={cur}"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(keys(&v), vec!["a"]);
+    assert!(v["cursor"].is_null());
+    // count with where
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}/count?where=%7B%22tag%22%3A%22x%22%7D"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(v["count"], 2, "{v}");
+
+    // merge patch: nested merge, null removes, OCC
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/patch",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "a", "patch": {"score": 15, "stats": {"losses": 4}, "tag": null}}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ver = v["acks"][0]["version"].as_str().unwrap().to_string();
+    let (_, r) = call(
+        &app,
+        "POST",
+        "/v1/storage/read",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "a"}]})),
+    )
+    .await;
+    assert_eq!(
+        r["objects"][0]["value"],
+        json!({"score": 15, "stats": {"wins": 1, "losses": 4}}),
+        "{r}"
+    );
+    assert_eq!(r["objects"][0]["version"], ver);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/patch",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "a", "patch": {"score": 1}, "version": "stale"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/patch",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "zzz", "patch": {"score": 1}}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/patch",
+        Some(&t),
+        Some(json!({"objects": [{"collection": col, "key": "a", "patch": {"score": 16}, "version": ver}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
 }

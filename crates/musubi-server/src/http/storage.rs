@@ -1,7 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use musubi_storage::{Ack, Caller, DeleteOp, Object, ReadRef, WriteOp};
+use musubi_storage::{Ack, Caller, DeleteOp, Object, PatchOp, ReadRef, WriteOp};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -14,7 +14,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/storage/read", post(read))
         .route("/v1/storage/write", post(write))
         .route("/v1/storage/delete", post(delete))
+        .route("/v1/storage/patch", post(patch))
         .route("/v1/storage/{collection}", get(list))
+        .route("/v1/storage/{collection}/count", get(count))
 }
 
 #[derive(Deserialize)]
@@ -46,6 +48,55 @@ struct ListQuery {
     /// Only keys starting with this prefix (literal match, `%`/`_` are escaped).
     #[serde(default)]
     prefix: Option<String>,
+    /// Field of the value to order by (`score`, `stats.wins`), `-field` for descending.
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PatchReq {
+    objects: Vec<PatchOp>,
+}
+
+async fn patch(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<PatchReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let acks: Vec<Ack> = s
+        .storage
+        .patch(Caller::User(me.account_id), None, &r.objects)
+        .await?;
+    Ok(Json(json!({ "acks": acks })))
+}
+
+async fn count(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(collection): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let filter = q
+        .filter
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|e| musubi_core::Error::InvalidArgument(format!("where: {e}")))?;
+    let n = s
+        .storage
+        .count(
+            Caller::User(me.account_id),
+            &collection,
+            q.owner_id,
+            musubi_storage::ListFilter {
+                cursor: None,
+                filter: filter.as_ref(),
+                key_prefix: q.prefix.as_deref(),
+                sort: None,
+            },
+        )
+        .await?;
+    Ok(Json(json!({ "count": n })))
 }
 
 fn default_limit() -> i64 {
@@ -116,6 +167,7 @@ async fn list(
                 cursor: q.cursor.as_deref(),
                 filter: filter.as_ref(),
                 key_prefix: q.prefix.as_deref(),
+                sort: q.sort.as_deref(),
             },
         )
         .await?;

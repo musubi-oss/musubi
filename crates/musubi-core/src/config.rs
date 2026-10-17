@@ -49,6 +49,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub realtime: RealtimeConfig,
     pub retention: RetentionConfig,
+    pub storage: StorageConfig,
     pub matchmaker: MatchmakerConfig,
     pub social: SocialConfig,
     pub tracing: TracingConfig,
@@ -764,6 +765,23 @@ impl Default for RealtimeConfig {
     fn default() -> Self {
         Self {
             resume_ttl_secs: 30,
+        }
+    }
+}
+
+/// Per-user quotas for the key-value storage (`0` = unlimited); the system owner is never limited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    pub max_objects_per_user: i64,
+    pub max_bytes_per_user: i64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            max_objects_per_user: 10_000,
+            max_bytes_per_user: 100 << 20,
         }
     }
 }

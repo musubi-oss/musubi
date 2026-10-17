@@ -95,7 +95,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         db::migrate(&db).await?;
     }
     let auth = AuthService::new(db.clone(), &cfg.session)?;
-    let storage = StorageService::new(db.clone());
+    let storage = StorageService::new(db.clone()).with_limits(
+        cfg.storage.max_objects_per_user,
+        cfg.storage.max_bytes_per_user,
+    );
     let accounts = AccountService::new(db.clone());
     let social = SocialService::new(db.clone());
     let groups = GroupService::new(db.clone());

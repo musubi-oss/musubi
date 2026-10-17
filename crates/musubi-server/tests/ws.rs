@@ -106,7 +106,10 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
     ));
     Some(AppState {
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
-        storage: StorageService::new(db.clone()),
+        storage: StorageService::new(db.clone()).with_limits(
+            cfg.storage.max_objects_per_user,
+            cfg.storage.max_bytes_per_user,
+        ),
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
         groups: musubi_social::GroupService::new(db.clone()),
