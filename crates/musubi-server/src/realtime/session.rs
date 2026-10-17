@@ -593,18 +593,36 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             string_properties,
             numeric_properties,
             count_multiple,
-        } => party_dispatch(
-            ctx,
-            &party_id,
-            PartyCmd::MatchmakerAdd {
-                min_count,
-                max_count,
-                query,
-                string_properties,
-                numeric_properties,
-                count_multiple,
-            },
-        ),
+        } => {
+            // same server-side mmr as solo tickets, per party member (best effort: only when the
+            // party is hosted here and the queue has a rating queue)
+            let mut mmr = std::collections::HashMap::new();
+            if let (Some(queue), false) = (
+                string_properties.get("queue"),
+                numeric_properties.contains_key("mmr"),
+            ) {
+                if let Ok(members) = ctx.parties.members_for_ticket(sid, &party_id) {
+                    let ids: Vec<_> = members.iter().map(|m| m.account_id).collect();
+                    match ctx.ratings.display_many(queue, &ids).await {
+                        Ok(m) => mmr = m,
+                        Err(e) => warn!(error = %e, queue, "party rating lookup failed"),
+                    }
+                }
+            }
+            party_dispatch(
+                ctx,
+                &party_id,
+                PartyCmd::MatchmakerAdd {
+                    min_count,
+                    max_count,
+                    query,
+                    string_properties,
+                    numeric_properties,
+                    count_multiple,
+                    mmr,
+                },
+            )
+        }
         ClientMessage::PartyMatchmakerRemove { party_id, ticket } => {
             party_dispatch(ctx, &party_id, PartyCmd::MatchmakerRemove { ticket })
         }

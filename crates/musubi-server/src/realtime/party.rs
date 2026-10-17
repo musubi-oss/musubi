@@ -502,6 +502,10 @@ pub enum PartyCmd {
         string_properties: std::collections::HashMap<String, String>,
         numeric_properties: std::collections::HashMap<String, f64>,
         count_multiple: u32,
+        /// Server-side `mmr` per member (from the rating queue of the same name), filled by the
+        /// session node before dispatch; a member missing here keeps the client's numbers.
+        #[serde(default)]
+        mmr: std::collections::HashMap<musubi_core::AccountId, f64>,
     },
     MatchmakerRemove {
         ticket: String,
@@ -558,15 +562,24 @@ pub fn exec(
             string_properties,
             numeric_properties,
             count_multiple,
+            mmr,
         } => {
             let members = parties.members_for_ticket(sid, party_id)?;
             let candidates = members
                 .into_iter()
-                .map(|presence| musubi_matchmaker::Candidate {
-                    presence,
-                    string_properties: string_properties.clone(),
-                    numeric_properties: numeric_properties.clone(),
-                    team: None,
+                .map(|presence| {
+                    let mut numeric_properties = numeric_properties.clone();
+                    if !numeric_properties.contains_key("mmr") {
+                        if let Some(v) = mmr.get(&presence.account_id) {
+                            numeric_properties.insert("mmr".into(), *v);
+                        }
+                    }
+                    musubi_matchmaker::Candidate {
+                        presence,
+                        string_properties: string_properties.clone(),
+                        numeric_properties,
+                        team: None,
+                    }
                 })
                 .collect();
             let ticket = mm.add(AddTicket {
