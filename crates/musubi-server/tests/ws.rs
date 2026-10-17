@@ -2366,7 +2366,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
                     saw_update = true;
                     break;
                 }
-                if despawned.contains(&eid.to_string()) {
+                if despawned.contains(&eid) {
                     break;
                 }
             }
@@ -5593,7 +5593,7 @@ async fn world_interest_across_nodes() {
         } = m
         {
             for d in despawned {
-                known.remove(&d);
+                known.remove(&d.to_string());
             }
             for e in spawned.into_iter().chain(updated) {
                 known.insert(e.id.to_string(), e.x);

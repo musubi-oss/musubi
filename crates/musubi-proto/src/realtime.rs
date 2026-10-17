@@ -351,7 +351,7 @@ pub enum ServerMessage {
         tick: u64,
         spawned: Vec<WorldEntity>,
         updated: Vec<WorldEntity>,
-        despawned: Vec<String>,
+        despawned: Vec<uuid::Uuid>,
         /// Slowest time scale among the cells around the client (1.0 = real time; EVE-style
         /// time dilation when a simulator cannot keep up). Interpolate against it.
         #[serde(default = "one_f64")]
@@ -394,7 +394,10 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldEntity {
     pub id: uuid::Uuid,
+    /// Binary wire: whole centimetres (see `musubi_proto::pos_cm`).
+    #[serde(with = "crate::pos_cm")]
     pub x: f64,
+    #[serde(with = "crate::pos_cm")]
     pub y: f64,
     pub components: Vec<WorldComponent>,
 }

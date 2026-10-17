@@ -86,6 +86,30 @@ pub mod json_in_binary {
     }
 }
 
+/// World positions on the wire: human-readable encodings carry the `f64` as is; the binary
+/// encoding quantises to whole centimetres (`i32`, postcard varint: 1–3 bytes instead of 8).
+/// Plan 4.7 — "position to 1 cm".
+pub mod pos_cm {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_f64(*v)
+        } else {
+            let cm = (v * 100.0).round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            s.serialize_i32(cm)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        if d.is_human_readable() {
+            f64::deserialize(d)
+        } else {
+            Ok(i32::deserialize(d)? as f64 / 100.0)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Encoding {
     #[default]
@@ -271,5 +295,58 @@ mod json_text_tests {
         let back: realtime::WorldComponent = Encoding::Postcard.decode(&bin).unwrap();
         assert_eq!(back, c);
         assert_eq!(back.value.to_value(), v);
+    }
+}
+
+#[cfg(test)]
+mod pos_cm_tests {
+    use crate::realtime::{ServerMessage, WorldEntity};
+
+    fn delta(x: f64, y: f64) -> ServerMessage {
+        ServerMessage::WorldDelta {
+            world: "w".into(),
+            tick: 7,
+            spawned: vec![],
+            updated: vec![WorldEntity {
+                id: uuid::Uuid::nil(),
+                x,
+                y,
+                components: vec![],
+            }],
+            despawned: vec![uuid::Uuid::nil()],
+            time_scale: 1.0,
+            sequenced: true,
+        }
+    }
+
+    fn pos(m: &ServerMessage) -> (f64, f64) {
+        match m {
+            ServerMessage::WorldDelta { updated, .. } => (updated[0].x, updated[0].y),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn json_keeps_full_precision() {
+        let m = delta(12.3456, -0.001);
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(pos(&back), (12.3456, -0.001));
+    }
+
+    #[test]
+    fn postcard_rounds_to_centimetres_and_is_smaller() {
+        let m = delta(12.3456, -1234567.891);
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        let back: ServerMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(pos(&back), (12.35, -1234567.89));
+        // two f64 would be 16 bytes; two centimetre varints of this size are at most 8
+        let f64_len = postcard::to_allocvec(&(12.3456f64, -1234567.891f64))
+            .unwrap()
+            .len();
+        let cm_len = postcard::to_allocvec(&(1235i32, -123456789i32))
+            .unwrap()
+            .len();
+        assert!(cm_len < f64_len, "{cm_len} vs {f64_len}");
     }
 }

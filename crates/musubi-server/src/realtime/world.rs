@@ -3036,7 +3036,7 @@ fn delta_msg(world: &str, tick: u64, scale: f64, d: Delta, sequenced: bool) -> S
         time_scale: scale,
         spawned: d.spawned.into_iter().map(ref_to_wire).collect(),
         updated: d.updated.into_iter().map(ref_to_wire).collect(),
-        despawned: d.despawned.iter().map(|i| i.to_string()).collect(),
+        despawned: d.despawned.clone(),
         sequenced,
     }
 }
