@@ -615,6 +615,49 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     continue;
                 }
                 n += 1;
+                // finished windows: fire `hook_tournament_end` / `hook_leaderboard_reset` once each
+                if n % 12 == 0 {
+                    match st.leaderboards.unended_windows().await {
+                        Ok(wins) => {
+                            for (id, expiry, is_t) in wins {
+                                if !st
+                                    .leaderboards
+                                    .claim_end(&id, expiry)
+                                    .await
+                                    .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                                let records = match st
+                                    .leaderboards
+                                    .records(&id, &[], 100, None, Some(expiry), None)
+                                    .await
+                                {
+                                    Ok(l) => l.records,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, id, "end-of-window records");
+                                        vec![]
+                                    }
+                                };
+                                let payload = serde_json::json!({
+                                    "id": id, "expiry": expiry, "size": records.len(),
+                                    "records": records,
+                                });
+                                let ctx = musubi_runtime::CallContext {
+                                    server: true,
+                                    ..Default::default()
+                                };
+                                let event = if is_t {
+                                    "tournament_end"
+                                } else {
+                                    "leaderboard_reset"
+                                };
+                                st.runtime.event(event, ctx, payload).await;
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "end-of-window scan failed"),
+                    }
+                }
                 // league rollovers: every minute, same leader as the market sweep
                 if n % 12 == 0 {
                     match st.leaderboards.rollover_due().await {

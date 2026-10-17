@@ -28,6 +28,8 @@ pub struct Tournament {
     pub max_num_score: i32,
     pub join_required: bool,
     pub authoritative: bool,
+    /// Joining needs the join code given at creation (the code itself is never returned).
+    pub private: bool,
     /// Participants in the current window.
     pub size: i64,
     /// Whether a new participant could join/submit right now.
@@ -41,6 +43,9 @@ pub struct Tournament {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTournament {
     pub id: String,
+    /// Makes the tournament private: `join` must present this code.
+    #[serde(default)]
+    pub join_code: Option<String>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -193,6 +198,7 @@ fn to_tournament(r: Row, p: &Phase, size: i64) -> Tournament {
         max_num_score: r.13,
         join_required: r.14,
         authoritative: r.15,
+        private: false,
         size,
         can_enter: p.active && (max_size == 0 || size < max_size as i64),
         end_active: if p.active {
@@ -256,8 +262,8 @@ impl TournamentService {
         };
         let res = sqlx::query_as::<_, Row>(&format!(
             "insert into musubi.leaderboards (id, is_tournament, title, description, category, sort_order, operator, reset_schedule, metadata,
-                 start_time, end_time, duration, max_size, max_num_score, join_required, authoritative)
-             values ($1, true, $2, $3, $4, $5, $6, $7, coalesce($8, '{{}}'::jsonb), $9, $10, $11, $12, $13, $14, $15)
+                 start_time, end_time, duration, max_size, max_num_score, join_required, authoritative, join_code)
+             values ($1, true, $2, $3, $4, $5, $6, $7, coalesce($8, '{{}}'::jsonb), $9, $10, $11, $12, $13, $14, $15, $16)
              returning {COLS}"
         ))
         .bind(&c.id)
@@ -275,6 +281,7 @@ impl TournamentService {
         .bind(c.max_num_score)
         .bind(c.join_required)
         .bind(c.authoritative)
+        .bind(&c.join_code)
         .fetch_one(&self.db)
         .await;
         let row = match res {
@@ -285,7 +292,9 @@ impl TournamentService {
             Err(e) => return Err(Error::internal(e)),
         };
         let p = phase(&row, OffsetDateTime::now_utc())?;
-        Ok(to_tournament(row, &p, 0))
+        let mut t = to_tournament(row, &p, 0);
+        t.private = c.join_code.is_some();
+        Ok(t)
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
@@ -315,7 +324,18 @@ impl TournamentService {
         let r = self.row(id).await?;
         let p = phase(&r, OffsetDateTime::now_utc())?;
         let size = size_of(&self.db, id, p.expiry).await?;
-        Ok(to_tournament(r, &p, size))
+        let mut t = to_tournament(r, &p, size);
+        t.private = self.join_code(id).await?.is_some();
+        Ok(t)
+    }
+
+    /// Join code of a private tournament (sqlx tuples stop at 16 columns, so it is read apart).
+    async fn join_code(&self, id: &str) -> Result<Option<String>> {
+        sqlx::query_scalar("select join_code from musubi.leaderboards where id = $1")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::internal)
     }
 
     pub async fn list(
@@ -357,15 +377,30 @@ impl TournamentService {
         for r in rows.into_iter().take(limit as usize) {
             let p = phase(&r, now)?;
             let size = size_of(&self.db, &r.0, p.expiry).await?;
-            out.push(to_tournament(r, &p, size));
+            let mut t = to_tournament(r, &p, size);
+            t.private = self.join_code(&t.id).await?.is_some();
+            out.push(t);
         }
         let cursor = more.then(|| out.last().map(|t| t.id.clone())).flatten();
         Ok((out, cursor))
     }
 
     /// Reserve a slot in the current window (records a zero-submission row).
-    pub async fn join(&self, id: &str, owner: AccountId, username: Option<&str>) -> Result<()> {
+    pub async fn join(
+        &self,
+        id: &str,
+        owner: AccountId,
+        username: Option<&str>,
+        code: Option<&str>,
+    ) -> Result<()> {
         let r = self.row(id).await?;
+        if let Some(expected) = self.join_code(id).await? {
+            if code != Some(expected.as_str()) {
+                return Err(Error::PermissionDenied(
+                    "tournament is private: a join code is required".into(),
+                ));
+            }
+        }
         let p = phase(&r, OffsetDateTime::now_utc())?;
         if !p.active {
             return Err(Error::Unavailable("tournament is not active".into()));
@@ -433,7 +468,8 @@ impl TournamentService {
             None if r.14 && !server => {
                 return Err(Error::PermissionDenied("join the tournament first".into()))
             }
-            None => self.join(id, owner, username).await?,
+            // a private tournament has to be joined explicitly, with its code
+            None => self.join(id, owner, username, None).await?,
             Some(n) if r.13 > 0 && n >= r.13 => {
                 return Err(Error::ResourceExhausted("submission limit reached".into()))
             }

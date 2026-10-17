@@ -102,13 +102,23 @@ async fn get_one(
     Ok(Json(s.tournaments.get(&id).await?))
 }
 
+#[derive(Deserialize, Default)]
+struct JoinBody {
+    #[serde(default)]
+    code: Option<String>,
+}
+
 async fn join(
     State(s): State<AppState>,
     Bearer(me): Bearer,
     Path(id): Path<String>,
+    body: Option<Json<JoinBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let u = username(&s, me.account_id).await?;
-    s.tournaments.join(&id, me.account_id, u.as_deref()).await?;
+    let code = body.as_ref().and_then(|b| b.0.code.as_deref());
+    s.tournaments
+        .join(&id, me.account_id, u.as_deref(), code)
+        .await?;
     Ok(Json(json!({ "ok": true })))
 }
 

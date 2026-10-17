@@ -861,6 +861,54 @@ impl LeaderboardService {
         }))
     }
 
+    /// Windows that have finished and were not announced yet: (id, expiry, is_tournament). A board
+    /// with a reset schedule finishes a window at every reset; the returned expiry is the finished
+    /// window's `expiry_time` (what its records are keyed by).
+    pub async fn unended_windows(&self) -> Result<Vec<(String, i64, bool)>> {
+        let rows: Vec<(String, Option<String>, bool, OffsetDateTime)> = sqlx::query_as(
+            "select id, reset_schedule, is_tournament, created_at from musubi.leaderboards where reset_schedule is not null",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let now = OffsetDateTime::now_utc();
+        let mut out = Vec::new();
+        for (id, schedule, is_t, created) in rows {
+            let (prev, _) = window(schedule.as_deref(), now)?;
+            // a window that ended before the board existed has nothing to announce
+            if prev == OffsetDateTime::UNIX_EPOCH || prev <= created {
+                continue;
+            }
+            let done: Option<i64> = sqlx::query_scalar(
+                "select 1::bigint from musubi.leaderboard_ends where leaderboard_id = $1 and expiry_time = $2",
+            )
+            .bind(&id)
+            .bind(prev)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(Error::internal)?;
+            if done.is_none() {
+                out.push((id, prev.unix_timestamp(), is_t));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Mark a finished window as announced; false when someone else already did.
+    pub async fn claim_end(&self, id: &str, expiry: i64) -> Result<bool> {
+        let exp = OffsetDateTime::from_unix_timestamp(expiry)
+            .map_err(|_| Error::InvalidArgument("bad expiry".into()))?;
+        let r = sqlx::query(
+            "insert into musubi.leaderboard_ends (leaderboard_id, expiry_time) values ($1, $2) on conflict do nothing",
+        )
+        .bind(id)
+        .bind(exp)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(r.rows_affected() > 0)
+    }
+
     /// Roll over every league board whose last window has finished (sweep).
     pub async fn rollover_due(&self) -> Result<Vec<Rollover>> {
         let ids: Vec<String> = sqlx::query_scalar(

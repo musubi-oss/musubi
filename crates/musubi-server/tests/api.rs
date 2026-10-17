@@ -7359,3 +7359,102 @@ async fn bucketed_league_leaderboard_scopes_ranks_and_rolls_over() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn private_tournament_requires_join_code() {
+    let Some(app) = app().await else { return };
+    let mut toks = vec![];
+    for _ in 0..2 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("pt")})),
+        )
+        .await;
+        toks.push(s["access_token"].as_str().unwrap().to_string());
+    }
+    let id = unique("private");
+    let (st, t) = call_server(
+        &app,
+        "POST",
+        "/v1/server/tournaments",
+        "defaultkey",
+        Some(json!({"id": id, "duration": 3600, "join_code": "s3cret", "join_required": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["private"], true);
+    assert!(
+        t.get("join_code").is_none(),
+        "code never leaves the server: {t}"
+    );
+    let (_, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/tournaments/{id}"),
+        Some(&toks[0]),
+        None,
+    )
+    .await;
+    assert_eq!(t["private"], true);
+    let path = format!("/v1/tournaments/{id}/join");
+    let (st, _) = call(&app, "POST", &path, Some(&toks[0]), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &path,
+        Some(&toks[0]),
+        Some(json!({"code": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &path,
+        Some(&toks[0]),
+        Some(json!({"code": "s3cret"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // joined player scores; a stranger cannot score their way in even though join is optional
+    let rec = format!("/v1/tournaments/{id}/records");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &rec,
+        Some(&toks[0]),
+        Some(json!({"score": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &rec,
+        Some(&toks[1]),
+        Some(json!({"score": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (_, l) = call(
+        &app,
+        "GET",
+        "/v1/tournaments?limit=100",
+        Some(&toks[1]),
+        None,
+    )
+    .await;
+    let mine = l["tournaments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == id)
+        .cloned();
+    if let Some(m) = mine {
+        assert_eq!(m["private"], true, "{m}");
+    }
+}
