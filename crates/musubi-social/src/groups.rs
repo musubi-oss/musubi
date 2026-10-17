@@ -773,6 +773,15 @@ impl GroupService {
     }
 
     /// Admin+: raise users one rank (member → admin, admin → superadmin), never above the caller.
+    /// Does `me`'s role in `group` hold `bit`? (owner always does) — for callers outside the
+    /// group service, e.g. the treasury.
+    pub async fn check_perm(&self, me: AccountId, group: GroupId, bit: i64) -> Result<()> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        require_perm(&mut tx, group, me, bit).await?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(())
+    }
+
     /// The group's role table: every rank 0..=7 with its name and permission bits (defaults for
     /// ranks the group has not customised).
     pub async fn roles(&self, group: GroupId) -> Result<Vec<GroupRole>> {

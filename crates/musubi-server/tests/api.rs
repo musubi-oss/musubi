@@ -10304,3 +10304,149 @@ async fn groups_roles_bitmask_and_ranks() {
         "{m}"
     );
 }
+
+#[tokio::test]
+async fn groups_treasury_deposit_and_withdraw() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut users = vec![];
+    for _ in 0..2 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("tr")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, _a) = &users[0];
+    let (tb, b) = &users[1];
+    let gold = unique("gold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": b, "currency": gold, "delta": 500, "reason": "seed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(ta),
+        Some(json!({"name": unique("bank"), "open": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // a member pays in from their own wallet; more than they hold is refused
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/treasury/deposit"),
+        Some(tb),
+        Some(json!({"currency": gold, "amount": 300, "reason": "tax"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entry"]["balance_after"], 300);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/treasury/deposit"),
+        Some(tb),
+        Some(json!({"currency": gold, "amount": 1000})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(tb), None).await;
+    let bal = |w: &Value| {
+        w["balances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["currency"] == json!(gold))
+            .map(|x| x["balance"].clone())
+    };
+    assert_eq!(bal(&w), Some(json!(200)), "{w}");
+    let (st, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/treasury"),
+        Some(tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["balances"][0]["balance"], 300);
+    // members may not pay out; the owner pays a member, never below zero
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/treasury/withdraw"),
+        Some(tb),
+        Some(json!({"currency": gold, "amount": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/treasury/withdraw"),
+        Some(ta),
+        Some(json!({"currency": gold, "amount": 100, "to": b, "reason": "salary"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entry"]["balance_after"], 200);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/treasury/withdraw"),
+        Some(ta),
+        Some(json!({"currency": gold, "amount": 1000, "to": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(tb), None).await;
+    assert_eq!(bal(&w), Some(json!(300)), "{w}");
+    let (st, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/treasury/ledger"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let entries = l["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{l}");
+    assert_eq!(entries[0]["delta"], -100);
+    assert_eq!(entries[0]["reason"], "salary");
+    assert_eq!(entries[1]["delta"], 300);
+}

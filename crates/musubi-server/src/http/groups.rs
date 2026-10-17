@@ -23,6 +23,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/groups/{id}/promote", post(promote))
         .route("/v1/groups/{id}/roles", get(roles).put(set_roles))
         .route("/v1/groups/{id}/rank", post(set_rank))
+        .route("/v1/groups/{id}/treasury", get(treasury))
+        .route("/v1/groups/{id}/treasury/ledger", get(treasury_ledger))
+        .route("/v1/groups/{id}/treasury/deposit", post(treasury_deposit))
+        .route("/v1/groups/{id}/treasury/withdraw", post(treasury_withdraw))
         .route("/v1/groups/{id}/demote", post(demote))
         .route("/v1/groups/{id}/members", get(members))
         .route("/v1/groups/{id}/ban", post(ban).delete(unban))
@@ -216,6 +220,106 @@ async fn set_roles(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let roles = groups(&s).set_roles(me.account_id, id, &r.roles).await?;
     Ok(Json(json!({ "roles": roles })))
+}
+
+async fn treasury(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::TREASURY_DEPOSIT,
+        )
+        .await?;
+    Ok(Json(json!({ "balances": s.economy.treasury(id.0).await? })))
+}
+
+async fn treasury_ledger(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Query(q): Query<PageQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::TREASURY_DEPOSIT,
+        )
+        .await?;
+    let limit = q.limit as i64;
+    Ok(Json(
+        json!({ "entries": s.economy.treasury_ledger(id.0, limit).await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct TreasuryReq {
+    currency: String,
+    amount: i64,
+    #[serde(default)]
+    reason: String,
+    /// Withdrawals only: who receives the money (default: the caller).
+    #[serde(default)]
+    to: Option<AccountId>,
+}
+
+async fn treasury_deposit(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(r): Json<TreasuryReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::TREASURY_DEPOSIT,
+        )
+        .await?;
+    let e = s
+        .economy
+        .treasury_deposit(id.0, me.account_id, &r.currency, r.amount, &r.reason)
+        .await?;
+    s.events
+        .emit(
+            "group.treasury_deposit",
+            Some(me.account_id),
+            json!({ "group_id": id, "currency": r.currency, "amount": r.amount }),
+        )
+        .await;
+    Ok(Json(json!({ "entry": e })))
+}
+
+async fn treasury_withdraw(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<GroupId>,
+    Json(r): Json<TreasuryReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    groups(&s)
+        .check_perm(
+            me.account_id,
+            id,
+            musubi_social::groups::perm::TREASURY_WITHDRAW,
+        )
+        .await?;
+    let to = r.to.unwrap_or(me.account_id);
+    let e = s
+        .economy
+        .treasury_withdraw(id.0, to, &r.currency, r.amount, &r.reason)
+        .await?;
+    s.events
+        .emit(
+            "group.treasury_withdraw",
+            Some(me.account_id),
+            json!({ "group_id": id, "to": to, "currency": r.currency, "amount": r.amount }),
+        )
+        .await;
+    Ok(Json(json!({ "entry": e })))
 }
 
 #[derive(Deserialize)]
