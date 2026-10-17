@@ -116,6 +116,14 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/server/wallet/adjust", post(adjust))
         .route("/v1/server/items", get(items).post(upsert_item))
+        .route("/v1/server/items/{id}", get(item))
+        .route("/v1/server/items/{id}/versions", get(item_versions))
+        .route(
+            "/v1/server/items/{id}/versions/{version}/rollback",
+            post(item_rollback),
+        )
+        .route("/v1/server/items/{id}/migrate", post(item_migrate))
+        .route("/v1/server/items/{id}/convert", post(item_convert))
         .route("/v1/server/inventory/grant", post(grant_item))
         .route(
             "/v1/server/crafting/recipes",
@@ -328,6 +336,90 @@ async fn upsert_item(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         serde_json::to_value(s.economy.upsert_item(r).await?).map_err(Error::internal)?,
+    ))
+}
+
+async fn item(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        serde_json::to_value(s.economy.item(&id).await?).map_err(Error::internal)?,
+    ))
+}
+
+async fn item_versions(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "versions": s.economy.item_versions(&id).await? }),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ItemRollbackReq {
+    migrations: Option<Vec<musubi_economy::Migration>>,
+    note: Option<String>,
+}
+
+async fn item_rollback(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path((id, version)): axum::extract::Path<(String, i32)>,
+    body: Option<Json<ItemRollbackReq>>,
+) -> Result<Json<Value>, ApiError> {
+    let r = body.map(|Json(r)| r).unwrap_or_default();
+    let item = s
+        .economy
+        .rollback_item(&id, version, r.migrations, r.note)
+        .await?;
+    Ok(Json(serde_json::to_value(item).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct BatchQuery {
+    batch: Option<i64>,
+}
+
+async fn item_migrate(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<BatchQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (migrated, remaining) = s
+        .economy
+        .migrate_item_inventory(&id, q.batch.unwrap_or(500))
+        .await?;
+    Ok(Json(
+        json!({ "migrated": migrated, "remaining": remaining }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ConvertReq {
+    to: String,
+    #[serde(default = "one")]
+    ratio: i64,
+    batch: Option<i64>,
+}
+
+async fn item_convert(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(r): Json<ConvertReq>,
+) -> Result<Json<Value>, ApiError> {
+    let (converted, remaining) = s
+        .economy
+        .convert_item(&id, &r.to, r.ratio, r.batch.unwrap_or(500))
+        .await?;
+    Ok(Json(
+        json!({ "converted": converted, "remaining": remaining }),
     ))
 }
 

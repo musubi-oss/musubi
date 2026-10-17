@@ -3,6 +3,7 @@
 //! purchases debit the wallet and grant the item in one transaction.
 
 use musubi_core::{AccountId, Error, Result};
+pub use musubi_storage::schema::{Migration, MigrationOp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -75,6 +76,19 @@ pub struct Item {
     pub stackable: bool,
     pub max_stack: i32,
     pub properties: Value,
+    /// Bumped on every change of the definition; the previous one stays in `item_versions`.
+    #[serde(default = "one_i32")]
+    pub version: i32,
+    /// JSON schema the `instance` data of a grant must satisfy (`null` = anything).
+    #[serde(default)]
+    pub instance_schema: Value,
+    /// How instance data granted under an older version is brought to the current one.
+    #[serde(default)]
+    pub migrations: Vec<Migration>,
+}
+
+fn one_i32() -> i32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -86,6 +100,21 @@ pub struct CreateItem {
     pub stackable: Option<bool>,
     pub max_stack: Option<i32>,
     pub properties: Value,
+    pub instance_schema: Value,
+    /// Omitted = keep the migrations the item already has.
+    pub migrations: Option<Vec<Migration>>,
+    /// Stored with the new version when the definition changed.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemVersion {
+    pub item_id: String,
+    pub version: i32,
+    pub definition: Value,
+    pub note: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +123,9 @@ pub struct InventoryEntry {
     pub item_id: String,
     pub quantity: i64,
     pub instance: Value,
+    /// Definition version the instance data conforms to (migrated lazily on read).
+    #[serde(default = "one_i32")]
+    pub item_version: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +373,44 @@ fn ledger(r: LedgerRow) -> LedgerEntry {
 const LEDGER_COLS: &str =
     "id, currency, delta, balance_after, reason, ref, idempotency_key, metadata, created_at";
 
+type ItemRow = (
+    String,
+    String,
+    String,
+    bool,
+    i32,
+    Value,
+    i32,
+    Option<Value>,
+    Value,
+);
+const ITEM_COLS: &str =
+    "id, name, category, stackable, max_stack, properties, version, instance_schema, migrations";
+
+fn item_of(r: ItemRow) -> Item {
+    Item {
+        id: r.0,
+        name: r.1,
+        category: r.2,
+        stackable: r.3,
+        max_stack: r.4,
+        properties: r.5,
+        version: r.6,
+        instance_schema: r.7.unwrap_or(Value::Null),
+        migrations: serde_json::from_value(r.8).unwrap_or_default(),
+    }
+}
+
+fn same_definition(a: &Item, b: &Item) -> bool {
+    a.name == b.name
+        && a.category == b.category
+        && a.stackable == b.stackable
+        && a.max_stack == b.max_stack
+        && a.properties == b.properties
+        && a.instance_schema == b.instance_schema
+        && a.migrations == b.migrations
+}
+
 pub(crate) fn check_code(code: &str) -> Result<()> {
     if code.is_empty()
         || code.len() > 64
@@ -565,7 +635,9 @@ impl EconomyService {
 
     pub async fn upsert_item(&self, c: CreateItem) -> Result<Item> {
         check_code(&c.id)?;
-        let item = Item {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let prev = Self::item_tx(&mut tx, &c.id).await?;
+        let mut item = Item {
             id: c.id,
             name: c.name,
             category: c.category,
@@ -576,11 +648,39 @@ impl EconomyService {
             } else {
                 Value::Object(Default::default())
             },
+            version: prev.as_ref().map_or(1, |p| p.version),
+            instance_schema: if c.instance_schema.is_object() {
+                c.instance_schema
+            } else {
+                Value::Null
+            },
+            migrations: c.migrations.unwrap_or_else(|| {
+                prev.as_ref()
+                    .map(|p| p.migrations.clone())
+                    .unwrap_or_default()
+            }),
         };
+        if !item.instance_schema.is_null() {
+            musubi_storage::schema::compile_schema(&item.instance_schema)
+                .map_err(|e| Error::InvalidArgument(format!("instance_schema: {e}")))?;
+        }
+        let changed = match &prev {
+            None => true,
+            Some(p) => !same_definition(p, &item),
+        };
+        if changed {
+            if let Some(p) = &prev {
+                item.version = p.version + 1;
+            }
+        }
+        musubi_storage::schema::check_migrations(&item.migrations, item.version)?;
+        let migrations = serde_json::to_value(&item.migrations)?;
         sqlx::query(
-            "insert into musubi.items (id, name, category, stackable, max_stack, properties) values ($1, $2, $3, $4, $5, $6)
+            "insert into musubi.items (id, name, category, stackable, max_stack, properties, version, instance_schema, migrations)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              on conflict (id) do update set name = excluded.name, category = excluded.category, stackable = excluded.stackable,
-             max_stack = excluded.max_stack, properties = excluded.properties",
+             max_stack = excluded.max_stack, properties = excluded.properties, version = excluded.version,
+             instance_schema = excluded.instance_schema, migrations = excluded.migrations",
         )
         .bind(&item.id)
         .bind(&item.name)
@@ -588,34 +688,281 @@ impl EconomyService {
         .bind(item.stackable)
         .bind(item.max_stack)
         .bind(&item.properties)
-        .execute(&self.db)
+        .bind(item.version)
+        .bind((!item.instance_schema.is_null()).then_some(&item.instance_schema))
+        .bind(&migrations)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
+        if changed {
+            sqlx::query(
+                "insert into musubi.item_versions (item_id, version, definition, note) values ($1, $2, $3, $4)
+                 on conflict (item_id, version) do update set definition = excluded.definition, note = excluded.note",
+            )
+            .bind(&item.id)
+            .bind(item.version)
+            .bind(serde_json::to_value(&item)?)
+            .bind(c.note.unwrap_or_default())
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        }
+        tx.commit().await.map_err(Error::internal)?;
         Ok(item)
     }
 
+    async fn item_tx(tx: &mut Transaction<'_, Postgres>, id: &str) -> Result<Option<Item>> {
+        let row: Option<ItemRow> = sqlx::query_as(&format!(
+            "select {ITEM_COLS} from musubi.items where id = $1 for update"
+        ))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.map(item_of))
+    }
+
+    pub async fn item(&self, id: &str) -> Result<Item> {
+        let row: Option<ItemRow> = sqlx::query_as(&format!(
+            "select {ITEM_COLS} from musubi.items where id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        row.map(item_of)
+            .ok_or_else(|| Error::NotFound(format!("item {id}")))
+    }
+
     pub async fn items(&self) -> Result<Vec<Item>> {
-        let rows: Vec<(String, String, String, bool, i32, Value)> =
-            sqlx::query_as("select id, name, category, stackable, max_stack, properties from musubi.items order by id")
+        let rows: Vec<ItemRow> =
+            sqlx::query_as(&format!("select {ITEM_COLS} from musubi.items order by id"))
                 .fetch_all(&self.db)
                 .await
                 .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(item_of).collect())
+    }
+
+    /// Every definition the item ever had, newest first.
+    pub async fn item_versions(&self, id: &str) -> Result<Vec<ItemVersion>> {
+        self.item(id).await?;
+        let rows: Vec<(String, i32, Value, String, OffsetDateTime)> = sqlx::query_as(
+            "select item_id, version, definition, note, created_at from musubi.item_versions
+             where item_id = $1 order by version desc",
+        )
+        .bind(id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|r| Item {
-                id: r.0,
-                name: r.1,
-                category: r.2,
-                stackable: r.3,
-                max_stack: r.4,
-                properties: r.5,
+            .map(|r| ItemVersion {
+                item_id: r.0,
+                version: r.1,
+                definition: r.2,
+                note: r.3,
+                created_at: r.4,
             })
             .collect())
     }
 
+    /// Re-apply an older definition as a new version. The migration chain is kept (and may be
+    /// extended in the same call) so instances granted meanwhile still reach the current version.
+    pub async fn rollback_item(
+        &self,
+        id: &str,
+        version: i32,
+        migrations: Option<Vec<Migration>>,
+        note: Option<String>,
+    ) -> Result<Item> {
+        let current = self.item(id).await?;
+        let def: Option<(Value,)> = sqlx::query_as(
+            "select definition from musubi.item_versions where item_id = $1 and version = $2",
+        )
+        .bind(id)
+        .bind(version)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some((def,)) = def else {
+            return Err(Error::NotFound(format!("item {id} version {version}")));
+        };
+        let old: Item = serde_json::from_value(def)?;
+        self.upsert_item(CreateItem {
+            id: id.into(),
+            name: old.name,
+            category: old.category,
+            stackable: Some(old.stackable),
+            max_stack: Some(old.max_stack),
+            properties: old.properties,
+            instance_schema: old.instance_schema,
+            migrations: Some(migrations.unwrap_or(current.migrations)),
+            note: Some(note.unwrap_or_else(|| format!("rollback to version {version}"))),
+        })
+        .await
+    }
+
+    /// Bring up to `batch` inventory entries of the item granted under an older definition to the
+    /// current one, in the database. Returns `(migrated, remaining)`.
+    pub async fn migrate_item_inventory(&self, id: &str, batch: i64) -> Result<(i64, i64)> {
+        let item = self.item(id).await?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let rows: Vec<(Uuid, Value, i32)> = sqlx::query_as(
+            "select id, instance, item_version from musubi.inventory
+             where item_id = $1 and item_version < $2 order by created_at limit $3 for update skip locked",
+        )
+        .bind(id)
+        .bind(item.version)
+        .bind(batch.clamp(1, 5000))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let mut migrated = 0i64;
+        for (eid, mut instance, iv) in rows {
+            let reached = musubi_storage::schema::migrate_steps(
+                &item.migrations,
+                item.version,
+                &mut instance,
+                iv,
+            );
+            if reached == iv {
+                continue;
+            }
+            sqlx::query(
+                "update musubi.inventory set instance = $2, item_version = $3, updated_at = now() where id = $1",
+            )
+            .bind(eid)
+            .bind(&instance)
+            .bind(reached)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            migrated += 1;
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        let remaining: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.inventory where item_id = $1 and item_version < $2",
+        )
+        .bind(id)
+        .bind(item.version)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok((migrated, remaining))
+    }
+
+    /// Turn up to `batch` inventory entries of `from` into `to` (`quantity × ratio`), e.g. when two
+    /// items are merged or one is retired. Plain stacks join an existing stack of `to`; instance
+    /// data is carried over as is. Returns `(converted, remaining)`.
+    pub async fn convert_item(
+        &self,
+        from: &str,
+        to: &str,
+        ratio: i64,
+        batch: i64,
+    ) -> Result<(i64, i64)> {
+        if from == to {
+            return Err(Error::InvalidArgument(
+                "from and to are the same item".into(),
+            ));
+        }
+        if ratio < 1 {
+            return Err(Error::InvalidArgument("ratio must be ≥ 1".into()));
+        }
+        self.item(from).await?;
+        let target = self.item(to).await?;
+        if !target.stackable && ratio != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "{to} is not stackable, ratio must be 1"
+            )));
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let rows: Vec<(Uuid, Uuid, i64, Value)> = sqlx::query_as(
+            "select id, account_id, quantity, instance from musubi.inventory
+             where item_id = $1 order by created_at limit $2 for update skip locked",
+        )
+        .bind(from)
+        .bind(batch.clamp(1, 5000))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let mut converted = 0i64;
+        for (eid, account, q, instance) in rows {
+            let nq = q
+                .checked_mul(ratio)
+                .ok_or_else(|| Error::InvalidArgument("overflow".into()))?;
+            if !target.stackable && nq != 1 {
+                return Err(Error::InvalidArgument(format!(
+                    "{to} is not stackable but entry {eid} holds {q}"
+                )));
+            }
+            let plain = target.stackable && instance.as_object().is_some_and(|m| m.is_empty());
+            if plain {
+                let existing: Option<(Uuid, i64)> = sqlx::query_as(
+                    "select id, quantity from musubi.inventory where account_id = $1 and item_id = $2
+                     and instance = '{}'::jsonb and id <> $3 order by created_at limit 1 for update",
+                )
+                .bind(account)
+                .bind(to)
+                .bind(eid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+                if let Some((sid, sq)) = existing {
+                    let total = sq
+                        .checked_add(nq)
+                        .ok_or_else(|| Error::InvalidArgument("overflow".into()))?;
+                    if total <= target.max_stack as i64 {
+                        sqlx::query("update musubi.inventory set quantity = $2, item_version = $3, updated_at = now() where id = $1")
+                            .bind(sid)
+                            .bind(total)
+                            .bind(target.version)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(Error::internal)?;
+                        sqlx::query("delete from musubi.inventory where id = $1")
+                            .bind(eid)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(Error::internal)?;
+                        converted += 1;
+                        continue;
+                    }
+                }
+            }
+            if nq > target.max_stack as i64 {
+                return Err(Error::ResourceExhausted(format!(
+                    "stack of {to} capped at {}: entry {eid} would hold {nq}",
+                    target.max_stack
+                )));
+            }
+            sqlx::query(
+                "update musubi.inventory set item_id = $2, quantity = $3, item_version = $4, updated_at = now() where id = $1",
+            )
+            .bind(eid)
+            .bind(to)
+            .bind(nq)
+            .bind(target.version)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            converted += 1;
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        let remaining: i64 =
+            sqlx::query_scalar("select count(*) from musubi.inventory where item_id = $1")
+                .bind(from)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        Ok((converted, remaining))
+    }
+
     pub async fn inventory(&self, account: AccountId) -> Result<Vec<InventoryEntry>> {
-        let rows: Vec<(Uuid, String, i64, Value)> = sqlx::query_as(
-            "select id, item_id, quantity, instance from musubi.inventory where account_id = $1 order by item_id, created_at",
+        let rows: Vec<(Uuid, String, i64, Value, i32, i32, Value)> = sqlx::query_as(
+            "select i.id, i.item_id, i.quantity, i.instance, i.item_version, d.version, d.migrations
+             from musubi.inventory i join musubi.items d on d.id = i.item_id
+             where i.account_id = $1 order by i.item_id, i.created_at",
         )
         .bind(account.0)
         .fetch_all(&self.db)
@@ -623,11 +970,26 @@ impl EconomyService {
         .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|r| InventoryEntry {
-                id: r.0,
-                item_id: r.1,
-                quantity: r.2,
-                instance: r.3,
+            .map(|r| {
+                let (id, item_id, quantity, mut instance, mut item_version, current, migrations) =
+                    r;
+                if item_version < current {
+                    let migrations: Vec<Migration> =
+                        serde_json::from_value(migrations).unwrap_or_default();
+                    item_version = musubi_storage::schema::migrate_steps(
+                        &migrations,
+                        current,
+                        &mut instance,
+                        item_version,
+                    );
+                }
+                InventoryEntry {
+                    id,
+                    item_id,
+                    quantity,
+                    instance,
+                    item_version,
+                }
             })
             .collect())
     }
@@ -655,13 +1017,14 @@ impl EconomyService {
         if quantity <= 0 {
             return Err(Error::InvalidArgument("quantity must be positive".into()));
         }
-        let item: Option<(bool, i32)> =
-            sqlx::query_as("select stackable, max_stack from musubi.items where id = $1")
-                .bind(item_id)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(Error::internal)?;
-        let Some((stackable, max_stack)) = item else {
+        let item: Option<(bool, i32, i32, Option<Value>, Value)> = sqlx::query_as(
+            "select stackable, max_stack, version, instance_schema, migrations from musubi.items where id = $1",
+        )
+        .bind(item_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        let Some((stackable, max_stack, version, schema, migrations)) = item else {
             return Err(Error::NotFound(format!("item {item_id}")));
         };
         let instance = if instance.is_object() {
@@ -669,10 +1032,14 @@ impl EconomyService {
         } else {
             Value::Object(Default::default())
         };
+        if let Some(schema) = schema.filter(|s| s.is_object()) {
+            musubi_storage::schema::validate(&schema, &instance)
+                .map_err(|e| Error::InvalidArgument(format!("instance of {item_id}: {e}")))?;
+        }
         // stackable items with default instance data merge into the existing stack
         if stackable && instance.as_object().is_some_and(|m| m.is_empty()) {
-            let existing: Option<(Uuid, i64)> = sqlx::query_as(
-                "select id, quantity from musubi.inventory where account_id = $1 and item_id = $2 and instance = '{}'::jsonb
+            let existing: Option<(Uuid, i64, i32)> = sqlx::query_as(
+                "select id, quantity, item_version from musubi.inventory where account_id = $1 and item_id = $2 and instance = '{}'::jsonb
                  order by created_at limit 1 for update",
             )
             .bind(account.0)
@@ -680,7 +1047,19 @@ impl EconomyService {
             .fetch_optional(&mut **tx)
             .await
             .map_err(Error::internal)?;
-            if let Some((id, q)) = existing {
+            // an older plain stack only merges when migrating it keeps it plain
+            let still_plain = |iv: i32| {
+                if iv >= version {
+                    return true;
+                }
+                let migrations: Vec<Migration> =
+                    serde_json::from_value(migrations.clone()).unwrap_or_default();
+                let mut probe = Value::Object(Default::default());
+                musubi_storage::schema::migrate_steps(&migrations, version, &mut probe, iv);
+                probe.as_object().is_some_and(|m| m.is_empty())
+            };
+            if let Some((id, q, iv)) = existing.filter(|(_, _, iv)| still_plain(*iv)) {
+                let _ = iv;
                 let nq = q
                     .checked_add(quantity)
                     .ok_or_else(|| Error::InvalidArgument("overflow".into()))?;
@@ -690,10 +1069,11 @@ impl EconomyService {
                     )));
                 }
                 sqlx::query(
-                    "update musubi.inventory set quantity = $2, updated_at = now() where id = $1",
+                    "update musubi.inventory set quantity = $2, item_version = $3, updated_at = now() where id = $1",
                 )
                 .bind(id)
                 .bind(nq)
+                .bind(version)
                 .execute(&mut **tx)
                 .await
                 .map_err(Error::internal)?;
@@ -702,6 +1082,7 @@ impl EconomyService {
                     item_id: item_id.into(),
                     quantity: nq,
                     instance,
+                    item_version: version,
                 });
             }
         }
@@ -716,12 +1097,13 @@ impl EconomyService {
             )));
         }
         let id = Uuid::now_v7();
-        sqlx::query("insert into musubi.inventory (id, account_id, item_id, quantity, instance) values ($1, $2, $3, $4, $5)")
+        sqlx::query("insert into musubi.inventory (id, account_id, item_id, quantity, instance, item_version) values ($1, $2, $3, $4, $5, $6)")
             .bind(id)
             .bind(account.0)
             .bind(item_id)
             .bind(quantity)
             .bind(&instance)
+            .bind(version)
             .execute(&mut **tx)
             .await
             .map_err(Error::internal)?;
@@ -730,6 +1112,7 @@ impl EconomyService {
             item_id: item_id.into(),
             quantity,
             instance,
+            item_version: version,
         })
     }
 
@@ -744,15 +1127,15 @@ impl EconomyService {
             return Err(Error::InvalidArgument("quantity must be positive".into()));
         }
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        let row: Option<(String, i64, Value)> = sqlx::query_as(
-            "select item_id, quantity, instance from musubi.inventory where id = $1 and account_id = $2 for update",
+        let row: Option<(String, i64, Value, i32)> = sqlx::query_as(
+            "select item_id, quantity, instance, item_version from musubi.inventory where id = $1 and account_id = $2 for update",
         )
         .bind(entry_id)
         .bind(account.0)
         .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        let Some((item_id, have, instance)) = row else {
+        let Some((item_id, have, instance, item_version)) = row else {
             return Err(Error::NotFound("inventory entry".into()));
         };
         if have < quantity {
@@ -783,6 +1166,7 @@ impl EconomyService {
             item_id,
             quantity: left,
             instance,
+            item_version,
         }))
     }
 
@@ -1036,8 +1420,8 @@ impl EconomyService {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(Error::internal)?;
-                let granted: Option<(Uuid, String, i64, Value)> = sqlx::query_as(
-                    "select i.id, i.item_id, i.quantity, i.instance from musubi.inventory i
+                let granted: Option<(Uuid, String, i64, Value, i32)> = sqlx::query_as(
+                    "select i.id, i.item_id, i.quantity, i.instance, i.item_version from musubi.inventory i
                      join musubi.store_items s on s.item_id = i.item_id where i.account_id = $1 and s.id = $2 order by i.updated_at desc limit 1",
                 )
                 .bind(account.0)
@@ -1050,6 +1434,7 @@ impl EconomyService {
                     item_id: g.1,
                     quantity: g.2,
                     instance: g.3,
+                    item_version: g.4,
                 });
                 return Ok(Purchase {
                     id,

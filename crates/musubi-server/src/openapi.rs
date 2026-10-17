@@ -441,6 +441,15 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/admin/accounts/{id}/grants", "admin"),
     ("GET", "/v1/server/items", "economy"),
     ("POST", "/v1/server/items", "economy"),
+    ("GET", "/v1/server/items/{id}", "economy"),
+    ("GET", "/v1/server/items/{id}/versions", "economy"),
+    (
+        "POST",
+        "/v1/server/items/{id}/versions/{version}/rollback",
+        "economy",
+    ),
+    ("POST", "/v1/server/items/{id}/migrate", "economy"),
+    ("POST", "/v1/server/items/{id}/convert", "economy"),
     ("DELETE", "/v1/server/leaderboards/{id}", "leaderboards"),
     ("POST", "/v1/server/leaderboards", "leaderboards"),
     (

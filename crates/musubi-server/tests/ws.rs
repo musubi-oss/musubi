@@ -12990,3 +12990,293 @@ async fn world_replica_takes_over_without_snapshot() {
         info1.mirrors
     );
 }
+
+/// Item definitions are versioned: a changed definition bumps `version` and keeps the old one,
+/// grants are validated against `instance_schema`, instance data granted under an older version is
+/// migrated lazily on read and in batches in the database, an older definition can be rolled back,
+/// and a retired item is converted into another.
+#[tokio::test]
+async fn item_definitions_are_versioned_and_inventories_migrate() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (sword, blade) = (format!("sword-{sfx}"), format!("blade-{sfx}"));
+    let (ta, acc_a) = token(&router).await;
+    let items = "/v1/server/items".to_string();
+    // a schema with a typo in a keyword is rejected, not silently accepted
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &items,
+        None,
+        true,
+        Some(json!({"id": sword, "name": "Sword", "stackable": false,
+            "instance_schema": {"type": "object", "propertis": {}}})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let v1 = json!({"id": sword, "name": "Sword", "stackable": false,
+        "instance_schema": {"type": "object", "required": ["dur"], "additionalProperties": false,
+            "properties": {"dur": {"type": "number", "maximum": 100}}}});
+    let (st, r) = http_json(&router, "POST", &items, None, true, Some(v1.clone())).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["version"], 1);
+    // grants are validated against the instance schema
+    let grant = |instance: Value| json!({"account_id": acc_a, "item_id": sword, "quantity": 1, "instance": instance});
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(grant(json!({"dur": 150}))),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    assert!(r.to_string().contains("maximum"), "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(grant(json!({}))),
+    )
+    .await;
+    assert_eq!(st, 400, "dur is required: {r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(grant(json!({"dur": 90}))),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["item_version"], 1);
+    // the same definition again is not a new version
+    let (st, r) = http_json(&router, "POST", &items, None, true, Some(v1.clone())).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["version"], 1);
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("{items}/{sword}/versions"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["versions"].as_array().unwrap().len(), 1);
+    // v2 renames dur → durability and adds tier, with the migration for existing instances
+    let v2 = json!({"id": sword, "name": "Sword", "stackable": false, "note": "rename dur",
+        "instance_schema": {"type": "object", "required": ["durability", "tier"], "additionalProperties": false,
+            "properties": {"durability": {"type": "number", "maximum": 100}, "tier": {"type": "integer"}}},
+        "migrations": [{"from": 1, "to": 2, "ops": [
+            {"op": "rename", "from": "dur", "to": "durability"},
+            {"op": "default", "path": "tier", "value": 1}]}]});
+    let (st, r) = http_json(&router, "POST", &items, None, true, Some(v2.clone())).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["version"], 2);
+    // the old instance is migrated on read…
+    let (st, r) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    assert_eq!(st, 200, "{r}");
+    let inv = r["items"].as_array().unwrap();
+    assert_eq!(inv.len(), 1);
+    assert_eq!(
+        inv[0]["instance"],
+        json!({"durability": 90, "tier": 1}),
+        "{r}"
+    );
+    assert_eq!(inv[0]["item_version"], 2);
+    // …and in the database in batches
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{items}/{sword}/migrate?batch=10"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r, json!({"migrated": 1, "remaining": 0}));
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{items}/{sword}/migrate"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["migrated"], 0);
+    let stored: (Value, i32) = sqlx::query_as(
+        "select instance, item_version from musubi.inventory where account_id = $1 and item_id = $2",
+    )
+    .bind(uuid::Uuid::parse_str(&acc_a).unwrap())
+    .bind(&sword)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(stored, (json!({"durability": 90, "tier": 1}), 2));
+    // new grants must follow the new schema
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(grant(json!({"dur": 50}))),
+    )
+    .await;
+    assert_eq!(st, 400, "old shape rejected: {r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/inventory/grant",
+        None,
+        true,
+        Some(grant(json!({"durability": 50, "tier": 2}))),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["item_version"], 2);
+    // history, newest first
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("{items}/{sword}/versions"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let vs = r["versions"].as_array().unwrap();
+    assert_eq!(vs.len(), 2);
+    assert_eq!(vs[0]["version"], 2);
+    assert_eq!(vs[0]["note"], "rename dur");
+    assert_eq!(vs[1]["version"], 1);
+    assert_eq!(
+        vs[1]["definition"]["instance_schema"]["required"],
+        json!(["dur"])
+    );
+    // rollback re-applies v1 as version 3, keeping the migration chain
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{items}/{sword}/versions/99/rollback"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{items}/{sword}/versions/1/rollback"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["version"], 3);
+    assert_eq!(r["instance_schema"]["required"], json!(["dur"]));
+    assert_eq!(r["migrations"].as_array().unwrap().len(), 1);
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("{items}/{sword}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["version"], 3);
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("{items}/{sword}/versions"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["versions"][0]["note"], "rollback to version 1");
+    // retiring the sword: every entry becomes 2 blades
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &items,
+        None,
+        true,
+        Some(json!({"id": blade, "name": "Blade", "stackable": true, "max_stack": 1000})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let convert = format!("{items}/{sword}/convert");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &convert,
+        None,
+        true,
+        Some(json!({"to": sword})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &convert,
+        None,
+        true,
+        Some(json!({"to": format!("nope-{sfx}")})),
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &convert,
+        None,
+        true,
+        Some(json!({"to": blade, "ratio": 2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r, json!({"converted": 2, "remaining": 0}));
+    let (st, r) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    assert_eq!(st, 200, "{r}");
+    let inv = r["items"].as_array().unwrap();
+    assert_eq!(inv.len(), 2, "{r}");
+    assert!(
+        inv.iter()
+            .all(|e| e["item_id"] == blade && e["quantity"] == 2 && e["item_version"] == 1),
+        "{r}"
+    );
+    assert!(
+        inv.iter().any(|e| e["instance"]["durability"] == 90),
+        "instance data carried over: {r}"
+    );
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{items}/nope-{sfx}/migrate"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+}

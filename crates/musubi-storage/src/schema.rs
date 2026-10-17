@@ -271,10 +271,43 @@ pub fn validate_definition(s: &CollectionSchema) -> Result<()> {
 /// Bring `value` written at `from` as far forward as the migration chain allows; returns the
 /// version reached.
 pub fn migrate(s: &CollectionSchema, value: &mut Value, from: i32) -> i32 {
+    migrate_steps(&s.migrations, s.version, value, from)
+}
+
+/// Compile a bare JSON schema (the subset accepted for collections) and reject unknown keywords.
+pub fn compile_schema(schema: &Value) -> Result<()> {
+    if !schema.is_object() {
+        return Err(Error::InvalidArgument("schema must be an object".into()));
+    }
+    compile(schema, schema, "schema")
+}
+
+/// Migrations must move forward, not past `version`, and start at distinct versions.
+pub fn check_migrations(migrations: &[Migration], version: i32) -> Result<()> {
+    for m in migrations {
+        if m.to <= m.from || m.to > version {
+            return Err(Error::InvalidArgument(format!(
+                "migration {}→{}: must move forward and not past version {}",
+                m.from, m.to, version
+            )));
+        }
+        if migrations.iter().filter(|o| o.from == m.from).count() > 1 {
+            return Err(Error::InvalidArgument(format!(
+                "two migrations start at version {}",
+                m.from
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Walk `value` from version `from` towards `target` along `migrations`; returns the version reached
+/// (the chain may stop short when a step is missing).
+pub fn migrate_steps(migrations: &[Migration], target: i32, value: &mut Value, from: i32) -> i32 {
     let mut v = from;
     let mut hops = 0;
-    while v < s.version && hops < 1024 {
-        let Some(m) = s.migrations.iter().find(|m| m.from == v) else {
+    while v < target && hops < 1024 {
+        let Some(m) = migrations.iter().find(|m| m.from == v) else {
             break;
         };
         for op in &m.ops {

@@ -118,7 +118,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Вебхуки: HMAC, backoff, dead-letter, redeliver, test | ✅ | 🟡 | ❌ | ✅ | ✅ |
 | Аудит админ-мутаций | ✅ `/v1/admin/audit` | ✅ | ❌ | ✅ | ✅ |
 | Админ-API: аккаунты (поиск по identity, patch, ban, sessions, export), storage, chat-модерация, worlds/matches, конфиг | ✅ | ✅ portal | 🟡 | ✅ | ✅ |
-| Контент-каталоги с версиями / item definitions | 🟡 items/products/tables через server API, без версий и промоушена | ✅ | ❌ | ✅ | ✅ |
+| Контент-каталоги с версиями / item definitions | ✅ контент-бандлы с diff/историей/откатом + версии item definitions (`instance_schema`, миграции инстансов lazy/batch, история, откат, конвертация предметов) | ✅ | ❌ | ✅ | ✅ |
 | OpenAPI, CLI, миграция с Nakama | ✅ `openapi.json`, `musubi migrate-nakama` | 🟡 | 🟡 | ✅ | ✅ |
 | IaC (Helm / Terraform) | ✅ Helm-чарт `deploy/helm/musubi` (ConfigMap TOML + секреты env, Service http/udp, HPA, PDB) и Dockerfile; Terraform — нет | — | 🟡 | — | — |
 | Prometheus, OpenTelemetry, trace_id в ошибках | ✅ | ✅ | 🟡 | ✅ | ✅ |
@@ -159,7 +159,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 7. ~~**Мешинг II — handover без пересылки**~~ ✅ — handover передаёт только компоненты новее ревизии ghost'а на принимающей ноде.
 8. **Мешинг III — replication layer**: ✅ standby-реплики ячеек (`replicas`), поток репликации всей ячейки, захват из зеркала при смерти хоста без снапшота/журнала.
 9. ~~**Мешинг IV — кросс-ячеечные транзакции и авто-выгрузка холодных ячеек**~~ ✅
-10. **Окружения и версии контента/конфига**: ~~контент-бандлы с diff/историей/откатом~~ ✅; осталось: версии item definitions с миграцией инвентарей, конфиг кластера по окружениям.
+10. **Окружения и версии контента/конфига**: ~~контент-бандлы с diff/историей/откатом~~ ✅; ~~версии item definitions с миграцией инвентарей~~ ✅; осталось: конфиг кластера по окружениям.
 11. ~~**RBAC операторов**~~ ✅ (роли ключей); мультипроект и SSO операторов — открыто.
 12. ~~**Подписки IAP** (продление, grace), WebPush, SMTP-провайдер~~ ✅.
 13. ~~**Схемы player data и миграции**, live-подписки на объекты, вторичные индексы~~ ✅.
