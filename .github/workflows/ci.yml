@@ -34,3 +34,24 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+  bench:
+    # criterion micro-benches (plan 6.2): the last main run is the baseline, >5% slower fails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: restore baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.sha }}
+          restore-keys: criterion-baseline-
+      - run: cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches -- --noplot
+      - run: python3 scripts/bench-compare.py 5
+      - name: save baseline
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.sha }}

@@ -44,6 +44,16 @@ WebSocket ping p50 0.4 ms / p99 2.6 ms — bounded by the default per-account `[
 the server. Run it against your own deployment; numbers from a release build on real hardware are
 the ones that matter.
 
+### Micro-benchmarks (criterion)
+
+Hot paths have criterion benches that run on every push and pull request (`bench` job in
+`.github/workflows/ci.yml`): `musubi-mesh` (handover detection, per-tick advance, cell view, client
+delta at 1k / 10k entities), `musubi-proto` (envelope encode/decode in JSON and postcard) and
+`musubi-auth` (argon2 hash/verify, password policy). The last `main` run is the baseline (restored
+from the Actions cache); `scripts/bench-compare.py 5` fails the job when any bench's mean is more
+than 5 % slower. Locally: `cargo bench -p musubi-mesh -p musubi-proto -p musubi-auth --benches` on the old code, again on
+the new code (criterion keeps the previous run as `base`), then `python3 scripts/bench-compare.py`.
+
 ### Chaos stand (`musubi soak`)
 
 Failover claims are measured the same way latency is. `musubi soak` spawns a real local cluster of
