@@ -34,6 +34,17 @@ enum Cmd {
     },
     /// Apply pending database migrations and exit.
     Migrate,
+    /// Import a Nakama 3.x database (accounts, linked identities, devices, storage, friends,
+    /// groups, leaderboards, wallets, notifications, chat history) into this Musubi database.
+    /// Idempotent: rows already present are kept unless `--replace`.
+    MigrateNakama {
+        /// Postgres/CockroachDB URL of the Nakama database (read only).
+        #[arg(long)]
+        from: String,
+        /// Overwrite rows that already exist here with the Nakama version.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Dump game data (every `musubi` table except runtime state, or `--tables`) as JSONL.
     Export {
         /// Output file (default: stdout).
@@ -206,6 +217,19 @@ async fn main() -> anyhow::Result<()> {
             musubi_server::init_tracing(&cfg);
             let pool = musubi_server::db::connect(&cfg.database).await?;
             musubi_server::db::migrate(&pool).await
+        }
+        Cmd::MigrateNakama { from, replace } => {
+            musubi_server::init_tracing(&cfg);
+            let dst = musubi_server::db::connect(&cfg.database).await?;
+            musubi_server::db::migrate(&dst).await?;
+            let src = sqlx::PgPool::connect(&from)
+                .await
+                .map_err(|e| anyhow::anyhow!("connecting to the Nakama database: {e}"))?;
+            let report = musubi_server::nakama::import(&src, &dst, replace).await?;
+            for (t, c) in &report {
+                eprintln!("{t:<22} written {:<8} kept {}", c.written, c.kept);
+            }
+            Ok(())
         }
         Cmd::Bench {
             url,

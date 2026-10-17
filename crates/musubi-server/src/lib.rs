@@ -15,6 +15,7 @@ pub mod limits;
 pub mod logins;
 pub mod metrics;
 pub mod modules;
+pub mod nakama;
 pub mod notify;
 pub mod openapi;
 pub mod push;

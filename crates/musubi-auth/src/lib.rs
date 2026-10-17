@@ -5,7 +5,7 @@
 //! token stored hashed in `musubi.sessions`. Refresh tokens rotate; reuse of a rotated
 //! token revokes the whole family.
 
-mod password;
+pub mod password;
 mod service;
 pub mod token;
 
