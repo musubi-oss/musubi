@@ -14,6 +14,7 @@ mod leaderboards;
 mod matches;
 mod matchmaker;
 mod notifications;
+pub mod rating;
 mod rpc;
 mod rtc;
 mod storage;
@@ -56,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .merge(cluster::routes())
         .merge(matches::routes())
         .merge(matchmaker::routes())
+        .merge(rating::routes())
         .merge(fleets::routes())
         .merge(worlds::routes())
         .merge(integrations::routes())

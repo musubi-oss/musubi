@@ -116,6 +116,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
+        ratings: musubi_leaderboard::RatingService::new(db.clone()),
         economy: musubi_economy::EconomyService::new(db.clone()),
         matchmaker,
         parties,

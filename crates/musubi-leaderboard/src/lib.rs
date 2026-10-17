@@ -1,6 +1,11 @@
 //! Leaderboards: definitions, score submission with operators, ranked listing and reset windows.
 
+pub mod rating;
 pub mod tournament;
+pub use rating::{
+    MatchResult, Rating, RatingChange, RatingParams, RatingQueue, RatingService, RatingSystem,
+    ResultApplied, UpsertRatingQueue,
+};
 pub use tournament::{CreateTournament, Tournament, TournamentFilter, TournamentService};
 
 use std::str::FromStr;

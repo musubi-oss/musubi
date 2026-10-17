@@ -95,6 +95,7 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         limits: Limits::default(),
         rate: s.limits.clone(),
         chat: s.chat.clone(),
+        ratings: s.ratings.clone(),
         matchmaker: s.matchmaker.clone(),
         parties: s.parties.clone(),
         relayed: s.relayed.clone(),

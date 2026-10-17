@@ -36,6 +36,7 @@ pub struct AppState {
     pub chat: ChatService,
     pub leaderboards: LeaderboardService,
     pub tournaments: TournamentService,
+    pub ratings: musubi_leaderboard::RatingService,
     pub economy: musubi_economy::EconomyService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
@@ -101,6 +102,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let leaderboards = LeaderboardService::new(db.clone());
     let economy = musubi_economy::EconomyService::new(db.clone());
     let tournaments = TournamentService::new(db.clone());
+    let ratings = musubi_leaderboard::RatingService::new(db.clone());
     let hub = Arc::new(Hub::new());
     let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
         fuel: cfg.runtime.fuel,
@@ -467,6 +469,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         chat,
         leaderboards,
         tournaments,
+        ratings,
         economy,
         matchmaker,
         parties,
@@ -605,10 +608,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let st = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut n: u64 = 0;
             loop {
                 tick.tick().await;
                 if !market_lease.held() {
                     continue;
+                }
+                n += 1;
+                // rating decay: every ten minutes, same leader as the market sweep
+                if n % 120 == 0 {
+                    match st.ratings.decay_all().await {
+                        Ok(k) if k > 0 => tracing::info!(ratings = k, "rating decay applied"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "rating decay failed"),
+                    }
                 }
                 match crate::http::economy::settle_market(&st).await {
                     Ok((l, t)) if l + t > 0 => {

@@ -34,6 +34,7 @@ pub struct ConnectParams {
     pub restore: Option<super::resume::ResumeRecord>,
     pub limits: Limits,
     pub chat: ChatService,
+    pub ratings: musubi_leaderboard::RatingService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
@@ -57,6 +58,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         restore,
         limits,
         chat,
+        ratings,
         matchmaker,
         parties,
         relayed,
@@ -79,6 +81,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     let ctx = Ctx {
         hub: &hub,
         chat: &chat,
+        ratings: &ratings,
         matchmaker: &matchmaker,
         parties: &parties,
         relayed: &relayed,
@@ -255,6 +258,7 @@ enum Exit {
 struct Ctx<'a> {
     hub: &'a Hub,
     chat: &'a ChatService,
+    ratings: &'a musubi_leaderboard::RatingService,
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
     relayed: &'a RelayedRegistry,
@@ -494,6 +498,26 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             numeric_properties,
             count_multiple,
         } => {
+            let mut numeric_properties = numeric_properties;
+            // a queue with a rating queue of the same name rates players server-side: fill in
+            // `mmr` from it unless the client sent one (a server-authoritative game can forbid
+            // client values with a before-hook)
+            if let Some(queue) = string_properties.get("queue") {
+                if !numeric_properties.contains_key("mmr") {
+                    match ctx
+                        .ratings
+                        .display_many(queue, &[ctx.presence.account_id])
+                        .await
+                    {
+                        Ok(r) => {
+                            if let Some(v) = r.get(&ctx.presence.account_id) {
+                                numeric_properties.insert("mmr".into(), *v);
+                            }
+                        }
+                        Err(e) => warn!(error = %e, queue, "rating lookup failed"),
+                    }
+                }
+            }
             let me = MatchmakerUser {
                 presence: ctx.presence.clone(),
                 string_properties,

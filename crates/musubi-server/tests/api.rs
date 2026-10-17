@@ -77,6 +77,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         chat: musubi_chat::ChatService::new(db.clone()),
         leaderboards: musubi_leaderboard::LeaderboardService::new(db.clone()),
         tournaments: musubi_leaderboard::TournamentService::new(db.clone()),
+        ratings: musubi_leaderboard::RatingService::new(db.clone()),
         economy: musubi_economy::EconomyService::new(db.clone()),
         matchmaker,
         parties,
@@ -6989,4 +6990,197 @@ async fn order_book_matches_price_time_with_partial_fills_and_trade_hold() {
     assert_eq!(held_of(&inv, &ore), 95, "{inv}");
     let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&alice), None).await;
     assert_eq!(held_of(&inv, &ore), 25, "{inv}");
+}
+
+#[tokio::test]
+async fn rating_queues_elo_glicko_openskill_seasons_and_decay() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..4 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("rt")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, a) = (&users[0].0, &users[0].1);
+    let (_, b) = (&users[1].0, &users[1].1);
+    let (_, c) = (&users[2].0, &users[2].1);
+    let (_, d) = (&users[3].0, &users[3].1);
+    let key = "defaultkey";
+    let q = unique("elo");
+
+    // queue needs a server key; bad params are refused
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/server/rating/queues",
+        Some(ta),
+        Some(json!({"id": q})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/rating/queues",
+        key,
+        Some(json!({"id": q, "params": {"glicko_tau": 9.0}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/rating/queues",
+        key,
+        Some(json!({"id": q, "system": "elo", "params": {"elo_k": 32.0, "placement_games": 2}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["season"], 1);
+
+    // never played → initial rating, not placed
+    let (st, v) = call(&app, "GET", &format!("/v1/rating/{q}"), Some(ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["display"], 1500.0);
+    assert_eq!(v["placed"], false);
+    let (st, _) = call(&app, "GET", "/v1/rating/no-such-queue", Some(ta), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // a beats b: placement K (32 × 2) × 0.5 expected = ±32
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/rating/queues/{q}/results"),
+        key,
+        Some(json!({"teams": [[a], [b]], "match_id": "m1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ch = v["changes"].as_array().unwrap();
+    assert_eq!(ch[0]["after"], 1532.0);
+    assert_eq!(ch[1]["after"], 1468.0);
+    assert_eq!(ch[0]["rating"]["wins"], 1);
+    assert_eq!(ch[1]["rating"]["losses"], 1);
+    // a player in two teams is refused
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/rating/queues/{q}/results"),
+        key,
+        Some(json!({"teams": [[a], [a]]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // 2v2 draw between fresh c,d and a,b: a,b are 1500 on average → nothing moves
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/rating/queues/{q}/results"),
+        key,
+        Some(json!({"teams": [[a, b], [c, d]], "ranks": [1, 1]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    for ch in v["changes"].as_array().unwrap() {
+        assert_eq!(ch["before"], ch["after"], "{ch}");
+        assert_eq!(ch["rating"]["draws"], 1);
+    }
+    // ladder lists only placed players (2 games): a and b, a first
+    let (st, v) = call(&app, "GET", &format!("/v1/rating/{q}/top"), Some(ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let top = v["ratings"].as_array().unwrap();
+    assert_eq!(top.len(), 2, "{v}");
+    assert_eq!(top[0]["account_id"], *a);
+    assert_eq!(top[0]["placed"], true);
+    let (st, v) = call(&app, "GET", &format!("/v1/rating/{q}/{c}"), Some(ta), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["games"], 1);
+    assert_eq!(v["placed"], false);
+
+    // Glicko-2 and OpenSkill queues: winner up, loser down, uncertainty shrinks
+    for (system, id) in [("glicko2", unique("gl")), ("openskill", unique("os"))] {
+        let (st, _) = call_server(
+            &app,
+            "PUT",
+            "/v1/server/rating/queues",
+            key,
+            Some(json!({"id": id, "system": system})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            &format!("/v1/server/rating/queues/{id}/results"),
+            key,
+            Some(json!({"teams": [[a], [b]]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let ch = v["changes"].as_array().unwrap();
+        assert!(ch[0]["after"].as_f64().unwrap() > 1500.0, "{system}: {v}");
+        assert!(ch[1]["after"].as_f64().unwrap() < 1500.0, "{system}: {v}");
+        let init_sigma = if system == "glicko2" {
+            350.0
+        } else {
+            25.0 / 3.0
+        };
+        assert!(
+            ch[0]["rating"]["sigma"].as_f64().unwrap() < init_sigma,
+            "{system}: {v}"
+        );
+        assert!(
+            ch[0]["rating"]["conservative"].as_f64().unwrap()
+                < ch[0]["rating"]["display"].as_f64().unwrap()
+        );
+    }
+
+    // season rollover carries half of the distance from 1500; decay has nothing to do yet
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/rating/queues/{q}/season"),
+        key,
+        Some(json!({"carry": 0.5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["season"], 2);
+    let (_, v) = call(&app, "GET", &format!("/v1/rating/{q}"), Some(ta), None).await;
+    assert_eq!(v["season"], 2);
+    assert_eq!(v["display"], 1516.0);
+    assert_eq!(v["games"], 0);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/rating/queues/{q}/decay"),
+        key,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["decayed"], 0);
+    let (st, v) = call_server(&app, "GET", "/v1/server/rating/queues", key, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(v["queues"].as_array().unwrap().iter().any(|x| x["id"] == q));
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/rating/queues/{q}"),
+        key,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", &format!("/v1/rating/{q}"), Some(ta), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }
