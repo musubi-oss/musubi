@@ -13,12 +13,14 @@ pub mod achievements;
 pub mod iap;
 pub mod mailbox;
 pub mod market;
+pub mod orderbook;
 pub use achievements::Achievement;
 pub use mailbox::{Mail, SendMail};
 pub use market::{
     EscrowItem, Listing, ListingFilter, MarketRules, NewListing, NewTrade, OfferItem, Sale,
     Settled, Trade, TradeSide, WantItem,
 };
+pub use orderbook::{Book, Fill, NewOrder, Order, Placed, Side};
 pub mod progression;
 pub mod quests;
 pub mod seasons;

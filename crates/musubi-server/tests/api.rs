@@ -6589,3 +6589,404 @@ async fn http_hooks_rewrite_and_reject_calls_by_nakama_names() {
     let (st, v) = call(&app, "GET", "/v1/notifications", Some(tok), None).await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
+
+fn balance_of(v: &Value, cur: &str) -> i64 {
+    v["balances"]
+        .as_array()
+        .and_then(|a| a.iter().find(|w| w["currency"] == cur))
+        .and_then(|w| w["balance"].as_i64())
+        .unwrap_or(0)
+}
+
+fn held_of(inv: &Value, item: &str) -> i64 {
+    inv["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["item_id"] == item)
+                .map(|e| e["quantity"].as_i64().unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn order_book_matches_price_time_with_partial_fills_and_trade_hold() {
+    let Some(app) = app_with(|c| c.market.trade_hold_secs = 1).await else {
+        return;
+    };
+    let k = "defaultkey";
+    let mut users = Vec::new();
+    for _ in 0..3 {
+        let (st, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("book")})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        users.push((
+            sess["access_token"].as_str().unwrap().to_string(),
+            sess["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (alice, alice_id) = users[0].clone();
+    let (bob, bob_id) = users[1].clone();
+    let (carol, carol_id) = users[2].clone();
+    let gold = unique("gold");
+    let ore = unique("ore");
+    let relic = unique("relic");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for (id, stackable) in [(&ore, true), (&relic, false)] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/items",
+            k,
+            Some(json!({"id": id, "name": id, "stackable": stackable, "max_stack": 1000})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    for (acc, amount) in [(&bob_id, 10_000), (&carol_id, 1_000)] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/wallet/adjust",
+            k,
+            Some(json!({"account_id": acc, "currency": gold, "delta": amount})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    for (acc, item, qty) in [
+        (&alice_id, &ore, 100),
+        (&carol_id, &ore, 50),
+        (&alice_id, &relic, 1),
+    ] {
+        let (st, g) = call_server(
+            &app,
+            "POST",
+            "/v1/server/inventory/grant",
+            k,
+            Some(json!({"account_id": acc, "item_id": item, "quantity": qty})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{g}");
+    }
+    let place = |tok: String, side: &'static str, price: i64, qty: i64| {
+        let app = app.clone();
+        let ore = ore.clone();
+        let gold = gold.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/v1/market/orders",
+                Some(&tok),
+                Some(json!({"item_id": ore, "currency": gold, "side": side, "price": price, "quantity": qty})),
+            )
+            .await
+        }
+    };
+
+    // Unique items and unknown items are refused up front.
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/market/orders",
+        Some(&alice),
+        Some(
+            json!({"item_id": relic, "currency": gold, "side": "sell", "price": 5, "quantity": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/market/orders",
+        Some(&alice),
+        Some(json!({"item_id": "no-such-item", "currency": gold, "side": "sell", "price": 5, "quantity": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // Three asks: alice 40 @ 10, carol 50 @ 12, alice 30 @ 10 (behind her first one in time).
+    let (st, ask1) = place(alice.clone(), "sell", 10, 40).await;
+    assert_eq!(st, StatusCode::OK, "{ask1}");
+    assert_eq!(ask1["fills"].as_array().unwrap().len(), 0);
+    let (st, ask2) = place(carol.clone(), "sell", 12, 50).await;
+    assert_eq!(st, StatusCode::OK, "{ask2}");
+    let (st, ask3) = place(alice.clone(), "sell", 10, 30).await;
+    assert_eq!(st, StatusCode::OK, "{ask3}");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&alice), None).await;
+    assert_eq!(held_of(&inv, &ore), 30, "70 ore sit in escrow: {inv}");
+    let (st, book) = call(
+        &app,
+        "GET",
+        &format!("/v1/market/book/{ore}?currency={gold}"),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{book}");
+    assert_eq!(book["bids"].as_array().unwrap().len(), 0);
+    assert_eq!(book["asks"][0]["price"], 10);
+    assert_eq!(book["asks"][0]["quantity"], 70);
+    assert_eq!(book["asks"][0]["orders"], 2);
+    assert_eq!(book["asks"][1]["price"], 12);
+    assert!(book["last_price"].is_null());
+
+    // bob buys 60 @ 15: 40 from ask1 then 20 from ask3, both at 10; he pays 600, not 900.
+    let (st, buy1) = place(bob.clone(), "buy", 15, 60).await;
+    assert_eq!(st, StatusCode::OK, "{buy1}");
+    let fills = buy1["fills"].as_array().unwrap();
+    assert_eq!(fills.len(), 2, "{buy1}");
+    assert_eq!(fills[0]["quantity"], 40);
+    assert_eq!(fills[0]["price"], 10);
+    assert_eq!(fills[0]["sell_order_id"], ask1["order"]["id"]);
+    assert_eq!(fills[1]["quantity"], 20);
+    assert_eq!(fills[1]["sell_order_id"], ask3["order"]["id"]);
+    assert_eq!(fills[0]["fee"], 20, "5% of 400");
+    assert_eq!(buy1["order"]["status"], "filled");
+    assert_eq!(buy1["order"]["remaining"], 0);
+    assert_eq!(buy1["order"]["escrow"], 0);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&bob), None).await;
+    assert_eq!(balance_of(&w, &gold), 10_000 - 600, "{w}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&alice), None).await;
+    assert_eq!(
+        balance_of(&w, &gold),
+        600 - 30,
+        "seller gets 600 minus 5%: {w}"
+    );
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&bob), None).await;
+    assert_eq!(held_of(&inv, &ore), 60, "{inv}");
+    let (_, a3) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/market/orders/{}",
+            ask3["order"]["id"].as_str().unwrap()
+        ),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(a3["status"], "open");
+    assert_eq!(a3["remaining"], 10);
+
+    // bob buys 100 @ 11: 10 more from ask3, the other 90 rest as the best bid with 990 escrowed.
+    let (st, buy2) = place(bob.clone(), "buy", 11, 100).await;
+    assert_eq!(st, StatusCode::OK, "{buy2}");
+    assert_eq!(buy2["fills"].as_array().unwrap().len(), 1);
+    assert_eq!(buy2["fills"][0]["quantity"], 10);
+    assert_eq!(buy2["fills"][0]["price"], 10);
+    assert_eq!(buy2["order"]["status"], "open");
+    assert_eq!(buy2["order"]["remaining"], 90);
+    assert_eq!(buy2["order"]["escrow"], 990);
+    let bid_id = buy2["order"]["id"].as_str().unwrap().to_string();
+    let (_, book) = call(
+        &app,
+        "GET",
+        &format!("/v1/market/book/{ore}?currency={gold}"),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(book["bids"][0]["price"], 11);
+    assert_eq!(book["bids"][0]["quantity"], 90);
+    assert_eq!(book["asks"][0]["price"], 12);
+    assert_eq!(book["last_price"], 10);
+    assert_eq!(book["volume_24h"], 70);
+    assert_eq!(book["fills_24h"], 3);
+
+    // carol's 50 ore are escrowed in ask2, so she cannot sell more until she cancels it.
+    let (st, v) = place(carol.clone(), "sell", 11, 20).await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (st, c) = call(
+        &app,
+        "POST",
+        &format!(
+            "/v1/market/orders/{}/cancel",
+            ask2["order"]["id"].as_str().unwrap()
+        ),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["status"], "cancelled");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&carol), None).await;
+    assert_eq!(held_of(&inv, &ore), 50);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!(
+            "/v1/market/orders/{}/cancel",
+            ask2["order"]["id"].as_str().unwrap()
+        ),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // Now she hits bob's bid: 20 @ 11 (the maker's price), bob's bid shrinks to 70 / 770.
+    let (st, sell) = place(carol.clone(), "sell", 11, 20).await;
+    assert_eq!(st, StatusCode::OK, "{sell}");
+    assert_eq!(sell["fills"][0]["quantity"], 20);
+    assert_eq!(sell["fills"][0]["price"], 11);
+    assert_eq!(sell["fills"][0]["buy_order_id"], bid_id);
+    assert_eq!(sell["order"]["status"], "filled");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&carol), None).await;
+    assert_eq!(balance_of(&w, &gold), 1_000 + 220 - 11, "{w}");
+
+    // No self-trading: bob's own cheap ask does not cross his bid.
+    let (st, own) = place(bob.clone(), "sell", 5, 10).await;
+    assert_eq!(st, StatusCode::OK, "{own}");
+    assert_eq!(own["fills"].as_array().unwrap().len(), 0);
+    assert_eq!(own["order"]["status"], "open");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!(
+            "/v1/market/orders/{}/cancel",
+            own["order"]["id"].as_str().unwrap()
+        ),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // Not his order.
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/orders/{bid_id}/cancel"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, c) = call(
+        &app,
+        "POST",
+        &format!("/v1/market/orders/{bid_id}/cancel"),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&bob), None).await;
+    assert_eq!(
+        balance_of(&w, &gold),
+        10_000 - 400 - 200 - 100 - 220,
+        "escrow refunded, only fills paid: {w}"
+    );
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&bob), None).await;
+    assert_eq!(held_of(&inv, &ore), 90, "{inv}");
+    let (_, f) = call(&app, "GET", "/v1/market/fills", Some(&bob), None).await;
+    assert_eq!(f["fills"].as_array().unwrap().len(), 4, "{f}");
+    let (_, mine) = call(
+        &app,
+        "GET",
+        "/v1/market/orders?status=filled",
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(mine["orders"].as_array().unwrap().len(), 1, "{mine}");
+    let (_, mine) = call(&app, "GET", "/v1/market/orders", Some(&bob), None).await;
+    assert_eq!(mine["orders"].as_array().unwrap().len(), 3, "{mine}");
+
+    // Direct trade with the anti-scam hold: alice offers 5 ore for 50 gold.
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&alice), None).await;
+    let stack = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["item_id"] == ore)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let propose = || {
+        let app = app.clone();
+        let alice = alice.clone();
+        let body = json!({"to_account": bob_id, "offer_items": [{"inventory_id": stack, "quantity": 5}], "want_currency": {gold.clone(): 50}});
+        async move { call(&app, "POST", "/v1/trades", Some(&alice), Some(body)).await }
+    };
+    let (st, t) = propose().await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let tid = t["id"].as_str().unwrap().to_string();
+    let (st, t) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{tid}/accept"),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["status"], "hold", "{t}");
+    assert!(t["settle_at"].is_string());
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&bob), None).await;
+    assert_eq!(
+        balance_of(&w, &gold),
+        9_080 - 50,
+        "bob's 50 are escrowed: {w}"
+    );
+    // Either side may back out during the hold; everything returns.
+    let (st, t) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{tid}/cancel"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["status"], "cancelled");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&bob), None).await;
+    assert_eq!(balance_of(&w, &gold), 9_080, "{w}");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&alice), None).await;
+    assert_eq!(held_of(&inv, &ore), 30, "{inv}");
+    // Accept again and let the hold run out: the sweep settles it.
+    let (st, t) = propose().await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let tid = t["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/trades/{tid}/accept"),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (st, r) = call_server(&app, "POST", "/v1/server/market/settle", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (_, t) = call(&app, "GET", &format!("/v1/trades/{tid}"), Some(&bob), None).await;
+    assert_eq!(t["status"], "accepted", "{t}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&alice), None).await;
+    assert_eq!(
+        balance_of(&w, &gold),
+        665 + 50,
+        "70 ore sold at 10 minus 5%, plus the trade: {w}"
+    );
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&bob), None).await;
+    assert_eq!(held_of(&inv, &ore), 95, "{inv}");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&alice), None).await;
+    assert_eq!(held_of(&inv, &ore), 25, "{inv}");
+}

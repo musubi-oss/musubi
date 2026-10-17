@@ -205,6 +205,11 @@ pub struct Trade {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
+    /// When a trade in `hold` settles (anti-scam delay); None otherwise.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub settle_at: Option<OffsetDateTime>,
+    /// What the recipient has put in escrow by accepting (filled while in `hold`).
+    pub want_escrow: TradeSide,
 }
 
 type TradeRow = (
@@ -216,9 +221,12 @@ type TradeRow = (
     String,
     OffsetDateTime,
     OffsetDateTime,
+    Option<OffsetDateTime>,
+    Value,
 );
 
-const TRADE_COLS: &str = "id, from_id, to_id, offer, want, status, created_at, expires_at";
+const TRADE_COLS: &str =
+    "id, from_id, to_id, offer, want, status, created_at, expires_at, settle_at, want_escrow";
 
 impl TryFrom<TradeRow> for Trade {
     type Error = Error;
@@ -232,6 +240,8 @@ impl TryFrom<TradeRow> for Trade {
             status: r.5,
             created_at: r.6,
             expires_at: r.7,
+            settle_at: r.8,
+            want_escrow: serde_json::from_value(r.9).map_err(Error::internal)?,
         })
     }
 }
@@ -244,6 +254,9 @@ pub struct MarketRules {
     pub default_listing_secs: i64,
     pub trade_ttl_secs: i64,
     pub anti_snipe_secs: i64,
+    /// Anti-scam hold: an accepted direct trade settles this many seconds later, both sides
+    /// escrowed, either side free to back out (0 = settle on accept).
+    pub trade_hold_secs: i64,
 }
 
 impl Default for MarketRules {
@@ -254,15 +267,16 @@ impl Default for MarketRules {
             default_listing_secs: 24 * 3600,
             trade_ttl_secs: 24 * 3600,
             anti_snipe_secs: 60,
+            trade_hold_secs: 0,
         }
     }
 }
 
-fn fee_for(price: i64, fee_bps: i64) -> i64 {
+pub(crate) fn fee_for(price: i64, fee_bps: i64) -> i64 {
     (price.saturating_mul(fee_bps.clamp(0, 10_000))) / 10_000
 }
 
-fn check_amount(v: i64, what: &str) -> Result<()> {
+pub(crate) fn check_amount(v: i64, what: &str) -> Result<()> {
     if v <= 0 {
         return Err(Error::InvalidArgument(format!("{what} must be positive")));
     }
@@ -396,7 +410,10 @@ impl EconomyService {
         Ok(out)
     }
 
-    async fn currency_exists_tx(tx: &mut Transaction<'_, Postgres>, code: &str) -> Result<()> {
+    pub(crate) async fn currency_exists_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        code: &str,
+    ) -> Result<()> {
         let c: Option<(String,)> =
             sqlx::query_as("select code from musubi.currencies where code = $1")
                 .bind(code)
@@ -1006,7 +1023,15 @@ impl EconomyService {
     }
 
     /// Recipient accepts: their side is taken, both sides are delivered, all in one transaction.
-    pub async fn accept_trade(&self, me: AccountId, id: Uuid) -> Result<Trade> {
+    /// Recipient accepts: their side is taken into escrow and, with `trade_hold_secs` 0, both
+    /// sides are delivered at once. With a hold the trade sits in `hold` until `settle_at`
+    /// (`settle_trades`), and either party may still cancel it.
+    pub async fn accept_trade(
+        &self,
+        me: AccountId,
+        id: Uuid,
+        rules: &MarketRules,
+    ) -> Result<Trade> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let t = Self::lock_trade_tx(&mut tx, id).await?;
         if t.to_id != me {
@@ -1034,24 +1059,56 @@ impl EconomyService {
                 serde_json::json!({ "trade_id": id, "to": t.from_id.0 }),
             )
             .await?;
+        }
+        if rules.trade_hold_secs > 0 {
+            let escrow = TradeSide {
+                items: taken,
+                currency: t.want.currency.clone(),
+            };
+            let row: TradeRow = sqlx::query_as(&format!(
+                "update musubi.trades set status = 'hold', settle_at = $2, want_escrow = $3 where id = $1 returning {TRADE_COLS}"
+            ))
+            .bind(id)
+            .bind(OffsetDateTime::now_utc() + time::Duration::seconds(rules.trade_hold_secs))
+            .bind(serde_json::to_value(&escrow).map_err(Error::internal)?)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            tx.commit().await.map_err(Error::internal)?;
+            return row.try_into();
+        }
+        let t = Self::deliver_trade_tx(&mut tx, &t, &taken).await?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(t)
+    }
+
+    /// Both sides change hands: the recipient's escrow (`taken` + the wanted currency already
+    /// debited) goes to the proposer, the proposer's offer to the recipient.
+    async fn deliver_trade_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        t: &Trade,
+        taken: &[EscrowItem],
+    ) -> Result<Trade> {
+        let id = t.id;
+        for (c, a) in &t.want.currency {
             Self::adjust_tx(
-                &mut tx,
+                tx,
                 t.from_id,
                 c,
                 *a,
                 "trade.receive",
                 &id.to_string(),
                 Some(&format!("trade.receive:{id}:{c}")),
-                serde_json::json!({ "trade_id": id, "from": me.0 }),
+                serde_json::json!({ "trade_id": id, "from": t.to_id.0 }),
             )
             .await?;
         }
-        Self::grant_escrow_tx(&mut tx, t.from_id, &taken).await?;
-        Self::grant_escrow_tx(&mut tx, me, &t.offer.items).await?;
+        Self::grant_escrow_tx(tx, t.from_id, taken).await?;
+        Self::grant_escrow_tx(tx, t.to_id, &t.offer.items).await?;
         for (c, a) in &t.offer.currency {
             Self::adjust_tx(
-                &mut tx,
-                me,
+                tx,
+                t.to_id,
                 c,
                 *a,
                 "trade.receive",
@@ -1061,12 +1118,41 @@ impl EconomyService {
             )
             .await?;
         }
-        let t = Self::close_trade_tx(&mut tx, id, "accepted").await?;
-        tx.commit().await.map_err(Error::internal)?;
-        Ok(t)
+        Self::close_trade_tx(tx, id, "accepted").await
     }
 
-    /// Recipient declines or proposer cancels a pending trade; the escrow goes back.
+    /// Deliver every held trade whose hold has run out (the market sweep).
+    pub async fn settle_trades(&self, now: OffsetDateTime, limit: i64) -> Result<Vec<Trade>> {
+        let due: Vec<(Uuid,)> = sqlx::query_as(
+            "select id from musubi.trades where status = 'hold' and settle_at <= $1 order by settle_at limit $2",
+        )
+        .bind(now)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut out = Vec::new();
+        for (id,) in due {
+            let mut tx = self.db.begin().await.map_err(Error::internal)?;
+            let row: Option<TradeRow> = sqlx::query_as(&format!(
+                "select {TRADE_COLS} from musubi.trades where id = $1 and status = 'hold' and settle_at <= $2
+                 for update skip locked"
+            ))
+            .bind(id)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            let Some(row) = row else { continue };
+            let t: Trade = row.try_into()?;
+            let t = Self::deliver_trade_tx(&mut tx, &t, &t.want_escrow.items.clone()).await?;
+            tx.commit().await.map_err(Error::internal)?;
+            out.push(t);
+        }
+        Ok(out)
+    }
+
+    /// Recipient declines or proposer cancels a pending or held trade; every escrow goes back.
     pub async fn close_trade(&self, me: AccountId, id: Uuid) -> Result<Trade> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let t = Self::lock_trade_tx(&mut tx, id).await?;
@@ -1077,10 +1163,26 @@ impl EconomyService {
         } else {
             return Err(Error::PermissionDenied("not your trade".into()));
         };
-        if t.status != "pending" {
+        if t.status != "pending" && t.status != "hold" {
             return Err(Error::Conflict(format!("trade is {}", t.status)));
         }
         Self::return_offer_tx(&mut tx, &t, "trade.refund").await?;
+        if t.status == "hold" {
+            Self::grant_escrow_tx(&mut tx, t.to_id, &t.want_escrow.items).await?;
+            for (c, a) in &t.want_escrow.currency {
+                Self::adjust_tx(
+                    &mut tx,
+                    t.to_id,
+                    c,
+                    *a,
+                    "trade.refund",
+                    &id.to_string(),
+                    Some(&format!("trade.refund:{id}:{c}")),
+                    serde_json::json!({ "trade_id": id }),
+                )
+                .await?;
+            }
+        }
         let t = Self::close_trade_tx(&mut tx, id, status).await?;
         tx.commit().await.map_err(Error::internal)?;
         Ok(t)

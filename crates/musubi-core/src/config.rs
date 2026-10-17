@@ -598,6 +598,9 @@ pub struct MarketConfig {
     pub trade_ttl_secs: i64,
     /// Bids in the last `anti_snipe_secs` push the deadline out to that many seconds.
     pub anti_snipe_secs: i64,
+    /// Anti-scam hold for direct trades: an accepted trade settles this many seconds later with
+    /// both sides escrowed, and either side may still cancel (0 = settle on accept).
+    pub trade_hold_secs: i64,
 }
 
 impl Default for MarketConfig {
@@ -608,6 +611,7 @@ impl Default for MarketConfig {
             default_listing_secs: 24 * 3600,
             trade_ttl_secs: 24 * 3600,
             anti_snipe_secs: 60,
+            trade_hold_secs: 0,
         }
     }
 }
