@@ -1,11 +1,17 @@
-//! Mobile push: FCM HTTP v1 (service-account OAuth) and APNs (token auth). A notification that
+//! Push: FCM HTTP v1 (service-account OAuth), APNs (token auth) and Web Push (RFC 8030 + 8291
+//! aes128gcm, VAPID). A notification that
 //! reaches no live session of the account is pushed to every registered device token; tokens the
 //! provider reports as gone are deleted.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+use base64::Engine;
+use ring::rand::SecureRandom;
+use ring::signature::KeyPair;
+use ring::{aead, agreement, hkdf, signature};
 use std::time::{Duration, Instant};
 
-use musubi_core::config::PushConfig;
+use musubi_core::config::{PushConfig, WebPushConfig};
 use musubi_core::{AccountId, Error, Result};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -15,11 +21,25 @@ pub struct Push {
     db: PgPool,
     http: reqwest::Client,
     fcm_token: Mutex<Option<(String, Instant)>>,
+    webpush: OnceLock<WebPushKeys>,
+}
+
+pub struct WebPushKeys {
+    key: signature::EcdsaKeyPair,
+    public: Vec<u8>,
+    subject: String,
+    ttl_secs: u64,
+}
+
+struct Subscription {
+    endpoint: String,
+    p256dh: Vec<u8>,
+    auth: Vec<u8>,
 }
 
 impl Push {
     pub fn new(cfg: PushConfig, db: PgPool) -> Self {
-        Self {
+        let p = Self {
             cfg,
             db,
             http: reqwest::Client::builder()
@@ -27,18 +47,62 @@ impl Push {
                 .build()
                 .expect("reqwest client"),
             fcm_token: Mutex::new(None),
+            webpush: OnceLock::new(),
+        };
+        if !p.cfg.webpush.vapid_private_key_pem.is_empty() {
+            if let Err(e) = p.set_webpush(&p.cfg.webpush.clone()) {
+                tracing::error!(error = %e, "webpush disabled");
+            }
         }
+        p
+    }
+
+    /// Install VAPID keys (also used by tests to enable Web Push after construction).
+    pub fn set_webpush(&self, cfg: &WebPushConfig) -> Result<()> {
+        let pkcs8 = pem_der(&cfg.vapid_private_key_pem)?;
+        let rng = ring::rand::SystemRandom::new();
+        let key = signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &pkcs8,
+            &rng,
+        )
+        .map_err(|_| {
+            Error::InvalidArgument(
+                "push.webpush.vapid_private_key_pem: not a PKCS#8 P-256 private key".into(),
+            )
+        })?;
+        let public = key.public_key().as_ref().to_vec();
+        self.webpush
+            .set(WebPushKeys {
+                key,
+                public,
+                subject: cfg.subject.clone(),
+                ttl_secs: cfg.ttl_secs,
+            })
+            .map_err(|_| Error::Conflict("webpush keys already set".into()))
+    }
+
+    /// base64url VAPID public key for `PushManager.subscribe({applicationServerKey})`.
+    pub fn vapid_public_key(&self) -> Option<String> {
+        self.webpush
+            .get()
+            .map(|k| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&k.public))
     }
 
     pub fn enabled(&self) -> bool {
-        !self.cfg.fcm.project_id.is_empty() || !self.cfg.apns.key_id.is_empty()
+        !self.cfg.fcm.project_id.is_empty()
+            || !self.cfg.apns.key_id.is_empty()
+            || self.webpush.get().is_some()
     }
 
     pub async fn register(&self, account: AccountId, platform: &str, token: &str) -> Result<()> {
-        if !matches!(platform, "fcm" | "apns") {
+        if !matches!(platform, "fcm" | "apns" | "webpush") {
             return Err(Error::InvalidArgument(
-                "platform must be fcm or apns".into(),
+                "platform must be fcm, apns or webpush".into(),
             ));
+        }
+        if platform == "webpush" {
+            parse_subscription(token)?;
         }
         if token.is_empty() || token.len() > 4096 {
             return Err(Error::InvalidArgument(
@@ -109,6 +173,10 @@ impl Push {
                 "apns" if !self.cfg.apns.key_id.is_empty() => {
                     self.apns(&token, title, data, code).await
                 }
+                "webpush" => match self.webpush.get() {
+                    Some(k) => self.webpush(k, &token, title, data, code).await,
+                    None => continue,
+                },
                 _ => continue,
             };
             match res {
@@ -250,5 +318,248 @@ impl Push {
             return Ok(false);
         }
         Err(Error::Internal(format!("apns send: {status} {body}")))
+    }
+    /// Ok(false) = subscription is gone (404 / 410).
+    async fn webpush(
+        &self,
+        k: &WebPushKeys,
+        token: &str,
+        title: &str,
+        data: &Value,
+        code: i32,
+    ) -> Result<bool> {
+        let sub = parse_subscription(token)?;
+        let payload = json!({ "title": title, "code": code, "data": data }).to_string();
+        if payload.len() > 3_900 {
+            return Err(Error::InvalidArgument(
+                "webpush payload must stay under 3900 bytes".into(),
+            ));
+        }
+        let body = encrypt(&sub, payload.as_bytes())?;
+        let auth = vapid(k, &sub.endpoint)?;
+        let res = self
+            .http
+            .post(&sub.endpoint)
+            .header("authorization", auth)
+            .header("content-encoding", "aes128gcm")
+            .header("content-type", "application/octet-stream")
+            .header("ttl", k.ttl_secs.to_string())
+            .header("urgency", "normal")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("webpush send: {e}")))?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if matches!(status.as_u16(), 404 | 410) {
+            return Ok(false);
+        }
+        let body = res.text().await.unwrap_or_default();
+        Err(Error::Internal(format!("webpush send: {status} {body}")))
+    }
+}
+
+fn pem_der(pem: &str) -> Result<Vec<u8>> {
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .map(str::trim)
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|e| Error::InvalidArgument(format!("vapid key pem: {e}")))
+}
+
+fn b64url(s: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.trim_end_matches('='))
+        .map_err(|e| Error::InvalidArgument(format!("webpush key: {e}")))
+}
+
+/// Token = the browser's `PushSubscription.toJSON()`: endpoint + p256dh (65-byte point) + auth (16).
+fn parse_subscription(token: &str) -> Result<Subscription> {
+    let v: Value = serde_json::from_str(token).map_err(|_| {
+        Error::InvalidArgument("webpush token must be the PushSubscription JSON".into())
+    })?;
+    let endpoint = v["endpoint"].as_str().unwrap_or("");
+    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+        return Err(Error::InvalidArgument(
+            "webpush subscription needs an http(s) endpoint".into(),
+        ));
+    }
+    let key = |k: &str| -> Result<Vec<u8>> {
+        v["keys"][k]
+            .as_str()
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!("webpush subscription: keys.{k} missing"))
+            })
+            .and_then(b64url)
+    };
+    let p256dh = key("p256dh")?;
+    let auth = key("auth")?;
+    if p256dh.len() != 65 || p256dh[0] != 4 {
+        return Err(Error::InvalidArgument(
+            "webpush subscription: p256dh must be an uncompressed P-256 point".into(),
+        ));
+    }
+    if auth.len() != 16 {
+        return Err(Error::InvalidArgument(
+            "webpush subscription: auth must be 16 bytes".into(),
+        ));
+    }
+    Ok(Subscription {
+        endpoint: endpoint.to_string(),
+        p256dh,
+        auth,
+    })
+}
+
+struct Len(usize);
+
+impl hkdf::KeyType for Len {
+    fn len(&self) -> usize {
+        self.0
+    }
+}
+
+fn expand(prk: &hkdf::Prk, info: &[u8], n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n];
+    prk.expand(&[info], Len(n))
+        .and_then(|okm| okm.fill(&mut out))
+        .expect("hkdf expand");
+    out
+}
+
+/// RFC 8291 §3 key derivation + RFC 8188 single-record aes128gcm body (salt | rs | idlen | as_public | ciphertext).
+pub(crate) fn encrypt_record(
+    ua_public: &[u8],
+    auth: &[u8],
+    as_public: &[u8],
+    ecdh_secret: &[u8],
+    salt: &[u8; 16],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let prk_key = hkdf::Salt::new(hkdf::HKDF_SHA256, auth).extract(ecdh_secret);
+    let mut info = b"WebPush: info\0".to_vec();
+    info.extend_from_slice(ua_public);
+    info.extend_from_slice(as_public);
+    let ikm = expand(&prk_key, &info, 32);
+    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(&ikm);
+    let cek = expand(&prk, b"Content-Encoding: aes128gcm\0", 16);
+    let nonce = expand(&prk, b"Content-Encoding: nonce\0", 12);
+    let key = aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::AES_128_GCM, &cek)
+            .map_err(|_| Error::Internal("webpush: cek".into()))?,
+    );
+    let mut record = plaintext.to_vec();
+    record.push(2);
+    key.seal_in_place_append_tag(
+        aead::Nonce::try_assume_unique_for_key(&nonce)
+            .map_err(|_| Error::Internal("webpush: nonce".into()))?,
+        aead::Aad::empty(),
+        &mut record,
+    )
+    .map_err(|_| Error::Internal("webpush: seal".into()))?;
+    let mut out = Vec::with_capacity(21 + as_public.len() + record.len());
+    out.extend_from_slice(salt);
+    out.extend_from_slice(&4096u32.to_be_bytes());
+    out.push(as_public.len() as u8);
+    out.extend_from_slice(as_public);
+    out.extend_from_slice(&record);
+    Ok(out)
+}
+
+fn encrypt(sub: &Subscription, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let rng = ring::rand::SystemRandom::new();
+    let as_private = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
+        .map_err(|_| Error::Internal("webpush: keygen".into()))?;
+    let as_public = as_private
+        .compute_public_key()
+        .map_err(|_| Error::Internal("webpush: keygen".into()))?
+        .as_ref()
+        .to_vec();
+    let peer = agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, &sub.p256dh);
+    let secret = agreement::agree_ephemeral(as_private, &peer, |s| s.to_vec())
+        .map_err(|_| Error::InvalidArgument("webpush: bad p256dh key".into()))?;
+    let mut salt = [0u8; 16];
+    rng.fill(&mut salt)
+        .map_err(|_| Error::Internal("webpush: salt".into()))?;
+    encrypt_record(
+        &sub.p256dh,
+        &sub.auth,
+        &as_public,
+        &secret,
+        &salt,
+        plaintext,
+    )
+}
+
+/// `Authorization: vapid t=<ES256 JWT aud=origin, exp=+12h, sub>, k=<public key>` (RFC 8292).
+fn vapid(k: &WebPushKeys, endpoint: &str) -> Result<String> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|e| Error::InvalidArgument(format!("webpush endpoint: {e}")))?;
+    let aud = url.origin().ascii_serialization();
+    let exp = time::OffsetDateTime::now_utc().unix_timestamp() + 12 * 3600;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = b64.encode(br#"{"typ":"JWT","alg":"ES256"}"#);
+    let claims = b64.encode(json!({ "aud": aud, "exp": exp, "sub": k.subject }).to_string());
+    let input = format!("{header}.{claims}");
+    let rng = ring::rand::SystemRandom::new();
+    let sig = k
+        .key
+        .sign(&rng, input.as_bytes())
+        .map_err(|_| Error::Internal("webpush: vapid sign".into()))?;
+    Ok(format!(
+        "vapid t={input}.{}, k={}",
+        b64.encode(sig.as_ref()),
+        b64.encode(&k.public)
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(s: &str) -> Vec<u8> {
+        b64url(s).unwrap()
+    }
+
+    /// RFC 8291 §5 worked example.
+    #[test]
+    fn rfc8291_vector() {
+        let ua_public = d("BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4");
+        let auth = d("BTBZMqHH6r4Tts7J_aSIgg");
+        let as_public = d("BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8");
+        let ecdh_secret = d("kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs");
+        let salt: [u8; 16] = d("DGv6ra1nlYgDCS1FRnbzlw").try_into().unwrap();
+        let body = encrypt_record(
+            &ua_public,
+            &auth,
+            &as_public,
+            &ecdh_secret,
+            &salt,
+            b"When I grow up, I want to be a watermelon",
+        )
+        .unwrap();
+        let expect = d("DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN");
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&body),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expect)
+        );
+    }
+
+    #[test]
+    fn subscription_parsing() {
+        let good = json!({"endpoint": "https://push.example/abc", "keys": {"p256dh": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4", "auth": "BTBZMqHH6r4Tts7J_aSIgg"}});
+        assert!(parse_subscription(&good.to_string()).is_ok());
+        assert!(parse_subscription("not json").is_err());
+        let mut bad = good.clone();
+        bad["keys"]["auth"] = json!("c2hvcnQ");
+        assert!(parse_subscription(&bad.to_string()).is_err());
+        let mut bad = good.clone();
+        bad["endpoint"] = json!("ftp://x");
+        assert!(parse_subscription(&bad.to_string()).is_err());
     }
 }

@@ -54,6 +54,7 @@ pub struct Config {
     pub social: SocialConfig,
     pub tracing: TracingConfig,
     pub push: PushConfig,
+    pub email: EmailConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1045,6 +1046,7 @@ impl Default for TracingConfig {
 pub struct PushConfig {
     pub fcm: FcmConfig,
     pub apns: ApnsConfig,
+    pub webpush: WebPushConfig,
 }
 
 /// Firebase Cloud Messaging HTTP v1 with a service account; empty project_id = off.
@@ -1106,6 +1108,72 @@ impl MetricsConfig {
                     ip == a
                 }
             })
+    }
+}
+
+/// Web Push (RFC 8030/8291, VAPID): browsers and PWAs. Empty key = off. The key is a PKCS#8 PEM
+/// P-256 private key (`openssl ecparam -name prime256v1 -genkey | openssl pkcs8 -topk8 -nocrypt`);
+/// clients fetch the matching public key from `GET /v1/account/push_tokens`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebPushConfig {
+    pub vapid_private_key_pem: String,
+    /// `mailto:` or https URL the push service may contact about this sender.
+    pub subject: String,
+    /// How long the push service keeps an undelivered message.
+    pub ttl_secs: u64,
+}
+
+impl Default for WebPushConfig {
+    fn default() -> Self {
+        Self {
+            vapid_private_key_pem: String::new(),
+            subject: "mailto:ops@example.com".into(),
+            ttl_secs: 86_400,
+        }
+    }
+}
+
+/// Outgoing e-mail over SMTP for `account.email_verification` / `account.password_reset`. Empty
+/// host = off (the events still reach webhooks and modules for a game-side mailer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmailConfig {
+    pub host: String,
+    pub port: u16,
+    /// `starttls` (587), `implicit` (465) or `none` (plain, for local relays/tests).
+    pub tls: String,
+    pub username: String,
+    pub password: String,
+    pub from: String,
+    pub from_name: String,
+    /// Name announced in EHLO.
+    pub helo: String,
+    pub timeout_secs: u64,
+    /// Page that completes verification, `{token}` substituted; empty = the mail carries the token.
+    pub verify_url: String,
+    /// Page that completes a password reset, `{token}` substituted.
+    pub reset_url: String,
+    /// Product name used in subjects.
+    pub product: String,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 587,
+            tls: "starttls".into(),
+            username: String::new(),
+            password: String::new(),
+            from: "no-reply@localhost".into(),
+            from_name: String::new(),
+            helo: "musubi".into(),
+            timeout_secs: 15,
+            verify_url: String::new(),
+            reset_url: String::new(),
+            product: "Musubi".into(),
+        }
     }
 }
 

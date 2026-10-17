@@ -336,12 +336,15 @@ async fn push_tokens(
     State(s): State<AppState>,
     Bearer(me): Bearer,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(
-        json!({ "tokens": push_of(&s)?.list(me.account_id).await? }),
-    ))
+    let push = push_of(&s)?;
+    Ok(Json(json!({
+        "tokens": push.list(me.account_id).await?,
+        "vapid_public_key": push.vapid_public_key(),
+    })))
 }
 
-/// Register a device token (`fcm` or `apns`) for the caller; re-registering moves it over.
+/// Register a device token (`fcm`, `apns`) or a Web Push subscription (`webpush`, token = the
+/// `PushSubscription` JSON) for the caller; re-registering moves it over.
 async fn push_register(
     State(s): State<AppState>,
     Bearer(me): Bearer,

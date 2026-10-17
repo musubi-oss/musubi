@@ -9975,3 +9975,366 @@ async fn iap_subscription_redeem_shows_active() {
     assert_eq!(mine["kind"], "subscription", "{prods}");
     assert_eq!(mine["grace_secs"], 86400);
 }
+
+#[tokio::test]
+async fn smtp_mailer_sends_verification_and_reset() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    use base64::Engine;
+    let expect_auth = std::sync::Arc::new(format!(
+        "AUTH PLAIN {}",
+        base64::engine::general_purpose::STANDARD.encode(b"\0user\0pass")
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<String>, String)>();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (tx, expect_auth) = (tx.clone(), expect_auth.clone());
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                let mut s = BufReader::new(sock);
+                s.write_all(b"220 mock ESMTP\r\n").await.unwrap();
+                let (mut cmds, mut data, mut in_data) = (Vec::new(), String::new(), false);
+                loop {
+                    let mut line = String::new();
+                    if s.read_line(&mut line).await.unwrap() == 0 {
+                        break;
+                    }
+                    if in_data {
+                        if line == ".\r\n" {
+                            in_data = false;
+                            s.write_all(b"250 queued\r\n").await.unwrap();
+                        } else {
+                            data.push_str(&line);
+                        }
+                        continue;
+                    }
+                    let cmd = line.trim_end().to_string();
+                    cmds.push(cmd.clone());
+                    let reply: &[u8] = if cmd.starts_with("EHLO") {
+                        b"250-mock\r\n250 AUTH PLAIN\r\n"
+                    } else if cmd.starts_with("AUTH PLAIN") {
+                        if cmd == *expect_auth {
+                            b"235 ok\r\n"
+                        } else {
+                            b"535 no\r\n"
+                        }
+                    } else if cmd == "DATA" {
+                        in_data = true;
+                        b"354 go\r\n"
+                    } else if cmd == "QUIT" {
+                        let _ = s.write_all(b"221 bye\r\n").await;
+                        break;
+                    } else {
+                        b"250 ok\r\n"
+                    };
+                    s.write_all(reply).await.unwrap();
+                }
+                let _ = tx.send((cmds, data));
+            });
+        }
+    });
+    state
+        .events
+        .set_mailer(std::sync::Arc::new(musubi_integrations::Mailer::new(
+            musubi_core::config::EmailConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: "none".into(),
+                username: "user".into(),
+                password: "pass".into(),
+                from: "no-reply@musubi.test".into(),
+                from_name: "Test Game".into(),
+                verify_url: "https://game.test/verify?t={token}".into(),
+                product: "TestGame".into(),
+                ..Default::default()
+            },
+        )));
+    let router = musubi_server::http::router(state.clone());
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let email = format!("u-{suffix}@musubi.test");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/auth/email",
+        None,
+        false,
+        Some(json!({"email": email, "password": "correct horse battery"})),
+    )
+    .await;
+    assert!(st == 200 || st == 201, "{st} {r}");
+    let ta = r["access_token"].as_str().unwrap().to_string();
+
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/auth/email/verify/request",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["verified"], false);
+    let (cmds, data) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("mail within 10 s")
+        .unwrap();
+    assert!(
+        cmds.iter().any(|c| c == "MAIL FROM:<no-reply@musubi.test>"),
+        "{cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|c| *c == format!("RCPT TO:<{email}>")),
+        "{cmds:?}"
+    );
+    assert!(cmds.iter().any(|c| c.starts_with("AUTH PLAIN")), "{cmds:?}");
+    assert!(
+        data.contains("Subject: TestGame: confirm your e-mail"),
+        "{data}"
+    );
+    assert!(
+        data.contains("From: Test Game <no-reply@musubi.test>"),
+        "{data}"
+    );
+    let marker = "https://game.test/verify?t=";
+    let at = data.find(marker).expect("link in mail") + marker.len();
+    let token: String = data[at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    assert!(!token.is_empty());
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/auth/email/verify",
+        Some(&ta),
+        false,
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        "/v1/auth/email/verify/request",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(r["verified"], true, "{r}");
+
+    // reset: no page configured → the mail carries the bare token
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/auth/email/reset/request",
+        None,
+        false,
+        Some(json!({"email": email})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (_, data) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("reset mail within 10 s")
+        .unwrap();
+    assert!(
+        data.contains("Subject: TestGame: reset your password"),
+        "{data}"
+    );
+    assert!(data.contains("code to reset your password"), "{data}");
+}
+
+#[tokio::test]
+async fn webpush_delivers_encrypted_notification_and_drops_gone_subscriptions() {
+    use base64::Engine;
+    use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        &rng,
+    )
+    .unwrap();
+    let pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref())
+    );
+    let push = std::sync::Arc::new(musubi_server::push::Push::new(
+        musubi_core::config::PushConfig::default(),
+        state.db.clone(),
+    ));
+    push.set_webpush(&musubi_core::config::WebPushConfig {
+        vapid_private_key_pem: pem,
+        subject: "mailto:ops@musubi.test".into(),
+        ttl_secs: 60,
+    })
+    .unwrap();
+    state.notify = state.notify.with_push(push);
+    // mock push service: /ok records the request, /gone says the subscription expired
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(axum::http::HeaderMap, Vec<u8>)>();
+    let app = axum::Router::new()
+        .route(
+            "/ok",
+            axum::routing::post(move |h: axum::http::HeaderMap, b: axum::body::Bytes| {
+                let tx = tx.clone();
+                async move {
+                    tx.send((h, b.to_vec())).unwrap();
+                    axum::http::StatusCode::CREATED
+                }
+            }),
+        )
+        .route(
+            "/gone",
+            axum::routing::post(|| async { axum::http::StatusCode::GONE }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let ua_private = EphemeralPrivateKey::generate(&ECDH_P256, &rng).unwrap();
+    let ua_public = ua_private.compute_public_key().unwrap().as_ref().to_vec();
+    let mut auth = [0u8; 16];
+    ring::rand::SecureRandom::fill(&rng, &mut auth).unwrap();
+    let sub = |path: &str| {
+        json!({"endpoint": format!("{base}{path}"), "keys": {"p256dh": b64.encode(&ua_public), "auth": b64.encode(auth)}}).to_string()
+    };
+
+    let router = musubi_server::http::router(state.clone());
+    let (ta, acc) = token(&router).await;
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        "/v1/account/push_tokens",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let vapid_public = r["vapid_public_key"].as_str().unwrap().to_string();
+    assert_eq!(b64.decode(&vapid_public).unwrap().len(), 65);
+    for path in ["/ok", "/gone"] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            "/v1/account/push_tokens",
+            Some(&ta),
+            false,
+            Some(json!({"platform": "webpush", "token": sub(path)})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/account/push_tokens",
+        Some(&ta),
+        false,
+        Some(
+            json!({"platform": "webpush", "token": "{\"endpoint\": \"https://x\", \"keys\": {}}"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+
+    // nobody is online for this account → the notification is pushed
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/notifications",
+        None,
+        true,
+        Some(json!({"user_id": acc, "subject": "hello", "content": {"k": 1}, "code": 7})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (headers, body) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("push within 10 s")
+        .unwrap();
+    assert_eq!(headers["content-encoding"], "aes128gcm");
+    assert_eq!(headers["ttl"], "60");
+    let authz = headers["authorization"].to_str().unwrap().to_string();
+    assert!(authz.starts_with("vapid t="), "{authz}");
+    assert!(authz.ends_with(&format!(", k={vapid_public}")), "{authz}");
+    let jwt = authz["vapid t=".len()..].split(',').next().unwrap();
+    let claims: Value =
+        serde_json::from_slice(&b64.decode(jwt.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert_eq!(claims["aud"], base);
+    assert_eq!(claims["sub"], "mailto:ops@musubi.test");
+
+    // decrypt as the browser would (RFC 8291)
+    assert!(body.len() > 86);
+    assert_eq!(body[20], 65);
+    let (salt, as_public, mut ct) = (&body[..16], &body[21..86], body[86..].to_vec());
+    let secret = agree_ephemeral(
+        ua_private,
+        &UnparsedPublicKey::new(&ECDH_P256, as_public),
+        |s| s.to_vec(),
+    )
+    .unwrap();
+    struct L(usize);
+    impl ring::hkdf::KeyType for L {
+        fn len(&self) -> usize {
+            self.0
+        }
+    }
+    let hk = |prk: &ring::hkdf::Prk, info: &[u8], n: usize| {
+        let mut out = vec![0u8; n];
+        prk.expand(&[info], L(n)).unwrap().fill(&mut out).unwrap();
+        out
+    };
+    let prk_key = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &auth).extract(&secret);
+    let mut info = b"WebPush: info\0".to_vec();
+    info.extend_from_slice(&ua_public);
+    info.extend_from_slice(as_public);
+    let ikm = hk(&prk_key, &info, 32);
+    let prk = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt).extract(&ikm);
+    let cek = hk(&prk, b"Content-Encoding: aes128gcm\0", 16);
+    let nonce = hk(&prk, b"Content-Encoding: nonce\0", 12);
+    let key = ring::aead::LessSafeKey::new(
+        ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &cek).unwrap(),
+    );
+    let pt = key
+        .open_in_place(
+            ring::aead::Nonce::try_assume_unique_for_key(&nonce).unwrap(),
+            ring::aead::Aad::empty(),
+            &mut ct,
+        )
+        .unwrap();
+    assert_eq!(*pt.last().unwrap(), 2);
+    let msg: Value = serde_json::from_slice(&pt[..pt.len() - 1]).unwrap();
+    assert_eq!(msg["title"], "hello");
+    assert_eq!(msg["code"], 7);
+    assert_eq!(msg["data"]["k"], 1);
+
+    // the 410 subscription is dropped
+    let mut left = 2;
+    for _ in 0..50 {
+        let (_, r) = http_json(
+            &router,
+            "GET",
+            "/v1/account/push_tokens",
+            Some(&ta),
+            false,
+            None,
+        )
+        .await;
+        left = r["tokens"].as_array().unwrap().len();
+        if left == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(left, 1);
+}

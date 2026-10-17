@@ -18,3 +18,7 @@ base64.workspace = true
 time.workspace = true
 x509-parser.workspace = true
 ring.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true

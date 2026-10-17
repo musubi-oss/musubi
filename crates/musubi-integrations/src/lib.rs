@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use musubi_core::{Error, Result};
 
+pub mod email;
 pub mod iap;
+pub use email::{Mail, Mailer};
 pub use iap::{AppleStoreClient, GooglePlayClient, SteamClient, SteamInitTxn, StoreTransaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

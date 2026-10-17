@@ -468,6 +468,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }
         None => None,
     };
+    let mailer = (!cfg.email.host.is_empty())
+        .then(|| Arc::new(musubi_integrations::Mailer::new(cfg.email.clone())));
     let state = AppState {
         audit: crate::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
@@ -475,6 +477,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             let e = crate::events::Events::new(db.clone());
             if let Some(l) = &liveops {
                 e.set_liveops(l.clone());
+            }
+            if let Some(m) = &mailer {
+                e.set_mailer(m.clone());
             }
             Arc::new(e)
         },

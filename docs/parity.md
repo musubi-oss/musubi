@@ -36,7 +36,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Login queue при лимите онлайна | ✅ `POST /v1/auth/queue` (гейт в выдаче сессии) | ✅ | ❌ | ❌ | 🟡 |
 | Линковка / слияние аккаунтов | ✅ link/unlink, `POST /v1/account/merge` с журналом | ✅ | ✅ (link) | ✅ | ✅ |
 | Сессии: refresh-семейства, revoke, device list, IP | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Отправка e-mail (verify/reset) | 🟡 событие `email.*` в шину → вебхук/модуль; SMTP-провайдера нет | 🟡 | ❌ | ✅ | ✅ |
+| Отправка e-mail (verify/reset) | ✅ `[email]` SMTP (STARTTLS/implicit/none, AUTH PLAIN) в `musubi-integrations/email.rs`, события `email.sent/failed`; плюс событие в шину для своего мейлера | 🟡 | ❌ | ✅ | ✅ |
 | Хранилище объектов (коллекции, права, версии, TTL) | ✅ `musubi-storage` | ✅ player data | ✅ | ✅ | ✅ |
 | Запросы по полям | ✅ `list_where` (фильтр по JSON-полям) | 🟡 | 🟡 | ❌ | ❌ |
 | Вторичные индексы / full-text | ❌ | ❌ | 🟡 | ❌ | ❌ |
@@ -54,7 +54,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Пати, лобби, ready, команды | ✅ parties (home-node) + `/v1/lobbies` | ✅ | ✅ | ✅ | ✅ |
 | Уведомления in-app | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Push FCM / APNs | ✅ `push.rs` | ❌ | ❌ | ✅ | ❌ |
-| WebPush | ❌ | ❌ | ❌ | ❌ | ❌ |
+| WebPush | ✅ `push.rs`: RFC 8030/8291 aes128gcm + VAPID, `platform: webpush` в `/v1/account/push_tokens` | ❌ | ❌ | ❌ | ❌ |
 | UGC (моды, карты, скины) | ❌ | ❌ | ❌ | ✅ | ✅ |
 | GDPR export / delete с retention | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Возраст / родительский контроль / COPPA, приватность профиля | ❌ | ✅ | ❌ | 🟡 | ✅ |
@@ -161,7 +161,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 9. ~~**Мешинг IV — кросс-ячеечные транзакции и авто-выгрузка холодных ячеек**~~ ✅
 10. **Окружения и версии контента/конфига**: ~~контент-бандлы с diff/историей/откатом~~ ✅; осталось: версии item definitions с миграцией инвентарей, конфиг кластера по окружениям.
 11. ~~**RBAC операторов**~~ ✅ (роли ключей); мультипроект и SSO операторов — открыто.
-12. ~~**Подписки IAP** (продление, grace)~~ ✅; WebPush, SMTP-провайдер — открыто.
+12. ~~**Подписки IAP** (продление, grace), WebPush, SMTP-провайдер~~ ✅.
 13. **Схемы player data и миграции**, live-подписки на объекты, вторичные индексы.
 14. **Брекеты турниров**, крафт, UGC.
 15. **Античит-сигналы**: серверная валидация ввода в authoritative-матчах, интеграция EAC/BattlEye.

@@ -28,6 +28,46 @@ pub struct Events {
     /// LiveOps (Zanshin) sink: every account-bound event is also tracked there.
     liveops:
         std::sync::Arc<std::sync::OnceLock<std::sync::Arc<musubi_integrations::ZanshinClient>>>,
+    /// SMTP sink for `account.email_verification` / `account.password_reset`.
+    mailer: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<musubi_integrations::Mailer>>>,
+}
+
+/// Which events become mail: (template, to, subject, text).
+fn mail_for(
+    m: &musubi_integrations::Mailer,
+    kind: &str,
+    p: &Value,
+) -> Option<(&'static str, String, String, String)> {
+    let to = p["email"].as_str()?.to_string();
+    let token = p["token"].as_str()?;
+    let c = m.config();
+    let minutes = (p["expires_in_secs"].as_i64().unwrap_or(0) / 60).max(1);
+    let (template, subject, action, link) = match kind {
+        "account.email_verification" => (
+            "verify",
+            format!("{}: confirm your e-mail", c.product),
+            "confirm your e-mail address",
+            musubi_integrations::Mailer::link(&c.verify_url, token),
+        ),
+        "account.password_reset" => (
+            "reset",
+            format!("{}: reset your password", c.product),
+            "reset your password",
+            musubi_integrations::Mailer::link(&c.reset_url, token),
+        ),
+        _ => return None,
+    };
+    let text = match link {
+        Some(l) => format!(
+            "Open this link to {action} for {}:\n\n{l}\n\nIt is valid for {minutes} minutes. If you did not request this, ignore this message.\n",
+            c.product
+        ),
+        None => format!(
+            "Your {} code to {action}:\n\n{token}\n\nIt is valid for {minutes} minutes. If you did not request this, ignore this message.\n",
+            c.product
+        ),
+    };
+    Some((template, to, subject, text))
 }
 
 fn backoff(attempts: i32) -> Duration {
@@ -58,12 +98,18 @@ impl Events {
                 .build()
                 .expect("reqwest client"),
             liveops: Default::default(),
+            mailer: Default::default(),
         }
     }
 
     /// Forward account-bound events to LiveOps as analytics events (`external_id` = account id).
     pub fn set_liveops(&self, c: std::sync::Arc<musubi_integrations::ZanshinClient>) {
         let _ = self.liveops.set(c);
+    }
+
+    /// Send verification / reset mails over SMTP (in addition to the event itself).
+    pub fn set_mailer(&self, m: std::sync::Arc<musubi_integrations::Mailer>) {
+        let _ = self.mailer.set(m);
     }
 
     /// Record an event and queue it for every subscribed webhook. Never fails the caller's
@@ -76,6 +122,41 @@ impl Events {
     ) -> Option<Uuid> {
         if let (Some(l), Some(a)) = (self.liveops.get(), account) {
             l.track(&a.to_string(), kind, payload.clone());
+        }
+        if let Some(m) = self.mailer.get() {
+            if let Some(mail) = mail_for(m, kind, &payload) {
+                let (m, ev, acct) = (m.clone(), self.clone(), account);
+                tokio::spawn(async move {
+                    let (template, to, subject, text) = mail;
+                    let res = m
+                        .send(musubi_integrations::Mail {
+                            to: &to,
+                            subject: &subject,
+                            text: &text,
+                        })
+                        .await;
+                    match res {
+                        Ok(()) => {
+                            let _ = ev
+                                .emit_inner(
+                                    "email.sent",
+                                    acct,
+                                    json!({ "to": to, "template": template }),
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(template, error = %e, "mail failed");
+                            let _ = ev.emit_inner(
+                                "email.failed",
+                                acct,
+                                json!({ "to": to, "template": template, "error": e.to_string() }),
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
         }
         match self.emit_inner(kind, account, payload).await {
             Ok(id) => Some(id),
