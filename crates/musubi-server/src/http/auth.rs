@@ -79,13 +79,6 @@ fn authenticated(s: &AppState, sess: &Session, provider: &'static str) {
             .await;
         });
     }
-    if let Some(l) = &s.liveops {
-        l.track(
-            &sess.account_id.to_string(),
-            "musubi.authenticated",
-            serde_json::json!({ "provider": provider, "created": sess.created }),
-        );
-    }
     if !s.runtime.has_hook("hook_authenticated") {
         return;
     }

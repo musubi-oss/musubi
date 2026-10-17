@@ -460,7 +460,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let state = AppState {
         audit: crate::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
-        events: Arc::new(crate::events::Events::new(db.clone())),
+        events: {
+            let e = crate::events::Events::new(db.clone());
+            if let Some(l) = &liveops {
+                e.set_liveops(l.clone());
+            }
+            Arc::new(e)
+        },
         banned: Arc::new(crate::bans::Bans::default()),
         keys: Arc::new(crate::keys::ServerKeys::default()),
         logins,

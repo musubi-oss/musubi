@@ -16,13 +16,19 @@ use crate::app::AppState;
 pub struct ServerHost {
     state: AppState,
     handle: tokio::runtime::Handle,
+    /// LiveOps answers per (account, op, names), good for `LIVEOPS_TTL`.
+    liveops_cache: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
 }
+
+/// How long a module sees the same flags / live events for one account.
+pub const LIVEOPS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Install on the state's runtime; call once the state is complete.
 pub fn install(state: &AppState) {
     state.runtime.set_host(Arc::new(ServerHost {
         state: state.clone(),
         handle: tokio::runtime::Handle::current(),
+        liveops_cache: Default::default(),
     }));
 }
 
@@ -151,6 +157,38 @@ impl ServerHost {
                     }])
                     .await?;
                 Ok(json!({ "sent": true }))
+            }
+            "liveops.flags" | "liveops.live_events" => {
+                let op = str_field(&req, "op")?.to_string();
+                let l = s
+                    .liveops
+                    .clone()
+                    .ok_or_else(|| Error::NotFound("liveops (zanshin) not configured".into()))?;
+                let acc = account(&req, ctx)?;
+                let names: Vec<String> = req["names"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let key = format!("{op}|{acc}|{}", names.join(","));
+                let now = std::time::Instant::now();
+                if let Some((at, v)) = self.liveops_cache.lock().unwrap().get(&key) {
+                    if now.duration_since(*at) < LIVEOPS_TTL {
+                        return Ok(v.clone());
+                    }
+                }
+                let v = if op == "liveops.flags" {
+                    l.flags(&acc.to_string(), &names).await?
+                } else {
+                    l.live_events(&acc.to_string()).await?
+                };
+                let mut cache = self.liveops_cache.lock().unwrap();
+                cache.retain(|_, (at, _)| now.duration_since(*at) < LIVEOPS_TTL);
+                cache.insert(key, (now, v.clone()));
+                Ok(v)
             }
             other => Err(Error::InvalidArgument(format!("unknown host op `{other}`"))),
         }

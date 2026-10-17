@@ -2822,19 +2822,27 @@ async fn zanshin_and_aurix_integrations() {
     let (upstream, seen) = mock_upstreams().await;
     let liveops = musubi_integrations::ZanshinClient::new(&upstream, "zk_s_test");
     state.liveops = Some(liveops.clone());
+    state.events.set_liveops(liveops.clone());
     state.voice = Some(musubi_integrations::AurixClient::new(&upstream, "ak_test"));
     let router = musubi_server::http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     let r = router.clone();
     tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
-    // authentication is tracked as an analytics event
+    // authentication reaches LiveOps through the event bus (emitted asynchronously)
     let (ta, acc) = token(&router).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(liveops.flush().await, 1);
+    let mut flushed = 0;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        flushed += liveops.flush().await;
+        if flushed > 0 {
+            break;
+        }
+    }
+    assert_eq!(flushed, 1);
     let ev = seen.lock().unwrap().clone();
     assert_eq!(ev[0]["external_id"], acc.to_string());
-    assert_eq!(ev[0]["events"][0]["name"], "musubi.authenticated");
+    assert_eq!(ev[0]["events"][0]["name"], "account.authenticated");
     // flags are evaluated for the caller's identity
     let req = Request::get("/v1/liveops/flags?names=new_map")
         .header(header::AUTHORIZATION, format!("Bearer {ta}"))

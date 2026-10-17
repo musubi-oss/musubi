@@ -25,6 +25,9 @@ pub const MAX_ATTEMPTS: i32 = 12;
 pub struct Events {
     db: PgPool,
     http: reqwest::Client,
+    /// LiveOps (Zanshin) sink: every account-bound event is also tracked there.
+    liveops:
+        std::sync::Arc<std::sync::OnceLock<std::sync::Arc<musubi_integrations::ZanshinClient>>>,
 }
 
 fn backoff(attempts: i32) -> Duration {
@@ -54,7 +57,13 @@ impl Events {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
+            liveops: Default::default(),
         }
+    }
+
+    /// Forward account-bound events to LiveOps as analytics events (`external_id` = account id).
+    pub fn set_liveops(&self, c: std::sync::Arc<musubi_integrations::ZanshinClient>) {
+        let _ = self.liveops.set(c);
     }
 
     /// Record an event and queue it for every subscribed webhook. Never fails the caller's
@@ -65,6 +74,9 @@ impl Events {
         account: Option<AccountId>,
         payload: Value,
     ) -> Option<Uuid> {
+        if let (Some(l), Some(a)) = (self.liveops.get(), account) {
+            l.track(&a.to_string(), kind, payload.clone());
+        }
         match self.emit_inner(kind, account, payload).await {
             Ok(id) => Some(id),
             Err(e) => {

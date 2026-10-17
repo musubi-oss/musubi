@@ -65,6 +65,12 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     let schedules = Arc::new(musubi_server::schedules::Schedules::from_config(
         &cfg.runtime,
     ));
+    let liveops = cfg.zanshin.url.as_deref().map(|u| {
+        let c = musubi_integrations::ZanshinClient::new(u, &cfg.zanshin.server_key);
+        c.clone()
+            .spawn_flusher(std::time::Duration::from_millis(200));
+        c
+    });
     let state = AppState {
         audit: musubi_server::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
@@ -96,7 +102,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         relayed,
         matches: test_matches(&db, &runtime),
         worlds: worlds.clone(),
-        liveops: None,
+        liveops: liveops.clone(),
         voice: None,
         rtc: None,
         apple_iap: None,
@@ -108,7 +114,13 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         fleets: fleets.clone(),
         fanout,
         hub,
-        events: Arc::new(musubi_server::events::Events::new(db.clone())),
+        events: {
+            let e = musubi_server::events::Events::new(db.clone());
+            if let Some(l) = &liveops {
+                e.set_liveops(l.clone());
+            }
+            Arc::new(e)
+        },
         banned: Arc::new(musubi_server::bans::Bans::default()),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
@@ -8660,4 +8672,101 @@ async fn account_merge_folds_guest_into_main() {
     // B is gone
     let (st, _) = call(&app, "GET", "/v1/account/me", Some(tb), None).await;
     assert_ne!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn liveops_receives_bus_events_and_flags() {
+    use axum::body::Bytes;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    // fake Zanshin: records every request, answers flags
+    let seen: StdArc<StdMutex<Vec<(String, String, Value)>>> = Default::default();
+    let seen2 = seen.clone();
+    let mock = axum::Router::new().fallback(
+        move |method: axum::http::Method, uri: axum::http::Uri, body: Bytes| {
+            let seen = seen2.clone();
+            async move {
+                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                seen.lock()
+                    .unwrap()
+                    .push((method.to_string(), uri.to_string(), v));
+                if uri.path().ends_with("/flags") {
+                    axum::Json(json!({ "flags": [{ "name": "new_ui", "enabled": true }] }))
+                } else {
+                    axum::Json(json!({ "accepted": true }))
+                }
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let Some(app) = app_with(|c| {
+        c.zanshin.url = Some(url.clone());
+        c.zanshin.server_key = "k".into();
+    })
+    .await
+    else {
+        return;
+    };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("lo")})),
+    )
+    .await;
+    let t = s["access_token"].as_str().unwrap().to_string();
+    let acc = s["account_id"].as_str().unwrap().to_string();
+    // the bus event reaches Zanshin as an analytics event for that account
+    let mut got = None;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let found = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, p, b)| {
+                m == "POST"
+                    && p.ends_with("/server/v1/events")
+                    && b["external_id"] == acc
+                    && b["events"]
+                        .as_array()
+                        .is_some_and(|e| e.iter().any(|e| e["name"] == "account.authenticated"))
+            })
+            .cloned();
+        if found.is_some() {
+            got = found;
+            break;
+        }
+    }
+    let (_, _, body) = got.unwrap_or_else(|| {
+        panic!(
+            "account.authenticated not forwarded to liveops; seen: {:?}",
+            seen.lock().unwrap()
+        )
+    });
+    let ev = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "account.authenticated")
+        .unwrap();
+    assert_eq!(ev["metadata"]["provider"], "device", "{body}");
+    // flags still answered through the proxy endpoint
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/liveops/flags?names=new_ui",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["flags"][0]["name"], "new_ui", "{v}");
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, p, _)| m == "GET" && p.contains("/server/v1/flags") && p.contains(&acc)));
 }
