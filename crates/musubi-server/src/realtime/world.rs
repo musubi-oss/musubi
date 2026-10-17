@@ -1954,6 +1954,11 @@ impl WorldRegistry {
                 .execute(db)
                 .await
                 .map_err(Error::internal)?;
+            sqlx::query("delete from musubi.world_cold_cells where name = $1")
+                .bind(name)
+                .execute(db)
+                .await
+                .map_err(Error::internal)?;
         }
         self.publish_home(name, None).await;
         Ok(())
