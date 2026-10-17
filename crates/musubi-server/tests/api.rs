@@ -12461,3 +12461,129 @@ async fn content_bundle_export_import_diff_rollback() {
     let (st, _) = call_server(&app, "GET", "/v1/admin/content/versions/999999999", k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// Operator roles: a support key moderates players but cannot touch content; a liveops key
+/// imports content but cannot ban; neither issues keys; a server key stays out of `/v1/admin/`.
+#[tokio::test]
+async fn operator_roles_scope_admin_writes() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut keys = std::collections::HashMap::new();
+    for role in ["support", "liveops", "ops", "server"] {
+        let (st, r) = call_server(
+            &app,
+            "POST",
+            "/v1/admin/keys",
+            k,
+            Some(json!({"name": format!("{role}-key"), "role": role})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        keys.insert(role, r["secret"].as_str().unwrap().to_string());
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": format!("role-target-{}", uuid::Uuid::now_v7().simple())})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, me) = call(
+        &app,
+        "GET",
+        "/v1/account/me",
+        v["access_token"].as_str(),
+        None,
+    )
+    .await;
+    let target = me["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{me}"))
+        .to_string();
+    // every operator role reads
+    for role in ["support", "liveops", "ops"] {
+        let (st, _) =
+            call_server(&app, "GET", "/v1/admin/accounts?q=role", &keys[role], None).await;
+        assert_eq!(st, StatusCode::OK, "{role} must read");
+        let (st, _) = call_server(&app, "GET", "/v1/admin/content", &keys[role], None).await;
+        assert_eq!(st, StatusCode::OK, "{role} must read");
+    }
+    // support: ban yes, content no, keys no
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{target}/ban"),
+        &keys["support"],
+        Some(json!({"until_secs": 60, "reason": "test"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        &keys["support"],
+        Some(json!({"bundle": {"format": 1, "tables": {}}, "dry_run": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{r}");
+    assert!(
+        r["message"].as_str().unwrap_or("").contains("support"),
+        "{r}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/keys",
+        &keys["support"],
+        Some(json!({"name": "escalate", "role": "admin"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // liveops: content yes, ban no
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        &keys["liveops"],
+        Some(json!({"bundle": {"format": 1, "tables": {}}, "dry_run": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{target}/ban"),
+        &keys["liveops"],
+        Some(json!({"until_secs": 60})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // ops: worlds yes, ban no
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/worlds",
+        &keys["ops"],
+        Some(json!({"name": format!("ops-{}", uuid::Uuid::now_v7().simple())})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{target}/ban"),
+        &keys["ops"],
+        Some(json!({"until_secs": 60})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // server keys never enter the admin surface
+    let (st, _) = call_server(&app, "GET", "/v1/admin/accounts", &keys["server"], None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, r) = call_server(&app, "GET", "/v1/admin/keys", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(r.to_string().contains("liveops"), "{r}");
+}

@@ -43,11 +43,13 @@ impl FromRequestParts<AppState> for ServerKey {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let caller = check_server_key(state, &parts.headers)?;
-        if parts.uri.path().starts_with("/v1/admin/") && caller.role != crate::keys::Role::Admin {
+        if !caller.role.allows(parts.method.as_str(), parts.uri.path()) {
             return Err(Error::PermissionDenied(format!(
-                "key '{}' has role {}, admin required",
+                "key '{}' has role {}: {} {} is outside its scope",
                 caller.name,
-                caller.role.as_str()
+                caller.role.as_str(),
+                parts.method,
+                parts.uri.path()
             ))
             .into());
         }

@@ -29,23 +29,99 @@ const TOUCH_EVERY: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// Game servers and trusted services: everything outside `/v1/admin/`.
     Server,
+    /// Everything.
     Admin,
+    /// Player support and moderation: reads everything; writes accounts, bans, reports, login queue.
+    Support,
+    /// LiveOps: reads everything; writes content bundles, economy and competition definitions.
+    Liveops,
+    /// Operations: reads everything; writes fleets, worlds, cluster, webhooks.
+    Ops,
 }
+
+/// Write prefixes of the scoped operator roles (any method other than GET/HEAD).
+const SUPPORT_WRITES: &[&str] = &[
+    "/v1/admin/accounts/",
+    "/v1/admin/reports",
+    "/v1/admin/auth/queue",
+    "/v1/admin/chat/",
+    "/v1/server/chat/",
+    "/v1/server/friends/",
+    "/v1/server/mail",
+    "/v1/server/notifications",
+];
+const LIVEOPS_WRITES: &[&str] = &[
+    "/v1/admin/content",
+    "/v1/server/currencies",
+    "/v1/server/items",
+    "/v1/server/inventory/",
+    "/v1/server/wallet/",
+    "/v1/server/rewards",
+    "/v1/server/progression",
+    "/v1/server/quests",
+    "/v1/server/seasons",
+    "/v1/server/store",
+    "/v1/server/entitlements",
+    "/v1/server/grant_limits",
+    "/v1/server/rating/",
+    "/v1/server/leaderboards",
+    "/v1/server/tournaments",
+    "/v1/server/mail",
+    "/v1/server/notifications",
+];
+const OPS_WRITES: &[&str] = &[
+    "/v1/admin/fleets",
+    "/v1/admin/worlds",
+    "/v1/admin/cluster",
+    "/v1/admin/webhooks",
+    "/v1/admin/integrations",
+    "/v1/server/fleets",
+    "/v1/server/worlds",
+    "/v1/server/builds",
+];
 
 impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Server => "server",
             Role::Admin => "admin",
+            Role::Support => "support",
+            Role::Liveops => "liveops",
+            Role::Ops => "ops",
         }
     }
     fn parse(s: &str) -> Option<Self> {
         match s {
             "server" => Some(Role::Server),
             "admin" => Some(Role::Admin),
+            "support" => Some(Role::Support),
+            "liveops" => Some(Role::Liveops),
+            "ops" => Some(Role::Ops),
             _ => None,
         }
+    }
+
+    /// May a key with this role perform `method` on `path`? Admin may do anything, a server key
+    /// anything outside `/v1/admin/`; operator roles read everything and write their own area.
+    pub fn allows(self, method: &str, path: &str) -> bool {
+        let read = matches!(method, "GET" | "HEAD");
+        let writes: &[&str] = match self {
+            Role::Admin => return true,
+            Role::Server => return !path.starts_with("/v1/admin/"),
+            Role::Support => SUPPORT_WRITES,
+            Role::Liveops => LIVEOPS_WRITES,
+            Role::Ops => OPS_WRITES,
+        };
+        if read {
+            return true;
+        }
+        // keys are issued by admins only, whatever the caller's area
+        if path.starts_with("/v1/admin/keys") {
+            return false;
+        }
+        writes.iter().any(|p| path.starts_with(p))
     }
 }
 
