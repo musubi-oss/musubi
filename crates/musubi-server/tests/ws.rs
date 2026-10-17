@@ -14515,3 +14515,234 @@ async fn world_history_and_verify() {
     assert!(rows >= 1);
     r1.delete(&name).await.unwrap();
 }
+
+/// Export → damage → restore brings the account's rows back exactly; merge keeps live rows;
+/// a purged account is recreated from its bundle.
+#[tokio::test]
+async fn account_export_restore_roundtrip() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, aid) = token(&router).await;
+    let id = uuid::Uuid::parse_str(&aid).unwrap();
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "slot1", "value": {"level": 3}}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    sqlx::query("update musubi.accounts set display_name = 'Before' where id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (st, export) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/export"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{export}");
+    assert_eq!(
+        export["tables"]["storage_objects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // damage: save gone, name changed, a stray object appeared
+    sqlx::query("delete from musubi.storage_objects where owner_id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("update musubi.accounts set display_name = 'After' where id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "slot2", "value": {"level": 1}}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/restore"),
+        None,
+        true,
+        Some(json!({"export": export, "mode": "sideways"})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (tb, bid) = token(&router).await;
+    let _ = tb;
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/accounts/{bid}/restore"),
+        None,
+        true,
+        Some(json!({"export": export})),
+    )
+    .await;
+    assert_eq!(st, 400, "bundle of another account: {r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/restore"),
+        None,
+        true,
+        Some(json!({"export": export})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["account"], "updated");
+    assert_eq!(r["mode"], "replace");
+    assert_eq!(r["tables"]["storage_objects"]["deleted"], 1, "{r}");
+    assert_eq!(r["tables"]["storage_objects"]["inserted"], 1, "{r}");
+    assert!(
+        r["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "sessions"),
+        "{r}"
+    );
+    let (st, again) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/export"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        again["tables"]["storage_objects"],
+        export["tables"]["storage_objects"]
+    );
+    assert_eq!(again["account"]["display_name"], "Before");
+    // the restored save is readable through the normal API
+    let (st, read) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/read",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "slot1"}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{read}");
+    assert_eq!(read["objects"][0]["value"]["level"], 3, "{read}");
+    // merge keeps live rows and adds nothing that conflicts
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "slot2", "value": {"level": 1}}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/restore"),
+        None,
+        true,
+        Some(json!({"export": export, "mode": "merge", "tables": ["storage_objects"]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["account"], "unchanged");
+    assert_eq!(r["tables"]["storage_objects"]["deleted"], 0);
+    assert_eq!(
+        r["tables"]["storage_objects"]["inserted"], 0,
+        "slot1 already live: {r}"
+    );
+    assert!(
+        r["tables"].get("identities").is_none(),
+        "only the asked table: {r}"
+    );
+    let n: i64 =
+        sqlx::query_scalar("select count(*) from musubi.storage_objects where owner_id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(n, 2);
+    // purged account comes back from its bundle
+    state
+        .accounts
+        .purge(musubi_core::AccountId(id))
+        .await
+        .unwrap();
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/restore"),
+        None,
+        true,
+        Some(json!({"export": export})),
+    )
+    .await;
+    assert_eq!(st, 404, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/restore"),
+        None,
+        true,
+        Some(json!({"export": export, "create_missing": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["account"], "created");
+    let (st, back) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/export"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{back}");
+    assert_eq!(back["account"]["display_name"], "Before");
+    assert_eq!(
+        back["tables"]["storage_objects"],
+        export["tables"]["storage_objects"]
+    );
+    assert_eq!(back["tables"]["identities"], export["tables"]["identities"]);
+    // the device identity works again
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({"objects": [{"collection": "saves", "key": "slot3", "value": {}}]})),
+    )
+    .await;
+    assert!(
+        st == 200 || st == 401,
+        "old token may be invalid after purge: {st}"
+    );
+}

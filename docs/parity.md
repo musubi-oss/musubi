@@ -20,7 +20,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Скоуп-ключи сервер/админ | ✅ `server_keys` role server\|admin, аудит мутаций | ✅ | 🟡 один HTTP key | ✅ | ✅ |
 | RBAC операторов консоли (роли, SSO операторов) | ✅ роли ключей server / admin / support / liveops / ops (чтение всем, запись по области, 403 с маршрутом); SSO операторов через любой OIDC (`[operators.sso]`: группы → роль, домены, короткоживущие ключи) | ✅ | ❌ / ✅ | ✅ | ✅ |
 | Квоты и rate-limit per key / per account | 🟡 лимиты auth/ip, storage per-user; per-key нет | ✅ | ❌ | ✅ | ✅ |
-| Бэкап / restore данных игрока точечно | 🟡 export JSON (`/v1/admin/accounts/{id}/export`), restore нет | 🟡 | ❌ | ✅ | 🟡 |
+| Бэкап / restore данных игрока точечно | ✅ export JSON (`/v1/admin/accounts/{id}/export`) + `POST …/restore {export, tables?, mode: replace|merge, create_missing}` — построчный restore тех же таблиц в одной транзакции, воссоздание purged-аккаунта | 🟡 | ❌ | ✅ | 🟡 |
 
 ## 2. Идентичность, данные, социалка
 

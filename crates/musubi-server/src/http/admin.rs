@@ -84,6 +84,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/accounts/{id}/unban", post(unban))
         .route("/v1/admin/accounts/{id}/kick", post(kick))
         .route("/v1/admin/accounts/{id}/export", get(export))
+        .route("/v1/admin/accounts/{id}/restore", post(restore))
         .route("/v1/admin/accounts/{id}/sessions", get(sessions))
         .route(
             "/v1/admin/accounts/{id}/identities/{provider}/{subject}",
@@ -391,6 +392,62 @@ async fn export(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(s.accounts.export(AccountId(id)).await?))
+}
+
+#[derive(Deserialize)]
+struct RestoreBody {
+    export: Value,
+    /// Restore only these tables of the bundle (default: every known table it contains and the
+    /// account row; list `account` to include the row explicitly).
+    tables: Option<Vec<String>>,
+    /// `replace` (default) clears the account's rows of each restored table first; `merge`
+    /// keeps live rows and adds the missing ones.
+    #[serde(default = "default_restore_mode")]
+    mode: String,
+    /// Recreate the account row from the bundle when it was purged.
+    #[serde(default)]
+    create_missing: bool,
+}
+
+fn default_restore_mode() -> String {
+    "replace".into()
+}
+
+/// Point-in-time restore from an export bundle (see `AccountService::restore`).
+async fn restore(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(b): Json<RestoreBody>,
+) -> Result<Json<Value>, ApiError> {
+    let replace = match b.mode.as_str() {
+        "replace" => true,
+        "merge" => false,
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "mode must be replace or merge, not {other}"
+            ))
+            .into())
+        }
+    };
+    let out = s
+        .accounts
+        .restore(
+            AccountId(id),
+            &b.export,
+            b.tables.as_deref(),
+            replace,
+            b.create_missing,
+        )
+        .await?;
+    s.events
+        .emit(
+            "account.restored",
+            Some(AccountId(id)),
+            json!({ "mode": b.mode, "tables": out["tables"], "account": out["account"] }),
+        )
+        .await;
+    Ok(Json(out))
 }
 
 async fn purge_account(

@@ -744,6 +744,146 @@ impl AccountService {
         Ok(serde_json::json!({ "account": account, "tables": tables }))
     }
 
+    /// Point-in-time restore from an `export` bundle (support tooling: "roll my save back",
+    /// undo a bad purge). Tables are restored row by row through `jsonb_populate_record`, so
+    /// the bundle format is the export format; `replace` first clears the account's rows of each
+    /// restored table, `merge` keeps existing rows and adds the missing ones (conflicts on keys
+    /// leave the live row). `sessions` are never restored (their secrets are stripped on
+    /// export); unknown tables are skipped and reported. The account row itself is updated from
+    /// `account` (every column but `id`/`created_at`; with an explicit `tables` list only when
+    /// it names `account`) or recreated when it is gone and `create_missing` is set. One
+    /// transaction: a failing row rolls everything back.
+    pub async fn restore(
+        &self,
+        id: AccountId,
+        bundle: &serde_json::Value,
+        tables: Option<&[String]>,
+        replace: bool,
+        create_missing: bool,
+    ) -> Result<serde_json::Value> {
+        let Some(bundle_tables) = bundle.get("tables").and_then(|t| t.as_object()) else {
+            return Err(Error::InvalidArgument(
+                "bundle has no `tables` (use the output of the account export)".into(),
+            ));
+        };
+        if let Some(acc) = bundle.get("account").filter(|a| !a.is_null()) {
+            if acc.get("id").and_then(|v| v.as_str()) != Some(&id.0.to_string()) {
+                return Err(Error::InvalidArgument(
+                    "bundle `account.id` does not match the account being restored".into(),
+                ));
+            }
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from musubi.accounts where id = $1)")
+                .bind(id.0)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+        let mut out = serde_json::Map::new();
+        let mut account_action = "unchanged";
+        // with an explicit table list the account row is restored only when "account" is listed
+        let account_wanted = tables.is_none_or(|ts| ts.iter().any(|t| t == "account"));
+        let account = bundle
+            .get("account")
+            .filter(|a| a.is_object() && account_wanted);
+        match (exists, account) {
+            (true, Some(acc)) => {
+                let cols: Vec<String> = sqlx::query_scalar(
+                    "select column_name::text from information_schema.columns where table_schema = 'musubi' and table_name = 'accounts' and column_name not in ('id', 'created_at') order by ordinal_position",
+                )
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+                let sets: Vec<String> = cols
+                    .iter()
+                    .filter(|c| acc.get(c.as_str()).is_some())
+                    .map(|c| format!("\"{c}\" = r.\"{c}\""))
+                    .collect();
+                if !sets.is_empty() {
+                    sqlx::query(&format!(
+                        "update musubi.accounts a set {} from jsonb_populate_record(null::musubi.accounts, $1) r where a.id = $2",
+                        sets.join(", ")
+                    ))
+                    .bind(acc)
+                    .bind(id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(Error::internal)?;
+                    account_action = "updated";
+                }
+            }
+            (false, Some(acc)) if create_missing => {
+                sqlx::query(
+                    "insert into musubi.accounts select * from jsonb_populate_record(null::musubi.accounts, $1)",
+                )
+                .bind(acc)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+                account_action = "created";
+            }
+            (false, _) => return Err(Error::NotFound("account".into())),
+            (true, None) => {}
+        }
+        let mut skipped: Vec<String> = Vec::new();
+        let wanted = |t: &str| tables.is_none_or(|ts| ts.iter().any(|x| x == t));
+        for name in bundle_tables.keys() {
+            let known = ACCOUNT_TABLES.iter().any(|(t, _)| t == name);
+            if !known || name == "sessions" || !wanted(name) {
+                if wanted(name) {
+                    skipped.push(name.clone());
+                }
+                continue;
+            }
+        }
+        let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (table, col) in ACCOUNT_TABLES {
+            if *table == "sessions" || !wanted(table) || !done.insert(table) {
+                continue;
+            }
+            let Some(rows) = bundle_tables.get(*table).and_then(|r| r.as_array()) else {
+                continue;
+            };
+            let mut deleted = 0u64;
+            if replace {
+                // every column that names the account (market_sales: seller_id and buyer_id)
+                for (t, c) in ACCOUNT_TABLES.iter().filter(|(t, _)| t == table) {
+                    let _ = c;
+                    let r = sqlx::query(&format!("delete from musubi.{t} where {} = $1", c))
+                        .bind(id.0)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(Error::internal)?;
+                    deleted += r.rows_affected();
+                }
+            }
+            let _ = col;
+            let mut inserted = 0u64;
+            for row in rows {
+                let r = sqlx::query(&format!(
+                    "insert into musubi.{table} select * from jsonb_populate_record(null::musubi.{table}, $1) on conflict do nothing"
+                ))
+                .bind(row)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::InvalidArgument(format!("{table}: {e}")))?;
+                inserted += r.rows_affected();
+            }
+            out.insert(
+                table.to_string(),
+                serde_json::json!({ "rows": rows.len(), "inserted": inserted, "deleted": deleted }),
+            );
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(serde_json::json!({
+            "account": account_action,
+            "mode": if replace { "replace" } else { "merge" },
+            "tables": out,
+            "skipped": skipped,
+        }))
+    }
+
     /// Hard delete: the account row and every row in `ACCOUNT_TABLES` (GDPR erasure). Rows that
     /// only reference the account as a counter-party (sales, trades) go too.
     pub async fn purge(&self, id: AccountId) -> Result<u64> {

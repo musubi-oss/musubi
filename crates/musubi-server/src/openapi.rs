@@ -50,6 +50,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/admin/accounts/{id}/ban", "admin"),
     ("GET", "/v1/admin/accounts/{id}/ban", "admin"),
     ("GET", "/v1/admin/accounts/{id}/export", "admin"),
+    ("POST", "/v1/admin/accounts/{id}/restore", "admin"),
     (
         "DELETE",
         "/v1/admin/accounts/{id}/identities/{provider}/{subject}",
