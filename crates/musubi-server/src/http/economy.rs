@@ -808,6 +808,23 @@ fn receipt_input(t: StoreTransaction) -> ReceiptInput {
     }
 }
 
+/// Leader sweep (every minute): subscriptions past their period become `grace` / `expired` and
+/// emit `iap.subscription.grace` / `iap.subscription.expired` once.
+pub async fn sweep_subscriptions(s: &AppState) -> Result<usize, Error> {
+    let moved = s.economy.sweep_subscriptions().await?;
+    for sub in &moved {
+        let acc = sub["account_id"]
+            .as_str()
+            .and_then(|a| a.parse().ok())
+            .map(musubi_core::AccountId);
+        let status = sub["status"].as_str().unwrap_or("expired");
+        s.events
+            .emit(&format!("iap.subscription.{status}"), acc, sub.clone())
+            .await;
+    }
+    Ok(moved.len())
+}
+
 async fn iap_subscriptions(
     State(s): State<AppState>,
     Bearer(me): Bearer,

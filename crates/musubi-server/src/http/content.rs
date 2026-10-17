@@ -405,10 +405,21 @@ async fn run_import(
     let sections = sections_of(bundle);
     let db = &s.db;
     let mut tx = db.begin().await.map_err(Error::internal)?;
+    // one consistent view for before/diff/after: rows other requests commit meanwhile must not
+    // show up as changes of this import
+    sqlx::query("set transaction isolation level repeatable read")
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
     let before = export_bundle(&mut tx, &sections, env).await?;
     let diff = apply(&mut tx, bundle, prune).await?;
     let after = export_bundle(&mut tx, &sections, env).await?;
-    let changed = before["tables"] != after["tables"];
+    // what the bundle itself changed (not what else moved in those tables)
+    let changed = diff.values().any(|d| {
+        ["added", "changed", "removed"]
+            .iter()
+            .any(|k| d[k].as_u64().unwrap_or(0) > 0)
+    });
     if dry_run {
         tx.rollback().await.map_err(Error::internal)?;
         return Ok(json!({"applied": false, "dry_run": true, "changes": changed, "diff": diff}));

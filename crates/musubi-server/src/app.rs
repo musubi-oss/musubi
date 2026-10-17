@@ -755,6 +755,14 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                         Err(e) => tracing::warn!(error = %e, "end-of-window scan failed"),
                     }
                 }
+                // subscriptions past their period: every minute, same leader as the market sweep
+                if n % 12 == 0 {
+                    match crate::http::economy::sweep_subscriptions(&st).await {
+                        Ok(k) if k > 0 => tracing::info!(subscriptions = k, "subscription sweep"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "subscription sweep failed"),
+                    }
+                }
                 // expired bans: every minute, same leader as the market sweep
                 if n % 12 == 0 {
                     match crate::http::admin::lift_expired_bans(&st).await {

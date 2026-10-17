@@ -382,6 +382,51 @@ impl EconomyService {
             .collect())
     }
 
+    /// Move subscriptions whose period ended into `grace` (while the product's grace lasts) and
+    /// then `expired`, once each; returns the transitions for events. Store notifications usually
+    /// arrive first — this catches the ones that never come.
+    pub async fn sweep_subscriptions(&self) -> Result<Vec<Value>> {
+        let now = now_ms();
+        type Row = (Uuid, Uuid, String, String, String, i64, String);
+        let mut out = Vec::new();
+        for (from, to, cond) in [
+            (
+                "active",
+                "grace",
+                "s.expires_at_ms <= $1 and s.expires_at_ms + coalesce(p.grace_secs, 0)::bigint * 1000 > $1",
+            ),
+            (
+                "active",
+                "expired",
+                "s.expires_at_ms + coalesce(p.grace_secs, 0)::bigint * 1000 <= $1",
+            ),
+            (
+                "grace",
+                "expired",
+                "s.expires_at_ms + coalesce(p.grace_secs, 0)::bigint * 1000 <= $1",
+            ),
+        ] {
+            let rows: Vec<Row> = sqlx::query_as(&format!(
+                "update musubi.iap_subscriptions s set status = '{to}', updated_at = now()
+                 from musubi.iap_products p
+                 where p.provider = s.provider and p.product_id = s.product_id
+                   and s.status = '{from}' and {cond}
+                 returning s.id, s.account_id, s.provider, s.product_id, s.store_item_id, s.expires_at_ms, s.status"
+            ))
+            .bind(now)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::internal)?;
+            for r in rows {
+                out.push(serde_json::json!({
+                    "id": r.0, "account_id": r.1, "provider": r.2, "product_id": r.3,
+                    "store_item_id": r.4, "expires_at_ms": r.5, "status": r.6, "from": from,
+                }));
+            }
+        }
+        Ok(out)
+    }
+
     /// A store notification about a subscription: new period end, renewal preference, or its end.
     pub async fn update_subscription(
         &self,

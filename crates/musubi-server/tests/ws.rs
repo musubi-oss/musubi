@@ -13984,3 +13984,125 @@ async fn environments_promote_config_bundles() {
     assert_eq!(st, 200, "{r}");
     assert_eq!(r["applied"], false);
 }
+
+/// The subscription sweep (leader, every minute) moves ended periods to `grace` while the
+/// product's grace lasts and then to `expired`, each transition once, without waiting for a store
+/// notification.
+#[tokio::test]
+async fn iap_subscription_sweep_marks_grace_and_expired() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (item, listing) = (format!("vip-{sfx}"), format!("vip-month-{sfx}"));
+    let (_, acc) = token(&router).await;
+    let acc = uuid::Uuid::parse_str(&acc).unwrap();
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/items",
+        None,
+        true,
+        Some(json!({"id": item, "name": "VIP"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/store",
+        None,
+        true,
+        Some(json!({"id": listing, "item_id": item, "quantity": 1, "prices": {}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    for (pid, grace) in [("grace", 3600), ("hard", 0)] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            "/v1/server/iap/products",
+            None,
+            true,
+            Some(
+                json!({"provider": "apple", "product_id": format!("{pid}.{sfx}"),
+                "store_item_id": listing, "kind": "subscription", "grace_secs": grace}),
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+    // one period ended a minute ago with an hour of grace, one ended with no grace, one is live
+    for (pid, expires) in [
+        ("grace", now - 60_000),
+        ("hard", now - 60_000),
+        ("grace", now + 3_600_000),
+    ] {
+        sqlx::query(
+            "insert into musubi.iap_subscriptions (id, account_id, provider, product_id, store_item_id,
+             original_transaction_id, latest_transaction_id, status, started_at_ms, expires_at_ms)
+             values ($1, $2, 'apple', $3, $4, $5, $5, 'active', $6, $7)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(acc)
+        .bind(format!("{pid}.{sfx}"))
+        .bind(&listing)
+        .bind(uuid::Uuid::now_v7().simple().to_string())
+        .bind(now - 86_400_000)
+        .bind(expires)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let moved = musubi_server::http::economy::sweep_subscriptions(&state)
+        .await
+        .unwrap();
+    assert_eq!(moved, 2, "grace + expired, the live one untouched");
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "select product_id, status from musubi.iap_subscriptions where account_id = $1 order by expires_at_ms, product_id",
+    )
+    .bind(acc)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        statuses,
+        vec![
+            (format!("grace.{sfx}"), "grace".to_string()),
+            (format!("hard.{sfx}"), "expired".to_string()),
+            (format!("grace.{sfx}"), "active".to_string()),
+        ]
+    );
+    assert_eq!(
+        musubi_server::http::economy::sweep_subscriptions(&state)
+            .await
+            .unwrap(),
+        0,
+        "each transition fires once"
+    );
+    // once the grace runs out the sweep finishes the job
+    sqlx::query(
+        "update musubi.iap_subscriptions set expires_at_ms = $2 where account_id = $1 and status = 'grace'",
+    )
+    .bind(acc)
+    .bind(now - 7_200_000)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        musubi_server::http::economy::sweep_subscriptions(&state)
+            .await
+            .unwrap(),
+        1
+    );
+    let expired: i64 = sqlx::query_scalar(
+        "select count(*) from musubi.iap_subscriptions where account_id = $1 and status = 'expired'",
+    )
+    .bind(acc)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(expired, 2);
+}
