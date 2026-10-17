@@ -12122,3 +12122,151 @@ async fn limited_grants_cap_server_grants_per_window() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn match_results_report_fans_out_once() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut acc = vec![];
+    for i in 0..4 {
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(&format!("mr{i}-"))})),
+        )
+        .await;
+        acc.push((
+            v["access_token"].as_str().unwrap().to_string(),
+            v["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (q, cur, win, played, track) = (
+        unique("mrq-"),
+        unique("mrc"),
+        unique("mrw-"),
+        unique("mrp-"),
+        unique("mrt-"),
+    );
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/rating/queues",
+        k,
+        Some(json!({"id": q})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": cur, "name": "Gold", "max_balance": 1_000_000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for (t, amount) in [(&win, 100), (&played, 10)] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/rewards/tables",
+            k,
+            Some(json!({
+                "id": t, "name": t, "kind": "weighted",
+                "entries": [{"weight": 1, "rarity": "common", "currency": cur, "amount": amount}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/tracks",
+        k,
+        Some(json!({"id": track, "name": "Account", "levels": [{"xp": 50}, {"xp": 200}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mid = unique("match-");
+    let body = json!({
+        "queue": q,
+        "teams": [
+            {"rank": 1, "players": [{"account_id": acc[0].1, "stats": {"kills": 7}}, {"account_id": acc[1].1}]},
+            {"rank": 2, "players": [{"account_id": acc[2].1}, {"account_id": acc[3].1}]}
+        ],
+        "rewards": {"1": win, "default": played},
+        "quest_event": {"name": "matches_played"},
+        "progression": {"track_id": track, "xp_by_rank": {"1": 60, "default": 20}},
+        "metadata": {"map": "dust"}
+    });
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matches/{mid}/results"),
+        k,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["replayed"], false);
+    assert_eq!(v["players"].as_array().unwrap().len(), 4, "{v}");
+    assert!(
+        v["rating"]["changes"]
+            .as_array()
+            .map(|c| c.len() == 4)
+            .unwrap_or(false),
+        "{v}"
+    );
+    assert_eq!(v["players"][0]["rewards"]["table"], json!(win), "{v}");
+    assert_eq!(v["players"][2]["rewards"]["table"], json!(played), "{v}");
+    assert!(v["players"][0]["rewards_error"].is_null(), "{v}");
+    assert!(v["players"][0]["xp_error"].is_null(), "{v}");
+    // winners got 100, losers 10; winner reached level 2 with 60 xp
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&acc[0].0), None).await;
+    assert!(w.to_string().contains("100"), "{w}");
+    let (_, l) = call(&app, "GET", "/v1/wallet", Some(&acc[2].0), None).await;
+    assert!(l.to_string().contains("10"), "{l}");
+    assert!(!v["players"][0]["xp"].is_null(), "{v}");
+    assert!(
+        !v["players"][0]["quests"].is_null() || !v["players"][0]["quests_error"].is_null(),
+        "{v}"
+    );
+    // repeat → stored outcome, no second payout
+    let (st, v2) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matches/{mid}/results"),
+        k,
+        Some(body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v2}");
+    assert_eq!(v2["replayed"], true);
+    let (_, w2) = call(&app, "GET", "/v1/wallet", Some(&acc[0].0), None).await;
+    assert_eq!(w2, w);
+    let (st, g) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/matches/{mid}/results"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(g["payload"]["metadata"]["map"], "dust", "{g}");
+    assert_eq!(g["result"]["players"].as_array().unwrap().len(), 4);
+    let (st, _) = call_server(&app, "GET", "/v1/server/matches/nope/results", k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matches/{}/results", unique("m-")),
+        k,
+        Some(json!({"teams": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
