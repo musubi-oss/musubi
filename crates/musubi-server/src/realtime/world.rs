@@ -2534,9 +2534,28 @@ impl WorldRegistry {
                     if let Some(e) = st.world.get(id).cloned() {
                         let inputs = st.world.take_buffered_inputs(id);
                         let from = e.transit.as_ref().map(|t| t.from);
+                        let group = e
+                            .transit
+                            .as_ref()
+                            .map(|t| t.group.clone())
+                            .unwrap_or_default();
                         let mut shipped = e;
                         shipped.transit = None;
                         fanout.world_handover(&name, shipped, self.node_id, inputs, false);
+                        // attached entities travel with their root (plan 4.5)
+                        for m in group {
+                            if let Some(mut part) = st.world.get(m).cloned() {
+                                let part_inputs = st.world.take_buffered_inputs(m);
+                                part.transit = None;
+                                fanout.world_handover(
+                                    &name,
+                                    part,
+                                    self.node_id,
+                                    part_inputs,
+                                    false,
+                                );
+                            }
+                        }
                         if let Some(from) = from {
                             push_event(
                                 st,
@@ -2618,17 +2637,26 @@ impl WorldRegistry {
             }
             for o in outcomes {
                 match o {
-                    HandoverOutcome::Started { entity, from, to } => {
+                    HandoverOutcome::Started {
+                        entity,
+                        from,
+                        to,
+                        group,
+                    } => {
                         let full = st.world.get(entity).map(to_wire);
+                        let parts: Vec<_> = group
+                            .iter()
+                            .filter_map(|m| st.world.get(*m).map(to_wire))
+                            .collect();
                         push_event(
                             st,
                             to,
-                            json!({"type": "handover_request", "entity": entity, "from": from, "state": full}),
+                            json!({"type": "handover_request", "entity": entity, "from": from, "state": full, "group": parts}),
                         );
                         push_event(
                             st,
                             from,
-                            json!({"type": "handover_started", "entity": entity, "to": to}),
+                            json!({"type": "handover_started", "entity": entity, "to": to, "group": group}),
                         );
                     }
                     HandoverOutcome::Completed { .. } => {}
@@ -2674,9 +2702,22 @@ impl WorldRegistry {
                         }
                         st.remote_transit.insert(entity, (host, n + 1));
                         if st.world.begin_remote_handover(entity, host) {
-                            if let Some(mut e) = st.world.get(entity).cloned() {
-                                e.transit = None;
-                                fanout.world_handover(&name, e, self.node_id, Vec::new(), false);
+                            let group: Vec<EntityId> = st
+                                .world
+                                .get(entity)
+                                .and_then(|e| e.transit.as_ref().map(|t| t.group.clone()))
+                                .unwrap_or_default();
+                            for m in std::iter::once(entity).chain(group) {
+                                if let Some(mut e) = st.world.get(m).cloned() {
+                                    e.transit = None;
+                                    fanout.world_handover(
+                                        &name,
+                                        e,
+                                        self.node_id,
+                                        Vec::new(),
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }

@@ -87,6 +87,16 @@ pub struct Entity {
     /// Survives everyone leaving and cluster restarts (persistent entity streaming).
     pub persistent: bool,
     pub transit: Option<Transit>,
+    /// Root of the group this entity belongs to (passenger → vehicle, part → construction): it
+    /// never hands over on its own and moves cells together with the root (plan 4.5).
+    #[serde(default)]
+    pub attached_to: Option<EntityId>,
+    /// Handover attempts since the last success; drives the backoff after an Ack timeout.
+    #[serde(default)]
+    pub handover_attempts: u32,
+    /// No new handover of this entity before this tick (backoff after a cancelled one).
+    #[serde(default)]
+    pub handover_retry_tick: u64,
     /// Despawned after this many ticks without a write, interaction or handover (`None` = never).
     #[serde(default)]
     pub decay_ticks: Option<u64>,
@@ -109,6 +119,9 @@ pub struct Transit {
     pub to: SimId,
     pub to_cell: CellId,
     pub requested_tick: u64,
+    /// Entities attached to this one that travel in the same transaction.
+    #[serde(default)]
+    pub group: Vec<EntityId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +205,9 @@ pub enum HandoverOutcome {
         entity: EntityId,
         from: SimId,
         to: SimId,
+        /// Attached entities moving with it (empty for a lone entity).
+        #[serde(default)]
+        group: Vec<EntityId>,
     },
     Completed {
         entity: EntityId,
@@ -702,6 +718,9 @@ impl World {
                 .collect(),
             persistent,
             transit: None,
+            attached_to: None,
+            handover_attempts: 0,
+            handover_retry_tick: 0,
             decay_ticks: None,
             touched_tick: self.tick,
             changed_tick: self.tick,
@@ -1012,7 +1031,13 @@ impl World {
         for id in ids {
             let (cell, pos, in_transit) = {
                 let e = &self.entities[&id];
-                (e.cell, e.pos, e.transit.is_some())
+                (
+                    e.cell,
+                    e.pos,
+                    e.transit.is_some()
+                        || e.attached_to.is_some()
+                        || e.handover_retry_tick > self.tick,
+                )
             };
             if in_transit {
                 continue;
@@ -1027,19 +1052,35 @@ impl World {
             match (from, to) {
                 (Some(a), Some(b)) if a == b => {
                     self.move_cell(id, target);
+                    for m in self.attached(id) {
+                        self.move_cell(m, target);
+                    }
                 }
                 (Some(a), Some(b)) => {
-                    let e = self.entities.get_mut(&id).unwrap();
-                    e.transit = Some(Transit {
+                    let group = self.attached(id);
+                    let t = Transit {
                         from: a,
                         to: b,
                         to_cell: target,
                         requested_tick: self.tick,
-                    });
+                        group: group.clone(),
+                    };
+                    for m in &group {
+                        if let Some(e) = self.entities.get_mut(m) {
+                            e.transit = Some(Transit {
+                                group: vec![],
+                                ..t.clone()
+                            });
+                        }
+                    }
+                    let e = self.entities.get_mut(&id).unwrap();
+                    e.transit = Some(t);
+                    e.handover_attempts += 1;
                     out.push(HandoverOutcome::Started {
                         entity: id,
                         from: a,
                         to: b,
+                        group,
                     });
                 }
                 _ => {
@@ -1062,7 +1103,13 @@ impl World {
         for id in ids {
             let (cell, pos, in_transit) = {
                 let e = &self.entities[&id];
-                (e.cell, e.pos, e.transit.is_some())
+                (
+                    e.cell,
+                    e.pos,
+                    e.transit.is_some()
+                        || e.attached_to.is_some()
+                        || e.handover_retry_tick > self.tick,
+                )
             };
             if in_transit {
                 continue;
@@ -1081,13 +1128,28 @@ impl World {
             let Some(host) = remote_host(target) else {
                 continue;
             };
+            let group = self.attached(id);
+            let tick = self.tick;
+            for m in &group {
+                if let Some(e) = self.entities.get_mut(m) {
+                    e.transit = Some(Transit {
+                        from,
+                        to: host,
+                        to_cell: target,
+                        requested_tick: tick,
+                        group: vec![],
+                    });
+                }
+            }
             let e = self.entities.get_mut(&id).unwrap();
             e.transit = Some(Transit {
                 from,
                 to: host,
                 to_cell: target,
-                requested_tick: self.tick,
+                requested_tick: tick,
+                group,
             });
+            e.handover_attempts += 1;
             out.push((id, target, host));
         }
         out
@@ -1104,14 +1166,77 @@ impl World {
             return false;
         };
         let to_cell = self.cell_of(pos);
+        let group = self.attached(id);
+        for m in &group {
+            if let Some(e) = self.entities.get_mut(m) {
+                e.transit = Some(Transit {
+                    from,
+                    to: host,
+                    to_cell,
+                    requested_tick: tick,
+                    group: vec![],
+                });
+            }
+        }
         let e = self.entities.get_mut(&id).unwrap();
         e.transit = Some(Transit {
             from,
             to: host,
             to_cell,
             requested_tick: tick,
+            group,
         });
+        e.handover_attempts += 1;
         true
+    }
+
+    /// Entities attached (directly or through other parts) to `root`, root excluded.
+    pub fn attached(&self, root: EntityId) -> Vec<EntityId> {
+        let mut out = Vec::new();
+        let mut frontier = vec![root];
+        while let Some(r) = frontier.pop() {
+            for e in self.entities.values() {
+                if e.attached_to == Some(r) && !out.contains(&e.id) {
+                    out.push(e.id);
+                    frontier.push(e.id);
+                }
+            }
+        }
+        out
+    }
+
+    /// Make `id` travel with `root` (vehicle, construction): it moves to the root's cell now and
+    /// in every later handover. Cycles and attaching while in transit are refused.
+    pub fn attach(&mut self, id: EntityId, root: EntityId) -> Result<(), MeshError> {
+        if id == root || !self.entities.contains_key(&id) {
+            return Err(MeshError::NoEntity);
+        }
+        let r = self.entities.get(&root).ok_or(MeshError::NoEntity)?;
+        if r.transit.is_some() || self.entities[&id].transit.is_some() {
+            return Err(MeshError::NotAuthoritative("entity in transit".into()));
+        }
+        if self.attached(id).contains(&root) {
+            return Err(MeshError::NotAuthoritative("attachment cycle".into()));
+        }
+        let (cell, tick) = (r.cell, self.tick);
+        let e = self.entities.get_mut(&id).unwrap();
+        e.attached_to = Some(root);
+        e.touched_tick = tick;
+        if e.cell != cell {
+            self.move_cell(id, cell);
+        }
+        Ok(())
+    }
+
+    /// `id` travels on its own again (its cell is re-evaluated by the next `detect_handovers`).
+    pub fn detach(&mut self, id: EntityId) -> bool {
+        match self.entities.get_mut(&id) {
+            Some(e) if e.attached_to.is_some() => {
+                e.attached_to = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Inputs buffered while `id` was in transit.
@@ -1129,7 +1254,19 @@ impl World {
 
     /// Abort a handover in progress; the entity stays with its current owner.
     pub fn cancel_handover(&mut self, id: EntityId) -> Option<Transit> {
-        self.entities.get_mut(&id).and_then(|e| e.transit.take())
+        let tick = self.tick;
+        let t = self.entities.get_mut(&id).and_then(|e| {
+            let t = e.transit.take()?;
+            // backoff: 2, 4, 8 … ticks (capped at 32) before the entity is offered again
+            e.handover_retry_tick = tick + 2u64.pow(e.handover_attempts.min(5));
+            Some(t)
+        })?;
+        for m in &t.group {
+            if let Some(e) = self.entities.get_mut(m) {
+                e.transit = None;
+            }
+        }
+        Some(t)
     }
 
     fn move_cell(&mut self, id: EntityId, target: CellId) {
@@ -1162,11 +1299,16 @@ impl World {
                 t.to
             )));
         }
-        self.move_cell(id, t.to_cell);
-        {
-            let tick = self.tick;
-            let e = self.entities.get_mut(&id).unwrap();
+        let tick = self.tick;
+        for m in std::iter::once(id).chain(t.group.iter().copied()) {
+            if !self.entities.contains_key(&m) {
+                continue;
+            }
+            self.move_cell(m, t.to_cell);
+            let e = self.entities.get_mut(&m).unwrap();
             e.transit = None;
+            e.handover_attempts = 0;
+            e.handover_retry_tick = 0;
             e.touched_tick = tick;
             e.changed_tick = tick;
             self.by_cell.mark(e.cell, e.id, tick);
@@ -1186,16 +1328,26 @@ impl World {
         let timeout = self.cfg.handover_timeout_ticks;
         let tick = self.tick;
         let mut out = Vec::new();
-        for e in self.entities.values_mut() {
-            let expired = e
-                .transit
-                .as_ref()
-                .is_some_and(|t| tick.saturating_sub(t.requested_tick) > timeout);
-            if expired {
-                let t = e.transit.take().unwrap();
+        let expired: Vec<EntityId> = self
+            .entities
+            .values()
+            .filter(|e| {
+                e.attached_to.is_none()
+                    && e.transit
+                        .as_ref()
+                        .is_some_and(|t| tick.saturating_sub(t.requested_tick) > timeout)
+            })
+            .map(|e| e.id)
+            .collect();
+        for id in expired {
+            if let Some(t) = self.cancel_handover(id) {
+                let retry = self.entities[&id].handover_retry_tick.saturating_sub(tick);
                 out.push(HandoverOutcome::Cancelled {
-                    entity: e.id,
-                    reason: format!("no ack from {} within {timeout} ticks", t.to),
+                    entity: id,
+                    reason: format!(
+                        "no ack from {} within {timeout} ticks; retry in {retry}",
+                        t.to
+                    ),
                 });
             }
         }
@@ -1431,7 +1583,8 @@ mod tests {
             vec![HandoverOutcome::Started {
                 entity: a,
                 from: s1,
-                to: s2
+                to: s2,
+                group: vec![],
             }]
         );
         // input during transit is buffered, not routed
@@ -1572,6 +1725,81 @@ mod tests {
             d.updated.iter().map(|u| u.id).collect::<Vec<_>>(),
             vec![far]
         );
+    }
+
+    #[test]
+    fn group_handover_moves_attached_together_and_backs_off_after_timeout() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ghost_margin: 10.0,
+            hysteresis: 5.0,
+            handover_timeout_ticks: 3,
+            ..Default::default()
+        });
+        let s1 = Uuid::now_v7();
+        let s2 = Uuid::now_v7();
+        w.grant_lease(CellId { x: 0, y: 0 }, s1);
+        w.grant_lease(CellId { x: 1, y: 0 }, s2);
+        let v = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
+        let p = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
+        let q = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
+        w.attach(p, v).unwrap();
+        w.attach(q, p).unwrap();
+        assert!(w.attach(v, q).is_err(), "cycle refused");
+        assert!(w.attach(v, v).is_err());
+        assert_eq!(w.attached(v), vec![p, q]);
+        // only the root crosses; passengers ride along in one transaction
+        w.apply(s1, v, Some(Pos { x: 108.0, y: 50.0 }), BTreeMap::new())
+            .unwrap();
+        let out = w.detect_handovers();
+        assert_eq!(
+            out,
+            vec![HandoverOutcome::Started {
+                entity: v,
+                from: s1,
+                to: s2,
+                group: vec![p, q],
+            }]
+        );
+        assert!(w.get(p).unwrap().transit.is_some());
+        assert!(w.detect_handovers().is_empty());
+        assert_eq!(w.route_input(q, serde_json::json!({})).unwrap(), None);
+        let (outcome, _) = w.handover_ack(s2, v).unwrap();
+        assert_eq!(outcome, HandoverOutcome::Completed { entity: v, to: s2 });
+        for e in [v, p, q] {
+            let e = w.get(e).unwrap();
+            assert_eq!(e.cell, CellId { x: 1, y: 0 });
+            assert!(e.transit.is_none());
+        }
+        assert_eq!(w.route_input(q, serde_json::json!({})).unwrap(), Some(s2));
+        // timeout: the whole group rolls back and is not offered again until the backoff passes
+        w.apply(s2, v, Some(Pos { x: 80.0, y: 50.0 }), BTreeMap::new())
+            .unwrap();
+        assert!(matches!(
+            w.detect_handovers()[0],
+            HandoverOutcome::Started { .. }
+        ));
+        for _ in 0..3 {
+            assert!(w.advance().is_empty());
+        }
+        let out = w.advance();
+        assert!(
+            matches!(&out[0], HandoverOutcome::Cancelled { entity, reason } if *entity == v && reason.contains("retry in")),
+            "{out:?}"
+        );
+        assert_eq!(out.len(), 1, "no immediate retry");
+        assert!(w.get(p).unwrap().transit.is_none());
+        assert!(w.detect_handovers().is_empty(), "still backing off");
+        let retried = (0..4).any(|_| {
+            w.advance();
+            w.detect_handovers()
+                .iter()
+                .any(|o| matches!(o, HandoverOutcome::Started { entity, group, .. } if *entity == v && group.len() == 2))
+        });
+        assert!(retried, "handover retried after backoff");
+        assert!(w.detach(p));
+        assert!(!w.detach(p));
+        assert!(w.attached(v).is_empty());
     }
 
     #[test]
