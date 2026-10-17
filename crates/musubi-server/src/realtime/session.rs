@@ -791,7 +791,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                 }
                 if let Some(v) = ctx
                     .anticheat
-                    .observe_input(ctx.presence.session_id.0, data.len())
+                    .observe_input(ctx.presence.session_id.0, &data)
                 {
                     let (ac, acc, sid, mid) = (
                         ctx.anticheat.clone(),

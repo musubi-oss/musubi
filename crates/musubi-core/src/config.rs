@@ -1359,6 +1359,14 @@ pub struct AntiCheatConfig {
     pub window_hours: i64,
     /// Kick the account from every node when its windowed score reaches this (0 = never).
     pub kick_score: i64,
+    /// Dotted field of a JSON match input that carries the player's position (`pos`,
+    /// `state.position`; `[x, y]` or `[x, y, z]`); empty = no movement heuristics.
+    pub movement_field: String,
+    /// Fastest legitimate movement in world units per second: a position further from the
+    /// previous input than `max_speed × elapsed` (+ `movement_slack`) is an `impossible_move`.
+    pub max_speed: f64,
+    /// Distance tolerated on top of `max_speed × elapsed` (lag compensation, respawns…).
+    pub movement_slack: f64,
     /// Vendor endpoints that receive `{provider, account_id, ticket}` and answer `{ok: bool}`.
     pub eac_url: String,
     pub eac_key: String,
@@ -1375,6 +1383,9 @@ impl Default for AntiCheatConfig {
             max_input_bytes: 4096,
             window_hours: 24,
             kick_score: 0,
+            movement_field: String::new(),
+            max_speed: 0.0,
+            movement_slack: 0.0,
             eac_url: String::new(),
             eac_key: String::new(),
             battleye_url: String::new(),

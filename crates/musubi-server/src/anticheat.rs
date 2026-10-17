@@ -27,6 +27,8 @@ pub struct InputGuard {
     started: Option<Instant>,
     count: u32,
     flagged: bool,
+    /// Last position seen in an input and when (movement heuristics).
+    last_pos: Option<(Vec<f64>, Instant)>,
 }
 
 impl InputGuard {
@@ -34,8 +36,9 @@ impl InputGuard {
         &mut self,
         cfg: &AntiCheatConfig,
         now: Instant,
-        bytes: usize,
+        data: &[u8],
     ) -> Option<Violation> {
+        let bytes = data.len();
         if cfg.max_input_bytes > 0 && bytes > cfg.max_input_bytes {
             return Some(Violation {
                 kind: "input_size",
@@ -60,8 +63,59 @@ impl InputGuard {
                 details: json!({ "per_sec": self.count, "max": cfg.max_inputs_per_sec }),
             });
         }
+        if !cfg.movement_field.is_empty() && cfg.max_speed > 0.0 {
+            if let Some(pos) = position_of(data, &cfg.movement_field) {
+                let prev = self.last_pos.replace((pos.clone(), now));
+                if let Some((from, at)) = prev {
+                    if from.len() == pos.len() {
+                        let dist = from
+                            .iter()
+                            .zip(&pos)
+                            .map(|(a, b)| (a - b) * (a - b))
+                            .sum::<f64>()
+                            .sqrt();
+                        // inputs faster than 120 Hz are judged as one tick of movement
+                        let secs = now.duration_since(at).as_secs_f64().max(1.0 / 120.0);
+                        let allowed = cfg.max_speed * secs + cfg.movement_slack;
+                        if dist > allowed {
+                            return Some(Violation {
+                                kind: "impossible_move",
+                                severity: 20,
+                                details: json!({
+                                    "from": from, "to": pos, "distance": dist,
+                                    "elapsed_ms": (secs * 1000.0).round(), "allowed": allowed,
+                                    "max_speed": cfg.max_speed,
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         None
     }
+}
+
+/// `[x, y(, z)]` (or `{x, y(, z)}`) at the dotted `field` of a JSON input, if it is one.
+fn position_of(data: &[u8], field: &str) -> Option<Vec<f64>> {
+    if data.first() != Some(&b'{') {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(data).ok()?;
+    let mut cur = &v;
+    for k in field.split('.') {
+        cur = cur.get(k)?;
+    }
+    let nums: Vec<f64> = match cur {
+        Value::Array(a) => a.iter().map(|x| x.as_f64()).collect::<Option<Vec<_>>>()?,
+        Value::Object(o) => ["x", "y", "z"]
+            .iter()
+            .filter_map(|k| o.get(*k))
+            .map(|x| x.as_f64())
+            .collect::<Option<Vec<_>>>()?,
+        _ => return None,
+    };
+    ((2..=3).contains(&nums.len()) && nums.iter().all(|n| n.is_finite())).then_some(nums)
 }
 
 pub struct AntiCheat {
@@ -99,13 +153,13 @@ impl AntiCheat {
     }
 
     /// Count one match input from a session; `Some` when it must be rejected and flagged.
-    pub fn observe_input(&self, session: Uuid, bytes: usize) -> Option<Violation> {
+    pub fn observe_input(&self, session: Uuid, data: &[u8]) -> Option<Violation> {
         let cfg = self.config()?;
         if !cfg.enabled {
             return None;
         }
         let mut g = self.inputs.entry(session).or_default();
-        g.observe(cfg, Instant::now(), bytes)
+        g.observe(cfg, Instant::now(), data)
     }
 
     pub fn forget_session(&self, session: Uuid) {
@@ -327,16 +381,66 @@ mod tests {
         };
         let mut g = InputGuard::default();
         let t0 = Instant::now();
-        assert_eq!(g.observe(&cfg, t0, 9).map(|v| v.kind), Some("input_size"));
+        assert_eq!(
+            g.observe(&cfg, t0, b"123456789").map(|v| v.kind),
+            Some("input_size")
+        );
         for _ in 0..3 {
-            assert!(g.observe(&cfg, t0, 4).is_none());
+            assert!(g.observe(&cfg, t0, b"1234").is_none());
         }
-        assert_eq!(g.observe(&cfg, t0, 4).map(|v| v.kind), Some("input_rate"));
-        assert!(g.observe(&cfg, t0, 4).is_none(), "flagged once per window");
+        assert_eq!(
+            g.observe(&cfg, t0, b"1234").map(|v| v.kind),
+            Some("input_rate")
+        );
+        assert!(
+            g.observe(&cfg, t0, b"1234").is_none(),
+            "flagged once per window"
+        );
         let t1 = t0 + Duration::from_millis(1100);
         assert!(
-            g.observe(&cfg, t1, 4).is_none(),
+            g.observe(&cfg, t1, b"1234").is_none(),
             "new window resets the count"
+        );
+    }
+
+    #[test]
+    fn guard_flags_impossible_moves() {
+        let cfg = AntiCheatConfig {
+            movement_field: "state.pos".into(),
+            max_speed: 10.0,
+            movement_slack: 0.5,
+            ..Default::default()
+        };
+        let mut g = InputGuard::default();
+        let t0 = Instant::now();
+        let input = |x: f64, y: f64| format!(r#"{{"state":{{"pos":[{x},{y},0]}},"fire":false}}"#);
+        assert!(g.observe(&cfg, t0, input(0.0, 0.0).as_bytes()).is_none());
+        // 1 unit in 100 ms: fine (10 u/s)
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(g.observe(&cfg, t1, input(1.0, 0.0).as_bytes()).is_none());
+        // 50 units in 100 ms: 500 u/s
+        let t2 = t1 + Duration::from_millis(100);
+        let v = g.observe(&cfg, t2, input(51.0, 0.0).as_bytes()).unwrap();
+        assert_eq!(v.kind, "impossible_move");
+        assert_eq!(v.details["to"], json!([51.0, 0.0, 0.0]));
+        assert!(v.details["distance"].as_f64().unwrap() > 49.0);
+        // the jump is the new reference: standing still afterwards is fine
+        let t3 = t2 + Duration::from_millis(100);
+        assert!(g.observe(&cfg, t3, input(51.0, 0.0).as_bytes()).is_none());
+        // inputs without a position, or with a malformed one, are left alone
+        assert!(g.observe(&cfg, t3, br#"{"fire":true}"#).is_none());
+        assert!(g
+            .observe(&cfg, t3, br#"{"state":{"pos":"here"}}"#)
+            .is_none());
+        assert!(g.observe(&cfg, t3, b" binary").is_none());
+        // object form and the 120 Hz floor: two inputs in the same instant may move one tick
+        let mut g = InputGuard::default();
+        let obj = |x: f64| format!(r#"{{"state":{{"pos":{{"x":{x},"y":0,"z":0}}}}}}"#);
+        assert!(g.observe(&cfg, t0, obj(0.0).as_bytes()).is_none());
+        assert!(g.observe(&cfg, t0, obj(0.5).as_bytes()).is_none());
+        assert_eq!(
+            g.observe(&cfg, t0, obj(5.0).as_bytes()).map(|v| v.kind),
+            Some("impossible_move")
         );
     }
 }
