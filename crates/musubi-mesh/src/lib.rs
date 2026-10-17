@@ -8,6 +8,8 @@
 //! Space is 2D here (x, y); 3D/octree and non-spatial partition keys plug into `CellId` later.
 
 pub mod controller;
+pub mod ghost;
+pub use ghost::{GhostCache, GhostDelta, GhostSendState, GhostUpsert};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -168,6 +170,14 @@ pub struct WorldConfig {
     /// Ticks of position history kept per entity for lag compensation (`position_at`): a hit
     /// claimed at the shooter's tick is checked against where the target was then.
     pub history_ticks: u64,
+    /// Estimated bytes of ghost deltas one cell may send its neighbours per tick; entities
+    /// nearest the border go first, the rest wait a tick (0 = unlimited, keyframes never cut).
+    pub ghost_budget_bytes: usize,
+    /// Every this many ticks the border band goes out complete, so a late neighbour converges
+    /// (0 = only the first time).
+    pub ghost_keyframe_ticks: u64,
+    /// Ghosts from a cell whose host sent nothing for this many ticks are dropped from views.
+    pub ghost_stale_ticks: u64,
 }
 
 impl Default for WorldConfig {
@@ -188,6 +198,9 @@ impl Default for WorldConfig {
             queue_ttl_ticks: 600,
             hibernate_after_ticks: 1800,
             history_ticks: 15,
+            ghost_budget_bytes: 256 * 1024,
+            ghost_keyframe_ticks: 30,
+            ghost_stale_ticks: 60,
         }
     }
 }

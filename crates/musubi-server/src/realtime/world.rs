@@ -40,8 +40,10 @@ struct WorldState {
     sim_events: HashMap<Uuid, Vec<Value>>,
     /// Persistent-entity ops since the last journal flush (see `musubi.world_journal`).
     journal: Vec<WorldOp>,
-    /// Border entities of cells hosted on other nodes, as last received over the bus.
-    remote_ghosts: HashMap<CellId, (std::time::Instant, Vec<Entity>)>,
+    /// Ghosts streamed by the hosts of cells on other nodes, merged from their deltas.
+    remote_ghosts: HashMap<CellId, musubi_mesh::GhostCache>,
+    /// Per leased cell: what the neighbours already hold, so each tick sends only the changes.
+    ghost_send: HashMap<CellId, musubi_mesh::GhostSendState>,
     /// This shard exists only for cells assigned to this node (it is not the world's home).
     hosted_only: bool,
     /// The world's home node as of shard creation: cells without an explicit host live there.
@@ -123,9 +125,6 @@ pub enum SpawnOutcome {
 
 /// A cross-node handover still unacknowledged after this many re-sends is logged (it keeps going).
 const REMOTE_HANDOVER_RETRIES: u32 = 5;
-
-/// Remote ghosts older than this are stale (their host stopped publishing or moved).
-const REMOTE_GHOST_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 const JOURNAL_EVERY: u64 = 5;
 
@@ -568,6 +567,7 @@ impl WorldRegistry {
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
+                    ghost_send: HashMap::new(),
                     sub_opts: HashMap::new(),
                     hosted_only: true,
                     home_node: home,
@@ -1280,6 +1280,7 @@ impl WorldRegistry {
                     sim_events: HashMap::new(),
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
+                ghost_send: HashMap::new(),
             sub_opts: HashMap::new(),
                     hosted_only: false,
                     home_node: None,
@@ -1719,6 +1720,7 @@ impl WorldRegistry {
                 sim_events: HashMap::new(),
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
+                ghost_send: HashMap::new(),
                 sub_opts: HashMap::new(),
                 hosted_only: false,
                 home_node: None,
@@ -2233,13 +2235,13 @@ impl WorldRegistry {
         let st = w.lock();
         let mut v = st.world.view(cell);
         for n in World::neighbours(cell) {
-            let Some((at, es)) = st.remote_ghosts.get(&n) else {
+            let Some(g) = st.remote_ghosts.get(&n) else {
                 continue;
             };
-            if at.elapsed() > REMOTE_GHOST_TTL {
+            if g.stale(st.world.tick, st.world.config().ghost_stale_ticks) {
                 continue;
             }
-            for g in st.world.ghosts_among(cell, es.iter()) {
+            for g in st.world.ghosts_among(cell, g.entities()) {
                 if !v.ghosts.iter().any(|e| e.id == g.id) {
                     v.ghosts.push(g.clone());
                 }
@@ -2255,7 +2257,8 @@ impl WorldRegistry {
     }
 
     /// Ghosts from another node: border entities of `cell`, which lives there, not here.
-    pub fn accept_ghosts(&self, name: &str, cell: CellId, tick: u64, entities: Vec<Entity>) {
+    pub fn accept_ghosts(&self, name: &str, delta: musubi_mesh::GhostDelta) {
+        let cell = delta.cell;
         let Some(w) = self.worlds.get(name) else {
             return;
         };
@@ -2270,9 +2273,11 @@ impl WorldRegistry {
         if st.world.owner(cell).is_some() {
             return;
         }
-        let _ = tick;
+        let local = st.world.tick;
         st.remote_ghosts
-            .insert(cell, (std::time::Instant::now(), entities));
+            .entry(cell)
+            .or_default()
+            .apply(delta, local);
     }
 
     /// An entity handed over from another node into a cell hosted here. Taken when a local
@@ -2733,17 +2738,22 @@ impl WorldRegistry {
                         }
                     }
                 }
-                for (cell, _) in st.world.leased_cells() {
-                    let border: Vec<Entity> = st
-                        .world
-                        .border_entities(cell)
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                    fanout.world_ghosts(&name, cell, st.world.tick, border);
+                let leased: Vec<CellId> = st
+                    .world
+                    .leased_cells()
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .collect();
+                st.ghost_send.retain(|c, _| leased.contains(c));
+                for cell in leased {
+                    let mut gs = st.ghost_send.remove(&cell).unwrap_or_default();
+                    if let Some(d) = st.world.ghost_delta(cell, &mut gs) {
+                        fanout.world_ghosts(&name, d);
+                    }
+                    st.ghost_send.insert(cell, gs);
                 }
-                st.remote_ghosts
-                    .retain(|_, (at, _)| at.elapsed() <= REMOTE_GHOST_TTL);
+                let (now, stale) = (st.world.tick, st.world.config().ghost_stale_ticks);
+                st.remote_ghosts.retain(|_, g| !g.stale(now, stale));
             }
             if st.world.tick % JOURNAL_EVERY == 0 && !st.journal.is_empty() {
                 if let Some(db) = self.db.clone() {

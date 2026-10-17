@@ -77,13 +77,12 @@ enum Wire {
     },
     RelayedCmd(RelayedCmdEnv),
     WorldCmd(WorldCmdEnv),
-    /// Cell host → cluster, every tick: entities of `cell` near its border, ghosts for the hosts
-    /// of the neighbouring cells.
+    /// Cell host → cluster, when something near the border changed: component-level delta of the
+    /// cell's border band (keyframe every `ghost_keyframe_ticks`), ghosts for the hosts of the
+    /// neighbouring cells.
     WorldGhosts {
         world: String,
-        cell: musubi_mesh::CellId,
-        tick: u64,
-        entities: Vec<musubi_mesh::Entity>,
+        delta: musubi_mesh::GhostDelta,
     },
     /// Cell host → host of `entity.cell`: the entity crossed into a cell that lives on another
     /// node; full state plus inputs buffered so far.
@@ -346,18 +345,10 @@ impl Fanout {
     }
 
     /// Publish the border entities of a locally hosted cell as ghosts for neighbour-cell hosts.
-    pub fn world_ghosts(
-        &self,
-        world: &str,
-        cell: musubi_mesh::CellId,
-        tick: u64,
-        entities: Vec<musubi_mesh::Entity>,
-    ) {
+    pub fn world_ghosts(&self, world: &str, delta: musubi_mesh::GhostDelta) {
         self.publish(Wire::WorldGhosts {
             world: world.to_string(),
-            cell,
-            tick,
-            entities,
+            delta,
         });
     }
 
@@ -662,14 +653,9 @@ impl Fanout {
                     w.unsubscribe_all(sid);
                 }
             }
-            Ok(Wire::WorldGhosts {
-                world,
-                cell,
-                tick,
-                entities,
-            }) => {
+            Ok(Wire::WorldGhosts { world, delta }) => {
                 if let Some(w) = self.worlds.get() {
-                    w.accept_ghosts(&world, cell, tick, entities);
+                    w.accept_ghosts(&world, delta);
                 }
             }
             Ok(Wire::WorldHandover {
