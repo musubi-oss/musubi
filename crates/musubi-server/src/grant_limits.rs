@@ -31,7 +31,7 @@ pub async fn check(
         return Ok(());
     };
     let used: i64 = sqlx::query_scalar(
-        "select coalesce(sum(amount), 0) from musubi.grant_usage
+        "select coalesce(sum(amount), 0)::bigint from musubi.grant_usage
          where account_id = $1 and kind = $2 and key = $3 and at > now() - make_interval(secs => $4)",
     )
     .bind(account.0)
