@@ -8811,3 +8811,122 @@ async fn relayed_host_migrates_by_rtt() {
         m => panic!("{m:?}"),
     }
 }
+
+/// Account-level shadow ban: the account keeps working, its chat reaches nobody and its
+/// matchmaking tickets are acknowledged but never matched.
+#[tokio::test]
+async fn shadow_ban_mutes_chat_and_matchmaking() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, acc_a) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let room = format!("shadow-{}", uuid::Uuid::now_v7().simple());
+    let join = || ClientMessage::ChannelJoin {
+        target: room.clone(),
+        kind: ChannelKind::Room,
+        persistence: false,
+        hidden: false,
+    };
+    send(&mut a, f, None, join()).await;
+    let room_id = match recv(&mut a).await.msg {
+        ServerMessage::Channel { id, .. } => id,
+        m => panic!("{m:?}"),
+    };
+    send(&mut b, f, None, join()).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Channel { .. }
+    ));
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::ChannelPresenceEvent { .. }
+    ));
+
+    let req = Request::post(format!("/v1/admin/accounts/{acc_a}/ban"))
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"shadow": true, "reason": "spam"}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+
+    // A's message: ack + own echo for A, nothing for B
+    send(
+        &mut a,
+        f,
+        Some("s1"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "hidden"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    let (mut ack, mut echo) = (false, false);
+    for _ in 0..2 {
+        match recv(&mut a).await.msg {
+            ServerMessage::ChannelMessageAck { .. } => ack = true,
+            ServerMessage::ChannelMessage(m) => {
+                assert_eq!(m.content["text"], "hidden");
+                echo = true;
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    assert!(ack && echo);
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "visible"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    // the first thing B receives is its own traffic, not A's message
+    for _ in 0..2 {
+        match recv(&mut b).await.msg {
+            ServerMessage::ChannelMessageAck { .. } => {}
+            ServerMessage::ChannelMessage(m) => assert_eq!(m.content["text"], "visible"),
+            m => panic!("{m:?}"),
+        }
+    }
+    // A still receives others' messages
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::ChannelMessage(m) if m.content["text"] == "visible")
+    );
+
+    // identical 2-player tickets: A is acknowledged but never matched, so B waits
+    let region = uuid::Uuid::now_v7().simple().to_string();
+    let add = || ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: format!("+region:{region}"),
+        string_properties: [("region".to_string(), region.clone())].into(),
+        numeric_properties: Default::default(),
+        count_multiple: 1,
+    };
+    send(&mut a, f, None, add()).await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    send(&mut b, f, None, add()).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(700), recv(&mut b)).await;
+    assert!(
+        waited.is_err(),
+        "shadow-banned ticket must not match: {:?}",
+        waited.map(|r| r.msg)
+    );
+}

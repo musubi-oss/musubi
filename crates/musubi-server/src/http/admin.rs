@@ -57,7 +57,7 @@ pub fn routes() -> Router<AppState> {
             "/v1/admin/accounts/{id}",
             get(account).delete(purge_account),
         )
-        .route("/v1/admin/accounts/{id}/ban", post(ban))
+        .route("/v1/admin/accounts/{id}/ban", post(ban).get(get_ban))
         .route("/v1/admin/accounts/{id}/unban", post(unban))
         .route("/v1/admin/accounts/{id}/kick", post(kick))
         .route("/v1/admin/accounts/{id}/export", get(export))
@@ -148,18 +148,100 @@ pub(crate) async fn kick_everywhere(s: &AppState, id: AccountId) -> usize {
     local
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct BanBody {
+    /// Internal note for moderators.
+    pub reason: Option<String>,
+    /// Shown to the player in the rejection.
+    pub message: Option<String>,
+    /// Lifted automatically after this many seconds; absent = permanent.
+    pub until_secs: Option<i64>,
+    /// Keep the account working but make chat and matchmaking silently ignore it.
+    pub shadow: bool,
+}
+
+/// `POST /v1/admin/accounts/{id}/ban` — body optional (legacy: permanent hard ban).
 async fn ban(
     _k: ServerKey,
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
+    body: Option<Json<BanBody>>,
 ) -> Result<Json<Value>, ApiError> {
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    if b.until_secs.is_some_and(|u| u <= 0) {
+        return Err(Error::InvalidArgument("until_secs must be positive".into()).into());
+    }
+    if b.message.as_ref().is_some_and(|m| m.chars().count() > 512) {
+        return Err(Error::InvalidArgument("message over 512 chars".into()).into());
+    }
     let id = AccountId(id);
-    s.accounts.set_disabled(id, true).await?;
-    s.banned.set(id, true, s.cluster.as_ref()).await;
-    s.events.emit("account.banned", Some(id), json!({})).await;
-    let kicked = kick_everywhere(&s, id).await;
-    voice_ban(&s, id, true);
-    Ok(Json(json!({ "banned": true, "kicked_local": kicked })))
+    let until = b
+        .until_secs
+        .map(|u| time::OffsetDateTime::now_utc().unix_timestamp() + u);
+    let info = crate::bans::BanInfo {
+        reason: b.reason.clone(),
+        message: b.message.clone(),
+        until,
+        shadow: b.shadow,
+    };
+    sqlx::query(
+        "insert into musubi.account_bans (account_id, reason, message, until, shadow, actor)
+         values ($1, $2, $3, to_timestamp($4), $5, 'server')
+         on conflict (account_id) do update set reason = excluded.reason,
+            message = excluded.message, until = excluded.until, shadow = excluded.shadow,
+            actor = excluded.actor, created_at = now()",
+    )
+    .bind(id.0)
+    .bind(&b.reason)
+    .bind(&b.message)
+    .bind(until.map(|u| u as f64))
+    .bind(b.shadow)
+    .execute(&s.db)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
+            Error::NotFound("account".into())
+        }
+        e => Error::internal(e),
+    })?;
+    let mut kicked = 0;
+    if b.shadow {
+        // a previous hard ban on the same account becomes a shadow one
+        s.accounts.set_disabled(id, false).await?;
+        voice_ban(&s, id, false);
+    } else {
+        s.accounts.set_disabled(id, true).await?;
+        kicked = kick_everywhere(&s, id).await;
+        voice_ban(&s, id, true);
+    }
+    s.banned.set(id, Some(info), s.cluster.as_ref()).await;
+    s.events
+        .emit(
+            "account.banned",
+            Some(id),
+            json!({ "reason": b.reason, "until": until, "shadow": b.shadow }),
+        )
+        .await;
+    Ok(Json(json!({
+        "banned": true, "shadow": b.shadow, "until": until, "kicked_local": kicked
+    })))
+}
+
+/// Lift a ban: used by `unban` and by the leader sweep for expired ones.
+pub(crate) async fn lift_ban(s: &AppState, id: AccountId, auto: bool) -> Result<(), Error> {
+    sqlx::query("delete from musubi.account_bans where account_id = $1")
+        .bind(id.0)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?;
+    s.accounts.set_disabled(id, false).await?;
+    s.banned.set(id, None, s.cluster.as_ref()).await;
+    voice_ban(s, id, false);
+    s.events
+        .emit("account.unbanned", Some(id), json!({ "auto": auto }))
+        .await;
+    Ok(())
 }
 
 async fn unban(
@@ -167,13 +249,72 @@ async fn unban(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    s.accounts.set_disabled(AccountId(id), false).await?;
-    s.banned.set(AccountId(id), false, s.cluster.as_ref()).await;
-    voice_ban(&s, AccountId(id), false);
-    s.events
-        .emit("account.unbanned", Some(AccountId(id)), json!({}))
-        .await;
+    lift_ban(&s, AccountId(id), false).await?;
     Ok(Json(json!({ "banned": false })))
+}
+
+/// `GET /v1/admin/accounts/{id}/ban`
+async fn get_ban(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    type Row = (Option<String>, Option<String>, Option<i64>, bool, String);
+    let row: Option<Row> = sqlx::query_as(
+        "select reason, message, (extract(epoch from until))::bigint, shadow,
+                to_char(created_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+         from musubi.account_bans where account_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let Some((reason, message, until, shadow, created_at)) = row else {
+        return Err(Error::NotFound("ban".into()).into());
+    };
+    Ok(Json(json!({
+        "account_id": id, "reason": reason, "message": message, "until": until,
+        "shadow": shadow, "created_at": created_at,
+        "active": until.is_none_or(|u| u > time::OffsetDateTime::now_utc().unix_timestamp()),
+    })))
+}
+
+/// Expired bans → lifted (leader sweep, once a minute).
+pub(crate) async fn lift_expired_bans(s: &AppState) -> Result<usize, Error> {
+    let ids: Vec<(Uuid,)> =
+        sqlx::query_as("select account_id from musubi.account_bans where until <= now()")
+            .fetch_all(&s.db)
+            .await
+            .map_err(Error::internal)?;
+    for (id,) in &ids {
+        lift_ban(s, AccountId(*id), true).await?;
+    }
+    Ok(ids.len())
+}
+
+/// Soft-deleted accounts older than `[retention] deleted_account_days` are purged for good.
+pub(crate) async fn purge_deleted_accounts(s: &AppState) -> Result<usize, Error> {
+    let days = s.cfg.retention.deleted_account_days;
+    if days == 0 {
+        return Ok(0);
+    }
+    let ids: Vec<(Uuid,)> = sqlx::query_as(
+        "select id from musubi.accounts
+         where deleted_at is not null and deleted_at < now() - make_interval(days => $1::int)
+         limit 200",
+    )
+    .bind(days as i32)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    for (id,) in &ids {
+        let id = AccountId(*id);
+        s.accounts.purge(id).await?;
+        s.events
+            .emit("account.purged", Some(id), json!({ "after_days": days }))
+            .await;
+    }
+    Ok(ids.len())
 }
 
 async fn kick(

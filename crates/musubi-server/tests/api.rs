@@ -9389,3 +9389,163 @@ async fn passkeys_register_and_login() {
     .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Bans carry a player-visible message and an expiry; shadow bans keep the account working.
+#[tokio::test]
+async fn account_bans_message_expiry_and_shadow() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let dev_id = unique("ban-dev-");
+    let (st, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let at = a["access_token"].as_str().unwrap();
+    let aid = a["account_id"].as_str().unwrap().to_string();
+
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        Some(json!({"reason": "aimbot", "message": "cheating is not allowed", "until_secs": 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["shadow"], false);
+    assert!(r["until"].is_i64());
+    // the player sees the message on requests and at login
+    let (st, e) = call(&app, "GET", "/v1/account", Some(at), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    let msg = e["message"].as_str().unwrap();
+    assert!(
+        msg.contains("cheating is not allowed") && msg.contains("until"),
+        "{msg}"
+    );
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert!(
+        e["message"]
+            .as_str()
+            .unwrap()
+            .contains("cheating is not allowed"),
+        "{e}"
+    );
+    let (st, b) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["reason"], "aimbot");
+    assert_eq!(b["active"], true);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/unban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // shadow: nothing is denied
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        Some(json!({"shadow": true, "reason": "spam"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, b) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b["shadow"], true);
+    assert_eq!(b["until"], serde_json::Value::Null);
+
+    // a short ban expires on its own (in-memory check; the leader sweep also clears the row)
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        Some(json!({"until_secs": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, b) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b["active"], false);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/unban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // legacy: bare POST = permanent hard ban
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["until"], serde_json::Value::Null);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(at), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}

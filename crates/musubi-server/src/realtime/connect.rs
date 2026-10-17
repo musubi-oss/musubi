@@ -103,6 +103,7 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         relayed: s.relayed.clone(),
         matches: s.matches.clone(),
         worlds: s.worlds.clone(),
+        banned: s.banned.clone(),
         runtime: s.runtime.clone(),
         fanout: s.fanout.clone(),
     }

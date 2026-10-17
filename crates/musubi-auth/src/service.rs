@@ -863,6 +863,31 @@ impl AuthService {
         }
     }
 
+    /// Player-facing text for a disabled account: the moderator's message and expiry from
+    /// `musubi.account_bans` when there is one.
+    async fn ban_text(&self, account_id: AccountId) -> String {
+        let row: Option<(Option<String>, Option<OffsetDateTime>)> =
+            sqlx::query_as("select message, until from musubi.account_bans where account_id = $1")
+                .bind(account_id.0)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten();
+        let mut s = String::from("account banned");
+        if let Some((message, until)) = row {
+            if let Some(m) = message.filter(|m| !m.is_empty()) {
+                s.push_str(": ");
+                s.push_str(&m);
+            }
+            if let Some(u) = until {
+                if let Ok(f) = u.format(&time::format_description::well_known::Rfc3339) {
+                    s.push_str(&format!(" (until {f})"));
+                }
+            }
+        }
+        s
+    }
+
     async fn open_session(
         &self,
         account_id: AccountId,
@@ -894,7 +919,7 @@ impl AuthService {
         let username = match row {
             None => return Err(Error::NotFound("account".into())),
             Some((Some(_), _)) => {
-                return Err(Error::PermissionDenied("account disabled".into()));
+                return Err(Error::PermissionDenied(self.ban_text(account_id).await));
             }
             Some((None, username)) => username,
         };

@@ -579,6 +579,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     Ok(v) => tracing::info!(removed = %v, "retention pass"),
                     Err(e) => tracing::warn!(error = %e, "retention pass failed"),
                 }
+                match crate::http::admin::purge_deleted_accounts(&st).await {
+                    Ok(k) if k > 0 => tracing::info!(accounts = k, "deleted accounts purged"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "account purge failed"),
+                }
             }
         });
     }
@@ -688,6 +693,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                             }
                         }
                         Err(e) => tracing::warn!(error = %e, "end-of-window scan failed"),
+                    }
+                }
+                // expired bans: every minute, same leader as the market sweep
+                if n % 12 == 0 {
+                    match crate::http::admin::lift_expired_bans(&st).await {
+                        Ok(k) if k > 0 => tracing::info!(accounts = k, "expired bans lifted"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "ban expiry sweep failed"),
                     }
                 }
                 // league rollovers: every minute, same leader as the market sweep

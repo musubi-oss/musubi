@@ -808,6 +808,8 @@ pub struct RetentionConfig {
     pub world_history_days: u64,
     /// Recorded matches (`params.record = true`) and their replay frames.
     pub replay_days: u64,
+    /// Soft-deleted accounts are purged for good after this many days (0 = never).
+    pub deleted_account_days: u64,
 }
 
 impl Default for RetentionConfig {
@@ -825,6 +827,7 @@ impl Default for RetentionConfig {
             sessions_days: 7,
             world_history_days: 7,
             replay_days: 30,
+            deleted_account_days: 30,
         }
     }
 }

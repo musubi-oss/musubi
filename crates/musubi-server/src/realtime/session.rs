@@ -42,6 +42,7 @@ pub struct ConnectParams {
     pub relayed: Arc<RelayedRegistry>,
     pub matches: Arc<MatchRegistry>,
     pub worlds: Arc<super::WorldRegistry>,
+    pub banned: Arc<crate::bans::Bans>,
     pub runtime: Arc<Runtime>,
     pub fanout: Fanout,
     pub rate: Arc<crate::limits::RateLimiter>,
@@ -71,6 +72,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         runtime,
         fanout,
         rate,
+        banned,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -97,6 +99,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         fanout: &fanout,
         presence: &presence,
         rate: &rate,
+        banned: &banned,
         resume: None,
     };
     let resume_token = given_token.or_else(|| {
@@ -277,6 +280,7 @@ struct Ctx<'a> {
     fanout: &'a Fanout,
     presence: &'a UserPresence,
     rate: &'a crate::limits::RateLimiter,
+    banned: &'a crate::bans::Bans,
     resume: Option<Arc<super::resume::ResumeTracker>>,
 }
 
@@ -552,6 +556,12 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                     }
                 }
             }
+            if ctx.banned.is_shadow(ctx.presence.account_id) {
+                // shadow-banned: looks like a ticket, never matches
+                return Some(ServerMessage::MatchmakerTicket {
+                    ticket: uuid::Uuid::now_v7().to_string(),
+                });
+            }
             let me = MatchmakerUser {
                 presence: ctx.presence.clone(),
                 string_properties,
@@ -628,6 +638,11 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             numeric_properties,
             count_multiple,
         } => {
+            if ctx.banned.is_shadow(ctx.presence.account_id) {
+                return Some(ServerMessage::MatchmakerTicket {
+                    ticket: uuid::Uuid::now_v7().to_string(),
+                });
+            }
             // same server-side mmr as solo tickets, per party member (best effort: only when the
             // party is hosted here and the queue has a rating queue)
             let mut mmr = std::collections::HashMap::new();
@@ -924,7 +939,12 @@ async fn channel_send(
 ) -> musubi_core::Result<ServerMessage> {
     let channel = joined_channel(ctx, channel_id)?;
     let me = ctx.presence.account_id;
-    let restriction = ctx.chat.restriction(&channel, me).await?;
+    // an account-level shadow ban behaves like a shadow restriction on every channel
+    let restriction = if ctx.banned.is_shadow(me) {
+        Some("shadow".to_string())
+    } else {
+        ctx.chat.restriction(&channel, me).await?
+    };
     if let Some(kind) = restriction.as_deref().filter(|k| *k != "shadow") {
         return Err(Error::PermissionDenied(format!("{kind}d in this channel")));
     }
