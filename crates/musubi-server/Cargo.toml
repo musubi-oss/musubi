@@ -76,3 +76,4 @@ musubi-proto.workspace = true
 jsonwebtoken.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
+str0m = "0.24"

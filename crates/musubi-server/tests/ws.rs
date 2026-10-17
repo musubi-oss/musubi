@@ -113,6 +113,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
         worlds: worlds.clone(),
         liveops: None,
         voice: None,
+        rtc: None,
         apple_iap: None,
         google_iap: None,
         steam_iap: None,
@@ -7338,4 +7339,122 @@ async fn world_unreliable_position_updates() {
         }
         m => panic!("{m:?}"),
     }
+}
+
+/// Drive a str0m client until an event the caller wants shows up (or 10 s pass).
+async fn rtc_drive(
+    rtc: &mut str0m::Rtc,
+    sock: &tokio::net::UdpSocket,
+    mut want: impl FnMut(&str0m::Event) -> bool,
+) -> Option<str0m::Event> {
+    let local = sock.local_addr().unwrap();
+    let mut buf = vec![0u8; 2000];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let timeout = loop {
+            match rtc.poll_output().unwrap() {
+                str0m::Output::Timeout(t) => break t,
+                str0m::Output::Transmit(t) => {
+                    sock.send_to(&t.contents, t.destination).await.unwrap();
+                }
+                str0m::Output::Event(e) => {
+                    if want(&e) {
+                        return Some(e);
+                    }
+                }
+            }
+        };
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        let dur = timeout
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_millis(1));
+        match tokio::time::timeout(dur, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, source))) => {
+                let contents = buf[..n].try_into().unwrap();
+                rtc.handle_input(str0m::Input::Receive(
+                    std::time::Instant::now(),
+                    str0m::net::Receive {
+                        proto: str0m::net::Protocol::Udp,
+                        source,
+                        destination: local,
+                        contents,
+                    },
+                ))
+                .unwrap();
+            }
+            _ => rtc
+                .handle_input(str0m::Input::Timeout(std::time::Instant::now()))
+                .unwrap(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn webrtc_datachannel_ping() {
+    use musubi_transport::quic::QuicConnection as Q;
+    use musubi_transport::Frame;
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let rtc_server =
+        musubi_transport::webrtc::RtcServer::bind("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+    state.rtc = Some(rtc_server);
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _) = token(&router).await;
+
+    // browser side: a str0m peer with one data channel, offer over HTTP
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut rtc = str0m::Rtc::builder().build(std::time::Instant::now());
+    rtc.add_local_candidate(str0m::Candidate::host(sock.local_addr().unwrap(), "udp").unwrap());
+    let mut api = rtc.sdp_api();
+    let cid = api.add_channel("reliable".into());
+    let (offer, pending) = api.apply().unwrap();
+    let req = Request::post("/v1/rtc/offer")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&offer).unwrap()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let v: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["type"], "answer");
+    let answer: str0m::change::SdpAnswer = serde_json::from_value(v).unwrap();
+    rtc.sdp_api().accept_answer(pending, answer).unwrap();
+
+    let opened = rtc_drive(
+        &mut rtc,
+        &sock,
+        |e| matches!(e, str0m::Event::ChannelOpen(c, _) if *c == cid),
+    )
+    .await;
+    assert!(opened.is_some(), "data channel never opened");
+    let hello = Q::encode_datagram(&Frame::Text(
+        json!({"token": ta, "format": "json"}).to_string(),
+    ));
+    rtc.channel(cid).unwrap().write(true, &hello).unwrap();
+    let ping = Q::encode_datagram(&Frame::Text(
+        serde_json::to_string(&Envelope {
+            cid: Some("1".into()),
+            msg: ClientMessage::Ping,
+        })
+        .unwrap(),
+    ));
+    rtc.channel(cid).unwrap().write(true, &ping).unwrap();
+    let data = rtc_drive(&mut rtc, &sock, |e| {
+        matches!(e, str0m::Event::ChannelData(_))
+    })
+    .await;
+    let Some(str0m::Event::ChannelData(d)) = data else {
+        panic!("no reply on the data channel")
+    };
+    let Frame::Text(t) = Q::decode_datagram(bytes::Bytes::from(d.data)).unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert_eq!(r.cid.as_deref(), Some("1"));
+    assert!(matches!(r.msg, ServerMessage::Pong), "{r:?}");
 }

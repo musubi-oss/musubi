@@ -19,3 +19,5 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 rcgen.workspace = true
 wtransport = "0.7"
+str0m = "0.24"
+serde_json.workspace = true

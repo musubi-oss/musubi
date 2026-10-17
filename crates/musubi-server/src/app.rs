@@ -44,6 +44,8 @@ pub struct AppState {
     pub worlds: Arc<crate::realtime::WorldRegistry>,
     pub liveops: Option<Arc<ZanshinClient>>,
     pub voice: Option<Arc<AurixClient>>,
+    /// WebRTC signalling + data channels (`[webrtc] listen`).
+    pub rtc: Option<Arc<musubi_transport::webrtc::RtcServer>>,
     pub apple_iap: Option<Arc<musubi_integrations::AppleStoreClient>>,
     pub google_iap: Option<Arc<musubi_integrations::GooglePlayClient>>,
     pub steam_iap: Option<Arc<musubi_integrations::SteamClient>>,
@@ -420,6 +422,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     for p in &schedules.problems {
         tracing::warn!(problem = %p, "runtime schedule ignored");
     }
+    let rtc = match cfg.webrtc.listen {
+        Some(listen) => {
+            let s = musubi_transport::webrtc::RtcServer::bind(listen, cfg.webrtc.public_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("webrtc: {e}"))?;
+            tracing::info!(addr = %s.local_addr(), public = %s.public_addr(), "webrtc listening");
+            Some(s)
+        }
+        None => None,
+    };
     let state = AppState {
         cfg: Arc::new(cfg),
         events: Arc::new(crate::events::Events::new(db.clone())),
@@ -446,6 +458,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         worlds,
         liveops,
         voice,
+        rtc,
         apple_iap,
         google_iap,
         steam_iap,

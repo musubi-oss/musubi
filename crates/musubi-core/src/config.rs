@@ -37,6 +37,7 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub quic: QuicConfig,
     pub webtransport: WebTransportConfig,
+    pub webrtc: WebRtcConfig,
     pub zanshin: ZanshinConfig,
     pub aurix: AurixConfig,
     pub iap: IapConfig,
@@ -429,6 +430,18 @@ pub struct WebTransportConfig {
     /// Unset = self-signed `localhost` cert (development only).
     pub cert_pem: Option<std::path::PathBuf>,
     pub key_pem: Option<std::path::PathBuf>,
+}
+
+/// WebRTC DataChannel realtime transport (browsers without WebTransport). Signalling is
+/// `POST /v1/rtc/offer` on the HTTP port; media/data flow over this UDP socket.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WebRtcConfig {
+    /// UDP listen address; unset = WebRTC disabled.
+    pub listen: Option<SocketAddr>,
+    /// Address browsers reach the UDP socket at (ICE host candidate); defaults to `listen`,
+    /// or loopback when `listen` is an unspecified IP.
+    pub public_addr: Option<SocketAddr>,
 }
 
 /// Zanshin LiveOps (flags, experiments, analytics). Unset `url` = disabled.

@@ -85,6 +85,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         worlds: worlds.clone(),
         liveops: None,
         voice: None,
+        rtc: None,
         apple_iap: None,
         google_iap: None,
         steam_iap: None,

@@ -12,6 +12,7 @@ pub use musubi_proto::Encoding;
 
 pub mod framing;
 pub mod quic;
+pub mod webrtc;
 pub mod webtransport;
 pub mod ws;
 
