@@ -3133,7 +3133,7 @@ async fn mock_stores(bundle_id: &str, item_product: &str) -> (String, Arc<TestCh
                     }
                     let payload = json!({
                         "transactionId": id, "originalTransactionId": id, "bundleId": if id == "foreign" { "com.other.app" } else { b.as_str() },
-                        "productId": prod, "purchaseDate": 1_700_000_000_000i64, "quantity": 1, "environment": "Sandbox", "type": "Consumable",
+                        "productId": prod, "purchaseDate": 1_700_000_000_000i64, "quantity": 1, "environment": "Sandbox", "type": if prod.ends_with("-sub") { "Auto-Renewable Subscription" } else { "Consumable" }, "expiresDate": if prod.ends_with("-sub") { json!(4_000_000_000_000i64) } else { Value::Null },
                         "revocationDate": if id == "refunded" { json!(1_700_000_100_000i64) } else { Value::Null }
                     });
                     let jws = ch.sign(&payload, &id);
@@ -9808,4 +9808,170 @@ async fn world_cold_cell_unloads_and_reloads() {
         "{info}"
     );
     assert_eq!(info["entities"], 1, "{info}");
+}
+
+#[tokio::test]
+async fn iap_subscription_redeem_shows_active() {
+    let Some(mut state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let (gem_pack, gems_item, product) = (
+        format!("pack-{suffix}"),
+        format!("gems-{suffix}"),
+        format!("com.musubi.gold.{suffix}-sub"),
+    );
+    let (upstream, apple_chain) = mock_stores("com.musubi.test", &product).await;
+    let apple_pem = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/apple_test_ec.pem"
+    ))
+    .unwrap();
+    let google_pem = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/google_test_rsa.pem"
+    ))
+    .unwrap();
+    state.apple_iap = Some(
+        musubi_integrations::AppleStoreClient::new_with_root(
+            &upstream,
+            "ISSUER",
+            "KEYID",
+            "com.musubi.test",
+            &apple_pem,
+            &apple_chain.root,
+        )
+        .unwrap(),
+    );
+    state.steam_iap =
+        Some(musubi_integrations::SteamClient::new(&upstream, "STEAMKEY", 480, true).unwrap());
+    state.google_iap = Some(
+        musubi_integrations::GooglePlayClient::new_with_notifications(
+            &upstream,
+            &format!("{upstream}/token"),
+            "com.musubi.test",
+            "sa@test.iam",
+            &google_pem,
+            "notify-secret",
+        )
+        .unwrap(),
+    );
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _) = token(&router).await;
+    let (_tb, _acc_b) = token(&router).await;
+    // catalog: item + store listing + provider product mapping
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/items",
+        None,
+        true,
+        Some(json!({"id": gems_item, "name": "Gems", "stackable": true, "max_stack": 100000})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, b) = http_json(
+        &router,
+        "POST",
+        "/v1/server/store",
+        None,
+        true,
+        Some(json!({"id": gem_pack, "item_id": gems_item, "quantity": 100, "prices": {}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/iap/products",
+        None,
+        true,
+        Some(json!({"provider": "apple", "product_id": product, "store_item_id": "nope"})),
+    )
+    .await;
+    assert_eq!(st, 404, "unknown store item");
+    for prov in ["apple", "google"] {
+        let (st, b) = http_json(
+            &router,
+            "POST",
+            "/v1/server/iap/products",
+            None,
+            true,
+            Some(json!({"provider": prov, "product_id": product, "store_item_id": gem_pack, "kind": "subscription", "grace_secs": 86400})),
+        )
+        .await;
+        assert_eq!(st, 200, "{b}");
+    }
+    // a subscription receipt: gems granted for the period, subscription visible and active
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": format!("sub-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, subs) = http_json(
+        &router,
+        "GET",
+        "/v1/iap/subscriptions",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{subs}");
+    let list = subs["subscriptions"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{subs}");
+    assert_eq!(list[0]["status"], "active");
+    assert_eq!(list[0]["active"], true);
+    assert_eq!(list[0]["product_id"], product);
+    assert_eq!(list[0]["expires_at_ms"], 4_000_000_000_000i64);
+    assert_eq!(list[0]["grace_secs"], 86400);
+    assert_eq!(list[0]["original_transaction_id"], format!("sub-{suffix}"));
+    // the same receipt again is replayed: still one subscription, gems granted once
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/apple",
+        Some(&ta),
+        false,
+        Some(json!({"transaction_id": format!("sub-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, subs) = http_json(
+        &router,
+        "GET",
+        "/v1/iap/subscriptions",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(subs["subscriptions"].as_array().unwrap().len(), 1);
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    let gems: i64 = inv["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|it| it["item_id"] == gems_item)
+                .map(|it| it["quantity"].as_i64().unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
+    assert_eq!(gems, 100, "{inv}");
+    // products list carries kind and grace
+    let (_, prods) = http_json(&router, "GET", "/v1/server/iap/products", None, true, None).await;
+    let mine = prods["products"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["provider"] == "apple" && p["product_id"] == product)
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(mine["kind"], "subscription", "{prods}");
+    assert_eq!(mine["grace_secs"], 86400);
 }

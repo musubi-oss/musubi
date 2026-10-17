@@ -52,6 +52,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/iap/apple", post(iap_apple))
         .route("/v1/iap/google", post(iap_google))
         .route("/v1/iap/receipts", get(iap_receipts))
+        .route("/v1/iap/subscriptions", get(iap_subscriptions))
         .route("/v1/iap/apple/notifications", post(iap_apple_notifications))
         .route(
             "/v1/iap/google/notifications",
@@ -62,6 +63,7 @@ pub fn routes() -> Router<AppState> {
             get(iap_products).post(upsert_iap_product),
         )
         .route("/v1/server/iap/receipts", get(iap_receipts_of))
+        .route("/v1/server/iap/subscriptions", get(iap_subscriptions_of))
         .route("/v1/quests", get(quests_mine))
         .route("/v1/quests/{id}/claim", post(quest_claim))
         .route("/v1/seasons/current", get(season_current))
@@ -697,8 +699,33 @@ fn receipt_input(t: StoreTransaction) -> ReceiptInput {
         environment: t.environment,
         purchased_at_ms: t.purchased_at_ms,
         quantity: t.quantity,
+        original_transaction_id: t.original_transaction_id,
+        expires_at_ms: t.expires_at_ms,
         raw: t.raw,
     }
+}
+
+async fn iap_subscriptions(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "subscriptions": s.economy.subscriptions_of(me.account_id).await? }),
+    ))
+}
+
+async fn iap_subscriptions_of(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<AccountQ>,
+) -> Result<Json<Value>, ApiError> {
+    let id: Uuid = q
+        .account_id
+        .parse()
+        .map_err(|_| Error::InvalidArgument("account_id".into()))?;
+    Ok(Json(json!({
+        "subscriptions": s.economy.subscriptions_of(musubi_core::AccountId(id)).await?
+    })))
 }
 
 #[derive(Deserialize)]
@@ -740,7 +767,34 @@ async fn iap_google(
     let Some(c) = &s.google_iap else {
         return Err(Error::NotFound("google iap is not configured".into()).into());
     };
-    let t = c.product_purchase(&r.product_id, &r.purchase_token).await?;
+    let kind = s
+        .economy
+        .iap_product("google", &r.product_id)
+        .await?
+        .map(|p| p.kind)
+        .unwrap_or_default();
+    let t = if kind == "subscription" {
+        let i = c.subscription_purchase(&r.purchase_token).await?;
+        if !i.product_id.is_empty() && i.product_id != r.product_id {
+            return Err(Error::InvalidArgument(
+                "product_id does not match the subscription".into(),
+            )
+            .into());
+        }
+        musubi_integrations::StoreTransaction {
+            provider: "google".into(),
+            transaction_id: i.transaction_id,
+            product_id: r.product_id.clone(),
+            environment: i.environment,
+            purchased_at_ms: 0,
+            quantity: 1,
+            original_transaction_id: Some(i.original_transaction_id),
+            expires_at_ms: i.expires_at_ms,
+            raw: i.raw,
+        }
+    } else {
+        c.product_purchase(&r.product_id, &r.purchase_token).await?
+    };
     let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
     s.events
         .emit(
@@ -1117,9 +1171,10 @@ async fn iap_apple_notifications(
     let p = c.verify_payload(&n.signed_payload)?;
     let kind = p["notificationType"].as_str().unwrap_or("").to_string();
     let mut revoked = None;
-    if matches!(kind.as_str(), "REFUND" | "REVOKE") {
-        if let Some(jws) = p["data"]["signedTransactionInfo"].as_str() {
-            let t = c.verify_payload(jws)?;
+    let mut subscription = None;
+    if let Some(jws) = p["data"]["signedTransactionInfo"].as_str() {
+        let t = c.verify_payload(jws)?;
+        if matches!(kind.as_str(), "REFUND" | "REVOKE") {
             if let Some(id) = t["transactionId"].as_str() {
                 revoked = s
                     .economy
@@ -1127,9 +1182,51 @@ async fn iap_apple_notifications(
                     .await?;
             }
         }
+        if t["type"].as_str() == Some("Auto-Renewable Subscription") {
+            if let Some(orig) = t["originalTransactionId"].as_str() {
+                let status = match kind.as_str() {
+                    "EXPIRED" | "GRACE_PERIOD_EXPIRED" => Some("expired"),
+                    "REFUND" | "REVOKE" => Some("revoked"),
+                    "DID_FAIL_TO_RENEW" => Some("grace"),
+                    "SUBSCRIBED" | "DID_RENEW" | "OFFER_REDEEMED" | "RENEWAL_EXTENDED" => {
+                        Some("active")
+                    }
+                    _ => None,
+                };
+                let auto_renew = p["data"]["signedRenewalInfo"]
+                    .as_str()
+                    .and_then(|j| c.verify_payload(j).ok())
+                    .and_then(|r| r["autoRenewStatus"].as_i64())
+                    .map(|v| v == 1);
+                subscription = s
+                    .economy
+                    .update_subscription(
+                        "apple",
+                        orig,
+                        t["transactionId"].as_str(),
+                        t["expiresDate"].as_i64(),
+                        status,
+                        auto_renew,
+                    )
+                    .await?;
+                if let Some(sub) = &subscription {
+                    let acc = sub["account_id"]
+                        .as_str()
+                        .and_then(|a| a.parse().ok())
+                        .map(musubi_core::AccountId);
+                    s.events
+                        .emit(
+                            &format!("iap.subscription.{}", kind.to_lowercase()),
+                            acc,
+                            sub.clone(),
+                        )
+                        .await;
+                }
+            }
+        }
     }
     Ok(Json(
-        json!({ "notification_type": kind, "revoked": revoked }),
+        json!({ "notification_type": kind, "revoked": revoked, "subscription": subscription }),
     ))
 }
 
@@ -1183,7 +1280,51 @@ async fn iap_google_notifications(
     if let Some(t) = token {
         revoked = s.economy.revoke_receipt("google", t, reason).await?;
     }
-    Ok(Json(json!({ "revoked": revoked })))
+    let mut subscription = None;
+    if let Some(t) = v["subscriptionNotification"]["purchaseToken"].as_str() {
+        // RTDN types: 1 RECOVERED 2 RENEWED 3 CANCELED 4 PURCHASED 5 ON_HOLD 6 IN_GRACE_PERIOD
+        // 7 RESTARTED 12 REVOKED 13 EXPIRED
+        let kind = v["subscriptionNotification"]["notificationType"]
+            .as_i64()
+            .unwrap_or(0);
+        let info = c.subscription_purchase(t).await?;
+        let status = match kind {
+            1 | 2 | 4 | 7 => Some("active"),
+            5 => Some("hold"),
+            6 => Some("grace"),
+            12 => Some("revoked"),
+            13 => Some("expired"),
+            _ => None,
+        };
+        let auto_renew = if kind == 3 {
+            Some(false)
+        } else {
+            info.auto_renew
+        };
+        subscription = s
+            .economy
+            .update_subscription(
+                "google",
+                t,
+                Some(&info.transaction_id),
+                info.expires_at_ms,
+                status,
+                auto_renew,
+            )
+            .await?;
+        if let Some(sub) = &subscription {
+            let acc = sub["account_id"]
+                .as_str()
+                .and_then(|a| a.parse().ok())
+                .map(musubi_core::AccountId);
+            s.events
+                .emit(&format!("iap.subscription.google_{kind}"), acc, sub.clone())
+                .await;
+        }
+    }
+    Ok(Json(
+        json!({ "revoked": revoked, "subscription": subscription }),
+    ))
 }
 
 // ----- steam microtransactions -----
@@ -1298,6 +1439,8 @@ async fn iap_steam_finalize(
             me.account_id,
             ReceiptInput {
                 provider: "steam".into(),
+                original_transaction_id: None,
+                expires_at_ms: None,
                 transaction_id: transid,
                 product_id: order.product_id.clone(),
                 environment: environment.into(),

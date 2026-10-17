@@ -20,6 +20,26 @@ pub struct StoreTransaction {
     pub environment: String,
     pub purchased_at_ms: i64,
     pub quantity: i64,
+    /// Subscriptions: the id that stays the same across renewals (Apple originalTransactionId,
+    /// Google purchaseToken).
+    pub original_transaction_id: Option<String>,
+    /// Subscriptions: when the current period ends (ms since epoch).
+    pub expires_at_ms: Option<i64>,
+    pub raw: Value,
+}
+
+/// State of an auto-renewing subscription as the store reports it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubscriptionInfo {
+    pub provider: String,
+    pub product_id: String,
+    pub original_transaction_id: String,
+    pub transaction_id: String,
+    pub expires_at_ms: Option<i64>,
+    /// Store's own state string (e.g. `SUBSCRIPTION_STATE_ACTIVE`).
+    pub state: String,
+    pub auto_renew: Option<bool>,
+    pub environment: String,
     pub raw: Value,
 }
 
@@ -153,6 +173,8 @@ impl AppleStoreClient {
         }
         Ok(StoreTransaction {
             provider: "apple".into(),
+            original_transaction_id: t["originalTransactionId"].as_str().map(str::to_string),
+            expires_at_ms: t["expiresDate"].as_i64(),
             transaction_id: transaction_id.into(),
             product_id: t["productId"].as_str().unwrap_or("").into(),
             environment: t["environment"].as_str().unwrap_or("Production").into(),
@@ -262,6 +284,57 @@ impl GooglePlayClient {
     }
 
     /// Validates a one-time product purchase token; requires `purchaseState == 0` (purchased).
+    /// `purchases.subscriptionsv2.get`: current state of an auto-renewing subscription.
+    pub async fn subscription_purchase(&self, purchase_token: &str) -> Result<SubscriptionInfo> {
+        if purchase_token.is_empty() || purchase_token.len() > 1024 {
+            return Err(Error::InvalidArgument("purchase_token".into()));
+        }
+        let token = self.access_token().await?;
+        let res = self
+            .http
+            .get(format!(
+                "{}/androidpublisher/v3/applications/{}/purchases/subscriptionsv2/tokens/{purchase_token}",
+                self.url, self.package_name
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("google: {e}")))?;
+        match res.status().as_u16() {
+            200 => {}
+            400 | 404 => return Err(Error::NotFound("google subscription".into())),
+            401 | 403 => {
+                return Err(Error::Internal(
+                    "google: rejected server credentials".into(),
+                ))
+            }
+            s => return Err(Error::Unavailable(format!("google: status {s}"))),
+        }
+        let v: Value = res.json().await.map_err(Error::internal)?;
+        let line = v["lineItems"][0].clone();
+        let expires_at_ms = line["expiryTime"]
+            .as_str()
+            .and_then(|s| {
+                OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+            })
+            .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64);
+        Ok(SubscriptionInfo {
+            provider: "google".into(),
+            product_id: line["productId"].as_str().unwrap_or("").into(),
+            original_transaction_id: purchase_token.into(),
+            transaction_id: v["latestOrderId"].as_str().unwrap_or(purchase_token).into(),
+            expires_at_ms,
+            state: v["subscriptionState"].as_str().unwrap_or("").into(),
+            auto_renew: line["autoRenewingPlan"]["autoRenewEnabled"].as_bool(),
+            environment: if v["testPurchase"].is_null() {
+                "Production".into()
+            } else {
+                "Sandbox".into()
+            },
+            raw: v,
+        })
+    }
+
     pub async fn product_purchase(
         &self,
         product_id: &str,
@@ -301,6 +374,8 @@ impl GooglePlayClient {
         let order_id = v["orderId"].as_str().unwrap_or(purchase_token).to_string();
         Ok(StoreTransaction {
             provider: "google".into(),
+            original_transaction_id: Some(purchase_token.to_string()),
+            expires_at_ms: None,
             transaction_id: order_id,
             product_id: product_id.into(),
             environment: if v["purchaseType"].as_i64() == Some(0) {

@@ -19,6 +19,28 @@ pub struct IapProduct {
     pub amount_cents: i64,
     #[serde(default)]
     pub description: String,
+    /// `consumable` (default) or `subscription` (auto-renewing: one `iap_subscriptions` row per
+    /// original transaction, the store item granted on every renewal).
+    #[serde(default)]
+    pub kind: String,
+    /// Subscriptions: seconds of access kept after the period ends without a renewal.
+    #[serde(default)]
+    pub grace_secs: i64,
+}
+
+/// Where a subscription stands at `now_ms` given its period end and grace.
+pub fn subscription_status(expires_at_ms: i64, grace_secs: i64, now_ms: i64) -> &'static str {
+    if now_ms < expires_at_ms {
+        "active"
+    } else if now_ms < expires_at_ms.saturating_add(grace_secs.saturating_mul(1000)) {
+        "grace"
+    } else {
+        "expired"
+    }
+}
+
+fn now_ms() -> i64 {
+    (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
 /// A provider-validated transaction, ready to be redeemed.
@@ -30,6 +52,8 @@ pub struct ReceiptInput {
     pub environment: String,
     pub purchased_at_ms: i64,
     pub quantity: i64,
+    pub original_transaction_id: Option<String>,
+    pub expires_at_ms: Option<i64>,
     pub raw: Value,
 }
 
@@ -91,6 +115,18 @@ impl EconomyService {
         if p.product_id.is_empty() || p.product_id.len() > 128 {
             return Err(Error::InvalidArgument("product_id".into()));
         }
+        let mut p = p;
+        if p.kind.is_empty() {
+            p.kind = "consumable".into();
+        }
+        if !matches!(p.kind.as_str(), "consumable" | "subscription") {
+            return Err(Error::InvalidArgument(
+                "kind: consumable|subscription".into(),
+            ));
+        }
+        if p.grace_secs < 0 || p.grace_secs > 30 * 86_400 {
+            return Err(Error::InvalidArgument("grace_secs: 0..=30 days".into()));
+        }
         let exists: Option<(String,)> =
             sqlx::query_as("select id from musubi.store_items where id = $1")
                 .bind(&p.store_item_id)
@@ -101,14 +137,16 @@ impl EconomyService {
             return Err(Error::NotFound(format!("store item {}", p.store_item_id)));
         }
         sqlx::query(
-            "insert into musubi.iap_products (provider, product_id, store_item_id, amount_cents, description) values ($1, $2, $3, $4, $5)
-             on conflict (provider, product_id) do update set store_item_id = excluded.store_item_id, amount_cents = excluded.amount_cents, description = excluded.description",
+            "insert into musubi.iap_products (provider, product_id, store_item_id, amount_cents, description, kind, grace_secs) values ($1, $2, $3, $4, $5, $6, $7)
+             on conflict (provider, product_id) do update set store_item_id = excluded.store_item_id, amount_cents = excluded.amount_cents, description = excluded.description, kind = excluded.kind, grace_secs = excluded.grace_secs",
         )
         .bind(&p.provider)
         .bind(&p.product_id)
         .bind(&p.store_item_id)
         .bind(p.amount_cents)
         .bind(&p.description)
+        .bind(&p.kind)
+        .bind(p.grace_secs)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -116,8 +154,8 @@ impl EconomyService {
     }
 
     pub async fn iap_products(&self) -> Result<Vec<IapProduct>> {
-        let rows: Vec<(String, String, String)> =
-            sqlx::query_as("select provider, product_id, store_item_id from musubi.iap_products order by provider, product_id")
+        let rows: Vec<(String, String, String, String, i64)> =
+            sqlx::query_as("select provider, product_id, store_item_id, kind, grace_secs from musubi.iap_products order by provider, product_id")
                 .fetch_all(&self.db)
                 .await
                 .map_err(Error::internal)?;
@@ -129,6 +167,8 @@ impl EconomyService {
                 store_item_id: r.2,
                 amount_cents: 0,
                 description: String::new(),
+                kind: r.3,
+                grace_secs: r.4,
             })
             .collect())
     }
@@ -165,15 +205,15 @@ impl EconomyService {
             }
             return Ok(receipt(p, true));
         }
-        let mapping: Option<(String,)> = sqlx::query_as(
-            "select store_item_id from musubi.iap_products where provider = $1 and product_id = $2",
+        let mapping: Option<(String, String, i64)> = sqlx::query_as(
+            "select store_item_id, kind, grace_secs from musubi.iap_products where provider = $1 and product_id = $2",
         )
         .bind(&input.provider)
         .bind(&input.product_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        let Some((store_item_id,)) = mapping else {
+        let Some((store_item_id, kind, grace_secs)) = mapping else {
             return Err(Error::NotFound(format!(
                 "iap product {}:{} is not mapped",
                 input.provider, input.product_id
@@ -197,6 +237,38 @@ impl EconomyService {
             Value::Object(Default::default()),
         )
         .await?;
+        if kind == "subscription" {
+            let orig = input
+                .original_transaction_id
+                .clone()
+                .unwrap_or_else(|| input.transaction_id.clone());
+            let expires = input.expires_at_ms.unwrap_or(0);
+            let status = subscription_status(expires, grace_secs, now_ms());
+            sqlx::query(
+                "insert into musubi.iap_subscriptions (id, account_id, provider, product_id, store_item_id, original_transaction_id, latest_transaction_id, status, started_at_ms, expires_at_ms, environment, raw)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 on conflict (provider, original_transaction_id) do update set
+                   latest_transaction_id = excluded.latest_transaction_id, product_id = excluded.product_id,
+                   status = case when musubi.iap_subscriptions.status = 'revoked' then 'revoked' else excluded.status end,
+                   expires_at_ms = greatest(musubi.iap_subscriptions.expires_at_ms, excluded.expires_at_ms),
+                   raw = excluded.raw, updated_at = now()",
+            )
+            .bind(Uuid::now_v7())
+            .bind(account.0)
+            .bind(&input.provider)
+            .bind(&input.product_id)
+            .bind(&store_item_id)
+            .bind(&orig)
+            .bind(&input.transaction_id)
+            .bind(status)
+            .bind(input.purchased_at_ms)
+            .bind(expires)
+            .bind(&input.environment)
+            .bind(&input.raw)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        }
         let id = Uuid::now_v7();
         let created_at = OffsetDateTime::now_utc();
         sqlx::query(
@@ -235,6 +307,115 @@ impl EconomyService {
 
     /// Store-side refund/revocation: mark the receipt and take back the granted items (clamped at
     /// what the player still holds). `reference` is the provider transaction id or purchase token.
+    /// A product's mapping, if any (`kind` tells a verify handler which store API to call).
+    pub async fn iap_product(
+        &self,
+        provider: &str,
+        product_id: &str,
+    ) -> Result<Option<IapProduct>> {
+        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+            "select store_item_id, kind, description, grace_secs from musubi.iap_products where provider = $1 and product_id = $2",
+        )
+        .bind(provider)
+        .bind(product_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.map(
+            |(store_item_id, kind, description, grace_secs)| IapProduct {
+                provider: provider.into(),
+                product_id: product_id.into(),
+                store_item_id,
+                amount_cents: 0,
+                description,
+                kind,
+                grace_secs,
+            },
+        ))
+    }
+
+    /// An account's subscriptions with their state as of now (`active`, `grace`, `expired`,
+    /// `revoked`); `active: true` while the player keeps access (active or grace).
+    pub async fn subscriptions_of(&self, account: AccountId) -> Result<Vec<Value>> {
+        type Row = (
+            Uuid,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            bool,
+            String,
+            i64,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "select s.id, s.provider, s.product_id, s.store_item_id, s.original_transaction_id, s.latest_transaction_id, s.status,
+                    s.started_at_ms, s.expires_at_ms, s.auto_renew, s.environment, coalesce(p.grace_secs, 0)
+             from musubi.iap_subscriptions s
+             left join musubi.iap_products p on p.provider = s.provider and p.product_id = s.product_id
+             where s.account_id = $1 order by s.started_at_ms desc",
+        )
+        .bind(account.0)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let now = now_ms();
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let status = if r.6 == "revoked" {
+                    "revoked"
+                } else {
+                    subscription_status(r.8, r.11, now)
+                };
+                serde_json::json!({
+                    "id": r.0, "provider": r.1, "product_id": r.2, "store_item_id": r.3,
+                    "original_transaction_id": r.4, "latest_transaction_id": r.5,
+                    "status": status, "active": matches!(status, "active" | "grace"),
+                    "started_at_ms": r.7, "expires_at_ms": r.8, "auto_renew": r.9,
+                    "environment": r.10, "grace_secs": r.11,
+                })
+            })
+            .collect())
+    }
+
+    /// A store notification about a subscription: new period end, renewal preference, or its end.
+    pub async fn update_subscription(
+        &self,
+        provider: &str,
+        original_transaction_id: &str,
+        latest_transaction_id: Option<&str>,
+        expires_at_ms: Option<i64>,
+        status: Option<&str>,
+        auto_renew: Option<bool>,
+    ) -> Result<Option<Value>> {
+        let row: Option<(Uuid, String, String, i64)> = sqlx::query_as(
+            "update musubi.iap_subscriptions set
+               latest_transaction_id = coalesce($3, latest_transaction_id),
+               expires_at_ms = coalesce($4, expires_at_ms),
+               status = coalesce($5, status),
+               auto_renew = coalesce($6, auto_renew),
+               updated_at = now()
+             where provider = $1 and original_transaction_id = $2
+             returning account_id, product_id, status, expires_at_ms",
+        )
+        .bind(provider)
+        .bind(original_transaction_id)
+        .bind(latest_transaction_id)
+        .bind(expires_at_ms)
+        .bind(status)
+        .bind(auto_renew)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.map(|(account_id, product_id, status, expires_at_ms)| {
+            serde_json::json!({"account_id": account_id, "provider": provider, "product_id": product_id, "status": status, "expires_at_ms": expires_at_ms})
+        }))
+    }
+
     pub async fn revoke_receipt(
         &self,
         provider: &str,
@@ -325,6 +506,8 @@ impl EconomyService {
             store_item_id: r.2,
             amount_cents: r.3,
             description: r.4,
+            kind: "consumable".into(),
+            grace_secs: 0,
         }))
     }
 
