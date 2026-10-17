@@ -98,6 +98,7 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         notify: s.notify.clone(),
         social: s.social.clone(),
         ratings: s.ratings.clone(),
+        storage: s.storage.clone(),
         matchmaker: s.matchmaker.clone(),
         parties: s.parties.clone(),
         relayed: s.relayed.clone(),

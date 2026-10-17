@@ -22,3 +22,11 @@ pub use party::PartyRegistry;
 pub use relayed::RelayedRegistry;
 pub use session::{resume_or_reject, serve, ConnectParams};
 pub use world::WorldRegistry;
+
+/// Hub channel carrying `storage_update` for one object (`key`) or an owner's whole collection.
+pub fn storage_channel(collection: &str, owner: uuid::Uuid, key: Option<&str>) -> String {
+    match key {
+        Some(k) => format!("storage:{collection}:{owner}:{k}"),
+        None => format!("storage:{collection}:{owner}"),
+    }
+}

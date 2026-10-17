@@ -104,7 +104,7 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
     let schedules = Arc::new(musubi_server::schedules::Schedules::from_config(
         &cfg.runtime,
     ));
-    Some(AppState {
+    let state = AppState {
         audit: musubi_server::audit::Sink::new(&db),
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         storage: StorageService::new(db.clone()).with_limits(
@@ -164,7 +164,9 @@ async fn build_state_in(leader: bool, group: &str, region: &str) -> Option<AppSt
                 ..Default::default()
             },
         )),
-    })
+    };
+    musubi_server::app::wire_storage_live(&state.storage, &state.fanout);
+    Some(state)
 }
 
 async fn token(router: &axum::Router) -> (String, String) {
@@ -10337,4 +10339,423 @@ async fn webpush_delivers_encrypted_notification_and_drops_gone_subscriptions() 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert_eq!(left, 1);
+}
+
+fn pct(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn storage_schemas_validate_migrate_index_and_stream() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let (ta, acc) = token(&router).await;
+    let (tb, _acc_b) = token(&router).await;
+    let acc_id: uuid::Uuid = acc.to_string().parse().unwrap();
+    let col = format!("heroes_{}", uuid::Uuid::now_v7().simple());
+    let schema_path = format!("/v1/admin/storage_schemas/{col}");
+
+    // v1 contract with a numeric index on level
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &schema_path,
+        None,
+        true,
+        Some(json!({
+            "version": 1,
+            "schema": {
+                "type": "object", "required": ["name", "level"], "additionalProperties": false,
+                "properties": {
+                    "name": {"type": "string", "minLength": 2},
+                    "level": {"type": "integer", "minimum": 1, "maximum": 60},
+                    "gold": {"type": "integer"}
+                }
+            },
+            "indexes": [{"field": "level", "kind": "number"}]
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["indexes"][0]["field"], "level");
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        &schema_path,
+        None,
+        true,
+        Some(json!({"schema": {"typo": 1}})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        "/v1/admin/storage_schemas",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(
+        r["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["collection"] == col),
+        "{r}"
+    );
+
+    // writes are validated
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/write",
+        Some(&ta),
+        false,
+        Some(json!({
+            "objects": [{"collection": col, "key": "h1", "value": {"name": "x", "level": 99}}]
+        })),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let msg = r.to_string();
+    assert!(
+        msg.contains("value.level") && msg.contains("value.name"),
+        "{msg}"
+    );
+    for (k, lvl) in [("h1", 5), ("h2", 20), ("h3", 40)] {
+        let (st, r) = http_json(&router, "POST", "/v1/storage/write", Some(&ta), false, Some(json!({
+            "objects": [{"collection": col, "key": k, "value": {"name": "hero", "level": lvl, "gold": lvl * 10}, "read_permission": 2}]
+        }))).await;
+        assert_eq!(st, 200, "{r}");
+    }
+
+    // $where range filters (served by the expression index)
+    let w = pct(&json!({"$where": [["level", ">=", 20]]}).to_string());
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/storage/{col}?where={w}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let keys: Vec<&str> = r["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["h2", "h3"], "{r}");
+    let (_, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/storage/{col}/count?where={w}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(r["count"], 2, "{r}");
+    let w = pct(
+        &json!({"name": "hero", "$where": [["level", "<", 10], ["name", "=", "hero"]]}).to_string(),
+    );
+    let (_, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/storage/{col}?where={w}&sort=-level"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(r["objects"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["objects"][0]["key"], "h1");
+    let w = pct(&json!({"$where": [["level", "~", 1]]}).to_string());
+    let (st, _) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/storage/{col}?where={w}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 400);
+
+    // v2: gold moves under wallet, gems default 0; old shape is rejected, old rows migrate on read
+    let (st, r) = http_json(&router, "PUT", &schema_path, None, true, Some(json!({
+        "version": 2,
+        "schema": {
+            "type": "object", "required": ["name", "level", "wallet"], "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 2},
+                "level": {"type": "integer", "minimum": 1, "maximum": 60},
+                "wallet": {"type": "object", "required": ["gold", "gems"], "properties": {"gold": {"type": "integer"}, "gems": {"type": "integer"}}}
+            }
+        },
+        "migrations": [{"from": 1, "to": 2, "ops": [
+            {"op": "rename", "from": "gold", "to": "wallet.gold"},
+            {"op": "default", "path": "wallet.gems", "value": 0}
+        ]}],
+        "indexes": [{"field": "level", "kind": "number"}, {"field": "wallet.gold", "kind": "number"}]
+    }))).await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/read",
+        Some(&ta),
+        false,
+        Some(json!({
+            "objects": [{"collection": col, "key": "h1"}]
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let h1 = &r["objects"][0];
+    assert_eq!(
+        h1["value"],
+        json!({"name": "hero", "level": 5, "wallet": {"gold": 50, "gems": 0}}),
+        "{r}"
+    );
+    assert_eq!(h1["schema_version"], 2);
+    let (st, r) = http_json(&router, "POST", "/v1/storage/write", Some(&ta), false, Some(json!({
+        "objects": [{"collection": col, "key": "h4", "value": {"name": "hero", "level": 1, "gold": 1}}]
+    }))).await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/patch",
+        Some(&ta),
+        false,
+        Some(json!({
+            "objects": [{"collection": col, "key": "h2", "patch": {"wallet": {"gems": 3}}}]
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/read",
+        Some(&ta),
+        false,
+        Some(json!({
+            "objects": [{"collection": col, "key": "h2"}]
+        })),
+    )
+    .await;
+    assert_eq!(
+        r["objects"][0]["value"]["wallet"],
+        json!({"gold": 200, "gems": 3}),
+        "{r}"
+    );
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{schema_path}/migrate?batch=10"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["migrated"], 2, "{r}");
+    assert_eq!(r["remaining"], 0);
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        &format!("{schema_path}/migrate"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(r["migrated"], 0);
+    let w = pct(&json!({"$where": [["wallet.gold", ">", 100]]}).to_string());
+    let (_, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/storage/{col}?where={w}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(r["objects"].as_array().unwrap().len(), 2, "{r}");
+
+    // live updates: A follows its whole collection, B follows A's public h1 by key
+    let mut a = connect(&addr, &ta, "json").await;
+    let mut b = connect(&addr, &tb, "json").await;
+    send(
+        &mut a,
+        "json",
+        None,
+        ClientMessage::StorageSubscribe {
+            collection: col.clone(),
+            key: None,
+            owner_id: None,
+        },
+    )
+    .await;
+    send(
+        &mut b,
+        "json",
+        None,
+        ClientMessage::StorageSubscribe {
+            collection: col.clone(),
+            key: None,
+            owner_id: Some(musubi_core::AccountId(acc_id)),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::Error { .. }),
+        "collection of another user needs a key"
+    );
+    send(
+        &mut b,
+        "json",
+        None,
+        ClientMessage::StorageSubscribe {
+            collection: col.clone(),
+            key: Some("h1".into()),
+            owner_id: Some(musubi_core::AccountId(acc_id)),
+        },
+    )
+    .await;
+    send(
+        &mut b,
+        "json",
+        None,
+        ClientMessage::StorageSubscribe {
+            collection: col.clone(),
+            key: Some("nope".into()),
+            owner_id: Some(musubi_core::AccountId(acc_id)),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut b).await.msg, ServerMessage::Error { .. }),
+        "unreadable object"
+    );
+    let (st, r) = http_json(&router, "POST", "/v1/storage/write", Some(&ta), false, Some(json!({
+        "objects": [{"collection": col, "key": "h1", "value": {"name": "hero", "level": 6, "wallet": {"gold": 1, "gems": 0}}, "read_permission": 2}]
+    }))).await;
+    assert_eq!(st, 200, "{r}");
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::StorageUpdate {
+                collection,
+                key,
+                value,
+                deleted,
+                version,
+                ..
+            } => {
+                assert_eq!(collection, col);
+                assert_eq!(key, "h1");
+                assert!(!deleted);
+                assert!(version.is_some());
+                assert_eq!(value.unwrap()["level"], 6);
+            }
+            other => panic!("expected storage_update, got {other:?}"),
+        }
+    }
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/delete",
+        Some(&ta),
+        false,
+        Some(json!({
+            "objects": [{"collection": col, "key": "h1"}]
+        })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::StorageUpdate {
+                key,
+                deleted,
+                value,
+                ..
+            } => {
+                assert_eq!(key, "h1");
+                assert!(deleted);
+                assert!(value.is_none());
+            }
+            other => panic!("expected delete update, got {other:?}"),
+        }
+    }
+    // h3 is not followed by B
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/storage/patch",
+        Some(&ta),
+        false,
+        Some(json!({
+            "objects": [{"collection": col, "key": "h3", "patch": {"level": 41}}]
+        })),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::StorageUpdate { key, .. } if key == "h3")
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), b.next())
+            .await
+            .is_err()
+    );
+    send(
+        &mut a,
+        "json",
+        None,
+        ClientMessage::StorageUnsubscribe {
+            collection: col.clone(),
+            key: None,
+            owner_id: None,
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    http_json(
+        &router,
+        "POST",
+        "/v1/storage/patch",
+        Some(&ta),
+        false,
+        Some(json!({
+            "objects": [{"collection": col, "key": "h3", "patch": {"level": 42}}]
+        })),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), a.next())
+            .await
+            .is_err()
+    );
+
+    let (_, r) = http_json(&router, "DELETE", &schema_path, None, true, None).await;
+    assert_eq!(r["deleted"], true);
+    let (st, _) = http_json(&router, "GET", &schema_path, None, true, None).await;
+    assert_eq!(st, 404);
 }

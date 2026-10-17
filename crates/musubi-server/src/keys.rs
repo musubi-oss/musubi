@@ -54,6 +54,7 @@ const SUPPORT_WRITES: &[&str] = &[
 ];
 const LIVEOPS_WRITES: &[&str] = &[
     "/v1/admin/content",
+    "/v1/admin/storage_schemas",
     "/v1/server/currencies",
     "/v1/server/items",
     "/v1/server/inventory/",

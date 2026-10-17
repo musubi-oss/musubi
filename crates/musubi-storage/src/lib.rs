@@ -11,6 +11,9 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod schema;
+pub use schema::CollectionSchema;
+
 pub const SYSTEM_OWNER: Uuid = Uuid::nil();
 pub const MAX_VALUE_BYTES: usize = 1 << 20;
 pub const MAX_BATCH: usize = 100;
@@ -24,6 +27,9 @@ pub struct Object {
     pub version: String,
     pub read_permission: i16,
     pub write_permission: i16,
+    /// Schema version the stored value conforms to (0 = no schema).
+    #[serde(default)]
+    pub schema_version: i32,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -85,11 +91,29 @@ pub enum Caller {
     Server,
 }
 
+/// One committed write/patch/delete, handed to the change hook (live subscriptions).
+#[derive(Debug, Clone, Serialize)]
+pub struct Change {
+    pub collection: String,
+    pub key: String,
+    pub owner_id: Uuid,
+    pub version: Option<String>,
+    pub value: Option<serde_json::Value>,
+    pub schema_version: i32,
+    pub deleted: bool,
+}
+
+type ChangeHook = std::sync::Arc<dyn Fn(Change) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct StorageService {
     db: PgPool,
     max_objects: i64,
     max_bytes: i64,
+    schemas: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<CollectionSchema>>>,
+    >,
+    on_change: std::sync::Arc<std::sync::RwLock<Option<ChangeHook>>>,
 }
 
 /// JSON Merge Patch (RFC 7386) against one object; OCC like `WriteOp::version`.
@@ -133,9 +157,10 @@ type Row = (
     OffsetDateTime,
     OffsetDateTime,
     Option<OffsetDateTime>,
+    i32,
 );
 
-const COLS: &str = "collection, key, owner_id, value, version, read_permission, write_permission, created_at, updated_at, expires_at";
+const COLS: &str = "collection, key, owner_id, value, version, read_permission, write_permission, created_at, updated_at, expires_at, schema_version";
 
 /// Optional narrowing for `StorageService::list_where`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -205,6 +230,8 @@ impl StorageService {
             db,
             max_objects: 0,
             max_bytes: 0,
+            schemas: Default::default(),
+            on_change: Default::default(),
         }
     }
 
@@ -265,28 +292,27 @@ impl StorageService {
         f: ListFilter<'_>,
     ) -> Result<i64> {
         validate_name(collection, "collection")?;
-        if let Some(fl) = f.filter {
-            if !fl.is_object() {
-                return Err(Error::InvalidArgument("where must be a JSON object".into()));
-            }
-        }
+        let (filter, ops) = schema::split_where(f.filter)?;
         let (owner_id, min_read) = visibility(caller, owner_id);
         let prefix_like = like_prefix(f.key_prefix);
-        sqlx::query_scalar::<_, i64>(
+        let sql = format!(
             "select count(*) from musubi.storage_objects
              where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
                and (expires_at is null or expires_at > now())
                and ($4::jsonb is null or value @> $4)
-               and ($5::text is null or key like $5)",
-        )
-        .bind(collection)
-        .bind(owner_id)
-        .bind(min_read)
-        .bind(f.filter)
-        .bind(prefix_like)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::internal)
+               and ($5::text is null or key like $5){}",
+            schema::where_sql(&ops, 6)
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql)
+            .bind(collection)
+            .bind(owner_id)
+            .bind(min_read)
+            .bind(filter)
+            .bind(prefix_like);
+        for o in &ops {
+            q = q.bind(&o.value);
+        }
+        q.fetch_one(&self.db).await.map_err(Error::internal)
     }
 
     /// Merge-patch existing objects (missing ones are an error) under the write rules of `write`.
@@ -312,14 +338,15 @@ impl StorageService {
         };
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let mut acks = Vec::with_capacity(ops.len());
+        let mut changes = Vec::new();
         for op in ops {
             validate_name(&op.collection, "collection")?;
             validate_name(&op.key, "key")?;
             if !op.patch.is_object() {
                 return Err(Error::InvalidArgument("patch must be a JSON object".into()));
             }
-            let current = sqlx::query_as::<_, (serde_json::Value, String, i16)>(
-                "select value, version, write_permission from musubi.storage_objects
+            let current = sqlx::query_as::<_, (serde_json::Value, String, i16, i32)>(
+                "select value, version, write_permission, schema_version from musubi.storage_objects
                  where collection = $1 and key = $2 and owner_id = $3
                    and (expires_at is null or expires_at > now()) for update",
             )
@@ -329,7 +356,7 @@ impl StorageService {
             .fetch_optional(&mut *tx)
             .await
             .map_err(Error::internal)?;
-            let Some((mut value, cur_version, cur_write)) = current else {
+            let Some((mut value, cur_version, cur_write, cur_sv)) = current else {
                 return Err(Error::NotFound(format!(
                     "{}/{} does not exist",
                     op.collection, op.key
@@ -347,14 +374,19 @@ impl StorageService {
                     op.collection, op.key
                 )));
             }
+            if let Some(sc) = self.schema_of(&op.collection) {
+                schema::migrate(&sc, &mut value, cur_sv);
+            }
             merge_patch(&mut value, &op.patch);
+            let schema_version = self.check_schema(&op.collection, &value)?;
+            let changed_value = &value;
             let bytes = serde_json::to_vec(&value)?;
             if bytes.len() > MAX_VALUE_BYTES {
                 return Err(Error::InvalidArgument("value exceeds 1 MiB".into()));
             }
             let new_version = version_of(&bytes);
             sqlx::query(
-                "update musubi.storage_objects set value = $4, version = $5, updated_at = now()
+                "update musubi.storage_objects set value = $4, version = $5, schema_version = $6, updated_at = now()
                  where collection = $1 and key = $2 and owner_id = $3",
             )
             .bind(&op.collection)
@@ -362,9 +394,19 @@ impl StorageService {
             .bind(owner)
             .bind(&value)
             .bind(&new_version)
+            .bind(schema_version)
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?;
+            changes.push(Change {
+                collection: op.collection.clone(),
+                key: op.key.clone(),
+                owner_id: owner,
+                version: Some(new_version.clone()),
+                value: Some(changed_value.clone()),
+                schema_version,
+                deleted: false,
+            });
             acks.push(Ack {
                 collection: op.collection.clone(),
                 key: op.key.clone(),
@@ -374,6 +416,7 @@ impl StorageService {
         }
         self.enforce_quota(&mut tx, owner).await?;
         tx.commit().await.map_err(Error::internal)?;
+        self.fire(changes);
         Ok(acks)
     }
 
@@ -408,7 +451,7 @@ impl StorageService {
                 }
             }
         }
-        Ok(out)
+        Ok(self.finish(out))
     }
 
     pub async fn list(
@@ -456,11 +499,7 @@ impl StorageService {
                 .await;
         }
         validate_name(collection, "collection")?;
-        if let Some(f) = filter {
-            if !f.is_object() {
-                return Err(Error::InvalidArgument("where must be a JSON object".into()));
-            }
-        }
+        let (filter, ops) = schema::split_where(filter)?;
         let limit = limit.clamp(1, 100);
         let after_key = cursor.map(decode_cursor).transpose()?;
         let prefix_like = key_prefix.filter(|p| !p.is_empty()).map(|p| {
@@ -478,27 +517,30 @@ impl StorageService {
             (Caller::User(a), Some(o)) if o == a.0 => (Some(o), 1),
             (Caller::User(_), Some(o)) => (Some(o), 2),
         };
-        let rows = sqlx::query_as::<_, Row>(&format!(
+        let sql = format!(
             "select {COLS} from musubi.storage_objects
              where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
                and (expires_at is null or expires_at > now())
                and ($4::text is null or (owner_id, key) > ($5::uuid, $4))
                and ($7::jsonb is null or value @> $7)
-               and ($8::text is null or key like $8)
-             order by owner_id, key limit $6"
-        ))
-        .bind(collection)
-        .bind(owner_id)
-        .bind(min_read)
-        .bind(after_key.as_ref().map(|c| c.1.as_str()))
-        .bind(after_key.as_ref().map(|c| c.0).unwrap_or(SYSTEM_OWNER))
-        .bind(limit + 1)
-        .bind(filter)
-        .bind(prefix_like)
-        .fetch_all(&self.db)
-        .await
-        .map_err(Error::internal)?;
-        let mut objs: Vec<Object> = rows.into_iter().map(to_object).collect();
+               and ($8::text is null or key like $8){}
+             order by owner_id, key limit $6",
+            schema::where_sql(&ops, 9)
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(collection)
+            .bind(owner_id)
+            .bind(min_read)
+            .bind(after_key.as_ref().map(|c| c.1.as_str()))
+            .bind(after_key.as_ref().map(|c| c.0).unwrap_or(SYSTEM_OWNER))
+            .bind(limit + 1)
+            .bind(filter)
+            .bind(prefix_like);
+        for o in &ops {
+            q = q.bind(&o.value);
+        }
+        let rows = q.fetch_all(&self.db).await.map_err(Error::internal)?;
+        let mut objs: Vec<Object> = self.finish(rows.into_iter().map(to_object).collect());
         let next = if objs.len() as i64 > limit {
             objs.truncate(limit as usize);
             objs.last().map(|o| encode_cursor(o.owner_id, &o.key))
@@ -530,6 +572,7 @@ impl StorageService {
         };
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let mut acks = Vec::with_capacity(ops.len());
+        let mut changes = Vec::new();
         for op in ops {
             validate_name(&op.collection, "collection")?;
             validate_name(&op.key, "key")?;
@@ -544,6 +587,8 @@ impl StorageService {
                 return Err(Error::InvalidArgument("invalid permission code".into()));
             }
             let new_version = version_of(&bytes);
+            let schema_version = self.check_schema(&op.collection, &op.value)?;
+            let changed_value = &op.value;
 
             let current = sqlx::query_as::<_, (String, i16)>(
                 "select version, write_permission from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 for update",
@@ -589,12 +634,12 @@ impl StorageService {
                     + time::Duration::seconds(t.min(100 * 365 * 86_400) as i64)
             });
             sqlx::query(
-                "insert into musubi.storage_objects (collection, key, owner_id, value, version, read_permission, write_permission, expires_at)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8)
+                "insert into musubi.storage_objects (collection, key, owner_id, value, version, read_permission, write_permission, expires_at, schema_version)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  on conflict (collection, key, owner_id) do update set
                    value = excluded.value, version = excluded.version,
                    read_permission = excluded.read_permission, write_permission = excluded.write_permission,
-                   expires_at = excluded.expires_at, updated_at = now()",
+                   expires_at = excluded.expires_at, schema_version = excluded.schema_version, updated_at = now()",
             )
             .bind(&op.collection)
             .bind(&op.key)
@@ -604,9 +649,19 @@ impl StorageService {
             .bind(op.read_permission)
             .bind(op.write_permission)
             .bind(expires)
+            .bind(schema_version)
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?;
+            changes.push(Change {
+                collection: op.collection.clone(),
+                key: op.key.clone(),
+                owner_id: owner,
+                version: Some(new_version.clone()),
+                value: Some(changed_value.clone()),
+                schema_version,
+                deleted: false,
+            });
             acks.push(Ack {
                 collection: op.collection.clone(),
                 key: op.key.clone(),
@@ -616,6 +671,7 @@ impl StorageService {
         }
         self.enforce_quota(&mut tx, owner).await?;
         tx.commit().await.map_err(Error::internal)?;
+        self.fire(changes);
         Ok(acks)
     }
 
@@ -632,11 +688,7 @@ impl StorageService {
         sort: &str,
     ) -> Result<(Vec<Object>, Option<String>)> {
         validate_name(collection, "collection")?;
-        if let Some(f) = filter {
-            if !f.is_object() {
-                return Err(Error::InvalidArgument("where must be a JSON object".into()));
-            }
-        }
+        let (filter, ops) = schema::split_where(filter)?;
         let (desc, field) = match sort.strip_prefix('-') {
             Some(f) => (true, f),
             None => (false, sort),
@@ -650,29 +702,32 @@ impl StorageService {
         let (owner_id, min_read) = visibility(caller, owner_id);
         let prefix_like = like_prefix(key_prefix);
         let (cmp, dir) = if desc { ("<", "desc") } else { (">", "asc") };
-        let rows = sqlx::query_as::<_, Row>(&format!(
+        let sql = format!(
             "select {COLS} from musubi.storage_objects
              where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
                and (expires_at is null or expires_at > now())
                and ($4::jsonb is null or value @> $4)
                and ($5::text is null or key like $5)
-               and ($7::jsonb is null or (coalesce(value #> $6, 'null'::jsonb), owner_id, key) {cmp} ($7, $8::uuid, $9::text))
-             order by coalesce(value #> $6, 'null'::jsonb) {dir}, owner_id {dir}, key {dir} limit $10"
-        ))
-        .bind(collection)
-        .bind(owner_id)
-        .bind(min_read)
-        .bind(filter)
-        .bind(prefix_like)
-        .bind(&path)
-        .bind(after.as_ref().map(|a| &a.0))
-        .bind(after.as_ref().map(|a| a.1).unwrap_or(SYSTEM_OWNER))
-        .bind(after.as_ref().map(|a| a.2.as_str()).unwrap_or(""))
-        .bind(limit + 1)
-        .fetch_all(&self.db)
-        .await
-        .map_err(Error::internal)?;
-        let mut objs: Vec<Object> = rows.into_iter().map(to_object).collect();
+               and ($7::jsonb is null or (coalesce(value #> $6, 'null'::jsonb), owner_id, key) {cmp} ($7, $8::uuid, $9::text)){}
+             order by coalesce(value #> $6, 'null'::jsonb) {dir}, owner_id {dir}, key {dir} limit $10",
+            schema::where_sql(&ops, 11)
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(collection)
+            .bind(owner_id)
+            .bind(min_read)
+            .bind(filter)
+            .bind(prefix_like)
+            .bind(&path)
+            .bind(after.as_ref().map(|a| &a.0))
+            .bind(after.as_ref().map(|a| a.1).unwrap_or(SYSTEM_OWNER))
+            .bind(after.as_ref().map(|a| a.2.as_str()).unwrap_or(""))
+            .bind(limit + 1);
+        for o in &ops {
+            q = q.bind(&o.value);
+        }
+        let rows = q.fetch_all(&self.db).await.map_err(Error::internal)?;
+        let mut objs: Vec<Object> = self.finish(rows.into_iter().map(to_object).collect());
         let next = if objs.len() as i64 > limit {
             objs.truncate(limit as usize);
             objs.last().map(|o| {
@@ -710,6 +765,7 @@ impl StorageService {
             (Caller::User(a), _) => a.0,
         };
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let mut changes = Vec::new();
         for op in ops {
             validate_name(&op.collection, "collection")?;
             validate_name(&op.key, "key")?;
@@ -737,6 +793,15 @@ impl StorageService {
                     op.collection, op.key
                 )));
             }
+            changes.push(Change {
+                collection: op.collection.clone(),
+                key: op.key.clone(),
+                owner_id: owner,
+                version: None,
+                value: None,
+                schema_version: 0,
+                deleted: true,
+            });
             sqlx::query("delete from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3")
                 .bind(&op.collection)
                 .bind(&op.key)
@@ -745,7 +810,226 @@ impl StorageService {
                 .await
                 .map_err(Error::internal)?;
         }
-        tx.commit().await.map_err(Error::internal)
+        tx.commit().await.map_err(Error::internal)?;
+        self.fire(changes);
+        Ok(())
+    }
+
+    /// Schema/migration/index definitions as loaded at start (`load_schemas`) and kept in sync by
+    /// `put_schema` / `delete_schema` on this node; other nodes pick changes up on their next load.
+    pub fn schema_of(&self, collection: &str) -> Option<std::sync::Arc<CollectionSchema>> {
+        self.schemas.read().ok()?.get(collection).cloned()
+    }
+
+    pub fn schemas(&self) -> Vec<CollectionSchema> {
+        let mut v: Vec<CollectionSchema> = self
+            .schemas
+            .read()
+            .map(|m| m.values().map(|s| (**s).clone()).collect())
+            .unwrap_or_default();
+        v.sort_by(|a, b| a.collection.cmp(&b.collection));
+        v
+    }
+
+    pub async fn load_schemas(&self) -> Result<usize> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                i32,
+                serde_json::Value,
+                serde_json::Value,
+                serde_json::Value,
+            ),
+        >(
+            "select collection, version, schema, migrations, indexes from musubi.storage_schemas",
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut map = std::collections::HashMap::new();
+        for (collection, version, schema, migrations, indexes) in rows {
+            let sc = CollectionSchema {
+                collection: collection.clone(),
+                version,
+                schema,
+                migrations: serde_json::from_value(migrations).unwrap_or_default(),
+                indexes: serde_json::from_value(indexes).unwrap_or_default(),
+            };
+            map.insert(collection, std::sync::Arc::new(sc));
+        }
+        let n = map.len();
+        if let Ok(mut g) = self.schemas.write() {
+            *g = map;
+        }
+        Ok(n)
+    }
+
+    /// Store a collection contract, (re)create its expression indexes and drop the ones removed.
+    pub async fn put_schema(&self, s: CollectionSchema) -> Result<CollectionSchema> {
+        validate_name(&s.collection, "collection")?;
+        schema::validate_definition(&s)?;
+        let before = self.schema_of(&s.collection);
+        sqlx::query(
+            "insert into musubi.storage_schemas (collection, version, schema, migrations, indexes)
+             values ($1, $2, $3, $4, $5)
+             on conflict (collection) do update set version = excluded.version, schema = excluded.schema,
+               migrations = excluded.migrations, indexes = excluded.indexes, updated_at = now()",
+        )
+        .bind(&s.collection)
+        .bind(s.version)
+        .bind(&s.schema)
+        .bind(serde_json::to_value(&s.migrations)?)
+        .bind(serde_json::to_value(&s.indexes)?)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let keep: Vec<String> = s
+            .indexes
+            .iter()
+            .map(|d| schema::index_name(&s.collection, d))
+            .collect();
+        for old in before.iter().flat_map(|b| b.indexes.iter()) {
+            let name = schema::index_name(&s.collection, old);
+            if !keep.contains(&name) {
+                sqlx::query(&format!("drop index if exists musubi.{name}"))
+                    .execute(&self.db)
+                    .await
+                    .map_err(Error::internal)?;
+            }
+        }
+        for d in &s.indexes {
+            sqlx::query(&schema::index_ddl(&s.collection, d)?)
+                .execute(&self.db)
+                .await
+                .map_err(|e| match e {
+                    sqlx::Error::Database(d) if d.code().as_deref() == Some("23505") => {
+                        Error::Conflict(format!(
+                            "unique index violated by existing objects: {}",
+                            d.message()
+                        ))
+                    }
+                    e => Error::internal(e),
+                })?;
+        }
+        if let Ok(mut g) = self.schemas.write() {
+            g.insert(s.collection.clone(), std::sync::Arc::new(s.clone()));
+        }
+        Ok(s)
+    }
+
+    pub async fn delete_schema(&self, collection: &str) -> Result<bool> {
+        if let Some(old) = self.schema_of(collection) {
+            for d in &old.indexes {
+                sqlx::query(&format!(
+                    "drop index if exists musubi.{}",
+                    schema::index_name(collection, d)
+                ))
+                .execute(&self.db)
+                .await
+                .map_err(Error::internal)?;
+            }
+        }
+        let n = sqlx::query("delete from musubi.storage_schemas where collection = $1")
+            .bind(collection)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+        if let Ok(mut g) = self.schemas.write() {
+            g.remove(collection);
+        }
+        Ok(n > 0)
+    }
+
+    /// Rewrite up to `batch` objects still at an older schema version; returns (migrated, remaining).
+    pub async fn migrate_collection(&self, collection: &str, batch: i64) -> Result<(i64, i64)> {
+        let Some(sc) = self.schema_of(collection) else {
+            return Err(Error::NotFound(format!("no schema for {collection}")));
+        };
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let rows = sqlx::query_as::<_, (String, Uuid, serde_json::Value, i32)>(
+            "select key, owner_id, value, schema_version from musubi.storage_objects
+             where collection = $1 and schema_version < $2
+             order by owner_id, key limit $3 for update skip locked",
+        )
+        .bind(collection)
+        .bind(sc.version)
+        .bind(batch.clamp(1, 5000))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let mut migrated = 0i64;
+        for (key, owner, mut value, sv) in rows {
+            let reached = schema::migrate(&sc, &mut value, sv);
+            if reached == sv {
+                continue;
+            }
+            let bytes = serde_json::to_vec(&value)?;
+            sqlx::query(
+                "update musubi.storage_objects set value = $4, version = $5, schema_version = $6, updated_at = now()
+                 where collection = $1 and key = $2 and owner_id = $3",
+            )
+            .bind(collection)
+            .bind(&key)
+            .bind(owner)
+            .bind(&value)
+            .bind(version_of(&bytes))
+            .bind(reached)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            migrated += 1;
+        }
+        tx.commit().await.map_err(Error::internal)?;
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "select count(*) from musubi.storage_objects where collection = $1 and schema_version < $2",
+        )
+        .bind(collection)
+        .bind(sc.version)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok((migrated, remaining))
+    }
+
+    pub fn set_on_change(&self, f: impl Fn(Change) + Send + Sync + 'static) {
+        if let Ok(mut g) = self.on_change.write() {
+            *g = Some(std::sync::Arc::new(f));
+        }
+    }
+
+    fn fire(&self, changes: Vec<Change>) {
+        let hook = self.on_change.read().ok().and_then(|g| g.clone());
+        if let Some(h) = hook {
+            for c in changes {
+                h(c);
+            }
+        }
+    }
+
+    fn check_schema(&self, collection: &str, value: &serde_json::Value) -> Result<i32> {
+        match self.schema_of(collection) {
+            Some(sc) => {
+                if !sc.schema.is_null() {
+                    schema::validate(&sc.schema, value)?;
+                }
+                Ok(sc.version)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Lazily migrate objects written under an older schema version.
+    fn finish(&self, mut objs: Vec<Object>) -> Vec<Object> {
+        for o in &mut objs {
+            if let Some(sc) = self.schema_of(&o.collection) {
+                if o.schema_version < sc.version {
+                    o.schema_version = schema::migrate(&sc, &mut o.value, o.schema_version);
+                }
+            }
+        }
+        objs
     }
 }
 
@@ -768,6 +1052,7 @@ fn to_object(r: Row) -> Object {
         created_at: r.7,
         updated_at: r.8,
         expires_at: r.9,
+        schema_version: r.10,
     }
 }
 

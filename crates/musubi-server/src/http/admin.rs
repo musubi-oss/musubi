@@ -67,6 +67,15 @@ pub fn routes() -> Router<AppState> {
             "/v1/admin/accounts/{id}/identities/{provider}/{subject}",
             delete(unlink),
         )
+        .route("/v1/admin/storage_schemas", get(schemas_list))
+        .route(
+            "/v1/admin/storage_schemas/{collection}",
+            get(schema_get).put(schema_put).delete(schema_delete),
+        )
+        .route(
+            "/v1/admin/storage_schemas/{collection}/migrate",
+            post(schema_migrate),
+        )
         .route("/v1/admin/storage/{collection}", get(storage_list))
         .route(
             "/v1/admin/storage/{collection}/{key}",
@@ -865,4 +874,90 @@ async fn queue_stats(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Va
 async fn queue_flush(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let dropped = s.auth.queue_flush().await?;
     Ok(Json(json!({ "dropped": dropped })))
+}
+
+#[derive(Deserialize)]
+struct SchemaBody {
+    #[serde(default)]
+    version: i32,
+    #[serde(default)]
+    schema: Value,
+    #[serde(default)]
+    migrations: Vec<musubi_storage::schema::Migration>,
+    #[serde(default)]
+    indexes: Vec<musubi_storage::schema::IndexDef>,
+}
+
+fn schema_json(sc: &musubi_storage::CollectionSchema) -> Result<Json<Value>, ApiError> {
+    Ok(Json(serde_json::to_value(sc).map_err(Error::internal)?))
+}
+
+/// All collection contracts (schema, version, migrations, indexes).
+async fn schemas_list(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "schemas": s.storage.schemas() })))
+}
+
+async fn schema_get(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match s.storage.schema_of(&collection) {
+        Some(sc) => schema_json(&sc),
+        None => Err(Error::NotFound(format!("no schema for {collection}")).into()),
+    }
+}
+
+/// Set the contract: `schema` (JSON Schema subset) is enforced on every write/patch, `version` +
+/// `migrations` move older objects forward on read, `indexes` become expression indexes used by
+/// `$where` range filters.
+async fn schema_put(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(collection): Path<String>,
+    Json(b): Json<SchemaBody>,
+) -> Result<Json<Value>, ApiError> {
+    let sc = s
+        .storage
+        .put_schema(musubi_storage::CollectionSchema {
+            collection,
+            version: b.version,
+            schema: b.schema,
+            migrations: b.migrations,
+            indexes: b.indexes,
+        })
+        .await?;
+    schema_json(&sc)
+}
+
+async fn schema_delete(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(collection): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = s.storage.delete_schema(&collection).await?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+#[derive(Deserialize)]
+struct MigrateQuery {
+    #[serde(default = "default_migrate_batch")]
+    batch: i64,
+}
+
+fn default_migrate_batch() -> i64 {
+    500
+}
+
+/// Rewrite one batch of objects still at an older schema version (call until `remaining` is 0).
+async fn schema_migrate(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(collection): Path<String>,
+    Query(q): Query<MigrateQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (migrated, remaining) = s.storage.migrate_collection(&collection, q.batch).await?;
+    Ok(Json(
+        json!({ "migrated": migrated, "remaining": remaining }),
+    ))
 }

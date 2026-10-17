@@ -37,6 +37,7 @@ pub struct ConnectParams {
     pub notify: crate::notify::Notifier,
     pub social: musubi_social::SocialService,
     pub ratings: musubi_leaderboard::RatingService,
+    pub storage: musubi_storage::StorageService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
@@ -64,6 +65,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         notify,
         social,
         ratings,
+        storage,
         matchmaker,
         parties,
         relayed,
@@ -90,6 +92,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         notify: &notify,
         social: &social,
         ratings: &ratings,
+        storage: &storage,
         matchmaker: &matchmaker,
         parties: &parties,
         relayed: &relayed,
@@ -271,6 +274,7 @@ struct Ctx<'a> {
     notify: &'a crate::notify::Notifier,
     social: &'a musubi_social::SocialService,
     ratings: &'a musubi_leaderboard::RatingService,
+    storage: &'a musubi_storage::StorageService,
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
     relayed: &'a RelayedRegistry,
@@ -824,6 +828,60 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
         }
         ClientMessage::StatusUnfollow { account_ids } => {
             hub.unfollow(sid, &account_ids);
+            None
+        }
+        ClientMessage::StorageSubscribe {
+            collection,
+            key,
+            owner_id,
+        } => {
+            let me = ctx.presence.account_id;
+            let owner = owner_id.unwrap_or(me);
+            if owner != me {
+                let Some(k) = &key else {
+                    return Some(ServerMessage::error(&Error::PermissionDenied(
+                        "another user's collection can only be followed per key".into(),
+                    )));
+                };
+                let found = ctx
+                    .storage
+                    .read(
+                        musubi_storage::Caller::User(me),
+                        &[musubi_storage::ReadRef {
+                            collection: collection.clone(),
+                            key: k.clone(),
+                            owner_id: Some(owner.0),
+                        }],
+                    )
+                    .await;
+                match found {
+                    Ok(objs) if objs.is_empty() => {
+                        return Some(ServerMessage::error(&Error::NotFound(format!(
+                            "{collection}/{k} is not readable"
+                        ))))
+                    }
+                    Err(e) => return Some(ServerMessage::error(&e)),
+                    Ok(_) => {}
+                }
+            }
+            hub.join_channel(
+                &super::storage_channel(&collection, owner.0, key.as_deref()),
+                sid,
+                true,
+                false,
+            );
+            None
+        }
+        ClientMessage::StorageUnsubscribe {
+            collection,
+            key,
+            owner_id,
+        } => {
+            let owner = owner_id.unwrap_or(ctx.presence.account_id);
+            hub.leave_channel(
+                &super::storage_channel(&collection, owner.0, key.as_deref()),
+                sid,
+            );
             None
         }
         ClientMessage::Rpc { id, payload } => {

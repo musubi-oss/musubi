@@ -20,6 +20,22 @@ pub enum ClientMessage {
     StatusUnfollow {
         account_ids: Vec<AccountId>,
     },
+    /// Receive `storage_update` for one object (`key`) or for every object of an owner's
+    /// collection (`key` omitted; own objects only). Another owner's object must be readable.
+    StorageSubscribe {
+        collection: String,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        owner_id: Option<AccountId>,
+    },
+    StorageUnsubscribe {
+        collection: String,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        owner_id: Option<AccountId>,
+    },
     /// Call a server-side RPC over the socket.
     Rpc {
         id: String,
@@ -258,6 +274,18 @@ pub enum ServerMessage {
         joins: Vec<UserPresence>,
         #[serde(default)]
         leaves: Vec<UserPresence>,
+    },
+    /// A subscribed storage object was written (`value`, `version`) or deleted.
+    StorageUpdate {
+        collection: String,
+        key: String,
+        owner_id: AccountId,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        value: Option<serde_json::Value>,
+        #[serde(default)]
+        deleted: bool,
     },
     Rpc {
         id: String,

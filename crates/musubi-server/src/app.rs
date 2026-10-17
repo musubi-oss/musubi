@@ -449,6 +449,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         )
     });
     worlds.clone().spawn_ticker(fanout.clone());
+    match storage.load_schemas().await {
+        Ok(n) if n > 0 => tracing::info!(collections = n, "storage schemas loaded"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "storage schemas not loaded"),
+    }
+    wire_storage_live(&storage, &fanout);
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone()).with_push(
         Arc::new(crate::push::Push::new(cfg.push.clone(), db.clone())),
     );
@@ -1120,4 +1126,28 @@ pub fn captcha_verifier(
         }) as musubi_auth::CaptchaFuture
     });
     musubi_auth::CaptchaVerifier { configured, verify }
+}
+
+/// Turn committed storage writes into `storage_update` messages on the subscription channels
+/// (one per object, one per owner collection) on every node.
+pub fn wire_storage_live(storage: &musubi_storage::StorageService, fanout: &crate::fanout::Fanout) {
+    let f = fanout.clone();
+    storage.set_on_change(move |c: musubi_storage::Change| {
+        let msg = musubi_proto::realtime::ServerMessage::StorageUpdate {
+            collection: c.collection.clone(),
+            key: c.key.clone(),
+            owner_id: musubi_core::AccountId(c.owner_id),
+            version: c.version,
+            value: c.value,
+            deleted: c.deleted,
+        };
+        f.channel(
+            &crate::realtime::storage_channel(&c.collection, c.owner_id, Some(&c.key)),
+            msg.clone(),
+        );
+        f.channel(
+            &crate::realtime::storage_channel(&c.collection, c.owner_id, None),
+            msg,
+        );
+    });
 }
