@@ -190,7 +190,7 @@ async fn start(
         }
         payload["lobby_id"] = json!(lobby.id);
         payload["members"] = json!(roster);
-        let a = s.fleets.allocate(fleet_id, payload).await?;
+        let a = s.fleets.allocate(fleet_id, payload, false).await?;
         json!({
             "kind": "dedicated",
             "server_id": a.server_id,

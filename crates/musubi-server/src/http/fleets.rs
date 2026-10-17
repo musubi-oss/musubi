@@ -42,6 +42,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/gameserver/allocate", post(sdk_allocate))
         .route("/v1/gameserver/shutdown", post(sdk_shutdown))
         .route("/v1/gameserver/label", post(sdk_label))
+        .route("/v1/gameserver/players", post(sdk_players))
+        .route("/v1/gameserver/watch", get(sdk_watch))
         .route("/v1/gameserver/connect", post(sdk_connect))
 }
 
@@ -120,6 +122,8 @@ async fn scale(
 #[serde(default)]
 struct AllocateReq {
     payload: Value,
+    /// Prefer a live server with free player slots (backfill) over a fresh one.
+    backfill: bool,
 }
 
 async fn allocate(
@@ -128,7 +132,11 @@ async fn allocate(
     Path(id): Path<String>,
     Json(r): Json<AllocateReq>,
 ) -> Result<Json<Allocation>, ApiError> {
-    Ok(Json(s.fleets.allocate(parse(&id)?, r.payload).await?))
+    Ok(Json(
+        s.fleets
+            .allocate(parse(&id)?, r.payload, r.backfill)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -235,6 +243,51 @@ async fn sdk_label(
     Json(labels): Json<Value>,
 ) -> Result<Json<GameServer>, ApiError> {
     Ok(Json(s.fleets.sdk_labels(self_id(&headers)?, labels).await?))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PlayersReq {
+    players: i32,
+    capacity: Option<i32>,
+}
+
+/// `POST /v1/gameserver/players {players, capacity?}` — occupancy for backfill allocations.
+async fn sdk_players(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    Json(r): Json<PlayersReq>,
+) -> Result<Json<GameServer>, ApiError> {
+    Ok(Json(
+        s.fleets
+            .sdk_players(self_id(&headers)?, r.players, r.capacity)
+            .await?,
+    ))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WatchQuery {
+    /// Last `version` the caller saw; the call returns as soon as the server changed past it.
+    since: Option<i64>,
+    /// Long-poll budget, 1..=60 s (default 30).
+    timeout_secs: Option<u64>,
+}
+
+/// `GET /v1/gameserver/watch?since=&timeout_secs=` — WatchGameServer: returns the server record
+/// when it changes (state, labels, allocation, players) or when the timeout passes.
+async fn sdk_watch(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    Query(q): Query<WatchQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let id = self_id(&headers)?;
+    let budget = std::time::Duration::from_secs(q.timeout_secs.unwrap_or(30).clamp(1, 60));
+    let gs = s.fleets.watch(id, q.since, budget).await?;
+    let changed = q.since.is_none_or(|v| gs.version > v);
+    Ok(Json(json!({ "changed": changed, "server": gs })))
 }
 
 #[derive(Deserialize)]

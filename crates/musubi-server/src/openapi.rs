@@ -181,6 +181,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/gameserver/connect", "fleets"),
     ("POST", "/v1/gameserver/health", "fleets"),
     ("POST", "/v1/gameserver/label", "fleets"),
+    ("POST", "/v1/gameserver/players", "fleets"),
+    ("GET", "/v1/gameserver/watch", "fleets"),
     ("POST", "/v1/gameserver/ready", "fleets"),
     ("POST", "/v1/gameserver/shutdown", "fleets"),
     ("GET", "/v1/groups", "groups"),

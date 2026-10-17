@@ -511,6 +511,7 @@ impl Fanout {
                         .allocate(
                             f.id,
                             serde_json::json!({ "token": m.token, "users": m.users() }),
+                            false,
                         )
                         .await
                     {

@@ -6482,7 +6482,10 @@ async fn edge_proxy_routes_allocations_by_connect_token() {
     assert!(svc.route_token("not-a-token").await.is_none());
 
     // clients are told the proxy's address, never the game server's
-    let alloc = svc.allocate(fuid, json!({"match": "edge"})).await.unwrap();
+    let alloc = svc
+        .allocate(fuid, json!({"match": "edge"}), false)
+        .await
+        .unwrap();
     assert_eq!(alloc.address, edge.ip().to_string());
     assert_eq!(alloc.port, edge.port() as i32);
     let real = svc.server(alloc.server_id).await.unwrap();
@@ -9803,4 +9806,165 @@ async fn store_windows_bundles_discounts_coupons_and_rotation() {
     .await;
     assert_eq!(st, StatusCode::OK, "{b2}");
     assert_eq!(b2["amount"], 500);
+}
+
+/// Game-server SDK: occupancy reports, backfill allocations onto a live server, WatchGameServer.
+#[tokio::test]
+async fn gameserver_watch_and_backfill() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("wbfleet");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(
+            json!({"name": name, "provider": "local", "buffer": 1, "max_servers": 2,
+            "port_start": 48200, "port_end": 48300, "spec": {"command": ["sleep", "60"]}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let _ = svc.reconcile().await.unwrap();
+    let (_, list) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let sid = list["servers"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{list}"))
+        .to_string();
+
+    // SDK calls carry the server key and the server's own id
+    let sdk = |method: &str, path: &str, body: Option<Value>| {
+        let app = app.clone();
+        let sid = sid.clone();
+        let (method, path) = (method.to_string(), path.to_string());
+        async move {
+            let mut req = Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .header("x-musubi-server-id", sid);
+            let req = match body {
+                Some(b) => req
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(b.to_string()))
+                    .unwrap(),
+                None => {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                    req.body(Body::empty()).unwrap()
+                }
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&bytes)
+                .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
+            (status, v)
+        }
+    };
+    let (st, gs) = sdk("POST", "/v1/gameserver/ready", None).await;
+    assert_eq!(st, StatusCode::OK, "{gs}");
+    assert_eq!(gs["state"], "ready");
+    let (st, gs) = sdk(
+        "POST",
+        "/v1/gameserver/players",
+        Some(json!({"players": 1, "capacity": 4})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{gs}");
+    assert_eq!(gs["capacity"], 4);
+    let v0 = gs["version"].as_i64().unwrap();
+
+    // first allocation takes the ready server; a backfill one lands on the same live server
+    let (st, a1) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({"payload": {"match": "m1"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a1}");
+    assert_eq!(a1["server_id"], sid);
+    assert_eq!(a1["backfill"], false);
+    let (st, a2) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({"payload": {"match": "m1", "late": true}, "backfill": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a2}");
+    assert_eq!(a2["server_id"], sid);
+    assert_eq!(a2["backfill"], true);
+    assert_eq!(
+        a2["connect_token"], a1["connect_token"],
+        "newcomers share the live match's token"
+    );
+    // a full server is not backfilled: no ready server left either → exhausted
+    let (st, _) = sdk(
+        "POST",
+        "/v1/gameserver/players",
+        Some(json!({"players": 4})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({"payload": {}, "backfill": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+
+    // watch: the version moved past v0 → immediate; from the latest version → times out unchanged;
+    // a label change wakes it up
+    let (st, w) = sdk(
+        "GET",
+        &format!("/v1/gameserver/watch?since={v0}&timeout_secs=5"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+    assert_eq!(w["changed"], true);
+    let v1 = w["server"]["version"].as_i64().unwrap();
+    assert!(v1 > v0);
+    let started = std::time::Instant::now();
+    let (st, w) = sdk(
+        "GET",
+        &format!("/v1/gameserver/watch?since={v1}&timeout_secs=1"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+    assert_eq!(w["changed"], false);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+    let waiter = tokio::spawn(sdk(
+        "GET",
+        &format!("/v1/gameserver/watch?since={v1}&timeout_secs=10"),
+        None,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (st, _) = sdk("POST", "/v1/gameserver/label", Some(json!({"map": "dust"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, w) = waiter.await.unwrap();
+    assert_eq!(st, StatusCode::OK, "{w}");
+    assert_eq!(w["changed"], true);
+    assert_eq!(w["server"]["labels"]["map"], "dust");
+    let (_, _) = sdk("POST", "/v1/gameserver/shutdown", None).await;
 }

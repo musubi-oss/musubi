@@ -246,6 +246,14 @@ pub struct GameServer {
     pub created_at: OffsetDateTime,
     /// Fleet build this server was started from (`None` = the fleet's own spec).
     pub build_version: Option<String>,
+    /// Occupancy reported by the server (`POST /v1/gameserver/players`); `capacity` 0 = unknown.
+    #[serde(default)]
+    pub players: i32,
+    #[serde(default)]
+    pub capacity: i32,
+    /// Change counter, bumped by every update; `GET /v1/gameserver/watch` long-polls on it.
+    #[serde(default)]
+    pub version: i64,
 }
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
@@ -318,6 +326,9 @@ pub struct Allocation {
     pub fleet_id: Uuid,
     pub address: String,
     pub port: i32,
+    /// Joined a live server with free slots instead of starting on a fresh one.
+    #[serde(default)]
+    pub backfill: bool,
     /// Token the game server validates through `/v1/gameserver/connect` (shared by the group).
     pub connect_token: String,
 }
@@ -484,6 +495,9 @@ type ServerRow = (
     OffsetDateTime,
     OffsetDateTime,
     Option<String>,
+    i32,
+    i32,
+    i64,
 );
 
 fn row_to_server(r: ServerRow) -> GameServer {
@@ -500,13 +514,16 @@ fn row_to_server(r: ServerRow) -> GameServer {
         last_health: r.9,
         created_at: r.10,
         build_version: r.11,
+        players: r.12,
+        capacity: r.13,
+        version: r.14,
     }
 }
 
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version";
 
 impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
@@ -766,6 +783,49 @@ impl FleetService {
         self.server(id).await
     }
 
+    /// Occupancy report for backfill: `players` in game now, `capacity` total slots (kept when `None`).
+    pub async fn sdk_players(
+        &self,
+        id: Uuid,
+        players: i32,
+        capacity: Option<i32>,
+    ) -> Result<GameServer> {
+        if players < 0 || capacity.is_some_and(|c| c < 0) {
+            return Err(Error::InvalidArgument(
+                "players/capacity must be >= 0".into(),
+            ));
+        }
+        sqlx::query(
+            "update musubi.game_servers set players = $2, capacity = coalesce($3, capacity), updated_at = now()
+             where id = $1",
+        )
+        .bind(id)
+        .bind(players)
+        .bind(capacity)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        self.server(id).await
+    }
+
+    /// WatchGameServer: return the record as soon as its `version` passes `since` (or at once
+    /// without `since`), else after `budget` with whatever is current.
+    pub async fn watch(
+        &self,
+        id: Uuid,
+        since: Option<i64>,
+        budget: Duration,
+    ) -> Result<GameServer> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let gs = self.server(id).await?;
+            if since.is_none_or(|v| gs.version > v) || tokio::time::Instant::now() >= deadline {
+                return Ok(gs);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     /// Validate the allocation's connect token (shared by the whole group; the game server calls
     /// this when a client arrives). The first valid connect moves the server to `in_game`.
     pub async fn sdk_connect(&self, id: Uuid, token: &str) -> Result<serde_json::Value> {
@@ -792,7 +852,45 @@ impl FleetService {
     // ----- control surface -----
 
     /// Hand a ready server to a caller; `payload` travels to the game server with the connect token.
-    pub async fn allocate(&self, fleet_id: Uuid, payload: serde_json::Value) -> Result<Allocation> {
+    /// With `backfill`, a live (`allocated`/`in_game`) server that reported free slots is reused
+    /// — same connect token, so the newcomers join the running match — before a `ready` one is taken.
+    pub async fn allocate(
+        &self,
+        fleet_id: Uuid,
+        payload: serde_json::Value,
+        backfill: bool,
+    ) -> Result<Allocation> {
+        if backfill {
+            let r = sqlx::query_as::<_, (Uuid, String, i32, Option<String>)>(
+                "update musubi.game_servers set allocation = allocation || jsonb_build_object('backfill',
+                        coalesce(allocation->'backfill', '[]'::jsonb) || jsonb_build_array($2::jsonb)),
+                     updated_at = now()
+                 where id = (select id from musubi.game_servers
+                             where fleet_id = $1 and state in ('allocated', 'in_game') and capacity > 0
+                               and players < capacity and connect_token is not null
+                             order by (capacity - players) desc, created_at limit 1 for update skip locked)
+                 returning id, address, port, connect_token",
+            )
+            .bind(fleet_id)
+            .bind(serde_json::json!({ "payload": payload, "at": OffsetDateTime::now_utc().unix_timestamp() }))
+            .fetch_optional(&self.db)
+            .await
+            .map_err(Error::internal)?;
+            if let Some((id, address, port, Some(token))) = r {
+                let (address, port) = match self.edge {
+                    Some(e) => (e.ip().to_string(), e.port() as i32),
+                    None => (address, port),
+                };
+                return Ok(Allocation {
+                    server_id: id,
+                    fleet_id,
+                    address,
+                    port,
+                    connect_token: token,
+                    backfill: true,
+                });
+            }
+        }
         let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
         let alloc = serde_json::json!({ "payload": payload, "at": OffsetDateTime::now_utc().unix_timestamp() });
         let r = sqlx::query_as::<_, (Uuid, String, i32)>(
@@ -824,6 +922,7 @@ impl FleetService {
             address,
             port,
             connect_token: token,
+            backfill: false,
         })
     }
 
