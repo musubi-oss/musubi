@@ -55,6 +55,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/admin/worlds/{w}/entities", get(world_entities))
         .route("/v1/admin/worlds/{w}/at", get(world_at))
+        .route("/v1/admin/worlds/{w}/history", get(world_history))
+        .route("/v1/admin/worlds/{w}/verify", post(world_verify))
         .route("/v1/admin/worlds/{w}/snapshot", post(world_snapshot))
         .route("/v1/admin/cluster/nodes/{id}/drain", post(drain_node))
         .route("/v1/admin/retention/run", post(retention_run))
@@ -848,6 +850,49 @@ async fn world_at(
     Query(q): Query<AtQuery>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(s.worlds.entities_at(&w, q.tick).await?))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    entity: Option<Uuid>,
+    #[serde(default)]
+    from_tick: u64,
+    to_tick: Option<u64>,
+    #[serde(default = "default_history_limit")]
+    limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    500
+}
+
+/// Journal ops with provenance (who/what wrote each persistent mutation and when).
+async fn world_history(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(w): Path<String>,
+    Query(q): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        s.worlds
+            .history(
+                &w,
+                q.entity,
+                q.from_tick,
+                q.to_tick.unwrap_or(u64::MAX),
+                q.limit,
+            )
+            .await?,
+    ))
+}
+
+/// Rebuild the world from snapshots + journal and diff it against the live state.
+async fn world_verify(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(w): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.worlds.verify(&w).await?))
 }
 
 /// Snapshot this node's shard of the world now (also a history row for the time machine).

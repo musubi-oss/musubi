@@ -14425,3 +14425,93 @@ async fn ugc_blobs_live_in_object_storage() {
     assert_eq!(st, 200, "{r}");
     assert!(objects.lock().unwrap().objects.is_empty());
 }
+
+/// Journal ops carry provenance and are listed by `history`; `verify` rebuilds the world from
+/// snapshots + journal and finds it identical to the live state.
+#[tokio::test]
+async fn world_history_and_verify() {
+    let Some(url) = std::env::var("MUSUBI_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let group = test_group();
+    migrate_once(&db).await;
+    let n1 = uuid::Uuid::now_v7();
+    let r1 = musubi_server::realtime::WorldRegistry::new(n1, Some(db.clone())).with_group(&group);
+    let name = format!("wh-{}", n1.simple());
+    r1.create(
+        &name,
+        musubi_mesh::WorldConfig::default(),
+        musubi_mesh::controller::ControllerConfig::default(),
+        "",
+    )
+    .await
+    .unwrap();
+    let sim = uuid::Uuid::now_v7();
+    r1.register_sim(&name, sim, 8).unwrap();
+    let keep = r1
+        .spawn(
+            &name,
+            sim,
+            musubi_mesh::Pos { x: 1.0, y: 1.0 },
+            json!({"hp": 10}),
+            true,
+        )
+        .unwrap();
+    r1.snapshot_now(&name).await.unwrap();
+    r1.apply(&name, sim, &keep.id.to_string(), None, json!({"hp": 5}))
+        .unwrap();
+    let gone = r1
+        .spawn(
+            &name,
+            sim,
+            musubi_mesh::Pos { x: 1.2, y: 1.2 },
+            json!({}),
+            true,
+        )
+        .unwrap();
+    r1.despawn(&name, sim, &gone.id.to_string()).unwrap();
+    // flushed rows and the unflushed in-memory tail together
+    let h = r1.history(&name, None, 0, u64::MAX, 500).await.unwrap();
+    assert_eq!(h["total"], 4, "{h}");
+    let ops = h["ops"].as_array().unwrap();
+    assert!(ops.iter().all(|o| o["node_id"] == json!(n1)), "{h}");
+    assert!(
+        ops.iter()
+            .all(|o| o["source"]["by"] == "sim" || o["source"]["by"] == "spawn"),
+        "{h}"
+    );
+    let apply = ops.iter().find(|o| o["op"].get("Apply").is_some()).unwrap();
+    assert_eq!(apply["source"]["by"], "sim");
+    assert_eq!(apply["source"]["sim"], json!(sim));
+    assert_eq!(apply["entity"], json!(keep.id));
+    let last_tick = ops.last().unwrap()["tick"].as_u64().unwrap();
+    let only_gone = r1
+        .history(&name, Some(gone.id), 0, u64::MAX, 500)
+        .await
+        .unwrap();
+    assert_eq!(only_gone["total"], 2, "spawn + despawn: {only_gone}");
+    let none = r1
+        .history(&name, None, last_tick + 1, u64::MAX, 500)
+        .await
+        .unwrap();
+    assert_eq!(none["total"], 0);
+    let one = r1.history(&name, None, 0, u64::MAX, 1).await.unwrap();
+    assert_eq!(one["total"], 4);
+    assert_eq!(one["ops"].as_array().unwrap().len(), 1);
+    // determinism: rebuilt == live
+    let v = r1.verify(&name).await.unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["live"], 1);
+    assert_eq!(v["rebuilt"], 1);
+    // the flushed journal is still listed, from the database now
+    let h2 = r1.history(&name, None, 0, u64::MAX, 500).await.unwrap();
+    assert_eq!(h2["total"], 4, "{h2}");
+    let rows: i64 = sqlx::query_scalar("select count(*) from musubi.world_journal where name = $1")
+        .bind(&name)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(rows >= 1);
+    r1.delete(&name).await.unwrap();
+}

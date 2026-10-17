@@ -160,6 +160,10 @@ fn tx_apply_local(st: &mut WorldState, tx: Uuid, ops: &[TxOp]) -> Vec<EntityId> 
         if persistent {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "tx".into(),
+                    sim: None,
+                }),
                 op: WorldMutation::Apply {
                     id: op.entity,
                     pos: None,
@@ -324,6 +328,19 @@ const JOURNAL_EVERY: u64 = 5;
 pub struct WorldOp {
     pub tick: u64,
     pub op: WorldMutation,
+    /// Who caused the op (debugging meshing: which simulator / mechanism wrote what, when).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Provenance>,
+}
+
+/// Provenance of a journaled op: `by` is `sim` (a simulator's spawn/apply/despawn/attach/detach),
+/// `tx` (world transaction commit), `handover` (entity moved between cells/nodes), `spawn`
+/// (server-side spawn), `decay`, `queue` (soft-cap admission) or `rewind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provenance {
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +367,16 @@ pub enum WorldMutation {
     Detach {
         id: Uuid,
     },
+}
+
+fn op_entity(op: &WorldMutation) -> Uuid {
+    match op {
+        WorldMutation::Spawn { id, .. }
+        | WorldMutation::Despawn { id }
+        | WorldMutation::Apply { id, .. }
+        | WorldMutation::Attach { id, .. }
+        | WorldMutation::Detach { id } => *id,
+    }
 }
 
 /// Replays `node`'s journal over a world merged from several shards. `src` remembers which node's
@@ -1143,6 +1170,122 @@ impl WorldRegistry {
         .await
         .map_err(Error::internal)?;
         Ok(())
+    }
+
+    /// Journaled ops of a world (flushed rows plus this node's unflushed tail) in `[from, to]`,
+    /// optionally for one entity, each with the node that wrote it and its provenance — the
+    /// audit trail for "who moved this entity and when" while debugging meshing.
+    pub async fn history(
+        &self,
+        name: &str,
+        entity: Option<Uuid>,
+        from: u64,
+        to: u64,
+        limit: usize,
+    ) -> Result<Value> {
+        let Some(db) = &self.db else {
+            return Err(Error::Internal(
+                "no database: world history is not kept".into(),
+            ));
+        };
+        let rows: Vec<(Option<Uuid>, Value)> = sqlx::query_as(
+            "select node_id, entries from musubi.world_journal where name = $1 and tick_to >= $2 and tick_from <= $3 order by tick_from",
+        )
+        .bind(name)
+        .bind(from.min(i64::MAX as u64) as i64)
+        .bind(to.min(i64::MAX as u64) as i64)
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
+        let mut ops: Vec<(u64, Uuid, WorldOp)> = Vec::new();
+        for (node, v) in rows {
+            if let Ok(o) = serde_json::from_value::<Vec<WorldOp>>(v) {
+                let node = node.unwrap_or(Uuid::nil());
+                ops.extend(o.into_iter().map(|op| (op.tick, node, op)));
+            }
+        }
+        if let Ok(w) = self.get(name) {
+            let st = w.lock();
+            ops.extend(
+                st.journal
+                    .iter()
+                    .cloned()
+                    .map(|op| (op.tick, self.node_id, op)),
+            );
+        }
+        ops.retain(|(t, _, op)| {
+            *t >= from && *t <= to && entity.is_none_or(|e| op_entity(&op.op) == e)
+        });
+        ops.sort_by_key(|(t, _, _)| *t);
+        let total = ops.len();
+        ops.truncate(limit.clamp(1, 5000));
+        let ops: Vec<Value> = ops
+            .into_iter()
+            .map(|(tick, node, op)| {
+                json!({ "tick": tick, "node_id": node, "entity": op_entity(&op.op), "source": op.source, "op": op.op })
+            })
+            .collect();
+        Ok(json!({ "world": name, "from_tick": from, "to_tick": to, "total": total, "ops": ops }))
+    }
+
+    /// Determinism check: flush this node's journal, then rebuild the world at the current tick
+    /// from snapshots + journal (`entities_at`) and diff it against the live persistent
+    /// entities. Any difference means an unjournaled mutation or a non-deterministic replay.
+    pub async fn verify(&self, name: &str) -> Result<Value> {
+        let Some(db) = &self.db else {
+            return Err(Error::Internal(
+                "no database: world history is not kept".into(),
+            ));
+        };
+        let (ops, tick, live) = {
+            let w = self.get(name)?;
+            let mut st = w.lock();
+            (
+                std::mem::take(&mut st.journal),
+                st.world.tick,
+                st.world.snapshot_persistent(),
+            )
+        };
+        Self::write_journal(db, name, self.node_id, self.host_term(name)?, ops, tick).await?;
+        let rebuilt = self.entities_at(name, tick).await?;
+        let rebuilt: Vec<musubi_mesh::Entity> =
+            serde_json::from_value(rebuilt["entities"].clone()).map_err(Error::internal)?;
+        let live_by: HashMap<Uuid, Value> = live
+            .iter()
+            .map(|e| (e.id, serde_json::to_value(e).unwrap_or(Value::Null)))
+            .collect();
+        let rebuilt_by: HashMap<Uuid, Value> = rebuilt
+            .iter()
+            .map(|e| (e.id, serde_json::to_value(e).unwrap_or(Value::Null)))
+            .collect();
+        let mut missing_in_rebuilt: Vec<Uuid> = live_by
+            .keys()
+            .filter(|id| !rebuilt_by.contains_key(id))
+            .copied()
+            .collect();
+        let mut missing_in_live: Vec<Uuid> = rebuilt_by
+            .keys()
+            .filter(|id| !live_by.contains_key(id))
+            .copied()
+            .collect();
+        missing_in_rebuilt.sort();
+        missing_in_live.sort();
+        let mut differing: Vec<Value> = live_by
+            .iter()
+            .filter_map(|(id, l)| {
+                let r = rebuilt_by.get(id)?;
+                (l != r).then(|| json!({ "id": id, "live": l, "rebuilt": r }))
+            })
+            .collect();
+        differing.sort_by_key(|d| d["id"].as_str().unwrap_or("").to_string());
+        let ok =
+            missing_in_rebuilt.is_empty() && missing_in_live.is_empty() && differing.is_empty();
+        Ok(json!({
+            "world": name, "tick": tick, "ok": ok,
+            "live": live_by.len(), "rebuilt": rebuilt_by.len(),
+            "missing_in_rebuilt": missing_in_rebuilt, "missing_in_live": missing_in_live,
+            "differing": differing,
+        }))
     }
 
     /// Plan 4.9 time machine: the world's persistent entities as of the end of `tick`, rebuilt from each
@@ -2405,6 +2548,10 @@ impl WorldRegistry {
         if persistent {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "sim".into(),
+                    sim: Some(sim),
+                }),
                 op: WorldMutation::Despawn { id },
             });
         }
@@ -2434,6 +2581,10 @@ impl WorldRegistry {
         if st.world.get(id).is_some_and(|e| e.persistent) {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "sim".into(),
+                    sim: Some(sim),
+                }),
                 op: WorldMutation::Attach { id, root },
             });
         }
@@ -2459,6 +2610,10 @@ impl WorldRegistry {
         if persistent {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "sim".into(),
+                    sim: Some(sim),
+                }),
                 op: WorldMutation::Detach { id },
             });
         }
@@ -2492,6 +2647,10 @@ impl WorldRegistry {
         if st.world.get(id).is_some_and(|e| e.persistent) {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "sim".into(),
+                    sim: Some(sim),
+                }),
                 op: WorldMutation::Apply {
                     id,
                     pos,
@@ -2764,6 +2923,10 @@ impl WorldRegistry {
         if entity.persistent {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "handover".into(),
+                    sim: None,
+                }),
                 op: WorldMutation::Spawn {
                     id,
                     pos: entity.pos,
@@ -2832,6 +2995,10 @@ impl WorldRegistry {
                         if e.persistent {
                             st.journal.push(WorldOp {
                                 tick: st.world.tick,
+                                source: Some(Provenance {
+                                    by: "handover".into(),
+                                    sim: None,
+                                }),
                                 op: WorldMutation::Despawn { id },
                             });
                         }
@@ -2853,6 +3020,10 @@ impl WorldRegistry {
             if persistent {
                 st.journal.push(WorldOp {
                     tick: st.world.tick,
+                    source: Some(Provenance {
+                        by: "handover".into(),
+                        sim: None,
+                    }),
                     op: WorldMutation::Despawn { id },
                 });
             }
@@ -4091,6 +4262,10 @@ fn spawn_entity(
     if persistent {
         st.journal.push(WorldOp {
             tick: st.world.tick,
+            source: Some(Provenance {
+                by: "spawn".into(),
+                sim: None,
+            }),
             op: WorldMutation::Spawn {
                 id,
                 pos,
@@ -4120,6 +4295,10 @@ fn decay_entities(st: &mut WorldState) {
         if persistent {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "decay".into(),
+                    sim: None,
+                }),
                 op: WorldMutation::Despawn { id },
             });
         }
@@ -4175,6 +4354,10 @@ fn drain_admission(st: &mut WorldState) {
             if e.persistent {
                 st.journal.push(WorldOp {
                     tick,
+                    source: Some(Provenance {
+                        by: "queue".into(),
+                        sim: None,
+                    }),
                     op: WorldMutation::Spawn {
                         id,
                         pos: e.pos,

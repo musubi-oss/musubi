@@ -79,7 +79,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Подписки с продлением / grace | ✅ `iap_products.kind = subscription` + `grace_secs`, продление по чеку и Apple V2 / Google RTDN, `GET /v1/iap/subscriptions` | 🟡 | ✅ | ✅ | ✅ |
 | Entitlements: платформенные покупки / DLC → предметы | ❌ | ✅ | ❌ | ✅ | ✅ |
 | Limited grants (лимит серверных грантов на игрока в окно) | ❌ | ✅ | ❌ | ❌ | ❌ |
-| Жалобы на игроков общего вида + ревью | 🟡 только на сообщения чата | ✅ | ❌ | ✅ | ✅ |
+| Жалобы на игроков общего вида + ревью | ✅ `POST /v1/reports` на игрока/матч/UGC, очередь и решение `GET/POST /v1/admin/reports/{id}`, история по аккаунту | ✅ | ❌ | ✅ | ✅ |
 | Баны (timed, shadow), kick, purge | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Античит: серверная валидация, EAC/BattlEye-интеграция | ✅ размер/частота ввода в authoritative-матчах → отказ + сигнал; `POST /v1/server/anticheat/flag` от серверов и `anticheat.flag` из модулей; очки за окно, авто-кик по порогу, очередь `GET /v1/admin/anticheat`; `POST /v1/server/anticheat/verify` → EAC/BattlEye endpoint | 🟡 | ❌ | 🟡 | 🟡 |
 
@@ -94,7 +94,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Детерминированный rollback | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Матчмейкер: MMR-окно по времени, пинг, роли, команды, кроссплей, приоритет, ready-check, dodge | ✅ `QueueConfig` | ✅ | 🟡 query | ✅ | ✅ |
 | Backfill в живой матч / сервер | ✅ | ✅ | 🟡 | ✅ | ✅ |
-| Game flow: пати → очередь → инстанс → результаты → награды | 🟡 звенья есть; единого «end-game report → рейтинги + награды + статы» маршрута нет | ✅ | ❌ | 🟡 | ✅ |
+| Game flow: пати → очередь → инстанс → результаты → награды | ✅ `POST /v1/server/matches/{id}/results` — один отчёт: рейтинг-очередь, награды по рангу (под limited grants), квесты, XP, bracket турнира, шина; идемпотентно по матчу | ✅ | ❌ | 🟡 | ✅ |
 | Dedicated-серверы: провайдеры | ✅ local, docker, kubernetes (Agones-совместимый манифест), firecracker | 🟡 внешние | 🟡 FleetManager API | ✅ | ✅ AMS |
 | Внешние оркестраторы как провайдеры (Edgegap, GameLift) | ✅ `provider = edgegap` (deploy/status/stop) и `gamelift` (CreateGameSession/Describe/Terminate, SigV4) рядом с local/docker/firecracker/k8s/agones | — | ✅ | — | — |
 | Автоскейл: буфер + прогноз по истории | ✅ `demand`/`scale` | ❌ | ❌ | ✅ | ✅ |
@@ -110,7 +110,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Hot reload модулей | ✅ `PUT /v1/admin/runtime/modules/{name}` | ❌ | ❌ | ✅ | — |
 | Канареечный rollout модулей | ❌ (есть для билдов флота, не для модулей) | ❌ | ❌ | ❌ | — |
 | Изоляция: fuel, память, дедлайн | ✅ | — | ❌ | ✅ | — |
-| Локальная отладка: dev-сервер, фикстуры, replay запросов | 🟡 `musubi dev`; фикстур и записи/воспроизведения запросов нет | ✅ | 🟡 | 🟡 | — |
+| Локальная отладка: dev-сервер, фикстуры, replay запросов | ✅ `musubi dev`; фикстуры `POST /v1/admin/dev/fixtures`, запись/replay запросов `/v1/admin/dev/recording(s)`, канарейки модулей | ✅ | 🟡 | 🟡 | — |
 | Cron / schedule_-хуки | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Durable workflows / saga | ❌ | ❌ | ❌ | ✅ | ❌ |
 | Flags, live events, аудитории, A/B | ✅ через Zanshin (кэш + мгновенный пуш `liveops.changed`) | ✅ | Satori платно | ✅ | ✅ |
@@ -142,7 +142,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 | Репликация server↔server на уровне компонентов (дельты, приоритеты, bandwidth budget) | ✅ | ghost-поток — дельты по компонентам (`changed_rev`), приоритет по расстоянию до границы, бюджет байт на ячейку в тик (`ghost_budget_bytes`), keyframe раз в `ghost_keyframe_ticks`; handover строится на ghost'е принимающей ноды: уходят только компоненты новее её ревизии (`base_rev`) + буфер ввода, без ghost'а — `resend_full` и повтор полным состоянием |
 | Единый entity id space + адресация через директорию для любого запроса из любой ячейки | ✅ | директория Raft |
 | Персистентный entity streaming (мир живёт без игроков, выгрузка холодных ячеек) | ✅ | снапшоты/журнал; hibernate по отсутствию интереса, затем `unload_after_ticks` — персистентные сущности уходят в `world_cold_cells` и освобождают память, возвращаются при интересе/lease/спавне; `cold_cells` в инфо мира |
-| Детерминизм и replay симуляции для отладки мешинга | 🟡 | replay матчей есть; replay мира с provenance — частично |
+| Детерминизм и replay симуляции для отладки мешинга | ✅ журнал мутаций с provenance (`by: sim/tx/handover/spawn/decay/queue`, `sim`), `GET /v1/admin/worlds/{w}/history?entity&from_tick&to_tick`, `GET …/at?tick` (time machine), `POST …/verify` — детерминированная пересборка из снапшотов+журнала и diff с живым состоянием | replay матчей есть; replay мира с provenance — частично |
 | Кросс-ячеечные транзакции (атомарный обмен предметами между сущностями разных серверов) | ✅ | `POST /v1/server/worlds/{w}/tx` — двухфазно по шине: prepare с проверкой версий компонентов и удержанием сущностей (запись 409, handover отложен), голоса хостов, commit/abort везде, таймаут по тикам, идемпотентно по tx id; локальный случай атомарно без шины |
 
 ## 7. Очередь работ
