@@ -892,6 +892,13 @@ pub struct SocialConfig {
     /// Any other OpenID Connect issuer (Discord, Twitch, Epic, Xbox, Keycloak, …) keyed by a
     /// short name: `POST /v1/auth/oidc/{name}` with its ID token; identities are `oidc:<name>`.
     pub oidc: std::collections::HashMap<String, OidcLoginConfig>,
+    /// Xbox Live: the client's XSTS token + user hash are checked against the profile service.
+    pub xbox: XboxLoginConfig,
+    /// PlayStation Network: the title's `id_token` (RS256 JWT). Set `jwks_url`/`issuers`/
+    /// `client_ids` from the DevNet "ID token" page for the environment you target.
+    pub psn: OidcLoginConfig,
+    /// Nintendo Account / NSA `id_token`; `jwks_url` + `issuers` + `client_ids` from NDP docs.
+    pub nintendo: OidcLoginConfig,
     pub passkeys: PasskeyConfig,
     /// Group XP needed to reach level 2, 3, …; the last entry caps the level.
     pub group_level_xp: Vec<i64>,
@@ -925,6 +932,9 @@ impl Default for SocialConfig {
             google: Self::google_defaults(),
             apple: Self::apple_defaults(),
             oidc: Default::default(),
+            xbox: XboxLoginConfig::default(),
+            psn: OidcLoginConfig::default(),
+            nintendo: OidcLoginConfig::default(),
             passkeys: PasskeyConfig::default(),
             group_level_xp: vec![
                 1_000, 3_000, 6_000, 10_000, 15_000, 21_000, 28_000, 36_000, 45_000,
@@ -940,6 +950,25 @@ pub struct SteamLoginConfig {
     /// Steamworks Web API key; empty = Steam login disabled.
     pub web_api_key: String,
     pub app_id: u32,
+}
+
+/// Xbox Live profile service used to validate XSTS tokens (`Authorization: XBL3.0 x=<uhs>;<token>`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct XboxLoginConfig {
+    /// Empty = Xbox login disabled. Production: `https://profile.xboxlive.com`.
+    pub url: String,
+    /// `x-xbl-contract-version` sent with the request.
+    pub contract_version: u32,
+}
+
+impl Default for XboxLoginConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            contract_version: 2,
+        }
+    }
 }
 
 impl Default for SteamLoginConfig {

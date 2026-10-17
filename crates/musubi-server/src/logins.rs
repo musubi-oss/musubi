@@ -43,6 +43,15 @@ pub struct IdClaims {
     pub email: Option<String>,
     #[serde(default)]
     pub email_verified: Option<serde_json::Value>,
+    /// PSN puts the player's online id in the id token.
+    #[serde(default)]
+    pub online_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct XboxProfile {
+    pub xuid: String,
+    pub gamertag: Option<String>,
 }
 
 impl Social {
@@ -123,6 +132,95 @@ impl Social {
             return Err(Error::PermissionDenied("steam account banned".into()));
         }
         Ok(p.steamid)
+    }
+
+    /// Xbox Live: the XSTS token the client got for the `http://xboxlive.com` relying party is
+    /// presented to the profile service as `XBL3.0 x=<uhs>;<token>`; a 401 there means the
+    /// token is forged, expired or for another relying party. Returns the XUID and gamertag.
+    pub async fn xbox(&self, user_hash: &str, token: &str) -> Result<XboxProfile> {
+        let c = &self.cfg.xbox;
+        if c.url.is_empty() {
+            return Err(Error::InvalidArgument(
+                "xbox login is not configured".into(),
+            ));
+        }
+        let clean = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 8192
+                && s.bytes()
+                    .all(|b| b.is_ascii_graphic() && b != b';' && b != b',')
+        };
+        if !clean(user_hash) || !clean(token) {
+            return Err(Error::Unauthenticated("malformed xbox token".into()));
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Resp {
+            #[serde(rename = "profileUsers")]
+            profile_users: Vec<User>,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct User {
+            id: String,
+            settings: Vec<Setting>,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Setting {
+            id: String,
+            value: String,
+        }
+        let url = format!(
+            "{}/users/me/profile/settings?settings=Gamertag",
+            c.url.trim_end_matches('/')
+        );
+        let res = self
+            .http
+            .get(url)
+            .header("Authorization", format!("XBL3.0 x={user_hash};{token}"))
+            .header("x-xbl-contract-version", c.contract_version.to_string())
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("xbox live: {e}")))?;
+        match res.status().as_u16() {
+            200 => {}
+            401 | 403 => {
+                return Err(Error::Unauthenticated(
+                    "xbox live rejected the token".into(),
+                ))
+            }
+            s => return Err(Error::Internal(format!("xbox live: status {s}"))),
+        }
+        let resp: Resp = res
+            .json()
+            .await
+            .map_err(|e| Error::Internal(format!("xbox live: {e}")))?;
+        let Some(u) = resp.profile_users.into_iter().next() else {
+            return Err(Error::Unauthenticated("xbox live: no profile".into()));
+        };
+        if u.id.is_empty() || !u.id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Unauthenticated("xbox live: bad xuid".into()));
+        }
+        let gamertag = u
+            .settings
+            .into_iter()
+            .find(|s| s.id == "Gamertag")
+            .map(|s| s.value)
+            .filter(|v| !v.is_empty());
+        Ok(XboxProfile {
+            xuid: u.id,
+            gamertag,
+        })
+    }
+
+    pub async fn psn(&self, id_token: &str) -> Result<IdClaims> {
+        self.verify_oidc(&self.cfg.psn, id_token).await
+    }
+
+    pub async fn nintendo(&self, id_token: &str) -> Result<IdClaims> {
+        self.verify_oidc(&self.cfg.nintendo, id_token).await
     }
 
     pub async fn google(&self, id_token: &str) -> Result<IdClaims> {

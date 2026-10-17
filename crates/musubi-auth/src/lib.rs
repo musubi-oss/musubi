@@ -27,6 +27,12 @@ pub mod provider {
     pub const STEAM: &str = "steam";
     pub const GOOGLE: &str = "google";
     pub const APPLE: &str = "apple";
+    /// Xbox Live; `subject` is the XUID.
+    pub const XBOX: &str = "xbox";
+    /// PlayStation Network; `subject` is the PSN account id (`sub` of the id token).
+    pub const PSN: &str = "psn";
+    /// Nintendo Account / NSA id.
+    pub const NINTENDO: &str = "nintendo";
     /// WebAuthn credential; `subject` is the base64url credential id.
     pub const PASSKEY: &str = "passkey";
     pub const CUSTOM: &str = "custom";

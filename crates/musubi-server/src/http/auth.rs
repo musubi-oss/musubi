@@ -17,6 +17,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/queue", post(queue))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/steam", post(steam))
+        .route("/v1/auth/xbox", post(xbox))
+        .route("/v1/auth/psn", post(psn))
+        .route("/v1/auth/nintendo", post(nintendo))
         .route("/v1/auth/google", post(google))
         .route("/v1/auth/apple", post(apple))
         .route("/v1/auth/oidc/{provider}", post(oidc))
@@ -441,6 +444,66 @@ async fn steam(
         .authenticate_external(musubi_auth::provider::STEAM, &steam_id, r.opts)
         .await?;
     authenticated(&s, &sess, musubi_auth::provider::STEAM, &ip.0);
+    Ok(Json(sess))
+}
+
+#[derive(Deserialize)]
+struct XboxReq {
+    user_hash: String,
+    token: String,
+    #[serde(flatten)]
+    opts: AuthOptions,
+}
+
+#[derive(Deserialize)]
+struct ConsoleIdTokenReq {
+    id_token: String,
+    #[serde(flatten)]
+    opts: AuthOptions,
+}
+
+async fn xbox(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<XboxReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let p = s.logins.xbox(&r.user_hash, &r.token).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::XBOX, &p.xuid, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::XBOX, &ip.0);
+    Ok(Json(sess))
+}
+
+async fn psn(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<ConsoleIdTokenReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let c = s.logins.psn(&r.id_token).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::PSN, &c.sub, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::PSN, &ip.0);
+    Ok(Json(sess))
+}
+
+async fn nintendo(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<ConsoleIdTokenReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let c = s.logins.nintendo(&r.id_token).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::NINTENDO, &c.sub, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::NINTENDO, &ip.0);
     Ok(Json(sess))
 }
 

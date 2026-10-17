@@ -11345,3 +11345,206 @@ async fn webhooks_redeliver_resets_a_delivery() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// Console sign-in (5.1): Xbox XSTS against a mock profile service, PSN / Nintendo id tokens
+/// against the RSA test JWKS; identities are provider-scoped and found by the admin lookup.
+#[tokio::test]
+async fn console_logins_xbox_psn_nintendo() {
+    use axum::http::HeaderMap;
+    use axum::routing::get as ax_get;
+    let jwks: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/google_test_jwks.json")).unwrap();
+    let mock = Router::new()
+        .route(
+            "/jwks",
+            ax_get(move || {
+                let j = jwks.clone();
+                async move { axum::Json(j) }
+            }),
+        )
+        .route(
+            "/users/me/profile/settings",
+            ax_get(|headers: HeaderMap| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let ver = headers
+                    .get("x-xbl-contract-version")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if ver != "2" {
+                    return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({})));
+                }
+                match auth {
+                    "XBL3.0 x=uhs1;xsts-good" => (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"profileUsers": [{"id": "2535400000000001",
+                            "settings": [{"id": "Gamertag", "value": "MusubiFan"}]}]})),
+                    ),
+                    _ => (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        axum::Json(json!({"code": 401})),
+                    ),
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        c.social.xbox.url = b.clone();
+        c.social.psn.jwks_url = format!("{b}/jwks");
+        c.social.psn.issuers = vec!["https://auth.api.sonyentertainmentnetwork.com".into()];
+        c.social.psn.client_ids = vec!["psn-client".into()];
+        c.social.nintendo.jwks_url = format!("{b}/jwks");
+        c.social.nintendo.issuers = vec!["https://accounts.nintendo.com".into()];
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+
+    // Xbox: good token → session, identity xbox:<xuid>; forged → 401; malformed → 401
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/xbox",
+        None,
+        Some(json!({"user_hash": "uhs1", "token": "xsts-good"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    let acc = s1["account_id"].as_str().unwrap().to_string();
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/accounts?identity=xbox:2535400000000001",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["accounts"][0]["id"], json!(acc), "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/xbox",
+        None,
+        Some(json!({"user_hash": "uhs1", "token": "xsts-forged"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/xbox",
+        None,
+        Some(json!({"user_hash": "uhs;1", "token": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // same token again → same account
+    let (_, again) = call(
+        &app,
+        "POST",
+        "/v1/auth/xbox",
+        None,
+        Some(json!({"user_hash": "uhs1", "token": "xsts-good"})),
+    )
+    .await;
+    assert_eq!(again["account_id"], json!(acc));
+
+    // PSN / Nintendo id tokens
+    let key =
+        jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!("fixtures/google_test_rsa.pem"))
+            .unwrap();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("t1".into());
+    let exp = time::OffsetDateTime::now_utc().unix_timestamp() + 600;
+    let sign = |claims: serde_json::Value| jsonwebtoken::encode(&header, &claims, &key).unwrap();
+    let psn_sub = unique("psn-");
+    let tok = sign(
+        json!({"iss": "https://auth.api.sonyentertainmentnetwork.com", "aud": "psn-client",
+        "sub": psn_sub, "exp": exp, "online_id": "ps_player", "env": "np"}),
+    );
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/psn",
+        None,
+        Some(json!({"id_token": tok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts?identity=psn:{psn_sub}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["accounts"][0]["id"], p["account_id"], "{v}");
+    // wrong audience → 401
+    let bad = sign(
+        json!({"iss": "https://auth.api.sonyentertainmentnetwork.com", "aud": "other",
+        "sub": psn_sub, "exp": exp}),
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/psn",
+        None,
+        Some(json!({"id_token": bad})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // Nintendo token linked to the Xbox account; linking it to a second account → conflict
+    let nsa = unique("nsa-");
+    let ntok =
+        sign(json!({"iss": "https://accounts.nintendo.com", "aud": "any", "sub": nsa, "exp": exp}));
+    let bearer = s1["access_token"].as_str().unwrap();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/link/nintendo",
+        Some(bearer),
+        Some(json!({"id_token": ntok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/link/nintendo",
+        Some(p["access_token"].as_str().unwrap()),
+        Some(json!({"id_token": ntok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    // and signing in with it lands on the Xbox account
+    let (st, n) = call(
+        &app,
+        "POST",
+        "/v1/auth/nintendo",
+        None,
+        Some(json!({"id_token": ntok})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{n}");
+    assert_eq!(n["account_id"], json!(acc));
+    // link xbox returns the gamertag
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/link/xbox",
+        Some(p["access_token"].as_str().unwrap()),
+        Some(json!({"user_hash": "uhs1", "token": "xsts-good"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+}

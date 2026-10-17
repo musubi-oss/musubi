@@ -20,6 +20,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/account/link/device", post(link_device))
         .route("/v1/account/link/email", post(link_email))
         .route("/v1/account/link/steam", post(link_steam))
+        .route("/v1/account/link/xbox", post(link_xbox))
+        .route("/v1/account/link/psn", post(link_psn))
+        .route("/v1/account/link/nintendo", post(link_nintendo))
         .route("/v1/account/link/google", post(link_google))
         .route("/v1/account/link/apple", post(link_apple))
         .route("/v1/account/link/oidc/{provider}", post(link_oidc))
@@ -201,6 +204,48 @@ async fn link_steam(
     let id = s.logins.steam(&b.ticket).await?;
     s.auth
         .link_external(me.account_id, musubi_auth::provider::STEAM, &id)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LinkXboxBody {
+    user_hash: String,
+    token: String,
+}
+
+async fn link_xbox(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<LinkXboxBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let p = s.logins.xbox(&b.user_hash, &b.token).await?;
+    s.auth
+        .link_external(me.account_id, musubi_auth::provider::XBOX, &p.xuid)
+        .await?;
+    Ok(Json(json!({ "ok": true, "gamertag": p.gamertag })))
+}
+
+async fn link_psn(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<LinkIdTokenBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = s.logins.psn(&b.id_token).await?;
+    s.auth
+        .link_external(me.account_id, musubi_auth::provider::PSN, &c.sub)
+        .await?;
+    Ok(Json(json!({ "ok": true, "online_id": c.online_id })))
+}
+
+async fn link_nintendo(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<LinkIdTokenBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = s.logins.nintendo(&b.id_token).await?;
+    s.auth
+        .link_external(me.account_id, musubi_auth::provider::NINTENDO, &c.sub)
         .await?;
     Ok(Json(json!({ "ok": true })))
 }
