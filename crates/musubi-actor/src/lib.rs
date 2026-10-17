@@ -597,6 +597,7 @@ fn snapshot(
         size: members.len() as u32,
         presences: members.to_vec(),
         me: me.clone(),
+        host: None,
     }
 }
 

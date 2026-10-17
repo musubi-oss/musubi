@@ -140,6 +140,15 @@ pub enum ClientMessage {
         #[serde(default)]
         name: Option<String>,
     },
+    /// Client-measured round trip to the server (ping→pong), used to pick relayed-match hosts.
+    Rtt {
+        ms: u32,
+    },
+    /// Relayed matches: the current host hands the host role to another member.
+    MatchHostTransfer {
+        match_id: String,
+        session_id: musubi_core::SessionId,
+    },
     /// Join by match id, or by matchmaker `token` (all matched users may join the same match).
     MatchJoin {
         #[serde(default)]
@@ -369,6 +378,14 @@ pub enum ServerMessage {
         presences: Vec<UserPresence>,
         #[serde(rename = "self")]
         me: UserPresence,
+        /// Relayed matches: the member that simulates the game; `None` for authoritative ones.
+        #[serde(default)]
+        host: Option<UserPresence>,
+    },
+    /// Relayed matches: the host changed (left, dropped or handed over) — `host` simulates now.
+    MatchHost {
+        match_id: String,
+        host: UserPresence,
     },
     /// Server meshing: what changed inside the client's interest since the last delta.
     WorldDelta {

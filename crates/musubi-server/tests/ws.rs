@@ -1058,6 +1058,11 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
     assert!(
         matches!(recv(&mut b).await.msg, ServerMessage::MatchPresenceEvent { leaves, .. } if leaves.len() == 1)
     );
+    // the host left: the only member left is the new host
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchHost { .. }
+    ));
     send(
         &mut b,
         f,
@@ -1134,9 +1139,13 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
         },
     )
     .await;
-    assert!(
-        matches!(recv(&mut b).await.msg, ServerMessage::Match { match_id, size: 2, .. } if match_id == m1)
-    );
+    match recv(&mut b).await.msg {
+        ServerMessage::Match { match_id, size, .. } => {
+            assert_eq!(match_id, m1);
+            assert_eq!(size, 2);
+        }
+        m => panic!("{m:?}"),
+    }
     send(
         &mut c,
         f,
@@ -8678,4 +8687,127 @@ async fn match_recording_produces_replay() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn relayed_host_migrates_by_rtt() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(&mut a, f, None, ClientMessage::MatchCreate { name: None }).await;
+    let (mid, a_sid) = match recv(&mut a).await.msg {
+        ServerMessage::Match {
+            match_id, host, me, ..
+        } => {
+            assert_eq!(host.as_ref().map(|h| h.session_id), Some(me.session_id));
+            (match_id, me.session_id)
+        }
+        m => panic!("{m:?}"),
+    };
+    let join = || ClientMessage::MatchJoin {
+        match_id: Some(mid.clone()),
+        token: None,
+        metadata: Default::default(),
+        spectator: false,
+    };
+    send(&mut b, f, None, join()).await;
+    let b_sid = match recv(&mut b).await.msg {
+        ServerMessage::Match { host, me, .. } => {
+            assert_eq!(host.map(|h| h.session_id), Some(a_sid));
+            me.session_id
+        }
+        m => panic!("{m:?}"),
+    };
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchPresenceEvent { .. }
+    ));
+    send(&mut c, f, None, join()).await;
+    let c_sid = match recv(&mut c).await.msg {
+        ServerMessage::Match { me, .. } => me.session_id,
+        m => panic!("{m:?}"),
+    };
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchPresenceEvent { .. }
+    ));
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchPresenceEvent { .. }
+    ));
+
+    // only the host may hand over
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchHostTransfer {
+            match_id: mid.clone(),
+            session_id: c_sid,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Error {
+            code: musubi_core::Code::PermissionDenied,
+            ..
+        }
+    ));
+
+    // A 80 ms, B 50 ms, C 20 ms: when the host leaves, C takes over
+    send(&mut a, f, None, ClientMessage::Rtt { ms: 80 }).await;
+    send(&mut b, f, None, ClientMessage::Rtt { ms: 50 }).await;
+    send(&mut c, f, None, ClientMessage::Rtt { ms: 20 }).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    for ws in [&mut b, &mut c] {
+        assert!(
+            matches!(recv(ws).await.msg, ServerMessage::MatchPresenceEvent { leaves, .. } if leaves.len() == 1)
+        );
+        match recv(ws).await.msg {
+            ServerMessage::MatchHost { host, .. } => assert_eq!(host.session_id, c_sid),
+            m => panic!("{m:?}"),
+        }
+    }
+    // the new host hands over to B
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchHostTransfer {
+            match_id: mid.clone(),
+            session_id: b_sid,
+        },
+    )
+    .await;
+    for ws in [&mut b, &mut c] {
+        match recv(ws).await.msg {
+            ServerMessage::MatchHost { host, .. } => assert_eq!(host.session_id, b_sid),
+            m => panic!("{m:?}"),
+        }
+    }
+    // host drops its connection: C is the last one left and becomes host
+    drop(b);
+    assert!(
+        matches!(recv(&mut c).await.msg, ServerMessage::MatchPresenceEvent { leaves, .. } if leaves.len() == 1)
+    );
+    match recv(&mut c).await.msg {
+        ServerMessage::MatchHost { host, .. } => assert_eq!(host.session_id, c_sid),
+        m => panic!("{m:?}"),
+    }
 }

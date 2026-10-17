@@ -212,6 +212,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         fanout.mm_remove(&t);
     }
     relayed.leave_all(&fanout, sid);
+    relayed.take_remote(sid);
     worlds.unsubscribe_all(sid);
     matches.leave_all(sid);
     hub.leave(sid);
@@ -732,6 +733,16 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             };
             relayed_dispatch(ctx, &id, RelayedCmd::Join)
         }
+        ClientMessage::Rtt { ms } => {
+            for id in ctx.relayed.matches_of(ctx.presence.session_id) {
+                relayed_dispatch(ctx, &id, RelayedCmd::Rtt { ms });
+            }
+            None
+        }
+        ClientMessage::MatchHostTransfer {
+            match_id,
+            session_id,
+        } => relayed_dispatch(ctx, &match_id, RelayedCmd::Host { to: session_id }),
         ClientMessage::MatchLeave { match_id } => {
             if ctx.matches.get(&match_id).is_some() {
                 return ctx
@@ -1050,6 +1061,11 @@ fn relayed_dispatch(ctx: &Ctx<'_>, match_id: &str, cmd: RelayedCmd) -> Option<Se
     }
     if ctx.relayed.is_home(match_id) {
         return super::relayed::exec(ctx.relayed, ctx.fanout, ctx.presence, match_id, cmd);
+    }
+    match &cmd {
+        RelayedCmd::Join => ctx.relayed.note_remote(ctx.presence.session_id, match_id),
+        RelayedCmd::Leave => ctx.relayed.forget_remote(ctx.presence.session_id, match_id),
+        _ => {}
     }
     ctx.fanout.relayed_cmd(RelayedCmdEnv {
         match_id: match_id.to_string(),
