@@ -427,6 +427,9 @@ pub struct MatchmakerUser {
     pub string_properties: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub numeric_properties: std::collections::HashMap<String, f64>,
+    /// Team index assigned by a queue with teams.
+    #[serde(default)]
+    pub team: Option<u32>,
 }
 
 impl ServerMessage {

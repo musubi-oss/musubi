@@ -4,14 +4,19 @@
 //! once the seed has waited `min_wait`), honouring `count_multiple`.
 
 pub mod query;
+pub mod queue;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use musubi_core::{AccountId, Error, Result, SessionId};
 use parking_lot::Mutex;
 
 pub use query::{Properties, Query};
+use queue::{assign_teams, quality};
+pub use queue::{CandidateMatch, MmrRule, PingRule, Quality, QueueConfig, Recent, Scorer, Teams};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub const MAX_TICKETS_PER_SESSION: usize = 3;
 pub const MAX_COUNT: usize = 100;
@@ -22,6 +27,8 @@ pub type Candidate = musubi_proto::realtime::MatchmakerUser;
 pub struct Ticket {
     pub id: String,
     pub party_id: Option<String>,
+    /// Named queue (string property `queue`); such tickets follow the queue's rules, not mutual queries.
+    pub queue: Option<String>,
     pub members: Vec<Candidate>,
     pub query: Query,
     pub query_src: String,
@@ -32,10 +39,14 @@ pub struct Ticket {
     pub created: Instant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Matched {
     pub token: String,
     pub tickets: Vec<Ticket>,
+    /// Set for queue matches: the queue, the region with the lowest worst ping and the grade.
+    pub queue: Option<String>,
+    pub region: Option<String>,
+    pub quality: Option<Quality>,
 }
 
 impl Matched {
@@ -52,6 +63,8 @@ impl Matched {
 pub struct TicketWire {
     pub id: String,
     pub party_id: Option<String>,
+    #[serde(default)]
+    pub queue: Option<String>,
     pub members: Vec<Candidate>,
     pub query: String,
     pub min_count: usize,
@@ -65,6 +78,7 @@ impl From<&Ticket> for TicketWire {
         Self {
             id: t.id.clone(),
             party_id: t.party_id.clone(),
+            queue: t.queue.clone(),
             members: t.members.clone(),
             query: t.query_src.clone(),
             min_count: t.min_count,
@@ -82,6 +96,7 @@ impl TicketWire {
         Ok(Ticket {
             id: self.id,
             party_id: self.party_id,
+            queue: self.queue,
             members: self.members,
             query,
             query_src: self.query,
@@ -105,6 +120,12 @@ pub struct MatchedWire {
     #[serde(default)]
     pub server: Option<musubi_proto::realtime::MatchmakerServer>,
     pub tickets: Vec<TicketWire>,
+    #[serde(default)]
+    pub queue: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub quality: Option<Quality>,
 }
 
 impl Matched {
@@ -134,12 +155,18 @@ impl Matched {
             match_id: match_id.to_string(),
             server,
             tickets: self.tickets.iter().map(TicketWire::from).collect(),
+            queue: self.queue.clone(),
+            region: self.region.clone(),
+            quality: self.quality,
         }
     }
 
     pub fn from_wire(w: MatchedWire) -> Result<Self> {
         Ok(Self {
             token: w.token,
+            queue: w.queue,
+            region: w.region,
+            quality: w.quality,
             tickets: w
                 .tickets
                 .into_iter()
@@ -179,6 +206,11 @@ struct Pool {
 
 pub struct Matchmaker {
     pool: Mutex<Pool>,
+    queues: parking_lot::RwLock<HashMap<String, QueueConfig>>,
+    recent: Mutex<Recent>,
+    scorer: Option<Arc<dyn Scorer>>,
+    /// Why queue candidates were kept apart, per (queue, reason) — the operator's expansion view.
+    rejections: Mutex<HashMap<(String, &'static str), u64>>,
     /// How long a seed waits for `max_count` before settling for `min_count`.
     min_wait: Duration,
     /// Tickets older than this are dropped by `expire` (the client gets `MatchmakerExpired`).
@@ -199,12 +231,56 @@ impl Matchmaker {
     pub fn new(min_wait: Duration) -> Self {
         Self {
             pool: Mutex::new(Pool::default()),
+            queues: parking_lot::RwLock::new(HashMap::new()),
+            recent: Mutex::new(Recent::default()),
+            scorer: None,
+            rejections: Mutex::new(HashMap::new()),
             min_wait,
             backfill_ttl: None,
             ttl: DEFAULT_TICKET_TTL,
         }
     }
 
+    pub fn with_queues(self, queues: Vec<QueueConfig>) -> Result<Self> {
+        for q in queues {
+            self.set_queue(q)?;
+        }
+        Ok(self)
+    }
+    pub fn with_scorer(mut self, scorer: Arc<dyn Scorer>) -> Self {
+        self.scorer = Some(scorer);
+        self
+    }
+    /// Add or replace a queue at runtime; waiting tickets of that queue follow the new rules.
+    pub fn set_queue(&self, q: QueueConfig) -> Result<()> {
+        q.validate()?;
+        self.queues.write().insert(q.name.clone(), q);
+        Ok(())
+    }
+    pub fn remove_queue(&self, name: &str) -> bool {
+        self.queues.write().remove(name).is_some()
+    }
+    pub fn queues(&self) -> Vec<QueueConfig> {
+        let mut v: Vec<QueueConfig> = self.queues.read().values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+    /// Waiting tickets per queue (`""` = free-form tickets).
+    pub fn waiting(&self) -> BTreeMap<String, usize> {
+        let pool = self.pool.lock();
+        let mut out = BTreeMap::new();
+        for t in &pool.tickets {
+            *out.entry(t.queue.clone().unwrap_or_default()).or_insert(0) += 1;
+        }
+        out
+    }
+    /// Counts of (queue, reason) a pair of tickets was kept apart since the last call.
+    pub fn take_rejections(&self) -> Vec<(String, &'static str, u64)> {
+        std::mem::take(&mut *self.rejections.lock())
+            .into_iter()
+            .map(|((q, r), n)| (q, r, n))
+            .collect()
+    }
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
         self
@@ -306,6 +382,7 @@ impl Matchmaker {
                 Matched {
                     token: o.token.clone(),
                     tickets: vec![t],
+                    ..Default::default()
                 },
                 o.match_id.clone(),
             ));
@@ -341,6 +418,24 @@ impl Matchmaker {
         }
         let query = Query::parse(&t.query)?;
         let props = merged_props(&t.members);
+        let queue = props.strings.get("queue").cloned();
+        let (min_count, max_count, count_multiple) = match &queue {
+            Some(name) => {
+                let queues = self.queues.read();
+                let q = queues.get(name).ok_or_else(|| {
+                    Error::NotFound(format!("matchmaker queue {name} does not exist"))
+                })?;
+                if t.members.len() > q.max_count
+                    || q.teams.is_some_and(|tm| t.members.len() > tm.size)
+                {
+                    return Err(Error::InvalidArgument(
+                        "party larger than the queue's team".into(),
+                    ));
+                }
+                (q.min_count, q.max_count, 1)
+            }
+            None => (t.min_count, t.max_count, t.count_multiple),
+        };
         let mut pool = self.pool.lock();
         for m in &t.members {
             if pool
@@ -363,13 +458,14 @@ impl Matchmaker {
         pool.tickets.push(Ticket {
             id: id.clone(),
             party_id: t.party_id,
+            queue,
             members: t.members,
             query,
             query_src: t.query,
             props,
-            min_count: t.min_count,
-            max_count: t.max_count,
-            count_multiple: t.count_multiple,
+            min_count,
+            max_count,
+            count_multiple,
             created: Instant::now(),
         });
         Ok(id)
@@ -449,10 +545,14 @@ impl Matchmaker {
     pub fn process(&self) -> Vec<Matched> {
         let now = Instant::now();
         let mut pool = self.pool.lock();
-        let mut out = Vec::new();
+        let mut out = self.process_queues(&mut pool, now);
         let mut i = 0;
         'seed: while i < pool.tickets.len() {
             let seed = pool.tickets[i].clone();
+            if seed.queue.is_some() {
+                i += 1;
+                continue;
+            }
             let patient = now.duration_since(seed.created) < self.min_wait;
             let mut group: Vec<usize> = vec![i];
             let mut size = seed.members.len();
@@ -513,6 +613,7 @@ impl Matchmaker {
             out.push(Matched {
                 token: uuid::Uuid::now_v7().simple().to_string(),
                 tickets,
+                ..Default::default()
             });
             // the pool shifted; restart scanning from the beginning of what remains
             i = 0;
@@ -559,7 +660,247 @@ fn unindex(pool: &mut Pool, t: &Ticket) {
 }
 
 fn compatible(a: &Ticket, b: &Ticket) -> bool {
-    a.query.matches(&b.props) && b.query.matches(&a.props) && a.count_multiple == b.count_multiple
+    a.queue == b.queue
+        && a.query.matches(&b.props)
+        && b.query.matches(&a.props)
+        && a.count_multiple == b.count_multiple
+}
+
+impl Matchmaker {
+    /// Queue pass: per queue, a scorer proposal or the greedy seed-and-fill under the queue's
+    /// rules, then team balancing, grading and (optionally) the scorer's verdict.
+    fn process_queues(&self, pool: &mut Pool, now: Instant) -> Vec<Matched> {
+        let queues = self.queues.read();
+        if queues.is_empty() {
+            return vec![];
+        }
+        let mut recent = self.recent.lock();
+        let mut rejections = self.rejections.lock();
+        let mut out = Vec::new();
+        let mut remove: Vec<usize> = Vec::new();
+        for (name, cfg) in queues.iter() {
+            let idx: Vec<usize> = pool
+                .tickets
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.queue.as_deref() == Some(name.as_str()))
+                .map(|(i, _)| i)
+                .collect();
+            let members: usize = idx.iter().map(|&i| pool.tickets[i].members.len()).sum();
+            if members < cfg.min_count {
+                continue;
+            }
+            let mut bump = |reason: &'static str| {
+                *rejections.entry((name.clone(), reason)).or_insert(0) += 1;
+            };
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            if let Some(sc) = &self.scorer {
+                let wires: Vec<TicketWire> = idx
+                    .iter()
+                    .map(|&i| TicketWire::from(&pool.tickets[i]))
+                    .collect();
+                if let Some(proposal) = sc.propose(cfg, &wires) {
+                    let by_id: HashMap<&str, usize> = idx
+                        .iter()
+                        .map(|&i| (pool.tickets[i].id.as_str(), i))
+                        .collect();
+                    let mut used: HashSet<usize> = HashSet::new();
+                    for g in proposal {
+                        let mut gi = Vec::new();
+                        for id in &g {
+                            match by_id.get(id.as_str()) {
+                                Some(&i) if !used.contains(&i) => gi.push(i),
+                                _ => {
+                                    gi.clear();
+                                    break;
+                                }
+                            }
+                        }
+                        let n: usize = gi.iter().map(|&i| pool.tickets[i].members.len()).sum();
+                        if !gi.is_empty() && cfg.accepts(n) {
+                            used.extend(gi.iter().copied());
+                            groups.push(gi);
+                        } else {
+                            bump("bad_proposal");
+                        }
+                    }
+                }
+            }
+            if groups.is_empty() {
+                groups = greedy_queue(
+                    cfg,
+                    &pool.tickets,
+                    &idx,
+                    now,
+                    &recent,
+                    self.min_wait,
+                    &mut bump,
+                );
+            }
+            for g in groups {
+                let mut tickets: Vec<Ticket> = g.iter().map(|&i| pool.tickets[i].clone()).collect();
+                let Some(teams) = assign_teams(cfg, &tickets) else {
+                    bump("roles");
+                    continue;
+                };
+                let refs: Vec<&Ticket> = tickets.iter().collect();
+                let region = cfg.best_region(&refs);
+                let mut q = quality(cfg, &tickets, &teams, region.as_ref(), now);
+                if let Some(sc) = &self.scorer {
+                    let cand = CandidateMatch {
+                        queue: name.clone(),
+                        tickets: tickets.iter().map(TicketWire::from).collect(),
+                        teams: teams
+                            .iter()
+                            .map(|g| g.iter().map(|&k| tickets[k].id.clone()).collect())
+                            .collect(),
+                        region: region.as_ref().map(|r| r.0.clone()),
+                        quality: q,
+                    };
+                    if let Some(s) = sc.score(&cand) {
+                        if s < 0.0 {
+                            bump("vetoed");
+                            continue;
+                        }
+                        q.score = s;
+                    }
+                }
+                for (team, g) in teams.iter().enumerate() {
+                    for &k in g {
+                        for m in &mut tickets[k].members {
+                            m.team = Some(team as u32);
+                        }
+                    }
+                }
+                if cfg.no_repeat_secs > 0 {
+                    let accounts: Vec<AccountId> = tickets
+                        .iter()
+                        .flat_map(|t| t.members.iter().map(|m| m.presence.account_id))
+                        .collect();
+                    recent.record(&accounts, now, Duration::from_secs(cfg.no_repeat_secs));
+                }
+                remove.extend(g.iter().copied());
+                out.push(Matched {
+                    token: uuid::Uuid::now_v7().simple().to_string(),
+                    tickets,
+                    queue: Some(name.clone()),
+                    region: region.map(|r| r.0),
+                    quality: Some(q),
+                });
+            }
+        }
+        remove.sort_unstable_by(|a, b| b.cmp(a));
+        for k in remove {
+            let t = pool.tickets.remove(k);
+            unindex(pool, &t);
+        }
+        let keep = queues.values().map(|q| q.no_repeat_secs).max().unwrap_or(0);
+        recent.prune(now, Duration::from_secs(keep));
+        out
+    }
+}
+
+/// Seed-and-fill under a queue's rules: the longest-waiting (priority first) unused ticket seeds a
+/// group, the closest compatible tickets (by MMR distance, then age) join until the match is full;
+/// a seed past `min_wait` settles for the largest accepted smaller size.
+fn greedy_queue(
+    cfg: &QueueConfig,
+    tickets: &[Ticket],
+    idx: &[usize],
+    now: Instant,
+    recent: &Recent,
+    min_wait: Duration,
+    bump: &mut dyn FnMut(&'static str),
+) -> Vec<Vec<usize>> {
+    let waited = |i: usize| now.saturating_duration_since(tickets[i].created);
+    let priority = Duration::from_secs(cfg.priority_after_secs);
+    let mut order: Vec<usize> = idx.to_vec();
+    order.sort_by(|&a, &b| {
+        let pa = cfg.priority_after_secs > 0 && waited(a) >= priority;
+        let pb = cfg.priority_after_secs > 0 && waited(b) >= priority;
+        pb.cmp(&pa)
+            .then(tickets[a].created.cmp(&tickets[b].created))
+    });
+    let mut used: HashSet<usize> = HashSet::new();
+    let mut groups = Vec::new();
+    for &s in &order {
+        if used.contains(&s) {
+            continue;
+        }
+        let seed = &tickets[s];
+        let mut group = vec![s];
+        let mut size = seed.members.len();
+        let mut cands: Vec<(usize, f64)> = Vec::new();
+        for &c in &order {
+            if c == s || used.contains(&c) {
+                continue;
+            }
+            let t = &tickets[c];
+            if !(seed.query.matches(&t.props) && t.query.matches(&seed.props)) {
+                bump("query");
+                continue;
+            }
+            if let Some(reason) = cfg.incompatible(seed, t, now, recent) {
+                bump(reason);
+                continue;
+            }
+            let d = match (cfg.mmr_of(seed), cfg.mmr_of(t)) {
+                (Some(a), Some(b)) => (a - b).abs(),
+                _ => 0.0,
+            };
+            cands.push((c, d));
+        }
+        cands.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then(tickets[a.0].created.cmp(&tickets[b.0].created))
+        });
+        for (c, _) in cands {
+            let t = &tickets[c];
+            if size + t.members.len() > cfg.max_count {
+                continue;
+            }
+            if group
+                .iter()
+                .any(|&g| cfg.incompatible(&tickets[g], t, now, recent).is_some())
+            {
+                continue;
+            }
+            if cfg.teams.is_none() {
+                let roles = group.iter().chain(std::iter::once(&c)).flat_map(|&k| {
+                    tickets[k]
+                        .members
+                        .iter()
+                        .map(|m| m.string_properties.get("role").cloned())
+                });
+                if !cfg.roles_fit(roles) {
+                    bump("roles");
+                    continue;
+                }
+            }
+            group.push(c);
+            size += t.members.len();
+            if size == cfg.max_count {
+                break;
+            }
+        }
+        if size < cfg.max_count {
+            if waited(s) < min_wait {
+                bump("waiting_for_full");
+                continue;
+            }
+            while size > 0 && !cfg.accepts(size) && group.len() > 1 {
+                let last = group.pop().unwrap();
+                size -= tickets[last].members.len();
+            }
+            if !cfg.accepts(size) {
+                bump("too_few");
+                continue;
+            }
+        }
+        used.extend(group.iter().copied());
+        groups.push(group);
+    }
+    groups
 }
 
 fn group_compatible(tickets: &[Ticket], group: &[usize], t: &Ticket) -> bool {
@@ -609,6 +950,7 @@ mod tests {
             },
             string_properties: [("region".to_string(), region.to_string())].into(),
             numeric_properties: [("rank".to_string(), rank)].into(),
+            team: None,
         }
     }
 

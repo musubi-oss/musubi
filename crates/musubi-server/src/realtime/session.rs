@@ -498,6 +498,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                 presence: ctx.presence.clone(),
                 string_properties,
                 numeric_properties,
+                team: None,
             };
             let res = ctx.matchmaker.add(AddTicket {
                 party_id: None,

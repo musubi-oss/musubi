@@ -102,15 +102,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let economy = musubi_economy::EconomyService::new(db.clone());
     let tournaments = TournamentService::new(db.clone());
     let hub = Arc::new(Hub::new());
-    let matchmaker = Arc::new(
-        Matchmaker::new(std::time::Duration::from_secs(cfg.matchmaker.min_wait_secs))
-            .with_backfill(Some(std::time::Duration::from_secs(
-                cfg.matchmaker.backfill_secs,
-            )))
-            .with_ttl(std::time::Duration::from_secs(
-                cfg.matchmaker.ticket_ttl_secs,
-            )),
-    );
     let runtime = Arc::new(Runtime::new(musubi_runtime::Limits {
         fuel: cfg.runtime.fuel,
         max_memory_bytes: cfg.runtime.max_memory_mb << 20,
@@ -121,6 +112,27 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let (m, r) = runtime.load_dir(dir)?;
         tracing::info!(modules = m, rpcs = r, dir = %dir.display(), "runtime modules loaded");
     }
+    let queues: Vec<musubi_matchmaker::QueueConfig> = cfg
+        .matchmaker
+        .queues
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("[[matchmaker.queues]]: {e}"))?;
+    let matchmaker = Arc::new(
+        Matchmaker::new(std::time::Duration::from_secs(cfg.matchmaker.min_wait_secs))
+            .with_backfill(Some(std::time::Duration::from_secs(
+                cfg.matchmaker.backfill_secs,
+            )))
+            .with_ttl(std::time::Duration::from_secs(
+                cfg.matchmaker.ticket_ttl_secs,
+            ))
+            .with_scorer(Arc::new(crate::realtime::matchmaking::RuntimeScorer(
+                runtime.clone(),
+            )))
+            .with_queues(queues)?,
+    );
     let mut cluster = Cluster::new(
         db.clone(),
         &cfg.node.name,

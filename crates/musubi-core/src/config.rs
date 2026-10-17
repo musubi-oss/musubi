@@ -809,6 +809,9 @@ pub struct MatchmakerConfig {
     pub ticket_ttl_secs: u64,
     /// Formed matches with free slots accept compatible later tickets (backfill) for this long; 0 = off.
     pub backfill_secs: u64,
+    /// Named queues (`[[matchmaker.queues]]`, see `musubi_matchmaker::QueueConfig`): match size,
+    /// teams, MMR/ping rules that widen with wait, role quotas, cross-play, no-repeat.
+    pub queues: Vec<serde_json::Value>,
 }
 
 impl Default for MatchmakerConfig {
@@ -817,6 +820,7 @@ impl Default for MatchmakerConfig {
             min_wait_secs: 15,
             backfill_secs: 60,
             ticket_ttl_secs: 180,
+            queues: Vec::new(),
         }
     }
 }

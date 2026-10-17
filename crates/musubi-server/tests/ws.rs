@@ -7515,3 +7515,92 @@ async fn udp_transport_ping_and_bad_token() {
     let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
     assert!(matches!(r.msg, ServerMessage::Error { .. }));
 }
+
+#[tokio::test]
+async fn matchmaker_queue_forms_balanced_teams() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let queue = format!("duel-{}", uuid::Uuid::now_v7().simple());
+    let body = serde_json::json!({
+        "name": queue, "min_count": 4, "max_count": 4,
+        "teams": {"count": 2, "size": 2},
+        "mmr": {"initial_delta": 1000.0}
+    });
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/v1/server/matchmaker/queues")
+        .header("x-musubi-server-key", "defaultkey")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/server/matchmaker/stats")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v["queues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q["name"] == queue),
+        "{v}"
+    );
+
+    let add = |q: &str, mmr: f64| ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: "*".into(),
+        string_properties: [("queue".to_string(), q.to_string())].into(),
+        numeric_properties: [("mmr".to_string(), mmr)].into(),
+        count_multiple: 1,
+    };
+    let mut socks = Vec::new();
+    for _ in 0..4 {
+        let (t, _) = token(&router).await;
+        socks.push(connect(&addr, &t, f).await);
+    }
+    // unknown queue → error
+    send(&mut socks[0], f, None, add("no-such-queue", 1000.0)).await;
+    assert!(matches!(
+        recv(&mut socks[0]).await.msg,
+        ServerMessage::Error { .. }
+    ));
+    for (i, mmr) in [1000.0, 1100.0, 1200.0, 1300.0].into_iter().enumerate() {
+        send(&mut socks[i], f, None, add(&queue, mmr)).await;
+        assert!(matches!(
+            recv(&mut socks[i]).await.msg,
+            ServerMessage::MatchmakerTicket { .. }
+        ));
+    }
+    let mut token_seen = None;
+    let mut teams: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+    for s in socks.iter_mut() {
+        match recv(s).await.msg {
+            ServerMessage::MatchmakerMatched {
+                token, users, me, ..
+            } => {
+                assert_eq!(users.len(), 4);
+                assert!(token_seen.get_or_insert(token.clone()) == &token);
+                let team = me.team.expect("queue with teams assigns a team") as usize;
+                teams[team].push(me.numeric_properties["mmr"]);
+                assert!(users.iter().all(|u| u.team.is_some()));
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    assert_eq!(teams[0].len(), 2);
+    assert_eq!(teams[1].len(), 2);
+    let sum = |t: &Vec<f64>| t.iter().sum::<f64>();
+    assert_eq!(sum(&teams[0]), sum(&teams[1]), "{teams:?}");
+}

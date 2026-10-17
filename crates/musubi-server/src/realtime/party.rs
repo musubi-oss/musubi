@@ -566,6 +566,7 @@ pub fn exec(
                     presence,
                     string_properties: string_properties.clone(),
                     numeric_properties: numeric_properties.clone(),
+                    team: None,
                 })
                 .collect();
             let ticket = mm.add(AddTicket {
