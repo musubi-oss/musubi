@@ -8,8 +8,9 @@
 pub mod password;
 mod service;
 pub mod token;
+pub mod totp;
 
-pub use service::{AuthService, Authenticated, Session, SessionInfo};
+pub use service::{AuthService, Authenticated, Login, Session, SessionInfo, MFA_TOKEN_SECS};
 pub use token::{Claims, TokenSigner};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 pub mod provider {
     pub const DEVICE: &str = "device";
     pub const EMAIL: &str = "email";
+    pub const TOTP: &str = "totp";
     pub const STEAM: &str = "steam";
     pub const GOOGLE: &str = "google";
     pub const APPLE: &str = "apple";

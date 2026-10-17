@@ -2294,6 +2294,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "bcrypt",
+ "hex",
  "jsonwebtoken",
  "musubi-core",
  "rand 0.8.8",

@@ -8770,3 +8770,142 @@ async fn liveops_receives_bus_events_and_flags() {
         .iter()
         .any(|(m, p, _)| m == "GET" && p.contains("/server/v1/flags") && p.contains(&acc)));
 }
+
+#[tokio::test]
+async fn totp_mfa_gates_email_login() {
+    let Some(app) = app().await else { return };
+    let email = format!("{}@example.com", unique("mfa"));
+    let creds = json!({"email": email, "password": "Str0ng-Passw0rd!"});
+    let (st, s) = call(&app, "POST", "/v1/auth/email", None, Some(creds.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{s}");
+    let t = s["access_token"].as_str().unwrap().to_string();
+    let acc = s["account_id"].as_str().unwrap().to_string();
+    let now = || time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let (st, v) = call(&app, "POST", "/v1/account/mfa/totp", Some(&t), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let secret = v["secret"].as_str().unwrap().to_string();
+    assert!(
+        v["otpauth"]
+            .as_str()
+            .unwrap()
+            .starts_with("otpauth://totp/Musubi:"),
+        "{v}"
+    );
+    let recovery: Vec<String> = v["recovery_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(recovery.len(), 8);
+    // not enforced until verified
+    let (st, s2) = call(&app, "POST", "/v1/auth/email", None, Some(creds.clone())).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(s2["access_token"].is_string(), "{s2}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/mfa/totp/verify",
+        Some(&t),
+        Some(json!({"code": "000000"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let code = musubi_auth::totp::code_at(&secret, now()).unwrap();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/mfa/totp/verify",
+        Some(&t),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // password login is now a challenge; the pending token is not a bearer
+    let (st, c) = call(&app, "POST", "/v1/auth/email", None, Some(creds.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["mfa_required"], true, "{c}");
+    assert_eq!(c["account_id"], acc);
+    let mfa_token = c["mfa_token"].as_str().unwrap().to_string();
+    let (st, _) = call(&app, "GET", "/v1/account/me", Some(&mfa_token), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": "123456"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": t, "code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let code = musubi_auth::totp::code_at(&secret, now()).unwrap();
+    let (st, s3) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s3}");
+    assert_eq!(s3["account_id"], acc);
+    let (st, _) = call(
+        &app,
+        "GET",
+        "/v1/account/me",
+        Some(s3["access_token"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // a recovery code works exactly once
+    let (st, c) = call(&app, "POST", "/v1/auth/email", None, Some(creds.clone())).await;
+    assert_eq!(st, StatusCode::OK);
+    let mfa_token = c["mfa_token"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": recovery[0]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, c) = call(&app, "POST", "/v1/auth/email", None, Some(creds.clone())).await;
+    assert_eq!(st, StatusCode::OK);
+    let mfa_token = c["mfa_token"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": recovery[0]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // disable with a code → plain logins again
+    let code = musubi_auth::totp::code_at(&secret, now()).unwrap();
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        "/v1/account/mfa/totp",
+        Some(&t),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, s4) = call(&app, "POST", "/v1/auth/email", None, Some(creds)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(s4["access_token"].is_string(), "{s4}");
+}

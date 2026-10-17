@@ -12,6 +12,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/auth/device", post(device))
         .route("/v1/auth/email", post(email))
+        .route("/v1/auth/mfa", post(mfa))
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/steam", post(steam))
@@ -96,9 +97,9 @@ async fn email(
     State(s): State<AppState>,
     ip: super::ClientIp,
     Json(r): Json<EmailReq>,
-) -> Result<Json<Session>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
-    let sess = match s
+    let login = match s
         .auth
         .authenticate_email(&r.email, &r.password, r.opts)
         .await
@@ -119,6 +120,39 @@ async fn email(
         }
         Err(e) => return Err(e.into()),
     };
+    match login {
+        musubi_auth::Login::Session(sess) => {
+            authenticated(&s, &sess, musubi_auth::provider::EMAIL);
+            Ok(Json(
+                serde_json::to_value(sess).map_err(musubi_core::Error::internal)?,
+            ))
+        }
+        musubi_auth::Login::MfaRequired {
+            account_id,
+            mfa_token,
+        } => Ok(Json(json!({
+            "mfa_required": true,
+            "account_id": account_id,
+            "mfa_token": mfa_token,
+            "expires_in": musubi_auth::MFA_TOKEN_SECS,
+        }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct MfaReq {
+    mfa_token: String,
+    code: String,
+}
+
+/// `POST /v1/auth/mfa` — second step of a password login on an account with an authenticator.
+async fn mfa(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<MfaReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let sess = s.auth.mfa_complete(&r.mfa_token, &r.code).await?;
     authenticated(&s, &sess, musubi_auth::provider::EMAIL);
     Ok(Json(sess))
 }

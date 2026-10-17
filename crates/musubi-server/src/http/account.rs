@@ -30,6 +30,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/account/unlink/email", delete(unlink_email))
         .route("/v1/account/export", get(export_self))
         .route("/v1/account/merge", post(merge))
+        .route(
+            "/v1/account/mfa/totp",
+            post(totp_begin).delete(totp_disable),
+        )
+        .route("/v1/account/mfa/totp/verify", post(totp_verify))
         .route("/v1/account/delete", post(delete_self))
         .route("/v1/users", get(get_users))
         .route("/v1/users/search", get(search_users))
@@ -322,4 +327,50 @@ async fn merge(
     Ok(Json(
         json!({ "merged": other.account_id, "report": report }),
     ))
+}
+
+/// `POST /v1/account/mfa/totp` — start enrolling an authenticator app.
+async fn totp_begin(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let label = match s.auth.email_of(me.account_id).await? {
+        Some((email, _)) => email,
+        None => me.account_id.to_string(),
+    };
+    let (secret, uri, recovery) = s.auth.totp_begin(me.account_id, "Musubi", &label).await?;
+    Ok(Json(
+        json!({ "secret": secret, "otpauth": uri, "recovery_codes": recovery }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CodeReq {
+    code: String,
+}
+
+/// `POST /v1/account/mfa/totp/verify` — confirm with a code; password logins now need it.
+async fn totp_verify(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<CodeReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.auth.totp_enable(me.account_id, &r.code).await?;
+    s.events
+        .emit("account.mfa_enabled", Some(me.account_id), json!({}))
+        .await;
+    Ok(Json(json!({ "enabled": true })))
+}
+
+/// `DELETE /v1/account/mfa/totp` — turn the authenticator off (code or recovery code required).
+async fn totp_disable(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<CodeReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.auth.totp_disable(me.account_id, &r.code).await?;
+    s.events
+        .emit("account.mfa_disabled", Some(me.account_id), json!({}))
+        .await;
+    Ok(Json(json!({ "enabled": false })))
 }

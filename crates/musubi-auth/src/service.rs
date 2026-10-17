@@ -32,6 +32,21 @@ type SessionRow = (
     OffsetDateTime,
 );
 
+/// Outcome of a password login: a session, or a second-factor challenge.
+#[derive(Debug, Clone)]
+pub enum Login {
+    Session(Session),
+    /// The account has TOTP enabled: finish with `AuthService::mfa_complete`.
+    MfaRequired {
+        account_id: AccountId,
+        mfa_token: String,
+    },
+}
+
+/// How long a pending second-factor token stays valid.
+pub const MFA_TOKEN_SECS: i64 = 300;
+pub const RECOVERY_CODES: usize = 8;
+
 /// One login/device of an account as seen in `GET /v1/account/sessions`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionInfo {
@@ -128,7 +143,7 @@ impl AuthService {
         email: &str,
         pass: &str,
         opts: AuthOptions,
-    ) -> Result<Session> {
+    ) -> Result<Login> {
         let email = normalize_email(email)?;
         password::validate(pass)?;
         if let Some(lock) = self.login_lock(&email).await? {
@@ -166,16 +181,7 @@ impl AuthService {
                     .await?
             }
         };
-        self.open_session(
-            account_id,
-            created,
-            opts.vars,
-            Device {
-                device_id: None,
-                user_agent: None,
-            },
-        )
-        .await
+        self.finish_login(account_id, created, opts.vars).await
     }
 
     /// Active lockout for a (normalised) email address, if any.
@@ -266,6 +272,9 @@ impl AuthService {
     /// Verify an access token. Stateless: no DB hit on the hot path.
     pub fn verify_access(&self, token: &str) -> Result<Authenticated> {
         let c = self.signer.verify(token)?;
+        if c.vars.contains_key("mfa") {
+            return Err(Error::Unauthenticated("second factor pending".into()));
+        }
         Ok(Authenticated {
             account_id: c.sub,
             session_id: c.sid,
@@ -379,6 +388,217 @@ impl AuthService {
         .map_err(Error::internal)?
         .rows_affected();
         Ok(n > 0)
+    }
+
+    async fn finish_login(
+        &self,
+        account_id: AccountId,
+        created: bool,
+        vars: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Login> {
+        if !self.totp_required(account_id).await? {
+            return Ok(Login::Session(
+                self.open_session(
+                    account_id,
+                    created,
+                    vars,
+                    Device {
+                        device_id: None,
+                        user_agent: None,
+                    },
+                )
+                .await?,
+            ));
+        }
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut pending = serde_json::Map::new();
+        pending.insert("mfa".into(), serde_json::Value::String("pending".into()));
+        pending.insert("created".into(), serde_json::Value::Bool(created));
+        pending.insert("pending_vars".into(), serde_json::Value::Object(vars));
+        let mfa_token = self.signer.sign(&Claims {
+            sub: account_id,
+            sid: SessionId(Uuid::nil()),
+            iat: now,
+            exp: now + MFA_TOKEN_SECS,
+            vars: pending,
+            name: None,
+        })?;
+        Ok(Login::MfaRequired {
+            account_id,
+            mfa_token,
+        })
+    }
+
+    /// Does this account have a verified authenticator?
+    pub async fn totp_required(&self, account_id: AccountId) -> Result<bool> {
+        sqlx::query_scalar(
+            "select exists(select 1 from musubi.identities where account_id = $1 and provider = 'totp' and verified)",
+        )
+        .bind(account_id.0)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
+    /// Start enrolling an authenticator: returns (base32 secret, otpauth URI, recovery codes).
+    /// Nothing is enforced until `totp_enable` confirms a code. Recovery codes are stored hashed.
+    pub async fn totp_begin(
+        &self,
+        account_id: AccountId,
+        issuer: &str,
+        label: &str,
+    ) -> Result<(String, String, Vec<String>)> {
+        if self.totp_required(account_id).await? {
+            return Err(Error::AlreadyExists("authenticator already enabled".into()));
+        }
+        let secret = crate::totp::new_secret();
+        let recovery: Vec<String> = (0..RECOVERY_CODES)
+            .map(|_| {
+                use rand::RngCore;
+                let mut b = [0u8; 5];
+                rand::thread_rng().fill_bytes(&mut b);
+                hex::encode(b)
+            })
+            .collect();
+        let hashes: Vec<serde_json::Value> = recovery
+            .iter()
+            .map(|c| serde_json::Value::String(hex::encode(Sha256::digest(c.as_bytes()))))
+            .collect();
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        sqlx::query("delete from musubi.identities where account_id = $1 and provider = 'totp'")
+            .bind(account_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        sqlx::query(
+            "insert into musubi.identities (id, account_id, provider, subject, secret_hash, verified, metadata)
+             values ($1, $2, 'totp', $3, $4, false, $5)",
+        )
+        .bind(IdentityId::new().0)
+        .bind(account_id.0)
+        .bind(account_id.0.to_string())
+        .bind(&secret)
+        .bind(serde_json::json!({ "recovery": hashes }))
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        let uri = crate::totp::otpauth_uri(issuer, label, &secret);
+        Ok((secret, uri, recovery))
+    }
+
+    /// Confirm enrolment with a code from the app; from now on password logins need a second factor.
+    pub async fn totp_enable(&self, account_id: AccountId, code: &str) -> Result<()> {
+        let secret: Option<String> = sqlx::query_scalar(
+            "select secret_hash from musubi.identities where account_id = $1 and provider = 'totp' and not verified",
+        )
+        .bind(account_id.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some(secret) = secret else {
+            return Err(Error::NotFound(
+                "no authenticator enrolment in progress".into(),
+            ));
+        };
+        if !crate::totp::verify(&secret, code, OffsetDateTime::now_utc().unix_timestamp()) {
+            return Err(Error::Unauthenticated("bad code".into()));
+        }
+        sqlx::query(
+            "update musubi.identities set verified = true, updated_at = now() where account_id = $1 and provider = 'totp'",
+        )
+        .bind(account_id.0)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Accept an authenticator code or an unused recovery code (which is burned).
+    async fn totp_check(&self, account_id: AccountId, code: &str) -> Result<()> {
+        let row: Option<(Uuid, String, serde_json::Value)> = sqlx::query_as(
+            "select id, secret_hash, metadata from musubi.identities where account_id = $1 and provider = 'totp' and verified",
+        )
+        .bind(account_id.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some((id, secret, mut meta)) = row else {
+            return Err(Error::NotFound("authenticator not enabled".into()));
+        };
+        if crate::totp::verify(&secret, code, OffsetDateTime::now_utc().unix_timestamp()) {
+            return Ok(());
+        }
+        let want = hex::encode(Sha256::digest(code.trim().to_ascii_lowercase().as_bytes()));
+        let codes = meta.get_mut("recovery").and_then(|r| r.as_array_mut());
+        if let Some(codes) = codes {
+            if let Some(pos) = codes.iter().position(|c| c.as_str() == Some(want.as_str())) {
+                codes.remove(pos);
+                let n = sqlx::query(
+                    "update musubi.identities set metadata = $2, updated_at = now() where id = $1 and metadata = $3",
+                )
+                .bind(id)
+                .bind(&meta)
+                .bind(
+                    sqlx::query_scalar::<_, serde_json::Value>(
+                        "select metadata from musubi.identities where id = $1",
+                    )
+                    .bind(id)
+                    .fetch_one(&self.db)
+                    .await
+                    .map_err(Error::internal)?,
+                )
+                .execute(&self.db)
+                .await
+                .map_err(Error::internal)?
+                .rows_affected();
+                if n == 1 {
+                    return Ok(());
+                }
+            }
+        }
+        Err(Error::Unauthenticated("bad code".into()))
+    }
+
+    /// Turn the authenticator off (needs a valid code or recovery code).
+    pub async fn totp_disable(&self, account_id: AccountId, code: &str) -> Result<()> {
+        self.totp_check(account_id, code).await?;
+        sqlx::query("delete from musubi.identities where account_id = $1 and provider = 'totp'")
+            .bind(account_id.0)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Second step of a password login: the pending token from `Login::MfaRequired` plus a code.
+    pub async fn mfa_complete(&self, mfa_token: &str, code: &str) -> Result<Session> {
+        let c = self.signer.verify(mfa_token)?;
+        if c.vars.get("mfa").and_then(|v| v.as_str()) != Some("pending") {
+            return Err(Error::Unauthenticated("not a pending login".into()));
+        }
+        self.totp_check(c.sub, code).await?;
+        let created = c
+            .vars
+            .get("created")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let vars = c
+            .vars
+            .get("pending_vars")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        self.open_session(
+            c.sub,
+            created,
+            vars,
+            Device {
+                device_id: None,
+                user_agent: None,
+            },
+        )
+        .await
     }
 
     pub async fn link(
