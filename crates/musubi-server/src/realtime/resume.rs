@@ -292,6 +292,8 @@ impl ResumeStore {
                     session_id: SessionId(sid),
                     username,
                     status,
+                    rich: None,
+                    invisible: false,
                 },
                 channels: serde_json::from_value(channels).unwrap_or_default(),
                 matches: serde_json::from_value(matches).unwrap_or_default(),

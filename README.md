@@ -317,6 +317,13 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Presence: rich status and appear offline
+
+`status_update {status?, rich?, appear_offline?}` — `rich` is a JSON object (≤ 2 KB: activity,
+party size, joinable …) followers receive next to the status text; `appear_offline: true` sends
+followers a leave and keeps the session out of `status_follow` snapshots until it is turned off
+(a lone join), while the server still treats the player as online for delivery.
+
 ### Notifications: TTL, push templates and schedule
 
 `POST /v1/server/notifications` takes `ttl_secs`: the notification carries `expire_time`, leaves

@@ -896,13 +896,27 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             )
         }
         ClientMessage::Ping => Some(ServerMessage::Pong),
-        ClientMessage::StatusUpdate { status } => {
+        ClientMessage::StatusUpdate {
+            status,
+            rich,
+            appear_offline,
+        } => {
             if status.as_ref().is_some_and(|s| s.chars().count() > 128) {
                 return Some(ServerMessage::error(&Error::InvalidArgument(
                     "status must be ≤ 128 chars".into(),
                 )));
             }
-            hub.set_status(sid, status);
+            if let Some(r) = &rich {
+                let too_big = serde_json::to_vec(r)
+                    .map(|b| b.len() > 2048)
+                    .unwrap_or(true);
+                if !r.is_object() || too_big {
+                    return Some(ServerMessage::error(&Error::InvalidArgument(
+                        "rich must be a JSON object ≤ 2 KB".into(),
+                    )));
+                }
+            }
+            hub.update_presence(sid, Some(status), rich, appear_offline);
             None
         }
         ClientMessage::StatusFollow { account_ids } => {

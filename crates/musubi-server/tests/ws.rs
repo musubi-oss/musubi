@@ -325,6 +325,8 @@ async fn ping_follow_status_and_disconnect_in_both_encodings() {
             None,
             ClientMessage::StatusUpdate {
                 status: Some("in menu".into()),
+                rich: None,
+                appear_offline: None,
             },
         )
         .await;
@@ -1641,6 +1643,8 @@ async fn cross_node_presence_follow() {
         None,
         ClientMessage::StatusUpdate {
             status: Some("remote".into()),
+            rich: None,
+            appear_offline: None,
         },
     )
     .await;
@@ -4186,6 +4190,8 @@ async fn lost_socket_is_resumed_with_its_token() {
         None,
         ClientMessage::StatusUpdate {
             status: Some("back".into()),
+            rich: None,
+            appear_offline: None,
         },
     )
     .await;
@@ -4309,6 +4315,8 @@ async fn quic_session_resumes_with_its_token() {
         None,
         ClientMessage::StatusUpdate {
             status: Some("back".into()),
+            rich: None,
+            appear_offline: None,
         },
     )
     .await;
@@ -5299,6 +5307,8 @@ async fn resume_rebuilds_session_on_another_node() {
         None,
         ClientMessage::StatusUpdate {
             status: Some("moved".into()),
+            rich: None,
+            appear_offline: None,
         },
     )
     .await;
@@ -16437,4 +16447,140 @@ async fn notification_ttl_and_push_schedule() {
     .await;
     assert_eq!(st, 200, "{r}");
     assert_eq!(r["deleted"], 1);
+}
+
+/// Rich presence travels to followers; appear-offline hides a session from them (lone leave,
+/// no snapshot) until it comes back (lone join).
+#[tokio::test]
+async fn presence_rich_and_appear_offline() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let b_id: musubi_core::AccountId = acc_b
+        .parse::<uuid::Uuid>()
+        .map(musubi_core::AccountId)
+        .unwrap();
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::StatusFollow {
+            account_ids: vec![b_id],
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::Status { presences } => assert_eq!(presences.len(), 1),
+        m => panic!("{m:?}"),
+    }
+    // rich presence → followers see it next to the status text
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::StatusUpdate {
+            status: Some("in match".into()),
+            rich: Some(json!({"activity": "ranked", "party": 3, "joinable": true})),
+            appear_offline: None,
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::StatusPresenceEvent { joins, leaves } => {
+            assert_eq!(leaves.len(), 1);
+            assert_eq!(joins[0].status.as_deref(), Some("in match"));
+            assert_eq!(joins[0].rich.as_ref().unwrap()["party"], 3);
+        }
+        m => panic!("{m:?}"),
+    }
+    // too big / non-object rich is refused
+    send(
+        &mut b,
+        f,
+        Some("bad"),
+        ClientMessage::StatusUpdate {
+            status: None,
+            rich: Some(json!("nope")),
+            appear_offline: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Error { .. }
+    ));
+    // appear offline → a lone leave; a fresh follow sees nobody
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::StatusUpdate {
+            status: None,
+            rich: None,
+            appear_offline: Some(true),
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::StatusPresenceEvent { joins, leaves } => {
+            assert!(joins.is_empty());
+            assert_eq!(leaves.len(), 1);
+        }
+        m => panic!("{m:?}"),
+    }
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::StatusFollow {
+            account_ids: vec![b_id],
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::Status { presences } => assert!(presences.is_empty()),
+        m => panic!("{m:?}"),
+    }
+    // a status change while invisible is silent; coming back is a lone join with the new text
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::StatusUpdate {
+            status: Some("afk".into()),
+            rich: Some(json!({})),
+            appear_offline: None,
+        },
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), recv(&mut a))
+            .await
+            .is_err()
+    );
+    send(
+        &mut b,
+        f,
+        None,
+        // `status: None` still means "clear", so the text is sent along with the toggle
+        ClientMessage::StatusUpdate {
+            status: Some("afk".into()),
+            rich: None,
+            appear_offline: Some(false),
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::StatusPresenceEvent { joins, leaves } => {
+            assert!(leaves.is_empty());
+            assert_eq!(joins[0].status.as_deref(), Some("afk"));
+            assert!(joins[0].rich.is_none());
+        }
+        m => panic!("{m:?}"),
+    }
 }

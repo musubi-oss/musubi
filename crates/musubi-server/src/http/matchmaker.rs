@@ -226,6 +226,8 @@ async fn simulate(
                         session_id: musubi_core::SessionId::new(),
                         username: format!("sim-{}", arrivals),
                         status: None,
+                        rich: None,
+                        invisible: false,
                     },
                     string_properties: strings,
                     numeric_properties: numbers,

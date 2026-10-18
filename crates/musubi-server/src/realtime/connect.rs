@@ -78,6 +78,8 @@ pub async fn authorize(s: &AppState, hello: &Hello) -> Result<(UserPresence, Enc
             session_id: SessionId::new(),
             username,
             status: hello.status.clone(),
+            rich: None,
+            invisible: false,
         },
         encoding,
     ))

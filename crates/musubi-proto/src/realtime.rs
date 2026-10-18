@@ -12,6 +12,12 @@ pub enum ClientMessage {
     StatusUpdate {
         #[serde(default)]
         status: Option<String>,
+        /// Rich presence object; `null`/absent keeps the current one, `{}` clears it.
+        #[serde(default, with = "crate::json_in_binary")]
+        rich: Option<serde_json::Value>,
+        /// Appear offline to followers (absent = unchanged).
+        #[serde(default)]
+        appear_offline: Option<bool>,
     },
     /// Start receiving presence events for these users; replies with a snapshot.
     StatusFollow {

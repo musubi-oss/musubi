@@ -1235,6 +1235,8 @@ mod tests {
                 session_id: SessionId::new(),
                 username: "u".into(),
                 status: None,
+                rich: None,
+                invisible: false,
             },
             string_properties: [("region".to_string(), region.to_string())].into(),
             numeric_properties: [("rank".to_string(), rank)].into(),

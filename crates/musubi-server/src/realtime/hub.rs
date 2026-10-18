@@ -329,14 +329,42 @@ impl Hub {
 
     /// Change the status text; followers get a leave (old) + join (new) pair, like Nakama.
     pub fn set_status(&self, session_id: SessionId, status: Option<String>) {
+        self.update_presence(session_id, Some(status), None, None);
+    }
+
+    /// Change status text / rich presence / visibility. `None` = leave as is (for `rich`, an
+    /// empty object clears it). Followers get leave+join for a visible change, a lone leave when
+    /// the session goes invisible, a lone join when it comes back, nothing while invisible.
+    pub fn update_presence(
+        &self,
+        session_id: SessionId,
+        status: Option<Option<String>>,
+        rich: Option<serde_json::Value>,
+        appear_offline: Option<bool>,
+    ) {
         let Some(mut h) = self.sessions.get_mut(&session_id) else {
             return;
         };
         let old = h.presence.clone();
-        h.presence.status = status;
+        if let Some(s) = status {
+            h.presence.status = s;
+        }
+        if let Some(r) = rich {
+            h.presence.rich = r.as_object().filter(|o| !o.is_empty()).map(|_| r.clone());
+        }
+        if let Some(inv) = appear_offline {
+            h.presence.invisible = inv;
+        }
         let new = h.presence.clone();
         drop(h);
-        self.notify_followers(old.account_id, vec![new], vec![old]);
+        let account = old.account_id;
+        let (joins, leaves) = match (old.invisible, new.invisible) {
+            (false, false) => (vec![new], vec![old]),
+            (false, true) => (vec![], vec![old]),
+            (true, false) => (vec![new], vec![]),
+            (true, true) => return,
+        };
+        self.notify_followers(account, joins, leaves);
     }
 
     /// Follow accounts; returns the snapshot of currently online presences among them.
@@ -349,7 +377,9 @@ impl Hub {
             if let Some(sids) = self.by_account.get(t) {
                 for sid in sids.iter() {
                     if let Some(h) = self.sessions.get(sid) {
-                        snapshot.push(h.presence.clone());
+                        if !h.presence.invisible {
+                            snapshot.push(h.presence.clone());
+                        }
                     }
                 }
             }
@@ -465,6 +495,8 @@ mod tests {
             session_id: SessionId::new(),
             username: "u".into(),
             status: None,
+            rich: None,
+            invisible: false,
         };
         (
             SessionHandle {

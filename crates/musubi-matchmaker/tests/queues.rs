@@ -24,6 +24,8 @@ fn user(mmr: f64, extra: &[(&str, &str)], pings: &[(&str, f64)]) -> Candidate {
             session_id: SessionId::new(),
             username: "u".into(),
             status: None,
+            rich: None,
+            invisible: false,
         },
         string_properties: strings,
         numeric_properties: numbers,

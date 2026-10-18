@@ -171,6 +171,14 @@ pub struct UserPresence {
     pub username: String,
     #[serde(default)]
     pub status: Option<String>,
+    /// Structured rich presence (activity, party size, joinable …): a JSON object ≤ 2 KB,
+    /// shown to followers next to `status`.
+    #[serde(default, with = "crate::json_in_binary")]
+    pub rich: Option<serde_json::Value>,
+    /// Appear offline: followers see a leave and the session is left out of presence
+    /// snapshots; the server still knows it is online.
+    #[serde(default)]
+    pub invisible: bool,
 }
 
 #[cfg(test)]
@@ -183,6 +191,8 @@ mod tests {
             cid: Some("1".into()),
             msg: ClientMessage::StatusUpdate {
                 status: Some("afk".into()),
+                rich: None,
+                appear_offline: None,
             },
         };
         for enc in [Encoding::Json, Encoding::Postcard] {
