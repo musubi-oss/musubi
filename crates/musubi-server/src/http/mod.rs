@@ -31,6 +31,7 @@ mod rtc;
 mod sso;
 pub mod stats;
 mod storage;
+pub mod timers;
 pub mod tournaments;
 mod tx;
 mod ugc;
@@ -168,6 +169,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(crate::idl::router())
         .merge(configs::router())
+        .merge(timers::router())
         .merge(sso::routes())
         .merge(stats::routes())
         .merge(push::routes())

@@ -818,7 +818,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     crate::workflows::start_runner(&state);
     crate::platform_friends::start_matcher(&state);
-    if !state.schedules.is_empty() {
+    {
+        // cron schedules and module timers: one runner cluster-wide (lease `schedules`)
         let st = state.clone();
         let lease = st
             .cluster
@@ -835,6 +836,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                         let _ = st.schedules.due();
                         continue;
                     }
+                }
+                match crate::http::timers::sweep(&st.db, &st.runtime).await {
+                    Ok((fired, failed)) if fired + failed > 0 => {
+                        tracing::info!(fired, failed, "timers swept")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "timer sweep failed"),
                 }
                 for (name, at) in st.schedules.due() {
                     match st.schedules.run_one(&st.runtime, &name, Some(at)).await {

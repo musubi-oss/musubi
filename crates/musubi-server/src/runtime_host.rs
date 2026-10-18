@@ -16,6 +16,74 @@ use crate::app::AppState;
 pub struct ServerHost {
     state: AppState,
     handle: tokio::runtime::Handle,
+    /// Outbound client for `http.fetch`: no redirects (they could leave the allow-list).
+    http: reqwest::Client,
+    /// Token bucket for `http.fetch` (tokens, last refill).
+    http_bucket: std::sync::Mutex<(f64, std::time::Instant)>,
+}
+
+/// `http.fetch` allow-list: exact host or `*.suffix` (any depth of subdomains, not the apex).
+pub fn host_allowed(allow: &[String], host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    allow.iter().any(|p| {
+        let p = p.to_ascii_lowercase();
+        match p.strip_prefix("*.") {
+            Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
+            None => host == p,
+        }
+    })
+}
+
+/// Deterministic numbers for `rng.random`: FNV-1a of the seed → SplitMix64.
+pub fn seeded_values(seed: &str, count: usize, max: u64) -> Vec<u64> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut x = h;
+    (0..count)
+        .map(|_| {
+            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) % max.max(1)
+        })
+        .collect()
+}
+
+fn metric_name(s: &str) -> Result<String> {
+    let ok = !s.is_empty()
+        && s.len() <= 100
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !s.starts_with(|c: char| c.is_ascii_digit());
+    if ok {
+        Ok(format!("musubi_module_{s}"))
+    } else {
+        Err(Error::InvalidArgument(
+            "metric name: [A-Za-z_][A-Za-z0-9_]*".into(),
+        ))
+    }
+}
+
+fn labels_of(req: &Value) -> Vec<metrics::Label> {
+    req["labels"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .take(8)
+                .map(|(k, v)| {
+                    metrics::Label::new(
+                        k.clone(),
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// LiveOps answers per (account, op, names), good for `LIVEOPS_TTL`; shared by the module host
@@ -73,9 +141,21 @@ pub const LIVEOPS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Install on the state's runtime; call once the state is complete.
 pub fn install(state: &AppState) {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_millis(
+            state.cfg.runtime.http_timeout_ms.max(100),
+        ))
+        .build()
+        .unwrap_or_default();
     state.runtime.set_host(Arc::new(ServerHost {
         state: state.clone(),
         handle: tokio::runtime::Handle::current(),
+        http,
+        http_bucket: std::sync::Mutex::new((
+            state.cfg.runtime.http_rate_per_sec as f64,
+            std::time::Instant::now(),
+        )),
     }));
 }
 
@@ -279,6 +359,149 @@ impl ServerHost {
                 cache.retain(|_, (at, _)| now.duration_since(*at) < LIVEOPS_TTL);
                 cache.insert(key, (now, v.clone()));
                 Ok(v)
+            }
+            "time.now" => {
+                let now = chrono::Utc::now();
+                Ok(
+                    json!({ "unix": now.timestamp(), "unix_ms": now.timestamp_millis(), "iso": now.to_rfc3339() }),
+                )
+            }
+            // `{seed?, count?, max?}`: with a seed the sequence is a pure function of the seed
+            // (match modules pass e.g. "<match_id>:<tick>" for deterministic, replayable rolls)
+            "rng.random" => {
+                let count = req["count"].as_u64().unwrap_or(1).clamp(1, 1024) as usize;
+                let max = req["max"].as_u64().unwrap_or(1 << 32).clamp(1, 1 << 53);
+                let values: Vec<u64> = match &req["seed"] {
+                    Value::Null => (0..count).map(|_| rand::random::<u64>() % max).collect(),
+                    seed => {
+                        let seed = seed
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| seed.to_string());
+                        seeded_values(&seed, count, max)
+                    }
+                };
+                Ok(json!({ "values": values, "max": max }))
+            }
+            "secrets.get" => {
+                let name = str_field(&req, "name")?;
+                let raw = s
+                    .cfg
+                    .runtime
+                    .secrets
+                    .get(name)
+                    .ok_or_else(|| Error::NotFound(format!("secret `{name}`")))?;
+                let value = match raw.strip_prefix("env:") {
+                    Some(var) => std::env::var(var)
+                        .map_err(|_| Error::NotFound(format!("secret `{name}`: {var} not set")))?,
+                    None => raw.clone(),
+                };
+                Ok(json!({ "name": name, "value": value }))
+            }
+            "metrics.inc" | "metrics.gauge" => {
+                let name = metric_name(str_field(&req, "name")?)?;
+                let labels = labels_of(&req);
+                let value = req["value"].as_f64().unwrap_or(1.0);
+                if str_field(&req, "op")? == "metrics.inc" {
+                    metrics::counter!(name, labels).increment(value.max(0.0) as u64);
+                } else {
+                    metrics::gauge!(name, labels).set(value);
+                }
+                Ok(json!({ "ok": true }))
+            }
+            "http.fetch" => {
+                let url = reqwest::Url::parse(str_field(&req, "url")?)
+                    .map_err(|e| Error::InvalidArgument(format!("http.fetch url: {e}")))?;
+                if !matches!(url.scheme(), "http" | "https") {
+                    return Err(Error::InvalidArgument("http.fetch: http(s) only".into()));
+                }
+                let host = url.host_str().unwrap_or_default();
+                if !host_allowed(&s.cfg.runtime.http_allow, host) {
+                    return Err(Error::PermissionDenied(format!(
+                        "http.fetch: host `{host}` is not in runtime.http_allow"
+                    )));
+                }
+                {
+                    let mut b = self.http_bucket.lock().unwrap_or_else(|e| e.into_inner());
+                    let rate = s.cfg.runtime.http_rate_per_sec.max(1) as f64;
+                    let now = std::time::Instant::now();
+                    b.0 = (b.0 + now.duration_since(b.1).as_secs_f64() * rate).min(rate);
+                    b.1 = now;
+                    if b.0 < 1.0 {
+                        return Err(Error::ResourceExhausted(
+                            "http.fetch: outbound rate limit".into(),
+                        ));
+                    }
+                    b.0 -= 1.0;
+                }
+                let method = req["method"].as_str().unwrap_or("GET").to_ascii_uppercase();
+                let method = reqwest::Method::from_bytes(method.as_bytes())
+                    .map_err(|_| Error::InvalidArgument("http.fetch: bad method".into()))?;
+                let mut r = self.http.request(method, url);
+                if let Some(h) = req["headers"].as_object() {
+                    for (k, v) in h.iter().take(32) {
+                        if let Some(v) = v.as_str() {
+                            r = r.header(k.as_str(), v);
+                        }
+                    }
+                }
+                match &req["body"] {
+                    Value::Null => {}
+                    Value::String(b) => r = r.body(b.clone()),
+                    other => r = r.json(other),
+                }
+                let max = s.cfg.runtime.http_max_body_kb.max(1) << 10;
+                let res = r
+                    .send()
+                    .await
+                    .map_err(|e| Error::Unavailable(format!("http.fetch: {e}")))?;
+                let status = res.status().as_u16();
+                let headers: serde_json::Map<String, Value> = res
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), json!(v))))
+                    .collect();
+                if res.content_length().is_some_and(|l| l as usize > max) {
+                    return Err(Error::ResourceExhausted(
+                        "http.fetch: response too large".into(),
+                    ));
+                }
+                let body = res
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::Unavailable(format!("http.fetch: {e}")))?;
+                if body.len() > max {
+                    return Err(Error::ResourceExhausted(
+                        "http.fetch: response too large".into(),
+                    ));
+                }
+                let text = String::from_utf8_lossy(&body).into_owned();
+                let json = serde_json::from_slice::<Value>(&body).ok();
+                Ok(json!({ "status": status, "headers": headers, "body": text, "json": json }))
+            }
+            "timer.schedule" => {
+                let target = crate::http::timers::target_of(&req)?;
+                let due = crate::http::timers::due_of(&req)?;
+                crate::http::timers::schedule(
+                    &s.db,
+                    &target,
+                    req.get("payload").cloned().unwrap_or(json!({})),
+                    due,
+                    req["key"].as_str(),
+                )
+                .await
+            }
+            "timer.cancel" => {
+                let id = req["id"]
+                    .as_str()
+                    .map(|v| {
+                        Uuid::parse_str(v)
+                            .map_err(|_| Error::InvalidArgument("bad timer id".into()))
+                    })
+                    .transpose()?;
+                Ok(
+                    json!({ "cancelled": crate::http::timers::cancel(&s.db, id, req["key"].as_str()).await? }),
+                )
             }
             other => Err(Error::InvalidArgument(format!("unknown host op `{other}`"))),
         }

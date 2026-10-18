@@ -569,6 +569,17 @@ pub struct RuntimeConfig {
     pub max_payload_kb: usize,
     /// Cron-driven calls into module exports named `schedule_<name>` (one runner cluster-wide).
     pub schedules: Vec<ScheduleConfig>,
+    /// Hosts modules may reach through the `http.fetch` host op (`api.example.com`,
+    /// `*.example.com`); empty = no outbound HTTP for modules.
+    pub http_allow: Vec<String>,
+    pub http_timeout_ms: u64,
+    /// Largest response body `http.fetch` returns.
+    pub http_max_body_kb: usize,
+    /// Outbound requests per second across all modules on this node (token bucket).
+    pub http_rate_per_sec: u32,
+    /// Named secrets for the `secrets.get` host op; a value `env:NAME` is read from the
+    /// environment at use. Modules never see the process environment itself.
+    pub secrets: std::collections::BTreeMap<String, String>,
 }
 
 /// `[[runtime.schedules]] name = "nightly" cron = "0 3 * * *"` → calls export `schedule_nightly`.
@@ -588,6 +599,11 @@ impl Default for RuntimeConfig {
             timeout_ms: 2000,
             max_payload_kb: 1024,
             schedules: Vec::new(),
+            http_allow: Vec::new(),
+            http_timeout_ms: 5000,
+            http_max_body_kb: 256,
+            http_rate_per_sec: 50,
+            secrets: Default::default(),
         }
     }
 }

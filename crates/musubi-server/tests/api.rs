@@ -15802,3 +15802,231 @@ version = 2
     assert_eq!(st, StatusCode::NOT_FOUND);
     call_server(&app, "DELETE", "/v1/admin/idl", "defaultkey", None).await;
 }
+
+/// Plan 3.6 host API for modules: `time.now`, deterministic `rng.random`, `secrets.get`,
+/// allow-listed `http.fetch`, `metrics.*` and durable `timer.schedule` / `timer.cancel`.
+#[tokio::test]
+async fn host_ops_time_rng_secrets_http_metrics_timers() {
+    std::env::set_var("MUSUBI_TEST_SECRET_X", "from-env");
+    let Some(app) = app_with(|c| {
+        c.runtime.http_allow = vec!["127.0.0.1".into(), "*.allowed.test".into()];
+        c.runtime.http_max_body_kb = 1;
+        c.runtime.secrets.insert("api_key".into(), "s3cr3t".into());
+        c.runtime
+            .secrets
+            .insert("from_env".into(), "env:MUSUBI_TEST_SECRET_X".into());
+    })
+    .await
+    else {
+        return;
+    };
+    // a local HTTP target
+    let target = axum::Router::new()
+        .route(
+            "/hello",
+            axum::routing::get(|| async { axum::Json(json!({"hi": true})) }),
+        )
+        .route("/big", axum::routing::get(|| async { "x".repeat(4096) }))
+        .route(
+            "/echo",
+            axum::routing::post(|body: String| async move { body }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, target).await.unwrap() });
+
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("hostops")})),
+    )
+    .await;
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let host = |body: Value| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let (st, v) = call(&app, "POST", "/v1/rpc/host", Some(&tok), Some(body)).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            match v.get("ok") {
+                Some(ok) => (true, ok.clone()),
+                None => (false, v["error"].clone()),
+            }
+        }
+    };
+
+    let (st, v) = host(json!({"op": "time.now"})).await;
+    assert!(st, "{v}");
+    assert!(v["unix"].as_i64().is_some_and(|u| u > 1_700_000_000), "{v}");
+    assert!(v["iso"].as_str().unwrap().contains('T'));
+
+    // seeded rolls are a pure function of the seed
+    let (_, a) = host(json!({"op": "rng.random", "seed": "m1:7", "count": 3, "max": 100})).await;
+    let (_, b) = host(json!({"op": "rng.random", "seed": "m1:7", "count": 3, "max": 100})).await;
+    let (_, c) = host(json!({"op": "rng.random", "seed": "m1:8", "count": 3, "max": 100})).await;
+    assert_eq!(a["values"], b["values"], "{a}");
+    assert_ne!(a["values"], c["values"]);
+    assert_eq!(a["values"].as_array().unwrap().len(), 3);
+    assert!(a["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|v| v.as_u64().unwrap() < 100));
+    let (_, r) = host(json!({"op": "rng.random", "count": 2, "max": 6})).await;
+    assert!(r["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|v| v.as_u64().unwrap() < 6));
+
+    // secrets: named, env-indirected, unknown
+    let (st, v) = host(json!({"op": "secrets.get", "name": "api_key"})).await;
+    assert!(st, "{v}");
+    assert_eq!(v["value"], "s3cr3t");
+    let (_, v) = host(json!({"op": "secrets.get", "name": "from_env"})).await;
+    assert_eq!(v["value"], "from-env");
+    let (st, v) = host(json!({"op": "secrets.get", "name": "nope"})).await;
+    assert!(!st && v.to_string().contains("secret `nope`"), "{v}");
+
+    // http.fetch: allow-listed host, JSON parsed; POST body echoed; denied host; bad scheme; cap
+    let (st, v) =
+        host(json!({"op": "http.fetch", "url": format!("http://127.0.0.1:{port}/hello")})).await;
+    assert!(st, "{v}");
+    assert_eq!(v["status"], 200);
+    assert_eq!(v["json"]["hi"], true);
+    let (_, v) = host(json!({"op": "http.fetch", "url": format!("http://127.0.0.1:{port}/echo"), "method": "post", "body": "ping", "headers": {"x-a": "1"}})).await;
+    assert_eq!(v["body"], "ping");
+    assert!(v["json"].is_null());
+    let (st, v) = host(json!({"op": "http.fetch", "url": "http://evil.test/x"})).await;
+    assert!(!st && v.to_string().contains("http_allow"), "{v}");
+    let (st, v) = host(json!({"op": "http.fetch", "url": "ftp://127.0.0.1/x"})).await;
+    assert!(!st && v.to_string().contains("http(s) only"), "{v}");
+    let (st, v) =
+        host(json!({"op": "http.fetch", "url": format!("http://127.0.0.1:{port}/big")})).await;
+    assert!(!st && v.to_string().contains("too large"), "{v}");
+    assert!(musubi_server::runtime_host::host_allowed(
+        &["*.allowed.test".into()],
+        "a.b.allowed.test"
+    ));
+    assert!(!musubi_server::runtime_host::host_allowed(
+        &["*.allowed.test".into()],
+        "allowed.test"
+    ));
+
+    // metrics: names are checked, labels pass through
+    let (st, v) = host(
+        json!({"op": "metrics.inc", "name": "rolls", "labels": {"kind": "gacha"}, "value": 2}),
+    )
+    .await;
+    assert!(st, "{v}");
+    let (st, v) = host(json!({"op": "metrics.gauge", "name": "queue_depth", "value": 7.5})).await;
+    assert!(st, "{v}");
+    let (st, v) = host(json!({"op": "metrics.inc", "name": "1bad"})).await;
+    assert!(!st && v.to_string().contains("metric name"), "{v}");
+
+    // timers: a due rpc timer runs with a server context, a hook timer too, a bad target retries
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let key = format!("tk-{sfx}");
+    let write = json!({"op": "storage.write", "collection": "timers_t", "key": sfx, "owner_id": acc, "value": {"fired": true}});
+    let (st, t1) = host(
+        json!({"op": "timer.schedule", "rpc": "host", "key": key, "in_secs": 0, "payload": write}),
+    )
+    .await;
+    assert!(st, "{t1}");
+    // same key → same timer, moved
+    let (_, t1b) = host(
+        json!({"op": "timer.schedule", "rpc": "host", "key": key, "in_secs": 0, "payload": write}),
+    )
+    .await;
+    assert_eq!(t1["id"], t1b["id"]);
+    let (_, t2) = host(
+        json!({"op": "timer.schedule", "hook": "authenticated", "in_secs": 0, "payload": {"x": 1}}),
+    )
+    .await;
+    let (_, t3) = host(json!({"op": "timer.schedule", "rpc": "no_such_rpc", "in_secs": 0})).await;
+    let (st, v) = host(json!({"op": "timer.schedule", "rpc": "host", "in_secs": 0, "at": 1})).await;
+    assert!(!st && v.to_string().contains("exactly one of"), "{v}");
+    let (st, v) = host(json!({"op": "timer.schedule", "in_secs": 0})).await;
+    assert!(!st && v.to_string().contains("exactly one of"), "{v}");
+    let ids = |l: &Value| -> Vec<String> {
+        l["timers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/runtime/timers?limit=1000",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert!(
+        ids(&l).contains(&t1["id"].as_str().unwrap().to_string()),
+        "{l}"
+    );
+    let (st, sw) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/runtime/timers/sweep",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sw}");
+    assert!(sw["fired"].as_u64().unwrap() >= 2, "{sw}");
+    assert!(sw["failed"].as_u64().unwrap() >= 1, "{sw}");
+    let (_, v) =
+        host(json!({"op": "storage.read", "collection": "timers_t", "key": sfx, "owner_id": acc}))
+            .await;
+    assert_eq!(v["value"]["fired"], true, "{v}");
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/runtime/timers?limit=1000",
+        "defaultkey",
+        None,
+    )
+    .await;
+    let left = ids(&l);
+    assert!(!left.contains(&t1["id"].as_str().unwrap().to_string()));
+    assert!(!left.contains(&t2["id"].as_str().unwrap().to_string()));
+    let bad = l["timers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == t3["id"])
+        .cloned();
+    let bad = bad.expect("failed timer kept for retry");
+    assert_eq!(bad["attempts"], 1);
+    assert!(
+        bad["last_error"].as_str().unwrap().contains("no_such_rpc"),
+        "{bad}"
+    );
+    let (_, v) = host(json!({"op": "timer.cancel", "id": t3["id"]})).await;
+    assert_eq!(v["cancelled"], true);
+    let (_, v) = host(json!({"op": "timer.cancel", "id": t3["id"]})).await;
+    assert_eq!(v["cancelled"], false);
+    // key cancel and admin delete
+    let (_, t4) = host(json!({"op": "timer.schedule", "hook": "authenticated", "in_secs": 3600, "key": format!("k4-{sfx}")})).await;
+    let (_, v) = host(json!({"op": "timer.cancel", "key": format!("k4-{sfx}")})).await;
+    assert_eq!(v["cancelled"], true, "{t4}");
+    let (_, t5) =
+        host(json!({"op": "timer.schedule", "hook": "authenticated", "in_secs": 3600})).await;
+    let (st, d) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/runtime/timers/{}", t5["id"].as_str().unwrap()),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(d["deleted"], true);
+}
