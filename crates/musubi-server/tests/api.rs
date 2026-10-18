@@ -14506,3 +14506,258 @@ async fn age_gate_and_parental_consent() {
     let (st, _) = call(&app, "PUT", "/v1/account/age", Some(&tt), Some(json!({}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn facebook_gamecenter_logins_and_password_policy() {
+    use axum::extract::Query as AxQuery;
+    use axum::routing::get as ax_get;
+    use base64::Engine;
+    let uid = unique("fbuid");
+    let cert = include_bytes!("fixtures/gamecenter_test_cert.der").to_vec();
+    let mock = Router::new()
+        .route(
+            "/debug_token",
+            ax_get(move |AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| {
+                let uid = uid.clone();
+                async move {
+                    assert_eq!(q.get("access_token").map(String::as_str), Some("app1|sec"));
+                    match q.get("input_token").map(String::as_str) {
+                        Some("fb-ok") => axum::Json(json!({"data": {"app_id": "app1", "is_valid": true, "user_id": uid}})),
+                        Some("fb-other-app") => axum::Json(json!({"data": {"app_id": "app2", "is_valid": true, "user_id": "x"}})),
+                        _ => axum::Json(json!({"data": {"app_id": "app1", "is_valid": false, "error": {"code": 190, "message": "Invalid OAuth access token."}}})),
+                    }
+                }
+            }),
+        )
+        .route("/gc/public.cer", ax_get(move || { let c = cert.clone(); async move { c } }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        c.social.facebook.url = b.clone();
+        c.social.facebook.app_id = "app1".into();
+        c.social.facebook.app_secret = "sec".into();
+        c.social.gamecenter.bundle_ids = vec!["com.example.game".into()];
+        c.social.gamecenter.public_key_url_prefixes = vec![format!("{b}/gc/")];
+        c.session.password_min_length = 10;
+        c.session.password_require_classes = 2;
+    })
+    .await
+    else {
+        return;
+    };
+
+    // Facebook access tokens: valid → session, same uid → same account; other app / invalid → 401.
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/facebook",
+        None,
+        Some(json!({"token": "fb-ok"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/facebook",
+        None,
+        Some(json!({"token": "fb-ok"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    assert_eq!(s1["account_id"], s2["account_id"]);
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/facebook",
+        None,
+        Some(json!({"token": "fb-other-app"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/facebook",
+        None,
+        Some(json!({"token": "fb-bad"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{r}");
+    let (st, r) = call(
+        &app,
+        "GET",
+        "/v1/account",
+        Some(s1["access_token"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(
+        r["identities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["provider"] == "facebook"),
+        "{r}"
+    );
+
+    // Game Center: sign player_id ‖ bundle_id ‖ timestamp(be) ‖ salt with the fixture key.
+    let key = ring::signature::RsaKeyPair::from_pkcs8(include_bytes!(
+        "fixtures/gamecenter_test_key.p8.der"
+    ))
+    .unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let player = unique("G:");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let salt = [7u8, 8, 9, 10];
+    let sign = |player: &str, bundle: &str, ts: u64| {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(player.as_bytes());
+        payload.extend_from_slice(bundle.as_bytes());
+        payload.extend_from_slice(&ts.to_be_bytes());
+        payload.extend_from_slice(&salt);
+        let mut sig = vec![0u8; key.public().modulus_len()];
+        key.sign(
+            &ring::signature::RSA_PKCS1_SHA256,
+            &ring::rand::SystemRandom::new(),
+            &payload,
+            &mut sig,
+        )
+        .unwrap();
+        b64.encode(sig)
+    };
+    let req = |player: &str, bundle: &str, ts: u64, sig: String, url: &str| json!({"player_id": player, "bundle_id": bundle, "timestamp": ts, "salt": b64.encode(salt), "signature": sig, "public_key_url": url});
+    let good_url = format!("{base}/gc/public.cer");
+    let (st, g1) = call(
+        &app,
+        "POST",
+        "/v1/auth/gamecenter",
+        None,
+        Some(req(
+            &player,
+            "com.example.game",
+            ts,
+            sign(&player, "com.example.game", ts),
+            &good_url,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g1}");
+    let (st, g2) = call(
+        &app,
+        "POST",
+        "/v1/auth/gamecenter",
+        None,
+        Some(req(
+            &player,
+            "com.example.game",
+            ts + 1,
+            sign(&player, "com.example.game", ts + 1),
+            &good_url,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g2}");
+    assert_eq!(g1["account_id"], g2["account_id"]);
+    assert_ne!(g1["account_id"], s1["account_id"]);
+    // tampered player id, wrong bundle, stale timestamp, foreign certificate host → refused
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/gamecenter",
+        None,
+        Some(req(
+            "G:someone-else",
+            "com.example.game",
+            ts,
+            sign(&player, "com.example.game", ts),
+            &good_url,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/gamecenter",
+        None,
+        Some(req(
+            &player,
+            "com.evil.game",
+            ts,
+            sign(&player, "com.evil.game", ts),
+            &good_url,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{r}");
+    let old = ts - 3600 * 1000;
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/gamecenter",
+        None,
+        Some(req(
+            &player,
+            "com.example.game",
+            old,
+            sign(&player, "com.example.game", old),
+            &good_url,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/gamecenter",
+        None,
+        Some(req(
+            &player,
+            "com.example.game",
+            ts,
+            sign(&player, "com.example.game", ts),
+            "https://evil.example/public.cer",
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{r}");
+
+    // Password policy applies when a password is set, not to existing logins.
+    let email = format!("{}@example.test", unique("pp"));
+    for weak in ["short1", "alllowercaseonly", "Password123", "qwertyuiop12"] {
+        let (st, r) = call(
+            &app,
+            "POST",
+            "/v1/auth/email",
+            None,
+            Some(json!({"email": email, "password": weak})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{weak}: {r}");
+    }
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(json!({"email": email, "password": "Correct-horse-9"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/email",
+        None,
+        Some(json!({"email": email, "password": "Correct-horse-9"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+}

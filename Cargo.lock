@@ -2694,6 +2694,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wtransport",
+ "x509-parser",
 ]
 
 [[package]]

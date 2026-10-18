@@ -24,6 +24,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/google", post(google))
         .route("/v1/auth/apple", post(apple))
         .route("/v1/auth/oidc/{provider}", post(oidc))
+        .route("/v1/auth/facebook", post(facebook))
+        .route("/v1/auth/gamecenter", post(gamecenter))
         .route("/v1/auth/email/verify/request", post(verify_request))
         .route("/v1/auth/email/verify", post(verify))
         .route("/v1/auth/email/reset/request", post(reset_request))
@@ -621,6 +623,57 @@ async fn apple(
         .authenticate_external(musubi_auth::provider::APPLE, &claims.sub, r.opts)
         .await?;
     authenticated(&s, &sess, musubi_auth::provider::APPLE, &ip.0);
+    Ok(Json(sess))
+}
+
+#[derive(Deserialize)]
+struct FacebookReq {
+    /// Classic access token or Limited Login id token.
+    token: String,
+    #[serde(flatten)]
+    opts: AuthOptions,
+}
+
+/// `POST /v1/auth/facebook` — `{token}`: an access token (checked with `debug_token`) or a
+/// Limited Login id token; identity `facebook:<app-scoped user id>`.
+async fn facebook(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<FacebookReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let uid = s.logins.facebook(&r.token).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::FACEBOOK, &uid, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::FACEBOOK, &ip.0);
+    Ok(Json(sess))
+}
+
+#[derive(Deserialize)]
+struct GameCenterReq {
+    #[serde(flatten)]
+    sig: crate::logins::GameCenterSig,
+    #[serde(flatten)]
+    opts: AuthOptions,
+}
+
+/// `POST /v1/auth/gamecenter` — the identity verification signature from GameKit
+/// (`player_id, bundle_id, timestamp, salt, signature, public_key_url`); identity
+/// `gamecenter:<player_id>`.
+async fn gamecenter(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<GameCenterReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let pid = s.logins.gamecenter(&r.sig).await?;
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::GAMECENTER, &pid, r.opts)
+        .await?;
+    authenticated(&s, &sess, musubi_auth::provider::GAMECENTER, &ip.0);
     Ok(Json(sess))
 }
 

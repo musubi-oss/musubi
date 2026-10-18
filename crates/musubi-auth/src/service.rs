@@ -80,6 +80,7 @@ pub struct AuthService {
     refresh_ttl_secs: u64,
     max_sessions: u32,
     lockout: Lockout,
+    policy: password::Policy,
     captcha: Arc<std::sync::RwLock<Option<CaptchaVerifier>>>,
     queue: Arc<std::sync::RwLock<Option<LoginQueue>>>,
 }
@@ -151,6 +152,11 @@ impl AuthService {
             signer: TokenSigner::from_config(cfg)?,
             refresh_ttl_secs: cfg.refresh_ttl_secs,
             max_sessions: cfg.max_sessions_per_account,
+            policy: password::Policy {
+                min_length: cfg.password_min_length,
+                require_classes: cfg.password_require_classes,
+                deny_common: cfg.password_deny_common,
+            },
             lockout: Lockout {
                 threshold: cfg.lockout_threshold,
                 base_secs: cfg.lockout_base_secs.max(1),
@@ -485,6 +491,7 @@ impl AuthService {
                 if !opts.create {
                     return Err(self.record_login_failure(&email).await?);
                 }
+                self.policy.check(pass, Some(&email))?;
                 let hash = password::hash(pass.to_owned()).await?;
                 self.find_or_create(provider::EMAIL, &email, Some(&hash), &opts)
                     .await?
@@ -954,7 +961,7 @@ impl AuthService {
         pass: &str,
     ) -> Result<IdentityId> {
         let email = normalize_email(email)?;
-        password::validate(pass)?;
+        self.policy.check(pass, Some(&email))?;
         let hash = password::hash(pass.to_owned()).await?;
         self.link(account_id, provider::EMAIL, &email, Some(&hash))
             .await
@@ -1091,7 +1098,7 @@ impl AuthService {
         email: &str,
         new_password: &str,
     ) -> Result<()> {
-        password::validate(new_password)?;
+        self.policy.check(new_password, Some(email))?;
         let hash = password::hash(new_password.to_owned()).await?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let n = sqlx::query(

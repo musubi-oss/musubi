@@ -35,6 +35,10 @@ pub mod provider {
     pub const NINTENDO: &str = "nintendo";
     /// WebAuthn credential; `subject` is the base64url credential id.
     pub const PASSKEY: &str = "passkey";
+    /// Facebook user id (app-scoped).
+    pub const FACEBOOK: &str = "facebook";
+    /// Game Center `gamePlayerID` / `teamPlayerID`.
+    pub const GAMECENTER: &str = "gamecenter";
     pub const CUSTOM: &str = "custom";
 }
 

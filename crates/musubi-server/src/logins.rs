@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
-use musubi_core::config::{OidcLoginConfig, SocialConfig};
+use musubi_core::config::{oidc_preset, OidcLoginConfig, SocialConfig};
 use musubi_core::{Error, Result};
 use serde::Deserialize;
 
@@ -21,6 +21,8 @@ pub struct Social {
     jwks: Mutex<HashMap<String, (Instant, JwkSet)>>,
     /// issuer → discovered `jwks_uri`
     discovery: Mutex<HashMap<String, (Instant, String)>>,
+    /// Game Center public-key certificates by URL.
+    certs: Mutex<HashMap<String, (Instant, Vec<u8>)>>,
 }
 
 /// Identity provider name for a configured OIDC issuer.
@@ -51,6 +53,20 @@ pub struct IdClaims {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What the client gets from `GKLocalPlayer.fetchItems(forIdentityVerificationSignature:)`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameCenterSig {
+    pub player_id: String,
+    pub bundle_id: String,
+    /// Milliseconds since the epoch, as Apple hands it out.
+    pub timestamp: u64,
+    /// base64
+    pub salt: String,
+    /// base64
+    pub signature: String,
+    pub public_key_url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct XboxProfile {
     pub xuid: String,
@@ -67,6 +83,7 @@ impl Social {
             cfg,
             jwks: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
+            certs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -241,7 +258,176 @@ impl Social {
             .oidc
             .get(name)
             .ok_or_else(|| Error::NotFound(format!("unknown login provider {name}")))?;
+        if c.jwks_url.is_empty() && c.issuer.is_empty() {
+            if let Some(mut preset) = oidc_preset(name) {
+                preset.client_ids = c.client_ids.clone();
+                if !c.issuers.is_empty() {
+                    preset.issuers = c.issuers.clone();
+                }
+                return self.verify_oidc(&preset, id_token).await;
+            }
+        }
         self.verify_oidc(c, id_token).await
+    }
+
+    /// Facebook: a Limited Login id token (JWT) is verified against Facebook's OIDC keys with
+    /// the app id as audience; a classic access token is inspected with `debug_token` under the
+    /// app's credentials and must belong to this app and be valid. Returns the app-scoped user id.
+    pub async fn facebook(&self, token: &str) -> Result<String> {
+        let c = &self.cfg.facebook;
+        if c.app_id.is_empty() {
+            return Err(Error::InvalidArgument(
+                "facebook login is not configured".into(),
+            ));
+        }
+        if token.is_empty() || token.len() > 4096 {
+            return Err(Error::Unauthenticated("malformed facebook token".into()));
+        }
+        if token.matches('.').count() == 2 && !token.contains('|') {
+            let mut oidc = c.oidc.clone();
+            if oidc.client_ids.is_empty() {
+                oidc.client_ids = vec![c.app_id.clone()];
+            }
+            return Ok(self.verify_oidc(&oidc, token).await?.sub);
+        }
+        if c.app_secret.is_empty() {
+            return Err(Error::InvalidArgument(
+                "facebook access tokens need social.facebook.app_secret".into(),
+            ));
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            data: Data,
+            #[serde(default)]
+            error: Option<serde_json::Value>,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Data {
+            app_id: String,
+            is_valid: bool,
+            user_id: String,
+            error: Option<serde_json::Value>,
+        }
+        let url = format!("{}/debug_token", c.url.trim_end_matches('/'));
+        let app_token = format!("{}|{}", c.app_id, c.app_secret);
+        let resp: Resp = self
+            .http
+            .get(url)
+            .query(&[("input_token", token), ("access_token", app_token.as_str())])
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("facebook api: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::Internal(format!("facebook api: {e}")))?;
+        if let Some(e) = resp.error.or(resp.data.error) {
+            return Err(Error::Unauthenticated(format!(
+                "facebook rejected the token: {e}"
+            )));
+        }
+        if !resp.data.is_valid || resp.data.user_id.is_empty() {
+            return Err(Error::Unauthenticated("facebook token invalid".into()));
+        }
+        if resp.data.app_id != c.app_id {
+            return Err(Error::Unauthenticated(
+                "facebook token is for another app".into(),
+            ));
+        }
+        Ok(resp.data.user_id)
+    }
+
+    /// Game Center: the signature from `fetchItems(forIdentityVerificationSignature:)` is
+    /// RSA-SHA256 over `player_id ‖ bundle_id ‖ timestamp(be u64) ‖ salt`, made with the key of
+    /// the certificate at `public_key_url` (which must live on Apple's hosts). Returns `player_id`.
+    pub async fn gamecenter(&self, r: &GameCenterSig) -> Result<String> {
+        use base64::Engine;
+        let c = &self.cfg.gamecenter;
+        if c.bundle_ids.is_empty() {
+            return Err(Error::InvalidArgument(
+                "game center login is not configured".into(),
+            ));
+        }
+        if r.player_id.is_empty() || r.player_id.len() > 128 {
+            return Err(Error::Unauthenticated(
+                "malformed game center player id".into(),
+            ));
+        }
+        if !c.bundle_ids.contains(&r.bundle_id) {
+            return Err(Error::Unauthenticated("unexpected bundle id".into()));
+        }
+        if !c
+            .public_key_url_prefixes
+            .iter()
+            .any(|p| r.public_key_url.starts_with(p))
+        {
+            return Err(Error::Unauthenticated(
+                "public_key_url is not an Apple certificate".into(),
+            ));
+        }
+        if c.max_skew_secs > 0 {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp() as i128 * 1000;
+            if (now - r.timestamp as i128).unsigned_abs() > c.max_skew_secs as u128 * 1000 {
+                return Err(Error::Unauthenticated(
+                    "game center signature expired".into(),
+                ));
+            }
+        }
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let salt = b64
+            .decode(&r.salt)
+            .map_err(|_| Error::Unauthenticated("salt is not base64".into()))?;
+        let sig = b64
+            .decode(&r.signature)
+            .map_err(|_| Error::Unauthenticated("signature is not base64".into()))?;
+        let der = self.certificate(&r.public_key_url).await?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|e| Error::Unauthenticated(format!("certificate: {e}")))?;
+        if !cert.validity().is_valid() {
+            return Err(Error::Unauthenticated(
+                "certificate is expired or not yet valid".into(),
+            ));
+        }
+        let spki = cert.public_key().subject_public_key.data.to_vec();
+        let mut payload =
+            Vec::with_capacity(r.player_id.len() + r.bundle_id.len() + 8 + salt.len());
+        payload.extend_from_slice(r.player_id.as_bytes());
+        payload.extend_from_slice(r.bundle_id.as_bytes());
+        payload.extend_from_slice(&r.timestamp.to_be_bytes());
+        payload.extend_from_slice(&salt);
+        ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, spki)
+            .verify(&payload, &sig)
+            .map_err(|_| Error::Unauthenticated("game center signature does not verify".into()))?;
+        Ok(r.player_id.clone())
+    }
+
+    async fn certificate(&self, url: &str) -> Result<Vec<u8>> {
+        if let Some((at, der)) = self.certs.lock().unwrap().get(url) {
+            if at.elapsed() < JWKS_TTL {
+                return Ok(der.clone());
+            }
+        }
+        let bytes = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("game center certificate: {e}")))?
+            .error_for_status()
+            .map_err(|e| Error::Unauthenticated(format!("game center certificate: {e}")))?
+            .bytes()
+            .await
+            .map_err(|e| Error::Internal(format!("game center certificate: {e}")))?;
+        if bytes.len() > 64 * 1024 {
+            return Err(Error::Unauthenticated("certificate too large".into()));
+        }
+        let der = bytes.to_vec();
+        self.certs
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), (Instant::now(), der.clone()));
+        Ok(der)
     }
 
     /// Verify an ID token against an arbitrary issuer config (operator SSO).

@@ -139,6 +139,13 @@ pub struct SessionConfig {
     /// Live sessions (refresh-token families) one account may hold; a new login evicts the oldest
     /// beyond this. 0 = unlimited.
     pub max_sessions_per_account: u32,
+    /// Password policy for email accounts (set / change / reset).
+    pub password_min_length: usize,
+    /// Character classes (lower, upper, digit, other) a password must mix; 0–4.
+    pub password_require_classes: u8,
+    /// Refuse the usual suspects (`password1`, `qwerty123`, one repeated character, a keyboard
+    /// walk) and anything containing the account's email local part.
+    pub password_deny_common: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +205,9 @@ impl Default for SessionConfig {
             lockout_max_secs: 15 * 60,
             captcha_after: 3,
             max_sessions_per_account: 0,
+            password_min_length: 8,
+            password_require_classes: 0,
+            password_deny_common: true,
             captcha_verify_url: None,
             captcha_secret: None,
             login_queue_capacity: 0,
@@ -1102,6 +1112,12 @@ pub struct SocialConfig {
     /// Nintendo Account / NSA `id_token`; `jwks_url` + `issuers` + `client_ids` from NDP docs.
     pub nintendo: OidcLoginConfig,
     pub passkeys: PasskeyConfig,
+    /// Facebook Login: classic access tokens are checked with `debug_token` under the app's
+    /// credentials; Limited Login id tokens (JWT) against Facebook's OIDC keys. Empty `app_id` =
+    /// disabled.
+    pub facebook: FacebookLoginConfig,
+    /// Game Center identity verification signatures (`fetchItems(forIdentityVerificationSignature:)`).
+    pub gamecenter: GameCenterLoginConfig,
     /// Group XP needed to reach level 2, 3, …; the last entry caps the level.
     pub group_level_xp: Vec<i64>,
 }
@@ -1139,6 +1155,8 @@ impl Default for SocialConfig {
             platform_match_secs: 300,
             nintendo: OidcLoginConfig::default(),
             passkeys: PasskeyConfig::default(),
+            facebook: FacebookLoginConfig::default(),
+            gamecenter: GameCenterLoginConfig::default(),
             group_level_xp: vec![
                 1_000, 3_000, 6_000, 10_000, 15_000, 21_000, 28_000, 36_000, 45_000,
             ],
@@ -1219,6 +1237,94 @@ impl SocialConfig {
             client_ids: vec![],
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FacebookLoginConfig {
+    /// Graph API base; tests point it at a mock.
+    pub url: String,
+    pub app_id: String,
+    pub app_secret: String,
+    /// Limited Login (OIDC) verification; defaults to Facebook's issuer and JWKS, `app_id` is
+    /// the accepted audience.
+    pub oidc: OidcLoginConfig,
+}
+
+impl Default for FacebookLoginConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://graph.facebook.com".into(),
+            app_id: String::new(),
+            app_secret: String::new(),
+            oidc: OidcLoginConfig {
+                jwks_url: "https://www.facebook.com/.well-known/oauth/openid-configuration/jwks"
+                    .into(),
+                issuer: String::new(),
+                issuers: vec!["https://www.facebook.com".into()],
+                client_ids: vec![],
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameCenterLoginConfig {
+    /// Empty = Game Center login disabled. The signature's `bundle_id` must be one of these.
+    pub bundle_ids: Vec<String>,
+    /// `public_key_url` must start with one of these (Apple's certificate hosts).
+    pub public_key_url_prefixes: Vec<String>,
+    /// Signatures older/newer than this are refused; 0 disables the check.
+    pub max_skew_secs: u64,
+}
+
+impl Default for GameCenterLoginConfig {
+    fn default() -> Self {
+        Self {
+            bundle_ids: vec![],
+            public_key_url_prefixes: vec![
+                "https://static.gc.apple.com/".into(),
+                "https://sandbox.gc.apple.com/".into(),
+            ],
+            max_skew_secs: 600,
+        }
+    }
+}
+
+/// Built-in issuer/JWKS for well-known OIDC providers, so `[social.oidc.twitch] client_ids = […]`
+/// is all an operator writes. Applied when the entry leaves `jwks_url` and `issuer` empty.
+pub fn oidc_preset(name: &str) -> Option<OidcLoginConfig> {
+    let (issuer, jwks) = match name {
+        "discord" => ("https://discord.com", "https://discord.com/api/oauth2/keys"),
+        "twitch" => (
+            "https://id.twitch.tv/oauth2",
+            "https://id.twitch.tv/oauth2/keys",
+        ),
+        "epic" => (
+            "https://api.epicgames.dev/epic/oauth/v2",
+            "https://api.epicgames.dev/epic/oauth/v2/.well-known/jwks.json",
+        ),
+        "microsoft" => (
+            "https://login.microsoftonline.com/common/v2.0",
+            "https://login.microsoftonline.com/common/discovery/v2.0/keys",
+        ),
+        "line" => (
+            "https://access.line.me",
+            "https://api.line.me/oauth2/v2.1/certs",
+        ),
+        "kakao" => (
+            "https://kauth.kakao.com",
+            "https://kauth.kakao.com/.well-known/jwks.json",
+        ),
+        _ => return None,
+    };
+    Some(OidcLoginConfig {
+        jwks_url: jwks.into(),
+        issuer: String::new(),
+        issuers: vec![issuer.into()],
+        client_ids: vec![],
+    })
 }
 
 /// Distributed tracing export (OpenTelemetry). Empty endpoint = spans stay local.
