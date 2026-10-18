@@ -1142,6 +1142,7 @@ async fn channel_send(
                 }),
                 code: CODE_MENTION,
                 persistent: true,
+                ttl_secs: None,
             })
             .collect();
         if !batch.is_empty() {

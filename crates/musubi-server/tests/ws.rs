@@ -16284,3 +16284,157 @@ async fn recv_account(router: &axum::Router, token: &str) -> Value {
         .await
         .1
 }
+
+/// Notification TTL (expired ones vanish from the inbox and the unread count) and the push
+/// template/schedule surface.
+#[tokio::test]
+async fn notification_ttl_and_push_schedule() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (t, acc) = token(&router).await;
+    for (subject, ttl) in [("short", Some(1)), ("long", None)] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            "/v1/server/notifications",
+            None,
+            true,
+            Some(json!({"user_id": acc, "subject": subject, "ttl_secs": ttl})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let (st, r) = http_json(&router, "GET", "/v1/notifications", Some(&t), false, None).await;
+    assert_eq!(st, 200, "{r}");
+    let list = r["notifications"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{r}");
+    assert!(list
+        .iter()
+        .any(|n| n["subject"] == "short" && n["expire_time"].is_string()));
+    assert!(list
+        .iter()
+        .any(|n| n["subject"] == "long" && n["expire_time"].is_null()));
+    assert_eq!(r["unread_count"], 2);
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    let (_, r) = http_json(&router, "GET", "/v1/notifications", Some(&t), false, None).await;
+    let list = r["notifications"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{r}");
+    assert_eq!(list[0]["subject"], "long");
+    assert_eq!(r["unread_count"], 1);
+
+    // push templates
+    let tid = format!("tpl-{}", uuid::Uuid::now_v7().simple());
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/push/templates",
+        None,
+        true,
+        Some(json!({"templates": [{"id": tid, "title": "Hi {{username}}", "body": "{{n}} new", "data": {"deep_link": "app://x/{{n}}"}, "code": 7}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(r["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["id"] == tid));
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/push/templates",
+        None,
+        true,
+        Some(json!({"templates": [{"id": "bad id", "title": "x"}]})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    // unknown template → 404; no push configured in tests → immediate send is 503
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/push",
+        None,
+        true,
+        Some(json!({"template_id": "nope-such", "account_ids": [acc]})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/push",
+        None,
+        true,
+        Some(json!({"template_id": tid, "vars": {"n": 3}, "account_ids": [acc]})),
+    )
+    .await;
+    assert_eq!(st, 503, "{r}");
+    // scheduling needs no push backend until it is due
+    let later = time::OffsetDateTime::now_utc().unix_timestamp() + 3600;
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/push",
+        None,
+        true,
+        Some(json!({"template_id": tid, "vars": {"n": 3}, "send_at": later})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let sid = r["id"].as_str().unwrap().to_string();
+    assert_eq!(r["send_at"], later);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/push",
+        None,
+        true,
+        Some(json!({"title": "Daily", "local_date": "2030-01-02", "local_time": "19:00", "account_ids": [acc]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["local"], true);
+    // due when UTC+14 reaches 19:00 on that date
+    assert_eq!(r["send_at"], 1893610800 - 14 * 3600);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/push",
+        None,
+        true,
+        Some(json!({"title": "x", "local_date": "2030-01-02"})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(&router, "GET", "/v1/server/push/schedule", None, true, None).await;
+    assert_eq!(st, 200, "{r}");
+    let sched = r["schedule"].as_array().unwrap();
+    assert!(sched
+        .iter()
+        .any(|x| x["id"] == sid && x["recipients"] == -1));
+    let (st, r) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/server/push/schedule/{sid}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["cancelled"], 1);
+    let (st, r) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/server/push/templates/{tid}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["deleted"], 1);
+}

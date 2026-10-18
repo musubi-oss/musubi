@@ -311,6 +311,7 @@ impl LobbyService {
                 content: body.clone(),
                 code: CODE_LOBBY,
                 persistent,
+                ttl_secs: None,
             })
             .collect();
         if let Err(e) = self.notify.send(batch).await {

@@ -704,6 +704,24 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     if let Some(c) = state.cluster.clone() {
         let st = state.clone();
+        let lease = c.lease("push_schedule", musubi_cluster::DEAD_AFTER);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
+                match crate::http::push::dispatch_due(&st).await {
+                    Ok(n) if n > 0 => tracing::info!(pushed = n, "scheduled push pass"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "scheduled push pass failed"),
+                }
+            }
+        });
+    }
+    if let Some(c) = state.cluster.clone() {
+        let st = state.clone();
         let lease = c.lease("lobbies", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));

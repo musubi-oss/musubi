@@ -44,13 +44,18 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     )
     .await?;
     let audit = purge(db, "musubi.audit_log", &age("at"), cfg.audit_days).await?;
-    let notifications = purge(
+    let mut notifications = purge(
         db,
         "musubi.notifications",
         &age("created_at"),
         cfg.notifications_days,
     )
     .await?;
+    notifications += sqlx::query("delete from musubi.notifications where expires_at <= now()")
+        .execute(db)
+        .await
+        .map_err(musubi_core::Error::internal)?
+        .rows_affected();
     let mut chat = 0u64;
     for (kind, days) in [
         (2, cfg.chat_room_days),

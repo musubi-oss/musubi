@@ -310,6 +310,9 @@ pub enum ServerMessage {
         sender_id: Option<AccountId>,
         create_time: i64,
         persistent: bool,
+        /// Unix time after which the client should drop it (absent = keep).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expire_time: Option<i64>,
     },
     /// Reply to `ChannelJoin`.
     Channel {

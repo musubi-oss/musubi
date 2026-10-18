@@ -243,6 +243,7 @@ impl ServerHost {
                         content: req.get("content").cloned().unwrap_or(json!({})),
                         code: req["code"].as_i64().unwrap_or(0) as i32,
                         persistent: req["persistent"].as_bool().unwrap_or(true),
+                        ttl_secs: None,
                     }])
                     .await?;
                 Ok(json!({ "sent": true }))

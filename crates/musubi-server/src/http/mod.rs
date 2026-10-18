@@ -21,6 +21,7 @@ mod matches;
 mod matchmaker;
 mod notifications;
 mod passkeys;
+pub mod push;
 pub mod rating;
 mod regions;
 pub mod reports;
@@ -163,6 +164,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(sso::routes())
         .merge(stats::routes())
+        .merge(push::routes())
         .merge(crate::events::routes())
         .merge(auth::routes())
         .merge(account::routes())

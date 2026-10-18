@@ -33,6 +33,13 @@ pub struct Notification {
         skip_serializing_if = "Option::is_none"
     )]
     pub read_time: Option<OffsetDateTime>,
+    /// When it stops being shown; absent = until retention.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expire_time: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +50,8 @@ pub struct NewNotification {
     pub content: serde_json::Value,
     pub code: i32,
     pub persistent: bool,
+    /// Drop (and stop listing) after this many seconds; `None` = until retention.
+    pub ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +76,7 @@ type Row = (
     i32,
     Option<Uuid>,
     OffsetDateTime,
+    Option<OffsetDateTime>,
     Option<OffsetDateTime>,
 );
 
@@ -95,9 +105,12 @@ impl NotificationService {
                 ));
             }
             let id = Uuid::now_v7();
+            let expires = n.ttl_secs.filter(|t| *t > 0).map(|t| {
+                OffsetDateTime::now_utc() + time::Duration::seconds(t.min(i64::MAX as u64) as i64)
+            });
             let created = if n.persistent {
                 sqlx::query_scalar::<_, OffsetDateTime>(
-                    "insert into musubi.notifications (id, user_id, sender_id, subject, content, code) values ($1, $2, $3, $4, $5, $6) returning created_at",
+                    "insert into musubi.notifications (id, user_id, sender_id, subject, content, code, expires_at) values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
                 )
                 .bind(id)
                 .bind(n.user_id.0)
@@ -105,6 +118,7 @@ impl NotificationService {
                 .bind(&n.subject)
                 .bind(&n.content)
                 .bind(n.code)
+                .bind(expires)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(Error::internal)?
@@ -122,6 +136,7 @@ impl NotificationService {
                     create_time: created,
                     persistent: n.persistent,
                     read_time: None,
+                    expire_time: expires,
                 },
             ));
         }
@@ -146,8 +161,9 @@ impl NotificationService {
             None => None,
         };
         let rows = sqlx::query_as::<_, Row>(
-            "select id, subject, content, code, sender_id, created_at, read_at from musubi.notifications
+            "select id, subject, content, code, sender_id, created_at, read_at, expires_at from musubi.notifications
              where user_id = $1 and ($2::uuid is null or id < $2) and (not $4 or read_at is null)
+               and (expires_at is null or expires_at > now())
              order by id desc limit $3",
         )
         .bind(user.0)
@@ -170,13 +186,15 @@ impl NotificationService {
                 create_time: r.5,
                 persistent: true,
                 read_time: r.6,
+                expire_time: r.7,
             })
             .collect();
         let cursor = more
             .then(|| notifications.last().map(|n| n.id.to_string()))
             .flatten();
         let unread_count: i64 = sqlx::query_scalar(
-            "select count(*) from musubi.notifications where user_id = $1 and read_at is null",
+            "select count(*) from musubi.notifications where user_id = $1 and read_at is null
+               and (expires_at is null or expires_at > now())",
         )
         .bind(user.0)
         .fetch_one(&self.db)

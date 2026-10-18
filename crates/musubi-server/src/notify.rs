@@ -44,6 +44,7 @@ impl Notifier {
                     sender_id: n.sender_id,
                     create_time: n.create_time.unix_timestamp(),
                     persistent: n.persistent,
+                    expire_time: n.expire_time.map(|t| t.unix_timestamp()),
                 },
             );
             if live == 0 && !self.fanout.is_online_anywhere(user) {

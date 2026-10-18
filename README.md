@@ -317,6 +317,17 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Notifications: TTL, push templates and schedule
+
+`POST /v1/server/notifications` takes `ttl_secs`: the notification carries `expire_time`, leaves
+the inbox and the unread count when it passes, and is purged by retention. Push grew a server
+surface: `PUT /v1/server/push/templates` (title/body/data with `{{var}}` placeholders;
+`{{username}}` is always set), `POST /v1/server/push {template_id | title/body/data, vars,
+account_ids | everyone with a token, send_at | local_date + local_time}` — immediate, at a UTC
+instant, or at a wall-clock time in each recipient's own timezone (`accounts.timezone`, rolled
+out zone by zone by the `push_schedule` lease holder every 30 s) — and
+`GET/DELETE /v1/server/push/schedule`.
+
 ### Chat: typing, attachments, automod
 
 `channel_typing {channel_id}` fans a `channel_typing {channel_id, user}` event to everyone else

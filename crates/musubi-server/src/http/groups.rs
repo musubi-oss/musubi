@@ -621,6 +621,7 @@ async fn announce(
                 content: json!({ "group_id": id, "text": text }),
                 code: CODE_GROUP_ANNOUNCEMENT,
                 persistent: true,
+                ttl_secs: None,
             })
             .collect::<Vec<_>>();
         if !batch.is_empty() {

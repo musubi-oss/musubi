@@ -89,6 +89,9 @@ struct ServerSendReq {
     sender_id: Option<Uuid>,
     #[serde(default = "yes")]
     persistent: bool,
+    /// Seconds until the notification disappears from the inbox (0/absent = until retention).
+    #[serde(default)]
+    ttl_secs: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -114,6 +117,7 @@ async fn server_send(
             content: r.content,
             code: r.code,
             persistent: r.persistent,
+            ttl_secs: r.ttl_secs,
         }])
         .await?;
     Ok(Json(json!({ "ok": true })))

@@ -1056,6 +1056,7 @@ async fn mail_send(
                 content: json!({ "kind": "mail" }),
                 code: NOTIFY_MAIL,
                 persistent: false,
+                ttl_secs: None,
             })
             .collect();
         s.notify.send(batch).await?;
@@ -1647,6 +1648,7 @@ async fn notify_one(s: &AppState, to: AccountId, code: i32, subject: &str, conte
         content,
         code,
         persistent: true,
+        ttl_secs: None,
     };
     if let Err(e) = s.notify.send(vec![n]).await {
         tracing::warn!(error = %e, "notification failed");

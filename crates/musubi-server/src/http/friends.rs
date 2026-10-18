@@ -183,6 +183,7 @@ async fn add(
                     code::FRIEND_REQUEST
                 },
                 persistent: true,
+                ttl_secs: None,
             })
             .collect();
         s.notify.send(batch).await?;
