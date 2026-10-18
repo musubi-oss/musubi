@@ -176,6 +176,10 @@ pub enum ClientMessage {
         /// Watch only (authoritative matches): not a player, inputs refused.
         #[serde(default)]
         spectator: bool,
+        /// Spectator stream delay in ticks (anti-ghosting); the match's
+        /// `params.spectator_delay_ticks` is the floor.
+        #[serde(default)]
+        delay_ticks: u64,
     },
     MatchLeave {
         match_id: String,

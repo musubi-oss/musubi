@@ -726,6 +726,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             token,
             metadata,
             spectator,
+            delay_ticks,
         } => {
             if let Some(id) = match_id
                 .as_deref()
@@ -733,7 +734,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             {
                 return Some(
                     ctx.matches
-                        .join(ctx.presence, id, metadata, spectator)
+                        .join(ctx.presence, id, metadata, spectator.then_some(delay_ticks))
                         .await
                         .unwrap_or_else(|e| ServerMessage::error(&e)),
                 );

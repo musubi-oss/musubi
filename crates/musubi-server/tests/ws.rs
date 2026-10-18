@@ -1015,6 +1015,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1113,6 +1114,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1152,6 +1154,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             token: Some(tok.clone()),
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1168,6 +1171,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             token: Some(tok),
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1187,6 +1191,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             token: Some("bogus".into()),
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1384,6 +1389,7 @@ async fn authoritative_echo_match_lifecycle() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1404,6 +1410,7 @@ async fn authoritative_echo_match_lifecycle() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1428,6 +1435,7 @@ async fn authoritative_echo_match_lifecycle() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1539,6 +1547,7 @@ async fn match_snapshots_persist_and_resume_on_another_registry() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -1657,6 +1666,7 @@ async fn wasm_match_module_runs_as_authoritative_match() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -2025,6 +2035,7 @@ async fn quic_unreliable_match_data_uses_datagrams() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         }),
     )
     .await
@@ -2100,6 +2111,7 @@ async fn cross_node_relayed_match() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -5063,6 +5075,7 @@ async fn match_join_records_recent_players() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -8488,6 +8501,7 @@ async fn spectator_watches_without_playing() {
         token: None,
         metadata: Default::default(),
         spectator,
+        delay_ticks: 0,
     };
     send(&mut a, f, None, join(false)).await;
     assert!(matches!(
@@ -8560,6 +8574,64 @@ async fn spectator_watches_without_playing() {
             m => panic!("{m:?}"),
         }
     }
+    // a spectator watching with a delay gets the same stream, `delay_ticks` late (20 Hz: 1 s)
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+            spectator: true,
+            delay_ticks: 20,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Match {
+            authoritative: true,
+            ..
+        }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 7,
+            data: vec![7],
+            presences: vec![],
+            reliable: true,
+        },
+    )
+    .await;
+    for ws in [&mut a, &mut b] {
+        assert!(matches!(
+            recv(ws).await.msg,
+            ServerMessage::MatchData { op_code: 7, .. }
+        ));
+    }
+    let early = tokio::time::timeout(std::time::Duration::from_millis(400), recv(&mut c)).await;
+    assert!(early.is_err(), "held back: {early:?}");
+    match recv(&mut c).await.msg {
+        ServerMessage::MatchData { op_code, data, .. } => {
+            assert_eq!(op_code, 7);
+            assert_eq!(data, vec![7]);
+        }
+        m => panic!("{m:?}"),
+    }
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
     // the spectator leaving does not disturb the players
     send(
         &mut b,
@@ -8617,6 +8689,7 @@ async fn match_recording_produces_replay() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;
@@ -8792,6 +8865,7 @@ async fn relayed_host_migrates_by_rtt() {
         token: None,
         metadata: Default::default(),
         spectator: false,
+        delay_ticks: 0,
     };
     send(&mut b, f, None, join()).await;
     let b_sid = match recv(&mut b).await.msg {
@@ -9276,6 +9350,7 @@ async fn match_fenced_node_cannot_persist_after_takeover() {
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         },
     )
     .await;

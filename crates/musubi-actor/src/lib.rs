@@ -2,7 +2,7 @@
 //! the current state and returns the next one, so the latest state is always a complete snapshot
 //! (the basis for failover and migration). The actor owns the tick loop, membership and delivery.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -225,7 +225,8 @@ enum Cmd {
     Join {
         presence: UserPresence,
         metadata: HashMap<String, String>,
-        spectator: bool,
+        /// `Some(delay_ticks)`: watch only, every message held back that many ticks.
+        spectator: Option<u64>,
         reply: oneshot::Sender<Result<ServerMessage>>,
     },
     Leave {
@@ -245,13 +246,15 @@ pub struct MatchHandle {
 }
 
 impl MatchHandle {
-    /// `spectator`: watch only — receives match data and presence events, is not counted as a
-    /// player, never reaches the handler, and its own inputs are refused.
+    /// `spectator: Some(delay_ticks)`: watch only — receives match data and presence events
+    /// `delay_ticks` late (floored by the match's `params.spectator_delay_ticks`, so a stream
+    /// cannot be used to ghost the players), is not counted as a player, never reaches the
+    /// handler, and its own inputs are refused.
     pub async fn join(
         &self,
         presence: UserPresence,
         metadata: HashMap<String, String>,
-        spectator: bool,
+        spectator: Option<u64>,
     ) -> Result<ServerMessage> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -432,6 +435,14 @@ async fn run(
     let mut label = init.label;
     let mut members: Vec<UserPresence> = Vec::new();
     let mut spectators: Vec<UserPresence> = Vec::new();
+    // spectators watching with a delay, and what is held back for them until its tick comes
+    let mut delays: HashMap<SessionId, u64> = HashMap::new();
+    let mut delayed: VecDeque<(u64, SessionId, ServerMessage)> = VecDeque::new();
+    let min_delay = persist
+        .params
+        .get("spectator_delay_ticks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let mut inputs: Vec<Input> = Vec::new();
     let mut tick: u64 = persist.start_tick;
     let mut interval = tokio::time::interval(Duration::from_millis(1000 / init.tick_rate as u64));
@@ -446,9 +457,13 @@ async fn run(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     Cmd::Join { presence, metadata, spectator, reply } => {
-                        if spectator {
+                        if let Some(delay) = spectator {
                             if !spectators.iter().any(|p| p.session_id == presence.session_id) {
                                 spectators.push(presence.clone());
+                            }
+                            let delay = delay.max(min_delay);
+                            if delay > 0 {
+                                delays.insert(presence.session_id, delay);
                             }
                             let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
                             let mut i = info.write().await;
@@ -473,7 +488,7 @@ async fn run(
                                             journal.push(JournalEntry { tick, op: Op::Join { presence: presence.clone(), metadata: metadata.clone() } });
                                         }
                                         members.push(presence.clone());
-                                        deliver(others, ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![presence.clone()], leaves: vec![] });
+                                        fan(&deliver, &delays, &mut delayed, tick, others, ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![presence.clone()], leaves: vec![] });
                                         let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
                                     }
                                     Err(e) => { let _ = reply.send(Err(e)); }
@@ -485,6 +500,8 @@ async fn run(
                     Cmd::Leave { session } => {
                         if let Some(idx) = spectators.iter().position(|p| p.session_id == session) {
                             spectators.remove(idx);
+                            delays.remove(&session);
+                            delayed.retain(|(_, s, _)| *s != session);
                             let mut i = info.write().await;
                             i.spectators = spectators.iter().map(|p| p.session_id).collect();
                             continue;
@@ -498,7 +515,7 @@ async fn run(
                                 Ok(s) => state = s,
                                 Err(e) => tracing::error!(%match_id, error = %e, "leave handler failed"),
                             }
-                            deliver(watchers(&members, &spectators), ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![], leaves: vec![gone] });
+                            fan(&deliver, &delays, &mut delayed, tick, watchers(&members, &spectators), ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![], leaves: vec![gone] });
                         }
                     }
                     Cmd::Data(input) => {
@@ -536,9 +553,21 @@ async fn run(
                 };
                 state = res.state;
                 if let Some(l) = res.label { label = l; }
+                let mut due = Vec::new();
+                delayed.retain(|(at, s, m)| {
+                    if *at <= tick {
+                        due.push((*s, m.clone()));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for (s, m) in due {
+                    deliver(vec![s], m);
+                }
                 for out in res.outbound {
                     let to = if out.to.is_empty() { watchers(&members, &spectators) } else { out.to };
-                    deliver(to, ServerMessage::MatchData { match_id: match_id.clone(), presence: None, op_code: out.op_code, data: out.data, reliable: out.reliable });
+                    fan(&deliver, &delays, &mut delayed, tick, to, ServerMessage::MatchData { match_id: match_id.clone(), presence: None, op_code: out.op_code, data: out.data, reliable: out.reliable });
                 }
                 {
                     let mut i = info.write().await;
@@ -573,6 +602,27 @@ async fn run(
     }
     persist.clear(id);
     on_end(id);
+}
+
+/// Send `msg` to `to` now, except to spectators watching with a delay: theirs is held back until
+/// `tick + delay` and released by the tick loop.
+fn fan(
+    deliver: &Deliver,
+    delays: &HashMap<SessionId, u64>,
+    delayed: &mut VecDeque<(u64, SessionId, ServerMessage)>,
+    tick: u64,
+    to: Vec<SessionId>,
+    msg: ServerMessage,
+) {
+    let (now, later): (Vec<SessionId>, Vec<SessionId>) = to
+        .into_iter()
+        .partition(|s| delays.get(s).is_none_or(|d| *d == 0));
+    for s in later {
+        delayed.push_back((tick + delays[&s], s, msg.clone()));
+    }
+    if !now.is_empty() {
+        deliver(now, msg);
+    }
 }
 
 /// Players plus spectators: everyone who receives what the match sends.

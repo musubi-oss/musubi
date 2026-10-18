@@ -484,7 +484,7 @@ impl MatchRegistry {
         me: &UserPresence,
         match_id: &str,
         metadata: HashMap<String, String>,
-        spectator: bool,
+        spectator: Option<u64>,
     ) -> Result<ServerMessage> {
         let h = self
             .get(match_id)

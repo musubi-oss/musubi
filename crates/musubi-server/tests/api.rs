@@ -4927,7 +4927,7 @@ async fn match_failover_replays_the_journal() {
         "account_id": uuid::Uuid::now_v7(), "session_id": uuid::Uuid::now_v7(), "username": "p1", "status": null
     }))
     .unwrap();
-    a.join(&me, &h.id.to_string(), Default::default(), false)
+    a.join(&me, &h.id.to_string(), Default::default(), None)
         .await
         .unwrap();
     for _ in 0..4 {

@@ -792,6 +792,7 @@ async fn match_loop(
             token: None,
             metadata: Default::default(),
             spectator: false,
+            delay_ticks: 0,
         }
     };
     if ws.send(envelope(join)).await.is_err() {
