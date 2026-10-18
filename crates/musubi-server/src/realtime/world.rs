@@ -702,7 +702,12 @@ impl WorldRegistry {
 
     /// Directory key of one cell's host node: cells of a world may live on different nodes.
     fn cell_key(name: &str, cell: CellId) -> String {
-        format!("world:{name}:cell:{},{}", cell.x, cell.y)
+        // base-grid cells keep the historical key; deeper quadtree cells carry their level
+        if cell.level == 0 {
+            format!("world:{name}:cell:{},{}", cell.x, cell.y)
+        } else {
+            format!("world:{name}:cell:{},{}@{}", cell.x, cell.y, cell.level)
+        }
     }
 
     /// Record (or clear) which node hosts `cell` of `name`.
@@ -903,13 +908,16 @@ impl WorldRegistry {
             let Some((x, y)) = rest.split_once(',') else {
                 continue;
             };
-            let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) else {
+            let (y, level) = y.split_once('@').unwrap_or((y, "0"));
+            let (Ok(x), Ok(y), Ok(level)) =
+                (x.parse::<i32>(), y.parse::<i32>(), level.parse::<u8>())
+            else {
                 continue;
             };
             if v["node_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) != Some(self.node_id) {
                 continue;
             }
-            let cell = CellId { x, y };
+            let cell = CellId { x, y, level };
             let home = match self.home_of(name).await {
                 Ok(Some(h)) => h,
                 _ => continue,
@@ -1062,10 +1070,16 @@ impl WorldRegistry {
             if c.raft_id() != 0 {
                 // the replicated directory is the truth; the cache only mirrors it (a bus
                 // announcement can be lost, an unassignment is never announced)
-                let h = c
-                    .directory_get(&Self::cell_key(name, cell))
-                    .await
-                    .and_then(|v| v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()));
+                let mut h = None;
+                for probe in std::iter::once(cell).chain(cell.ancestors()) {
+                    h = c
+                        .directory_get(&Self::cell_key(name, probe))
+                        .await
+                        .and_then(|v| v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()));
+                    if h.is_some() {
+                        break;
+                    }
+                }
                 return match h {
                     Some(h) => {
                         self.cell_hosts.insert(key, h);
@@ -1459,14 +1473,18 @@ impl WorldRegistry {
             world.tick = world.tick.max(tick as u64);
             since.insert(node, tick as u64);
         }
-        let cold: Vec<(i32, i32)> =
-            sqlx::query_as("select x, y from musubi.world_cold_cells where name = $1")
+        let cold: Vec<(i32, i32, i32)> =
+            sqlx::query_as("select x, y, level from musubi.world_cold_cells where name = $1")
                 .bind(name)
                 .fetch_all(db)
                 .await
                 .map_err(Error::internal)?;
-        for (x, y) in cold {
-            world.mark_unloaded(CellId { x, y });
+        for (x, y, level) in cold {
+            world.mark_unloaded(CellId {
+                x,
+                y,
+                level: level as u8,
+            });
         }
         let rows: Vec<(Option<Uuid>, Value)> = sqlx::query_as(if only {
             "select node_id, entries from musubi.world_journal where name = $1 and (node_id = any($2) or node_id is null) order by tick_from"
@@ -2807,12 +2825,12 @@ impl WorldRegistry {
                 .map(|h| format!("; hosted by {}", *h))
                 .unwrap_or_default();
             return Err(Error::NotFound(format!(
-                "cell ({}, {}) of world {name} is not hosted here{host}",
-                cell.x, cell.y
+                "cell ({}, {}, level {}) of world {name} is not hosted here{host}",
+                cell.x, cell.y, cell.level
             )));
         }
         let mut v = st.world.view(cell);
-        for n in World::neighbours(cell) {
+        for n in st.world.neighbours(cell) {
             let Some(g) = st.remote_ghosts.get(&n) else {
                 continue;
             };
@@ -3562,14 +3580,15 @@ impl WorldRegistry {
         tick: u64,
     ) -> Result<()> {
         sqlx::query(
-            "insert into musubi.world_cold_cells (name, x, y, entities, tick) values ($1, $2, $3, $4, $5)
-             on conflict (name, x, y) do update set entities = excluded.entities, tick = excluded.tick, unloaded_at = now()",
+            "insert into musubi.world_cold_cells (name, x, y, level, entities, tick) values ($1, $2, $3, $6, $4, $5)
+             on conflict (name, x, y, level) do update set entities = excluded.entities, tick = excluded.tick, unloaded_at = now()",
         )
         .bind(name)
         .bind(cell.x)
         .bind(cell.y)
         .bind(serde_json::to_value(entities)?)
         .bind(tick as i64)
+        .bind(i32::from(cell.level))
         .execute(db)
         .await
         .map_err(Error::internal)?;
@@ -3578,11 +3597,12 @@ impl WorldRegistry {
 
     async fn read_cold_cell(db: &PgPool, name: &str, cell: CellId) -> Result<Option<Vec<Entity>>> {
         let row: Option<(Value,)> = sqlx::query_as(
-            "select entities from musubi.world_cold_cells where name = $1 and x = $2 and y = $3",
+            "select entities from musubi.world_cold_cells where name = $1 and x = $2 and y = $3 and level = $4",
         )
         .bind(name)
         .bind(cell.x)
         .bind(cell.y)
+        .bind(i32::from(cell.level))
         .fetch_optional(db)
         .await
         .map_err(Error::internal)?;
@@ -3593,10 +3613,13 @@ impl WorldRegistry {
     }
 
     async fn delete_cold_cell(db: &PgPool, name: &str, cell: CellId) -> Result<()> {
-        sqlx::query("delete from musubi.world_cold_cells where name = $1 and x = $2 and y = $3")
-            .bind(name)
-            .bind(cell.x)
-            .bind(cell.y)
+        sqlx::query(
+            "delete from musubi.world_cold_cells where name = $1 and x = $2 and y = $3 and level = $4",
+        )
+        .bind(name)
+        .bind(cell.x)
+        .bind(cell.y)
+        .bind(i32::from(cell.level))
             .execute(db)
             .await
             .map_err(Error::internal)?;

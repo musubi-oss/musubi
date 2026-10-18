@@ -1075,13 +1075,25 @@ async fn world_snapshot(
     Ok(Json(json!({"world": w, "tick": tick})))
 }
 
+/// `?level=` picks a quadtree cell below the base grid (default 0).
+#[derive(Deserialize, Default)]
+pub struct CellLevelQuery {
+    #[serde(default)]
+    pub level: u8,
+}
+
 async fn world_cell_host(
     _k: ServerKey,
     State(s): State<AppState>,
     Path((w, x, y)): Path<(String, i32, i32)>,
+    Query(q): Query<CellLevelQuery>,
     Json(r): Json<CellHostReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let cell = musubi_mesh::CellId { x, y };
+    let cell = musubi_mesh::CellId {
+        x,
+        y,
+        level: q.level,
+    };
     if s.worlds.home_of(&w).await?.is_none() {
         return Err(Error::NotFound(format!("world {w}")).into());
     }

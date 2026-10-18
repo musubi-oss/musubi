@@ -568,10 +568,15 @@ async fn view(
     uri: OriginalUri,
     ServerKey: ServerKey,
     Path((w, x, y)): Path<(String, i32, i32)>,
+    Query(q): Query<crate::http::admin::CellLevelQuery>,
 ) -> Result<Json<Value>, Response> {
-    ensure_cell_home(&s, &w, CellId { x, y }, &uri).await?;
-    let r: Result<Json<Value>, ApiError> =
-        async { Ok(Json(s.worlds.view(&w, CellId { x, y })?)) }.await;
+    let cell = CellId {
+        x,
+        y,
+        level: q.level,
+    };
+    ensure_cell_home(&s, &w, cell, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async { Ok(Json(s.worlds.view(&w, cell)?)) }.await;
     r.map_err(IntoResponse::into_response)
 }
 

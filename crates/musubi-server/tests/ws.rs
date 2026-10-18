@@ -2726,11 +2726,25 @@ async fn sim_sdk_two_simulators_hand_an_entity_over() {
     client.register(s1, 1).await.unwrap();
     client.register(s2, 1).await.unwrap();
     client
-        .lease(s1, &[musubi_mesh::CellId { x: 0, y: 0 }])
+        .lease(
+            s1,
+            &[musubi_mesh::CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            }],
+        )
         .await
         .unwrap();
     client
-        .lease(s2, &[musubi_mesh::CellId { x: 1, y: 0 }])
+        .lease(
+            s2,
+            &[musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            }],
+        )
         .await
         .unwrap();
     let e = client
@@ -2764,7 +2778,11 @@ async fn sim_sdk_two_simulators_hand_an_entity_over() {
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let v = client
-            .view(musubi_mesh::CellId { x: 1, y: 0 })
+            .view(musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            })
             .await
             .unwrap();
         if let Some(car) = v.owned.iter().find(|c| c.id == e.id) {
@@ -4316,7 +4334,11 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
     assert_eq!(r2.home_of(&name).await.unwrap(), Some(n2));
     let info = r2.info(&name).unwrap();
     assert_eq!(info.entities, 1, "only the persistent entity is restored");
-    let cell = musubi_mesh::CellId { x: 0, y: 0 };
+    let cell = musubi_mesh::CellId {
+        x: 0,
+        y: 0,
+        level: 0,
+    };
     let view = r2.view(&name, cell).unwrap();
     let s = view.to_string();
     assert!(s.contains(&keep.id.to_string()), "{s}");
@@ -4689,7 +4711,14 @@ async fn world_journal_is_replayed_on_rehome() {
     assert_eq!(r2.recover(&[]).await.unwrap(), vec![name.clone()]);
     assert_eq!(r2.info(&name).unwrap().entities, 2, "keep + late, not gone");
     let view = r2
-        .view(&name, musubi_mesh::CellId { x: 0, y: 0 })
+        .view(
+            &name,
+            musubi_mesh::CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+        )
         .unwrap()
         .to_string();
     assert!(
@@ -6712,7 +6741,14 @@ async fn world_cell_host_failover() {
         .unwrap();
     assert_eq!(
         cells,
-        vec![(name.clone(), musubi_mesh::CellId { x: 1, y: 0 })]
+        vec![(
+            name.clone(),
+            musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }
+        )]
     );
     let (st, va) = http_json(
         &router1,
@@ -13839,7 +13875,12 @@ async fn world_replica_takes_over_without_snapshot() {
     for _ in 0..100 {
         info = state2.worlds.info(&name).unwrap();
         if info.replicas.iter().any(|x| {
-            x.cell == musubi_mesh::CellId { x: 1, y: 0 }
+            x.cell
+                == musubi_mesh::CellId {
+                    x: 1,
+                    y: 0,
+                    level: 0,
+                }
                 && x.node == node1
                 && x.tick >= applied_tick
         }) {
@@ -13851,10 +13892,13 @@ async fn world_replica_takes_over_without_snapshot() {
     assert!(acked, "replica never caught up: {:?}", info.replicas);
     let info1 = state1.worlds.info(&name).unwrap();
     assert!(
-        info1
-            .mirrors
-            .iter()
-            .any(|m| m.cell == musubi_mesh::CellId { x: 1, y: 0 } && m.node == node2),
+        info1.mirrors.iter().any(|m| m.cell
+            == musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }
+            && m.node == node2),
         "home mirrors the cell hosted on node 2: {:?}",
         info1.mirrors
     );
@@ -13866,12 +13910,23 @@ async fn world_replica_takes_over_without_snapshot() {
             .unwrap()
             .mirrors
             .iter()
-            .find(|m| m.cell == musubi_mesh::CellId { x: 1, y: 0 })
+            .find(|m| {
+                m.cell
+                    == musubi_mesh::CellId {
+                        x: 1,
+                        y: 0,
+                        level: 0,
+                    }
+            })
             .map(|m| (m.node, m.tick))
     };
     let before = mirror_tick(&state1).expect("mirror present");
     let forged = |keyframe: bool| musubi_mesh::GhostDelta {
-        cell: musubi_mesh::CellId { x: 1, y: 0 },
+        cell: musubi_mesh::CellId {
+            x: 1,
+            y: 0,
+            level: 0,
+        },
         tick: before.1 + 1000,
         keyframe,
         upserts: Vec::new(),
@@ -13922,7 +13977,14 @@ async fn world_replica_takes_over_without_snapshot() {
         .unwrap();
     assert_eq!(
         cells,
-        vec![(name.clone(), musubi_mesh::CellId { x: 1, y: 0 })]
+        vec![(
+            name.clone(),
+            musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }
+        )]
     );
     let (st, va) = http_json(
         &router1,
@@ -16228,7 +16290,14 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
         .unwrap();
     assert_eq!(
         cells,
-        vec![(name.clone(), musubi_mesh::CellId { x: 1, y: 0 })]
+        vec![(
+            name.clone(),
+            musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }
+        )]
     );
     // the registry tick announces the restored ids; A answers with a drop
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

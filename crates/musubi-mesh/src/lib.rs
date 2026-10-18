@@ -24,6 +24,56 @@ pub type ClientId = Uuid;
 pub struct CellId {
     pub x: i32,
     pub y: i32,
+    /// Quadtree depth: 0 = a cell of the base grid (`cell_size`), each level halves the side.
+    /// Omitted on the wire for base-grid cells, so frames and stored rows stay as they were.
+    #[serde(default, skip_serializing_if = "is_zero_level")]
+    pub level: u8,
+}
+
+fn is_zero_level(l: &u8) -> bool {
+    *l == 0
+}
+
+impl CellId {
+    pub const fn root(x: i32, y: i32) -> Self {
+        Self { x, y, level: 0 }
+    }
+
+    pub fn parent(&self) -> Option<CellId> {
+        (self.level > 0).then(|| CellId {
+            x: self.x.div_euclid(2),
+            y: self.y.div_euclid(2),
+            level: self.level - 1,
+        })
+    }
+
+    /// The four cells this one splits into.
+    pub fn children(&self) -> [CellId; 4] {
+        let (x, y, l) = (self.x * 2, self.y * 2, self.level + 1);
+        [
+            CellId { x, y, level: l },
+            CellId {
+                x: x + 1,
+                y,
+                level: l,
+            },
+            CellId {
+                x,
+                y: y + 1,
+                level: l,
+            },
+            CellId {
+                x: x + 1,
+                y: y + 1,
+                level: l,
+            },
+        ]
+    }
+
+    /// Strict ancestors, nearest first.
+    pub fn ancestors(&self) -> impl Iterator<Item = CellId> {
+        std::iter::successors(self.parent(), |c| c.parent())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -136,6 +186,9 @@ pub struct Lease {
 #[serde(default)]
 pub struct WorldConfig {
     pub cell_size: f64,
+    /// Quadtree depth a hot cell may split down to (plan 4.3); 0 = fixed grid. A cell at depth
+    /// `d` has side `cell_size / 2^d`.
+    pub max_depth: u8,
     /// Entities this close to a border are ghosted to the neighbour.
     pub ghost_margin: f64,
     /// Extra distance past the border before a handover starts (prevents flapping).
@@ -196,6 +249,7 @@ impl Default for WorldConfig {
     fn default() -> Self {
         Self {
             cell_size: 256.0,
+            max_depth: 0,
             ghost_margin: 48.0,
             hysteresis: 24.0,
             lease_ttl_ticks: 60,
@@ -457,6 +511,10 @@ pub struct World {
     children: HashMap<EntityId, Vec<EntityId>>,
     /// Cells running slower than real time (EVE-style time dilation); absent = 1.0.
     cell_scale: HashMap<CellId, f64>,
+    /// Cells split into four children (quadtree interior nodes); leaves are the authority units.
+    split: HashSet<CellId>,
+    /// Split cells a designer pinned (a city, a dungeon entrance): never merged by the controller.
+    pinned_splits: HashSet<CellId>,
 }
 
 impl World {
@@ -476,6 +534,8 @@ impl World {
             history: HashMap::new(),
             pins: HashMap::new(),
             cell_scale: HashMap::new(),
+            split: HashSet::new(),
+            pinned_splits: HashSet::new(),
         }
     }
 
@@ -603,8 +663,9 @@ impl World {
         self.by_cell.get(&cell).map_or(0, |s| s.len())
     }
 
+    /// The leaf cell holding `p`: the base-grid cell, descended while cells are split.
     pub fn cell_of(&self, p: Pos) -> CellId {
-        grid_cell_of(self.cfg.cell_size, p)
+        leaf_of(self.cfg.cell_size, &self.split, p)
     }
 
     pub fn cell_bounds(&self, c: CellId) -> (Pos, Pos) {
@@ -616,15 +677,234 @@ impl World {
         grid_border_distance(self.cfg.cell_size, c, p)
     }
 
-    /// Cells a circle of interest touches (bounding box).
+    /// Leaf cells a circle of interest touches (bounding box).
     pub fn cells_in_radius(&self, p: Pos, radius: f64) -> Vec<CellId> {
-        grid_cells_in_radius(self.cfg.cell_size, p, radius)
+        grid_cells_in_radius(self.cfg.cell_size, &self.split, p, radius)
+    }
+
+    /// Leaf cells sharing a border or corner with `c` — coarser, equal or finer than `c`.
+    pub fn neighbours(&self, c: CellId) -> Vec<CellId> {
+        let (lo, hi) = self.cell_bounds(c);
+        let eps = self.cfg.cell_size * 1e-9;
+        let mut out = Vec::new();
+        for n in Self::grid_neighbours(c) {
+            let (nlo, nhi) = self.cell_bounds(n);
+            let centre = Pos {
+                x: (nlo.x + nhi.x) / 2.0,
+                y: (nlo.y + nhi.y) / 2.0,
+            };
+            let leaf = self.cell_of(centre);
+            if leaf.level <= n.level {
+                // `n` itself is a leaf, or a coarser leaf covers it
+                out.push(leaf);
+                continue;
+            }
+            // `n` is split: its descendant leaves that touch `c`
+            let mut stack = vec![n];
+            while let Some(k) = stack.pop() {
+                if self.split.contains(&k) {
+                    stack.extend(k.children());
+                    continue;
+                }
+                let (klo, khi) = self.cell_bounds(k);
+                let touches = khi.x >= lo.x - eps
+                    && klo.x <= hi.x + eps
+                    && khi.y >= lo.y - eps
+                    && klo.y <= hi.y + eps;
+                if touches {
+                    out.push(k);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out.retain(|n| *n != c);
+        out
+    }
+
+    pub fn is_split(&self, c: CellId) -> bool {
+        self.split.contains(&c)
+    }
+
+    /// A leaf: not split, and no ancestor is a leaf either (every ancestor is split).
+    pub fn is_leaf(&self, c: CellId) -> bool {
+        !self.split.contains(&c) && c.ancestors().all(|a| self.split.contains(&a))
+    }
+
+    /// Interior cells (split into four), coarsest first.
+    pub fn split_cells(&self) -> Vec<CellId> {
+        let mut v: Vec<CellId> = self.split.iter().copied().collect();
+        v.sort_by_key(|c| (c.level, c.x, c.y));
+        v
+    }
+
+    pub fn is_pinned_split(&self, c: CellId) -> bool {
+        self.pinned_splits.contains(&c)
+    }
+
+    fn transit_in(&self, cell: CellId) -> bool {
+        self.by_cell
+            .get(&cell)
+            .is_some_and(|ids| ids.iter().any(|id| self.entities[id].transit.is_some()))
+    }
+
+    fn rehome(&mut self, from: CellId, to_leaf: impl Fn(&Self, Pos) -> CellId) {
+        let ids: Vec<EntityId> = self
+            .by_cell
+            .get(&from)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let tick = self.tick;
+        for id in ids {
+            let pos = self.entities[&id].pos;
+            let target = to_leaf(self, pos);
+            if target == from {
+                continue;
+            }
+            self.by_cell.remove(&from, &id, tick);
+            self.by_cell.insert(target, id, tick);
+            self.entities.get_mut(&id).unwrap().cell = target;
+            if let Some(p) = self.pins.get_mut(&id) {
+                if p.0 == from {
+                    p.0 = target;
+                }
+            }
+        }
+    }
+
+    /// Split a leaf into four (plan 4.3): entities are re-homed by position, the lease, last
+    /// owner and time scale carry over to every child, so the owning simulator keeps
+    /// simulating and nothing is handed over. Refused above `max_depth`, for a split,
+    /// hibernated or unloaded cell, or while an entity of the cell is in handover.
+    pub fn split_cell(&mut self, c: CellId) -> std::result::Result<[CellId; 4], String> {
+        if c.level >= self.cfg.max_depth {
+            return Err(format!(
+                "cell {c:?} is already at max_depth {}",
+                self.cfg.max_depth
+            ));
+        }
+        if !self.is_leaf(c) {
+            return Err(format!("cell {c:?} is not a leaf"));
+        }
+        if self.hibernated.contains(&c) || self.unloaded.contains(&c) {
+            return Err(format!("cell {c:?} is hibernated or unloaded"));
+        }
+        if self.transit_in(c) {
+            return Err(format!("cell {c:?} has an entity in handover"));
+        }
+        let kids = c.children();
+        self.split.insert(c);
+        self.rehome(c, |w, p| w.cell_of(p));
+        if let Some(lease) = self.leases.remove(&c) {
+            for k in kids {
+                self.leases.insert(k, lease.clone());
+            }
+        }
+        if let Some(owner) = self.last_owners.remove(&c) {
+            for k in kids {
+                self.last_owners.insert(k, owner);
+            }
+        }
+        if let Some(scale) = self.cell_scale.remove(&c) {
+            for k in kids {
+                self.cell_scale.insert(k, scale);
+            }
+        }
+        Ok(kids)
+    }
+
+    /// Merge the four children of `parent` back into one leaf. Needs every child to be a leaf
+    /// with the same owner (or none), nothing in handover, no pin on the split. Returns the owner.
+    pub fn merge_cell(&mut self, parent: CellId) -> std::result::Result<Option<SimId>, String> {
+        if !self.split.contains(&parent) {
+            return Err(format!("cell {parent:?} is not split"));
+        }
+        if self.pinned_splits.contains(&parent) {
+            return Err(format!("split of {parent:?} is pinned"));
+        }
+        let kids = parent.children();
+        if kids.iter().any(|k| self.split.contains(k)) {
+            return Err(format!("a child of {parent:?} is split itself"));
+        }
+        if kids.iter().any(|k| {
+            self.hibernated.contains(k) || self.unloaded.contains(k) || self.transit_in(*k)
+        }) {
+            return Err(format!(
+                "a child of {parent:?} is hibernated, unloaded or in handover"
+            ));
+        }
+        let owners: std::collections::BTreeSet<SimId> =
+            kids.iter().filter_map(|k| self.owner(*k)).collect();
+        if owners.len() > 1 {
+            return Err(format!("children of {parent:?} have different owners"));
+        }
+        let owner = owners.into_iter().next();
+        self.split.remove(&parent);
+        for k in kids {
+            self.rehome(k, |_, _| parent);
+        }
+        let mut expires = 0u64;
+        let mut last = None;
+        let mut scale: Option<f64> = None;
+        for k in kids {
+            if let Some(l) = self.leases.remove(&k) {
+                expires = expires.max(l.expires_tick);
+            }
+            if let Some(o) = self.last_owners.remove(&k) {
+                last = Some(o);
+            }
+            if let Some(sc) = self.cell_scale.remove(&k) {
+                scale = Some(scale.map_or(sc, |s: f64| s.min(sc)));
+            }
+        }
+        if let Some(sim) = owner {
+            self.leases.insert(
+                parent,
+                Lease {
+                    sim,
+                    expires_tick: expires,
+                },
+            );
+            self.last_owners.insert(parent, sim);
+        } else if let Some(o) = last {
+            self.last_owners.insert(parent, o);
+        }
+        if let Some(sc) = scale {
+            self.cell_scale.insert(parent, sc);
+        }
+        Ok(owner)
+    }
+
+    /// Designer pin (plan 4.3 static configuration): `c` and every ancestor are split now and
+    /// the controller never merges `c` back. Fails like `split_cell` when a split is refused.
+    pub fn pin_split(&mut self, c: CellId) -> std::result::Result<(), String> {
+        if c.level >= self.cfg.max_depth {
+            return Err(format!(
+                "cell {c:?} is at or below max_depth {}",
+                self.cfg.max_depth
+            ));
+        }
+        let mut chain: Vec<CellId> = c.ancestors().collect();
+        chain.reverse();
+        chain.push(c);
+        for a in chain {
+            if !self.split.contains(&a) {
+                self.split_cell(a)?;
+            }
+        }
+        self.pinned_splits.insert(c);
+        Ok(())
+    }
+
+    pub fn unpin_split(&mut self, c: CellId) -> bool {
+        self.pinned_splits.remove(&c)
     }
 
     /// A read-only copy of what the per-client delta build needs, so that deltas for thousands
     /// of clients can be built off the world lock (the tick holds it only for the copy).
     pub fn snapshot(&self) -> WorldView {
         WorldView {
+            split: self.split.clone(),
             tick: self.tick,
             cfg: self.cfg.clone(),
             entities: self.entities.clone(),
@@ -1015,12 +1295,14 @@ impl World {
 
     // ----- ghosts & views -----
 
-    pub fn neighbours(c: CellId) -> impl Iterator<Item = CellId> {
+    /// The eight cells around `c` at its own level (whether or not they are leaves).
+    pub fn grid_neighbours(c: CellId) -> impl Iterator<Item = CellId> {
         (-1..=1).flat_map(move |dx| {
             (-1..=1).filter_map(move |dy| {
                 (dx != 0 || dy != 0).then_some(CellId {
                     x: c.x + dx,
                     y: c.y + dy,
+                    level: c.level,
                 })
             })
         })
@@ -1036,7 +1318,7 @@ impl World {
     /// Entities in cells adjacent to `cell` that lie within `ghost_margin` of its border.
     pub fn ghosts_for(&self, cell: CellId) -> Vec<&Entity> {
         let mut out = Vec::new();
-        for n in Self::neighbours(cell) {
+        for n in self.neighbours(cell) {
             let Some(ids) = self.by_cell.get(&n) else {
                 continue;
             };
@@ -1632,6 +1914,251 @@ fn estimate_refs(v: &[ComponentRef]) -> usize {
 mod tests {
     use super::*;
 
+    fn quad_world() -> World {
+        World::new(WorldConfig {
+            cell_size: 100.0,
+            max_depth: 2,
+            ghost_margin: 5.0,
+            hysteresis: 2.0,
+            ..WorldConfig::default()
+        })
+    }
+
+    fn at(x: f64, y: f64) -> Pos {
+        Pos { x, y }
+    }
+
+    #[test]
+    fn quadtree_split_rehomes_entities_and_carries_the_lease() {
+        let mut w = quad_world();
+        let sim = Uuid::now_v7();
+        let root = CellId::root(0, 0);
+        w.grant_lease(root, sim);
+        let a = w.spawn(at(10.0, 10.0), BTreeMap::new(), false);
+        let b = w.spawn(at(90.0, 10.0), BTreeMap::new(), false);
+        let c = w.spawn(at(10.0, 90.0), BTreeMap::new(), false);
+        let far = w.spawn(at(150.0, 10.0), BTreeMap::new(), false);
+        assert_eq!(w.cell_of(at(10.0, 10.0)), root);
+        let kids = w.split_cell(root).unwrap();
+        assert_eq!(
+            kids[0],
+            CellId {
+                x: 0,
+                y: 0,
+                level: 1
+            }
+        );
+        assert!(w.is_split(root) && !w.is_leaf(root));
+        assert!(kids.iter().all(|k| w.is_leaf(*k)));
+        assert_eq!(
+            w.get(a).unwrap().cell,
+            CellId {
+                x: 0,
+                y: 0,
+                level: 1
+            }
+        );
+        assert_eq!(
+            w.get(b).unwrap().cell,
+            CellId {
+                x: 1,
+                y: 0,
+                level: 1
+            }
+        );
+        assert_eq!(
+            w.get(c).unwrap().cell,
+            CellId {
+                x: 0,
+                y: 1,
+                level: 1
+            }
+        );
+        assert_eq!(w.get(far).unwrap().cell, CellId::root(1, 0));
+        assert_eq!(
+            w.cell_of(at(90.0, 10.0)),
+            CellId {
+                x: 1,
+                y: 0,
+                level: 1
+            }
+        );
+        for k in kids {
+            assert_eq!(w.owner(k), Some(sim), "{k:?}");
+        }
+        assert_eq!(w.owner(root), None);
+        assert_eq!(
+            w.entities_in(CellId {
+                x: 1,
+                y: 0,
+                level: 1
+            }),
+            1
+        );
+        // bounds halve per level; a leaf cannot split below max_depth
+        let (lo, hi) = w.cell_bounds(CellId {
+            x: 1,
+            y: 0,
+            level: 1,
+        });
+        assert_eq!((lo.x, hi.x, hi.y), (50.0, 100.0, 50.0));
+        let deeper = w
+            .split_cell(CellId {
+                x: 1,
+                y: 0,
+                level: 1,
+            })
+            .unwrap();
+        assert!(w.split_cell(deeper[0]).is_err(), "max_depth 2 reached");
+        assert!(w.split_cell(root).is_err(), "already split");
+        // the circle of interest resolves to leaves of mixed depth
+        let cells = w.cells_in_radius(at(95.0, 5.0), 10.0);
+        assert!(cells.contains(&CellId::root(1, 0)), "{cells:?}");
+        assert!(
+            cells.contains(&CellId {
+                x: 3,
+                y: 0,
+                level: 2
+            }),
+            "{cells:?}"
+        );
+        assert!(
+            !cells.contains(&root)
+                && !cells.contains(&CellId {
+                    x: 1,
+                    y: 0,
+                    level: 1
+                }),
+            "{cells:?}"
+        );
+        // neighbours cross levels: the fine cell next to the coarse root (1,0) sees it once
+        let n = w.neighbours(CellId {
+            x: 3,
+            y: 0,
+            level: 2,
+        });
+        assert!(
+            n.contains(&CellId::root(1, 0))
+                && n.contains(&CellId {
+                    x: 2,
+                    y: 0,
+                    level: 2
+                }),
+            "{n:?}"
+        );
+        assert!(
+            n.contains(&CellId {
+                x: 3,
+                y: 1,
+                level: 2
+            }),
+            "{n:?}"
+        );
+        assert!(!n.contains(&CellId {
+            x: 3,
+            y: 0,
+            level: 2
+        }));
+        // and the coarse root (1,0) sees the fine leaves on its western edge, not the split parent
+        let n = w.neighbours(CellId::root(1, 0));
+        assert!(
+            n.contains(&CellId {
+                x: 3,
+                y: 0,
+                level: 2
+            }) && n.contains(&CellId {
+                x: 3,
+                y: 1,
+                level: 2
+            }),
+            "{n:?}"
+        );
+        assert!(
+            !n.contains(&CellId {
+                x: 1,
+                y: 0,
+                level: 1
+            }) && !n.contains(&root),
+            "{n:?}"
+        );
+    }
+
+    #[test]
+    fn quadtree_merge_needs_one_owner_and_respects_pins() {
+        let mut w = quad_world();
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let root = CellId::root(0, 0);
+        w.grant_lease(root, s1);
+        let e = w.spawn(at(90.0, 90.0), BTreeMap::new(), false);
+        let kids = w.split_cell(root).unwrap();
+        w.revoke_lease(kids[3]);
+        w.grant_lease(kids[3], s2);
+        assert!(w.merge_cell(root).is_err(), "two owners");
+        w.revoke_lease(kids[3]);
+        w.grant_lease(kids[3], s1);
+        assert_eq!(w.merge_cell(root).unwrap(), Some(s1));
+        assert!(w.is_leaf(root) && w.owner(root) == Some(s1));
+        assert_eq!(w.get(e).unwrap().cell, root);
+        assert_eq!(w.entities_in(root), 1);
+        assert!(w.merge_cell(root).is_err(), "not split any more");
+        // a pinned split: ancestors split on the way, never merged
+        let deep = CellId {
+            x: 3,
+            y: 3,
+            level: 2,
+        };
+        w.pin_split(CellId {
+            x: 1,
+            y: 1,
+            level: 1,
+        })
+        .unwrap();
+        assert!(
+            w.is_split(root)
+                && w.is_split(CellId {
+                    x: 1,
+                    y: 1,
+                    level: 1
+                })
+        );
+        assert!(w.is_leaf(deep));
+        assert!(
+            w.merge_cell(CellId {
+                x: 1,
+                y: 1,
+                level: 1
+            })
+            .is_err(),
+            "pinned"
+        );
+        assert!(w.unpin_split(CellId {
+            x: 1,
+            y: 1,
+            level: 1
+        }));
+        assert_eq!(
+            w.merge_cell(CellId {
+                x: 1,
+                y: 1,
+                level: 1
+            })
+            .unwrap(),
+            Some(s1)
+        );
+        assert!(w.pin_split(deep).is_err(), "cannot split below max_depth");
+        // an unleased split merges to no owner
+        for k in root.children() {
+            w.revoke_lease(k);
+        }
+        assert_eq!(w.merge_cell(root).unwrap(), None);
+        // a fixed grid never splits
+        let mut flat = World::new(WorldConfig {
+            max_depth: 0,
+            ..WorldConfig::default()
+        });
+        assert!(flat.split_cell(CellId::root(0, 0)).is_err());
+    }
+
     fn comps(v: serde_json::Value) -> BTreeMap<String, serde_json::Value> {
         v.as_object()
             .unwrap()
@@ -1650,8 +2177,22 @@ mod tests {
         });
         let s1 = Uuid::now_v7();
         let s2 = Uuid::now_v7();
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
-        w.grant_lease(CellId { x: 1, y: 0 }, s2);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
+        w.grant_lease(
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+            s2,
+        );
         let a = w.spawn(
             Pos { x: 95.0, y: 50.0 },
             comps(serde_json::json!({"hp": 100})),
@@ -1662,15 +2203,30 @@ mod tests {
             comps(serde_json::json!({"hp": 100})),
             false,
         );
-        assert_eq!(w.get(a).unwrap().cell, CellId { x: 0, y: 0 });
+        assert_eq!(
+            w.get(a).unwrap().cell,
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0
+            }
+        );
         // a is within 10 of the border → ghost for cell (1,0); b is not
         let ghosts: Vec<EntityId> = w
-            .ghosts_for(CellId { x: 1, y: 0 })
+            .ghosts_for(CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            })
             .iter()
             .map(|e| e.id)
             .collect();
         assert_eq!(ghosts, vec![a]);
-        let v = w.view(CellId { x: 0, y: 0 });
+        let v = w.view(CellId {
+            x: 0,
+            y: 0,
+            level: 0,
+        });
         assert_eq!(v.owned.len(), 2);
         assert!(v.ghosts.is_empty());
         // only s1 may write to a
@@ -1695,8 +2251,22 @@ mod tests {
         });
         let s1 = Uuid::now_v7();
         let s2 = Uuid::now_v7();
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
-        w.grant_lease(CellId { x: 1, y: 0 }, s2);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
+        w.grant_lease(
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+            s2,
+        );
         let a = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
         // crossing by less than hysteresis: nothing happens
         w.apply(s1, a, Some(Pos { x: 103.0, y: 50.0 }), BTreeMap::new())
@@ -1724,7 +2294,14 @@ mod tests {
         let (outcome, inputs) = w.handover_ack(s2, a).unwrap();
         assert_eq!(outcome, HandoverOutcome::Completed { entity: a, to: s2 });
         assert_eq!(inputs.len(), 1);
-        assert_eq!(w.get(a).unwrap().cell, CellId { x: 1, y: 0 });
+        assert_eq!(
+            w.get(a).unwrap().cell,
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }
+        );
         assert_eq!(w.route_input(a, serde_json::json!({})).unwrap(), Some(s2));
         assert!(w.apply(s1, a, None, BTreeMap::new()).is_err());
         // timeout path: move back towards s1, never ack → cancelled after 3 ticks, authority stays with s2
@@ -1750,17 +2327,52 @@ mod tests {
             ..Default::default()
         });
         let s1 = Uuid::now_v7();
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
-        w.grant_lease(CellId { x: 1, y: 0 }, s1);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
+        w.grant_lease(
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
         let a = w.spawn(Pos { x: 50.0, y: 50.0 }, BTreeMap::new(), true);
         w.apply(s1, a, Some(Pos { x: 150.0, y: 50.0 }), BTreeMap::new())
             .unwrap();
         assert!(w.detect_handovers().is_empty());
-        assert_eq!(w.get(a).unwrap().cell, CellId { x: 1, y: 0 });
+        assert_eq!(
+            w.get(a).unwrap().cell,
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }
+        );
         w.advance();
         w.advance();
-        assert_eq!(w.owner(CellId { x: 1, y: 0 }), None);
-        assert_eq!(w.orphaned_cells(), vec![CellId { x: 1, y: 0 }]);
+        assert_eq!(
+            w.owner(CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }),
+            None
+        );
+        assert_eq!(
+            w.orphaned_cells(),
+            vec![CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }]
+        );
         let snap = w.snapshot_persistent();
         assert_eq!(snap.len(), 1);
         let mut w2 = World::new(WorldConfig {
@@ -1768,7 +2380,14 @@ mod tests {
             ..Default::default()
         });
         w2.restore(snap);
-        assert_eq!(w2.get(a).unwrap().cell, CellId { x: 1, y: 0 });
+        assert_eq!(
+            w2.get(a).unwrap().cell,
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0
+            }
+        );
     }
 
     #[test]
@@ -1778,7 +2397,14 @@ mod tests {
             ..Default::default()
         });
         let s1 = Uuid::now_v7();
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
         let c = Uuid::now_v7();
         w.subscribe(c, Pos { x: 0.0, y: 0.0 }, 60.0);
         let near = w.spawn(
@@ -1812,7 +2438,14 @@ mod tests {
             ..Default::default()
         });
         let s1 = Uuid::now_v7();
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
         let c = Uuid::now_v7();
         // budget of one byte: exactly one entity per tick, nearest first
         w.subscribe_with(
@@ -1865,8 +2498,22 @@ mod tests {
         });
         let s1 = Uuid::now_v7();
         let s2 = Uuid::now_v7();
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
-        w.grant_lease(CellId { x: 1, y: 0 }, s2);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
+        w.grant_lease(
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+            s2,
+        );
         let v = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
         let p = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
         let q = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
@@ -1895,7 +2542,14 @@ mod tests {
         assert_eq!(outcome, HandoverOutcome::Completed { entity: v, to: s2 });
         for e in [v, p, q] {
             let e = w.get(e).unwrap();
-            assert_eq!(e.cell, CellId { x: 1, y: 0 });
+            assert_eq!(
+                e.cell,
+                CellId {
+                    x: 1,
+                    y: 0,
+                    level: 0
+                }
+            );
             assert!(e.transit.is_none());
         }
         assert_eq!(w.route_input(q, serde_json::json!({})).unwrap(), Some(s2));
@@ -1937,7 +2591,14 @@ mod tests {
             ..Default::default()
         });
         let s1 = Uuid::now_v7();
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
         let c = Uuid::now_v7();
         let mut filter = BTreeMap::new();
         filter.insert("team".to_string(), serde_json::json!("red"));
@@ -1992,7 +2653,7 @@ mod perf {
         let lease_all = |w: &mut World| {
             for x in 0..3 {
                 for y in 0..3 {
-                    w.grant_lease(CellId { x, y }, s1);
+                    w.grant_lease(CellId { x, y, level: 0 }, s1);
                 }
             }
         };
@@ -2062,15 +2723,31 @@ mod perf {
     }
 }
 
-fn grid_cell_of(size: f64, p: Pos) -> CellId {
+/// Side of a cell at quadtree depth `level`.
+fn size_at(base: f64, level: u8) -> f64 {
+    base / f64::from(1u32 << level)
+}
+
+fn cell_at(base: f64, level: u8, p: Pos) -> CellId {
+    let s = size_at(base, level);
     CellId {
-        x: (p.x / size).floor() as i32,
-        y: (p.y / size).floor() as i32,
+        x: (p.x / s).floor() as i32,
+        y: (p.y / s).floor() as i32,
+        level,
     }
 }
 
-fn grid_bounds(size: f64, c: CellId) -> (Pos, Pos) {
-    let s = size;
+/// Deepest cell holding `p`: descend from the base grid while cells are split.
+fn leaf_of(base: f64, split: &HashSet<CellId>, p: Pos) -> CellId {
+    let mut c = cell_at(base, 0, p);
+    while split.contains(&c) {
+        c = cell_at(base, c.level + 1, p);
+    }
+    c
+}
+
+fn grid_bounds(base: f64, c: CellId) -> (Pos, Pos) {
+    let s = size_at(base, c.level);
     (
         Pos {
             x: c.x as f64 * s,
@@ -2083,34 +2760,47 @@ fn grid_bounds(size: f64, c: CellId) -> (Pos, Pos) {
     )
 }
 
-fn grid_border_distance(size: f64, c: CellId, p: Pos) -> f64 {
-    let (lo, hi) = grid_bounds(size, c);
+fn grid_border_distance(base: f64, c: CellId, p: Pos) -> f64 {
+    let (lo, hi) = grid_bounds(base, c);
     let dx = (p.x - lo.x).min(hi.x - p.x);
     let dy = (p.y - lo.y).min(hi.y - p.y);
     dx.min(dy)
 }
 
-fn grid_cells_in_radius(size: f64, p: Pos, radius: f64) -> Vec<CellId> {
-    let lo = grid_cell_of(
-        size,
+/// Leaf cells whose bounds intersect the square around `p` of half-side `radius`.
+fn grid_cells_in_radius(base: f64, split: &HashSet<CellId>, p: Pos, radius: f64) -> Vec<CellId> {
+    let (qlo, qhi) = (
         Pos {
             x: p.x - radius,
             y: p.y - radius,
         },
-    );
-    let hi = grid_cell_of(
-        size,
         Pos {
             x: p.x + radius,
             y: p.y + radius,
         },
     );
+    let lo = cell_at(base, 0, qlo);
+    let hi = cell_at(base, 0, qhi);
     let mut v = Vec::new();
+    let mut stack = Vec::new();
     for x in lo.x..=hi.x {
         for y in lo.y..=hi.y {
-            v.push(CellId { x, y });
+            stack.push(CellId::root(x, y));
+            while let Some(c) = stack.pop() {
+                if !split.contains(&c) {
+                    v.push(c);
+                    continue;
+                }
+                for k in c.children() {
+                    let (klo, khi) = grid_bounds(base, k);
+                    if khi.x > qlo.x && klo.x < qhi.x && khi.y > qlo.y && klo.y < qhi.y {
+                        stack.push(k);
+                    }
+                }
+            }
         }
     }
+    v.sort();
     v
 }
 
@@ -2124,11 +2814,12 @@ pub struct WorldView {
     entities: HashMap<EntityId, Entity>,
     by_cell: CellIndex,
     cell_scale: HashMap<CellId, f64>,
+    split: HashSet<CellId>,
 }
 
 impl WorldView {
     pub fn cells_in_radius(&self, p: Pos, radius: f64) -> Vec<CellId> {
-        grid_cells_in_radius(self.cfg.cell_size, p, radius)
+        grid_cells_in_radius(self.cfg.cell_size, &self.split, p, radius)
     }
 
     /// Slowest time scale around a client's interest (1.0 when undilated).

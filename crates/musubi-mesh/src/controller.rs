@@ -51,6 +51,14 @@ pub struct ControllerConfig {
     pub merge_cost: f64,
     /// Consecutive control rounds under `merge_cost` before merging (hysteresis against flapping).
     pub merge_after_rounds: u32,
+    /// Quadtree (plan 4.3): a leaf whose own cost stays above this for `split_cell_after_rounds`
+    /// rounds splits into four (needs `WorldConfig::max_depth` > 0); 0 disables.
+    pub split_cell_cost: f64,
+    pub split_cell_after_rounds: u32,
+    /// Four sibling leaves whose summed cost stays under this for `merge_cell_after_rounds`
+    /// rounds merge back into their parent (hysteresis against flapping).
+    pub merge_cell_cost: f64,
+    pub merge_cell_after_rounds: u32,
 }
 
 impl Default for ControllerConfig {
@@ -64,6 +72,10 @@ impl Default for ControllerConfig {
             cost_traffic: 20.0,
             merge_cost: 50.0,
             merge_after_rounds: 30,
+            split_cell_cost: 300.0,
+            split_cell_after_rounds: 3,
+            merge_cell_cost: 60.0,
+            merge_cell_after_rounds: 30,
         }
     }
 }
@@ -81,6 +93,10 @@ pub struct Controller {
     traffic: BTreeMap<CellId, f64>,
     /// Control rounds each simulator has spent under `merge_cost` in a row.
     quiet_rounds: BTreeMap<SimId, u32>,
+    /// Control rounds each leaf has spent above `split_cell_cost` in a row.
+    hot_rounds: BTreeMap<CellId, u32>,
+    /// Control rounds each split parent's children have spent under `merge_cell_cost` in a row.
+    cold_rounds: BTreeMap<CellId, u32>,
 }
 
 impl Controller {
@@ -91,6 +107,8 @@ impl Controller {
             idle_since: BTreeMap::new(),
             traffic: BTreeMap::new(),
             quiet_rounds: BTreeMap::new(),
+            hot_rounds: BTreeMap::new(),
+            cold_rounds: BTreeMap::new(),
         }
     }
 
@@ -227,7 +245,10 @@ impl Controller {
             if !self.is_alive(s, tick) || !self.has_room(world, s) {
                 continue;
             }
-            let adjacent = World::neighbours(cell).any(|n| world.owner(n) == Some(s));
+            let adjacent = world
+                .neighbours(cell)
+                .into_iter()
+                .any(|n| world.owner(n) == Some(s));
             let load = self.cost(world, s);
             let key = (adjacent, load, s);
             best = match best {
@@ -302,6 +323,124 @@ impl Controller {
 
     /// Periodic pass: re-lease orphaned cells, shed load from overloaded simulators, merge the
     /// cells of quiet ones onto their neighbours.
+    /// Quadtree control (plan 4.3): hot leaves split (the owner keeps all four children — no
+    /// handover, the simulator just reports per child from now on), cold sibling groups merge
+    /// back once their owners agree; siblings with different owners are first consolidated onto
+    /// the one holding most of them, the merge follows a round later.
+    fn split_and_merge_cells(&mut self, world: &mut World, out: &mut Vec<Assignment>) {
+        if world.cfg.max_depth == 0 {
+            return;
+        }
+        let tick = world.tick;
+        if self.cfg.split_cell_cost > 0.0 {
+            let mut hot = std::mem::take(&mut self.hot_rounds);
+            let leased = world.leased_cells();
+            hot.retain(|c, _| leased.iter().any(|(l, _)| l == c));
+            for (c, sim) in leased {
+                if c.level >= world.cfg.max_depth
+                    || self.cell_cost(world, c) <= self.cfg.split_cell_cost
+                {
+                    hot.remove(&c);
+                    continue;
+                }
+                let rounds = hot.entry(c).or_insert(0);
+                *rounds += 1;
+                if *rounds < self.cfg.split_cell_after_rounds.max(1) {
+                    continue;
+                }
+                hot.remove(&c);
+                if let Ok(kids) = world.split_cell(c) {
+                    self.traffic.remove(&c);
+                    self.idle_since.remove(&c);
+                    for k in kids {
+                        out.push(Assignment {
+                            cell: k,
+                            from: None,
+                            to: sim,
+                            reason: "split".into(),
+                        });
+                    }
+                }
+            }
+            self.hot_rounds = hot;
+        }
+        let mut cold = std::mem::take(&mut self.cold_rounds);
+        let parents = world.split_cells();
+        cold.retain(|c, _| parents.contains(c));
+        for p in parents {
+            let kids = p.children();
+            if world.is_pinned_split(p) || kids.iter().any(|k| world.is_split(*k)) {
+                cold.remove(&p);
+                continue;
+            }
+            let sum: f64 = kids.iter().map(|k| self.cell_cost(world, *k)).sum();
+            if sum >= self.cfg.merge_cell_cost {
+                cold.remove(&p);
+                continue;
+            }
+            let rounds = cold.entry(p).or_insert(0);
+            *rounds += 1;
+            if *rounds < self.cfg.merge_cell_after_rounds.max(1) {
+                continue;
+            }
+            let mut owners: BTreeMap<SimId, usize> = BTreeMap::new();
+            for k in kids {
+                if let Some(o) = world.owner(k) {
+                    *owners.entry(o).or_insert(0) += 1;
+                }
+            }
+            if owners.len() > 1 {
+                let target = owners
+                    .iter()
+                    .filter(|(o, _)| self.is_alive(**o, tick))
+                    .max_by_key(|(o, n)| (**n, std::cmp::Reverse(self.cost(world, **o) as i64)))
+                    .map(|(o, _)| *o);
+                let Some(target) = target else {
+                    continue;
+                };
+                for k in kids {
+                    let from = world.owner(k);
+                    if from == Some(target) || from.is_none() {
+                        continue;
+                    }
+                    if !self.has_room(world, target) {
+                        break;
+                    }
+                    world.revoke_lease(k);
+                    world.grant_lease(k, target);
+                    out.push(Assignment {
+                        cell: k,
+                        from,
+                        to: target,
+                        reason: "consolidate".into(),
+                    });
+                }
+                continue;
+            }
+            match world.merge_cell(p) {
+                Ok(owner) => {
+                    cold.remove(&p);
+                    for k in kids {
+                        self.traffic.remove(&k);
+                        self.idle_since.remove(&k);
+                    }
+                    if let Some(o) = owner {
+                        out.push(Assignment {
+                            cell: p,
+                            from: None,
+                            to: o,
+                            reason: "merge_cells".into(),
+                        });
+                    }
+                }
+                Err(_) => {
+                    cold.remove(&p);
+                }
+            }
+        }
+        self.cold_rounds = cold;
+    }
+
     pub fn reconcile(&mut self, world: &mut World) -> Vec<Assignment> {
         let mut out = Vec::new();
         for c in world.orphaned_cells() {
@@ -318,6 +457,7 @@ impl Controller {
         // empty cells of dead simulators simply become free
         world.drop_lapsed_leases();
         let tick = world.tick;
+        self.split_and_merge_cells(world, &mut out);
         // a simulator that cannot keep up sheds a cell before its cells get dilated (plan 4.8:
         // split first, time dilation only when there is nothing left to move)
         let tidi_after = world.cfg.tidi_after_ticks.max(1);
@@ -336,7 +476,9 @@ impl Controller {
                 .iter()
                 .copied()
                 .min_by_key(|c| {
-                    World::neighbours(*c)
+                    world
+                        .neighbours(*c)
+                        .into_iter()
                         .filter(|n| world.owner(*n) == Some(s))
                         .count()
                 })
@@ -386,7 +528,9 @@ impl Controller {
             }
             let mut plan: Vec<(CellId, SimId)> = Vec::new();
             for c in &cells {
-                let dest = World::neighbours(*c)
+                let dest = world
+                    .neighbours(*c)
+                    .into_iter()
                     .filter_map(|n| world.owner(n))
                     .filter(|o| *o != s && self.is_alive(*o, tick) && self.has_room(world, *o))
                     .filter(|o| self.lag(*o, tick) <= tidi_after)
@@ -427,6 +571,110 @@ impl Controller {
 mod tests {
     use super::*;
     use crate::{Pos, WorldConfig};
+
+    #[test]
+    fn hot_leaf_splits_and_cold_siblings_merge_after_consolidation() {
+        let mut world = World::new(WorldConfig {
+            cell_size: 100.0,
+            max_depth: 1,
+            ..WorldConfig::default()
+        });
+        let mut ctl = Controller::new(ControllerConfig {
+            split_cell_cost: 3.0,
+            split_cell_after_rounds: 2,
+            merge_cell_cost: 2.0,
+            merge_cell_after_rounds: 2,
+            cost_entity: 1.0,
+            cost_player: 0.0,
+            cost_traffic: 0.0,
+            split_cost: 1e9,
+            merge_cost: 0.0,
+            ..ControllerConfig::default()
+        });
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        ctl.register(s1, 16, 0);
+        ctl.register(s2, 16, 0);
+        let root = CellId::root(0, 0);
+        world.grant_lease(root, s1);
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(world.spawn(
+                Pos {
+                    x: 10.0 + 20.0 * i as f64,
+                    y: 10.0,
+                },
+                std::collections::BTreeMap::new(),
+                false,
+            ));
+        }
+        // round 1 is hysteresis, round 2 splits: four children, all to s1, nothing revoked
+        assert!(ctl
+            .reconcile(&mut world)
+            .iter()
+            .all(|a| a.reason != "split"));
+        assert!(!world.is_split(root));
+        let moves = ctl.reconcile(&mut world);
+        let splits: Vec<&Assignment> = moves.iter().filter(|a| a.reason == "split").collect();
+        assert_eq!(splits.len(), 4, "{moves:?}");
+        assert!(splits
+            .iter()
+            .all(|a| a.to == s1 && a.from.is_none() && a.cell.level == 1));
+        assert!(world.is_split(root));
+        assert_eq!(
+            world.entities_in(CellId {
+                x: 0,
+                y: 0,
+                level: 1
+            }),
+            2
+        );
+        assert_eq!(
+            world.entities_in(CellId {
+                x: 1,
+                y: 0,
+                level: 1
+            }),
+            2
+        );
+        // cool down: despawn three, hand one child to s2 → consolidate first, then merge
+        for id in &ids[..3] {
+            world.despawn(*id);
+        }
+        world.revoke_lease(CellId {
+            x: 1,
+            y: 1,
+            level: 1,
+        });
+        world.grant_lease(
+            CellId {
+                x: 1,
+                y: 1,
+                level: 1,
+            },
+            s2,
+        );
+        assert!(ctl
+            .reconcile(&mut world)
+            .iter()
+            .all(|a| a.reason != "consolidate"));
+        let moves = ctl.reconcile(&mut world);
+        let cons: Vec<&Assignment> = moves.iter().filter(|a| a.reason == "consolidate").collect();
+        assert_eq!(cons.len(), 1, "{moves:?}");
+        assert_eq!((cons[0].from, cons[0].to), (Some(s2), s1));
+        assert!(
+            world.is_split(root),
+            "merge waits a round after consolidation"
+        );
+        let moves = ctl.reconcile(&mut world);
+        assert!(
+            moves
+                .iter()
+                .any(|a| a.reason == "merge_cells" && a.cell == root && a.to == s1),
+            "{moves:?}"
+        );
+        assert!(world.is_leaf(root) && world.owner(root) == Some(s1));
+        assert_eq!(world.entities_in(root), 1);
+    }
 
     #[test]
     fn soft_cap_refuses_spawn_but_not_handover_room_check() {
@@ -474,7 +722,18 @@ mod tests {
         let (slow, fast) = (SimId::now_v7(), SimId::now_v7());
         ctl.register(slow, 4, 0);
         ctl.register(fast, 4, 0);
-        let (a, b) = (CellId { x: 0, y: 0 }, CellId { x: 1, y: 0 });
+        let (a, b) = (
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+        );
         w.grant_lease(a, slow);
         w.grant_lease(b, slow);
         w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
@@ -529,7 +788,11 @@ mod tests {
         let mut ctl = Controller::new(ControllerConfig::default());
         let sim = SimId::now_v7();
         ctl.register(sim, 4, 0);
-        let c = CellId { x: 0, y: 0 };
+        let c = CellId {
+            x: 0,
+            y: 0,
+            level: 0,
+        };
         w.grant_lease(c, sim);
         let keep = w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), true);
         let litter = w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
@@ -577,7 +840,11 @@ mod tests {
             ..WorldConfig::default()
         });
         let sim = SimId::now_v7();
-        let c = CellId { x: 0, y: 0 };
+        let c = CellId {
+            x: 0,
+            y: 0,
+            level: 0,
+        };
         w.grant_lease(c, sim);
         let litter = w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), true);
         let forever = w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
@@ -619,7 +886,18 @@ mod tests {
         let (s1, s2) = (SimId::now_v7(), SimId::now_v7());
         ctl.register(s1, 4, 0);
         ctl.register(s2, 4, 0);
-        let (a, b) = (CellId { x: 0, y: 0 }, CellId { x: 1, y: 0 });
+        let (a, b) = (
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+        );
         w.grant_lease(a, s1);
         w.grant_lease(b, s1);
         w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
@@ -666,7 +944,18 @@ mod tests {
         let (s1, s2) = (SimId::now_v7(), SimId::now_v7());
         ctl.register(s1, 4, 0);
         ctl.register(s2, 4, 0);
-        let (a, b) = (CellId { x: 0, y: 0 }, CellId { x: 1, y: 0 });
+        let (a, b) = (
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+        );
         w.grant_lease(a, s1);
         w.grant_lease(b, s2);
         w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
@@ -731,7 +1020,11 @@ mod tests {
         let mut ctl = Controller::new(ControllerConfig::default());
         let sim = SimId::now_v7();
         ctl.register(sim, 4, 0);
-        let c = CellId { x: 0, y: 0 };
+        let c = CellId {
+            x: 0,
+            y: 0,
+            level: 0,
+        };
         w.grant_lease(c, sim);
         // never reported: no dilation
         w.tick = 100;
@@ -778,18 +1071,84 @@ mod tests {
         c.register(s1, 2, 0);
         c.register(s2, 2, 0);
         let a = c
-            .ensure_leased(&mut w, CellId { x: 0, y: 0 }, Some(s1), "spawn")
+            .ensure_leased(
+                &mut w,
+                CellId {
+                    x: 0,
+                    y: 0,
+                    level: 0,
+                },
+                Some(s1),
+                "spawn",
+            )
             .unwrap();
         assert_eq!(a.to, s1);
         // neighbour of s1's cell → s1 again (adjacency beats s2's lower load)
-        assert_eq!(c.pick(&w, CellId { x: 1, y: 0 }, None), Some(s1));
-        c.ensure_leased(&mut w, CellId { x: 1, y: 0 }, None, "x");
-        // s1 is full now → far cell goes to s2
-        assert_eq!(c.pick(&w, CellId { x: 2, y: 0 }, None), Some(s2));
-        c.ensure_leased(&mut w, CellId { x: 2, y: 0 }, None, "x");
-        c.ensure_leased(&mut w, CellId { x: 3, y: 0 }, None, "x");
         assert_eq!(
-            c.pick(&w, CellId { x: 9, y: 9 }, None),
+            c.pick(
+                &w,
+                CellId {
+                    x: 1,
+                    y: 0,
+                    level: 0
+                },
+                None
+            ),
+            Some(s1)
+        );
+        c.ensure_leased(
+            &mut w,
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+            None,
+            "x",
+        );
+        // s1 is full now → far cell goes to s2
+        assert_eq!(
+            c.pick(
+                &w,
+                CellId {
+                    x: 2,
+                    y: 0,
+                    level: 0
+                },
+                None
+            ),
+            Some(s2)
+        );
+        c.ensure_leased(
+            &mut w,
+            CellId {
+                x: 2,
+                y: 0,
+                level: 0,
+            },
+            None,
+            "x",
+        );
+        c.ensure_leased(
+            &mut w,
+            CellId {
+                x: 3,
+                y: 0,
+                level: 0,
+            },
+            None,
+            "x",
+        );
+        assert_eq!(
+            c.pick(
+                &w,
+                CellId {
+                    x: 9,
+                    y: 9,
+                    level: 0
+                },
+                None
+            ),
             None,
             "everyone is full"
         );
@@ -806,8 +1165,22 @@ mod tests {
         let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
         c.register(s1, 4, 0);
         c.register(s2, 4, 0);
-        w.grant_lease(CellId { x: 0, y: 0 }, s1);
-        w.grant_lease(CellId { x: 1, y: 0 }, s1);
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
+        w.grant_lease(
+            CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+            },
+            s1,
+        );
         for x in [10.0, 20.0, 110.0, 120.0] {
             w.spawn(Pos { x, y: 10.0 }, BTreeMap::new(), false);
         }
