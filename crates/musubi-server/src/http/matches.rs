@@ -137,6 +137,18 @@ async fn backfill(
 /// frames the processed inputs/membership steps between snapshots. Available while the match
 /// is running (frames so far) and after it ended (`ended_at` set), until retention
 /// (`[retention] replay_days`) removes it.
+/// (match_id, module, label, params, started_at, ended_at, last_tick, participants)
+type ReplayRow = (
+    uuid::Uuid,
+    String,
+    String,
+    serde_json::Value,
+    String,
+    Option<String>,
+    i64,
+    Vec<uuid::Uuid>,
+);
+
 #[derive(Deserialize, Default)]
 struct ReplaysQuery {
     module: Option<String>,
@@ -175,16 +187,7 @@ async fn replays(
     };
     let (since, before) = (parse(&q.since)?, parse(&q.before)?);
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let rows: Vec<(
-        uuid::Uuid,
-        String,
-        String,
-        serde_json::Value,
-        String,
-        Option<String>,
-        i64,
-        Vec<uuid::Uuid>,
-    )> = sqlx::query_as(
+    let rows: Vec<ReplayRow> = sqlx::query_as(
         "select match_id, module, label, params,
                     to_char(started_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
                     to_char(ended_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
