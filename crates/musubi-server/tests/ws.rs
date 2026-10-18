@@ -9615,6 +9615,11 @@ async fn relayed_host_migrates_by_rtt() {
     send(&mut a, f, None, ClientMessage::Rtt { ms: 80 }).await;
     send(&mut b, f, None, ClientMessage::Rtt { ms: 50 }).await;
     send(&mut c, f, None, ClientMessage::Rtt { ms: 20 }).await;
+    // three connections, no ordering between them: make sure every RTT landed before A leaves
+    for ws in [&mut a, &mut b, &mut c] {
+        send(ws, f, None, ClientMessage::Ping).await;
+        assert_eq!(recv(ws).await.msg, ServerMessage::Pong);
+    }
     send(
         &mut a,
         f,
