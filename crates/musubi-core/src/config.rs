@@ -1670,6 +1670,8 @@ pub struct ChatConfig {
     pub translate_timeout_ms: u64,
     /// Most target languages asked for per message.
     pub translate_max_langs: usize,
+    /// Largest chat attachment (`PUT /v1/channel/{id}/attachments`), bytes. Default 10 MiB.
+    pub attachment_max_bytes: u64,
 }
 
 /// Age gate / parental controls (COPPA, GDPR-K, platform age ratings).
@@ -1714,6 +1716,7 @@ impl Default for ComplianceConfig {
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
+            attachment_max_bytes: 10 << 20,
             automod_url: String::new(),
             automod_token: String::new(),
             automod_timeout_ms: 500,

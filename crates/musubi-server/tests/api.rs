@@ -16030,3 +16030,95 @@ async fn host_ops_time_rng_secrets_http_metrics_timers() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(d["deleted"], true);
 }
+
+/// Plan 5.5 chat attachments: upload per channel (inline without object storage), download
+/// needs channel access, size cap and empty body are refused, wrong channel is not found.
+#[tokio::test]
+async fn chat_attachments_upload_and_download() {
+    let Some(app) = app_with(|c| c.chat.attachment_max_bytes = 64).await else {
+        return;
+    };
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("att")})),
+    )
+    .await;
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let room = format!("2.att{}", uuid::Uuid::now_v7().simple());
+    let put = |path: String, body: Vec<u8>, auth: bool| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let mut req = Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "image/png");
+            if auth {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {tok}"));
+            }
+            let res = app
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let st = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, a) = put(
+        format!("/v1/channel/{room}/attachments"),
+        b"\x89PNG tiny".to_vec(),
+        true,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["mime"], "image/png");
+    assert_eq!(a["size"], 9);
+    let url = a["url"].as_str().unwrap().to_string();
+    assert!(url.starts_with(&format!("/v1/channel/{room}/attachments/")));
+    // too large, empty, unauthenticated
+    let (st, e) = put(
+        format!("/v1/channel/{room}/attachments"),
+        vec![1u8; 100],
+        true,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, _) = put(format!("/v1/channel/{room}/attachments"), vec![], true).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = put(
+        format!("/v1/channel/{room}/attachments"),
+        b"x".to_vec(),
+        false,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // download with channel access, bytes and type intact
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&url)
+                .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(
+        res.into_body().collect().await.unwrap().to_bytes().as_ref(),
+        b"\x89PNG tiny"
+    );
+    let (st, _) = call(&app, "GET", &url, None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let other = url.replace(&room, "2.other");
+    let (st, _) = call(&app, "GET", &other, Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

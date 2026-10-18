@@ -517,20 +517,20 @@ fn too_large(len: u64, max: u64) -> Error {
     ))
 }
 
-struct Streamed {
-    sha256: String,
-    size: u64,
+pub(crate) struct Streamed {
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
     /// The bytes themselves when they stay in Postgres (no object storage configured).
-    inline: Option<Vec<u8>>,
+    pub(crate) inline: Option<Vec<u8>>,
 }
 
-struct StreamFailed {
-    error: Error,
+pub(crate) struct StreamFailed {
+    pub(crate) error: Error,
     /// A multipart upload that was begun and must be aborted.
-    upload: Option<String>,
+    pub(crate) upload: Option<String>,
 }
 
-async fn stream_blob(
+pub(crate) async fn stream_blob(
     s: &AppState,
     body: axum::body::Body,
     key: Option<&str>,

@@ -34,6 +34,14 @@ pub fn routes() -> Router<AppState> {
             delete(delete_message),
         )
         .route("/v1/channel/{id}/report", post(report))
+        .route(
+            "/v1/channel/{id}/attachments",
+            axum::routing::put(attachment_put).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/v1/channel/{id}/attachments/{attachment_id}",
+            get(attachment_get),
+        )
         .route("/v1/channel/unread", get(unread))
         .route("/v1/channel/{id}/read", post(mark_read))
         .route(
@@ -402,4 +410,127 @@ async fn toggle_reaction(
         },
     );
     Ok(Json(json!({ "emoji": emoji, "count": count, "me": add })))
+}
+
+/// Plan 5.5 attachments: raw body (`Content-Type` kept), at most `chat.attachment_max_bytes`,
+/// inline in Postgres or streamed to object storage when `[ugc.s3]` is configured. The reply
+/// is what a message carries in `content.attachments`; reading needs channel access.
+async fn attachment_put(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Json<Value>, ApiError> {
+    use axum::http::header;
+    let channel = Channel::parse(&id)?;
+    s.chat.authorize(me.account_id, &channel).await?;
+    s.age.check(me.account_id, "chat")?;
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|m| !m.is_empty() && m.len() <= 128)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let max = s.cfg.chat.attachment_max_bytes.max(1);
+    if let Some(len) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if len > max {
+            return Err(musubi_core::Error::InvalidArgument(format!(
+                "attachment is {len} bytes, [chat] attachment_max_bytes is {max}"
+            ))
+            .into());
+        }
+    }
+    let aid = Uuid::now_v7();
+    let key = s
+        .blobs
+        .as_ref()
+        .map(|_| format!("{}chat/{}/{aid}", s.cfg.ugc.s3.prefix, channel.id()));
+    let streamed = match super::ugc::stream_blob(&s, body, key.as_deref(), &mime, max).await {
+        Ok(v) => v,
+        Err(e) => {
+            if let (Some(store), Some(key), Some(upload)) = (&s.blobs, &key, e.upload.as_deref()) {
+                if let Err(e) = store.abort_multipart(key, upload).await {
+                    tracing::warn!(error = %e, key, "chat attachment upload not aborted");
+                }
+            }
+            return Err(e.error.into());
+        }
+    };
+    if streamed.size == 0 {
+        if let (Some(store), Some(key)) = (&s.blobs, &key) {
+            let _ = store.delete(key).await;
+        }
+        return Err(musubi_core::Error::InvalidArgument("empty body".into()).into());
+    }
+    sqlx::query(
+        "insert into musubi.chat_attachments (id, channel_id, account_id, mime, size, sha256, blob, blob_key)
+         values ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(aid)
+    .bind(channel.id())
+    .bind(me.account_id.0)
+    .bind(&mime)
+    .bind(streamed.size as i64)
+    .bind(&streamed.sha256)
+    .bind(streamed.inline.as_deref())
+    .bind(&key)
+    .execute(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    Ok(Json(json!({
+        "id": aid,
+        "url": format!("/v1/channel/{}/attachments/{aid}", channel.id()),
+        "mime": mime,
+        "size": streamed.size,
+        "sha256": streamed.sha256,
+    })))
+}
+
+type AttachmentRow = (String, i64, Option<Vec<u8>>, Option<String>);
+
+async fn attachment_get(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((id, attachment_id)): Path<(String, Uuid)>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::http::header;
+    let channel = Channel::parse(&id)?;
+    s.chat.authorize(me.account_id, &channel).await?;
+    let row: Option<AttachmentRow> = sqlx::query_as(
+        "select mime, size, blob, blob_key from musubi.chat_attachments where id = $1 and channel_id = $2",
+    )
+    .bind(attachment_id)
+    .bind(channel.id())
+    .fetch_optional(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let Some((mime, size, blob, key)) = row else {
+        return Err(musubi_core::Error::NotFound(format!("attachment {attachment_id}")).into());
+    };
+    let body = match (blob, key, &s.blobs) {
+        (Some(b), _, _) => axum::body::Body::from(b),
+        (None, Some(key), Some(store)) => {
+            let (_, stream) = store.get_stream(&key).await?;
+            axum::body::Body::from_stream(stream)
+        }
+        _ => {
+            return Err(musubi_core::Error::Unavailable(
+                "attachment is in object storage but [ugc.s3] is not configured on this node"
+                    .into(),
+            )
+            .into())
+        }
+    };
+    let res = axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::CACHE_CONTROL, "private, max-age=86400")
+        .body(body)
+        .map_err(musubi_core::Error::internal)?;
+    Ok(res)
 }
