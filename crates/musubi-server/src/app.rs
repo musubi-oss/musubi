@@ -691,6 +691,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     state.matches.set_events(state.events.clone());
     crate::http::admin::start_drain_listener(state.clone());
     state.worlds.set_events(state.events.clone());
+    state.worlds.set_runtime(state.runtime.clone());
     crate::events::start_cluster_events(state.clone());
     match crate::jwt::load(&state.db, state.auth.signer()).await {
         Ok(n) if n > 0 => {

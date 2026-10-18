@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use dashmap::{DashMap, DashSet};
 use musubi_core::{Error, Result, SessionId};
-use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo};
+use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo, Strategy};
 use musubi_mesh::{CellId, Delta, Entity, EntityId, HandoverOutcome, Pos, World, WorldConfig};
 use musubi_proto::realtime::{WorldComponent, WorldEntity};
 use musubi_proto::ServerMessage;
+use musubi_runtime::CallContext;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -520,6 +521,8 @@ pub struct WorldRegistry {
     region: std::sync::OnceLock<String>,
     /// Outbox for `world.rehomed`.
     events: std::sync::OnceLock<Arc<crate::events::Events>>,
+    /// Module runtime, for the `hook_mesh_place` placement hook of the `custom` strategy.
+    runtime: std::sync::OnceLock<Arc<musubi_runtime::Runtime>>,
     /// (world, cell) → host node, cached from the directory.
     cell_hosts: DashMap<(String, CellId), Uuid>,
     /// Fencing term this node holds per world (`musubi.world_hosts`); absent = may not persist.
@@ -680,11 +683,16 @@ impl WorldRegistry {
             cluster: std::sync::OnceLock::new(),
             region: std::sync::OnceLock::new(),
             events: std::sync::OnceLock::new(),
+            runtime: std::sync::OnceLock::new(),
         }
     }
 
     pub fn set_events(&self, events: Arc<crate::events::Events>) {
         let _ = self.events.set(events);
+    }
+
+    pub fn set_runtime(&self, runtime: Arc<musubi_runtime::Runtime>) {
+        let _ = self.runtime.set(runtime);
     }
 
     pub fn with_group(mut self, group: &str) -> Self {
@@ -4204,6 +4212,7 @@ impl WorldRegistry {
                 for a in &moves {
                     announce(st, a);
                 }
+                self.request_placement_hints(st, &name);
                 for (cell, sim, ephemeral) in st.controller.hibernate(&mut st.world) {
                     if let Some(sim) = sim {
                         push_event(
@@ -4527,6 +4536,77 @@ impl WorldRegistry {
                 let _ = self.ticks.send(t);
             }
         })
+    }
+}
+
+impl WorldRegistry {
+    /// `custom` placement strategy: ask the `hook_mesh_place` module export where the free
+    /// cells should go — `{world, tick, cells, sims: [{id, capacity, cells, players, cost}]}` →
+    /// `{placements: [{cell, sim}]}` — off the tick; the answers steer `pick` from the next
+    /// control round on (anything outside the live candidates falls back to adjacency).
+    fn request_placement_hints(&self, st: &mut WorldState, name: &str) {
+        if !matches!(st.controller.cfg.strategy, Strategy::Custom) {
+            return;
+        }
+        let Some(rt) = self.runtime.get() else {
+            return;
+        };
+        if !rt.has_hook("hook_mesh_place") {
+            return;
+        }
+        let mut cells: Vec<CellId> = st
+            .world
+            .orphaned_cells()
+            .into_iter()
+            .chain(st.world.interest_cells())
+            .filter(|c| st.world.owner(*c).is_none())
+            .collect();
+        cells.sort();
+        cells.dedup();
+        if cells.is_empty() {
+            return;
+        }
+        let sims: Vec<Value> = st
+            .controller
+            .sims()
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "capacity": s.capacity,
+                    "cells": st.world.cells_of(s.id).len(),
+                    "players": st.controller.players_of(&st.world, s.id),
+                    "cost": st.controller.cost(&st.world, s.id),
+                })
+            })
+            .collect();
+        let payload = json!({ "world": name, "tick": st.world.tick, "cells": cells, "sims": sims });
+        let hints = st.controller.hints();
+        let rt = rt.clone();
+        let world = name.to_string();
+        tokio::spawn(async move {
+            let ctx = CallContext {
+                server: true,
+                ..Default::default()
+            };
+            let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+            match rt.hook("hook_mesh_place", ctx, bytes).await {
+                Some(Ok(out)) => {
+                    let v: Value = serde_json::from_slice(&out).unwrap_or_default();
+                    let mut h = hints.lock().unwrap_or_else(|e| e.into_inner());
+                    h.clear();
+                    for p in v["placements"].as_array().into_iter().flatten() {
+                        let cell = serde_json::from_value::<CellId>(p["cell"].clone()).ok();
+                        let sim = p["sim"].as_str().and_then(|s| Uuid::parse_str(s).ok());
+                        if let (Some(c), Some(s)) = (cell, sim) {
+                            h.insert(c, s);
+                        }
+                    }
+                }
+                Some(Err(e)) => tracing::warn!(%world, error = %e, "hook_mesh_place failed"),
+                None => {}
+            }
+        });
     }
 }
 

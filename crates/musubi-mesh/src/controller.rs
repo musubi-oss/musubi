@@ -123,6 +123,10 @@ pub struct Controller {
     /// Control rounds each split parent's children have spent under `merge_cell_cost` in a row.
     cold_rounds: BTreeMap<CellId, u32>,
     picker: Option<std::sync::Arc<Picker>>,
+    /// Asynchronous placement answers for the `custom` strategy (cell → simulator), filled by
+    /// the embedder between control rounds (on a node: the `hook_mesh_place` module export);
+    /// consulted before the picker.
+    hints: std::sync::Arc<std::sync::Mutex<BTreeMap<CellId, SimId>>>,
 }
 
 impl std::fmt::Debug for Controller {
@@ -146,7 +150,13 @@ impl Controller {
             hot_rounds: BTreeMap::new(),
             cold_rounds: BTreeMap::new(),
             picker: None,
+            hints: Default::default(),
         }
+    }
+
+    /// Shared handle to the placement hints the `custom` strategy reads.
+    pub fn hints(&self) -> std::sync::Arc<std::sync::Mutex<BTreeMap<CellId, SimId>>> {
+        self.hints.clone()
     }
 
     /// Install the picker the `custom` strategy calls.
@@ -220,12 +230,23 @@ impl Controller {
                         .then_with(|| self.cost(world, *a).total_cmp(&self.cost(world, *b)))
                 })
             }),
-            Strategy::Custom => self
-                .picker
-                .as_ref()
-                .and_then(|p| p(world, cell, candidates))
-                .filter(|s| candidates.contains(s))
-                .or_else(|| self.pick_adjacent(world, cell, candidates)),
+            Strategy::Custom => {
+                let hinted = self
+                    .hints
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&cell)
+                    .copied()
+                    .filter(|s| candidates.contains(s));
+                hinted
+                    .or_else(|| {
+                        self.picker
+                            .as_ref()
+                            .and_then(|p| p(world, cell, candidates))
+                            .filter(|s| candidates.contains(s))
+                    })
+                    .or_else(|| self.pick_adjacent(world, cell, candidates))
+            }
         }
     }
 
@@ -739,6 +760,11 @@ mod tests {
         custom.set_picker(std::sync::Arc::new(
             move |_w: &World, _c: CellId, _: &[SimId]| Some(bogus),
         ));
+        assert_eq!(custom.pick(&w, next, None), Some(s1));
+        // an asynchronous hint beats the picker; a hint for a dead/full sim is ignored
+        custom.hints().lock().unwrap().insert(next, s2);
+        assert_eq!(custom.pick(&w, next, None), Some(s2));
+        custom.hints().lock().unwrap().insert(next, bogus);
         assert_eq!(custom.pick(&w, next, None), Some(s1));
         // serde shape
         let v: ControllerConfig = serde_json::from_value(serde_json::json!({
