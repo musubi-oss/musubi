@@ -8686,6 +8686,50 @@ async fn match_recording_produces_replay() {
     let sorted = ticks.clone();
     ticks.sort();
     assert_eq!(ticks, sorted);
+    // paging: one frame at a time, `next_tick` says where to resume; the state at a tick is
+    // rebuilt on the server from the last snapshot before it plus the journal up to it
+    let get_json = |router: axum::Router, path: String| {
+        let ta = ta.clone();
+        async move {
+            let req = Request::get(path)
+                .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let status = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            (status, v)
+        }
+    };
+    let (st, page) = get_json(router.clone(), format!("/v1/matches/{mid}/replay?limit=1")).await;
+    assert_eq!(st, 200);
+    assert_eq!(page["frames"].as_array().unwrap().len(), 1);
+    let next = page["next_tick"].as_i64().expect("more frames follow");
+    let (st, page2) = get_json(
+        router.clone(),
+        format!("/v1/matches/{mid}/replay?from_tick={next}&limit=1"),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(page2["frames"][0]["tick_to"].as_i64().unwrap() >= next);
+    let last_tick = live["last_tick"].as_i64().unwrap();
+    let (st, state) = get_json(
+        router.clone(),
+        format!("/v1/matches/{mid}/replay/state?tick={last_tick}"),
+    )
+    .await;
+    assert_eq!(st, 200, "{state}");
+    assert!(state["state"].is_string());
+    assert!(state["snapshot_tick"].as_i64().unwrap() <= state["tick"].as_i64().unwrap());
+    assert!(state["tick"].as_i64().unwrap() <= last_tick);
+    let (st, _) = get_json(
+        router.clone(),
+        format!("/v1/matches/{mid}/replay/state?tick=0"),
+    )
+    .await;
+    assert_eq!(st, 404, "no snapshot before tick 0");
 
     // Leaving empties the match: it ends after `empty_ticks` and the recording is closed.
     send(

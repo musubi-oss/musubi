@@ -437,6 +437,11 @@ impl MatchRegistry {
         mods
     }
 
+    /// The handler registered for `module`, if this node loaded it.
+    pub fn handler(&self, module: &str) -> Option<Arc<dyn MatchHandler>> {
+        self.handlers.read().get(module).cloned()
+    }
+
     pub fn register(&self, module: &str, handler: Arc<dyn MatchHandler>) {
         self.handlers.write().insert(module.to_string(), handler);
     }

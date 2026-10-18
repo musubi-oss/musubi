@@ -15,6 +15,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/matches/{id}", get(get_one).delete(terminate))
         .route("/v1/server/matches/{id}/backfill", post(backfill))
         .route("/v1/matches/{id}/replay", get(replay))
+        .route("/v1/matches/{id}/replay/state", get(replay_state))
         .route(
             "/v1/server/matches/{id}/replay",
             axum::routing::delete(delete_replay),
@@ -135,11 +136,24 @@ async fn backfill(
 /// frames the processed inputs/membership steps between snapshots. Available while the match
 /// is running (frames so far) and after it ended (`ended_at` set), until retention
 /// (`[retention] replay_days`) removes it.
+#[derive(Deserialize, Default)]
+struct ReplayQuery {
+    /// Only frames overlapping `[from_tick, to_tick]` (both inclusive, default: everything).
+    from_tick: Option<i64>,
+    to_tick: Option<i64>,
+    /// At most this many frames (default 1000, max 10000); `next_tick` says where to resume.
+    limit: Option<i64>,
+}
+
 async fn replay(
     State(s): State<AppState>,
     Bearer(_me): Bearer,
     Path(id): Path<String>,
+    Query(q): Query<ReplayQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let from = q.from_tick.unwrap_or(0);
+    let to = q.to_tick.unwrap_or(i64::MAX);
+    let limit = q.limit.unwrap_or(1000).clamp(1, 10_000);
     let mid: uuid::Uuid = id
         .parse()
         .map_err(|_| musubi_core::Error::NotFound("replay".into()))?;
@@ -156,12 +170,19 @@ async fn replay(
     let frames =
         sqlx::query_as::<_, (String, i64, i64, Option<Vec<u8>>, Option<serde_json::Value>)>(
             "select kind, tick_from, tick_to, state, entries from musubi.match_recording_frames
-         where match_id = $1 order by tick_from, case kind when 'snapshot' then 0 else 1 end",
+         where match_id = $1 and tick_to >= $2 and tick_from <= $3
+         order by tick_from, case kind when 'snapshot' then 0 else 1 end limit $4",
         )
         .bind(mid)
+        .bind(from)
+        .bind(to)
+        .bind(limit + 1)
         .fetch_all(&s.db)
         .await
         .map_err(musubi_core::Error::internal)?;
+    let truncated = frames.len() as i64 > limit;
+    let frames: Vec<_> = frames.into_iter().take(limit as usize).collect();
+    let next_tick = truncated.then(|| frames.last().map(|f| f.2 + 1)).flatten();
     use base64::Engine as _;
     let frames: Vec<serde_json::Value> = frames
         .into_iter()
@@ -179,7 +200,75 @@ async fn replay(
     Ok(Json(json!({
         "match_id": id, "module": head.0, "label": head.1, "params": head.2,
         "started_at": head.3, "ended_at": head.4, "last_tick": head.5,
-        "live": s.matches.get(&id).is_some(), "frames": frames,
+        "live": s.matches.get(&id).is_some(), "frames": frames, "next_tick": next_tick,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ReplayStateQuery {
+    tick: i64,
+}
+
+/// `GET /v1/matches/{id}/replay/state?tick=N` — the module state of a recorded match as it was
+/// after tick `N`, rebuilt on the server from the last snapshot at or before `N` plus the journal
+/// up to it (the same replay the failover uses): scrubbing a replay needs no client-side module
+/// and no download of every frame. Needs the module loaded on this node.
+async fn replay_state(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+    Path(id): Path<String>,
+    Query(q): Query<ReplayStateQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mid: uuid::Uuid = id
+        .parse()
+        .map_err(|_| musubi_core::Error::NotFound("replay".into()))?;
+    let (module, label0): (String, String) =
+        sqlx::query_as("select module, label from musubi.match_recordings where match_id = $1")
+            .bind(mid)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(musubi_core::Error::internal)?
+            .ok_or_else(|| musubi_core::Error::NotFound("replay".into()))?;
+    let handler = s.matches.handler(&module).ok_or_else(|| {
+        musubi_core::Error::Unavailable(format!("module {module} is not loaded here"))
+    })?;
+    let snap: (i64, Vec<u8>) = sqlx::query_as(
+        "select tick_from, state from musubi.match_recording_frames
+         where match_id = $1 and kind = 'snapshot' and tick_from <= $2 and state is not null
+         order by tick_from desc limit 1",
+    )
+    .bind(mid)
+    .bind(q.tick)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?
+    .ok_or_else(|| musubi_core::Error::NotFound("no snapshot at or before that tick".into()))?;
+    let chunks: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "select entries from musubi.match_recording_frames
+         where match_id = $1 and kind = 'journal' and tick_to > $2 and tick_from <= $3
+         order by tick_from",
+    )
+    .bind(mid)
+    .bind(snap.0)
+    .bind(q.tick)
+    .fetch_all(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let mut entries: Vec<musubi_actor::JournalEntry> = Vec::new();
+    for (v,) in chunks {
+        if let Ok(mut e) = serde_json::from_value::<Vec<musubi_actor::JournalEntry>>(v) {
+            e.retain(|e| e.tick as i64 <= q.tick);
+            entries.append(&mut e);
+        }
+    }
+    let applied = entries.len();
+    let (state, label, tick) =
+        musubi_actor::replay(handler.as_ref(), snap.1, label0, snap.0 as u64, &entries);
+    use base64::Engine as _;
+    Ok(Json(json!({
+        "match_id": id, "module": module, "label": label, "tick": tick,
+        "snapshot_tick": snap.0, "applied": applied,
+        "state": base64::engine::general_purpose::STANDARD.encode(state),
     })))
 }
 
