@@ -470,3 +470,80 @@ pub async fn rollback(s: &AppState, name: &str, version: i32) -> Result<Value> {
     out["rolled_back_to"] = json!(version);
     Ok(out)
 }
+
+/// Dev loop (plan 3.6): poll `dir` every `every` and hot-reload modules whose `*.wasm` / `*.wat`
+/// changed — edited or new files are loaded under their file stem (a failing load keeps the old
+/// version and is logged), removed files are unloaded; match handlers are re-registered.
+pub fn start_module_watch(
+    runtime: std::sync::Arc<musubi_runtime::Runtime>,
+    matches: std::sync::Arc<crate::realtime::MatchRegistry>,
+    dir: std::path::PathBuf,
+    every: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    use std::collections::BTreeMap;
+    use std::time::SystemTime;
+    fn scan(dir: &std::path::Path) -> BTreeMap<String, (std::path::PathBuf, SystemTime, u64)> {
+        let mut out = BTreeMap::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "wasm" && ext != "wat" {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("module")
+                .to_string();
+            out.insert(
+                name,
+                (
+                    p,
+                    meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    meta.len(),
+                ),
+            );
+        }
+        out
+    }
+    tokio::spawn(async move {
+        // start empty: everything present is (re)loaded once, so a file written before the
+        // first poll is never missed
+        let mut seen: BTreeMap<String, (std::path::PathBuf, SystemTime, u64)> = BTreeMap::new();
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            let now = scan(&dir);
+            for (name, (path, mtime, len)) in &now {
+                let changed = seen
+                    .get(name)
+                    .is_none_or(|(_, m, l)| m != mtime || l != len);
+                if !changed {
+                    continue;
+                }
+                match std::fs::read(path)
+                    .map_err(musubi_core::Error::internal)
+                    .and_then(|bytes| runtime.load_bytes(name, &bytes))
+                {
+                    Ok(rpcs) => {
+                        matches.register_wasm(&runtime);
+                        tracing::info!(module = %name, rpcs = rpcs.len(), "module hot-reloaded");
+                    }
+                    Err(e) => {
+                        tracing::warn!(module = %name, error = %e, "module reload failed; old version kept")
+                    }
+                }
+            }
+            for name in seen.keys() {
+                if !now.contains_key(name) && runtime.unload(name) {
+                    tracing::info!(module = %name, "module unloaded (file removed)");
+                }
+            }
+            seen = now;
+        }
+    })
+}

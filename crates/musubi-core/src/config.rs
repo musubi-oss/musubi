@@ -567,6 +567,10 @@ pub struct RuntimeConfig {
     pub max_memory_mb: usize,
     pub timeout_ms: u64,
     pub max_payload_kb: usize,
+    /// Dev loop: poll `modules_dir` and hot-reload a module whose file changed (new/edited files
+    /// are loaded, removed ones unloaded; a module that fails to load keeps its old version).
+    /// `musubi dev` turns it on.
+    pub watch_modules: bool,
     /// Cron-driven calls into module exports named `schedule_<name>` (one runner cluster-wide).
     pub schedules: Vec<ScheduleConfig>,
     /// Hosts modules may reach through the `http.fetch` host op (`api.example.com`,
@@ -599,6 +603,7 @@ impl Default for RuntimeConfig {
             timeout_ms: 2000,
             max_payload_kb: 1024,
             schedules: Vec::new(),
+            watch_modules: false,
             http_allow: Vec::new(),
             http_timeout_ms: 5000,
             http_max_body_kb: 256,

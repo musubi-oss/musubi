@@ -279,6 +279,17 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             .with_region(&cfg.node.region),
     );
     let wasm_mods = matches.register_wasm(&runtime);
+    if cfg.runtime.watch_modules {
+        if let Some(dir) = &cfg.runtime.modules_dir {
+            crate::modules::start_module_watch(
+                runtime.clone(),
+                matches.clone(),
+                dir.clone(),
+                std::time::Duration::from_secs(1),
+            );
+            tracing::info!(dir = %dir.display(), "watching modules_dir for hot reload");
+        }
+    }
     if !wasm_mods.is_empty() {
         tracing::info!(modules = ?wasm_mods, "wasm match modules registered");
     }

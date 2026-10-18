@@ -210,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.http.listen = listen.parse()?;
             cfg.database.run_migrations = true;
             cfg.node.allow_insecure_defaults = true;
+            cfg.runtime.watch_modules = true;
             if cfg.log.filter == "info" {
                 cfg.log.filter = "info,musubi=debug,tower_http=debug".into();
             }

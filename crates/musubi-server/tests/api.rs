@@ -16122,3 +16122,91 @@ async fn chat_attachments_upload_and_download() {
     let (st, _) = call(&app, "GET", &other, Some(&tok), None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// Plan 3.6 dev loop: modules in `runtime.modules_dir` hot-reload when their file changes.
+#[tokio::test]
+async fn modules_dir_hot_reloads_on_file_change() {
+    let dir = std::env::temp_dir().join(format!("musubi-watch-{}", uuid::Uuid::now_v7().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let module = |reply: &str| {
+        format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 1024))
+  (func (export "alloc") (param $n i32) (result i32) (local $p i32)
+    global.get $heap local.set $p
+    global.get $heap local.get $n i32.add global.set $heap
+    local.get $p)
+  (data (i32.const 16) "{reply}")
+  (func (export "rpc_hot") (param i32 i32 i32 i32) (result i64)
+    i64.const 16 i64.const 32 i64.shl i64.const {} i64.or))"#,
+            reply.len()
+        )
+    };
+    let rt = Arc::new(musubi_runtime::Runtime::new(musubi_runtime::Limits::default()).unwrap());
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok();
+    let db = match url {
+        Some(u) => {
+            let mut cfg = Config::default();
+            cfg.database.url = u;
+            Some(musubi_server::db::connect(&cfg.database).await.unwrap())
+        }
+        None => None,
+    };
+    let matches = Arc::new(musubi_server::realtime::MatchRegistry::new(
+        db,
+        uuid::Uuid::now_v7(),
+    ));
+    let _watch = musubi_server::modules::start_module_watch(
+        rt.clone(),
+        matches,
+        dir.clone(),
+        std::time::Duration::from_millis(30),
+    );
+    let ctx = musubi_runtime::CallContext::default();
+    let call = |rt: Arc<musubi_runtime::Runtime>| {
+        let ctx = ctx.clone();
+        async move {
+            for _ in 0..100 {
+                if let Ok(out) = rt.invoke_sync("rpc_hot", &ctx, b"{}") {
+                    return Some(String::from_utf8(out).unwrap());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            None
+        }
+    };
+    std::fs::write(dir.join("hot.wat"), module("v1")).unwrap();
+    assert_eq!(call(rt.clone()).await.as_deref(), Some("v1"));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    std::fs::write(dir.join("hot.wat"), module("v2-longer")).unwrap();
+    let mut got = None;
+    for _ in 0..100 {
+        got = call(rt.clone()).await;
+        if got.as_deref() == Some("v2-longer") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(got.as_deref(), Some("v2-longer"));
+    // a broken edit keeps the old version
+    std::fs::write(
+        dir.join("hot.wat"),
+        "(module (func (export \"rpc_hot\") broken",
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(call(rt.clone()).await.as_deref(), Some("v2-longer"));
+    // removing the file unloads the module
+    std::fs::remove_file(dir.join("hot.wat")).unwrap();
+    let mut gone = false;
+    for _ in 0..100 {
+        if rt.invoke_sync("rpc_hot", &ctx, b"{}").is_err() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(gone, "module unloaded after its file was removed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
