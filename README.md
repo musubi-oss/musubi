@@ -413,6 +413,14 @@ content}` and the answer `{"action": "allow" | "block" | "replace", "content"?, 
 applied after the built-in filters and the `before_chat_message` hook; `automod_timeout_ms` and
 `automod_fail_open` decide what a slow or dead service means.
 
+`chat.translate_url` adds translation: a message with a `text` is POSTed as `{channel_id,
+sender_id, text, source, targets}` — `source` is the sender's account language, `targets` the
+other languages of everyone present in the channel (at most `translate_max_langs`, nothing is
+sent when all speak one language) — and the answer `{"translations": {"de": "…"}}` rides on the
+message as `content.translations` (+ `source_lang`), stored with it so history has it too; each
+client renders its own language. Errors and timeouts (`translate_timeout_ms`, 800 ms) never hold
+a message back. Plug in DeepL, Google, Azure or an LLM behind that one endpoint.
+
 ### Matchmaker observability
 
 `GET /v1/server/matchmaker/stats` adds `wait` — p50/p95/p99/max wait per queue × region over the

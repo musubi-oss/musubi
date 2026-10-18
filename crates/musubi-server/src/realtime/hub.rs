@@ -237,6 +237,19 @@ impl Hub {
         others
     }
 
+    /// Accounts with a session in `channel_id` (hidden members included: they read it too).
+    pub fn channel_account_ids(&self, channel_id: &str) -> Vec<AccountId> {
+        let Some(members) = self.channels.get(channel_id) else {
+            return vec![];
+        };
+        let mut seen = HashSet::new();
+        members
+            .keys()
+            .filter_map(|sid| self.sessions.get(sid).map(|h| h.presence.account_id))
+            .filter(|a| seen.insert(*a))
+            .collect()
+    }
+
     pub fn leave_channel(&self, channel_id: &str, session_id: SessionId) {
         let Some(h) = self.sessions.get(&session_id) else {
             return;

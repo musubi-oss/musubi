@@ -33,6 +33,7 @@ pub mod retention;
 pub mod runtime_host;
 pub mod schedules;
 pub mod telemetry;
+pub mod translate;
 
 pub use app::run;
 pub use musubi_core::config::Config;

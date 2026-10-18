@@ -1403,6 +1403,15 @@ pub struct ChatConfig {
     pub automod_timeout_ms: u64,
     /// On webhook error/timeout: deliver the message (true) or reject it (false).
     pub automod_fail_open: bool,
+    /// POSTed `{channel_id, sender_id, text, source, targets}` for a message with a `text` when
+    /// someone present in the channel speaks another language; answers
+    /// `{"translations": {"de": "..."}}`, attached to the message as `content.translations`.
+    /// Empty = off.
+    pub translate_url: String,
+    pub translate_token: String,
+    pub translate_timeout_ms: u64,
+    /// Most target languages asked for per message.
+    pub translate_max_langs: usize,
 }
 
 impl Default for ChatConfig {
@@ -1412,6 +1421,10 @@ impl Default for ChatConfig {
             automod_token: String::new(),
             automod_timeout_ms: 500,
             automod_fail_open: true,
+            translate_url: String::new(),
+            translate_token: String::new(),
+            translate_timeout_ms: 800,
+            translate_max_langs: 8,
         }
     }
 }

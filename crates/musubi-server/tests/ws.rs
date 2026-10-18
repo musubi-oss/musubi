@@ -16379,6 +16379,194 @@ async fn chat_typing_attachments_and_automod() {
     }
 }
 
+/// Chat translation webhook: called once per message with the languages of everyone present
+/// (minus the sender's), translations ride on the message; no text / one language / a dead
+/// webhook never hold a message back.
+#[tokio::test]
+async fn chat_translation_webhook() {
+    let calls: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let c2 = calls.clone();
+    let translator = axum::Router::new().route(
+        "/translate",
+        axum::routing::post(move |axum::Json(v): axum::Json<Value>| {
+            let calls = c2.clone();
+            async move {
+                let text = v["text"].as_str().unwrap_or("").to_string();
+                let mut out = serde_json::Map::new();
+                for t in v["targets"].as_array().into_iter().flatten() {
+                    let l = t.as_str().unwrap();
+                    out.insert(l.to_string(), json!(format!("[{l}] {text}")));
+                }
+                calls.lock().unwrap().push(v);
+                axum::Json(json!({"translations": out}))
+            }
+        }),
+    );
+    let tl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let turl = format!(
+        "http://127.0.0.1:{}/translate",
+        tl.local_addr().unwrap().port()
+    );
+    let mock = tokio::spawn(async move { axum::serve(tl, translator).await.unwrap() });
+
+    let group = test_group();
+    let Some(state) = build_state_with(
+        true,
+        &group,
+        Box::new(move |st| {
+            let cfg = Arc::make_mut(&mut st.cfg);
+            cfg.chat.translate_url = turl;
+            cfg.chat.translate_timeout_ms = 2000;
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    for (t, lang) in [(&tb, "de"), (&tc, "ru-RU")] {
+        let id: uuid::Uuid = recv_account(&router, t).await["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        sqlx::query("update musubi.accounts set lang = $2 where id = $1")
+            .bind(id)
+            .bind(lang)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    let room = format!("xlat-{}", uuid::Uuid::now_v7().simple());
+    for ws in [&mut a, &mut b, &mut c] {
+        send(
+            ws,
+            f,
+            None,
+            ClientMessage::ChannelJoin {
+                target: room.clone(),
+                kind: ChannelKind::Room,
+                persistence: false,
+                hidden: false,
+            },
+        )
+        .await;
+        assert!(matches!(recv(ws).await.msg, ServerMessage::Channel { .. }));
+    }
+    let room_id = format!("2.{room}");
+
+    async fn next_message(ws: &mut Ws) -> musubi_proto::ChannelMessage {
+        for _ in 0..8 {
+            if let ServerMessage::ChannelMessage(m) = recv(ws).await.msg {
+                return m;
+            }
+        }
+        panic!("no channel message");
+    }
+
+    // A (en) → B (de) and C (ru): one webhook call with targets [de, ru]
+    send(
+        &mut a,
+        f,
+        Some("t1"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "hello"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    let mb = next_message(&mut b).await;
+    assert_eq!(mb.content["text"], "hello");
+    assert_eq!(
+        mb.content["translations"]["de"], "[de] hello",
+        "{}",
+        mb.content
+    );
+    assert_eq!(mb.content["translations"]["ru"], "[ru] hello");
+    assert_eq!(mb.content["source_lang"], "en");
+    let mc = next_message(&mut c).await;
+    assert_eq!(mc.content["translations"]["ru"], "[ru] hello");
+    let ma = next_message(&mut a).await;
+    assert_eq!(ma.content["translations"]["de"], "[de] hello");
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0]["source"], "en");
+        assert_eq!(calls[0]["targets"], json!(["de", "ru"]));
+        assert_eq!(calls[0]["channel_id"], room_id);
+    }
+    // B (de) → targets [en, ru]
+    send(
+        &mut b,
+        f,
+        Some("t2"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "hallo"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    let ma = next_message(&mut a).await;
+    assert_eq!(
+        ma.content["translations"]["en"], "[en] hallo",
+        "{}",
+        ma.content
+    );
+    assert_eq!(ma.content["source_lang"], "de");
+    let _ = next_message(&mut c).await;
+    let _ = next_message(&mut b).await;
+    assert_eq!(calls.lock().unwrap()[1]["targets"], json!(["en", "ru"]));
+    // no text → no call, message still delivered
+    send(
+        &mut a,
+        f,
+        Some("t3"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"sticker": 7}),
+            reply_to: None,
+        },
+    )
+    .await;
+    let mb = next_message(&mut b).await;
+    assert_eq!(mb.content["sticker"], 7);
+    assert!(mb.content.get("translations").is_none());
+    let _ = next_message(&mut a).await;
+    let _ = next_message(&mut c).await;
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    // webhook gone → message goes out untranslated
+    mock.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    send(
+        &mut a,
+        f,
+        Some("t4"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "still here"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    let mb = next_message(&mut b).await;
+    assert_eq!(mb.content["text"], "still here");
+    assert!(mb.content.get("translations").is_none(), "{}", mb.content);
+}
+
 async fn recv_account(router: &axum::Router, token: &str) -> Value {
     http_json(router, "GET", "/v1/account", Some(token), false, None)
         .await

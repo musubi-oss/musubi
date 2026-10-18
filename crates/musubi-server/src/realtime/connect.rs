@@ -109,6 +109,7 @@ pub fn params(s: &AppState, presence: UserPresence, encoding: Encoding) -> Conne
         banned: s.banned.clone(),
         anticheat: s.anticheat.clone(),
         automod: crate::automod::Automod::from_cfg(&s.cfg.chat),
+        translator: crate::translate::Translator::from_cfg(&s.cfg.chat, s.db.clone()),
         runtime: s.runtime.clone(),
         fanout: s.fanout.clone(),
     }

@@ -47,6 +47,7 @@ pub struct ConnectParams {
     pub banned: Arc<crate::bans::Bans>,
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
     pub automod: Option<crate::automod::Automod>,
+    pub translator: Option<crate::translate::Translator>,
     pub runtime: Arc<Runtime>,
     pub fanout: Fanout,
     pub rate: Arc<crate::limits::RateLimiter>,
@@ -80,6 +81,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         banned,
         anticheat,
         automod,
+        translator,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -113,6 +115,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         banned: &banned,
         anticheat: &anticheat,
         automod: automod.as_ref(),
+        translator: translator.as_ref(),
         typing: &typing,
         resume: None,
     };
@@ -301,6 +304,7 @@ struct Ctx<'a> {
     banned: &'a crate::bans::Bans,
     anticheat: &'a Arc<crate::anticheat::AntiCheat>,
     automod: Option<&'a crate::automod::Automod>,
+    translator: Option<&'a crate::translate::Translator>,
     /// Last typing indicator forwarded per channel (one per 2 s).
     typing: &'a std::sync::Mutex<HashMap<String, std::time::Instant>>,
     resume: Option<Arc<super::resume::ResumeTracker>>,
@@ -1121,6 +1125,10 @@ async fn channel_send(
         }
     }
     ctx.chat.filter_content(&mut content, None).await?;
+    if let Some(tr) = ctx.translator {
+        let members = ctx.hub.channel_account_ids(channel_id);
+        tr.translate(channel_id, me, &members, &mut content).await;
+    }
     let persistent = !matches!(channel, Channel::Room(_))
         || ctx
             .hub
