@@ -7,7 +7,7 @@ write_files:
     content: |
       #!/bin/bash
       set -euo pipefail
-      DEV=/dev/disk/by-id/scsi-0HC_Volume_${volume_id}
+      DEV=${volume_dev}
       for i in $(seq 1 60); do [ -e "$DEV" ] && break; sleep 2; done
       systemctl stop postgresql
       mkdir -p /var/lib/postgresql/16

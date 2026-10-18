@@ -21,8 +21,9 @@
 //! (`tests/idl_guest.rs` drives such a module through this ABI).
 //!
 //! Every call runs in a fresh instance with a fuel budget, a memory cap and a wall-clock deadline,
-//! so a misbehaving module can neither hang nor exhaust the node. A Component Model loader (WIT
-//! `musubi:runtime`) is the next step and will sit next to this ABI.
+//! so a misbehaving module can neither hang nor exhaust the node. Component Model guests (WIT
+//! `musubi:runtime`, see `wit::WIT`) load through the same `Runtime`: `is_component` picks the
+//! loader and `call` dispatches by export name either way.
 
 use std::collections::HashMap;
 use std::path::Path;

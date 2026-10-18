@@ -134,8 +134,8 @@ resource "hcloud_server" "pg" {
   firewall_ids = [hcloud_firewall.pg.id]
   labels       = merge(local.labels, { role = "pg" })
   user_data = templatefile("${path.module}/cloud-init/pg.yaml.tftpl", {
-    password  = random_password.pg.result
-    volume_id = hcloud_volume.pg[0].id
+    password   = random_password.pg.result
+    volume_dev = "/dev/disk/by-id/scsi-0HC_Volume_${hcloud_volume.pg[0].id}"
   })
   public_net {
     ipv4_enabled = true
