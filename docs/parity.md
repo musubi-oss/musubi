@@ -120,7 +120,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Админ-API: аккаунты (поиск по identity, patch, ban, sessions, export), storage, chat-модерация, worlds/matches, конфиг | ✅ | ✅ portal | 🟡 | ✅ | ✅ |
 | Контент-каталоги с версиями / item definitions | ✅ контент-бандлы с diff/историей/откатом + версии item definitions (`instance_schema`, миграции инстансов lazy/batch, история, откат, конвертация предметов) | ✅ | ❌ | ✅ | ✅ |
 | OpenAPI, CLI, миграция с Nakama | ✅ `openapi.json`, `musubi migrate-nakama` | 🟡 | 🟡 | ✅ | ✅ |
-| IaC (Helm / Terraform) | ✅ Helm-чарт `deploy/helm/musubi` (ConfigMap TOML + секреты env, Service http/udp, HPA, PDB) и Dockerfile; Terraform — нет | — | 🟡 | — | — |
+| IaC (Helm / Terraform) | ✅ Helm-чарт `deploy/helm/musubi` (ConfigMap TOML + секреты env, Service http/udp, HPA, PDB) и Dockerfile; Terraform-модуль `deploy/terraform/musubi` поверх чарта (namespace, секреты, HPA/PDB, edge) | — | 🟡 | — | — |
 | Prometheus, OpenTelemetry, trace_id в ошибках | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Бенчи: criterion + A/B-ворота в CI, `musubi bench/soak` | ✅ | ❌ | ❌ | ❌ | ❌ |
 | SDK клиентов | 🟡 Unreal-скаффолд (`sdk/unreal`), остальные нет | Unreal/Unity | большинство | Unreal/Unity/JS | Unreal/Unity |
@@ -233,5 +233,5 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 - **CLI (5.15).** Есть dev/migrate/migrate-nakama/export/import/doctor/config/bench/soak,
   `module publish/canary/promote/rollback/versions`, `fleet push/list`, `deploy` (манифест модули+флоты);
   `migrate-playfab` (PlayFab / UGS экспорт);
-  ~~нет `schema migrate`~~ ✅ `musubi schema push/list` и `[[schemas]]` в deploy-манифесте (применяются до модулей); Terraform.
+  ~~нет `schema migrate`~~ ✅ `musubi schema push/list` и `[[schemas]]` в deploy-манифесте (применяются до модулей); ~~Terraform~~ ✅ `deploy/terraform/musubi`.
 - **Realtime (5.8).** Типизированная схема состояния с автодельтами и детерминированный rollback — v2 / SDK.

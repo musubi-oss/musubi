@@ -502,4 +502,4 @@ Every match input in an authoritative match passes a per-session guard (`[antich
 
 **Fixtures.** `POST /v1/admin/dev/fixtures {name, accounts: [{username, display_name?, metadata?, wallet?: {gold: 100}, inventory?: [{item_id, quantity}], storage?: [{collection, key, value}]}], reset?}` creates the accounts once (re-applying finds them again), tops wallets up idempotently and seeds inventory and player data for new accounts (or all with `reset`); `DELETE /v1/admin/dev/fixtures/{name}` purges them.
 
-**Deploy.** `Dockerfile` builds the server image; `deploy/helm/musubi` is a Helm chart (TOML config in a ConfigMap, secrets as `MUSUBI__*` env, Service for HTTP and the UDP edge, HPA and PDB).
+**Deploy.** `Dockerfile` builds the server image; `deploy/helm/musubi` is a Helm chart (TOML config in a ConfigMap, secrets as `MUSUBI__*` env, Service for HTTP and the UDP edge, HPA and PDB). `deploy/terraform/musubi` wraps the chart as a Terraform module (namespace, Secret with database URL / server key, ConfigMap TOML, HPA/PDB, optional UDP edge Service) for EKS/GKE/AKS/k3s — Postgres comes from the caller (`database_url`).
