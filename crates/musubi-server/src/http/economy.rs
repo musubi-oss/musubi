@@ -66,6 +66,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/iap/subscriptions", get(iap_subscriptions_of))
         .route("/v1/quests", get(quests_mine))
         .route("/v1/quests/{id}/claim", post(quest_claim))
+        .route("/v1/quests/{id}/reroll", post(quest_reroll))
         .route("/v1/seasons/current", get(season_current))
         .route("/v1/seasons/{id}/claim", post(season_claim))
         .route("/v1/server/quests", get(quests_all).post(upsert_quest))
@@ -1139,6 +1140,19 @@ async fn quests_mine(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         json!({ "quests": s.economy.quest_views(me.account_id, OffsetDateTime::now_utc()).await? }),
+    ))
+}
+
+/// Swap a rerollable quest out for the rest of its period (limited per period and kind).
+async fn quest_reroll(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        s.economy
+            .reroll_quest(me.account_id, &id, time::OffsetDateTime::now_utc())
+            .await?,
     ))
 }
 

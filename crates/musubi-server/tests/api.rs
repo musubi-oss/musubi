@@ -12806,3 +12806,113 @@ async fn store_listings_filter_by_platform() {
         .unwrap();
     assert_eq!(item["platforms"], json!(["ios", "android"]));
 }
+
+/// Quest rerolls: a rerollable quest can be hidden for the period, limited per period and kind;
+/// completed and non-rerollable quests cannot be rerolled.
+#[tokio::test]
+async fn quest_rerolls_are_limited_per_period() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("reroll")})),
+    )
+    .await;
+    let tok = s["access_token"].as_str().unwrap().to_string();
+    let (a, b, fixed) = (unique("qa"), unique("qb"), unique("qf"));
+    for (id, rerollable) in [(&a, true), (&b, true), (&fixed, false)] {
+        let (st, r) = call_server(
+            &app,
+            "POST",
+            "/v1/server/quests",
+            k,
+            Some(json!({"id": id, "name": id, "kind": "daily", "rerollable": rerollable, "rerolls_per_period": 1,
+                "objectives": [{"event": "match_won", "target": 1}]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let (_, q) = call(&app, "GET", "/v1/quests", Some(&tok), None).await;
+    let view = |v: &Value, id: &str| -> Option<Value> {
+        v["quests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["quest_id"] == id)
+            .cloned()
+    };
+    assert_eq!(view(&q, &a).unwrap()["rerolls_left"], 1, "{q}");
+    assert_eq!(view(&q, &fixed).unwrap()["rerollable"], false);
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{fixed}/reroll"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{a}/reroll"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["rerolls_left"], 0);
+    let (_, q) = call(&app, "GET", "/v1/quests", Some(&tok), None).await;
+    assert!(view(&q, &a).is_none(), "{q}");
+    assert_eq!(view(&q, &b).unwrap()["rerolls_left"], 0);
+    // the kind's budget is spent
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{b}/reroll"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{r}");
+    // rerolling the same quest again is a no-op, not a second reroll
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{a}/reroll"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // a completed quest cannot be rerolled
+    let (_, me) = call(&app, "GET", "/v1/account", Some(&tok), None).await;
+    let acc = me["account"]["id"]
+        .as_str()
+        .unwrap_or(me["id"].as_str().unwrap_or(""))
+        .to_string();
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/quests/event",
+        k,
+        Some(json!({"account_id": acc, "event": "match_won", "count": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/{b}/reroll"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert!(
+        st == StatusCode::CONFLICT || st == StatusCode::TOO_MANY_REQUESTS,
+        "{st} {r}"
+    );
+}

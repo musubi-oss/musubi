@@ -317,6 +317,13 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Quests: rerolls
+
+A quest with `rerollable: true` can be swapped out by the player (`POST /v1/quests/{id}/reroll`):
+it disappears for the rest of its period, `rerolls_per_period` caps how many quests of that
+kind a player may reroll per period, completed quests stay. `GET /v1/quests` carries
+`rerollable` and `rerolls_left` per quest.
+
 ### Store: per-platform listings
 
 A store listing carries `platforms` (`steam`, `ios`, `android`, `psn`, `xbox`, `nintendo`,

@@ -205,6 +205,8 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   Steam/PSN/Xbox, фрод-эвристик по скорости покупок. IAP: только Apple/Google/Steam (нет Epic, PSN, Xbox,
   Nintendo, Huawei, Samsung, Facebook).
   ✅ витрины per-платформа: `platforms` у листинга (пусто = везде), `GET /v1/store?platform=`.
+  ✅ rerolls квестов: `rerollable` + `rerolls_per_period` у квеста, `POST /v1/quests/{id}/reroll` прячет его до конца
+  периода, лимит на вид квестов за период, завершённые не перекидываются.
 - **Аутентификация (5.1).** Нет magic-link, custom token, лимита одновременных сессий на аккаунт, SAML.
 - **Storage (5.3).** Patch — только JSON Merge Patch (нет RFC 6902), нет aggregate и full-text.
 - **Оркестрация (5.9).** Нет провайдеров `gamefabric` и `custom (WASM)`, билды не в OCI-реестре, warm-pool

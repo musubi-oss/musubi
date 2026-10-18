@@ -400,6 +400,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/progression", "economy"),
     ("GET", "/v1/quests", "economy"),
     ("POST", "/v1/quests/{id}/claim", "economy"),
+    ("POST", "/v1/quests/{id}/reroll", "economy"),
     ("GET", "/v1/rewards/rolls", "economy"),
     ("GET", "/v1/rewards/tables", "economy"),
     ("GET", "/v1/entitlements", "economy"),
