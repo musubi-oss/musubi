@@ -73,6 +73,10 @@ impl Audience {
         Ok(())
     }
 
+    pub fn validate_rules(&self) -> Result<()> {
+        self.validate()
+    }
+
     fn push_where(&self, qb: &mut QueryBuilder<'_, Postgres>, now: OffsetDateTime) {
         qb.push(" where a.deleted_at is null and a.disabled_at is null");
         for (col, vals) in [
@@ -343,6 +347,33 @@ impl EconomyService {
     }
 
     /// How many accounts a broadcast `audience` would reach right now.
+    /// Names of the given audiences `account` belongs to (plan 5.12), in the given order.
+    pub async fn audiences_of(
+        &self,
+        account: AccountId,
+        audiences: &[(String, Audience)],
+        now: OffsetDateTime,
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (name, aud) in audiences {
+            if aud.validate().is_err() {
+                continue;
+            }
+            let mut qb = QueryBuilder::new("select count(*) from musubi.accounts a");
+            aud.push_where(&mut qb, now);
+            qb.push(" and a.id = ").push_bind(account.0);
+            let n: i64 = qb
+                .build_query_scalar()
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::internal)?;
+            if n > 0 {
+                out.push(name.clone());
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn count_audience(&self, aud: &Audience, now: OffsetDateTime) -> Result<i64> {
         aud.validate()?;
         let mut qb = QueryBuilder::new("select count(*) from musubi.accounts a");

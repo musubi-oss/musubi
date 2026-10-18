@@ -84,6 +84,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         blobs: None,
         auth,
         idl: musubi_server::idl::IdlRegistry::new(db.clone(), storage.clone()),
+        audiences: Default::default(),
         storage,
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
@@ -16209,4 +16210,129 @@ async fn modules_dir_hot_reloads_on_file_change() {
     }
     assert!(gone, "module unloaded after its file was removed");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plan 5.12 named audiences: server CRUD, membership of an account, module host op,
+/// cache invalidation on change, validation.
+#[tokio::test]
+async fn audiences_crud_membership_and_host_op() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("aud")})),
+    )
+    .await;
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let all = format!("all_{sfx}");
+    let steam = format!("steam_{sfx}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{all}"),
+        "defaultkey",
+        Some(json!({"rules": {}, "description": "everyone"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["count"].as_i64().unwrap() >= 1);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{steam}"),
+        "defaultkey",
+        Some(json!({"rules": {"platform": ["steam"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/audiences/bad%20name",
+        "defaultkey",
+        Some(json!({"rules": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/lvl_{sfx}"),
+        "defaultkey",
+        Some(json!({"rules": {"min_level": 3}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, l) = call_server(&app, "GET", "/v1/server/audiences", "defaultkey", None).await;
+    let names: Vec<&str> = l["audiences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&all.as_str()) && names.contains(&steam.as_str()),
+        "{l}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{acc}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mine = v["audiences"].as_array().unwrap();
+    assert!(
+        mine.contains(&json!(all)) && !mine.contains(&json!(steam)),
+        "{v}"
+    );
+    // module host op sees the same
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/rpc/host",
+        Some(&tok),
+        Some(json!({"op": "audiences.of"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["ok"]["audiences"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(all)),
+        "{v}"
+    );
+    // deleting invalidates the cached answer
+    let (_, d) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/audiences/{all}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(d["deleted"], true);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{acc}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert!(
+        !v["audiences"].as_array().unwrap().contains(&json!(all)),
+        "{v}"
+    );
+    let (st, _) = call(&app, "GET", "/v1/server/audiences", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
 }

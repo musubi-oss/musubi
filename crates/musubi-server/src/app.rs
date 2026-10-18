@@ -43,6 +43,8 @@ pub struct AppStateInner {
     pub auth: AuthService,
     pub storage: StorageService,
     pub idl: crate::idl::IdlRegistry,
+    /// Named audiences (plan 5.12) with per-node caches.
+    pub audiences: crate::http::audiences::Audiences,
     pub accounts: AccountService,
     pub social: SocialService,
     pub groups: GroupService,
@@ -665,6 +667,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         auth,
         storage,
         idl,
+        audiences: Default::default(),
         accounts,
         social,
         groups,

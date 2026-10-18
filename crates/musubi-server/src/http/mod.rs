@@ -1,6 +1,7 @@
 mod account;
 pub mod admin;
 mod anticheat;
+pub mod audiences;
 mod auth;
 mod chat;
 mod cluster;
@@ -170,6 +171,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::idl::router())
         .merge(configs::router())
         .merge(timers::router())
+        .merge(audiences::router())
         .merge(sso::routes())
         .merge(stats::routes())
         .merge(push::routes())

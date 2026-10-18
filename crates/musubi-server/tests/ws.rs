@@ -159,6 +159,7 @@ async fn build_state_cfg_with(
         audit: musubi_server::audit::Sink::new(&db),
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
         idl: musubi_server::idl::IdlRegistry::new(db.clone(), StorageService::new(db.clone())),
+        audiences: Default::default(),
         storage: StorageService::new(db.clone()).with_limits(
             cfg.storage.max_objects_per_user,
             cfg.storage.max_bytes_per_user,

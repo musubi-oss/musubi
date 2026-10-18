@@ -360,6 +360,11 @@ impl ServerHost {
                 cache.insert(key, (now, v.clone()));
                 Ok(v)
             }
+            "audiences.of" => {
+                let acc = account(&req, ctx)?;
+                let names = s.audiences.of(&s.db, &s.economy, acc).await?;
+                Ok(json!({ "account_id": acc, "audiences": *names }))
+            }
             "time.now" => {
                 let now = chrono::Utc::now();
                 Ok(
