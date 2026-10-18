@@ -31,7 +31,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Xbox Live (XSTS), PSN, Nintendo | ✅ `POST /v1/auth/{xbox,psn,nintendo}` + link/unlink (XSTS-профиль, id_token через OIDC-проверку) | ✅ | ❌ (custom) | ✅ | ✅ |
 | Passkeys / WebAuthn | ✅ | ❌ | ❌ | ❌ | ❌ |
 | TOTP MFA + recovery codes | ✅ | ❌ | ❌ | ❌ | 🟡 |
-| Magic-link вход | ❌ (есть verify/reset по токену, вход по ссылке нет) | ❌ | ❌ | ✅ | ❌ |
+| Magic-link вход | ✅ `POST /v1/auth/email/magic/request` → событие `account.magic_link`, `POST /v1/auth/email/magic {token}` | ❌ | ❌ | ✅ | ❌ |
 | Lockout, captcha при брутфорсе, suspicious login | ✅ `[session]`, `hook_auth_captcha`, `account.suspicious_login` | 🟡 | ❌ | 🟡 | 🟡 |
 | Login queue при лимите онлайна | ✅ `POST /v1/auth/queue` (гейт в выдаче сессии) | ✅ | ❌ | ❌ | 🟡 |
 | Линковка / слияние аккаунтов | ✅ link/unlink, `POST /v1/account/merge` с журналом | ✅ | ✅ (link) | ✅ | ✅ |
@@ -53,7 +53,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Присутствие / статус | ✅ hub + шина (`online_remote`) | ✅ | ✅ | ❌ | ✅ |
 | Пати, лобби, ready, команды | ✅ parties (home-node) + `/v1/lobbies` | ✅ | ✅ | ✅ | ✅ |
 | Уведомления in-app | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Push FCM / APNs | ✅ `push.rs` | ❌ | ❌ | ✅ | ❌ |
+| Push FCM / APNs / Huawei, тихие пуши | ✅ `push.rs` (`fcm`/`apns`/`hms`, `data.silent`) | ❌ | ❌ | ✅ | ❌ |
 | WebPush | ✅ `push.rs`: RFC 8030/8291 aes128gcm + VAPID, `platform: webpush` в `/v1/account/push_tokens` | ❌ | ❌ | ❌ | ❌ |
 | UGC (моды, карты, скины) | ✅ `/v1/ugc`: реестр с версиями, blob ≤ 16 MiB или URL, теги/поиск/сортировка, рейтинг, подписки, модерация draft→pending→approved/rejected/hidden | ❌ | ❌ | ✅ | ✅ |
 | GDPR export / delete с retention | ✅ | ✅ | ✅ | ✅ | ✅ |
