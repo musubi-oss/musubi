@@ -1990,7 +1990,7 @@ impl WorldRegistry {
             .collect();
         let mut out = Vec::new();
         let mut restored: Vec<(String, Uuid)> = Vec::new();
-        let mut mirrored_cells: Vec<(String, CellId)> = Vec::new();
+        let mut mirrored_cells: Vec<(String, CellId, u64)> = Vec::new();
         for (name, cell, dead) in orphaned {
             if self.home_of(&name).await? != Some(self.node_id) {
                 continue;
@@ -2032,7 +2032,7 @@ impl WorldRegistry {
             // a mirror of the cell fed by the dead host up to its last tick beats the shard
             // restore: nothing to read, no ticks lost since the last journal flush, ephemeral
             // entities included
-            let mut mirrored = false;
+            let mut mirrored = None;
             if let Some((_, mut m)) = self.mirrors.remove(&(name.clone(), cell)) {
                 if m.from == dead {
                     if let Ok(w) = self.get(&name) {
@@ -2046,12 +2046,12 @@ impl WorldRegistry {
                             self.queue_adopted(&name, adopted.iter().map(|id| (*id, cell)));
                         }
                         tracing::info!(world = %name, ?cell, node = %dead, tick = m.tick, entities = n, "cell taken over from its replica mirror");
-                        mirrored = true;
+                        mirrored = Some(m.tick);
                     }
                 }
             }
-            if mirrored {
-                mirrored_cells.push((name.clone(), cell));
+            if let Some(tick) = mirrored {
+                mirrored_cells.push((name.clone(), cell, tick));
             }
             if !restored.contains(&(name.clone(), dead)) {
                 if let (Some(db), Ok(w)) = (&self.db, self.get(&name)) {
@@ -2065,12 +2065,20 @@ impl WorldRegistry {
                         // an entity that already lives here (handed over before the host died, or
                         // journaled on both sides) keeps its live copy
                         ents.retain(|e| st.world.get(e.id).is_none());
-                        // cells restored from a mirror are complete and newer than the shard
-                        ents.retain(|e| !mirrored_cells.contains(&(name.clone(), e.cell)));
-                        let adopted: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
+                        // a cell restored from a mirror at least as fresh as the shard is
+                        // complete; a mirror that fell behind the host's last snapshot misses
+                        // the entities the host accepted after the mirror's tick — those come
+                        // from the shard (and go through the duplicate check like the rest)
+                        ents.retain(|e| {
+                            !mirrored_cells
+                                .iter()
+                                .any(|(n, c, t)| *n == name && *c == e.cell && *t >= shard.tick)
+                        });
+                        let adopted: Vec<(EntityId, CellId)> =
+                            ents.iter().map(|e| (e.id, e.cell)).collect();
                         st.world.restore(ents);
                         if !adopted.is_empty() {
-                            self.queue_adopted(&name, adopted.iter().map(|id| (*id, cell)));
+                            self.queue_adopted(&name, adopted.iter().copied());
                         }
                     }
                     tracing::info!(world = %name, node = %dead, replayed = n, "dead cell host's shard restored");
@@ -4194,6 +4202,22 @@ impl WorldRegistry {
                                     .filter(|h| *h != self.node_id)
                             });
                         let Some(host) = fresh else {
+                            // nobody hosts the target cell yet (its host died, the lease is not
+                            // re-issued): keep the entity in transit and retry — the home takes
+                            // the cell within the failover round, and if the lease lands on
+                            // another node the entity must follow it, not stay here orphaned
+                            let ours = st
+                                .world
+                                .get(entity)
+                                .map(|e| st.world.cell_of(e.pos))
+                                .is_some_and(|c| {
+                                    self.cell_hosts
+                                        .get(&(name.clone(), c))
+                                        .is_some_and(|h| *h == self.node_id)
+                                });
+                            if !ours {
+                                continue;
+                            }
                             // the cell is ours now: the entity stays — but the copy we shipped may
                             // have been accepted by a host whose ack never arrived, so announce it
                             // like a restored one and let a live owner answer with a drop
