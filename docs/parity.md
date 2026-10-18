@@ -91,11 +91,12 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Relay-матчи, host migration по RTT | ✅ | ❌ | ✅ relayed | ✅ | ❌ |
 | Authoritative-матчи (акторы), снапшоты + журнал, failover, fencing | ✅ | ❌ (game instances на DS) | ✅ (без failover) | 🟡 | ❌ |
 | Spectator, запись и экспорт реплеев | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Детерминированный rollback | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Детерминированный rollback | ✅ `params.rollback = {window, hash_every}`: тик-штампованные `match_input`, пересимуляция с опоздавшего тика внутри окна, `match_input_ack`, `match_tick_hash` для детекта мисспредикта | ❌ | ❌ | ❌ | ❌ |
+| Типизированное состояние матча: снапшот при входе + автодельты (RFC 6902), приватные пути (`sync_exclude`) | ✅ IDL `[matches.m] state` → `match_state` / `match_state_delta`; `musubi idl from-colyseus` переносит Colyseus Schema | ❌ | ❌ | ❌ | ❌ |
 | Матчмейкер: MMR-окно по времени, пинг, роли, команды, кроссплей, приоритет, ready-check, dodge | ✅ `QueueConfig` | ✅ | 🟡 query | ✅ | ✅ |
 | Backfill в живой матч / сервер | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Game flow: пати → очередь → инстанс → результаты → награды | ✅ `POST /v1/server/matches/{id}/results` — один отчёт: рейтинг-очередь, награды по рангу (под limited grants), квесты, XP, bracket турнира, шина; идемпотентно по матчу | ✅ | ❌ | 🟡 | ✅ |
-| Dedicated-серверы: провайдеры | ✅ local, docker, kubernetes (Agones-совместимый манифест), firecracker (snapshot-restore + warm pool микроVM, identity через MMDS) | 🟡 внешние | 🟡 FleetManager API | ✅ | ✅ AMS |
+| Dedicated-серверы: провайдеры | ✅ local, docker, kubernetes (Agones-совместимый манифест), firecracker (snapshot-restore + warm pool микроVM, identity через MMDS)  ; `ssh` — bare-metal хосты без агента (`[fleet.ssh] hosts`, старт/стоп/probe по ssh, выбор хоста по свободной ёмкости) | 🟡 внешние | 🟡 FleetManager API | ✅ | ✅ AMS |
 | Внешние оркестраторы как провайдеры (Edgegap, GameLift) | ✅ `provider = edgegap` (deploy/status/stop) и `gamelift` (CreateGameSession/Describe/Terminate, SigV4) рядом с local/docker/firecracker/k8s/agones | — | ✅ | — | — |
 | Автоскейл: буфер + прогноз по истории | ✅ `demand`/`scale` | ❌ | ❌ | ✅ | ✅ |
 | Scale-to-zero флота | ✅ min 0 + холодный старт при аллокации (ожидание готовности), прогноз по истории | ❌ | ❌ | ✅ | ✅ |
@@ -120,7 +121,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Админ-API: аккаунты (поиск по identity, patch, ban, sessions, export), storage, chat-модерация, worlds/matches, конфиг | ✅ | ✅ portal | 🟡 | ✅ | ✅ |
 | Контент-каталоги с версиями / item definitions | ✅ контент-бандлы с diff/историей/откатом + версии item definitions (`instance_schema`, миграции инстансов lazy/batch, история, откат, конвертация предметов) | ✅ | ❌ | ✅ | ✅ |
 | OpenAPI, CLI, миграция с Nakama | ✅ `openapi.json`, `musubi migrate-nakama` | 🟡 | 🟡 | ✅ | ✅ |
-| IaC (Helm / Terraform) | ✅ Helm-чарт `deploy/helm/musubi` (ConfigMap TOML + секреты env, Service http/udp, HPA, PDB) и Dockerfile; Terraform-модуль `deploy/terraform/musubi` поверх чарта (namespace, секреты, HPA/PDB, edge) | — | 🟡 | — | — |
+| IaC (Helm / Terraform) | ✅ Helm-чарт `deploy/helm/musubi` (ConfigMap TOML + секреты env, Service http/udp, HPA, PDB) и Dockerfile; Terraform-модуль `deploy/terraform/musubi` поверх чарта (namespace, секреты, HPA/PDB, edge)  ; `deploy/terraform/musubi-hetzner` и `musubi-ovh` — профили single/hybrid без Kubernetes (core-ноды systemd, Postgres на томе, fleet-хосты в `[fleet.ssh]`, LB, firewalls) | — | 🟡 | — | — |
 | Prometheus, OpenTelemetry, trace_id в ошибках | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Бенчи: criterion + A/B-ворота в CI, `musubi bench/soak` | ✅ | ❌ | ❌ | ❌ | ❌ |
 | SDK клиентов | 🟡 Unreal-скаффолд (`sdk/unreal`), остальные нет | Unreal/Unity | большинство | Unreal/Unity/JS | Unreal/Unity |
