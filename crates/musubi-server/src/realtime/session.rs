@@ -45,6 +45,7 @@ pub struct ConnectParams {
     pub matches: Arc<MatchRegistry>,
     pub worlds: Arc<super::WorldRegistry>,
     pub banned: Arc<crate::bans::Bans>,
+    pub age: Arc<crate::compliance::AgeGate>,
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
     pub automod: Option<crate::automod::Automod>,
     pub translator: Option<crate::translate::Translator>,
@@ -79,6 +80,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         fanout,
         rate,
         banned,
+        age,
         anticheat,
         automod,
         translator,
@@ -113,6 +115,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         presence: &presence,
         rate: &rate,
         banned: &banned,
+        age: &age,
         anticheat: &anticheat,
         automod: automod.as_ref(),
         translator: translator.as_ref(),
@@ -302,6 +305,7 @@ struct Ctx<'a> {
     presence: &'a UserPresence,
     rate: &'a crate::limits::RateLimiter,
     banned: &'a crate::bans::Bans,
+    age: &'a crate::compliance::AgeGate,
     anticheat: &'a Arc<crate::anticheat::AntiCheat>,
     automod: Option<&'a crate::automod::Automod>,
     translator: Option<&'a crate::translate::Translator>,
@@ -1113,6 +1117,7 @@ async fn channel_send(
     if let Some(kind) = restriction.as_deref().filter(|k| *k != "shadow") {
         return Err(Error::PermissionDenied(format!("{kind}d in this channel")));
     }
+    ctx.age.check(me, "chat")?;
     ctx.chat.slow_mode_gate(&channel, me).await?;
     let mut content = before_chat_message(ctx, channel_id, content).await?;
     if let Some(am) = ctx.automod {

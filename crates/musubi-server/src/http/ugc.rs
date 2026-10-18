@@ -177,6 +177,7 @@ async fn create(
     Bearer(me): Bearer,
     Json(r): Json<CreateReq>,
 ) -> Result<Json<Value>, ApiError> {
+    s.age.check(me.account_id, "ugc")?;
     if !KINDS.contains(&r.kind.as_str()) {
         return Err(
             Error::InvalidArgument(format!("kind must be one of {}", KINDS.join("|"))).into(),

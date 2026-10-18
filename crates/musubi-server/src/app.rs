@@ -75,6 +75,7 @@ pub struct AppStateInner {
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
+    pub age: Arc<crate::compliance::AgeGate>,
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
     pub dev: Arc<crate::dev::DevTools>,
     pub liveops_cache: crate::runtime_host::LiveopsCache,
@@ -568,6 +569,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     if let Some(b) = &blobs {
         tracing::info!(bucket = b.bucket(), "ugc blobs in object storage");
     }
+    let compliance_cfg = cfg.compliance.clone();
     let state = AppState(Arc::new(AppStateInner {
         blobs,
         audit: crate::audit::Sink::new(&db),
@@ -583,6 +585,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             Arc::new(e)
         },
         banned: Arc::new(crate::bans::Bans::default()),
+        age: Arc::new(crate::compliance::AgeGate::new(compliance_cfg)),
         anticheat: Arc::new(crate::anticheat::AntiCheat::new()),
         dev: Arc::new(crate::dev::DevTools::new()),
         liveops_cache: Default::default(),
@@ -664,8 +667,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),
     }
+    match state.age.load(&state.db).await {
+        Ok(n) => tracing::info!(accounts = n, "age gate cache loaded"),
+        Err(e) => tracing::warn!(error = %e, "age gate cache load failed"),
+    }
     if let Some(c) = &state.cluster {
         state.banned.start(c);
+        state.age.start(c);
         crate::runtime_host::start_liveops_sync(&state, c);
     }
     if let Some(c) = state.cluster.clone() {

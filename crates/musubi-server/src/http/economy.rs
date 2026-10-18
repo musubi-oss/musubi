@@ -263,6 +263,7 @@ async fn buy(
     Bearer(me): Bearer,
     Json(r): Json<BuyReq>,
 ) -> Result<Json<Value>, ApiError> {
+    s.age.check(me.account_id, "purchases")?;
     let p = s
         .economy
         .buy(
@@ -1022,6 +1023,7 @@ async fn iap_apple(
     Bearer(me): Bearer,
     Json(r): Json<AppleReq>,
 ) -> Result<Json<Value>, ApiError> {
+    s.age.check(me.account_id, "purchases")?;
     let Some(c) = &s.apple_iap else {
         return Err(Error::NotFound("apple iap is not configured".into()).into());
     };
@@ -1048,6 +1050,7 @@ async fn iap_google(
     Bearer(me): Bearer,
     Json(r): Json<GoogleReq>,
 ) -> Result<Json<Value>, ApiError> {
+    s.age.check(me.account_id, "purchases")?;
     let Some(c) = &s.google_iap else {
         return Err(Error::NotFound("google iap is not configured".into()).into());
     };
@@ -1654,6 +1657,7 @@ async fn iap_steam_init(
     Bearer(me): Bearer,
     Json(r): Json<SteamInitReq>,
 ) -> Result<Json<Value>, ApiError> {
+    s.age.check(me.account_id, "purchases")?;
     let Some(c) = &s.steam_iap else {
         return Err(Error::NotFound("steam iap is not configured".into()).into());
     };

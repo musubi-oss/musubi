@@ -1,4 +1,4 @@
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use musubi_account::{Account, UpdateAccount, User};
@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::app::AppState;
-use crate::http::{ApiError, Bearer};
+use crate::http::{ApiError, Bearer, ServerKey};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -41,6 +41,11 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/account/mfa/totp/verify", post(totp_verify))
         .route("/v1/account/delete", post(delete_self))
+        .route("/v1/account/age", get(get_age).put(put_age))
+        .route(
+            "/v1/server/accounts/{id}/age",
+            axum::routing::put(server_put_age),
+        )
         .route("/v1/users", get(get_users))
         .route("/v1/users/search", get(search_users))
 }
@@ -162,7 +167,7 @@ async fn get_users(
         .map(String::from)
         .collect();
     let users: Vec<User> = s.accounts.get_users(&ids, &names).await?;
-    Ok(Json(json!({ "users": users })))
+    Ok(Json(json!({ "users": public_profiles(&s, users) })))
 }
 
 #[derive(Deserialize)]
@@ -183,7 +188,7 @@ async fn search_users(
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let users: Vec<User> = s.accounts.search_users(&q.q, q.limit).await?;
-    Ok(Json(json!({ "users": users })))
+    Ok(Json(json!({ "users": public_profiles(&s, users) })))
 }
 
 #[derive(Deserialize)]
@@ -464,4 +469,143 @@ async fn totp_disable(
         .emit("account.mfa_disabled", Some(me.account_id), json!({}))
         .await;
     Ok(Json(json!({ "enabled": false })))
+}
+
+/// Public profiles: accounts whose age group closes `public_profile` show only id, username and
+/// avatar.
+fn public_profiles(s: &AppState, users: Vec<User>) -> Vec<serde_json::Value> {
+    users
+        .into_iter()
+        .map(|u| {
+            let mut v = serde_json::to_value(&u).unwrap_or_default();
+            let id = v["id"].as_str().and_then(|x| x.parse::<AccountId>().ok());
+            if let Some(id) = id {
+                if s.age.restricted(id, "public_profile") {
+                    if let Some(o) = v.as_object_mut() {
+                        o.retain(|k, _| matches!(k.as_str(), "id" | "username" | "avatar_url"));
+                        o.insert("restricted".into(), json!(true));
+                    }
+                }
+            }
+            v
+        })
+        .collect()
+}
+
+fn age_view(s: &AppState, id: AccountId) -> serde_json::Value {
+    let info = s.age.get(id);
+    json!({
+        "bracket": info.bracket,
+        "parental_consent": info.consented,
+        "restrictions": s.age.restrictions(id),
+    })
+}
+
+/// `GET /v1/account/age` — the caller's age group, consent state and closed features.
+async fn get_age(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(age_view(&s, me.account_id)))
+}
+
+#[derive(Deserialize)]
+struct AgeReq {
+    /// `YYYY-MM-DD`; the bracket is derived from it.
+    #[serde(default)]
+    birthdate: Option<String>,
+    /// Platform-provided bracket (`child` / `teen` / `adult`) when no birthdate is collected.
+    #[serde(default)]
+    bracket: Option<String>,
+    /// Server route only.
+    #[serde(default)]
+    parental_consent: Option<bool>,
+}
+
+fn parse_birthdate(s: &str) -> Result<time::Date, musubi_core::Error> {
+    let fmt = time::macros::format_description!("[year]-[month]-[day]");
+    let d = time::Date::parse(s.trim(), &fmt)
+        .map_err(|_| musubi_core::Error::InvalidArgument("birthdate must be YYYY-MM-DD".into()))?;
+    let today = time::OffsetDateTime::now_utc().date();
+    if d > today || today.year() - d.year() > 130 {
+        return Err(musubi_core::Error::InvalidArgument(
+            "birthdate out of range".into(),
+        ));
+    }
+    Ok(d)
+}
+
+fn resolve_age(
+    s: &AppState,
+    r: &AgeReq,
+) -> Result<(crate::compliance::Bracket, Option<time::Date>), musubi_core::Error> {
+    if let Some(b) = r.birthdate.as_deref().filter(|b| !b.trim().is_empty()) {
+        let d = parse_birthdate(b)?;
+        let today = time::OffsetDateTime::now_utc().date();
+        return Ok((s.age.bracket_for(d, today), Some(d)));
+    }
+    match r
+        .bracket
+        .as_deref()
+        .and_then(crate::compliance::Bracket::parse)
+    {
+        Some(b) => Ok((b, None)),
+        None => Err(musubi_core::Error::InvalidArgument(
+            "give a birthdate (YYYY-MM-DD) or a bracket: child | teen | adult".into(),
+        )),
+    }
+}
+
+/// `PUT /v1/account/age {birthdate | bracket}` — a player states their age once; moving to an
+/// older bracket afterwards needs the game server (or a parent) so a child cannot lift its own
+/// restrictions.
+async fn put_age(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<AgeReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (bracket, birthdate) = resolve_age(&s, &r)?;
+    let cur = s.age.get(me.account_id);
+    use crate::compliance::Bracket as B;
+    let older = |a: B| matches!(a, B::Teen | B::Adult);
+    if cur.bracket == B::Child && older(bracket) {
+        return Err(musubi_core::Error::PermissionDenied(
+            "age group can only be raised by the game server or a parent".into(),
+        )
+        .into());
+    }
+    if cur.bracket == B::Teen && bracket == B::Adult && birthdate.is_none() {
+        return Err(musubi_core::Error::PermissionDenied(
+            "age group can only be raised with a birthdate".into(),
+        )
+        .into());
+    }
+    let info = crate::compliance::AgeInfo {
+        bracket,
+        consented: cur.consented,
+    };
+    s.age
+        .set(&s.db, me.account_id, info, birthdate, s.cluster.as_ref())
+        .await?;
+    Ok(Json(age_view(&s, me.account_id)))
+}
+
+/// `PUT /v1/server/accounts/{id}/age {bracket | birthdate, parental_consent?}` — trusted
+/// source (platform age rating, support desk, verified parent flow of your own).
+async fn server_put_age(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<AccountId>,
+    Json(r): Json<AgeReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (bracket, birthdate) = resolve_age(&s, &r)?;
+    let cur = s.age.get(id);
+    let info = crate::compliance::AgeInfo {
+        bracket,
+        consented: r.parental_consent.unwrap_or(cur.consented),
+    };
+    s.age
+        .set(&s.db, id, info, birthdate, s.cluster.as_ref())
+        .await?;
+    Ok(Json(age_view(&s, id)))
 }

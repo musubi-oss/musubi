@@ -57,6 +57,7 @@ pub struct Config {
     pub email: EmailConfig,
     pub anticheat: AntiCheatConfig,
     pub chat: ChatConfig,
+    pub compliance: ComplianceConfig,
     pub regions: RegionsConfig,
     pub operators: OperatorsConfig,
     pub ugc: UgcConfig,
@@ -1412,6 +1413,45 @@ pub struct ChatConfig {
     pub translate_timeout_ms: u64,
     /// Most target languages asked for per message.
     pub translate_max_langs: usize,
+}
+
+/// Age gate / parental controls (COPPA, GDPR-K, platform age ratings).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComplianceConfig {
+    /// Enforce the lists below (off = brackets are stored, nothing is gated).
+    pub age_gate: bool,
+    /// Younger than this = `child`.
+    pub child_until: u32,
+    /// Younger than this (and not a child) = `teen`.
+    pub adult_from: u32,
+    /// Treat accounts without an age as children until they give one.
+    pub unknown_as_child: bool,
+    /// Features closed for children: `chat`, `friends`, `purchases`, `ugc`, `public_profile`.
+    pub child_restrictions: Vec<String>,
+    /// Features that stay closed after a parent consented.
+    pub consented_child_restrictions: Vec<String>,
+    pub teen_restrictions: Vec<String>,
+    /// Lifetime of a parental-consent token.
+    pub consent_ttl_secs: i64,
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            age_gate: true,
+            child_until: 13,
+            adult_from: 18,
+            unknown_as_child: false,
+            child_restrictions: ["chat", "friends", "purchases", "ugc", "public_profile"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            consented_child_restrictions: vec!["purchases".into()],
+            teen_restrictions: vec![],
+            consent_ttl_secs: 7 * 24 * 3600,
+        }
+    }
 }
 
 impl Default for ChatConfig {

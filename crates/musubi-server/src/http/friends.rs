@@ -149,6 +149,7 @@ async fn add(
     Bearer(me): Bearer,
     Json(b): Json<Ids>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    s.age.check(me.account_id, "friends")?;
     let ids = resolve(&s, b).await?;
     let outcomes = s.social.add(me.account_id, &ids).await?;
     s.events

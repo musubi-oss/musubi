@@ -6,6 +6,7 @@ pub mod audit;
 pub mod automod;
 pub mod bans;
 pub mod blobstore;
+pub mod compliance;
 pub mod db;
 pub mod dev;
 pub mod edge;

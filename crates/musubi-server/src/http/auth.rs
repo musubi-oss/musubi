@@ -30,6 +30,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/email/reset", post(reset))
         .route("/v1/auth/email/magic/request", post(magic_request))
         .route("/v1/auth/email/magic", post(magic))
+        .route("/v1/account/parental/request", post(parental_request))
+        .route("/v1/auth/parental/consent", post(parental_consent))
         .route("/v1/server/auth/custom", post(custom))
         .route("/v1/account/me", get(me))
         .route("/v1/account/sessions", get(sessions))
@@ -677,4 +679,79 @@ async fn revoke_session(
         return Err(musubi_core::Error::NotFound("session".into()).into());
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ParentalReq {
+    parent_email: String,
+}
+
+/// Parental consent, step 1: a child (or any account) names a parent; emits
+/// `account.parental_consent_request` with a single-use token for your mailer. Always 200.
+async fn parental_request(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    ip: super::ClientIp,
+    Json(r): Json<ParentalReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let email = r.parent_email.trim().to_lowercase();
+    if email.len() > 254 || !email.contains('@') || email.starts_with('@') || email.ends_with('@') {
+        return Err(musubi_core::Error::InvalidArgument("bad parent_email".into()).into());
+    }
+    let ttl = s.cfg.compliance.consent_ttl_secs.max(60);
+    sqlx::query("update musubi.accounts set parent_email = $2 where id = $1")
+        .bind(me.account_id.0)
+        .bind(&email)
+        .execute(&s.db)
+        .await
+        .map_err(musubi_core::Error::internal)?;
+    let token = mint_token(&s, me.account_id, "consent", &email, ttl).await?;
+    s.events
+        .emit(
+            "account.parental_consent_request",
+            Some(me.account_id),
+            json!({ "account_id": me.account_id, "parent_email": email, "token": token, "expires_in_secs": ttl }),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ConsentReq {
+    token: String,
+}
+
+/// Parental consent, step 2 (no session — the parent clicks the link): marks the account as
+/// consented, which switches a child to `consented_child_restrictions`.
+async fn parental_consent(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<ConsentReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let Some((account, _email)) = consume_token(&s, &r.token, "consent").await? else {
+        return Err(musubi_core::Error::NotFound("token unknown, used or expired".into()).into());
+    };
+    let cur = s.age.get(account);
+    let info = crate::compliance::AgeInfo {
+        bracket: cur.bracket,
+        consented: true,
+    };
+    s.age
+        .set(&s.db, account, info, None, s.cluster.as_ref())
+        .await?;
+    s.events
+        .emit(
+            "account.parental_consent",
+            Some(account),
+            json!({ "account_id": account }),
+        )
+        .await;
+    Ok(Json(json!({
+        "account_id": account,
+        "bracket": info.bracket,
+        "parental_consent": true,
+        "restrictions": s.age.restrictions(account),
+    })))
 }

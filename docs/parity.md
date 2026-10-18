@@ -57,7 +57,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | WebPush | ✅ `push.rs`: RFC 8030/8291 aes128gcm + VAPID, `platform: webpush` в `/v1/account/push_tokens` | ❌ | ❌ | ❌ | ❌ |
 | UGC (моды, карты, скины) | ✅ `/v1/ugc`: реестр с версиями, blob ≤ 16 MiB или URL, теги/поиск/сортировка, рейтинг, подписки, модерация draft→pending→approved/rejected/hidden | ❌ | ❌ | ✅ | ✅ |
 | GDPR export / delete с retention | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Возраст / родительский контроль / COPPA, приватность профиля | ❌ | ✅ | ❌ | 🟡 | ✅ |
+| Возраст / родительский контроль / COPPA, приватность профиля | ✅ брекеты по дате рождения/платформе, списки закрытых фич, согласие родителя по токену, урезанный публичный профиль | ✅ | ❌ | 🟡 | ✅ |
 
 ## 3. Соревновательные и мета-системы
 
@@ -209,6 +209,8 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ возраст/COPPA: `PUT /v1/account/age`, `[compliance]` списки закрытых фич (chat/friends/purchases/ugc/public_profile),
+  согласие родителя (`account.parental_consent_request` → `POST /v1/auth/parental/consent`), серверная установка брекета; api+ws тесты.
   ✅ миграция с PlayFab/UGS: `musubi migrate-playfab --from dir` — аккаунты со стабильными id, привязки платформ,
   user data → storage, валюты → кошельки, инвентарь, статистики → лидерборды; старый id логинится через custom auth.
   ✅ CLI: `musubi module publish/canary/promote/rollback/versions`, `musubi fleet push/list`, `musubi deploy` —

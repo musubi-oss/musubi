@@ -151,6 +151,7 @@ async fn build_state_cfg_with(
     let schedules = Arc::new(musubi_server::schedules::Schedules::from_config(
         &cfg.runtime,
     ));
+    let compliance_cfg = cfg.compliance.clone();
     let mut inner = AppStateInner {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
         dev: Arc::new(musubi_server::dev::DevTools::new()),
@@ -200,6 +201,7 @@ async fn build_state_cfg_with(
         blobs: None,
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
@@ -16565,6 +16567,107 @@ async fn chat_translation_webhook() {
     let mb = next_message(&mut b).await;
     assert_eq!(mb.content["text"], "still here");
     assert!(mb.content.get("translations").is_none(), "{}", mb.content);
+}
+
+/// Age gate in realtime: a child can read a channel but not send to it.
+#[tokio::test]
+async fn age_gate_blocks_child_chat() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let a_id: uuid::Uuid = recv_account(&router, &ta).await["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    state
+        .age
+        .set(
+            &state.db,
+            musubi_core::AccountId(a_id),
+            musubi_server::compliance::AgeInfo {
+                bracket: musubi_server::compliance::Bracket::Child,
+                consented: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let room = format!("kids-{}", uuid::Uuid::now_v7().simple());
+    for ws in [&mut a, &mut b] {
+        send(
+            ws,
+            f,
+            None,
+            ClientMessage::ChannelJoin {
+                target: room.clone(),
+                kind: ChannelKind::Room,
+                persistence: false,
+                hidden: false,
+            },
+        )
+        .await;
+        assert!(matches!(recv(ws).await.msg, ServerMessage::Channel { .. }));
+    }
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::ChannelPresenceEvent { .. }
+    ));
+    let room_id = format!("2.{room}");
+    send(
+        &mut a,
+        f,
+        Some("k1"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "hi"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::Error { message, .. } => {
+            assert!(message.contains("chat is not available"), "{message}")
+        }
+        m => panic!("{m:?}"),
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), recv(&mut b))
+            .await
+            .is_err()
+    );
+    // reading stays open
+    send(
+        &mut b,
+        f,
+        Some("k2"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "welcome"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    let mut seen = false;
+    for _ in 0..4 {
+        if let ServerMessage::ChannelMessage(m) = recv(&mut a).await.msg {
+            assert_eq!(m.content["text"], "welcome");
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen);
 }
 
 async fn recv_account(router: &axum::Router, token: &str) -> Value {

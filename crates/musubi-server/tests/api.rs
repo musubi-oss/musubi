@@ -75,6 +75,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
             .spawn_flusher(std::time::Duration::from_millis(200));
         c
     });
+    let compliance_cfg = cfg.compliance.clone();
     let state = AppState(Arc::new(AppStateInner {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
         dev: Arc::new(musubi_server::dev::DevTools::new()),
@@ -129,6 +130,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
             Arc::new(e)
         },
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
@@ -13925,4 +13927,238 @@ async fn migrate_playfab_and_ugs_exports() {
     let (_, inv2) = call(&app, "GET", "/v1/inventory", Some(&tok2), None).await;
     assert!(inv2.to_string().contains("shield_ugs"), "{inv2}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn age_gate_and_parental_consent() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let login = |p: &str| {
+        let app = app.clone();
+        let id = unique(p);
+        async move {
+            let (st, s) = call(
+                &app,
+                "POST",
+                "/v1/auth/device",
+                None,
+                Some(json!({"id": id})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{s}");
+            (
+                s["access_token"].as_str().unwrap().to_string(),
+                s["account_id"].as_str().unwrap().to_string(),
+            )
+        }
+    };
+    let (kt, kid_id) = login("kid").await;
+    let (ot, other_id) = login("grown").await;
+    let today = time::OffsetDateTime::now_utc().date();
+    let born = |years: i32| {
+        format!(
+            "{}-{:02}-{:02}",
+            today.year() - years,
+            today.month() as u8,
+            today.day().min(28)
+        )
+    };
+
+    // no age yet: nothing is gated
+    let (st, a) = call(&app, "GET", "/v1/account/age", Some(&kt), None).await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["bracket"], "unknown");
+    assert_eq!(a["restrictions"], json!([]));
+
+    // ten years old → child, the default list is closed
+    let (st, a) = call(
+        &app,
+        "PUT",
+        "/v1/account/age",
+        Some(&kt),
+        Some(json!({"birthdate": born(10)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["bracket"], "child");
+    for f in ["chat", "friends", "purchases", "ugc", "public_profile"] {
+        assert!(
+            a["restrictions"].as_array().unwrap().contains(&json!(f)),
+            "{a}"
+        );
+    }
+    // a child cannot promote itself
+    let (st, e) = call(
+        &app,
+        "PUT",
+        "/v1/account/age",
+        Some(&kt),
+        Some(json!({"bracket": "adult"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    // friend requests are closed for the child, open for the adult
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&kt),
+        Some(json!({"ids": [other_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert!(e["message"].as_str().unwrap().contains("friends"), "{e}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&ot),
+        Some(json!({"ids": [kid_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // public profile of a child is reduced to id / username / avatar
+    let (st, u) = call(
+        &app,
+        "GET",
+        &format!("/v1/users?ids={kid_id},{other_id}"),
+        Some(&ot),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+    let users = u["users"].as_array().unwrap();
+    let kid = users.iter().find(|x| x["id"] == kid_id).unwrap();
+    let grown = users.iter().find(|x| x["id"] == other_id).unwrap();
+    assert_eq!(kid["restricted"], true, "{kid}");
+    assert!(
+        kid.get("lang").is_none() && kid.get("created_at").is_none(),
+        "{kid}"
+    );
+    assert!(kid["username"].is_string());
+    assert!(
+        grown.get("restricted").is_none() && grown["lang"].is_string(),
+        "{grown}"
+    );
+
+    // parental consent: request → token in the event → consent lifts all but purchases
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/account/parental/request",
+        Some(&kt),
+        Some(json!({"parent_email": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let parent = format!("{}@example.test", unique("parent"));
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/account/parental/request",
+        Some(&kt),
+        Some(json!({"parent_email": parent})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=account.parental_consent_request&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    let token = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            if e["payload"].is_object() {
+                &e["payload"]
+            } else {
+                &e["data"]
+            }
+        })
+        .filter(|p| p["account_id"] == kid_id)
+        .map(|p| p["token"].as_str().unwrap().to_string())
+        .next_back()
+        .expect("consent token event");
+    let (st, c) = call(
+        &app,
+        "POST",
+        "/v1/auth/parental/consent",
+        None,
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["parental_consent"], true);
+    assert_eq!(c["restrictions"], json!(["purchases"]));
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/parental/consent",
+        None,
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "token is single-use");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&kt),
+        Some(json!({"ids": [other_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, u) = call(
+        &app,
+        "GET",
+        &format!("/v1/users?ids={kid_id}"),
+        Some(&ot),
+        None,
+    )
+    .await;
+    assert!(u["users"][0].get("restricted").is_none(), "{u}");
+
+    // the game server (platform age signal, support) can raise the bracket
+    let (st, a) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/accounts/{kid_id}/age"),
+        k,
+        Some(json!({"bracket": "adult"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["bracket"], "adult");
+    assert_eq!(a["restrictions"], json!([]));
+
+    // teen: nothing closed by default; bad input
+    let (tt, _) = login("teen").await;
+    let (st, a) = call(
+        &app,
+        "PUT",
+        "/v1/account/age",
+        Some(&tt),
+        Some(json!({"birthdate": born(15)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["bracket"], "teen");
+    assert_eq!(a["restrictions"], json!([]));
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/account/age",
+        Some(&tt),
+        Some(json!({"birthdate": "2099-01-01"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(&app, "PUT", "/v1/account/age", Some(&tt), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }

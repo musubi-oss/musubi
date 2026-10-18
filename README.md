@@ -331,6 +331,21 @@ and stops it with `DELETE {url}/servers/{id}`. Three endpoints put GameFabric, a
 scheduler or a bare-metal panel behind the same fleets, buffers, autoscaling and allocation
 API as Docker, Kubernetes, Firecracker, Edgegap and GameLift.
 
+### Age gate and parental controls
+
+`PUT /v1/account/age {birthdate | bracket}` puts an account in an age bracket — `child` (under
+`compliance.child_until`, 13), `teen` (under `adult_from`, 18), `adult` — from a birthdate the
+player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does it from a
+trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
+closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),
+`purchases` (store + IAP), `ugc` and `public_profile` (lookups show only id/username/avatar);
+`unknown_as_child = true` treats accounts without an age as children. `GET /v1/account/age`
+tells the client what is closed. `POST /v1/account/parental/request {parent_email}` emits
+`account.parental_consent_request` with a single-use token for your mailer;
+`POST /v1/auth/parental/consent {token}` (no session) records the parent's consent, after which
+only `consented_child_restrictions` (`purchases` by default) remain. The view lives in memory on
+every node like bans, so a change bites on the next request.
+
 ### Storage: JSON Patch, aggregates, full-text
 
 `POST /v1/storage/patch` takes either a merge patch (`patch`, RFC 7386) or RFC 6902 operations
