@@ -297,6 +297,8 @@ Keys issued through `POST /v1/admin/keys {name, role}` carry a role: `server` (g
 
 ### Subscriptions
 
+Platform friends: `POST /v1/friends/import {provider, subjects, add?}` maps the console/launcher friend list to accounts and remembers the ids, so when one of those friends links that identity later the match is made by the server — `friend.platform_match` event, and the friend request is sent when the import had `add: true` (`social.platform_match_secs`, one node by lease). `GET /v1/friends/import?provider=steam` shows the stored ids and who they resolved to; `POST /v1/server/friends/platform-match` runs the matcher on demand.
+
 Achievements carry `platform_ids` (`{"steam": "ACH_WIN", "psn": "trophy_7", "xbox": "..."}`): on unlock the `achievement.unlocked` event lists them for the client SDK (PSN trophies / Xbox achievements can only be unlocked on the device), and Steam is unlocked server-to-server through `ISteamUserStats/SetUserStatsForGame` with the publisher key from `[iap.steam]` for the player's linked Steam identity (`achievement.sync_failed` on error).
 
 Mail broadcasts take an `audience` instead of `account_ids`/`all`: `{"audience": {"lang": ["de"], "location": ["eu"], "platform": ["psn"], "age_bracket": ["adult"], "track": "xp", "min_level": 10, "active_within_days": 7 | "inactive_days": 30, "created_after": <unix>, "metadata": {"cohort": "b"}}}` — every listed condition must hold; `POST /v1/server/mail/audience/count` previews the reach before sending.

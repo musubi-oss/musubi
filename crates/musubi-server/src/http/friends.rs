@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::app::AppState;
-use crate::http::{ApiError, Bearer};
+use crate::http::{ApiError, Bearer, ServerKey};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -16,7 +16,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/friends/block", post(block))
         .route("/v1/friends/recent", get(recent))
         .route("/v1/friends/suggestions", get(suggestions))
-        .route("/v1/friends/import", post(import))
+        .route("/v1/friends/import", post(import).get(import_list))
+        .route("/v1/server/friends/platform-match", post(platform_match))
         .route("/v1/friends/{id}", axum::routing::patch(annotate))
 }
 
@@ -111,7 +112,15 @@ async fn import(
     Bearer(me): Bearer,
     Json(b): Json<ImportBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if b.subjects.len() > 5000 {
+        return Err(musubi_core::Error::InvalidArgument("at most 5000 subjects".into()).into());
+    }
+    crate::platform_friends::remember(&s, me.account_id, &b.provider, &b.subjects, b.add).await?;
     let found = s.accounts.by_identities(&b.provider, &b.subjects).await?;
+    for (subject, a) in found.iter().filter(|(_, a)| a.id != me.account_id) {
+        crate::platform_friends::mark_matched(&s, me.account_id, &b.provider, subject, a.id)
+            .await?;
+    }
     let matches: Vec<serde_json::Value> = found
         .iter()
         .filter(|(_, a)| a.id != me.account_id && a.disabled_at.is_none())
@@ -142,6 +151,31 @@ async fn import(
             .await;
     }
     Ok(Json(json!({ "matches": matches, "added": added })))
+}
+
+#[derive(Deserialize)]
+struct ImportListQ {
+    provider: Option<String>,
+}
+
+/// Stored platform friend ids and who they resolved to (matches made later show up here too).
+async fn import_list(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<ImportListQ>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        crate::platform_friends::list(&s, me.account_id, q.provider.as_deref()).await?,
+    ))
+}
+
+/// Run the platform friend matcher now instead of waiting for the leader tick.
+async fn platform_match(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let n = crate::platform_friends::run_match(&s, 5000).await?;
+    Ok(Json(json!({ "matched": n })))
 }
 
 async fn add(

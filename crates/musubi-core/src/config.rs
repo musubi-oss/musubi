@@ -1096,6 +1096,9 @@ pub struct SocialConfig {
     /// PlayStation Network: the title's `id_token` (RS256 JWT). Set `jwks_url`/`issuers`/
     /// `client_ids` from the DevNet "ID token" page for the environment you target.
     pub psn: OidcLoginConfig,
+    /// How often one node re-checks imported platform friend ids against newly linked
+    /// identities (`friend.platform_match`); 0 disables the loop.
+    pub platform_match_secs: u64,
     /// Nintendo Account / NSA `id_token`; `jwks_url` + `issuers` + `client_ids` from NDP docs.
     pub nintendo: OidcLoginConfig,
     pub passkeys: PasskeyConfig,
@@ -1133,6 +1136,7 @@ impl Default for SocialConfig {
             oidc: Default::default(),
             xbox: XboxLoginConfig::default(),
             psn: OidcLoginConfig::default(),
+            platform_match_secs: 300,
             nintendo: OidcLoginConfig::default(),
             passkeys: PasskeyConfig::default(),
             group_level_xp: vec![

@@ -3234,6 +3234,108 @@ async fn mock_console_stores(
 }
 
 #[tokio::test]
+async fn platform_friends_match_later_links() {
+    let Some(state) = build_state_with(true, &test_group(), Box::new(|_| {})).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, acc_a) = token(&router).await;
+    let (_tb, acc_b) = token(&router).await;
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let (x, y) = (format!("x-{suffix}"), format!("y-{suffix}"));
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/friends/import",
+        Some(&ta),
+        false,
+        Some(json!({"provider": "steam", "subjects": [x, y], "add": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["matches"].as_array().unwrap().len(), 0);
+    let (st, l) = http_json(
+        &router,
+        "GET",
+        "/v1/friends/import?provider=steam",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    let fr = l["friends"].as_array().unwrap();
+    assert_eq!(fr.len(), 2);
+    assert!(fr
+        .iter()
+        .all(|f| f["account_id"].is_null() && f["auto_add"] == true));
+    // friend B shows up later with that Steam id
+    sqlx::query(
+        "insert into musubi.identities (id, account_id, provider, subject, verified) values ($1, $2, 'steam', $3, true)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid::Uuid::parse_str(&acc_b).unwrap())
+    .bind(&x)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (st, m) = http_json(
+        &router,
+        "POST",
+        "/v1/server/friends/platform-match",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{m}");
+    assert!(m["matched"].as_u64().unwrap() >= 1, "{m}");
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/friends/import?provider=steam",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    let fr = l["friends"].as_array().unwrap();
+    let fx = fr.iter().find(|f| f["subject"] == x.as_str()).unwrap();
+    assert_eq!(fx["account_id"], acc_b.as_str(), "{l}");
+    assert!(fx["username"].is_string());
+    assert!(fr.iter().find(|f| f["subject"] == y.as_str()).unwrap()["account_id"].is_null());
+    // auto_add sent the friend request
+    let (st, friends) = http_json(&router, "GET", "/v1/friends", Some(&ta), false, None).await;
+    assert_eq!(st, 200, "{friends}");
+    assert!(friends.to_string().contains(&acc_b), "{friends}");
+    // re-import replaces the stored list for the provider
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/friends/import",
+        Some(&ta),
+        false,
+        Some(json!({"provider": "steam", "subjects": [y]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        "/v1/friends/import?provider=steam",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    let fr = l["friends"].as_array().unwrap();
+    assert_eq!(fr.len(), 1, "{l}");
+    assert_eq!(fr[0]["subject"], y.as_str());
+    assert_eq!(fr[0]["auto_add"], false);
+    let _ = acc_a;
+}
+
+#[tokio::test]
 async fn achievement_platform_ids_and_steam_sync() {
     use std::sync::{Arc, Mutex};
     let calls: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>> = Default::default();

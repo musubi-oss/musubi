@@ -775,6 +775,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         });
     }
     crate::workflows::start_runner(&state);
+    crate::platform_friends::start_matcher(&state);
     if !state.schedules.is_empty() {
         let st = state.clone();
         let lease = st

@@ -44,7 +44,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Схемы player data и миграции версий | ✅ `PUT /v1/admin/storage_schemas/{c}`: JSON Schema-контракт на коллекцию, версия + миграции (на чтении и backfill), live-подписки `storage_subscribe` по WS | ✅ | ❌ | ❌ | ❌ |
 | Cloud save с разрешением конфликтов | ✅ версии + CAS; при устаревшей версии `merge: ours|theirs|max|min` + `base` в write-операции — трёхстороннее слияние на сервере (поле, изменённое одной стороной, побеждает; оба — по политике), ack с `merged.conflicts` | ❌ | 🟡 | ✅ | ✅ |
 | Друзья, блок, рекомендации, недавние | ✅ `musubi-social` | ✅ | ✅ | ✅ | ✅ |
-| Импорт друзей с платформ (Steam/PSN/Xbox) | ✅ `POST /v1/friends/import {provider, subjects}` (разово; периодического рефреша нет) | ✅ | ❌ | 🟡 | ✅ |
+| Импорт друзей с платформ (Steam/PSN/Xbox) | ✅ `POST /v1/friends/import {provider, subjects, add}` + серверный матч позже привязанных identity (`friend.platform_match`, авто-заявка) | ✅ | ❌ | 🟡 | ✅ |
 | Группы: роли-битмаска, казна, склад, XP/уровни, альянсы | ✅ | 🟡 | 🟡 | 🟡 | ✅ |
 | Войны / челленджи кланов | ❌ (геймплейная логика поверх, ядро есть) | ❌ | ❌ | ❌ | ❌ |
 | Чат: история, треды, реакции, правка, упоминания, модерация, slow-mode | ✅ `musubi-chat` | 🟡 | ✅ | 🟡 | ✅ |
@@ -197,7 +197,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   рассылка списку/всем с токеном, расписание по UTC или по локальному времени получателя (`accounts.timezone`,
   раскатка по часовым поясам, лидерский цикл 30 с). Перевод чата — вебхук (`translate_url`), Huawei Push Kit (`hms`) и тихие пуши (`data.silent`) — есть.
 - **Присутствие (5.4).** Статус — одна строка; нет `appear_offline` и структурированного rich presence.
-  Импорт платформенных друзей разовый, без периодического рефреша. Войны/челленджи кланов — нет.
+  ~~Импорт платформенных друзей разовый~~ ✅ id хранятся, друг, пришедший позже, матчится сервером (`friend.platform_match`). Войны/челленджи кланов — нет (уровень геймплея).
   ✅ `status_update {status, rich, appear_offline}`: rich presence — JSON-объект ≤2 КБ рядом со статусом; appear_offline —
   подписчики получают leave и не видят сессию в снапшотах `status_follow`, сервер по-прежнему знает, что она онлайн.
 - **Экономика (5.11).** ~~Нет синка достижений в Steam/PSN/Xbox~~ ✅ `platform_ids` у достижения: Steam — s2s `SetUserStatsForGame` под publisher key, PSN/Xbox — id в событии `achievement.unlocked` для клиентского SDK; ~~фрод-эвристик по скорости покупок~~ ✅ `[fraud]`: лимиты покупок/трат/IAP в окне → флаг (`economy.fraud_flag`, `/v1/server/economy/fraud/*`) или 429. ~~IAP: только Apple/Google/Steam~~ ✅ PSN/Xbox/Nintendo/Epic через

@@ -28,6 +28,7 @@ pub mod modules;
 pub mod nakama;
 pub mod notify;
 pub mod openapi;
+pub mod platform_friends;
 pub mod playfab;
 pub mod push;
 pub mod realtime;
