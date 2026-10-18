@@ -64,6 +64,8 @@ pub struct AppStateInner {
     pub apple_iap: Option<Arc<musubi_integrations::AppleStoreClient>>,
     pub google_iap: Option<Arc<musubi_integrations::GooglePlayClient>>,
     pub steam_iap: Option<Arc<musubi_integrations::SteamClient>>,
+    pub console_iap:
+        std::collections::HashMap<&'static str, Arc<musubi_integrations::ConsoleStoreClient>>,
     pub runtime: Arc<Runtime>,
     pub schedules: Arc<crate::schedules::Schedules>,
     pub cluster: Option<Arc<Cluster>>,
@@ -527,6 +529,22 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             }
         }
     };
+    let mut console_iap = std::collections::HashMap::new();
+    for p in musubi_integrations::ConsolePlatform::ALL {
+        let c = match p {
+            musubi_integrations::ConsolePlatform::Psn => &cfg.iap.psn,
+            musubi_integrations::ConsolePlatform::Xbox => &cfg.iap.xbox,
+            musubi_integrations::ConsolePlatform::Nintendo => &cfg.iap.nintendo,
+            musubi_integrations::ConsolePlatform::Epic => &cfg.iap.epic,
+        };
+        match musubi_integrations::ConsoleStoreClient::new(p, c) {
+            Ok(Some(client)) => {
+                console_iap.insert(p.as_str(), Arc::new(client));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(provider = p.as_str(), error = %e, "iap provider disabled"),
+        }
+    }
     let google_iap = iap_client("google", &cfg.iap.google.private_key_pem_path, |pem| {
         musubi_integrations::GooglePlayClient::new_with_notifications(
             &cfg.iap.google.url,
@@ -617,6 +635,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         apple_iap,
         google_iap,
         steam_iap,
+        console_iap,
         runtime,
         schedules,
         cluster: Some(cluster),

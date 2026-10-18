@@ -834,6 +834,42 @@ pub struct IapConfig {
     pub apple: AppleIapConfig,
     pub google: GoogleIapConfig,
     pub steam: SteamIapConfig,
+    pub psn: ConsoleStoreConfig,
+    pub xbox: ConsoleStoreConfig,
+    pub nintendo: ConsoleStoreConfig,
+    pub epic: ConsoleStoreConfig,
+}
+
+/// Console / launcher store with server-to-server entitlement lookup (PSN Entitlement Web API,
+/// Microsoft Store Collections, Nintendo consumable service items, Epic Ecom). The server
+/// authenticates with client credentials; empty `client_id` = disabled. `url`, `token_url` and the
+/// two path templates default per platform and are overridable (Nintendo paths are under NDA, so
+/// `url` must be set explicitly there). Placeholders: `{user}` platform account id,
+/// `{product}` product / entitlement label, `{entitlement}` entitlement id, `{sandbox}`,
+/// `{service_label}`, `{tenant}`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsoleStoreConfig {
+    pub url: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// OAuth scope (Xbox: `https://onestore.microsoft.com/.default`, PSN: `psn:s2s`).
+    pub scope: String,
+    /// Epic sandbox id; also substituted for `{sandbox}`.
+    pub sandbox_id: String,
+    /// Epic deployment id (sent with the token request).
+    pub deployment_id: String,
+    /// Azure AD tenant for Xbox (`{tenant}` in `token_url`).
+    pub tenant_id: String,
+    /// PSN service label (`{service_label}`), default `0`.
+    pub service_label: String,
+    pub verify_path: String,
+    pub consume_path: String,
+    /// Consume consumable entitlements on redeem (default true); off = redeem once per entitlement.
+    pub consume: Option<bool>,
+    /// Treat the store as a sandbox (receipts get environment `Sandbox`).
+    pub sandbox: bool,
 }
 
 /// Steamworks Web API microtransactions.

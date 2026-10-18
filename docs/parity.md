@@ -75,7 +75,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Гача с pity и публичным seed (commit-reveal) | ✅ | ❌ | Hiro | ❌ | ❌ |
 | Аукционы, P2P-трейд, ордербук | ✅ | ❌ | ❌ | ❌ | ❌ |
 | IAP: Apple / Google / Steam, уведомления, отзыв | ✅ `iap.rs` | ✅ | ✅ | ✅ | ✅ |
-| IAP: PSN / Xbox / Nintendo / Epic | ❌ | ✅ | ❌ | ✅ | ✅ |
+| IAP: PSN / Xbox / Nintendo / Epic | ✅ `POST /v1/iap/{platform}`: s2s entitlement lookup + consume, `[iap.<platform>]` с переопределяемыми путями | ✅ | ❌ | ✅ | ✅ |
 | Подписки с продлением / grace | ✅ `iap_products.kind = subscription` + `grace_secs`, продление по чеку и Apple V2 / Google RTDN, `GET /v1/iap/subscriptions` | 🟡 | ✅ | ✅ | ✅ |
 | Entitlements: платформенные покупки / DLC → предметы | ✅ `/v1/entitlements` (+`/sync` по Steam-ownership), серверный каталог/grant/revoke | ✅ | ❌ | ✅ | ✅ |
 | Limited grants (лимит серверных грантов на игрока в окно) | ✅ `/v1/server/grant_limits`, `GET /v1/admin/accounts/{id}/grants` | ✅ | ❌ | ❌ | ❌ |

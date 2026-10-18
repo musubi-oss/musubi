@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use musubi_core::{Error, Result};
 
+pub mod console;
 pub mod email;
 pub mod iap;
+pub use console::{ConsolePlatform, ConsoleStoreClient, Entitlement};
 pub use email::{Mail, Mailer};
 pub use iap::{AppleStoreClient, GooglePlayClient, SteamClient, SteamInitTxn, StoreTransaction};
 use serde::{Deserialize, Serialize};

@@ -71,6 +71,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/streaks", get(streak_defs).post(upsert_streak))
         .route("/v1/iap/apple", post(iap_apple))
         .route("/v1/iap/google", post(iap_google))
+        .route("/v1/iap/{platform}", post(iap_console))
         .route("/v1/iap/receipts", get(iap_receipts))
         .route("/v1/iap/subscriptions", get(iap_subscriptions))
         .route("/v1/iap/apple/notifications", post(iap_apple_notifications))
@@ -1088,6 +1089,61 @@ async fn iap_google(
             "iap.redeemed",
             Some(me.account_id),
             json!({ "provider": "google" }),
+        )
+        .await;
+    Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct ConsoleReq {
+    product_id: String,
+    /// Xbox: the user's collections id (`b2b` token from `XStore`/`StoreContext`); other
+    /// platforms use the linked identity.
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// `POST /v1/iap/{psn|xbox|nintendo|epic}` — server-to-server entitlement check on the console /
+/// launcher store for the player's linked identity, then the catalog grant via the same receipt
+/// path as Apple/Google (idempotent per platform transaction id).
+async fn iap_console(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(platform): Path<String>,
+    Json(r): Json<ConsoleReq>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(p) = musubi_integrations::ConsolePlatform::parse(&platform) else {
+        return Err(Error::NotFound("unknown iap platform".into()).into());
+    };
+    s.age.check(me.account_id, "purchases")?;
+    let Some(c) = s.console_iap.get(p.as_str()) else {
+        return Err(Error::NotFound(format!("{platform} iap is not configured")).into());
+    };
+    let user = match p {
+        musubi_integrations::ConsolePlatform::Xbox => r
+            .token
+            .clone()
+            .filter(|t| !t.is_empty() && t.len() <= 4096)
+            .ok_or_else(|| {
+                Error::InvalidArgument("token (user collections id) is required".into())
+            })?,
+        _ => sqlx::query_scalar::<_, String>(
+            "select subject from musubi.identities where account_id = $1 and provider = $2 limit 1",
+        )
+        .bind(me.account_id.0)
+        .bind(p.as_str())
+        .fetch_optional(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(|| Error::NotFound(format!("no linked {platform} identity")))?,
+    };
+    let t = c.redeem(&user, &r.product_id).await?;
+    let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
+    s.events
+        .emit(
+            "iap.redeemed",
+            Some(me.account_id),
+            json!({ "provider": p.as_str() }),
         )
         .await;
     Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))

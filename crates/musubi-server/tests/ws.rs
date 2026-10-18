@@ -190,6 +190,7 @@ async fn build_state_cfg_with(
         rtc: None,
         apple_iap: None,
         google_iap: None,
+        console_iap: Default::default(),
         steam_iap: None,
         runtime: runtime.clone(),
         schedules,
@@ -3146,6 +3147,309 @@ impl TestChain {
         h.x5c = Some(chain.iter().map(|c| e.encode(c)).collect());
         jsonwebtoken::encode(&h, payload, &jsonwebtoken::EncodingKey::from_ec_der(key)).unwrap()
     }
+}
+
+async fn mock_console_stores(
+    product: &str,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use axum::extract::{Path, Query};
+    use axum::routing::{get, post};
+    use axum::Json;
+    let tokens: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let consumed: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let (t1, c1, c2) = (tokens.clone(), consumed.clone(), consumed.clone());
+    let prod = product.to_string();
+    let (p1, p2, p3) = (prod.clone(), prod.clone(), prod.clone());
+    let app = axum::Router::new()
+        .route("/token", post(move |headers: axum::http::HeaderMap, body: String| async move {
+            t1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(body.contains("grant_type=client_credentials"), "{body}");
+            // epic/psn: basic auth; xbox: credentials in the form
+            assert!(headers.contains_key("authorization") || body.contains("client_id=xb-client"), "{body}");
+            Json(json!({"access_token": "ctok", "expires_in": 3600, "token_type": "Bearer"}))
+        }))
+        .route(
+            "/epic/ecom/v1/identities/{user}/entitlements",
+            get(|Path(user): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>, headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer ctok");
+                assert_eq!(q.get("sandboxId").map(String::as_str), Some("sb1"));
+                if !user.starts_with("epic-u1") {
+                    return Json(json!({"entitlements": []}));
+                }
+                Json(json!({"entitlements": [{
+                    "id": "ent-1", "entitlementName": q["entitlementName"], "catalogItemId": "cat-1",
+                    "status": "ACTIVE", "consumable": true, "useCount": 0, "originalUseCount": 3,
+                    "grantDate": "2024-01-01T00:00:00Z"
+                }]}))
+            }),
+        )
+        .route(
+            "/epic/ecom/v1/identities/{user}/entitlements/{ent}/redeem",
+            post(move |Path((user, ent)): Path<(String, String)>| async move {
+                assert!(user.starts_with("epic-u1") && ent == "ent-1", "{user} {ent}");
+                c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(json!({}))
+            }),
+        )
+        .route(
+            "/v1/users/{user}/entitlements",
+            get(move |Path(user): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                assert!(user.starts_with("psn-u1"), "{user}");
+                assert_eq!(q.get("service_label").map(String::as_str), Some("0"));
+                assert_eq!(q.get("entitlement_label").map(String::as_str), Some(p1.as_str()));
+                Json(json!({"entitlements": [{
+                    "id": "psn-ent", "entitlement_label": p1, "active_flag": true, "use_limit": 0,
+                    "active_date": "2024-01-02T00:00:00Z"
+                }]}))
+            }),
+        )
+        .route(
+            "/v9.0/collections/query",
+            post(move |Json(b): Json<Value>| async move {
+                assert_eq!(b["beneficiaries"][0]["identityValue"], "b2b-key");
+                assert_eq!(b["productSkuIds"][0]["productId"], p2);
+                Json(json!({"items": [{
+                    "id": "xb-item", "productId": p2, "status": "Active", "productKind": "Consumable",
+                    "quantity": 2, "acquiredDate": "2024-01-03T00:00:00Z"
+                }]}))
+            }),
+        )
+        .route(
+            "/v9.0/collections/consume",
+            post(move |Json(b): Json<Value>| async move {
+                assert_eq!(b["productId"], p3);
+                assert_eq!(b["quantity"], 1);
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(json!({"trackingId": b["trackingId"], "newQuantity": 1}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, tokens, consumed)
+}
+
+#[tokio::test]
+async fn console_iap_redeems_via_platform_entitlements() {
+    use musubi_core::config::ConsoleStoreConfig;
+    use musubi_integrations::{ConsolePlatform, ConsoleStoreClient};
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let (gem_pack, gems_item, product) = (
+        format!("cpack-{suffix}"),
+        format!("cgems-{suffix}"),
+        format!("gems100.{suffix}"),
+    );
+    let (up, tokens, consumed) = mock_console_stores(&product).await;
+    let upc = up.clone();
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            let base = ConsoleStoreConfig {
+                url: upc.clone(),
+                token_url: format!("{upc}/token"),
+                client_secret: "s3".into(),
+                ..Default::default()
+            };
+            let epic = ConsoleStoreConfig {
+                client_id: "epic-client".into(),
+                sandbox_id: "sb1".into(),
+                deployment_id: "dep1".into(),
+                sandbox: true,
+                ..base.clone()
+            };
+            let psn = ConsoleStoreConfig {
+                client_id: "psn-client".into(),
+                ..base.clone()
+            };
+            let xbox = ConsoleStoreConfig {
+                client_id: "xb-client".into(),
+                tenant_id: "tenant".into(),
+                ..base.clone()
+            };
+            for (p, c) in [
+                (ConsolePlatform::Epic, epic),
+                (ConsolePlatform::Psn, psn),
+                (ConsolePlatform::Xbox, xbox),
+            ] {
+                st.console_iap.insert(
+                    p.as_str(),
+                    Arc::new(ConsoleStoreClient::new(p, &c).unwrap().unwrap()),
+                );
+            }
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, acc_a) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let acc_a = uuid::Uuid::parse_str(&acc_a).unwrap();
+    for (prov, subj) in [("epic", "epic-u1"), ("psn", "psn-u1")] {
+        sqlx::query(
+            "insert into musubi.identities (id, account_id, provider, subject, verified) values ($1, $2, $3, $4, true)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(acc_a)
+        .bind(prov)
+        .bind(format!("{subj}-{suffix}"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/items",
+        None,
+        true,
+        Some(json!({"id": gems_item, "name": "Gems", "stackable": true, "max_stack": 100000})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/store",
+        None,
+        true,
+        Some(json!({"id": gem_pack, "item_id": gems_item, "quantity": 100, "prices": {}})),
+    )
+    .await;
+    assert!(st == 200 || st == 201, "{st}");
+    for prov in ["epic", "psn", "xbox"] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            "/v1/server/iap/products",
+            None,
+            true,
+            Some(json!({"provider": prov, "product_id": product, "store_item_id": gem_pack})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    // epic consumable: every redeem consumes one use and is a fresh receipt
+    let body = json!({"product_id": product});
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/epic",
+        Some(&ta),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["quantity"], 100);
+    assert_eq!(r["replayed"], false);
+    assert_eq!(r["environment"], "Sandbox");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/epic",
+        Some(&ta),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["replayed"], false);
+    assert_eq!(consumed.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // psn durable: the entitlement id is the receipt, second redeem replays
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/psn",
+        Some(&ta),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["replayed"], false);
+    assert_eq!(r["environment"], "Production");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/psn",
+        Some(&ta),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["replayed"], true);
+    // xbox needs the user collections id from the client
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/xbox",
+        Some(&ta),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/xbox",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "token": "b2b-key"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(consumed.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // no linked identity, unconfigured platform, unknown platform
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/epic",
+        Some(&tb),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/nintendo",
+        Some(&ta),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/wii",
+        Some(&ta),
+        false,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, 404);
+    // one token per client, cached across calls
+    assert_eq!(tokens.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    let qty: i64 = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["item_id"] == gems_item)
+        .map(|i| i["quantity"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(qty, 400, "{inv}");
 }
 
 async fn mock_stores(bundle_id: &str, item_product: &str) -> (String, Arc<TestChain>) {

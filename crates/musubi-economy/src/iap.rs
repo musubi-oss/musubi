@@ -107,9 +107,12 @@ const COLS: &str = "id, account_id, provider, transaction_id, product_id, store_
 
 impl EconomyService {
     pub async fn upsert_iap_product(&self, p: IapProduct) -> Result<IapProduct> {
-        if !matches!(p.provider.as_str(), "apple" | "google" | "steam") {
+        if !matches!(
+            p.provider.as_str(),
+            "apple" | "google" | "steam" | "psn" | "xbox" | "nintendo" | "epic"
+        ) {
             return Err(Error::InvalidArgument(
-                "provider: apple|google|steam".into(),
+                "provider: apple|google|steam|psn|xbox|nintendo|epic".into(),
             ));
         }
         if p.product_id.is_empty() || p.product_id.len() > 128 {
