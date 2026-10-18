@@ -70,8 +70,16 @@ pub struct RecentPlayer {
 pub struct Suggestion {
     pub user: User,
     pub mutual_friends: i64,
-    /// `mutual` or `recent`.
+    /// Strongest signal: `platform`, `mutual`, `group` or `recent`.
     pub reason: String,
+    /// Every signal that applies, strongest first; platform ones carry the provider
+    /// (`platform:steam`).
+    pub reasons: Vec<String>,
+    /// Ranking score: platform friend 40, each mutual friend 10, each shared group 6, each recent
+    /// match 3 (6 if within a week).
+    pub score: i64,
+    pub shared_groups: i64,
+    pub recent_matches: i64,
 }
 
 /// How many recent players are kept per account.
@@ -444,8 +452,11 @@ impl SocialService {
             .collect())
     }
 
-    /// Friend suggestions: friends of friends ranked by mutual friends, then recent teammates;
-    /// never anyone already related to `me` (any state) or who blocked `me`.
+    /// Friend suggestions: people the player knows from somewhere, ranked. Signals: imported
+    /// platform friends who turned out to have an account, friends of friends (count of mutual
+    /// friends), fellow members of the player's groups, recent teammates (recency-weighted).
+    /// Never anyone already related to `me` (any state), who blocked `me`, or who hides from
+    /// search.
     pub async fn suggestions(&self, me: AccountId, limit: usize) -> Result<Vec<Suggestion>> {
         let limit = limit.clamp(1, 50) as i64;
         let rows = sqlx::query_as::<_, (
@@ -458,26 +469,54 @@ impl SocialService {
             serde_json::Value,
             OffsetDateTime,
             i64,
-            String,
+            i64,
+            i64,
+            i64,
+            Vec<String>,
         )>(&format!(
             "with mutual as (
                  select f2.friend_id as id, count(*) as n
                  from musubi.friends f1 join musubi.friends f2 on f2.user_id = f1.friend_id
                  where f1.user_id = $1 and f1.state = 0 and f2.state = 0 and f2.friend_id <> $1
                  group by f2.friend_id
+             ), platform as (
+                 select matched_account as id, array_agg(distinct provider order by provider) as providers
+                 from musubi.platform_friends
+                 where account_id = $1 and matched_account is not null and matched_account <> $1
+                 group by matched_account
+             ), groups_shared as (
+                 select g2.user_id as id, count(*) as n
+                 from musubi.group_members g1
+                 join musubi.group_members g2 on g2.group_id = g1.group_id
+                 where g1.user_id = $1 and g1.state <= 2 and g2.state <= 2 and g2.user_id <> $1
+                 group by g2.user_id
              ), recent as (
-                 select other_id as id from musubi.recent_players where user_id = $1
+                 select other_id as id, 1::bigint as n,
+                        case when seen_at > now() - interval '7 days' then 6 else 3 end as pts
+                 from musubi.recent_players where user_id = $1
+             ), ids as (
+                 select id from mutual union select id from platform
+                 union select id from groups_shared union select id from recent
              ), cand as (
-                 select id, n, 'mutual' as reason from mutual
-                 union all
-                 select id, 0, 'recent' from recent where id not in (select id from mutual)
+                 select i.id,
+                        coalesce(m.n, 0) as mutual,
+                        coalesce(g.n, 0) as groups_n,
+                        coalesce(r.n, 0) as recent_n,
+                        coalesce(p.providers, '{{}}'::text[]) as providers,
+                        (case when p.id is not null then 40 else 0 end)
+                          + coalesce(m.n, 0) * 10 + coalesce(g.n, 0) * 6 + coalesce(r.pts, 0) as score
+                 from ids i
+                 left join mutual m on m.id = i.id
+                 left join platform p on p.id = i.id
+                 left join groups_shared g on g.id = i.id
+                 left join recent r on r.id = i.id
              )
-             select {USER_COLS}, c.n, c.reason
+             select {USER_COLS}, c.mutual, c.groups_n, c.recent_n, c.score, c.providers
              from cand c join musubi.accounts a on a.id = c.id
              where a.deleted_at is null
                and not exists (select 1 from musubi.friends x where x.user_id = $1 and x.friend_id = c.id)
                and not exists (select 1 from musubi.friends y where y.user_id = c.id and y.friend_id = $1 and y.state = 3)
-             order by c.n desc, a.username limit $2"
+             order by c.score desc, c.mutual desc, a.username limit $2"
         ))
         .bind(me.0)
         .bind(limit)
@@ -486,10 +525,34 @@ impl SocialService {
         .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|r| Suggestion {
-                user: to_user((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7)),
-                mutual_friends: r.8,
-                reason: r.9,
+            .map(|r| {
+                let mut reasons = Vec::new();
+                for p in &r.12 {
+                    reasons.push(format!("platform:{p}"));
+                }
+                if r.8 > 0 {
+                    reasons.push("mutual".into());
+                }
+                if r.9 > 0 {
+                    reasons.push("group".into());
+                }
+                if r.10 > 0 {
+                    reasons.push("recent".into());
+                }
+                let reason = if !r.12.is_empty() {
+                    "platform".to_string()
+                } else {
+                    reasons.first().cloned().unwrap_or_default()
+                };
+                Suggestion {
+                    user: to_user((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7)),
+                    mutual_friends: r.8,
+                    reason,
+                    reasons,
+                    score: r.11,
+                    shared_groups: r.9,
+                    recent_matches: r.10,
+                }
             })
             .collect())
     }

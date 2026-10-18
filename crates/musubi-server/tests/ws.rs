@@ -17800,3 +17800,138 @@ async fn presence_rich_and_appear_offline() {
         m => panic!("{m:?}"),
     }
 }
+
+#[tokio::test]
+async fn friend_suggestions_rank_platform_groups_and_recent() {
+    let Some(state) = build_state_with(true, &test_group(), Box::new(|_| {})).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, acc_a) = token(&router).await;
+    let (_tb, acc_b) = token(&router).await;
+    let (tc, acc_c) = token(&router).await;
+    let (td, acc_d) = token(&router).await;
+    let steam_id = format!("s-{}", uuid::Uuid::now_v7().simple());
+    // B: imported Steam friend who later links that id (no auto-add, so they stay unrelated)
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/friends/import",
+        Some(&ta),
+        false,
+        Some(json!({"provider": "steam", "subjects": [steam_id], "add": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    sqlx::query(
+        "insert into musubi.identities (id, account_id, provider, subject, verified) values ($1, $2, 'steam', $3, true)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid::Uuid::parse_str(&acc_b).unwrap())
+    .bind(&steam_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (st, m) = http_json(
+        &router,
+        "POST",
+        "/v1/server/friends/platform-match",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{m}");
+    // C and D: fellow members of A's group
+    let name = format!("sugg-{}", uuid::Uuid::now_v7().simple());
+    let (st, g) = http_json(
+        &router,
+        "POST",
+        "/v1/groups",
+        Some(&ta),
+        false,
+        Some(json!({"name": name})),
+    )
+    .await;
+    assert_eq!(st, 200, "{g}");
+    let gid = g["id"].as_str().expect("group id").to_string();
+    for t in [&tc, &td] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/groups/{gid}/join"),
+            Some(t),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    // D also played with A recently
+    sqlx::query(
+        "insert into musubi.recent_players (user_id, other_id, match_id) values ($1, $2, 'm1')",
+    )
+    .bind(uuid::Uuid::parse_str(&acc_a).unwrap())
+    .bind(uuid::Uuid::parse_str(&acc_d).unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (st, v) = http_json(
+        &router,
+        "GET",
+        "/v1/friends/suggestions",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let s = v["suggestions"].as_array().unwrap();
+    assert_eq!(s.len(), 3, "{v}");
+    assert_eq!(s[0]["user"]["id"], acc_b, "{v}");
+    assert_eq!(s[0]["reason"], "platform");
+    assert_eq!(s[0]["reasons"], json!(["platform:steam"]));
+    assert_eq!(s[0]["score"], 40);
+    assert_eq!(s[1]["user"]["id"], acc_d, "{v}");
+    assert_eq!(s[1]["reason"], "group");
+    assert_eq!(s[1]["reasons"], json!(["group", "recent"]));
+    assert_eq!(s[1]["score"], 12);
+    assert_eq!(s[1]["shared_groups"], 1);
+    assert_eq!(s[1]["recent_matches"], 1);
+    assert_eq!(s[2]["user"]["id"], acc_c, "{v}");
+    assert_eq!(s[2]["score"], 6);
+    // D blocks A → gone; A befriends C → gone
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/friends/block",
+        Some(&td),
+        false,
+        Some(json!({"ids": [acc_a]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/friends",
+        Some(&ta),
+        false,
+        Some(json!({"ids": [acc_c]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, v) = http_json(
+        &router,
+        "GET",
+        "/v1/friends/suggestions",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    let s = v["suggestions"].as_array().unwrap();
+    assert_eq!(s.len(), 1, "{v}");
+    assert_eq!(s[0]["user"]["id"], acc_b);
+}
