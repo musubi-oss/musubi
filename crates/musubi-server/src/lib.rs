@@ -18,6 +18,7 @@ pub mod grant_limits;
 pub mod hooks;
 pub mod http;
 pub mod idempotency;
+pub mod idl;
 pub mod jwt;
 pub mod keys;
 pub mod limits;

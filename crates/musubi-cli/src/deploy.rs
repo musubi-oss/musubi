@@ -84,6 +84,33 @@ pub enum FleetCmd {
 
 /// `musubi deploy` manifest: modules and fleets applied in order.
 #[derive(Subcommand)]
+pub enum IdlCmd {
+    /// Parse and validate an IDL file without touching a cluster.
+    Check { file: PathBuf },
+    /// Deploy an IDL file: its collections become storage contracts (version bumps need
+    /// migrations), its RPC types gate `/v1/rpc/{name}`, its types land in `/openapi.json`.
+    Push {
+        file: PathBuf,
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+    /// What the cluster has deployed: `summary` (default), `schemas`, `openapi`.
+    Show {
+        #[arg(long, default_value = "summary")]
+        format: String,
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+    /// Generate from a file into a directory: `types.rs`, `openapi.json`,
+    /// `schemas/<collection>.json`.
+    Gen {
+        file: PathBuf,
+        #[arg(long, default_value = "generated")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum SchemaCmd {
     /// Attach a storage collection contract (JSON Schema, migrations, indexes) from a TOML/JSON
     /// file with a `collection` field; re-running with the same version is a no-op.
@@ -102,7 +129,10 @@ pub enum SchemaCmd {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct Manifest {
-    /// Applied first: data contracts land before the code that relies on them.
+    /// IDL file (relative to the manifest), applied before everything else: its collections
+    /// become storage contracts and its RPC types gate `/v1/rpc/{name}`.
+    pub idl: Option<PathBuf>,
+    /// Applied next: data contracts land before the code that relies on them.
     pub schemas: Vec<Value>,
     pub modules: Vec<ManifestModule>,
     pub fleets: Vec<Value>,
@@ -268,6 +298,21 @@ impl Api {
         .await
     }
 
+    pub async fn idl_push(&self, source: &str) -> anyhow::Result<Value> {
+        musubi_idl::Idl::parse(source).map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.call(
+            "PUT",
+            "/v1/admin/idl",
+            Body::Json(json!({ "source": source })),
+        )
+        .await
+    }
+
+    pub async fn idl_show(&self, format: &str) -> anyhow::Result<Value> {
+        self.call("GET", &format!("/v1/admin/idl?format={format}"), Body::None)
+            .await
+    }
+
     pub async fn fleet_push(&self, mut spec: Value) -> anyhow::Result<Value> {
         let name = spec["name"]
             .as_str()
@@ -333,6 +378,15 @@ impl Api {
     }
 
     pub async fn deploy(&self, m: Manifest, base_dir: &Path) -> anyhow::Result<Value> {
+        let idl = match &m.idl {
+            Some(p) => {
+                let path = base_dir.join(p);
+                let src = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+                Some(self.idl_push(&src).await?)
+            }
+            None => None,
+        };
         let mut schemas = Vec::new();
         for sc in m.schemas {
             schemas.push(self.schema_push(sc).await?);
@@ -358,7 +412,7 @@ impl Api {
         for f in m.fleets {
             fleets.push(self.fleet_push(f).await?);
         }
-        Ok(json!({ "schemas": schemas, "modules": modules, "fleets": fleets }))
+        Ok(json!({ "idl": idl, "schemas": schemas, "modules": modules, "fleets": fleets }))
     }
 }
 
@@ -439,6 +493,50 @@ pub async fn schema(cfg: &Config, cmd: SchemaCmd) -> anyhow::Result<()> {
                 .await?
         }
         SchemaCmd::List { api } => Api::from_args(cfg, &api).schemas().await?,
+    };
+    print(&out)
+}
+
+pub async fn idl(cfg: &Config, cmd: IdlCmd) -> anyhow::Result<()> {
+    let read = |file: &Path| {
+        std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))
+    };
+    let out = match cmd {
+        IdlCmd::Check { file } => {
+            let idl = musubi_idl::Idl::parse(&read(&file)?).map_err(|e| anyhow::anyhow!("{e}"))?;
+            json!({
+                "ok": true,
+                "types": idl.types.len(),
+                "enums": idl.enums.len(),
+                "collections": idl.collections.keys().collect::<Vec<_>>(),
+                "rpcs": idl.rpcs.keys().collect::<Vec<_>>(),
+            })
+        }
+        IdlCmd::Push { file, api } => Api::from_args(cfg, &api).idl_push(&read(&file)?).await?,
+        IdlCmd::Show { format, api } => Api::from_args(cfg, &api).idl_show(&format).await?,
+        IdlCmd::Gen { file, out } => {
+            let idl = musubi_idl::Idl::parse(&read(&file)?).map_err(|e| anyhow::anyhow!("{e}"))?;
+            std::fs::create_dir_all(out.join("schemas"))?;
+            std::fs::write(out.join("types.rs"), idl.rust())?;
+            let openapi = json!({
+                "components": { "schemas": idl.openapi_components() },
+                "paths": idl.openapi_paths(),
+            });
+            std::fs::write(
+                out.join("openapi.json"),
+                serde_json::to_string_pretty(&openapi)?,
+            )?;
+            let mut files = vec!["types.rs".to_string(), "openapi.json".to_string()];
+            for c in idl
+                .collection_schemas()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                let name = format!("schemas/{}.json", c["collection"].as_str().unwrap_or("x"));
+                std::fs::write(out.join(&name), serde_json::to_string_pretty(&c)?)?;
+                files.push(name);
+            }
+            json!({ "out": out, "files": files })
+        }
     };
     print(&out)
 }

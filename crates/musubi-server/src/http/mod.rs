@@ -165,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
         .merge(admin::routes())
+        .merge(crate::idl::router())
         .merge(sso::routes())
         .merge(stats::routes())
         .merge(push::routes())
@@ -294,8 +295,12 @@ async fn node_info(State(s): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn openapi() -> Json<serde_json::Value> {
-    Json(crate::openapi::document(env!("CARGO_PKG_VERSION")))
+async fn openapi(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let idl = s.idl.get();
+    Json(crate::openapi::document_with(
+        env!("CARGO_PKG_VERSION"),
+        idl.as_deref(),
+    ))
 }
 
 /// Public keys of the managed JWT signing keys (RFC 7517), for verifying access tokens elsewhere.

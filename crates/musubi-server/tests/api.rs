@@ -83,6 +83,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         cfg: Arc::new(cfg),
         blobs: None,
         auth,
+        idl: musubi_server::idl::IdlRegistry::new(db.clone(), storage.clone()),
         storage,
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
@@ -15364,4 +15365,213 @@ async fn deferred_rewards_go_through_the_mailbox() {
     .await;
     assert_eq!(st, StatusCode::OK, "{c}");
     assert_eq!(balance(app.clone()).await, 57);
+}
+
+/// One IDL document (plan 3.8) drives storage contracts, `/v1/rpc/{name}` input validation and
+/// auth, and `/openapi.json`.
+#[tokio::test]
+async fn idl_deploys_contracts_rpc_validation_and_openapi() {
+    let Some(app) = app().await else { return };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("idl")})),
+    )
+    .await;
+    let t = s["access_token"].as_str().unwrap();
+    let col = format!("idlp{}", uuid::Uuid::now_v7().simple());
+    let source = format!(
+        r#"
+package = "t"
+
+[types.Profile]
+n = {{ type = "int", min = 0 }}
+nick = "string?"
+
+[types.EchoIn]
+x = "int?"
+
+[collections."{col}"]
+type = "Profile"
+
+[rpcs.echo]
+input = "EchoIn"
+output = "EchoIn"
+
+[rpcs.admin_only]
+auth = "server"
+"#
+    );
+    let (st, sum) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": source })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sum}");
+    assert_eq!(sum["collections"][0]["collection"], col);
+    assert_eq!(sum["collections"][0]["version"], 1);
+    assert!(sum["rpcs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == "echo"));
+
+    // the collection contract came from the IDL: `n` must be an int >= 0
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(t),
+        Some(json!({"objects": [{"collection": col, "key": "k", "value": {"n": "x"}}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(t),
+        Some(json!({"objects": [{"collection": col, "key": "k", "value": {"n": -1}}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, w) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(t),
+        Some(
+            json!({"objects": [{"collection": col, "key": "k", "value": {"n": 3, "nick": null}}]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+
+    // rpc input is validated against `EchoIn` before the module runs
+    let (st, out) = call(&app, "POST", "/v1/rpc/echo", Some(t), Some(json!({"x": 7}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(out["x"], 7);
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/rpc/echo",
+        Some(t),
+        Some(json!({"x": "no"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert!(e["message"].as_str().unwrap().contains("echo"), "{e}");
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/rpc/echo",
+        Some(t),
+        Some(json!({"x": 1, "y": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    // declared server-only: a player is refused before the runtime is consulted
+    let (st, _) = call(&app, "POST", "/v1/rpc/admin_only", Some(t), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/rpc/admin_only",
+        "defaultkey",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // openapi carries the IDL types and rpc paths; other formats are served too
+    let (st, doc) = call(&app, "GET", "/openapi.json", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(doc["components"]["schemas"]["t.EchoIn"]["type"], "object");
+    assert_eq!(
+        doc["paths"]["/v1/rpc/echo"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/t.EchoIn"
+    );
+    let (st, summary) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/idl?format=summary",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(summary["types"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("Profile")));
+    let (st, schemas) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/idl?format=schemas",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        schemas["schemas"][0]["schema"]["properties"]["n"]["minimum"],
+        0.0
+    );
+    let (st, _) = call_server(&app, "GET", "/v1/admin/idl?format=rust", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, e) = call_server(&app, "GET", "/v1/admin/idl?format=nope", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, _) = call(&app, "GET", "/v1/admin/idl", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // a broken document is refused and the previous one stays active
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": "[types.A]\nx = \"Nope\"" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert!(e["message"].as_str().unwrap().contains("Nope"), "{e}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/rpc/echo",
+        Some(t),
+        Some(json!({"x": "no"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // removing the IDL lifts rpc gating; the storage contract it attached stays
+    let (st, d) = call_server(&app, "DELETE", "/v1/admin/idl", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(d["removed"], true);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/rpc/echo",
+        Some(t),
+        Some(json!({"x": "no"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(t),
+        Some(json!({"objects": [{"collection": col, "key": "k2", "value": {"n": "x"}}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(&app, "GET", "/v1/admin/idl", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

@@ -16,6 +16,7 @@ rayon = "1"
 musubi-core.workspace = true
 musubi-auth.workspace = true
 musubi-storage.workspace = true
+musubi-idl.workspace = true
 musubi-account.workspace = true
 musubi-social.workspace = true
 musubi-chat.workspace = true

@@ -158,6 +158,7 @@ async fn build_state_cfg_with(
         dev: Arc::new(musubi_server::dev::DevTools::new()),
         audit: musubi_server::audit::Sink::new(&db),
         auth: AuthService::new(db.clone(), &cfg.session).unwrap(),
+        idl: musubi_server::idl::IdlRegistry::new(db.clone(), StorageService::new(db.clone())),
         storage: StorageService::new(db.clone()).with_limits(
             cfg.storage.max_objects_per_user,
             cfg.storage.max_bytes_per_user,
@@ -221,6 +222,7 @@ async fn build_state_cfg_with(
             },
         )),
     };
+    inner.idl = musubi_server::idl::IdlRegistry::new(inner.db.clone(), inner.storage.clone());
     if let Some(t) = tweak {
         t(&mut inner);
     }

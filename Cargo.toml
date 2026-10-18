@@ -29,6 +29,7 @@ musubi-leaderboard = { path = "crates/musubi-leaderboard" }
 musubi-matchmaker = { path = "crates/musubi-matchmaker" }
 musubi-runtime = { path = "crates/musubi-runtime" }
 musubi-storage = { path = "crates/musubi-storage" }
+musubi-idl = { path = "crates/musubi-idl" }
 musubi-server = { path = "crates/musubi-server" }
 
 tokio = { version = "1", features = ["full"] }

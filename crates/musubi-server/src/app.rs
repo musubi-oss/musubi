@@ -42,6 +42,7 @@ pub struct AppStateInner {
     pub db: PgPool,
     pub auth: AuthService,
     pub storage: StorageService,
+    pub idl: crate::idl::IdlRegistry,
     pub accounts: AccountService,
     pub social: SocialService,
     pub groups: GroupService,
@@ -592,6 +593,12 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         Err(e) => tracing::warn!(error = %e, "storage schemas not loaded"),
     }
     wire_storage_live(&storage, &fanout);
+    let idl = crate::idl::IdlRegistry::new(db.clone(), storage.clone());
+    match idl.load().await {
+        Ok(true) => tracing::info!("idl loaded"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "idl not loaded"),
+    }
     let notify = Notifier::new(NotificationService::new(db.clone()), fanout.clone()).with_push(
         Arc::new(crate::push::Push::new(cfg.push.clone(), db.clone())),
     );
@@ -645,6 +652,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         db,
         auth,
         storage,
+        idl,
         accounts,
         social,
         groups,

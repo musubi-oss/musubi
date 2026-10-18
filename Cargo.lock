@@ -2603,6 +2603,7 @@ dependencies = [
  "futures",
  "mimalloc",
  "musubi-core",
+ "musubi-idl",
  "musubi-proto",
  "musubi-server",
  "musubi-transport",
@@ -2697,6 +2698,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "musubi-idl"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]
@@ -2818,6 +2829,7 @@ dependencies = [
  "musubi-economy",
  "musubi-edge",
  "musubi-fleet",
+ "musubi-idl",
  "musubi-integrations",
  "musubi-leaderboard",
  "musubi-matchmaker",

@@ -1,0 +1,14 @@
+[package]
+name = "musubi-idl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Musubi IDL: one schema for RPCs, storage collections and types → JSON Schema, OpenAPI, Rust"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"

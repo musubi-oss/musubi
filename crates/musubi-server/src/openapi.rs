@@ -14,6 +14,9 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/.well-known/jwks.json", "auth"),
     ("GET", "/metrics", "system"),
     ("GET", "/v1/admin/debug/profile", "system"),
+    ("GET", "/v1/admin/idl", "system"),
+    ("PUT", "/v1/admin/idl", "system"),
+    ("DELETE", "/v1/admin/idl", "system"),
     ("GET", "/openapi.json", "system"),
     ("GET", "/readyz", "system"),
     ("DELETE", "/v1/account", "account"),
@@ -1148,6 +1151,27 @@ pub fn operation_id(method: &str, path: &str) -> String {
 }
 
 pub fn document(version: &str) -> Value {
+    document_with(version, None)
+}
+
+/// The document plus the deployed IDL (plan 3.8): its types under `components.schemas`
+/// (prefixed by the package) and `POST /v1/rpc/{name}` paths with typed bodies.
+pub fn document_with(version: &str, idl: Option<&musubi_idl::Idl>) -> Value {
+    let mut doc = base_document(version);
+    if let Some(idl) = idl {
+        if let Some(c) = doc["components"]["schemas"].as_object_mut() {
+            c.extend(idl.openapi_components());
+        }
+        if let Some(p) = doc["paths"].as_object_mut() {
+            for (path, item) in idl.openapi_paths() {
+                p.insert(path, item);
+            }
+        }
+    }
+    doc
+}
+
+fn base_document(version: &str) -> Value {
     let mut paths: Map<String, Value> = Map::new();
     for (method, path, tag) in ROUTES {
         let params: Vec<Value> = path
@@ -1239,6 +1263,7 @@ mod tests {
             .filter(|p| p.extension().is_some_and(|e| e == "rs"))
             .collect();
         files.push(root.join("events.rs"));
+        files.push(root.join("idl.rs"));
         let mut found = std::collections::BTreeSet::new();
         for f in files {
             let src = std::fs::read_to_string(&f).unwrap();

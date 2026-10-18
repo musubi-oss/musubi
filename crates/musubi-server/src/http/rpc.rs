@@ -67,6 +67,7 @@ async fn call(
     if let Some(acc) = ctx.account_id {
         s.limits.rpc(acc)?;
     }
+    s.idl.check_rpc(&id, ctx.server, &body)?;
     let out = s.runtime.call(&id, ctx, body.to_vec()).await?;
     let ct = headers
         .get(CONTENT_TYPE)

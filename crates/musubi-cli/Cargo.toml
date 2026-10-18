@@ -14,6 +14,7 @@ path = "src/main.rs"
 mimalloc = "0.1"
 musubi-core.workspace = true
 musubi-server.workspace = true
+musubi-idl.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

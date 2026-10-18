@@ -48,6 +48,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: deploy::SchemaCmd,
     },
+    /// One IDL (types, enums, storage collections, RPCs) → storage contracts, RPC validation,
+    /// OpenAPI, Rust types.
+    Idl {
+        #[command(subcommand)]
+        cmd: deploy::IdlCmd,
+    },
     /// Apply a deploy manifest (`[[schemas]]` + `[[modules]]` + `[[fleets]]`) against a running cluster.
     Deploy {
         #[arg(long, default_value = "musubi.deploy.toml")]
@@ -214,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Module { cmd } => deploy::module(&cfg, cmd).await,
         Cmd::Fleet { cmd } => deploy::fleet(&cfg, cmd).await,
         Cmd::Schema { cmd } => deploy::schema(&cfg, cmd).await,
+        Cmd::Idl { cmd } => deploy::idl(&cfg, cmd).await,
         Cmd::Deploy { file, api } => deploy::deploy(&cfg, file, api).await,
         Cmd::Export { out, tables } => {
             let pool = musubi_server::db::connect(&cfg.database).await?;

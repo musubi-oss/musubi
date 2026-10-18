@@ -41,7 +41,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Запросы по полям | ✅ `list_where` (фильтр по JSON-полям) | 🟡 | 🟡 | ❌ | ❌ |
 | Вторичные индексы / full-text | ✅ expression-индексы по полям `value` (`indexes` в контракте коллекции) + `$where` range-фильтры в `where`; full-text — нет | ❌ | 🟡 | ❌ | ❌ |
 | Live-подписка на изменения объектов | ✅ `storage_subscribe` / `storage_update` в сокете | ❌ | ❌ | ❌ | ❌ |
-| Схемы player data и миграции версий | ✅ `PUT /v1/admin/storage_schemas/{c}`: JSON Schema-контракт на коллекцию, версия + миграции (на чтении и backfill), live-подписки `storage_subscribe` по WS | ✅ | ❌ | ❌ | ❌ |
+| Схемы player data и миграции версий | ✅ `PUT /v1/admin/storage_schemas/{c}`: JSON Schema-контракт на коллекцию, версия + миграции (на чтении и backfill), live-подписки `storage_subscribe` по WS; единый IDL (`musubi-idl`, `PUT /v1/admin/idl`): типы/enum/коллекции/RPC в одном TOML → контракты storage, валидация и auth входа `/v1/rpc/{name}`, OpenAPI, Rust-типы (`musubi idl check/push/show/gen`) | ✅ | ❌ | ❌ | ❌ |
 | Cloud save с разрешением конфликтов | ✅ версии + CAS; при устаревшей версии `merge: ours|theirs|max|min` + `base` в write-операции — трёхстороннее слияние на сервере (поле, изменённое одной стороной, побеждает; оба — по политике), ack с `merged.conflicts` | ❌ | 🟡 | ✅ | ✅ |
 | Друзья, блок, рекомендации, недавние | ✅ `musubi-social` | ✅ | ✅ | ✅ | ✅ |
 | Импорт друзей с платформ (Steam/PSN/Xbox) | ✅ `POST /v1/friends/import {provider, subjects, add}` + серверный матч позже привязанных identity (`friend.platform_match`, авто-заявка) | ✅ | ❌ | 🟡 | ✅ |
