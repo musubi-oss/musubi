@@ -998,22 +998,34 @@ async fn start_listeners(state: &AppState, base: Option<&Config>) -> anyhow::Res
 
 /// Nodes currently considered dead. A failover round is owed when this runs, so a transient
 /// database error (pool contention) is retried a few times instead of losing the round.
-/// Nodes SWIM (or a stale heartbeat) considers gone, before the heartbeat check of `dead_nodes`.
-async fn swim_dead(cluster: &musubi_cluster::Cluster) -> usize {
-    cluster
-        .nodes()
-        .await
-        .map(|nodes| nodes.iter().filter(|n| !n.alive).count())
-        .unwrap_or(0)
-}
-
 /// SWIM's verdict comes within seconds, the database heartbeat fence a few seconds later:
-/// poll until they agree instead of waiting for the next round.
+/// poll until they agree instead of waiting for the next round. Only nodes whose heartbeat has
+/// stopped are waited for: a node SWIM misjudges (restarted a moment ago, flapping) keeps
+/// heartbeating, and waiting on it would stall every round by the full poll budget — the stand
+/// re-homed a dead host's cells 10 s late exactly so.
 async fn await_dead_agreement(cluster: &musubi_cluster::Cluster) {
+    let mut seen: std::collections::HashMap<uuid::Uuid, time::OffsetDateTime> =
+        std::collections::HashMap::new();
     for _ in 0..24 {
-        let s = swim_dead(cluster).await;
-        let d = dead_nodes(cluster).await.map(|d| d.len()).unwrap_or(0);
-        if s <= d {
+        let Ok(nodes) = cluster.nodes().await else {
+            return;
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let mut pending = false;
+        for n in nodes.iter().filter(|n| !n.alive) {
+            if now - n.heartbeat_at > musubi_cluster::HEARTBEAT + time::Duration::seconds(2) {
+                continue;
+            }
+            match seen.get(&n.id.0) {
+                // its heartbeat moved on since we first looked: alive, SWIM lags behind
+                Some(prev) if *prev != n.heartbeat_at => {}
+                _ => {
+                    seen.insert(n.id.0, n.heartbeat_at);
+                    pending = true;
+                }
+            }
+        }
+        if !pending {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

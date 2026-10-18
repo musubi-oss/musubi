@@ -1528,12 +1528,23 @@ async fn mesh_count(client: &reqwest::Client, alive: &Alive, mw: &MeshWorld) -> 
     let mut total = 0;
     for (x, y) in [(0, 0), (1, 0)] {
         for u in &urls {
+            let t = Instant::now();
             let res = client
                 .get(format!("{u}/v1/server/worlds/{}/view/{x}/{y}", mw.name))
                 .header("x-musubi-server-key", KEY)
                 .timeout(Duration::from_secs(2))
                 .send()
                 .await;
+            if t.elapsed() > Duration::from_millis(1000) {
+                eprintln!(
+                    "[soak] mesh: slow view {u} ({x},{y}) {} in {} ms",
+                    match &res {
+                        Ok(r) => r.status().to_string(),
+                        Err(e) => format!("err:{e}"),
+                    },
+                    t.elapsed().as_millis()
+                );
+            }
             if let Ok(r) = res {
                 if r.status().is_success() {
                     if let Ok(v) = r.json::<Value>().await {
