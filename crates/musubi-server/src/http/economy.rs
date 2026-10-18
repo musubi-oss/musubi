@@ -209,10 +209,22 @@ async fn consume(
     ))
 }
 
-async fn store(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({ "items": s.economy.store(Some(me.account_id), false).await? }),
-    ))
+#[derive(Deserialize, Default)]
+struct StoreQuery {
+    /// The caller's platform; listings limited to other platforms are left out.
+    #[serde(default)]
+    platform: Option<String>,
+}
+
+async fn store(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<StoreQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let platform = q.platform.as_deref().map(str::to_ascii_lowercase);
+    Ok(Json(json!({
+        "items": s.economy.store_for(Some(me.account_id), false, platform.as_deref()).await?
+    })))
 }
 
 #[derive(Deserialize, serde::Serialize)]

@@ -12725,3 +12725,84 @@ async fn leaderboard_friends_group_rank_range_and_windows() {
     assert_eq!(ws[0]["records"], 4);
     assert_eq!(ws[0]["current"], true);
 }
+
+/// Per-platform storefronts: a listing limited to some platforms is hidden from the others and
+/// from nobody when no platform is given.
+#[tokio::test]
+async fn store_listings_filter_by_platform() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("plat")})),
+    )
+    .await;
+    let tok = s["access_token"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 1000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let skin = unique("skin");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": skin, "name": "Skin", "category": "cosmetic", "stackable": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (every, ios_only) = (unique("every"), unique("ios"));
+    for (id, platforms) in [
+        (&every, json!([])),
+        (&ios_only, json!(["iOS", " android "])),
+    ] {
+        let (st, r) = call_server(
+            &app,
+            "POST",
+            "/v1/server/store",
+            k,
+            Some(json!({"id": id, "item_id": skin, "quantity": 1, "prices": {gold.clone(): 10}, "platforms": platforms})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let ids = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (_, all) = call(&app, "GET", "/v1/store", Some(&tok), None).await;
+    assert!(
+        ids(&all).contains(&every) && ids(&all).contains(&ios_only),
+        "{all}"
+    );
+    let (_, steam) = call(&app, "GET", "/v1/store?platform=steam", Some(&tok), None).await;
+    assert!(
+        ids(&steam).contains(&every) && !ids(&steam).contains(&ios_only),
+        "{steam}"
+    );
+    let (_, ios) = call(&app, "GET", "/v1/store?platform=IOS", Some(&tok), None).await;
+    assert!(ids(&ios).contains(&ios_only), "{ios}");
+    let (_, android) = call(&app, "GET", "/v1/store?platform=android", Some(&tok), None).await;
+    assert!(ids(&android).contains(&ios_only), "{android}");
+    let item = all["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == ios_only)
+        .unwrap();
+    assert_eq!(item["platforms"], json!(["ios", "android"]));
+}
