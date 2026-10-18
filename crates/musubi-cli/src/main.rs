@@ -43,7 +43,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: deploy::FleetCmd,
     },
-    /// Apply a deploy manifest (`[[modules]]` + `[[fleets]]`) against a running cluster.
+    /// Attach storage collection contracts from a TOML/JSON file.
+    Schema {
+        #[command(subcommand)]
+        cmd: deploy::SchemaCmd,
+    },
+    /// Apply a deploy manifest (`[[schemas]]` + `[[modules]]` + `[[fleets]]`) against a running cluster.
     Deploy {
         #[arg(long, default_value = "musubi.deploy.toml")]
         file: PathBuf,
@@ -208,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Doctor => doctor::run(&cfg).await,
         Cmd::Module { cmd } => deploy::module(&cfg, cmd).await,
         Cmd::Fleet { cmd } => deploy::fleet(&cfg, cmd).await,
+        Cmd::Schema { cmd } => deploy::schema(&cfg, cmd).await,
         Cmd::Deploy { file, api } => deploy::deploy(&cfg, file, api).await,
         Cmd::Export { out, tables } => {
             let pool = musubi_server::db::connect(&cfg.database).await?;

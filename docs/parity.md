@@ -233,5 +233,5 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 - **CLI (5.15).** Есть dev/migrate/migrate-nakama/export/import/doctor/config/bench/soak,
   `module publish/canary/promote/rollback/versions`, `fleet push/list`, `deploy` (манифест модули+флоты);
   `migrate-playfab` (PlayFab / UGS экспорт);
-  нет `schema migrate` (контракты коллекций применяются через API), Terraform.
+  ~~нет `schema migrate`~~ ✅ `musubi schema push/list` и `[[schemas]]` в deploy-манифесте (применяются до модулей); Terraform.
 - **Realtime (5.8).** Типизированная схема состояния с автодельтами и детерминированный rollback — v2 / SDK.

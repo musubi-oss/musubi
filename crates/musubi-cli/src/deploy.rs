@@ -83,9 +83,27 @@ pub enum FleetCmd {
 }
 
 /// `musubi deploy` manifest: modules and fleets applied in order.
+#[derive(Subcommand)]
+pub enum SchemaCmd {
+    /// Attach a storage collection contract (JSON Schema, migrations, indexes) from a TOML/JSON
+    /// file with a `collection` field; re-running with the same version is a no-op.
+    Push {
+        file: PathBuf,
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+    /// Collection contracts currently attached.
+    List {
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct Manifest {
+    /// Applied first: data contracts land before the code that relies on them.
+    pub schemas: Vec<Value>,
     pub modules: Vec<ManifestModule>,
     pub fleets: Vec<Value>,
 }
@@ -230,6 +248,26 @@ impl Api {
     }
 
     /// Upsert a fleet by name; `build` (if present in `spec`) is added as a build version.
+    pub async fn schemas(&self) -> anyhow::Result<Value> {
+        self.call("GET", "/v1/admin/storage_schemas", Body::None)
+            .await
+    }
+
+    pub async fn schema_push(&self, mut spec: Value) -> anyhow::Result<Value> {
+        let collection = spec
+            .as_object_mut()
+            .and_then(|o| o.remove("collection"))
+            .and_then(|c| c.as_str().map(str::to_string))
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("schema file needs a `collection`"))?;
+        self.call(
+            "PUT",
+            &format!("/v1/admin/storage_schemas/{collection}"),
+            Body::Json(spec),
+        )
+        .await
+    }
+
     pub async fn fleet_push(&self, mut spec: Value) -> anyhow::Result<Value> {
         let name = spec["name"]
             .as_str()
@@ -295,6 +333,10 @@ impl Api {
     }
 
     pub async fn deploy(&self, m: Manifest, base_dir: &Path) -> anyhow::Result<Value> {
+        let mut schemas = Vec::new();
+        for sc in m.schemas {
+            schemas.push(self.schema_push(sc).await?);
+        }
         let mut modules = Vec::new();
         for md in m.modules {
             let path = if md.path.is_absolute() {
@@ -316,7 +358,7 @@ impl Api {
         for f in m.fleets {
             fleets.push(self.fleet_push(f).await?);
         }
-        Ok(json!({ "modules": modules, "fleets": fleets }))
+        Ok(json!({ "schemas": schemas, "modules": modules, "fleets": fleets }))
     }
 }
 
@@ -385,6 +427,18 @@ pub async fn fleet(cfg: &Config, cmd: FleetCmd) -> anyhow::Result<()> {
                 .await?
         }
         FleetCmd::List { api } => Api::from_args(cfg, &api).fleets().await?,
+    };
+    print(&out)
+}
+
+pub async fn schema(cfg: &Config, cmd: SchemaCmd) -> anyhow::Result<()> {
+    let out = match cmd {
+        SchemaCmd::Push { file, api } => {
+            Api::from_args(cfg, &api)
+                .schema_push(read_value(&file)?)
+                .await?
+        }
+        SchemaCmd::List { api } => Api::from_args(cfg, &api).schemas().await?,
     };
     print(&out)
 }
@@ -462,6 +516,22 @@ mod tests {
                             ),
                         ));
                         Json(json!({ "name": name, "canary": true }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/admin/storage_schemas/{collection}",
+                put(
+                    |State(m): State<Mock>,
+                     AxPath(collection): AxPath<String>,
+                     body: axum::body::Bytes| async move {
+                        let v: Value = serde_json::from_slice(&body).unwrap();
+                        m.log.lock().unwrap().push((
+                            "PUT".into(),
+                            format!("/v1/admin/storage_schemas/{collection}"),
+                            v.to_string(),
+                        ));
+                        Json(json!({ "collection": collection, "version": v["version"] }))
                     },
                 ),
             )
@@ -560,6 +630,15 @@ canary_percent = 0
         std::fs::write(
             dir.join("musubi.deploy.toml"),
             r#"
+[[schemas]]
+collection = "profiles"
+version = 2
+[schemas.schema]
+type = "object"
+[[schemas.indexes]]
+field = "score"
+kind = "number"
+
 [[modules]]
 name = "game"
 path = "game.wasm"
@@ -578,6 +657,8 @@ port_end = 7100
         let m: Manifest =
             serde_json::from_value(read_value(&dir.join("musubi.deploy.toml")).unwrap()).unwrap();
         let out = api.deploy(m, &dir).await.unwrap();
+        assert_eq!(out["schemas"][0]["collection"], "profiles", "{out}");
+        assert_eq!(out["schemas"][0]["version"], 2);
         assert_eq!(out["modules"][0]["result"]["version"], 1);
         assert_eq!(out["fleets"][0]["action"], "updated");
 
@@ -592,11 +673,17 @@ port_end = 7100
                 "POST /v1/server/fleets/11111111-1111-1111-1111-111111111111/builds",
                 "POST /v1/server/fleets/11111111-1111-1111-1111-111111111111/scale",
                 "POST /v1/server/fleets/11111111-1111-1111-1111-111111111111/builds",
+                "PUT /v1/admin/storage_schemas/profiles",
                 "PUT /v1/admin/runtime/modules/game",
                 "POST /v1/server/fleets/11111111-1111-1111-1111-111111111111/scale",
             ],
             "{log:?}"
         );
+        let schema_body: Value = serde_json::from_str(&log[6].2).unwrap();
+        assert_eq!(schema_body["version"], 2);
+        assert_eq!(schema_body["schema"]["type"], "object");
+        assert_eq!(schema_body["indexes"][0]["kind"], "number");
+        assert!(schema_body.get("collection").is_none(), "{schema_body}");
         assert!(log[0].2.contains("key=k1 len=4"), "{:?}", log[0]);
         assert!(
             log[1].2.contains("percent=25 accounts=a,b len=5"),
@@ -619,7 +706,7 @@ port_end = 7100
             "{:?}",
             log[4]
         );
-        assert!(log[7].2.contains("\"buffer\":3"), "{:?}", log[7]);
+        assert!(log[8].2.contains("\"buffer\":3"), "{:?}", log[8]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
