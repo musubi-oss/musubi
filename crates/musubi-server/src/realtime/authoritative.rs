@@ -116,7 +116,7 @@ impl MatchRegistry {
                         let r = sqlx::query(
                             "insert into musubi.match_recordings (match_id, module, label, params, last_tick)
                              values ($1, $2, $3, $4, $5)
-                             on conflict (match_id) do update set label = excluded.label, last_tick = greatest(musubi.match_recordings.last_tick, excluded.last_tick)",
+                             on conflict (match_id) do update set module = excluded.module, params = excluded.params, label = excluded.label, last_tick = greatest(musubi.match_recordings.last_tick, excluded.last_tick)",
                         )
                         .bind(id.0)
                         .bind(&module)
@@ -171,7 +171,7 @@ impl MatchRegistry {
                     Some(s) => sqlx::query(
                         "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group, node_epoch)
                          values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
-                         on conflict (match_id) do update set label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, node_epoch = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_epoch else musubi.match_snapshots.node_epoch end, updated_at = now()
+                         on conflict (match_id) do update set module = excluded.module, params = excluded.params, label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, node_epoch = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_epoch else musubi.match_snapshots.node_epoch end, updated_at = now()
                          where musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id",
                     )
                     .bind(id.0)
@@ -370,9 +370,11 @@ impl MatchRegistry {
                         .collect();
                     if !joined.is_empty() {
                         if let Err(e) = sqlx::query(
-                            "update musubi.match_recordings set participants =
-                                 (select array_agg(distinct p) from unnest(participants || $2) p)
-                             where match_id = $1",
+                            "insert into musubi.match_recordings (match_id, module, label, params, last_tick, participants)
+                             values ($1, '', '', '{}'::jsonb, 0, $2)
+                             on conflict (match_id) do update set participants =
+                                 (select array_agg(distinct p)
+                                  from unnest(musubi.match_recordings.participants || excluded.participants) p)",
                         )
                         .bind(id.0)
                         .bind(&joined)
