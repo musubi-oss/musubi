@@ -6,8 +6,8 @@ use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use musubi_economy::{
     Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, ListingFilter, MarketRules,
-    NewListing, NewOrder, NewTrade, Quest, ReceiptInput, RewardTable, Season, SendMail, StreakDef,
-    Track,
+    NewListing, NewOrder, NewTrade, Quest, ReceiptInput, RewardModifier, RewardTable, Season,
+    SendMail, StreakDef, Track,
 };
 use musubi_integrations::StoreTransaction;
 use musubi_social::notifications::NewNotification;
@@ -36,6 +36,15 @@ pub fn routes() -> Router<AppState> {
             get(reward_tables_all).post(upsert_reward_table),
         )
         .route("/v1/server/rewards/grant", post(reward_grant))
+        .route("/v1/rewards/modifiers", get(my_reward_modifiers))
+        .route(
+            "/v1/server/rewards/modifiers",
+            get(reward_modifiers).put(upsert_reward_modifier),
+        )
+        .route(
+            "/v1/server/rewards/modifiers/{id}",
+            axum::routing::delete(delete_reward_modifier),
+        )
         .route("/v1/progression", get(progression))
         .route("/v1/energy", get(energy))
         .route("/v1/energy/{id}/spend", post(energy_spend))
@@ -646,6 +655,44 @@ async fn reward_grant(
         .await?;
     crate::grant_limits::record(&s.db, who, "reward_table", &r.table_id, 1).await?;
     Ok(Json(json!({ "rewards": rewards })))
+}
+
+// ----- reward modifiers -----
+
+async fn my_reward_modifiers(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    let m = s.economy.active_reward_modifiers(me.account_id).await?;
+    Ok(Json(json!({ "modifiers": m })))
+}
+
+async fn reward_modifiers(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "modifiers": s.economy.reward_modifiers().await? }),
+    ))
+}
+
+async fn upsert_reward_modifier(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(m): Json<RewardModifier>,
+) -> Result<Json<RewardModifier>, ApiError> {
+    Ok(Json(s.economy.upsert_reward_modifier(m).await?))
+}
+
+async fn delete_reward_modifier(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !s.economy.delete_reward_modifier(&id).await? {
+        return Err(Error::NotFound(format!("reward modifier {id}")).into());
+    }
+    Ok(Json(json!({ "deleted": id })))
 }
 
 // ----- progression -----

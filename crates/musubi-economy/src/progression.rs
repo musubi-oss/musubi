@@ -40,6 +40,10 @@ pub struct XpResult {
     pub previous_level: i32,
     pub level_ups: Vec<i32>,
     pub rewards: Vec<RewardEntry>,
+    /// Product of the active `xp` / `xp:<track>` modifiers applied to `delta`.
+    pub xp_factor: f64,
+    /// XP actually added after modifiers.
+    pub delta_applied: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,8 +314,10 @@ impl EconomyService {
         .fetch_one(&mut *tx)
         .await
         .map_err(Error::internal)?;
+        let xp_factor = Self::xp_factor(&mut tx, account, track_id).await?;
+        let delta_applied = crate::modifiers::scale(delta, xp_factor);
         let previous_level = level_for(&t.levels, xp);
-        let new_xp = xp.saturating_add(delta);
+        let new_xp = xp.saturating_add(delta_applied);
         let new_level = level_for(&t.levels, new_xp);
         let mut rewards = Vec::new();
         let level_ups: Vec<i32> = (previous_level + 1..=new_level).collect();
@@ -320,15 +326,16 @@ impl EconomyService {
                 let Some(table) = Self::load_table(&mut tx, table_id).await? else {
                     return Err(Error::NotFound(format!("reward table {table_id}")));
                 };
-                Self::apply_rewards(
+                let applied = Self::apply_rewards_for(
                     &mut tx,
                     account,
+                    Some(table_id),
                     &table.entries,
                     "progression.level",
                     &format!("{track_id}:{lvl}:{reason}"),
                 )
                 .await?;
-                rewards.extend(table.entries);
+                rewards.extend(applied);
             }
         }
         sqlx::query(
@@ -347,6 +354,8 @@ impl EconomyService {
             previous_level,
             level_ups,
             rewards,
+            xp_factor,
+            delta_applied,
         })
     }
 

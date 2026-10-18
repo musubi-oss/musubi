@@ -33,6 +33,8 @@ pub use quests::Quest;
 pub use seasons::Season;
 pub use treasury::TreasuryEntry;
 pub mod crafting;
+pub mod modifiers;
+pub use modifiers::RewardModifier;
 pub mod rewards;
 pub use crafting::{Crafted, Ingredient, Output, Recipe};
 pub use progression::{EnergyDef, Level, StreakDef, Track};

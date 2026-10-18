@@ -12933,3 +12933,173 @@ async fn quest_rerolls_are_limited_per_period() {
         assert_eq!(st, StatusCode::OK);
     }
 }
+
+/// Reward modifiers: a global currency x2 doubles table grants and level rewards, a per-account
+/// xp x2 only affects that player, an expired modifier does nothing, items are never multiplied.
+#[tokio::test]
+async fn reward_modifiers_scale_xp_and_currency() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut players = Vec::new();
+    for _ in 0..2 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("mod")})),
+        )
+        .await;
+        players.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (tok_a, acc_a) = players[0].clone();
+    let (tok_b, acc_b) = players[1].clone();
+    let gems = unique("gems");
+    let bonus = unique("bonus");
+    let track = unique("xp");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gems})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": bonus, "kind": "guaranteed", "entries": [{"currency": gems, "amount": 50}]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/tracks",
+        k,
+        Some(json!({"id": track, "levels": [{"xp": 100, "rewards": bonus}, {"xp": 250}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // invalid modifiers
+    for body in [
+        json!({"id": unique("m"), "scope": "gold", "factor": 2.0}),
+        json!({"id": unique("m"), "scope": "xp", "factor": 0.0}),
+        json!({"id": unique("m"), "scope": "xp", "factor": 2.0, "starts_at": "2030-01-01T00:00:00Z", "ends_at": "2029-01-01T00:00:00Z"}),
+    ] {
+        let (st, r) = call_server(&app, "PUT", "/v1/server/rewards/modifiers", k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    }
+    let (m_cur, m_xp, m_old) = (unique("m-cur"), unique("m-xp"), unique("m-old"));
+    let (st, r) = call_server(&app, "PUT", "/v1/server/rewards/modifiers", k, Some(json!({"id": m_cur, "scope": format!("currency:{gems}"), "factor": 2.0, "note": "weekend"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/rewards/modifiers",
+        k,
+        Some(json!({"id": m_xp, "scope": "xp", "factor": 2.0, "account_id": acc_a})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "PUT", "/v1/server/rewards/modifiers", k, Some(json!({"id": m_old, "scope": format!("table:{bonus}"), "factor": 10.0, "starts_at": "2020-01-01T00:00:00Z", "ends_at": "2020-01-02T00:00:00Z"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    // what each player sees as active
+    let (_, a) = call(&app, "GET", "/v1/rewards/modifiers", Some(&tok_a), None).await;
+    let ids = |v: &Value| -> Vec<String> {
+        v["modifiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let a_ids = ids(&a);
+    assert!(
+        a_ids.contains(&m_cur) && a_ids.contains(&m_xp) && !a_ids.contains(&m_old),
+        "{a}"
+    );
+    let (_, b) = call(&app, "GET", "/v1/rewards/modifiers", Some(&tok_b), None).await;
+    let b_ids = ids(&b);
+    assert!(b_ids.contains(&m_cur) && !b_ids.contains(&m_xp), "{b}");
+    // table grant: 50 gems x2 (expired table x10 ignored)
+    let (st, g) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/grant",
+        k,
+        Some(json!({"account_id": acc_b, "table_id": bonus, "reference": "r1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["rewards"][0]["amount"], 100);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok_b), None).await;
+    assert_eq!(w["balances"][0]["balance"], 100, "{w}");
+    // xp: A has x2 → 60 becomes 120 → level 1 with doubled level reward; B stays at 60
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": acc_a, "track_id": track, "delta": 60})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["xp_factor"], 2.0);
+    assert_eq!(r["delta_applied"], 120);
+    assert_eq!(r["level_ups"], json!([1]));
+    assert_eq!(r["rewards"][0]["amount"], 100);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok_a), None).await;
+    assert_eq!(w["balances"][0]["balance"], 100, "{w}");
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": acc_b, "track_id": track, "delta": 60})),
+    )
+    .await;
+    assert_eq!(r["xp_factor"], 1.0);
+    assert_eq!(r["delta_applied"], 60);
+    assert_eq!(r["progress"]["level"], 0);
+    // list / delete
+    let (_, all) = call_server(&app, "GET", "/v1/server/rewards/modifiers", k, None).await;
+    assert!(ids(&all).contains(&m_old));
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/rewards/modifiers/{m_cur}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/rewards/modifiers/{m_cur}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    for id in [&m_xp, &m_old] {
+        call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/rewards/modifiers/{id}"),
+            k,
+            None,
+        )
+        .await;
+    }
+    // without the modifier the grant is back to 50
+    let (_, g) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/grant",
+        k,
+        Some(json!({"account_id": acc_b, "table_id": bonus, "reference": "r2"})),
+    )
+    .await;
+    assert_eq!(g["rewards"][0]["amount"], 50);
+}

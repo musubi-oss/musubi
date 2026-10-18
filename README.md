@@ -317,6 +317,15 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Reward modifiers
+
+`PUT /v1/server/rewards/modifiers {id, scope, factor, starts_at?, ends_at?, account_id?}` multiplies
+rewards for a time window — for everyone or for one player. Scopes: `xp` / `xp:<track>` (XP added
+to a track), `currency` / `currency:<code>` (currency entries of any reward table, quest, level,
+achievement, mail…), `table:<id>` (one reward table). Active modifiers multiply together; items are
+never multiplied. `POST /v1/server/progression/xp` reports `xp_factor` and `delta_applied`, players
+see what is active in `GET /v1/rewards/modifiers`.
+
 ### Quests: rerolls
 
 A quest with `rerollable: true` can be swapped out by the player (`POST /v1/quests/{id}/reroll`):

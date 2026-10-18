@@ -331,7 +331,15 @@ impl EconomyService {
             return Err(Error::Internal("empty outcome".into()));
         }
         let id = Uuid::now_v7();
-        Self::apply_rewards(&mut tx, account, &rewards, "reward.roll", &id.to_string()).await?;
+        let rewards = Self::apply_rewards_for(
+            &mut tx,
+            account,
+            Some(table_id),
+            &rewards,
+            "reward.roll",
+            &id.to_string(),
+        )
+        .await?;
         let hit = t.pity.after > 0 && rewards.iter().any(|e| e.rarity == t.pity.rarity);
         sqlx::query("update musubi.reward_pity set counter = $3, nonce = $4 where account_id = $1 and table_id = $2")
             .bind(account.0)
@@ -389,9 +397,17 @@ impl EconomyService {
         let Some(t) = row.map(table) else {
             return Err(Error::NotFound(format!("reward table {table_id}")));
         };
-        Self::apply_rewards(&mut tx, account, &t.entries, "reward.grant", reference).await?;
+        let applied = Self::apply_rewards_for(
+            &mut tx,
+            account,
+            Some(table_id),
+            &t.entries,
+            "reward.grant",
+            reference,
+        )
+        .await?;
         tx.commit().await.map_err(Error::internal)?;
-        Ok(t.entries)
+        Ok(applied)
     }
 
     pub(crate) async fn load_table(
@@ -408,14 +424,28 @@ impl EconomyService {
         Ok(row.map(table))
     }
 
+    /// Applies rewards with the active modifiers (currency scopes only); returns what was granted.
     pub(crate) async fn apply_rewards(
         tx: &mut Transaction<'_, Postgres>,
         account: AccountId,
         rewards: &[RewardEntry],
         reason: &str,
         reference: &str,
-    ) -> Result<()> {
-        for e in rewards {
+    ) -> Result<Vec<RewardEntry>> {
+        Self::apply_rewards_for(tx, account, None, rewards, reason, reference).await
+    }
+
+    /// Same with the table's own modifiers (`table:<id>`) taken into account.
+    pub(crate) async fn apply_rewards_for(
+        tx: &mut Transaction<'_, Postgres>,
+        account: AccountId,
+        table_id: Option<&str>,
+        rewards: &[RewardEntry],
+        reason: &str,
+        reference: &str,
+    ) -> Result<Vec<RewardEntry>> {
+        let rewards = Self::modified_rewards(tx, account, table_id, rewards).await?;
+        for e in &rewards {
             if let Some(c) = &e.currency {
                 Self::adjust_tx(tx, account, c, e.amount, reason, reference, None, json!({}))
                     .await?;
@@ -425,6 +455,6 @@ impl EconomyService {
                     .await?;
             }
         }
-        Ok(())
+        Ok(rewards)
     }
 }
