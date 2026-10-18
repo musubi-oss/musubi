@@ -18,8 +18,15 @@ jobs:
           --health-cmd "pg_isready -U musubi" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       MUSUBI_TEST_DATABASE_URL: postgres://musubi:musubi@localhost:5432/musubi
+      # incremental artifacts double the target dir; the 14 GB runner disk ran out at link time
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

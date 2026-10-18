@@ -274,7 +274,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     let matches = Arc::new(
         MatchRegistry::new(Some(db.clone()), cluster.node_id().0)
             .with_epoch(cluster.epoch())
-            .with_group(&cfg.node.cluster_group),
+            .with_group(&cfg.node.cluster_group)
+            .with_region(&cfg.node.region),
     );
     let wasm_mods = matches.register_wasm(&runtime);
     if !wasm_mods.is_empty() {

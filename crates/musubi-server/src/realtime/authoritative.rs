@@ -29,6 +29,8 @@ pub struct MatchRegistry {
     events: std::sync::OnceLock<Arc<crate::events::Events>>,
     /// Periodic snapshot interval in ticks (membership changes and end always snapshot).
     pub snapshot_every: u64,
+    /// Region reported on listed matches and matched by `?region=`.
+    pub region: std::sync::RwLock<String>,
     /// Journal flush interval in ticks (0 = off); bounds what a failover loses.
     pub journal_every: u64,
     /// Set by `release_all`: no snapshot may re-own a row this node has just disowned.
@@ -52,6 +54,7 @@ impl MatchRegistry {
             by_session: DashMap::new(),
             db,
             node_id,
+            region: std::sync::RwLock::new("local".into()),
             group: "default".into(),
             events: std::sync::OnceLock::new(),
             snapshot_every: 50,
@@ -62,6 +65,11 @@ impl MatchRegistry {
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
         r
+    }
+
+    pub fn with_region(self, region: &str) -> Self {
+        *self.region.write().unwrap() = region.into();
+        self
     }
 
     pub fn with_group(mut self, group: &str) -> Self {
@@ -549,31 +557,49 @@ impl MatchRegistry {
         max_size: Option<u32>,
         limit: usize,
     ) -> Vec<MatchInfo> {
-        self.list_query(label, None, min_size, max_size, limit)
-            .await
+        self.list_query(
+            &ListFilter {
+                label,
+                min_size,
+                max_size,
+                ..Default::default()
+            },
+            limit,
+        )
+        .await
     }
 
     /// `query` uses the matchmaker syntax over the label: a JSON-object label exposes its fields
     /// as `label.<field>` (and bare `<field>`), any other label as the string `label`.
-    pub async fn list_query(
-        &self,
-        label: Option<&str>,
-        query: Option<&musubi_matchmaker::Query>,
-        min_size: Option<u32>,
-        max_size: Option<u32>,
-        limit: usize,
-    ) -> Vec<MatchInfo> {
+    pub async fn list_query(&self, f: &ListFilter<'_>, limit: usize) -> Vec<MatchInfo> {
+        let ListFilter {
+            label,
+            query,
+            min_size,
+            max_size,
+            open_slots,
+            region,
+        } = *f;
         let mut out = Vec::new();
+        let here = self.region.read().unwrap().clone();
+        if region.is_some_and(|r| r != here) {
+            return out;
+        }
         for h in self
             .matches
             .iter()
             .map(|e| e.value().clone())
             .collect::<Vec<_>>()
         {
-            let i = h.info().await;
+            let mut i = h.info().await;
+            i.region = here.clone();
             if label.is_some_and(|l| i.label != l)
                 || min_size.is_some_and(|m| i.size < m)
                 || max_size.is_some_and(|m| i.size > m)
+                || open_slots.is_some_and(|n| {
+                    i.max_players
+                        .is_none_or(|cap| cap.saturating_sub(i.size) < n)
+                })
                 || query.is_some_and(|q| !q.matches(&label_props(&i.label)))
             {
                 continue;
@@ -589,6 +615,19 @@ impl MatchRegistry {
     pub fn count(&self) -> usize {
         self.matches.len()
     }
+}
+
+/// Filters for `MatchRegistry::list_query` (`GET /v1/matches`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListFilter<'a> {
+    pub label: Option<&'a str>,
+    pub query: Option<&'a musubi_matchmaker::Query>,
+    pub min_size: Option<u32>,
+    pub max_size: Option<u32>,
+    /// At least this many free player slots (`max_players - size`); matches without a cap never qualify.
+    pub open_slots: Option<u32>,
+    /// Region of the hosting node.
+    pub region: Option<&'a str>,
 }
 
 /// Matchmaker properties derived from a match label (see `MatchRegistry::list_query`).

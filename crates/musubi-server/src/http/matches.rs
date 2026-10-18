@@ -31,6 +31,12 @@ struct ListQuery {
     min_size: Option<u32>,
     #[serde(default)]
     max_size: Option<u32>,
+    /// Only matches with at least this many free player slots (needs `params.max_players`).
+    #[serde(default)]
+    open_slots: Option<u32>,
+    /// Only matches hosted in this region.
+    #[serde(default)]
+    region: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
     /// Matchmaker-style query over the label, e.g. `+label.mode:ranked +label.open:1`.
@@ -63,10 +69,14 @@ async fn list(
     let matches: Vec<MatchInfo> = s
         .matches
         .list_query(
-            q.label.as_deref(),
-            query.as_ref(),
-            q.min_size,
-            q.max_size,
+            &crate::realtime::authoritative::ListFilter {
+                label: q.label.as_deref(),
+                query: query.as_ref(),
+                min_size: q.min_size,
+                max_size: q.max_size,
+                open_slots: q.open_slots,
+                region: q.region.as_deref(),
+            },
             q.limit.clamp(1, 100),
         )
         .await;

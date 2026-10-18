@@ -219,6 +219,12 @@ pub struct MatchInfo {
     pub state_bytes: usize,
     /// Sessions watching without playing.
     pub spectators: Vec<SessionId>,
+    /// Player cap from `params.max_players` (listing by open slots needs it).
+    #[serde(default)]
+    pub max_players: Option<u32>,
+    /// Region of the node hosting the match (filled by the registry).
+    #[serde(default)]
+    pub region: String,
 }
 
 enum Cmd {
@@ -358,6 +364,12 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
         tick_rate: init.tick_rate,
         tick: start_tick,
         state_bytes: init.state.len(),
+        max_players: sp
+            .params
+            .get("max_players")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        region: String::new(),
     }));
     let (tx, rx) = mpsc::channel(1024);
     let handle = MatchHandle {

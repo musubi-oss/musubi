@@ -1525,7 +1525,31 @@ async fn authoritative_echo_match_lifecycle() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| m["match_id"] == mid && m["size"] == 2));
+        .any(|m| m["match_id"] == mid
+            && m["size"] == 2
+            && m["region"] == "local"
+            && m["max_players"] == 2));
+    // region filter against the node's region; open_slots against max_players - size (2 - 2 = 0 free)
+    for (q, hit) in [
+        ("region=local", true),
+        ("region=mars", false),
+        ("open_slots=0", true),
+        ("open_slots=1", false),
+    ] {
+        let req = Request::get(format!("/v1/matches?label=duel&{q}"))
+            .header(header::AUTHORIZATION, format!("Bearer {ta}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let v: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let found = v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["match_id"] == mid);
+        assert_eq!(found, hit, "{q}: {v}");
+    }
 
     // leave → presence event; when empty for 2 ticks the match ends and disappears
     send(
