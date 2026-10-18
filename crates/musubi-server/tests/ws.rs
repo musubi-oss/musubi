@@ -18939,8 +18939,16 @@ async fn typed_match_state_syncs_snapshot_and_deltas() {
         "init",
         r#"{"state":"eyJyb3VuZCI6MSwic2VjcmV0Ijo3fQ==","tick_rate":20,"label":"s"}"#,
     );
-    wat += &reply(256, "join_attempt", r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ==","accept":true}"#);
-    wat += &reply(512, "join", r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#);
+    wat += &reply(
+        256,
+        "join_attempt",
+        r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ==","accept":true}"#,
+    );
+    wat += &reply(
+        512,
+        "join",
+        r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#,
+    );
     wat += &reply(
         768,
         "leave",
@@ -18951,7 +18959,11 @@ async fn typed_match_state_syncs_snapshot_and_deltas() {
         "tick",
         r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#,
     );
-    wat += &reply(1280, "terminate", r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#);
+    wat += &reply(
+        1280,
+        "terminate",
+        r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#,
+    );
     wat += ")";
     let res = router
         .clone()
