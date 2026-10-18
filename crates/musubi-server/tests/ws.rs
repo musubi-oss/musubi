@@ -16070,3 +16070,217 @@ async fn matchmaker_simulate_and_wait_stats() {
     assert!(s["wait"].is_array());
     assert!(s["waiting_ages"].is_object());
 }
+
+/// Chat depth: typing indicators (fanned out to everyone but the typist, one per 2 s),
+/// the attachment contract on `content.attachments`, and an external automod webhook that
+/// blocks or rewrites messages.
+#[tokio::test]
+async fn chat_typing_attachments_and_automod() {
+    // automod mock: "banned" → block, "rewrite" → replace, anything else → allow
+    let automod = axum::Router::new().route(
+        "/mod",
+        axum::routing::post(|axum::Json(v): axum::Json<Value>| async move {
+            let text = v["content"]["text"].as_str().unwrap_or("");
+            assert!(v["sender_id"].is_string() && v["channel_id"].is_string());
+            axum::Json(if text.contains("banned") {
+                json!({"action": "block", "reason": "no swearing"})
+            } else if text.contains("rewrite") {
+                json!({"action": "replace", "content": {"text": "[moderated]"}})
+            } else {
+                json!({"action": "allow"})
+            })
+        }),
+    );
+    let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let murl = format!("http://127.0.0.1:{}/mod", ml.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(ml, automod).await.unwrap() });
+
+    let group = test_group();
+    let Some(state) = build_state_with(
+        true,
+        &group,
+        Box::new(move |st| {
+            let cfg = Arc::make_mut(&mut st.cfg);
+            cfg.chat.automod_url = murl;
+            cfg.chat.automod_timeout_ms = 2000;
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let room = format!("typing-{}", uuid::Uuid::now_v7().simple());
+    for ws in [&mut a, &mut b] {
+        send(
+            ws,
+            f,
+            None,
+            ClientMessage::ChannelJoin {
+                target: room.clone(),
+                kind: ChannelKind::Room,
+                persistence: false,
+                hidden: false,
+            },
+        )
+        .await;
+        assert!(matches!(recv(ws).await.msg, ServerMessage::Channel { .. }));
+    }
+    // A's join event reaches nobody; B's join reaches A
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::ChannelPresenceEvent { .. }
+    ));
+    let room_id = format!("2.{room}");
+    let a_user = recv_account(&router, &ta).await["username"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // typing: B sees it, A does not; a second one inside 2 s is swallowed
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelTyping {
+            channel_id: room_id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::ChannelTyping { channel_id, user } => {
+            assert_eq!(channel_id, room_id);
+            assert_eq!(user.username, a_user);
+        }
+        m => panic!("{m:?}"),
+    }
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::ChannelTyping {
+            channel_id: room_id.clone(),
+        },
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), recv(&mut b))
+            .await
+            .is_err(),
+        "second typing within 2 s must be throttled"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), recv(&mut a))
+            .await
+            .is_err()
+    );
+
+    // attachments: shape is enforced
+    let many: Vec<Value> = (0..11)
+        .map(|i| json!({"url": format!("https://cdn.example/{i}.png")}))
+        .collect();
+    for bad in [
+        json!({"text": "x", "attachments": many}),
+        json!({"text": "x", "attachments": [{"url": "http://insecure/x.png"}]}),
+        json!({"text": "x", "attachments": [{"url": "https://cdn.example/a", "size": 999999999999u64}]}),
+        json!({"text": "x", "attachments": {"url": "https://cdn.example/a"}}),
+    ] {
+        send(
+            &mut a,
+            f,
+            Some("att"),
+            ClientMessage::ChannelMessageSend {
+                channel_id: room_id.clone(),
+                content: bad,
+                reply_to: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv(&mut a).await.msg,
+            ServerMessage::Error { .. }
+        ));
+    }
+    send(
+        &mut a,
+        f,
+        Some("ok"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "look", "attachments": [
+                {"url": "https://cdn.example/shot.png", "name": "shot.png", "mime": "image/png", "size": 1024},
+                {"url": "ugc:01HZZ"}
+            ]}),
+            reply_to: None,
+        },
+    )
+    .await;
+    let m = recv(&mut b).await.msg;
+    match m {
+        ServerMessage::ChannelMessage(m) => {
+            assert_eq!(m.content["attachments"].as_array().unwrap().len(), 2)
+        }
+        m => panic!("{m:?}"),
+    }
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::ChannelMessageAck { .. } | ServerMessage::ChannelMessage(_)
+    ));
+    // drain A's own copy if the ack came first
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), recv(&mut a)).await;
+
+    // automod: block → error to the sender, nothing to B; replace → B sees the rewrite
+    send(
+        &mut a,
+        f,
+        Some("blk"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "this is banned"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::Error { message, .. } => {
+            assert!(message.contains("no swearing"), "{message}")
+        }
+        m => panic!("{m:?}"),
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), recv(&mut b))
+            .await
+            .is_err()
+    );
+    send(
+        &mut a,
+        f,
+        Some("rw"),
+        ClientMessage::ChannelMessageSend {
+            channel_id: room_id.clone(),
+            content: json!({"text": "please rewrite this"}),
+            reply_to: None,
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::ChannelMessage(m) => assert_eq!(m.content["text"], "[moderated]"),
+        m => panic!("{m:?}"),
+    }
+}
+
+async fn recv_account(router: &axum::Router, token: &str) -> Value {
+    http_json(router, "GET", "/v1/account", Some(token), false, None)
+        .await
+        .1
+}

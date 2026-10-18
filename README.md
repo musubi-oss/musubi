@@ -317,6 +317,17 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Chat: typing, attachments, automod
+
+`channel_typing {channel_id}` fans a `channel_typing {channel_id, user}` event to everyone else
+in the channel (at most one per 2 s per channel, never stored). `content.attachments` is a
+checked contract — up to 10 `{url, name?, mime?, size?}` with `https://` or `ugc:<id>` URLs and
+sizes ≤ 25 MiB — so clients can render it without defensive parsing. `chat.automod_url` points
+at your moderation service: every message is POSTed as `{channel_id, sender_id, username,
+content}` and the answer `{"action": "allow" | "block" | "replace", "content"?, "reason"?}` is
+applied after the built-in filters and the `before_chat_message` hook; `automod_timeout_ms` and
+`automod_fail_open` decide what a slow or dead service means.
+
 ### Matchmaker observability
 
 `GET /v1/server/matchmaker/stats` adds `wait` — p50/p95/p99/max wait per queue × region over the

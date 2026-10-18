@@ -298,6 +298,21 @@ impl Hub {
         self.fan_out(&targets, msg)
     }
 
+    /// Everyone in the channel but `except` (typing indicators: the typist knows).
+    pub fn broadcast_channel_except(
+        &self,
+        channel_id: &str,
+        except: SessionId,
+        msg: ServerMessage,
+    ) -> usize {
+        let Some(members) = self.channels.get(channel_id) else {
+            return 0;
+        };
+        let targets: Vec<SessionId> = members.keys().copied().filter(|s| *s != except).collect();
+        drop(members);
+        self.fan_out(&targets, msg)
+    }
+
     fn fan_out(&self, targets: &[SessionId], msg: ServerMessage) -> usize {
         let mut n = 0;
         for sid in targets {

@@ -382,6 +382,16 @@ impl Fanout {
         n
     }
 
+    /// Like `channel`, skipping one local session (the author of a typing indicator).
+    pub fn channel_except(&self, channel_id: &str, except: SessionId, msg: ServerMessage) {
+        self.hub
+            .broadcast_channel_except(channel_id, except, msg.clone());
+        self.publish(Wire::Channel {
+            channel_id: channel_id.to_string(),
+            msg,
+        });
+    }
+
     pub fn channel(&self, channel_id: &str, msg: ServerMessage) {
         self.hub.broadcast_channel(channel_id, msg.clone());
         self.publish(Wire::Channel {

@@ -56,6 +56,7 @@ pub struct Config {
     pub push: PushConfig,
     pub email: EmailConfig,
     pub anticheat: AntiCheatConfig,
+    pub chat: ChatConfig,
     pub regions: RegionsConfig,
     pub operators: OperatorsConfig,
     pub ugc: UgcConfig,
@@ -1383,6 +1384,31 @@ pub struct AntiCheatConfig {
     pub battleye_url: String,
     pub battleye_key: String,
     pub vendor_timeout_secs: u64,
+}
+
+/// Chat moderation beyond the built-in filters: an external automod webhook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// POSTed `{channel_id, sender_id, username, content}` for every message; answers
+    /// `{"action": "allow" | "block" | "replace", "content"?, "reason"?}`. Empty = off.
+    pub automod_url: String,
+    /// Bearer token sent to the webhook (empty = none).
+    pub automod_token: String,
+    pub automod_timeout_ms: u64,
+    /// On webhook error/timeout: deliver the message (true) or reject it (false).
+    pub automod_fail_open: bool,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            automod_url: String::new(),
+            automod_token: String::new(),
+            automod_timeout_ms: 500,
+            automod_fail_open: true,
+        }
+    }
 }
 
 impl Default for AntiCheatConfig {

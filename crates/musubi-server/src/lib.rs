@@ -3,6 +3,7 @@
 pub mod anticheat;
 pub mod app;
 pub mod audit;
+pub mod automod;
 pub mod bans;
 pub mod blobstore;
 pub mod db;

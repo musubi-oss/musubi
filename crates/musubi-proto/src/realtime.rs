@@ -72,6 +72,11 @@ pub enum ClientMessage {
         channel_id: String,
         message_id: String,
     },
+    /// "I am typing" — fanned out to the channel as `ChannelTyping`, never stored; the server
+    /// forwards at most one per 2 s per channel, so send it freely.
+    ChannelTyping {
+        channel_id: String,
+    },
     /// Enter the matchmaker. Replies with `MatchmakerTicket`; later `MatchmakerMatched`.
     MatchmakerAdd {
         min_count: u32,
@@ -328,6 +333,11 @@ pub enum ServerMessage {
         channel_id: String,
         joins: Vec<UserPresence>,
         leaves: Vec<UserPresence>,
+    },
+    /// Someone in the channel is typing (ephemeral; show it for a couple of seconds).
+    ChannelTyping {
+        channel_id: String,
+        user: UserPresence,
     },
     MatchmakerTicket {
         ticket: String,

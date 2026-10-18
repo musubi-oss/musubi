@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ pub struct ConnectParams {
     pub worlds: Arc<super::WorldRegistry>,
     pub banned: Arc<crate::bans::Bans>,
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
+    pub automod: Option<crate::automod::Automod>,
     pub runtime: Arc<Runtime>,
     pub fanout: Fanout,
     pub rate: Arc<crate::limits::RateLimiter>,
@@ -77,6 +79,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         rate,
         banned,
         anticheat,
+        automod,
     } = params;
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
@@ -90,6 +93,7 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     });
     info!(session = %sid, account = %presence.account_id, transport = conn.kind(), "realtime connected");
 
+    let typing = std::sync::Mutex::new(HashMap::new());
     let ctx = Ctx {
         hub: &hub,
         chat: &chat,
@@ -108,6 +112,8 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         rate: &rate,
         banned: &banned,
         anticheat: &anticheat,
+        automod: automod.as_ref(),
+        typing: &typing,
         resume: None,
     };
     let resume_token = given_token.or_else(|| {
@@ -294,6 +300,9 @@ struct Ctx<'a> {
     rate: &'a crate::limits::RateLimiter,
     banned: &'a crate::bans::Bans,
     anticheat: &'a Arc<crate::anticheat::AntiCheat>,
+    automod: Option<&'a crate::automod::Automod>,
+    /// Last typing indicator forwarded per channel (one per 2 s).
+    typing: &'a std::sync::Mutex<HashMap<String, std::time::Instant>>,
     resume: Option<Arc<super::resume::ResumeTracker>>,
 }
 
@@ -546,6 +555,35 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                 .await
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
+        ClientMessage::ChannelTyping { channel_id } => {
+            if let Ok(channel) = joined_channel(ctx, &channel_id) {
+                let now = std::time::Instant::now();
+                let forward = {
+                    let mut t = ctx.typing.lock().unwrap_or_else(|e| e.into_inner());
+                    if t.len() > 64 {
+                        t.clear();
+                    }
+                    match t.get(channel.id().as_str()) {
+                        Some(last) if now.duration_since(*last) < Duration::from_secs(2) => false,
+                        _ => {
+                            t.insert(channel.id(), now);
+                            true
+                        }
+                    }
+                };
+                if forward {
+                    ctx.fanout.channel_except(
+                        &channel.id(),
+                        ctx.presence.session_id,
+                        ServerMessage::ChannelTyping {
+                            channel_id: channel.id(),
+                            user: ctx.presence.clone(),
+                        },
+                    );
+                }
+            }
+            None
+        }
         ClientMessage::ChannelMessageRemove {
             channel_id,
             message_id,
@@ -1059,6 +1097,15 @@ async fn channel_send(
     }
     ctx.chat.slow_mode_gate(&channel, me).await?;
     let mut content = before_chat_message(ctx, channel_id, content).await?;
+    if let Some(am) = ctx.automod {
+        match am.check(channel_id, ctx.presence, &content).await? {
+            crate::automod::Verdict::Allow => {}
+            crate::automod::Verdict::Replace(c) => content = c,
+            crate::automod::Verdict::Block(reason) => {
+                return Err(Error::PermissionDenied(reason));
+            }
+        }
+    }
     ctx.chat.filter_content(&mut content, None).await?;
     let persistent = !matches!(channel, Channel::Room(_))
         || ctx

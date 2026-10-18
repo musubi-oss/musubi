@@ -99,6 +99,65 @@ pub fn validate_content(content: &serde_json::Value) -> Result<()> {
             "content must be a JSON object ≤ {MAX_CONTENT_BYTES} bytes"
         )));
     }
+    if let Some(a) = content.get("attachments") {
+        validate_attachments(a)?;
+    }
+    Ok(())
+}
+
+pub const MAX_ATTACHMENTS: usize = 10;
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
+/// `content.attachments`: up to 10 `{url, name?, mime?, size?}` objects — `url` is https (or a
+/// UGC/blob reference `ugc:<id>`), ≤ 2048 chars; `size` ≤ 25 MiB. Anything else is rejected
+/// so clients can trust the shape.
+pub fn validate_attachments(v: &serde_json::Value) -> Result<()> {
+    let Some(list) = v.as_array() else {
+        return Err(Error::InvalidArgument(
+            "attachments must be an array".into(),
+        ));
+    };
+    if list.len() > MAX_ATTACHMENTS {
+        return Err(Error::InvalidArgument(format!(
+            "at most {MAX_ATTACHMENTS} attachments"
+        )));
+    }
+    for (i, a) in list.iter().enumerate() {
+        let Some(o) = a.as_object() else {
+            return Err(Error::InvalidArgument(format!(
+                "attachment {i}: not an object"
+            )));
+        };
+        let url = o.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if url.is_empty()
+            || url.len() > 2048
+            || !(url.starts_with("https://") || url.starts_with("ugc:"))
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attachment {i}: url must be https:// or ugc:<id>, ≤ 2048 chars"
+            )));
+        }
+        if o.get("name")
+            .is_some_and(|n| !n.is_string() || n.as_str().unwrap().chars().count() > 255)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attachment {i}: name ≤ 255 chars"
+            )));
+        }
+        if o.get("mime")
+            .is_some_and(|m| !m.is_string() || m.as_str().unwrap().len() > 128)
+        {
+            return Err(Error::InvalidArgument(format!("attachment {i}: bad mime")));
+        }
+        if let Some(sz) = o.get("size") {
+            let ok = sz.as_u64().is_some_and(|n| n <= MAX_ATTACHMENT_BYTES);
+            if !ok {
+                return Err(Error::InvalidArgument(format!(
+                    "attachment {i}: size must be ≤ {MAX_ATTACHMENT_BYTES} bytes"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
