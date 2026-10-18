@@ -14,6 +14,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/matches", post(create))
         .route("/v1/server/matches/{id}", get(get_one).delete(terminate))
         .route("/v1/server/matches/{id}/backfill", post(backfill))
+        .route("/v1/matches/replays", get(replays))
         .route("/v1/matches/{id}/replay", get(replay))
         .route("/v1/matches/{id}/replay/state", get(replay_state))
         .route(
@@ -136,6 +137,88 @@ async fn backfill(
 /// frames the processed inputs/membership steps between snapshots. Available while the match
 /// is running (frames so far) and after it ended (`ended_at` set), until retention
 /// (`[retention] replay_days`) removes it.
+#[derive(Deserialize, Default)]
+struct ReplaysQuery {
+    module: Option<String>,
+    /// Only matches this account played in (default: the caller; `any` for everyone's).
+    account_id: Option<String>,
+    /// Only recordings started at or after / before this RFC 3339 time.
+    since: Option<String>,
+    before: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `GET /v1/matches/replays?module&account_id&since&before&limit` — recorded matches, newest
+/// first: the caller's own by default, anyone's with `account_id` (or `any`), narrowed by module
+/// and start time. Each row carries what `GET /v1/matches/{id}/replay` has in its header.
+async fn replays(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Query(q): Query<ReplaysQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let account: Option<uuid::Uuid> = match q.account_id.as_deref() {
+        None => Some(me.account_id.0),
+        Some("any") => None,
+        Some(a) => Some(
+            a.parse()
+                .map_err(|_| musubi_core::Error::InvalidArgument("account_id".into()))?,
+        ),
+    };
+    let parse = |t: &Option<String>| -> Result<Option<time::OffsetDateTime>, ApiError> {
+        Ok(match t {
+            None => None,
+            Some(t) => Some(
+                time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| musubi_core::Error::InvalidArgument("time".into()))?,
+            ),
+        })
+    };
+    let (since, before) = (parse(&q.since)?, parse(&q.before)?);
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let rows: Vec<(
+        uuid::Uuid,
+        String,
+        String,
+        serde_json::Value,
+        String,
+        Option<String>,
+        i64,
+        Vec<uuid::Uuid>,
+    )> = sqlx::query_as(
+        "select match_id, module, label, params,
+                    to_char(started_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                    to_char(ended_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
+                    last_tick, participants
+             from musubi.match_recordings
+             where ($1::uuid is null or participants @> array[$1::uuid])
+               and ($2::text is null or module = $2)
+               and ($3::timestamptz is null or started_at >= $3)
+               and ($4::timestamptz is null or started_at < $4)
+             order by started_at desc limit $5",
+    )
+    .bind(account)
+    .bind(&q.module)
+    .bind(since)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let replays: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(
+            |(id, module, label, params, started, ended, last_tick, participants)| {
+                json!({
+                    "match_id": id, "module": module, "label": label, "params": params,
+                    "started_at": started, "ended_at": ended, "last_tick": last_tick,
+                    "participants": participants, "live": s.matches.get(&id.to_string()).is_some(),
+                })
+            },
+        )
+        .collect();
+    Ok(Json(json!({ "replays": replays })))
+}
+
 #[derive(Deserialize, Default)]
 struct ReplayQuery {
     /// Only frames overlapping `[from_tick, to_tick]` (both inclusive, default: everything).

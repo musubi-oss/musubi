@@ -360,6 +360,28 @@ impl MatchRegistry {
                     }
                 };
                 if record {
+                    let joined: Vec<Uuid> = chunk
+                        .entries
+                        .iter()
+                        .filter_map(|e| match &e.op {
+                            musubi_actor::Op::Join { presence, .. } => Some(presence.account_id.0),
+                            _ => None,
+                        })
+                        .collect();
+                    if !joined.is_empty() {
+                        if let Err(e) = sqlx::query(
+                            "update musubi.match_recordings set participants =
+                                 (select array_agg(distinct p) from unnest(participants || $2) p)
+                             where match_id = $1",
+                        )
+                        .bind(id.0)
+                        .bind(&joined)
+                        .execute(&db)
+                        .await
+                        {
+                            tracing::warn!(match_id = %id, error = %e, "recording participants not updated");
+                        }
+                    }
                     let r = sqlx::query(
                         "insert into musubi.match_recording_frames (match_id, kind, tick_from, tick_to, entries, node_id)
                          select $1, 'journal', $2, $3, $4, $5

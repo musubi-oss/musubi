@@ -8803,6 +8803,34 @@ async fn match_recording_produces_replay() {
     )
     .await;
     assert_eq!(st, 404, "no snapshot before tick 0");
+    // the recording is listed for its participant (the caller by default), filtered by module
+    let (st, list) = get_json(router.clone(), "/v1/matches/replays".to_string()).await;
+    assert_eq!(st, 200, "{list}");
+    let mine = list["replays"].as_array().unwrap();
+    let row = mine
+        .iter()
+        .find(|r| r["match_id"] == mid.as_str())
+        .unwrap_or_else(|| panic!("{list}"));
+    assert_eq!(row["live"], true);
+    assert_eq!(row["participants"].as_array().unwrap().len(), 1);
+    let (st, none) = get_json(
+        router.clone(),
+        "/v1/matches/replays?module=nope".to_string(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(none["replays"].as_array().unwrap().is_empty());
+    let (st, any) = get_json(
+        router.clone(),
+        "/v1/matches/replays?account_id=any&module=echo&limit=5".to_string(),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(any["replays"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["match_id"] == mid.as_str()));
 
     // Leaving empties the match: it ends after `empty_ticks` and the recording is closed.
     send(
