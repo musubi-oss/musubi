@@ -74,6 +74,20 @@ and the client resumes with its subscriptions.
 100) is the next knob: at 96 the same box does 28 439 ops/s on `GET /v1/account` and 17 108 ops/s
 on storage write+read-back (200 clients, one scenario at a time) against 24 931 / 14 674 at 32.
 
+Where the rest of the time goes (same box, 48 connections, storage write+read-back at ~15 000
+req/s): the node burns 1.1–1.5 cores, Postgres 2.2, and 2–3 cores stay idle; sampled thread states
+show 1–2 of the node's 10 threads runnable and `pg_stat_activity` shows most backends in
+`ClientRead` — the three processes are passing small messages to each other and the latency is
+the box's scheduling and loopback stack, not any one of them. Per node core that is ~21 000
+`GET /v1/account` and ~12 000 storage requests a second, against the 10 000 / 5 000 per vCPU the
+design aimed for. Two things that do move it: pointing `database.url` at the container's IP
+instead of the published port (Docker's userland proxy copies every byte) is +13 % and
+‑1.4 ms p50; and the storage layer now spends one round trip where it used to spend several — a
+batch read is a single `unnest` join in request order, and a write is one guarded
+`insert … on conflict do update … returning version` (permission, CAS and create-only checks are
+in the `where`), with the current row fetched only when the guard rejected. On loopback that is
+noise; with Postgres a network hop away each round trip is the whole budget.
+
 `musubi soak` on the same VM, release build, 3 nodes, 24 clients, 6 worlds split across two nodes
 each with 20 entities shuttling over the border, 75 s, SIGKILL of a node every 12 s (3 incidents):
 survivors marked the victim dead after 4.7 s, its worlds and matches were re-homed 4.7 s (p50) to

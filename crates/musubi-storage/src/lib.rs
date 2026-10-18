@@ -481,6 +481,8 @@ type Row = (
 );
 
 const COLS: &str = "collection, key, owner_id, value, version, read_permission, write_permission, created_at, updated_at, expires_at, schema_version";
+/// `COLS` qualified with the `o` alias for joins.
+const OCOLS: &str = "o.collection, o.key, o.owner_id, o.value, o.version, o.read_permission, o.write_permission, o.created_at, o.updated_at, o.expires_at, o.schema_version";
 
 /// Optional narrowing for `StorageService::list_where`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -816,7 +818,9 @@ impl StorageService {
                 "at most {MAX_BATCH} objects per read"
             )));
         }
-        let mut out = Vec::with_capacity(refs.len());
+        let mut collections = Vec::with_capacity(refs.len());
+        let mut keys = Vec::with_capacity(refs.len());
+        let mut owners = Vec::with_capacity(refs.len());
         for r in refs {
             validate_name(&r.collection, "collection")?;
             validate_name(&r.key, "key")?;
@@ -825,20 +829,49 @@ impl StorageService {
                 (None, Caller::User(a)) => a.0,
                 (None, Caller::Server) => SYSTEM_OWNER,
             };
+            collections.push(r.collection.clone());
+            keys.push(r.key.clone());
+            owners.push(owner);
+        }
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // the whole batch is one round-trip: refs ride along as parallel arrays, results come
+        // back in request order
+        if let [r] = refs {
             let row = sqlx::query_as::<_, Row>(&format!(
                 "select {COLS} from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 and (expires_at is null or expires_at > now())"
             ))
             .bind(&r.collection)
             .bind(&r.key)
-            .bind(owner)
+            .bind(owners[0])
             .fetch_optional(&self.db)
             .await
             .map_err(Error::internal)?;
-            if let Some(row) = row {
-                let obj = to_object(row);
-                if can_read(caller, &obj) {
-                    out.push(obj);
-                }
+            let out = row
+                .map(to_object)
+                .filter(|obj| can_read(caller, obj))
+                .into_iter()
+                .collect();
+            return Ok(self.finish(out));
+        }
+        let rows = sqlx::query_as::<_, Row>(&format!(
+            "select {OCOLS} from unnest($1::text[], $2::text[], $3::uuid[]) with ordinality as r(collection, key, owner_id, n)
+             join musubi.storage_objects o on o.collection = r.collection and o.key = r.key and o.owner_id = r.owner_id
+             where o.expires_at is null or o.expires_at > now()
+             order by r.n"
+        ))
+        .bind(&collections)
+        .bind(&keys)
+        .bind(&owners)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let obj = to_object(row);
+            if can_read(caller, &obj) {
+                out.push(obj);
             }
         }
         Ok(self.finish(out))
@@ -960,9 +993,6 @@ impl StorageService {
             }
             (Caller::User(a), _) => a.0,
         };
-        let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        let mut acks = Vec::with_capacity(ops.len());
-        let mut changes = Vec::new();
         for op in ops {
             validate_name(&op.collection, "collection")?;
             validate_name(&op.key, "key")?;
@@ -972,119 +1002,205 @@ impl StorageService {
             if !(0..=2).contains(&op.read_permission) || !(0..=1).contains(&op.write_permission) {
                 return Err(Error::InvalidArgument("invalid permission code".into()));
             }
-            let mut merged: Option<Merged> = None;
-            let mut owned: Option<serde_json::Value> = None;
+        }
+        let quota = owner != SYSTEM_OWNER && (self.max_objects > 0 || self.max_bytes > 0);
+        let mut acks = Vec::with_capacity(ops.len());
+        let mut changes = Vec::with_capacity(ops.len());
+        if let ([op], false) = (ops, quota) {
+            // the common case — one object, no quota to re-check — is a single statement on an
+            // autocommit connection: no begin/select/commit round-trips
+            let mut conn = self.db.acquire().await.map_err(Error::internal)?;
+            self.write_one(&mut conn, caller, owner, op, &mut acks, &mut changes)
+                .await?;
+        } else {
+            let mut tx = self.db.begin().await.map_err(Error::internal)?;
+            for op in ops {
+                self.write_one(&mut tx, caller, owner, op, &mut acks, &mut changes)
+                    .await?;
+            }
+            self.enforce_quota(&mut tx, owner).await?;
+            tx.commit().await.map_err(Error::internal)?;
+        }
+        self.fire(changes);
+        Ok(acks)
+    }
 
-            let current = sqlx::query_as::<_, (String, i16, serde_json::Value)>(
-                "select version, write_permission, value from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 for update",
-            )
-            .bind(&op.collection)
-            .bind(&op.key)
-            .bind(owner)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(Error::internal)?;
-
-            if let Some((cur_version, cur_write, cur_value)) = &current {
-                if caller != Caller::Server && *cur_write == 0 {
+    async fn write_one(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        caller: Caller,
+        owner: Uuid,
+        op: &WriteOp,
+        acks: &mut Vec<Ack>,
+        changes: &mut Vec<Change>,
+    ) -> Result<()> {
+        let create_only = op.version.as_deref() == Some("*");
+        let expected = op.version.as_deref().filter(|v| *v != "*");
+        let (cur, applied) = self
+            .upsert(conn, caller, owner, op, &op.value, expected, create_only)
+            .await?;
+        let mut merged = None;
+        let (value, version, schema_version) = match (applied, cur) {
+            (Some(applied), _) => (&op.value, applied.0, applied.1),
+            (None, None) => {
+                return Err(Error::Conflict(format!(
+                    "{}/{} does not exist",
+                    op.collection, op.key
+                )))
+            }
+            (None, Some((cur_version, cur_write, cur_value))) => {
+                if caller != Caller::Server && cur_write == 0 {
                     return Err(Error::PermissionDenied(format!(
                         "{}/{} is read-only",
                         op.collection, op.key
                     )));
                 }
-                match op.version.as_deref() {
-                    Some("*") => {
-                        return Err(Error::Conflict(format!(
-                            "{}/{} already exists",
-                            op.collection, op.key
-                        )))
-                    }
-                    Some(v) if v != cur_version => match op.merge {
-                        Some(policy) => {
-                            let mut conflicts = Vec::new();
-                            let value = three_way(
-                                op.base.as_ref(),
-                                &op.value,
-                                cur_value,
-                                policy,
-                                "",
-                                &mut conflicts,
-                            );
-                            owned = Some(value);
-                            merged = Some(Merged {
-                                with_version: cur_version.clone(),
-                                conflicts,
-                            });
-                        }
-                        None => {
-                            return Err(Error::Conflict(format!(
-                                "{}/{} version mismatch",
-                                op.collection, op.key
-                            )))
-                        }
-                    },
-                    _ => {}
+                if create_only {
+                    return Err(Error::Conflict(format!(
+                        "{}/{} already exists",
+                        op.collection, op.key
+                    )));
                 }
-            } else if matches!(op.version.as_deref(), Some(v) if v != "*") {
-                return Err(Error::Conflict(format!(
-                    "{}/{} does not exist",
-                    op.collection, op.key
-                )));
+                let Some(policy) = op.merge else {
+                    return Err(Error::Conflict(format!(
+                        "{}/{} version mismatch",
+                        op.collection, op.key
+                    )));
+                };
+                let mut conflicts = Vec::new();
+                let value = three_way(
+                    op.base.as_ref(),
+                    &op.value,
+                    &cur_value,
+                    policy,
+                    "",
+                    &mut conflicts,
+                );
+                let (_, applied) = self
+                    .upsert(conn, caller, owner, op, &value, Some(&cur_version), false)
+                    .await?;
+                let Some(applied) = applied else {
+                    // changed again under us between the two statements
+                    return Err(Error::Conflict(format!(
+                        "{}/{} version mismatch",
+                        op.collection, op.key
+                    )));
+                };
+                merged = Some(Merged {
+                    with_version: cur_version,
+                    conflicts,
+                });
+                acks.push(Ack {
+                    collection: op.collection.clone(),
+                    key: op.key.clone(),
+                    owner_id: owner,
+                    version: applied.0.clone(),
+                    merged,
+                });
+                changes.push(Change {
+                    collection: op.collection.clone(),
+                    key: op.key.clone(),
+                    owner_id: owner,
+                    version: Some(applied.0),
+                    value: Some(value),
+                    schema_version: applied.1,
+                    deleted: false,
+                });
+                return Ok(());
             }
+        };
+        changes.push(Change {
+            collection: op.collection.clone(),
+            key: op.key.clone(),
+            owner_id: owner,
+            version: Some(version.clone()),
+            value: Some(value.clone()),
+            schema_version,
+            deleted: false,
+        });
+        acks.push(Ack {
+            collection: op.collection.clone(),
+            key: op.key.clone(),
+            owner_id: owner,
+            version,
+            merged,
+        });
+        Ok(())
+    }
 
-            let value = owned.as_ref().unwrap_or(&op.value);
-            let bytes = serde_json::to_vec(value)?;
-            if bytes.len() > MAX_VALUE_BYTES {
-                return Err(Error::InvalidArgument("value exceeds 1 MiB".into()));
-            }
-            let new_version = version_of(&bytes);
-            let schema_version = self.check_schema(&op.collection, value)?;
-            let changed_value = value;
-            let expires = op.ttl_secs.map(|t| {
-                OffsetDateTime::now_utc()
-                    + time::Duration::seconds(t.min(100 * 365 * 86_400) as i64)
-            });
-            sqlx::query(
-                "insert into musubi.storage_objects (collection, key, owner_id, value, version, read_permission, write_permission, expires_at, schema_version)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 on conflict (collection, key, owner_id) do update set
-                   value = excluded.value, version = excluded.version,
-                   read_permission = excluded.read_permission, write_permission = excluded.write_permission,
-                   expires_at = excluded.expires_at, schema_version = excluded.schema_version, updated_at = now()",
-            )
-            .bind(&op.collection)
-            .bind(&op.key)
-            .bind(owner)
-            .bind(value)
-            .bind(&new_version)
-            .bind(op.read_permission)
-            .bind(op.write_permission)
-            .bind(expires)
-            .bind(schema_version)
-            .execute(&mut *tx)
-            .await
-            .map_err(Error::internal)?;
-            changes.push(Change {
-                collection: op.collection.clone(),
-                key: op.key.clone(),
-                owner_id: owner,
-                version: Some(new_version.clone()),
-                value: Some(changed_value.clone()),
-                schema_version,
-                deleted: false,
-            });
-            acks.push(Ack {
-                collection: op.collection.clone(),
-                key: op.key.clone(),
-                owner_id: owner,
-                version: new_version,
-                merged,
-            });
+    /// Lock-inspect-upsert in one statement. `cur` is the row as it was (version, write
+    /// permission, value); `applied` is `(version, schema_version)` when the upsert went through.
+    /// It does not when the caller may not write the row, `expected` differs from the stored
+    /// version, `create_only` finds a row, or `expected` is set and nothing exists — the caller
+    /// turns `cur` into the right error or a three-way merge.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        caller: Caller,
+        owner: Uuid,
+        op: &WriteOp,
+        value: &serde_json::Value,
+        expected: Option<&str>,
+        create_only: bool,
+    ) -> Result<(
+        Option<(String, i16, serde_json::Value)>,
+        Option<(String, i32)>,
+    )> {
+        let bytes = serde_json::to_vec(value)?;
+        if bytes.len() > MAX_VALUE_BYTES {
+            return Err(Error::InvalidArgument("value exceeds 1 MiB".into()));
         }
-        self.enforce_quota(&mut tx, owner).await?;
-        tx.commit().await.map_err(Error::internal)?;
-        self.fire(changes);
-        Ok(acks)
+        let new_version = version_of(&bytes);
+        let schema_version = self.check_schema(&op.collection, value)?;
+        let expires = op.ttl_secs.map(|t| {
+            OffsetDateTime::now_utc() + time::Duration::seconds(t.min(100 * 365 * 86_400) as i64)
+        });
+        let applied = sqlx::query_scalar::<_, String>(
+            "insert into musubi.storage_objects (collection, key, owner_id, value, version, read_permission, write_permission, expires_at, schema_version)
+             select $1::text, $2::text, $3::uuid, $4::jsonb, $5::text, $6::int2, $7::int2, $8::timestamptz, $9::int4
+             where $11::text is null or exists (
+               select 1 from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3
+             )
+             on conflict (collection, key, owner_id) do update set
+               value = excluded.value, version = excluded.version,
+               read_permission = excluded.read_permission, write_permission = excluded.write_permission,
+               expires_at = excluded.expires_at, schema_version = excluded.schema_version, updated_at = now()
+             where ($10::bool or storage_objects.write_permission = 1)
+               and ($11::text is null or storage_objects.version = $11::text)
+               and not $12::bool
+             returning version",
+        )
+        .bind(&op.collection)
+        .bind(&op.key)
+        .bind(owner)
+        .bind(value)
+        .bind(&new_version)
+        .bind(op.read_permission)
+        .bind(op.write_permission)
+        .bind(expires)
+        .bind(schema_version)
+        .bind(caller == Caller::Server)
+        .bind(expected)
+        .bind(create_only)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(Error::internal)?;
+        if let Some(v) = applied {
+            return Ok((None, Some((v, schema_version))));
+        }
+        // the guarded upsert did not apply: fetch the current row to decide why
+        let cur = sqlx::query_as::<_, (String, i16, serde_json::Value)>(
+            "select version, write_permission, value from musubi.storage_objects
+             where collection = $1 and key = $2 and owner_id = $3",
+        )
+        .bind(&op.collection)
+        .bind(&op.key)
+        .bind(owner)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(Error::internal)?;
+        Ok((cur, None))
     }
 
     #[allow(clippy::too_many_arguments)]
