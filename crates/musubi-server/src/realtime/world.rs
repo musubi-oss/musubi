@@ -463,6 +463,18 @@ struct SubOpts {
     unconfirmed: std::collections::HashSet<musubi_mesh::EntityId>,
 }
 
+/// See `WorldRegistry::requeue_journal`: ops of a failed (not fenced) flush go back to the front
+/// of the tail.
+fn requeue_journal(w: &Mutex<WorldState>, ops: Vec<WorldOp>, err: &Error) {
+    if matches!(err, Error::Unavailable(_)) {
+        return;
+    }
+    let mut st = w.lock();
+    let tail = std::mem::take(&mut st.journal);
+    st.journal = ops;
+    st.journal.extend(tail);
+}
+
 /// Registry ticks an adopted cell keeps re-announcing the entity ids restored from a dead shard.
 const ADOPT_ANNOUNCE_TICKS: u32 = 60;
 /// Every N of those ticks an announcement goes out (60, 40, 20 ticks left).
@@ -1257,6 +1269,7 @@ impl WorldRegistry {
                 "no database: world history is not kept".into(),
             ));
         };
+        let term = self.host_term(name)?;
         let (ops, tick, live) = {
             let w = self.get(name)?;
             let mut st = w.lock();
@@ -1266,7 +1279,10 @@ impl WorldRegistry {
                 st.world.snapshot_persistent(),
             )
         };
-        Self::write_journal(db, name, self.node_id, self.host_term(name)?, ops, tick).await?;
+        if let Err(e) = Self::write_journal(db, name, self.node_id, term, &ops, tick).await {
+            self.requeue_journal(name, ops, &e);
+            return Err(e);
+        }
         let rebuilt = self.entities_at(name, tick).await?;
         let rebuilt: Vec<musubi_mesh::Entity> =
             serde_json::from_value(rebuilt["entities"].clone()).map_err(Error::internal)?;
@@ -2710,12 +2726,26 @@ impl WorldRegistry {
     /// Persist the pending journal of a world now (the ticker does it every `JOURNAL_EVERY` ticks).
     pub async fn flush_journal(&self, name: &str) -> Result<()> {
         let Some(db) = &self.db else { return Ok(()) };
+        let term = self.host_term(name)?;
         let (ops, tick) = {
             let w = self.get(name)?;
             let mut st = w.lock();
             (std::mem::take(&mut st.journal), st.world.tick)
         };
-        Self::write_journal(db, name, self.node_id, self.host_term(name)?, ops, tick).await
+        if let Err(e) = Self::write_journal(db, name, self.node_id, term, &ops, tick).await {
+            self.requeue_journal(name, ops, &e);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// A flush that failed for any reason but fencing keeps its ops: back to the front of the
+    /// tail, the next flush retries them. A fenced node no longer owns the world — its ops die
+    /// with it, as they would have in a crash.
+    fn requeue_journal(&self, name: &str, ops: Vec<WorldOp>, err: &Error) {
+        if let Ok(w) = self.get(name) {
+            requeue_journal(&w, ops, err);
+        }
     }
 
     async fn write_journal(
@@ -2723,7 +2753,7 @@ impl WorldRegistry {
         name: &str,
         node: Uuid,
         term: i64,
-        ops: Vec<WorldOp>,
+        ops: &[WorldOp],
         tick: u64,
     ) -> Result<()> {
         if ops.is_empty() {
@@ -2739,7 +2769,7 @@ impl WorldRegistry {
         .bind(name)
         .bind(from as i64)
         .bind(tick as i64)
-        .bind(serde_json::to_value(&ops)?)
+        .bind(serde_json::to_value(ops)?)
         .bind(node)
         .bind(term)
         .execute(db)
@@ -4015,13 +4045,15 @@ impl WorldRegistry {
                         self.node_id,
                         self.host_terms.get(&name).map(|t| *t),
                     );
+                    let world = w.clone();
                     tokio::spawn(async move {
                         let Some(term) = term else {
                             tracing::warn!(world = %n, "world journal skipped: not an enrolled host");
                             return;
                         };
-                        if let Err(e) = Self::write_journal(&db, &n, node, term, ops, tick).await {
+                        if let Err(e) = Self::write_journal(&db, &n, node, term, &ops, tick).await {
                             tracing::warn!(world = %n, error = %e, "world journal failed");
+                            requeue_journal(&world, ops, &e);
                         }
                     });
                 }

@@ -15184,7 +15184,8 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
         "/v1/server/worlds",
         None,
         true,
-        Some(json!({"name": name, "config": {"cell_size": 100.0}})),
+        // no replicas: the dead cell must come back from B's stale shard, not a mirror
+        Some(json!({"name": name, "config": {"cell_size": 100.0, "replicas": 0}})),
     )
     .await;
     assert_eq!(st, 200, "{w}");
@@ -15238,6 +15239,15 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
     let id = e["id"].as_str().unwrap().to_string();
     // B's shard snapshot still has the entity in (1,0) …
     state_b.worlds.snapshot_now(&name).await.unwrap();
+    // from here B is fenced off the database (its row in world_hosts is gone): whatever it does
+    // in memory — the handover below included — never reaches the journal, as if it crashed
+    // before the flush
+    sqlx::query("delete from musubi.world_hosts where name = $1 and node_id = $2")
+        .bind(&name)
+        .bind(node_b)
+        .execute(&state_b.db)
+        .await
+        .unwrap();
     // … then it walks over the border into A's cell
     let (st, r) = http_json(
         &router_b,
@@ -15280,6 +15290,13 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     // B dies without flushing the departure; the home adopts (1,0) from B's snapshot
+    // anything B managed to flush before the fence took effect dies with it
+    sqlx::query("delete from musubi.world_journal where name = $1 and node_id = $2")
+        .bind(&name)
+        .bind(node_b)
+        .execute(&state_b.db)
+        .await
+        .unwrap();
     let cells = state_home
         .worlds
         .recover_cells(&[node_b], &state_home.fanout)
@@ -15327,4 +15344,33 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
         vec![id.clone()],
         "A keeps the live copy: {va}"
     );
+    // the drop is journaled on the adopter with its own provenance (a periodic flush may hold
+    // the op in flight for a moment: it is then neither in the tail nor in the database yet)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let h = state_home
+            .worlds
+            .history(
+                &name,
+                Some(uuid::Uuid::parse_str(&id).unwrap()),
+                0,
+                u64::MAX,
+                100,
+            )
+            .await
+            .unwrap();
+        if h["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["source"]["by"] == "dedupe")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drop is journaled with provenance: {h}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
