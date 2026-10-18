@@ -463,6 +463,19 @@ struct SubOpts {
     unconfirmed: std::collections::HashSet<musubi_mesh::EntityId>,
 }
 
+/// Of two copies of one entity exactly one wins. A copy a node owns live (its simulator put it
+/// there, or a handover delivered it) beats a *provisional* one — restored from a dead host's
+/// shard or kept after a cancelled handover, i.e. the ones that get announced. Two provisional
+/// copies go to the lower node id. Both sides evaluate the same order, so neither a mutual drop
+/// nor a mutual keep can happen.
+fn copy_wins(mine_provisional: bool, me: Uuid, theirs_provisional: bool, them: Uuid) -> bool {
+    match (mine_provisional, theirs_provisional) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => me < them,
+    }
+}
+
 /// See `WorldRegistry::requeue_journal`: ops of a failed (not fenced) flush go back to the front
 /// of the tail.
 fn requeue_journal(w: &Mutex<WorldState>, ops: Vec<WorldOp>, err: &Error) {
@@ -518,6 +531,8 @@ pub struct WorldRegistry {
     /// Entities restored from a dead host's shard, not yet announced to the other hosts of the
     /// world (they drop duplicates of copies that had handed over before the crash).
     adopted_pending: DashMap<(String, CellId), (Vec<EntityId>, u32)>,
+    /// Entities this node holds provisionally (see `copy_wins`), for as long as they are announced.
+    provisional: DashSet<(String, EntityId)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,6 +673,7 @@ impl WorldRegistry {
             host_terms: DashMap::new(),
             adopted_from: DashSet::new(),
             adopted_pending: DashMap::new(),
+            provisional: DashSet::new(),
             cluster: std::sync::OnceLock::new(),
             region: std::sync::OnceLock::new(),
             events: std::sync::OnceLock::new(),
@@ -943,14 +959,7 @@ impl WorldRegistry {
             let ids: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
             st.world.restore(ents);
             if !ids.is_empty() {
-                {
-                    let mut e = self
-                        .adopted_pending
-                        .entry((name.to_string(), cell))
-                        .or_insert((Vec::new(), 0));
-                    e.0.extend(ids);
-                    e.1 = ADOPT_ANNOUNCE_TICKS;
-                }
+                self.queue_adopted(name, ids.iter().map(|id| (*id, cell)));
             }
             n
         };
@@ -2034,14 +2043,7 @@ impl WorldRegistry {
                         let adopted: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
                         st.world.restore(ents);
                         if !adopted.is_empty() {
-                            {
-                                let mut e = self
-                                    .adopted_pending
-                                    .entry((name.clone(), cell))
-                                    .or_insert((Vec::new(), 0));
-                                e.0.extend(adopted);
-                                e.1 = ADOPT_ANNOUNCE_TICKS;
-                            }
+                            self.queue_adopted(&name, adopted.iter().map(|id| (*id, cell)));
                         }
                         tracing::info!(world = %name, ?cell, node = %dead, tick = m.tick, entities = n, "cell taken over from its replica mirror");
                         mirrored = true;
@@ -2068,14 +2070,7 @@ impl WorldRegistry {
                         let adopted: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
                         st.world.restore(ents);
                         if !adopted.is_empty() {
-                            {
-                                let mut e = self
-                                    .adopted_pending
-                                    .entry((name.clone(), cell))
-                                    .or_insert((Vec::new(), 0));
-                                e.0.extend(adopted);
-                                e.1 = ADOPT_ANNOUNCE_TICKS;
-                            }
+                            self.queue_adopted(&name, adopted.iter().map(|id| (*id, cell)));
                         }
                     }
                     tracing::info!(world = %name, node = %dead, replayed = n, "dead cell host's shard restored");
@@ -3796,6 +3791,7 @@ impl WorldRegistry {
     /// registry ticks announce them and a live owner elsewhere can answer with a drop.
     fn queue_adopted(&self, name: &str, ents: impl IntoIterator<Item = (EntityId, CellId)>) {
         for (id, cell) in ents {
+            self.provisional.insert((name.to_string(), id));
             let mut e = self
                 .adopted_pending
                 .entry((name.to_string(), cell))
@@ -3808,7 +3804,12 @@ impl WorldRegistry {
     /// Of `ids`, the persistent entities this node holds (owned, or in transit towards a host
     /// that may be the dead one — the transfer is cancelled and the entity stays here): the
     /// adopter that just restored them from a dead shard must drop its duplicates.
-    pub fn duplicates_of(&self, name: &str, ids: &[EntityId]) -> Vec<(EntityId, CellId)> {
+    pub fn duplicates_of(
+        &self,
+        name: &str,
+        from_node: Uuid,
+        ids: &[EntityId],
+    ) -> Vec<(EntityId, CellId, bool)> {
         let Ok(w) = self.get(name) else {
             return Vec::new();
         };
@@ -3822,7 +3823,12 @@ impl WorldRegistry {
         ids.iter()
             .filter_map(|id| {
                 let e = st.world.get(*id)?;
-                (e.persistent && hosted_here(e.cell)).then_some((*id, e.cell))
+                let mine = self.provisional.contains(&(name.to_string(), *id));
+                // the announcer's copy is provisional by definition
+                (e.persistent
+                    && hosted_here(e.cell)
+                    && copy_wins(mine, self.node_id, true, from_node))
+                .then_some((*id, e.cell, mine))
             })
             .collect()
     }
@@ -3832,7 +3838,7 @@ impl WorldRegistry {
         &self,
         name: &str,
         from_node: Uuid,
-        ids: &[(EntityId, CellId)],
+        ids: &[(EntityId, CellId, bool)],
     ) -> usize {
         let Ok(w) = self.get(name) else {
             return 0;
@@ -3840,7 +3846,7 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         let mut n = 0;
-        for (id, cell) in ids {
+        for (id, cell, theirs_provisional) in ids {
             // only the node the directory names as host of the cell it claims the entity in
             // may make us drop ours: a zombie that lost the cell (or has not noticed its
             // replica took over) is not believed; a lease we have not learned about yet is
@@ -3852,6 +3858,12 @@ impl WorldRegistry {
             if st.world.get(*id).is_none() {
                 continue;
             }
+            let mine = self.provisional.contains(&(name.to_string(), *id));
+            if copy_wins(mine, self.node_id, *theirs_provisional, from_node) {
+                // ours wins (live beats provisional, or the tie goes to us): the sender drops
+                continue;
+            }
+            self.provisional.remove(&(name.to_string(), *id));
             st.world.forget_for_clients(*id);
             if st.world.despawn(*id) {
                 n += 1;
@@ -3936,6 +3948,11 @@ impl WorldRegistry {
                 announce.push((key.clone(), ids.clone()));
             }
             *left = left.saturating_sub(1);
+            if *left == 0 {
+                for id in ids.iter() {
+                    self.provisional.remove(&(key.0.clone(), *id));
+                }
+            }
             *left > 0
         });
         for ((name, cell), ids) in announce {

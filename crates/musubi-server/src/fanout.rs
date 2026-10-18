@@ -140,9 +140,10 @@ enum Wire {
         world: String,
         to_node: uuid::Uuid,
         from_node: uuid::Uuid,
-        /// Each duplicate with the cell the sender holds it in: the receiver only believes a
-        /// sender its directory names as that cell's host.
-        ids: Vec<(musubi_mesh::EntityId, musubi_mesh::CellId)>,
+        /// Each duplicate with the cell the sender holds it in and whether the sender's own copy
+        /// is provisional: the receiver only believes a sender its directory names as that
+        /// cell's host, and keeps a copy that wins the order (see `copy_wins`).
+        ids: Vec<(musubi_mesh::EntityId, musubi_mesh::CellId, bool)>,
     },
     /// Cross-cell transaction, coordinator → cluster: hold the listed entities you own and vote.
     WorldTxPrepare {
@@ -535,7 +536,7 @@ impl Fanout {
         world: &str,
         to_node: uuid::Uuid,
         from_node: uuid::Uuid,
-        ids: Vec<(musubi_mesh::EntityId, musubi_mesh::CellId)>,
+        ids: Vec<(musubi_mesh::EntityId, musubi_mesh::CellId, bool)>,
     ) {
         self.publish(Wire::WorldDrop {
             world: world.to_string(),
@@ -946,7 +947,7 @@ impl Fanout {
             } => {
                 if let Some(w) = self.worlds.get() {
                     if from_node != w.node_id() {
-                        let dups = w.duplicates_of(&world, &ids);
+                        let dups = w.duplicates_of(&world, from_node, &ids);
                         tracing::info!(world = %world, from = %from_node, announced = ids.len(), duplicates = dups.len(), "adopted entities announced by another node");
                         if !dups.is_empty() {
                             self.world_drop(&world, from_node, w.node_id(), dups);

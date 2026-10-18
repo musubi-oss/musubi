@@ -418,7 +418,30 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                             ?names,
                             ?dead,
                             "adopted worlds (dead homes or pending placement)"
-                        )
+                        );
+                        // a world adopted from a dead home may have had cells on that same
+                        // node: re-home them now, not a whole round later (the stand saw the
+                        // mesh settle 15 s after the world for exactly this)
+                        if !dead.is_empty() {
+                            match tokio::time::timeout(STAGE, worlds.recover_cells(&dead, &fanout))
+                                .await
+                            {
+                                Ok(Ok(cells)) if !cells.is_empty() => {
+                                    tracing::info!(
+                                        ?cells,
+                                        ?dead,
+                                        "re-homed cells of adopted worlds"
+                                    )
+                                }
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %e, "cell failover after adoption failed")
+                                }
+                                Err(_) => {
+                                    tracing::warn!(?dead, "world failover: recover_cells timed out")
+                                }
+                            }
+                        }
                     }
                     Ok(Ok(_)) if dead.is_empty() => {}
                     Ok(Ok(_)) => tracing::info!(?dead, "world failover round: nothing to adopt"),
