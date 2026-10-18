@@ -260,8 +260,9 @@ async fn store(
     Query(q): Query<StoreQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let platform = q.platform.as_deref().map(str::to_ascii_lowercase);
+    let aud = s.audiences.of(&s.db, &s.economy, me.account_id).await?;
     Ok(Json(json!({
-        "items": s.economy.store_for(Some(me.account_id), false, platform.as_deref()).await?
+        "items": s.economy.store_for(Some(me.account_id), false, platform.as_deref(), &aud).await?
     })))
 }
 
@@ -282,6 +283,15 @@ async fn buy(
 ) -> Result<Json<Value>, ApiError> {
     s.age.check(me.account_id, "purchases")?;
     crate::fraud::check_store(&s, me.account_id, &r.currency).await?;
+    let gate = s.economy.store_item_audiences(&r.store_item_id).await?;
+    if !gate.is_empty() {
+        let mine = s.audiences.of(&s.db, &s.economy, me.account_id).await?;
+        if !gate.iter().any(|a| mine.contains(a)) {
+            return Err(
+                Error::PermissionDenied("listing is not available to this account".into()).into(),
+            );
+        }
+    }
     let p = s
         .economy
         .buy(

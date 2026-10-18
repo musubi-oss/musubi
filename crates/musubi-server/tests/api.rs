@@ -16336,3 +16336,107 @@ async fn audiences_crud_membership_and_host_op() {
     let (st, _) = call(&app, "GET", "/v1/server/audiences", Some(&tok), None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Plan 5.12: store listings with `audiences` are shown and sold only to members.
+#[tokio::test]
+async fn store_listings_gated_by_audience() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("audst")})),
+    )
+    .await;
+    let tok = s["access_token"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 1000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let skin = unique("skin");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": skin, "name": "Skin", "category": "cosmetic", "stackable": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (everyone, steam) = (format!("ev_{sfx}"), format!("st_{sfx}"));
+    for (name, rules) in [
+        (&everyone, json!({})),
+        (&steam, json!({"platform": ["steam"]})),
+    ] {
+        let (st, r) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/server/audiences/{name}"),
+            k,
+            Some(json!({"rules": rules})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let (open, for_all, for_steam) = (unique("open"), unique("all"), unique("steam"));
+    for (id, aud) in [
+        (&open, json!([])),
+        (&for_all, json!([everyone])),
+        (&for_steam, json!([steam, " "])),
+    ] {
+        let (st, r) = call_server(&app, "POST", "/v1/server/store", k, Some(json!({"id": id, "item_id": skin, "quantity": 1, "prices": {gold.clone(): 10}, "audiences": aud}))).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let ids = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (_, mine) = call(&app, "GET", "/v1/store", Some(&tok), None).await;
+    let got = ids(&mine);
+    assert!(
+        got.contains(&open) && got.contains(&for_all) && !got.contains(&for_steam),
+        "{mine}"
+    );
+    // the server view keeps everything and shows the gate
+    let (_, all) = call_server(&app, "GET", "/v1/server/store", k, None).await;
+    let gated = all["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == for_steam)
+        .cloned()
+        .unwrap();
+    assert_eq!(gated["audiences"], json!([steam]));
+    // buying a listing you are not in the audience of is refused before anything else
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": for_steam, "currency": gold})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": for_all, "currency": gold})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::FORBIDDEN, "{r}");
+}

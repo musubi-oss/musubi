@@ -38,6 +38,9 @@ pub struct ConnectParams {
     pub notify: crate::notify::Notifier,
     pub social: musubi_social::SocialService,
     pub ratings: musubi_leaderboard::RatingService,
+    pub audiences: crate::http::audiences::Audiences,
+    pub economy: musubi_economy::EconomyService,
+    pub db: sqlx::PgPool,
     pub storage: musubi_storage::StorageService,
     pub matchmaker: Arc<Matchmaker>,
     pub parties: Arc<PartyRegistry>,
@@ -70,6 +73,9 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         notify,
         social,
         ratings,
+        audiences,
+        economy,
+        db,
         storage,
         matchmaker,
         parties,
@@ -104,6 +110,9 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
         notify: &notify,
         social: &social,
         ratings: &ratings,
+        audiences: &audiences,
+        economy: &economy,
+        db: &db,
         storage: &storage,
         matchmaker: &matchmaker,
         parties: &parties,
@@ -294,6 +303,9 @@ struct Ctx<'a> {
     notify: &'a crate::notify::Notifier,
     social: &'a musubi_social::SocialService,
     ratings: &'a musubi_leaderboard::RatingService,
+    audiences: &'a crate::http::audiences::Audiences,
+    economy: &'a musubi_economy::EconomyService,
+    db: &'a sqlx::PgPool,
     storage: &'a musubi_storage::StorageService,
     matchmaker: &'a Matchmaker,
     parties: &'a PartyRegistry,
@@ -697,6 +709,22 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                 return Some(ServerMessage::MatchmakerTicket {
                     ticket: uuid::Uuid::now_v7().to_string(),
                 });
+            }
+            // plan 5.12: named audiences ride on the ticket as `audience_<name> = "true"`
+            let mut string_properties = string_properties;
+            match ctx
+                .audiences
+                .of(ctx.db, ctx.economy, ctx.presence.account_id)
+                .await
+            {
+                Ok(names) => {
+                    for n in names.iter() {
+                        string_properties
+                            .entry(format!("audience_{n}"))
+                            .or_insert_with(|| "true".into());
+                    }
+                }
+                Err(e) => warn!(error = %e, "audiences lookup failed; ticket without them"),
             }
             let me = MatchmakerUser {
                 presence: ctx.presence.clone(),

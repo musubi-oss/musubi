@@ -227,6 +227,9 @@ pub struct StoreItem {
     /// `nintendo`, `epic`, `web` …); empty = every platform.
     #[serde(default)]
     pub platforms: Vec<String>,
+    /// Shown and sold only to accounts in one of these named audiences; empty = everyone.
+    #[serde(default)]
+    pub audiences: Vec<String>,
     /// Filled for a viewer: prices after the current discount.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub effective_prices: Value,
@@ -266,6 +269,9 @@ pub struct CreateStoreItem {
     pub rotation_slots: Option<i32>,
     #[serde(default)]
     pub platforms: Vec<String>,
+    /// Shown and sold only to accounts in one of these named audiences; empty = everyone.
+    #[serde(default)]
+    pub audiences: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,7 +303,7 @@ impl Default for Coupon {
 
 const STORE_COLS: &str =
     "json_build_object('id', id, 'item_id', item_id, 'quantity', quantity, 'prices', prices,
-    'platforms', platforms,
+    'platforms', platforms, 'audiences', audiences,
     'enabled', enabled, 'max_per_account', max_per_account,
     'available_from', extract(epoch from available_from)::bigint,
     'available_until', extract(epoch from available_until)::bigint,
@@ -1600,6 +1606,12 @@ impl EconomyService {
                 .map(|p| p.trim().to_ascii_lowercase())
                 .filter(|p| !p.is_empty())
                 .collect(),
+            audiences: c
+                .audiences
+                .iter()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect(),
             effective_prices: Value::Null,
             locked: None,
         };
@@ -1618,9 +1630,9 @@ impl EconomyService {
         sqlx::query(
             "insert into musubi.store_items (id, item_id, quantity, prices, enabled, max_per_account,
                 available_from, available_until, bundle, min_level, level_track, discount_percent,
-                discount_until, rotation, rotation_slots, platforms)
+                discount_until, rotation, rotation_slots, platforms, audiences)
              values ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($8), $9, $10, $11, $12,
-                to_timestamp($13), $14, $15, $16)
+                to_timestamp($13), $14, $15, $16, $17)
              on conflict (id) do update set item_id = excluded.item_id, quantity = excluded.quantity,
                 prices = excluded.prices, enabled = excluded.enabled,
                 max_per_account = excluded.max_per_account, available_from = excluded.available_from,
@@ -1628,7 +1640,7 @@ impl EconomyService {
                 min_level = excluded.min_level, level_track = excluded.level_track,
                 discount_percent = excluded.discount_percent, discount_until = excluded.discount_until,
                 rotation = excluded.rotation, rotation_slots = excluded.rotation_slots,
-                platforms = excluded.platforms",
+                platforms = excluded.platforms, audiences = excluded.audiences",
         )
         .bind(&s.id)
         .bind(&s.item_id)
@@ -1646,6 +1658,7 @@ impl EconomyService {
         .bind(&s.rotation)
         .bind(s.rotation_slots)
         .bind(&s.platforms)
+        .bind(&s.audiences)
         .execute(&mut *tx)
         .await
         .map_err(|e| match e {
@@ -1664,15 +1677,27 @@ impl EconomyService {
         viewer: Option<AccountId>,
         include_disabled: bool,
     ) -> Result<Vec<StoreItem>> {
-        self.store_for(viewer, include_disabled, None).await
+        self.store_for(viewer, include_disabled, None, &[]).await
     }
 
     /// `platform`: only listings open to that platform (or to all).
+    /// Audience names a listing is restricted to (empty = everyone).
+    pub async fn store_item_audiences(&self, id: &str) -> Result<Vec<String>> {
+        let row: Option<(Vec<String>,)> =
+            sqlx::query_as("select audiences from musubi.store_items where id = $1")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        Ok(row.map(|r| r.0).unwrap_or_default())
+    }
+
     pub async fn store_for(
         &self,
         viewer: Option<AccountId>,
         include_disabled: bool,
         platform: Option<&str>,
+        audiences: &[String],
     ) -> Result<Vec<StoreItem>> {
         let rows: Vec<(Value,)> = sqlx::query_as(&format!(
             "select {STORE_COLS} from musubi.store_items
@@ -1693,6 +1718,9 @@ impl EconomyService {
         }
         let now = now_unix();
         items.retain(|i| i.in_window(now));
+        items.retain(|i| {
+            i.audiences.is_empty() || i.audiences.iter().any(|a| audiences.contains(a))
+        });
         items = rotation_filter(items, now.div_euclid(86_400));
         let levels = match viewer {
             Some(a) if items.iter().any(|i| i.min_level.is_some()) => Some(self.levels(a).await?),

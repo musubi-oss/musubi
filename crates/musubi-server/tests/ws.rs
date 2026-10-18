@@ -18843,3 +18843,72 @@ async fn quic_retry_validates_addresses_and_caps_pending_handshakes() {
     );
     assert!(musubi_server::realtime::quic::REFUSED.load(Ordering::Relaxed) > refused_before);
 }
+
+/// Plan 5.12: every ticket carries `audience_<name> = "true"` for the named audiences the
+/// account is in, so queries can select by audience.
+#[tokio::test]
+async fn matchmaker_tickets_carry_audiences() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (everyone, steam) = (format!("ev_{sfx}"), format!("st_{sfx}"));
+    for (name, rules) in [
+        (&everyone, json!({})),
+        (&steam, json!({"platform": ["steam"]})),
+    ] {
+        let (st, r) = http_json(
+            &router,
+            "PUT",
+            &format!("/v1/server/audiences/{name}"),
+            None,
+            true,
+            Some(json!({"rules": rules})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let add = || ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: format!("+audience_{everyone}:true +tag:{sfx}"),
+        string_properties: [("tag".to_string(), sfx.clone())].into(),
+        numeric_properties: Default::default(),
+        count_multiple: 1,
+    };
+    send(&mut a, f, None, add()).await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    send(&mut b, f, None, add()).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerMatched { users, me, .. } => {
+            assert_eq!(users.len(), 2);
+            assert_eq!(
+                me.string_properties
+                    .get(&format!("audience_{everyone}"))
+                    .map(String::as_str),
+                Some("true")
+            );
+            assert!(!me
+                .string_properties
+                .contains_key(&format!("audience_{steam}")));
+            assert_eq!(me.string_properties["tag"], sfx);
+        }
+        m => panic!("{m:?}"),
+    }
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerMatched { .. }
+    ));
+}
