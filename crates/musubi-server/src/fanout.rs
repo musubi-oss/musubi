@@ -954,7 +954,7 @@ impl Fanout {
                 if let Some(w) = self.worlds.get() {
                     if from_node != w.node_id() {
                         let dups = w.duplicates_of(&world, from_node, &ids);
-                        tracing::info!(world = %world, from = %from_node, announced = ids.len(), duplicates = dups.len(), "adopted entities announced by another node");
+                        tracing::info!(world = %world, from = %from_node, announced = ids.len(), duplicates = dups.len(), ?dups, "adopted entities announced by another node");
                         if !dups.is_empty() {
                             self.world_drop(&world, from_node, w.node_id(), dups);
                         }
@@ -969,7 +969,7 @@ impl Fanout {
             } => {
                 if let Some(w) = self.worlds.get() {
                     if to_node == w.node_id() {
-                        tracing::info!(world = %world, %from_node, ids = ids.len(), "drop request for duplicate copies");
+                        tracing::info!(world = %world, %from_node, ?ids, "drop request for duplicate copies");
                         w.drop_duplicates(&world, from_node, &ids);
                     }
                 }

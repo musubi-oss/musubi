@@ -273,9 +273,10 @@ impl MatchRegistry {
         let rows = sqlx::query_as::<_, (Uuid, String, String, serde_json::Value, Vec<u8>, i64)>(
             "update musubi.match_snapshots set node_id = $2, node_epoch = $4, updated_at = now()
              where cluster_group = $3 and (node_id is null or node_id = any($1)
+                    or (node_id = $2 and node_epoch <> $4)
                     or exists (select 1 from musubi.nodes n where n.id = match_snapshots.node_id and n.epoch > match_snapshots.node_epoch
                                  and n.started_at < now() - interval '10 seconds'))
-               and (node_id is null or node_id = $2 or not exists
+               and (node_id is null or node_id = $2 or node_id = any($1) or not exists
                     (select 1 from musubi.nodes n where n.id = match_snapshots.node_id
                        and n.heartbeat_at > now() - interval '10 seconds'
                        and (n.epoch <= match_snapshots.node_epoch or n.started_at > now() - interval '10 seconds')))

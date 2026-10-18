@@ -370,6 +370,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             let mut leaves = cluster.subscribe();
             let mut members = cluster.member_events();
             let mut owed = false;
+            let mut soon_for: Vec<uuid::Uuid> = Vec::new();
+            let mut soon_left: u32 = 0;
             loop {
                 wait_failover_round(&mut tick, &mut leaves, &mut members, owed).await;
                 owed = false;
@@ -448,7 +450,15 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                     }
                     Ok(Ok(_)) if dead.is_empty() => {}
                     Ok(Ok(_)) => {
-                        owed = true;
+                        // the dead node's leases may not have run out yet: retry soon a few
+                        // times, then fall back to the period — a node that owned nothing stays
+                        // dead for a long while and must not keep the round spinning every 2 s
+                        if dead != soon_for {
+                            soon_for = dead.clone();
+                            soon_left = 6;
+                        }
+                        owed = soon_left > 0;
+                        soon_left = soon_left.saturating_sub(1);
                         tracing::info!(?dead, "world failover round: nothing to adopt")
                     }
                     Ok(Err(e)) => tracing::warn!(error = %e, "world failover failed"),
@@ -1063,10 +1073,12 @@ async fn wait_failover_round(
     // a round that saw dead nodes but could adopt nothing yet (their leases still run) is
     // retried shortly instead of a whole period later
     const SOON: std::time::Duration = std::time::Duration::from_secs(2);
+    let retry = tokio::time::sleep(SOON);
+    tokio::pin!(retry);
     loop {
         tokio::select! {
             _ = tick.tick() => return,
-            _ = tokio::time::sleep(SOON), if soon => return,
+            _ = &mut retry, if soon => return,
             m = members.recv() => match m {
                 Ok(m) if m.state == "dead" => return,
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

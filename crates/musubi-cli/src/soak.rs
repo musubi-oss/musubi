@@ -956,6 +956,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             f64::NAN
         } else {
             let expected = mesh.len() * o.mesh_entities;
+            let mut last_report = t0;
             loop {
                 let mut total = 0;
                 for mw in &mesh {
@@ -963,6 +964,24 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
                 }
                 if total == expected {
                     break t0.elapsed().as_secs_f64() * 1e3;
+                }
+                // a long recovery is only debuggable with the per-world picture as it happens
+                if last_report.elapsed() > Duration::from_secs(5) {
+                    last_report = Instant::now();
+                    eprintln!(
+                        "[soak] mesh: {total} of {expected} entities after {:.1} s",
+                        t0.elapsed().as_secs_f64()
+                    );
+                    for mw in &mesh {
+                        let n = mesh_count(&client, &alive, mw).await;
+                        if n != o.mesh_entities {
+                            eprintln!(
+                                "[soak] mesh: {} has {n}: {}",
+                                mw.name,
+                                mesh_detail(&client, &alive, mw).await
+                            );
+                        }
+                    }
                 }
                 if t0.elapsed() > budget {
                     timed_out = true;

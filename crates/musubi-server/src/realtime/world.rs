@@ -243,7 +243,10 @@ struct WorldState {
     /// The world's home node as of shard creation: cells without an explicit host live there.
     home_node: Option<Uuid>,
     /// Cross-node handovers in flight: entity → (target node, attempts so far).
-    remote_transit: HashMap<EntityId, (Uuid, u32)>,
+    remote_transit: HashMap<EntityId, (Uuid, u32, CellId)>,
+    /// Target cell of each handover we cancelled and kept the entity of: a late ack from the
+    /// node that did take it must still make us drop our copy.
+    kept_after_cancel: HashMap<EntityId, CellId>,
     /// Per-target sequence of delivered interactions (this node is the single point of order
     /// for the entities it owns; the counter restarts when an entity changes owner).
     interaction_seq: HashMap<EntityId, u64>,
@@ -867,6 +870,7 @@ impl WorldRegistry {
                     hosted_only: true,
                     home_node: home,
                     remote_transit: HashMap::new(),
+                    kept_after_cancel: HashMap::new(),
                     interaction_seq: HashMap::new(),
                     admission: HashMap::new(),
                 }))
@@ -1577,11 +1581,12 @@ impl WorldRegistry {
                     (select 1 from musubi.nodes n where n.region = w.region
                        and n.heartbeat_at > now() - interval '10 seconds'))
                and (w.node_id is null or w.node_id = any($1)
+                    or (w.node_id = $2 and w.node_epoch <> $4)
                     or not exists (select 1 from musubi.nodes n where n.id = w.node_id)
                     or exists (select 1 from musubi.nodes n where n.id = w.node_id and n.epoch > w.node_epoch
                                  and n.started_at < now() - interval '10 seconds'))
                and (w.node_id is null or not (w.node_id = $2 and $2 <> all($1) and w.node_epoch = $4))
-               and (w.node_id is null or w.node_id = $2 or not exists
+               and (w.node_id is null or w.node_id = $2 or w.node_id = any($1) or not exists
                     (select 1 from musubi.nodes n where n.id = w.node_id
                        and n.heartbeat_at > now() - interval '10 seconds'
                        and (n.epoch <= w.node_epoch or n.started_at > now() - interval '10 seconds')))
@@ -1725,6 +1730,7 @@ impl WorldRegistry {
                     hosted_only: false,
                     home_node: None,
                     remote_transit: HashMap::new(),
+ kept_after_cancel: HashMap::new(),
             interaction_seq: HashMap::new(),
             admission: HashMap::new(),
                 })),
@@ -2015,7 +2021,7 @@ impl WorldRegistry {
                 let stuck: Vec<EntityId> = st
                     .remote_transit
                     .iter()
-                    .filter(|(_, (h, _))| *h == dead)
+                    .filter(|(_, (h, _, _))| *h == dead)
                     .map(|(id, _)| *id)
                     .collect();
                 for id in stuck {
@@ -2212,6 +2218,7 @@ impl WorldRegistry {
                 hosted_only: false,
                 home_node: None,
                 remote_transit: HashMap::new(),
+                kept_after_cancel: HashMap::new(),
                 interaction_seq: HashMap::new(),
                 admission: HashMap::new(),
             })),
@@ -2326,7 +2333,7 @@ impl WorldRegistry {
                 json!({
                     "id": e.id, "cell": e.cell, "pos": e.pos, "persistent": e.persistent,
                     "transit": e.transit,
-                    "remote_to": st.remote_transit.get(&e.id).map(|(h, _)| *h),
+                    "remote_to": st.remote_transit.get(&e.id).map(|(h, _, _)| *h),
                 })
             })
             .collect();
@@ -2790,6 +2797,20 @@ impl WorldRegistry {
     pub fn view(&self, name: &str, cell: CellId) -> Result<Value> {
         let w = self.get(name)?;
         let st = w.lock();
+        // only the cell's host has its authoritative state; a node that merely knows the world
+        // (home of a hosted-only world, a node that lost the cell) must not answer with an empty
+        // or stale view as if it were the truth
+        if !self.hosts_cell(&st, name, cell) {
+            let host = self
+                .cell_hosts
+                .get(&(name.to_string(), cell))
+                .map(|h| format!("; hosted by {}", *h))
+                .unwrap_or_default();
+            return Err(Error::NotFound(format!(
+                "cell ({}, {}) of world {name} is not hosted here{host}",
+                cell.x, cell.y
+            )));
+        }
         let mut v = st.world.view(cell);
         for n in World::neighbours(cell) {
             let Some(g) = st.remote_ghosts.get(&n) else {
@@ -2964,8 +2985,32 @@ impl WorldRegistry {
         }
         let id = entity.id;
         if st.world.get(id).is_some() {
-            // already taken earlier; the ack was lost — answer again, keep our copy
-            tracing::warn!(world = name, %id, %from_node, "handover re-acked (duplicate delivery)");
+            // we already hold this entity. Usually the ack was lost and this is the same transfer
+            // again: answer again, keep our copy. But if our copy is itself on its way to the
+            // sender (both sides restored or kept one and each ships it over the border at
+            // once), two mutual "accepted" acks would make both sides despawn and the entity
+            // vanish — the stand lost one exactly so. The lower node id keeps its copy and
+            // accepts; the higher one declines and waits for the ack of its own transfer.
+            let outgoing = st
+                .remote_transit
+                .get(&id)
+                .is_some_and(|(h, _, _)| *h == from_node);
+            if outgoing && self.node_id > from_node {
+                tracing::info!(world = name, %id, %from_node, "handover collision: declined, our copy is on its way there");
+                fanout.world_handover_ack(name, id, from_node, false, false);
+                return false;
+            }
+            if outgoing {
+                st.remote_transit.remove(&id);
+                st.world.cancel_handover(id);
+                tracing::info!(world = name, %id, %from_node, "handover collision: kept our copy, theirs is dropped");
+            } else if self.provisional.remove(&(name.to_string(), id)).is_some() {
+                // our copy was restored from a dead host's shard; the sender owned the entity
+                // live and has now handed it to us — ours is the live one from here on
+                tracing::info!(world = name, %id, %from_node, "handover delivered onto our restored copy: it is live now");
+            } else {
+                tracing::warn!(world = name, %id, %from_node, "handover re-acked (duplicate delivery)");
+            }
             fanout.world_handover_ack(name, id, from_node, true, false);
             return false;
         }
@@ -3062,14 +3107,19 @@ impl WorldRegistry {
             // two owners
             if accepted {
                 if let Some(e) = st.world.get(id).cloned() {
-                    let cell = st.world.cell_of(e.pos);
+                    let cell = st
+                        .kept_after_cancel
+                        .remove(&id)
+                        .unwrap_or_else(|| st.world.cell_of(e.pos));
                     // only believed from the node the directory names as the cell's host: a
                     // late ack from a node that has since died (or lost the cell) must not make
                     // us drop the only live copy
-                    let elsewhere = self
-                        .cell_hosts
-                        .get(&(name.to_string(), cell))
-                        .is_some_and(|h| *h == acker && acker != self.node_id);
+                    let elsewhere = acker != self.node_id
+                        && match self.cell_hosts.get(&(name.to_string(), cell)) {
+                            Some(h) => *h == acker,
+                            // an unassigned cell is the home's
+                            None => self.homes.get(name).is_some_and(|h| *h == acker),
+                        };
                     if elsewhere {
                         tracing::info!(world = name, %id, "late handover ack: stale local copy dropped");
                         st.remote_transit.remove(&id);
@@ -3091,6 +3141,7 @@ impl WorldRegistry {
             return;
         };
         st.remote_transit.remove(&id);
+        st.kept_after_cancel.remove(&id);
         if !accepted && resend_full {
             st.full_resend.insert(id);
         }
@@ -3856,6 +3907,7 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         let mut n = 0;
+        let mut dropped_ids: Vec<EntityId> = Vec::new();
         for (id, cell, theirs_provisional) in ids {
             // only the node the directory names as host of the cell it claims the entity in
             // may make us drop ours: a zombie that lost the cell (or has not noticed its
@@ -3869,7 +3921,10 @@ impl WorldRegistry {
                 continue;
             }
             let mine = self.provisional.contains(&(name.to_string(), *id));
-            if copy_wins(mine, self.node_id, *theirs_provisional, from_node) {
+            // a drop is only ever aimed at a provisional copy: if ours has since become the live
+            // one (the requester handed the entity to us after it computed the drop), the request
+            // is stale — honouring it would despawn the last copy (the stand lost one exactly so)
+            if !mine || copy_wins(true, self.node_id, *theirs_provisional, from_node) {
                 // ours wins (live beats provisional, or the tie goes to us): the sender drops
                 continue;
             }
@@ -3877,6 +3932,7 @@ impl WorldRegistry {
             st.world.forget_for_clients(*id);
             if st.world.despawn(*id) {
                 n += 1;
+                dropped_ids.push(*id);
                 st.journal.push(WorldOp {
                     tick: st.world.tick,
                     op: WorldMutation::Despawn { id: *id },
@@ -3891,6 +3947,7 @@ impl WorldRegistry {
             tracing::info!(
                 world = name,
                 dropped = n,
+                ids = ?dropped_ids,
                 "duplicate copies restored from a dead shard dropped"
             );
         }
@@ -3966,7 +4023,7 @@ impl WorldRegistry {
             *left > 0
         });
         for ((name, cell), ids) in announce {
-            tracing::info!(world = %name, ?cell, ids = ids.len(), "announcing entities adopted from a dead shard");
+            tracing::info!(world = %name, ?cell, ?ids, "announcing entities adopted from a dead shard");
             fanout.world_adopted(&name, cell, self.node_id, ids);
         }
     }
@@ -4001,8 +4058,8 @@ impl WorldRegistry {
                         })
                         .filter(|h| *h != self.node_id)
                 });
-                for (id, _, host) in remote {
-                    st.remote_transit.insert(id, (host, 1));
+                for (id, cell, host) in remote {
+                    st.remote_transit.insert(id, (host, 1, cell));
                     if let Some(e) = st.world.get(id).cloned() {
                         let inputs = st.world.take_buffered_inputs(id);
                         let from = e.transit.as_ref().map(|t| t.from);
@@ -4181,40 +4238,32 @@ impl WorldRegistry {
                         // already has it). Never give up: the entity sits in a cell another node
                         // hosts, and a copy kept alive here would become a second owner once the
                         // real one moves on (the stand saw 5 of 20 entities duplicated that way).
-                        let Some((stale, n)) = st.remote_transit.get(&entity).copied() else {
+                        let Some((stale, n, target)) = st.remote_transit.get(&entity).copied()
+                        else {
                             continue;
                         };
                         // the target may have moved since the first attempt (host died and the
                         // cell was re-homed, home adopted by another node): resolve it again
-                        let fresh = st
-                            .world
-                            .get(entity)
-                            .map(|e| st.world.cell_of(e.pos))
-                            .and_then(|c| {
-                                self.cell_hosts
-                                    .get(&(name.clone(), c))
-                                    .map(|h| *h)
-                                    .or(if st.hosted_only {
-                                        self.homes.get(&name).map(|h| *h).or(st.home_node)
-                                    } else {
-                                        None
-                                    })
-                                    .filter(|h| *h != self.node_id)
-                            });
+                        // by the cell the handover was for, not the entity's position: an entity
+                        // offered from inside the border margin (or moved back by its client) still
+                        // sits in our cell while the other side may already have taken it
+                        let fresh = Some(target).and_then(|c| {
+                            self.cell_hosts
+                                .get(&(name.clone(), c))
+                                .map(|h| *h)
+                                .or(if st.hosted_only {
+                                    self.homes.get(&name).map(|h| *h).or(st.home_node)
+                                } else {
+                                    None
+                                })
+                                .filter(|h| *h != self.node_id)
+                        });
                         let Some(host) = fresh else {
                             // nobody hosts the target cell yet (its host died, the lease is not
                             // re-issued): keep the entity in transit and retry — the home takes
                             // the cell within the failover round, and if the lease lands on
                             // another node the entity must follow it, not stay here orphaned
-                            let ours = st
-                                .world
-                                .get(entity)
-                                .map(|e| st.world.cell_of(e.pos))
-                                .is_some_and(|c| {
-                                    self.cell_hosts
-                                        .get(&(name.clone(), c))
-                                        .is_some_and(|h| *h == self.node_id)
-                                });
+                            let ours = self.hosts_cell(st, &name, target);
                             if !ours {
                                 continue;
                             }
@@ -4222,11 +4271,12 @@ impl WorldRegistry {
                             // have been accepted by a host whose ack never arrived, so announce it
                             // like a restored one and let a live owner answer with a drop
                             st.remote_transit.remove(&entity);
+                            st.kept_after_cancel.insert(entity, target);
                             st.world.cancel_handover(entity);
                             if let Some(c) = st.world.get(entity).map(|e| e.cell) {
                                 self.queue_adopted(&name, std::iter::once((entity, c)));
                             }
-                            tracing::info!(world = %name, %entity, was = %stale, "cross-node handover dropped: target cell is local now");
+                            tracing::info!(world = %name, %entity, was = %stale, cell = ?st.world.get(entity).map(|e| e.cell), "cross-node handover dropped: target cell is local now");
                             continue;
                         };
                         if host != stale {
@@ -4235,7 +4285,7 @@ impl WorldRegistry {
                         if n + 1 == REMOTE_HANDOVER_RETRIES {
                             tracing::warn!(world = %name, %entity, %host, tries = n + 1, "cross-node handover still unacknowledged; keeps retrying");
                         }
-                        st.remote_transit.insert(entity, (host, n + 1));
+                        st.remote_transit.insert(entity, (host, n + 1, target));
                         if st.world.begin_remote_handover(entity, host) {
                             let group: Vec<EntityId> = st
                                 .world
