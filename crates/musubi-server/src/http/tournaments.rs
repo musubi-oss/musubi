@@ -31,6 +31,10 @@ pub fn routes() -> Router<AppState> {
             post(bracket_report),
         )
         .route(
+            "/v1/server/tournaments/{id}/bracket/matches/{mid}/forfeit",
+            post(bracket_forfeit),
+        )
+        .route(
             "/v1/server/tournaments/{id}/bracket/rounds",
             post(bracket_round),
         )
@@ -389,6 +393,9 @@ struct BracketReq {
     /// Swiss only; defaults to ⌈log2 n⌉.
     #[serde(default)]
     swiss_rounds: Option<i32>,
+    /// Seconds a ready match has before its absent side may be forfeited.
+    #[serde(default)]
+    deadline_secs: Option<i64>,
 }
 
 fn bracket_json(b: &musubi_leaderboard::bracket::Bracket) -> serde_json::Value {
@@ -462,7 +469,11 @@ async fn bracket_create(
             })
             .collect()
     };
-    let b = generate(r.format, participants, r.swiss_rounds)?;
+    let mut b = generate(r.format, participants, r.swiss_rounds)?;
+    if r.deadline_secs.is_some() {
+        b.deadline_secs = r.deadline_secs;
+        musubi_leaderboard::bracket::stamp_deadlines(&mut b);
+    }
     s.tournaments.bracket_create(&id, &b).await?;
     s.events
         .emit(
@@ -502,6 +513,37 @@ struct BracketResult {
     score: serde_json::Value,
     #[serde(default)]
     match_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ForfeitReq {
+    /// The side that did not show up.
+    participant: uuid::Uuid,
+}
+
+/// No-show: once the match is past its deadline, the absent participant loses by forfeit.
+async fn bracket_forfeit(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, mid)): Path<(String, uuid::Uuid)>,
+    Json(r): Json<ForfeitReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (b, ready) = s
+        .tournaments
+        .bracket_update(&id, |b| {
+            musubi_leaderboard::bracket::forfeit(b, mid, r.participant)
+        })
+        .await?;
+    let winner = b
+        .matches
+        .iter()
+        .find(|m| m.id == mid)
+        .and_then(|m| m.winner)
+        .unwrap_or(r.participant);
+    emit_bracket(&s, &id, mid, winner, &ready, b.champion).await;
+    Ok(Json(
+        json!({ "ready": ready, "champion": b.champion, "bracket": bracket_json(&b) }),
+    ))
 }
 
 /// Decide a bracket match directly (the end-game report can do the same via `bracket_match`).

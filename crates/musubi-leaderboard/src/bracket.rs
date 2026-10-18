@@ -17,6 +17,8 @@ pub enum Format {
     Single,
     Double,
     Swiss,
+    /// Everyone plays everyone once; all rounds exist from the start (circle method).
+    RoundRobin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,10 @@ pub struct Match {
     pub score: Value,
     pub winner_to: Option<Link>,
     pub loser_to: Option<Link>,
+    /// Unix time by which a ready match must be reported (`Bracket::deadline_secs` after it
+    /// became ready); past it the organiser may `forfeit` the absent side.
+    #[serde(default)]
+    pub deadline: Option<i64>,
 }
 
 impl Match {
@@ -113,6 +119,56 @@ pub struct Bracket {
     /// Swiss: rounds planned. Elimination: number of winners-bracket rounds.
     pub rounds: i32,
     pub champion: Option<Uuid>,
+    /// Seconds a ready match has before it counts as a no-show candidate (None = no deadline).
+    #[serde(default)]
+    pub deadline_secs: Option<i64>,
+}
+
+fn now_secs() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Give every ready, undecided match without a deadline one, counting from now.
+pub fn stamp_deadlines(b: &mut Bracket) {
+    let Some(secs) = b.deadline_secs else { return };
+    let due = now_secs() + secs.max(0);
+    for m in &mut b.matches {
+        if m.ready() && m.winner.is_none() && m.deadline.is_none() {
+            m.deadline = Some(due);
+        }
+    }
+}
+
+/// The absent side loses: the other player wins with `score = {"forfeit": absent}`. Allowed
+/// only once the match's deadline has passed (or when it has none).
+pub fn forfeit(b: &mut Bracket, match_id: Uuid, absent: Uuid) -> Result<Vec<Uuid>> {
+    let Some(m) = b.matches.iter().find(|m| m.id == match_id) else {
+        return Err(Error::NotFound(format!("bracket match {match_id}")));
+    };
+    if let Some(d) = m.deadline {
+        if now_secs() < d {
+            return Err(Error::Conflict(format!(
+                "match {match_id} is not overdue until {d}"
+            )));
+        }
+    }
+    let (a, bb) = m.players();
+    let winner = match (a, bb) {
+        (Some(x), Some(y)) if x == absent => y,
+        (Some(x), Some(y)) if y == absent => x,
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "{absent} is not playing in match {match_id}"
+            )))
+        }
+    };
+    report(
+        b,
+        match_id,
+        winner,
+        serde_json::json!({ "forfeit": absent }),
+        None,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -174,12 +230,49 @@ pub fn generate(
         round: 0,
         rounds: r,
         champion: None,
+        deadline_secs: None,
     };
     match format {
         Format::Swiss => {
             let default_rounds = log2(size);
             b.rounds = swiss_rounds.unwrap_or(default_rounds).clamp(1, 20);
             swiss_next_round(&mut b)?;
+            return Ok(b);
+        }
+        Format::RoundRobin => {
+            // circle method: fix the first seat, rotate the rest; odd field → one bye a round
+            let mut seats: Vec<Slot> = b.participants.iter().map(|p| Slot::Player(p.id)).collect();
+            if seats.len() % 2 == 1 {
+                seats.push(Slot::Bye);
+            }
+            let k = seats.len();
+            b.rounds = (k - 1) as i32;
+            for round in 1..=b.rounds {
+                for i in 0..k / 2 {
+                    let (a, bb) = (seats[i], seats[k - 1 - i]);
+                    if a == Slot::Bye || bb == Slot::Bye {
+                        continue;
+                    }
+                    b.matches.push(Match {
+                        id: Uuid::now_v7(),
+                        side: Side::Winners,
+                        round,
+                        slot: i as i32,
+                        a,
+                        b: bb,
+                        winner: None,
+                        bye: false,
+                        match_id: None,
+                        score: Value::Null,
+                        winner_to: None,
+                        loser_to: None,
+                        deadline: None,
+                    });
+                }
+                let last = seats.pop().unwrap();
+                seats.insert(1, last);
+            }
+            b.round = b.rounds;
             return Ok(b);
         }
         Format::Single | Format::Double => {}
@@ -248,6 +341,7 @@ pub fn generate(
                 score: Value::Null,
                 winner_to,
                 loser_to,
+                deadline: None,
             });
         }
     }
@@ -296,6 +390,7 @@ pub fn generate(
                         score: Value::Null,
                         winner_to: Some(winner_to),
                         loser_to: None,
+                        deadline: None,
                     });
                 }
             }
@@ -312,6 +407,7 @@ pub fn generate(
                 score: Value::Null,
                 winner_to: None,
                 loser_to: None,
+                deadline: None,
             });
         }
     }
@@ -343,7 +439,7 @@ fn is_final(b: &Bracket, m: &Match) -> bool {
     match b.format {
         Format::Single => m.side == Side::Winners && m.round == b.rounds,
         Format::Double => m.side == Side::Final || (b.rounds == 1 && m.side == Side::Winners),
-        Format::Swiss => false,
+        Format::Swiss | Format::RoundRobin => false,
     }
 }
 
@@ -434,12 +530,13 @@ pub fn report(
     if is_final(b, &m) {
         b.champion = Some(winner);
     }
-    if b.format == Format::Swiss
+    if matches!(b.format, Format::Swiss | Format::RoundRobin)
         && b.round >= b.rounds
         && b.matches.iter().all(|m| m.winner.is_some() || m.bye)
     {
         b.champion = standings(b).first().map(|s| s.id);
     }
+    stamp_deadlines(b);
     let after = ready_ids(b);
     Ok(after
         .into_iter()
@@ -503,7 +600,7 @@ pub fn standings(b: &Bracket) -> Vec<Standing> {
         r.eliminated = match b.format {
             Format::Single => r.losses >= 1,
             Format::Double => r.losses >= 2,
-            Format::Swiss => false,
+            Format::Swiss | Format::RoundRobin => false,
         };
     }
     rows.sort_by(|x, y| {
@@ -584,6 +681,7 @@ pub fn swiss_next_round(b: &mut Bracket) -> Result<i32> {
             score: Value::Null,
             winner_to: None,
             loser_to: None,
+            deadline: None,
         });
     }
     b.round = round;

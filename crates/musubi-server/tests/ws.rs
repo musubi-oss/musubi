@@ -15815,3 +15815,158 @@ async fn player_stats_fold_visibility_and_match_report() {
     assert_eq!(st, 200, "{r}");
     assert_eq!(r["stats"][&kills]["scopes"]["ranked"]["value"], json!(1.0));
 }
+
+/// Round-robin brackets (everyone meets everyone once, all rounds up front) and no-shows: a
+/// ready match past its deadline can be forfeited by the organiser; before it, not.
+#[tokio::test]
+async fn tournament_round_robin_and_forfeit() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let tid = format!("rr-{}", uuid::Uuid::now_v7().simple());
+    let (st, r) = http_json(&router, "POST", "/v1/server/tournaments", None, true, Some(json!({
+        "id": tid, "title": "League", "duration": 3600, "max_size": 16, "max_num_score": 10, "join_required": true
+    }))).await;
+    assert_eq!(st, 200, "{r}");
+    let mut players = Vec::new();
+    let mut tokens = Vec::new();
+    for _ in 0..5 {
+        let (t, acc) = token(&router).await;
+        tokens.push(t.clone());
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/tournaments/{tid}/join"),
+            Some(&t),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        players.push(acc.to_string());
+    }
+    let bpath = format!("/v1/server/tournaments/{tid}/bracket");
+    // deadline far away: a forfeit is refused as not overdue
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &bpath,
+        None,
+        true,
+        Some(json!({"format": "round_robin", "seeding": "join", "deadline_secs": 3600})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["rounds"], 5, "{r}");
+    let ms = r["matches"].as_array().unwrap().clone();
+    // 5 players → 5 rounds × 2 games, every one ready from the start, every one with a deadline
+    assert_eq!(ms.len(), 10);
+    assert!(ms.iter().all(|m| m["status"] == "ready"));
+    assert!(ms.iter().all(|m| m["deadline"].as_i64().is_some()));
+    for r in 1..=5 {
+        assert_eq!(ms.iter().filter(|m| m["round"] == r).count(), 2);
+    }
+    let m0 = &ms[0];
+    let (a0, _b0) = (
+        m0["a"]["player"].as_str().unwrap().to_string(),
+        m0["b"]["player"].as_str().unwrap().to_string(),
+    );
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{bpath}/matches/{}/forfeit", m0["id"].as_str().unwrap()),
+        None,
+        true,
+        Some(json!({"participant": a0})),
+    )
+    .await;
+    assert_eq!(st, 409, "{r}");
+    let (st, _) = http_json(&router, "DELETE", &bpath, None, true, None).await;
+    assert_eq!(st, 200);
+
+    // deadline 0: overdue at once
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &bpath,
+        None,
+        true,
+        Some(json!({"format": "round_robin", "seeding": "join", "deadline_secs": 0})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let ms = r["matches"].as_array().unwrap().clone();
+    let m0 = &ms[0];
+    let (a0, b0) = (
+        m0["a"]["player"].as_str().unwrap().to_string(),
+        m0["b"]["player"].as_str().unwrap().to_string(),
+    );
+    let mid0 = m0["id"].as_str().unwrap().to_string();
+    // a stranger cannot be forfeited
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{bpath}/matches/{mid0}/forfeit"),
+        None,
+        true,
+        Some(json!({"participant": uuid::Uuid::now_v7()})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("{bpath}/matches/{mid0}/forfeit"),
+        None,
+        true,
+        Some(json!({"participant": a0})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let decided = r["bracket"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == mid0)
+        .unwrap()
+        .clone();
+    assert_eq!(decided["winner"], json!(b0));
+    assert_eq!(decided["score"]["forfeit"], json!(a0));
+    assert!(r["champion"].is_null());
+
+    // everyone else's games: the `a` side wins → standings decide the champion
+    let mut champion = Value::Null;
+    for m in ms.iter().skip(1) {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("{bpath}/matches/{}", m["id"].as_str().unwrap()),
+            None,
+            true,
+            Some(json!({"winner": m["a"]["player"]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        champion = r["champion"].clone();
+    }
+    assert!(!champion.is_null());
+    let (st, g) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/tournaments/{tid}/bracket"),
+        Some(&tokens[0]),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{g}");
+    assert_eq!(g["champion"], champion);
+    let top = &g["standings"][0];
+    assert_eq!(top["id"], champion, "{g}");
+    assert!(g["standings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["eliminated"] == false));
+}

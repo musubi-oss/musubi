@@ -528,6 +528,11 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ),
     (
         "POST",
+        "/v1/server/tournaments/{id}/bracket/matches/{mid}/forfeit",
+        "tournaments",
+    ),
+    (
+        "POST",
         "/v1/server/tournaments/{id}/bracket/rounds",
         "tournaments",
     ),
