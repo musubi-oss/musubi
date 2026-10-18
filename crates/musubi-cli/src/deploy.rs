@@ -518,6 +518,8 @@ pub async fn idl(cfg: &Config, cmd: IdlCmd) -> anyhow::Result<()> {
             let idl = musubi_idl::Idl::parse(&read(&file)?).map_err(|e| anyhow::anyhow!("{e}"))?;
             std::fs::create_dir_all(out.join("schemas"))?;
             std::fs::write(out.join("types.rs"), idl.rust())?;
+            std::fs::write(out.join("bindings.rs"), idl.guest_rust())?;
+            std::fs::write(out.join("docs.md"), idl.markdown())?;
             let openapi = json!({
                 "components": { "schemas": idl.openapi_components() },
                 "paths": idl.openapi_paths(),
@@ -526,7 +528,12 @@ pub async fn idl(cfg: &Config, cmd: IdlCmd) -> anyhow::Result<()> {
                 out.join("openapi.json"),
                 serde_json::to_string_pretty(&openapi)?,
             )?;
-            let mut files = vec!["types.rs".to_string(), "openapi.json".to_string()];
+            let mut files = vec![
+                "types.rs".to_string(),
+                "bindings.rs".to_string(),
+                "docs.md".to_string(),
+                "openapi.json".to_string(),
+            ];
             for c in idl
                 .collection_schemas()
                 .map_err(|e| anyhow::anyhow!("{e}"))?

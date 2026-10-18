@@ -30,6 +30,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # integration tests start many nodes at once and finished tests keep their pools until the
       # binary exits; the image's default 100 connections (and later 300) overflow on a 4-thread runner

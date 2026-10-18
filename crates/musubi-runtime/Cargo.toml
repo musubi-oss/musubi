@@ -14,3 +14,6 @@ tokio.workspace = true
 tracing.workspace = true
 parking_lot = "0.12"
 wasmtime = { version = "29", default-features = false, features = ["cranelift", "runtime", "wat", "std", "parallel-compilation", "component-model"] }
+
+[dev-dependencies]
+musubi-idl.workspace = true

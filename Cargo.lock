@@ -2790,6 +2790,7 @@ name = "musubi-runtime"
 version = "0.1.0"
 dependencies = [
  "musubi-core",
+ "musubi-idl",
  "parking_lot",
  "serde",
  "serde_json",

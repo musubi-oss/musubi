@@ -228,6 +228,8 @@ async fn show(
         }))
         .into_response(),
         "rust" => ([(CONTENT_TYPE, "text/x-rust")], idl.rust()).into_response(),
+        "bindings" => ([(CONTENT_TYPE, "text/x-rust")], idl.guest_rust()).into_response(),
+        "docs" => ([(CONTENT_TYPE, "text/markdown")], idl.markdown()).into_response(),
         other => {
             return Err(Error::InvalidArgument(format!("unknown format `{other}`")).into());
         }

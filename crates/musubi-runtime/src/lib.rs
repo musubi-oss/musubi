@@ -16,6 +16,10 @@
 //! * host imports under module `musubi`: `log(level: i32, ptr: i32, len: i32)` and
 //!   `error(ptr: i32, len: i32)` (sets the error message for the current call).
 //!
+//! Rust guests do not write this by hand: `musubi idl gen` (`musubi-idl::Idl::guest_rust`) emits
+//! `bindings.rs` with the glue, typed `Rpcs` / `<Module>Match` traits and the exports
+//! (`tests/idl_guest.rs` drives such a module through this ABI).
+//!
 //! Every call runs in a fresh instance with a fuel budget, a memory cap and a wall-clock deadline,
 //! so a misbehaving module can neither hang nor exhaust the node. A Component Model loader (WIT
 //! `musubi:runtime`) is the next step and will sit next to this ABI.
