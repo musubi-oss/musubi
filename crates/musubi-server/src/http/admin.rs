@@ -1133,6 +1133,8 @@ struct SchemaBody {
     migrations: Vec<musubi_storage::schema::Migration>,
     #[serde(default)]
     indexes: Vec<musubi_storage::schema::IndexDef>,
+    #[serde(default)]
+    policy: Option<musubi_storage::policy::Policy>,
 }
 
 fn schema_json(sc: &musubi_storage::CollectionSchema) -> Result<Json<Value>, ApiError> {
@@ -1172,6 +1174,7 @@ async fn schema_put(
             schema: b.schema,
             migrations: b.migrations,
             indexes: b.indexes,
+            policy: b.policy,
         })
         .await?;
     schema_json(&sc)

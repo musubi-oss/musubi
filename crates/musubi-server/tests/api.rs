@@ -16440,3 +16440,160 @@ async fn store_listings_gated_by_audience() {
     .await;
     assert_ne!(st, StatusCode::FORBIDDEN, "{r}");
 }
+
+/// Plan 3.5 collection policies: CEL-like read/write/delete rules gate user calls on top of the
+/// permission codes; bad expressions are rejected at schema time.
+#[tokio::test]
+async fn storage_policies_gate_user_reads_writes_deletes() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("pola")})),
+    )
+    .await;
+    let (_, b) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("polb")})),
+    )
+    .await;
+    let ta = a["access_token"].as_str().unwrap().to_string();
+    let tb = b["access_token"].as_str().unwrap().to_string();
+    let owner = a["account_id"].as_str().unwrap().to_string();
+    let col = unique("pol");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/storage_schemas/{col}"),
+        k,
+        Some(json!({"policy": {"read": "owner == me ||"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/storage_schemas/{col}"),
+        k,
+        Some(json!({"policy": {
+            "read": "owner == me || value.public == true",
+            "write": "!(value.locked == true) && size(new.name) <= 10",
+            "delete": "value.locked != true"
+        }})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["policy"]["read"], "owner == me || value.public == true");
+    let write = |tok: String, objs: Value| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/v1/storage/write",
+                Some(&tok),
+                Some(json!({"objects": objs})),
+            )
+            .await
+        }
+    };
+    // both public by permission code — the read policy still hides the non-public one from B
+    let (st, r) = write(ta.clone(), json!([
+        {"collection": col, "key": "pub", "value": {"public": true, "name": "a"}, "read_permission": 2},
+        {"collection": col, "key": "priv", "value": {"public": false, "name": "b"}, "read_permission": 2},
+        {"collection": col, "key": "locked", "value": {"public": true, "name": "c", "locked": true}, "read_permission": 2},
+    ])).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let read = |tok: String| {
+        let app = app.clone();
+        let col = col.clone();
+        let owner = owner.clone();
+        async move {
+            let (_, r) = call(
+                &app,
+                "POST",
+                "/v1/storage/read",
+                Some(&tok),
+                Some(json!({"objects": [
+                    {"collection": col, "key": "pub", "owner_id": owner},
+                    {"collection": col, "key": "priv", "owner_id": owner},
+                    {"collection": col, "key": "locked", "owner_id": owner},
+                ]})),
+            )
+            .await;
+            r["objects"]
+                .as_array()
+                .map(|o| {
+                    o.iter()
+                        .map(|x| x["key"].as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
+    };
+    assert_eq!(read(ta.clone()).await.len(), 3);
+    let seen = read(tb.clone()).await;
+    assert!(
+        seen.contains(&"pub".to_string())
+            && seen.contains(&"locked".to_string())
+            && !seen.contains(&"priv".to_string()),
+        "{seen:?}"
+    );
+    // write policy: name too long, locked object
+    let (st, r) = write(ta.clone(), json!([{"collection": col, "key": "pub", "value": {"public": true, "name": "waytoolongname"}}])).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{r}");
+    let (st, r) = write(
+        ta.clone(),
+        json!([{"collection": col, "key": "locked", "value": {"public": true, "name": "c2"}}]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{r}");
+    let (st, r) = write(
+        ta.clone(),
+        json!([{"collection": col, "key": "pub", "value": {"public": true, "name": "ok"}}]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    // delete policy
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/storage/delete",
+        Some(&ta),
+        Some(json!({"objects": [{"collection": col, "key": "locked"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/storage/delete",
+        Some(&ta),
+        Some(json!({"objects": [{"collection": col, "key": "priv"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(read(ta.clone()).await.len(), 2);
+    // dropping the policy restores the permission codes
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/storage_schemas/{col}"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = write(
+        ta.clone(),
+        json!([{"collection": col, "key": "locked", "value": {"public": true, "name": "c3"}}]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}

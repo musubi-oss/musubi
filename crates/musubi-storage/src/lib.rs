@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod policy;
 pub mod schema;
 pub use schema::CollectionSchema;
 
@@ -762,6 +763,16 @@ impl StorageService {
                     op.collection, op.key
                 )));
             }
+            self.policy_allows(
+                caller,
+                "write",
+                &op.collection,
+                &op.key,
+                owner,
+                cur_write,
+                Some(&value),
+                None,
+            )?;
             if matches!(op.version.as_deref(), Some(v) if v != cur_version) {
                 return Err(Error::Conflict(format!(
                     "{}/{} version mismatch",
@@ -856,7 +867,7 @@ impl StorageService {
             .map_err(Error::internal)?;
             let out = row
                 .map(to_object)
-                .filter(|obj| can_read(caller, obj))
+                .filter(|obj| self.allowed_read(caller, obj))
                 .into_iter()
                 .collect();
             return Ok(self.finish(out));
@@ -876,7 +887,7 @@ impl StorageService {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let obj = to_object(row);
-            if can_read(caller, &obj) {
+            if self.allowed_read(caller, &obj) {
                 out.push(obj);
             }
         }
@@ -1078,6 +1089,32 @@ impl StorageService {
         acks: &mut Vec<Ack>,
         changes: &mut Vec<Change>,
     ) -> Result<()> {
+        if caller != Caller::Server
+            && self
+                .schema_of(&op.collection)
+                .is_some_and(|s| s.policy.as_ref().is_some_and(|p| p.write.is_some()))
+        {
+            let cur: Option<(serde_json::Value, i16)> = sqlx::query_as(
+                "select value, write_permission from musubi.storage_objects
+                 where collection = $1 and key = $2 and owner_id = $3",
+            )
+            .bind(&op.collection)
+            .bind(&op.key)
+            .bind(owner)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(Error::internal)?;
+            self.policy_allows(
+                caller,
+                "write",
+                &op.collection,
+                &op.key,
+                owner,
+                cur.as_ref().map(|c| c.1).unwrap_or(op.write_permission),
+                cur.as_ref().map(|c| &c.0),
+                Some(&op.value),
+            )?;
+        }
         let create_only = op.version.as_deref() == Some("*");
         let expected = op.version.as_deref().filter(|v| *v != "*");
         let (cur, applied) = self
@@ -1341,8 +1378,8 @@ impl StorageService {
         for op in ops {
             validate_name(&op.collection, "collection")?;
             validate_name(&op.key, "key")?;
-            let current = sqlx::query_as::<_, (String, i16)>(
-                "select version, write_permission from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 for update",
+            let current = sqlx::query_as::<_, (String, i16, serde_json::Value)>(
+                "select version, write_permission, value from musubi.storage_objects where collection = $1 and key = $2 and owner_id = $3 for update",
             )
             .bind(&op.collection)
             .bind(&op.key)
@@ -1350,7 +1387,7 @@ impl StorageService {
             .fetch_optional(&mut *tx)
             .await
             .map_err(Error::internal)?;
-            let Some((cur_version, cur_write)) = current else {
+            let Some((cur_version, cur_write, cur_value)) = current else {
                 continue;
             };
             if caller != Caller::Server && cur_write == 0 {
@@ -1359,6 +1396,16 @@ impl StorageService {
                     op.collection, op.key
                 )));
             }
+            self.policy_allows(
+                caller,
+                "delete",
+                &op.collection,
+                &op.key,
+                owner,
+                cur_write,
+                Some(&cur_value),
+                None,
+            )?;
             if matches!(&op.version, Some(v) if *v != cur_version) {
                 return Err(Error::Conflict(format!(
                     "{}/{} version mismatch",
@@ -1389,6 +1436,79 @@ impl StorageService {
 
     /// Schema/migration/index definitions as loaded at start (`load_schemas`) and kept in sync by
     /// `put_schema` / `delete_schema` on this node; other nodes pick changes up on their next load.
+    /// Default permission codes, or the collection's `policy.read` for user callers.
+    fn allowed_read(&self, caller: Caller, o: &Object) -> bool {
+        if let Caller::User(a) = caller {
+            if let Some(rule) = self
+                .schema_of(&o.collection)
+                .and_then(|s| s.policy.as_ref().and_then(|p| p.read.clone()))
+            {
+                return policy::allows(
+                    &rule,
+                    &policy::Env {
+                        me: Some(a.0),
+                        owner: o.owner_id,
+                        key: &o.key,
+                        collection: &o.collection,
+                        op: "read",
+                        permission: o.read_permission,
+                        value: Some(&o.value),
+                        new: None,
+                    },
+                );
+            }
+        }
+        can_read(caller, o)
+    }
+
+    /// `policy.write` / `policy.delete` gate for user callers (`None` rule = allowed).
+    fn policy_allows(
+        &self,
+        caller: Caller,
+        op: &str,
+        collection: &str,
+        key: &str,
+        owner: Uuid,
+        permission: i16,
+        value: Option<&serde_json::Value>,
+        new: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let Caller::User(a) = caller else {
+            return Ok(());
+        };
+        let Some(p) = self.schema_of(collection).and_then(|s| s.policy.clone()) else {
+            return Ok(());
+        };
+        let rule = if op == "delete" {
+            p.delete_rule().map(str::to_string)
+        } else {
+            p.write.clone()
+        };
+        let Some(rule) = rule else {
+            return Ok(());
+        };
+        let ok = policy::allows(
+            &rule,
+            &policy::Env {
+                me: Some(a.0),
+                owner,
+                key,
+                collection,
+                op,
+                permission,
+                value,
+                new,
+            },
+        );
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied(format!(
+                "{collection}/{key}: policy denies {op}"
+            )))
+        }
+    }
+
     pub fn schema_of(&self, collection: &str) -> Option<std::sync::Arc<CollectionSchema>> {
         self.schemas.read().ok()?.get(collection).cloned()
     }
@@ -1427,6 +1547,7 @@ impl StorageService {
                 schema,
                 migrations: serde_json::from_value(migrations).unwrap_or_default(),
                 indexes: serde_json::from_value(indexes).unwrap_or_default(),
+                policy: None,
             };
             map.insert(collection, std::sync::Arc::new(sc));
         }

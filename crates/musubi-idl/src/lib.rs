@@ -153,6 +153,10 @@ pub struct CollectionDef {
     pub indexes: Vec<Value>,
     #[serde(default)]
     pub migrations: Vec<Value>,
+    /// Access policy expressions for user callers (`read` / `write` / `delete`), see the
+    /// storage policy language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
@@ -592,6 +596,7 @@ impl Idl {
                     "schema": self.json_schema(&c.ty)?,
                     "migrations": c.migrations,
                     "indexes": c.indexes,
+                    "policy": c.policy,
                 }))
             })
             .collect()

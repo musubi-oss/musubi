@@ -23,6 +23,9 @@ pub struct CollectionSchema {
     pub migrations: Vec<Migration>,
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+    /// Access policy expressions (plan 3.5) for user callers; see `policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::policy::Policy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -252,6 +255,9 @@ pub fn where_sql(ops: &[WhereOp], first_param: usize) -> String {
 
 /// Check a schema document before it is stored.
 pub fn validate_definition(s: &CollectionSchema) -> Result<()> {
+    if let Some(p) = &s.policy {
+        p.validate()?;
+    }
     if s.version < 0 {
         return Err(Error::InvalidArgument("version must be ≥ 0".into()));
     }
@@ -813,6 +819,7 @@ mod tests {
                 },
             ],
             indexes: vec![],
+            policy: None,
         };
         validate_definition(&s).unwrap();
         let mut v = json!({"gold": 5, "legacy": true, "wallet": {"gems": 9}});
