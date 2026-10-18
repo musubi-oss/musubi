@@ -112,7 +112,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Изоляция: fuel, память, дедлайн | ✅ | — | ❌ | ✅ | — |
 | Локальная отладка: dev-сервер, фикстуры, replay запросов | ✅ `musubi dev`; фикстуры `POST /v1/admin/dev/fixtures`, запись/replay запросов `/v1/admin/dev/recording(s)`, канарейки модулей | ✅ | 🟡 | 🟡 | — |
 | Cron / schedule_-хуки | ✅ | ✅ | 🟡 | ✅ | ✅ |
-| Durable workflows / saga | ❌ | ❌ | ❌ | ✅ | ❌ |
+| Durable workflows / saga | ✅ `workflow_<name>` шаги с персистентным состоянием, sleep/wait_signal/retry/compensate | ❌ | ❌ | ✅ | ❌ |
 | Flags, live events, аудитории, A/B | ✅ через Zanshin (кэш + мгновенный пуш `liveops.changed`) | ✅ | Satori платно | ✅ | ✅ |
 | Аналитика событий | ✅ шина → Zanshin / вебхуки; клиентскую телеметрию пишет Zanshin SDK | ✅ | Satori | ✅ | ✅ |
 | Вебхуки: HMAC, backoff, dead-letter, redeliver, test | ✅ | 🟡 | ❌ | ✅ | ✅ |
@@ -209,6 +209,8 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ durable workflows: `POST /v1/server/workflows` — шаги модуля `workflow_<name>` с состоянием в строке, сон, сигналы,
+  ретраи с backoff, компенсация (`workflow_<name>_compensate`), лидерский раннер с `skip locked`; ws-тест с WAT-модулем.
   ✅ возраст/COPPA: `PUT /v1/account/age`, `[compliance]` списки закрытых фич (chat/friends/purchases/ugc/public_profile),
   согласие родителя (`account.parental_consent_request` → `POST /v1/auth/parental/consent`), серверная установка брекета; api+ws тесты.
   ✅ миграция с PlayFab/UGS: `musubi migrate-playfab --from dir` — аккаунты со стабильными id, привязки платформ,

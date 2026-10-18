@@ -16670,6 +16670,202 @@ async fn age_gate_blocks_child_chat() {
     assert!(seen);
 }
 
+/// Durable workflows: steps of a module export with the state in the row — sleep, signal,
+/// retries with backoff, compensation, cancel, idempotent start.
+#[tokio::test]
+async fn durable_workflows_sleep_signal_retry_and_compensate() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    state
+        .runtime
+        .load_bytes("wf", WORKFLOW_WAT.as_bytes())
+        .unwrap();
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let post = |path: String, body: Value| {
+        let router = router.clone();
+        async move { http_json(&router, "POST", &path, None, true, Some(body)).await }
+    };
+    let get = |path: String| {
+        let router = router.clone();
+        async move { http_json(&router, "GET", &path, None, true, None).await.1 }
+    };
+    let run = || {
+        let router = router.clone();
+        async move {
+            http_json(
+                &router,
+                "POST",
+                "/v1/server/workflows/run",
+                None,
+                true,
+                None,
+            )
+            .await
+            .1["ran"]
+                .as_i64()
+                .unwrap()
+        }
+    };
+
+    // idempotent start + one-step completion
+    let (st, w) = post(
+        "/v1/server/workflows".into(),
+        json!({"name": "oneshot", "input": {"a": 1}, "key": format!("k-{sfx}")}),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    assert_eq!(w["status"], "running");
+    assert_eq!(w["created"], true);
+    let one = w["id"].as_str().unwrap().to_string();
+    let (_, again) = post(
+        "/v1/server/workflows".into(),
+        json!({"name": "oneshot", "key": format!("k-{sfx}")}),
+    )
+    .await;
+    assert_eq!(again["id"], one);
+    assert_eq!(again["created"], false);
+    let (st, e) = post("/v1/server/workflows".into(), json!({"name": "nope"})).await;
+    assert_eq!(st, 404, "{e}");
+    assert!(run().await >= 1);
+    let w = get(format!("/v1/server/workflows/{one}")).await;
+    assert_eq!(w["status"], "done", "{w}");
+    assert_eq!(w["output"], json!({"ok": true}));
+    assert_eq!(w["step"], 1);
+    assert!(w["finished_at"].is_string());
+
+    // sleep: a step every second, not sooner
+    let (_, w) = post("/v1/server/workflows".into(), json!({"name": "sleeper"})).await;
+    let sl = w["id"].as_str().unwrap().to_string();
+    run().await;
+    let w = get(format!("/v1/server/workflows/{sl}")).await;
+    assert_eq!(w["step"], 1, "{w}");
+    assert_eq!(w["state"], json!({"n": 1}));
+    assert_eq!(w["status"], "running");
+    assert!(w["wake_at"].is_string());
+    run().await;
+    assert_eq!(get(format!("/v1/server/workflows/{sl}")).await["step"], 1);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    run().await;
+    assert_eq!(get(format!("/v1/server/workflows/{sl}")).await["step"], 2);
+
+    // wait_signal: parked until a signal, which is handed to the next step
+    let (_, w) = post("/v1/server/workflows".into(), json!({"name": "wait"})).await;
+    let wt = w["id"].as_str().unwrap().to_string();
+    run().await;
+    let w = get(format!("/v1/server/workflows/{wt}")).await;
+    assert_eq!(w["status"], "waiting", "{w}");
+    assert!(w["wake_at"].is_null());
+    run().await;
+    assert_eq!(get(format!("/v1/server/workflows/{wt}")).await["step"], 1);
+    let (st, w) = post(
+        format!("/v1/server/workflows/{wt}/signal"),
+        json!({"payload": {"hello": 1}}),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    assert_eq!(w["status"], "running");
+    assert_eq!(w["pending_signals"], 1);
+    run().await;
+    let w = get(format!("/v1/server/workflows/{wt}")).await;
+    assert_eq!(w["step"], 2, "{w}");
+    assert_eq!(w["status"], "waiting");
+    assert_eq!(w["pending_signals"], 0);
+    assert_eq!(w["history"][1]["signal"], true);
+
+    // retries with backoff, then compensation
+    let (_, w) = post(
+        "/v1/server/workflows".into(),
+        json!({"name": "boom", "max_attempts": 2}),
+    )
+    .await;
+    let bm = w["id"].as_str().unwrap().to_string();
+    run().await;
+    let w = get(format!("/v1/server/workflows/{bm}")).await;
+    assert_eq!(w["status"], "running", "{w}");
+    assert_eq!(w["attempt"], 1);
+    assert!(w["error"].as_str().unwrap().contains("boom"), "{w}");
+    run().await;
+    assert_eq!(
+        get(format!("/v1/server/workflows/{bm}")).await["attempt"],
+        1
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    run().await;
+    let w = get(format!("/v1/server/workflows/{bm}")).await;
+    assert_eq!(w["status"], "compensated", "{w}");
+    assert_eq!(w["state"], json!({"undone": true}));
+    assert_eq!(w["attempt"], 2);
+
+    // explicit fail: no retry, no compensate export → failed
+    let (_, w) = post("/v1/server/workflows".into(), json!({"name": "giveup"})).await;
+    let gu = w["id"].as_str().unwrap().to_string();
+    run().await;
+    let w = get(format!("/v1/server/workflows/{gu}")).await;
+    assert_eq!(w["status"], "failed", "{w}");
+    assert_eq!(w["error"], "not worth it");
+
+    // cancel a live one; terminal ones refuse signals
+    let (st, w) = post(
+        format!("/v1/server/workflows/{sl}/cancel"),
+        json!({"reason": "ops"}),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    assert_eq!(w["status"], "cancelled");
+    let (st, _) = post(
+        format!("/v1/server/workflows/{one}/signal"),
+        json!({"payload": {}}),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let l = get("/v1/server/workflows?name=sleeper&status=cancelled&limit=5".into()).await;
+    assert!(
+        l["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["id"] == sl),
+        "{l}"
+    );
+}
+
+const WORKFLOW_WAT: &str = r#"(module
+  (import "musubi" "error" (func $error (param i32 i32)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 2048))
+  (func (export "alloc") (param $n i32) (result i32)
+    (local $p i32)
+    global.get $heap
+    local.set $p
+    global.get $heap
+    local.get $n
+    i32.add
+    global.set $heap
+    local.get $p)
+  (data (i32.const 0) "{\"state\":{\"n\":1},\"sleep_secs\":1}")
+  (func (export "workflow_sleeper") (param i32 i32 i32 i32) (result i64)
+    i64.const 0 i64.const 32 i64.shl i64.const 32 i64.or)
+  (data (i32.const 128) "{\"done\":true,\"output\":{\"ok\":true}}")
+  (func (export "workflow_oneshot") (param i32 i32 i32 i32) (result i64)
+    i64.const 128 i64.const 32 i64.shl i64.const 34 i64.or)
+  (data (i32.const 256) "{\"wait_signal\":true}")
+  (func (export "workflow_wait") (param i32 i32 i32 i32) (result i64)
+    i64.const 256 i64.const 32 i64.shl i64.const 20 i64.or)
+  (data (i32.const 384) "boom")
+  (func (export "workflow_boom") (param i32 i32 i32 i32) (result i64)
+    i32.const 384 i32.const 4 call $error
+    i64.const 0)
+  (data (i32.const 512) "{\"state\":{\"undone\":true}}")
+  (func (export "workflow_boom_compensate") (param i32 i32 i32 i32) (result i64)
+    i64.const 512 i64.const 32 i64.shl i64.const 25 i64.or)
+  (data (i32.const 640) "{\"fail\":\"not worth it\"}")
+  (func (export "workflow_giveup") (param i32 i32 i32 i32) (result i64)
+    i64.const 640 i64.const 32 i64.shl i64.const 23 i64.or)
+)
+"#;
+
 async fn recv_account(router: &axum::Router, token: &str) -> Value {
     http_json(router, "GET", "/v1/account", Some(token), false, None)
         .await

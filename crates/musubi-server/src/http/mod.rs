@@ -32,6 +32,7 @@ pub mod stats;
 mod storage;
 pub mod tournaments;
 mod ugc;
+mod workflows;
 mod worlds;
 mod ws;
 
@@ -190,6 +191,7 @@ pub fn router(state: AppState) -> Router {
         .merge(match_results::routes())
         .merge(content::routes())
         .merge(fleets::routes())
+        .merge(workflows::routes())
         .merge(worlds::routes())
         .merge(integrations::routes())
         .merge(rtc::routes())

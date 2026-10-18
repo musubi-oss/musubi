@@ -331,6 +331,21 @@ and stops it with `DELETE {url}/servers/{id}`. Three endpoints put GameFabric, a
 scheduler or a bare-metal panel behind the same fleets, buffers, autoscaling and allocation
 API as Docker, Kubernetes, Firecracker, Edgegap and GameLift.
 
+### Durable workflows (sagas)
+
+Long-running server logic — a trade with a 24-hour escrow, a tournament payout, a cross-game
+grant with rollback — is a module export `workflow_<name>` called one step at a time with its
+persisted state. `POST /v1/server/workflows {name, input, key?, delay_secs?, account_id?,
+max_attempts?}` starts one (`key` makes the start idempotent); each step receives `{id, name,
+step, attempt, input, state, signal, timed_out}` and answers `{state?, sleep_secs | wait_signal
+(+ timeout_secs) | done (+ output) | fail}`. A trap retries with exponential backoff up to
+`max_attempts`; a permanent failure or `POST …/{id}/cancel` runs `workflow_<name>_compensate`
+when the module exports it (the saga's undo) and the workflow ends `compensated`.
+`POST …/{id}/signal {payload}` wakes a parked workflow with that payload; `GET …/{id}` shows
+state, step history (last 50) and the next wake. One node runs due steps cluster-wide (lease
+`workflows`), rows are claimed with `skip locked`, and the state is the row — a restart loses
+nothing. `musubi.workflows` is also plain SQL for your dashboards.
+
 ### Age gate and parental controls
 
 `PUT /v1/account/age {birthdate | bracket}` puts an account in an age bracket — `child` (under

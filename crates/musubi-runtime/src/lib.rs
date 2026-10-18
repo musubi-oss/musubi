@@ -537,6 +537,7 @@ impl Runtime {
                 || n.starts_with("after_")
                 || n.starts_with("hook_")
                 || n.starts_with("schedule_")
+                || n.starts_with("workflow_")
             {
                 hooks.push(n.clone());
             }
