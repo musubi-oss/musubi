@@ -38,11 +38,28 @@ Clean-up of events/deliveries/audit/notifications/sessions runs on the `retentio
 
 ### Measured (not promised)
 
-`musubi bench` on a laptop-class VM, **debug** build, Postgres 16 in Docker, one node, 12 clients,
-3 s: HTTP `GET /v1/account` p50 2.5 ms / p99 6.7 ms, storage write/read p50 2.4 ms / p99 6.8 ms,
-WebSocket ping p50 0.4 ms / p99 2.6 ms — bounded by the default per-account `[limits]`, not by
-the server. Run it against your own deployment; numbers from a release build on real hardware are
-the ones that matter.
+`musubi bench`, **release** build, one node on an 8-vCPU / 31 GB VM with Postgres 16 in Docker on
+the same box, 200 clients for 30 s, per-account `[limits]` off (otherwise the limiter is what you
+measure):
+
+| scenario | ops | ops/s | p50 | p95 | p99 | max | errors |
+|---|---|---|---|---|---|---|---|
+| HTTP `GET /v1/account` | 68 887 | 2 296 | 17.2 ms | 21.0 ms | 24.6 ms | 56.3 ms | 0 |
+| storage write + read-back | 105 408 | 3 514 | 11.2 ms | 15.7 ms | 18.8 ms | 42.7 ms | 0 |
+| WebSocket ping | 1 173 385 | 39 113 | 0.84 ms | 2.4 ms | 3.4 ms | 30.6 ms | 0 |
+| chat message → delivered | 33 558 | 1 119 | 35.3 ms | 43.0 ms | 46.3 ms | 71.0 ms | 0 |
+| relayed match input → echo | 253 651 | 8 455 | 30.0 ms | 34.2 ms | 35.5 ms | 46.5 ms | 0 |
+
+`musubi soak` on the same VM, release build, 3 nodes, 24 clients, 6 worlds split across two nodes
+each with 20 entities shuttling over the border, 75 s, one SIGKILL of the raft leader: survivors
+marked it dead after 4.6 s, its 2 worlds and 2 matches were re-homed 6.8 s after the kill, the
+restarted process rejoined in 1.0 s; 25 381 verified storage writes with 0 lost, 3 WS sessions
+resumed (0 fresh reconnects), 5 528 match inputs echoed with 0 resets, 0 entities lost. The same
+run also showed a real defect: two of the six border worlds counted 36 and 33 entities instead of
+20 after the re-home (duplicates, not losses), so the stand reports the incident as not settled —
+that is the next thing being fixed, and the stand exists precisely so such numbers are not
+promised away. Run both against your own deployment; numbers from real hardware and a real network
+are the ones that matter.
 
 ### Micro-benchmarks (criterion)
 
