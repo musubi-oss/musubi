@@ -317,6 +317,16 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Webhook fleet provider
+
+`[fleet.webhook] url = "https://orchestrator.example/musubi"` registers `provider = "webhook"`:
+Musubi starts a server with `POST {url}/servers` (`{server_id, port, fleet{id,name,region,pool,image,command,vcpu}, env}`,
+env already holds `MUSUBI_SERVER_ID/FLEET_ID/PORT/API/SERVER_KEY`), expects `{id?, address, port}`
+— or `202` + `id` and polls `GET {url}/servers/{id}` until `{status: "ready", address, port}` —
+and stops it with `DELETE {url}/servers/{id}`. Three endpoints put GameFabric, a home-grown
+scheduler or a bare-metal panel behind the same fleets, buffers, autoscaling and allocation
+API as Docker, Kubernetes, Firecracker, Edgegap and GameLift.
+
 ### Storage: JSON Patch, aggregates, full-text
 
 `POST /v1/storage/patch` takes either a merge patch (`patch`, RFC 7386) or RFC 6902 operations

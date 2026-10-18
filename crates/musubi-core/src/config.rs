@@ -710,6 +710,7 @@ pub struct FleetConfig {
     pub kubernetes: KubernetesConfig,
     pub firecracker: FirecrackerConfig,
     pub edgegap: EdgegapConfig,
+    pub webhook: WebhookFleetConfig,
     pub gamelift: GameLiftConfig,
 }
 
@@ -1455,6 +1456,30 @@ impl Default for EdgegapConfig {
             token: String::new(),
             app: String::new(),
             version: String::new(),
+            poll_secs: 2,
+            ready_timeout_secs: 180,
+        }
+    }
+}
+
+/// Any orchestrator behind a small HTTP contract (`provider = "webhook"`), e.g. GameFabric or a
+/// custom scheduler; registered when `url` is set. `POST {url}/servers` starts a server and
+/// returns `{id?, address, port}` (or `202` + `id` to poll at `GET {url}/servers/{id}` until
+/// `status: "ready"`), `DELETE {url}/servers/{id}` stops it. `token` is sent as a Bearer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookFleetConfig {
+    pub url: String,
+    pub token: String,
+    pub poll_secs: u64,
+    pub ready_timeout_secs: u64,
+}
+
+impl Default for WebhookFleetConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: String::new(),
             poll_secs: 2,
             ready_timeout_secs: 180,
         }

@@ -209,6 +209,8 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ оркестрация: провайдер `webhook` — любой оркестратор за `POST /servers`, `GET /servers/{id}`, `DELETE /servers/{id}`
+  (`[fleet.webhook] url/token`), тест на мок-сервере.
   ✅ storage: JSON Patch RFC 6902 (`ops` в `/v1/storage/patch`, `test` → 409), агрегаты
   (`GET /v1/storage/{collection}/aggregate?field&group&where`), полнотекст (`"$q"` в `where`, GIN по `to_tsvector`).
   ✅ auth: magic-link (`POST /v1/auth/email/magic/request` → событие `account.magic_link` с токеном → `POST /v1/auth/email/magic`,
@@ -219,7 +221,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   `GET /v1/graphs`, `unlock`/`claim`/`skip`/`reset` (с частичным возвратом).
 - **Аутентификация (5.1).** Нет magic-link, custom token, лимита одновременных сессий на аккаунт, SAML.
 - **Storage (5.3).** Patch — только JSON Merge Patch (нет RFC 6902), нет aggregate и full-text.
-- **Оркестрация (5.9).** Нет провайдеров `gamefabric` и `custom (WASM)`, билды не в OCI-реестре, warm-pool
+- **Оркестрация (5.9).** Любой внешний оркестратор (GameFabric, свой планировщик) — провайдер `webhook` (start/status/stop по HTTP); нет, билды не в OCI-реестре, warm-pool
   «≤ 2 с до готовности» не измерен.
 - **CLI (5.15).** Есть dev/migrate/migrate-nakama/export/import/doctor/config/bench/soak; нет `deploy`,
   `module publish/rollout/rollback`, `schema migrate`, `fleet push`, миграции с PlayFab/UGS, Terraform.

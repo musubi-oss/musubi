@@ -240,6 +240,15 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             )),
         );
     }
+    if !cfg.fleet.webhook.url.is_empty() {
+        tracing::info!(provider = "webhook", url = %cfg.fleet.webhook.url, "fleet provider registered");
+        fleets = fleets.with_provider(
+            "webhook",
+            Arc::new(musubi_fleet::webhook::WebhookProvider::new(
+                cfg.fleet.webhook.clone(),
+            )),
+        );
+    }
     if !cfg.fleet.gamelift.access_key.is_empty() {
         tracing::info!(provider = "gamelift", region = %cfg.fleet.gamelift.region, "fleet provider registered");
         fleets = fleets.with_provider(

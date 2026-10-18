@@ -12566,6 +12566,96 @@ async fn regions_routed_allocation_cold_start_and_external_providers() {
             "{deploy}"
         );
     }
+    // Webhook provider (GameFabric / custom orchestrator) against a mock API
+    let (wh_base, wh_log) = mock_http(Arc::new(
+        |method: &str, path: &str, _head: &str, _body: &str| match (method, path) {
+            ("POST", "/servers") => (
+                200,
+                r#"{"id":"wh-1","address":"10.7.0.5","port":7777}"#.to_string(),
+            ),
+            ("DELETE", "/servers/wh-1") => (200, "{}".to_string()),
+            _ => (404, "{}".to_string()),
+        },
+    ))
+    .await;
+    state.fleets.register_provider(
+        "webhook",
+        Arc::new(musubi_fleet::webhook::WebhookProvider::new(
+            musubi_core::config::WebhookFleetConfig {
+                url: wh_base,
+                token: "wh-token".into(),
+                ..Default::default()
+            },
+        )),
+    );
+    let (st, whf) = http_json(
+        &router,
+        "POST",
+        "/v1/server/fleets",
+        None,
+        true,
+        Some(mk(
+            format!("wh-{sfx}"),
+            "eu",
+            "",
+            1,
+            (48600, 48699),
+            json!({"provider": "webhook", "image": "ghcr.io/acme/shooter:1.2"}),
+        )),
+    )
+    .await;
+    assert_eq!(st, 200, "{whf}");
+    let wh_id = uuid::Uuid::parse_str(whf["id"].as_str().unwrap()).unwrap();
+    state.fleets.reconcile().await.unwrap();
+    let servers = state.fleets.servers(wh_id, None).await.unwrap();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    assert_eq!(servers[0].address, "10.7.0.5");
+    assert_eq!(servers[0].port, 7777);
+    {
+        let log = wh_log.lock().unwrap();
+        let start = log
+            .iter()
+            .find(|l| l.starts_with("POST /servers"))
+            .expect("start call");
+        assert!(
+            start.contains(&format!("\"name\":\"wh-{sfx}\""))
+                && start.contains("MUSUBI_SERVER_KEY")
+                && start.contains(&format!("\"server_id\":\"{}\"", servers[0].id))
+                && start
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer wh-token"),
+            "{start}"
+        );
+    }
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/server/fleets/{wh_id}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let mut wh_stopped = false;
+    for _ in 0..30 {
+        if wh_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("DELETE /servers/wh-1"))
+        {
+            wh_stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        wh_stopped,
+        "webhook stop not called: {:?}",
+        wh_log.lock().unwrap()
+    );
+
     let (st, _) = http_json(
         &router,
         "DELETE",
