@@ -15369,10 +15369,15 @@ async fn deferred_rewards_go_through_the_mailbox() {
     assert_eq!(balance(app.clone()).await, 57);
 }
 
+/// The IDL is one document per cluster; tests that deploy and remove it must not overlap.
+static IDL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// One IDL document (plan 3.8) drives storage contracts, `/v1/rpc/{name}` input validation and
 /// auth, and `/openapi.json`.
 #[tokio::test]
 async fn idl_deploys_contracts_rpc_validation_and_openapi() {
+    let _idl_guard = IDL_LOCK.lock().await;
     let Some(app) = app().await else { return };
     let (_, s) = call(
         &app,
@@ -15582,6 +15587,7 @@ auth = "server"
 /// `[configs.*]` types server-written / client-read config documents.
 #[tokio::test]
 async fn idl_types_match_params_state_and_configs() {
+    let _idl_guard = IDL_LOCK.lock().await;
     let Some(app) = app().await else { return };
     let (_, s) = call(
         &app,
