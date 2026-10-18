@@ -614,6 +614,11 @@ impl Default for RuntimeConfig {
 pub struct QuicConfig {
     /// UDP listen address; unset = QUIC disabled.
     pub listen: Option<SocketAddr>,
+    /// Answer the first Initial of an unvalidated source with a Retry token (RFC 9000 §8.1): a
+    /// spoofed address never costs a handshake, and amplification stays at 1×. Default on.
+    pub retry: Option<bool>,
+    /// Handshakes in flight at once; above it new connections are refused (default 1024).
+    pub max_pending_handshakes: Option<usize>,
     /// PEM cert chain + key. Unset = self-signed `localhost` cert (development only).
     pub cert_pem: Option<std::path::PathBuf>,
     pub key_pem: Option<std::path::PathBuf>,

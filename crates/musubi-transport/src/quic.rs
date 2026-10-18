@@ -201,6 +201,10 @@ fn build(
             .map_err(|e| TransportError::Io(e.to_string()))?,
     ));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    // one session = one bidirectional stream (+ datagrams); a client gets a few spare streams
+    // for reconnect races and no unidirectional ones
+    transport.max_concurrent_bidi_streams(8u32.into());
+    transport.max_concurrent_uni_streams(0u32.into());
     cfg.transport_config(Arc::new(transport));
     Ok(cfg)
 }

@@ -14,6 +14,11 @@ use musubi_transport::Limits;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Initials answered with a Retry token because the source was not yet validated.
+pub static RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Connections refused because `quic.max_pending_handshakes` were already in flight.
+pub static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Bind and serve forever. Returns the bound address (port 0 is resolved).
 pub async fn start(state: AppState, listen: SocketAddr) -> anyhow::Result<SocketAddr> {
     let cfg = match (&state.cfg.quic.cert_pem, &state.cfg.quic.key_pem) {
@@ -35,12 +40,29 @@ pub async fn start_with(
 ) -> anyhow::Result<SocketAddr> {
     let endpoint = quinn::Endpoint::server(cfg, listen)?;
     let addr = endpoint.local_addr()?;
-    tracing::info!(%addr, "quic listening");
+    let retry = state.cfg.quic.retry.unwrap_or(true);
+    let max_pending = state.cfg.quic.max_pending_handshakes.unwrap_or(1024);
+    let pending = Arc::new(tokio::sync::Semaphore::new(max_pending));
+    tracing::info!(%addr, retry, max_pending, "quic listening");
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
+            // plan 3.7: address validation before any handshake state, then a cap on handshakes
+            // in flight so a flood of Initials cannot exhaust the node
+            if retry && !incoming.remote_address_validated() {
+                RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                incoming.retry().ok();
+                continue;
+            }
+            let Ok(permit) = pending.clone().try_acquire_owned() else {
+                REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                incoming.refuse();
+                continue;
+            };
             let state = state.clone();
             tokio::spawn(async move {
-                match incoming.await {
+                let conn = incoming.await;
+                drop(permit);
+                match conn {
                     Ok(conn) => handle(state, conn).await,
                     Err(e) => tracing::debug!(error = %e, "quic handshake failed"),
                 }

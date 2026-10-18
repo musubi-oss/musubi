@@ -18760,3 +18760,85 @@ async fn world_custom_placement_follows_module_hook() {
         "{ev}"
     );
 }
+
+/// Plan 3.7: an unvalidated source is answered with a Retry token first (no handshake state for
+/// spoofed addresses), and handshakes in flight are capped — above the cap connections are refused.
+#[tokio::test]
+async fn quic_retry_validates_addresses_and_caps_pending_handshakes() {
+    use std::sync::atomic::Ordering;
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (cfg, der) = musubi_transport::quic::dev_self_signed().unwrap();
+    let addr =
+        musubi_server::realtime::quic::start_with(state, "127.0.0.1:0".parse().unwrap(), cfg)
+            .await
+            .unwrap();
+    let (ta, _) = token(&router).await;
+    let retries_before = musubi_server::realtime::quic::RETRIES.load(Ordering::Relaxed);
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(
+        musubi_transport::quic::client_config(std::slice::from_ref(&der)).unwrap(),
+    );
+    let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+    assert!(
+        musubi_server::realtime::quic::RETRIES.load(Ordering::Relaxed) > retries_before,
+        "the first Initial got a Retry"
+    );
+    // the retried connection works like any other
+    let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+    use musubi_transport::quic::QuicConnection as Q;
+    use musubi_transport::Frame;
+    Q::write_frame(
+        &mut tx,
+        Frame::Text(json!({"token": ta, "format": "json"}).to_string()),
+    )
+    .await
+    .unwrap();
+    Q::write_frame(
+        &mut tx,
+        Frame::Text(
+            serde_json::to_string(&Envelope {
+                cid: Some("1".into()),
+                msg: ClientMessage::Ping,
+            })
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let Frame::Text(t) = Q::read_frame(&mut rx, 1 << 20).await.unwrap() else {
+        panic!()
+    };
+    let r: Envelope<ServerMessage> = serde_json::from_str(&t).unwrap();
+    assert!(matches!(r.msg, ServerMessage::Pong));
+
+    // a node that allows no handshakes in flight refuses every validated connection
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let mut c = Config::default();
+    c.database.url = url;
+    c.quic.max_pending_handshakes = Some(0);
+    let Some(state2) = build_state_cfg_with(true, &test_group(), "local", c, false, None).await
+    else {
+        return;
+    };
+    let (cfg2, der2) = musubi_transport::quic::dev_self_signed().unwrap();
+    let addr2 =
+        musubi_server::realtime::quic::start_with(state2, "127.0.0.1:0".parse().unwrap(), cfg2)
+            .await
+            .unwrap();
+    let refused_before = musubi_server::realtime::quic::REFUSED.load(Ordering::Relaxed);
+    let mut ep2 = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep2.set_default_client_config(musubi_transport::quic::client_config(&[der2]).unwrap());
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ep2.connect(addr2, "localhost").unwrap(),
+    )
+    .await;
+    assert!(
+        matches!(res, Ok(Err(_))),
+        "connection must be refused, got {res:?}"
+    );
+    assert!(musubi_server::realtime::quic::REFUSED.load(Ordering::Relaxed) > refused_before);
+}
