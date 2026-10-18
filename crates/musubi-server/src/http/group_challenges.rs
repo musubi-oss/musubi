@@ -6,7 +6,7 @@
 //! contributor) receive reward tables, and `group_challenge.settled` goes to the event bus.
 
 use axum::extract::{Path, Query, State};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error, Result};
 use serde::{Deserialize, Serialize};
@@ -30,10 +30,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/group_challenges", get(list_mine))
         .route("/v1/group_challenges/{id}", get(standings))
         .route("/v1/group_challenges/{id}/me", get(my_contribution))
-        .route(
-            "/v1/server/group_challenges/sweep",
-            delete(sweep_noop).post(sweep_now),
-        )
+        .route("/v1/server/group_challenges/sweep", post(sweep_now))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -590,8 +587,4 @@ async fn sweep_now(
     ServerKey: ServerKey,
 ) -> std::result::Result<Json<Value>, ApiError> {
     Ok(Json(json!({ "settled": settle_due(&s).await? })))
-}
-
-async fn sweep_noop(ServerKey: ServerKey) -> Json<Value> {
-    Json(json!({ "ok": true }))
 }
