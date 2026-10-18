@@ -28,7 +28,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 |---|---|---|---|---|---|
 | Device / email+пароль / Steam / Google / Apple | ✅ `musubi-auth`, `http/auth.rs` | ✅ | ✅ | ✅ | ✅ |
 | Generic OIDC (Discord, Twitch, Epic, Keycloak…) | ✅ `/v1/auth/oidc/{provider}`, discovery + JWKS | 🟡 | 🟡 | 🟡 | ✅ |
-| Xbox Live (XSTS), PSN, Nintendo | ❌ | ✅ | ❌ (custom) | ✅ | ✅ |
+| Xbox Live (XSTS), PSN, Nintendo | ✅ `POST /v1/auth/{xbox,psn,nintendo}` + link/unlink (XSTS-профиль, id_token через OIDC-проверку) | ✅ | ❌ (custom) | ✅ | ✅ |
 | Passkeys / WebAuthn | ✅ | ❌ | ❌ | ❌ | ❌ |
 | TOTP MFA + recovery codes | ✅ | ❌ | ❌ | ❌ | 🟡 |
 | Magic-link вход | ❌ (есть verify/reset по токену, вход по ссылке нет) | ❌ | ❌ | ✅ | ❌ |
@@ -40,11 +40,11 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Хранилище объектов (коллекции, права, версии, TTL) | ✅ `musubi-storage` | ✅ player data | ✅ | ✅ | ✅ |
 | Запросы по полям | ✅ `list_where` (фильтр по JSON-полям) | 🟡 | 🟡 | ❌ | ❌ |
 | Вторичные индексы / full-text | ✅ expression-индексы по полям `value` (`indexes` в контракте коллекции) + `$where` range-фильтры в `where`; full-text — нет | ❌ | 🟡 | ❌ | ❌ |
-| Live-подписка на изменения объектов | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Live-подписка на изменения объектов | ✅ `storage_subscribe` / `storage_update` в сокете | ❌ | ❌ | ❌ | ❌ |
 | Схемы player data и миграции версий | ✅ `PUT /v1/admin/storage_schemas/{c}`: JSON Schema-контракт на коллекцию, версия + миграции (на чтении и backfill), live-подписки `storage_subscribe` по WS | ✅ | ❌ | ❌ | ❌ |
 | Cloud save с разрешением конфликтов | ✅ версии + CAS; при устаревшей версии `merge: ours|theirs|max|min` + `base` в write-операции — трёхстороннее слияние на сервере (поле, изменённое одной стороной, побеждает; оба — по политике), ack с `merged.conflicts` | ❌ | 🟡 | ✅ | ✅ |
 | Друзья, блок, рекомендации, недавние | ✅ `musubi-social` | ✅ | ✅ | ✅ | ✅ |
-| Импорт друзей с платформ (Steam/PSN/Xbox) | ❌ | ✅ | ❌ | 🟡 | ✅ |
+| Импорт друзей с платформ (Steam/PSN/Xbox) | ✅ `POST /v1/friends/import {provider, subjects}` (разово; периодического рефреша нет) | ✅ | ❌ | 🟡 | ✅ |
 | Группы: роли-битмаска, казна, склад, XP/уровни, альянсы | ✅ | 🟡 | 🟡 | 🟡 | ✅ |
 | Войны / челленджи кланов | ❌ (геймплейная логика поверх, ядро есть) | ❌ | ❌ | ❌ | ❌ |
 | Чат: история, треды, реакции, правка, упоминания, модерация, slow-mode | ✅ `musubi-chat` | 🟡 | ✅ | 🟡 | ✅ |
@@ -77,8 +77,8 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | IAP: Apple / Google / Steam, уведомления, отзыв | ✅ `iap.rs` | ✅ | ✅ | ✅ | ✅ |
 | IAP: PSN / Xbox / Nintendo / Epic | ❌ | ✅ | ❌ | ✅ | ✅ |
 | Подписки с продлением / grace | ✅ `iap_products.kind = subscription` + `grace_secs`, продление по чеку и Apple V2 / Google RTDN, `GET /v1/iap/subscriptions` | 🟡 | ✅ | ✅ | ✅ |
-| Entitlements: платформенные покупки / DLC → предметы | ❌ | ✅ | ❌ | ✅ | ✅ |
-| Limited grants (лимит серверных грантов на игрока в окно) | ❌ | ✅ | ❌ | ❌ | ❌ |
+| Entitlements: платформенные покупки / DLC → предметы | ✅ `/v1/entitlements` (+`/sync` по Steam-ownership), серверный каталог/grant/revoke | ✅ | ❌ | ✅ | ✅ |
+| Limited grants (лимит серверных грантов на игрока в окно) | ✅ `/v1/server/grant_limits`, `GET /v1/admin/accounts/{id}/grants` | ✅ | ❌ | ❌ | ❌ |
 | Жалобы на игроков общего вида + ревью | ✅ `POST /v1/reports` на игрока/матч/UGC, очередь и решение `GET/POST /v1/admin/reports/{id}`, история по аккаунту | ✅ | ❌ | ✅ | ✅ |
 | Баны (timed, shadow), kick, purge | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Античит: серверная валидация, EAC/BattlEye-интеграция | ✅ размер/частота ввода в authoritative-матчах → отказ + сигнал; `POST /v1/server/anticheat/flag` от серверов и `anticheat.flag` из модулей; очки за окно, авто-кик по порогу, очередь `GET /v1/admin/anticheat`; `POST /v1/server/anticheat/verify` → EAC/BattlEye endpoint | 🟡 | ❌ | 🟡 | 🟡 |
@@ -98,7 +98,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Dedicated-серверы: провайдеры | ✅ local, docker, kubernetes (Agones-совместимый манифест), firecracker | 🟡 внешние | 🟡 FleetManager API | ✅ | ✅ AMS |
 | Внешние оркестраторы как провайдеры (Edgegap, GameLift) | ✅ `provider = edgegap` (deploy/status/stop) и `gamelift` (CreateGameSession/Describe/Terminate, SigV4) рядом с local/docker/firecracker/k8s/agones | — | ✅ | — | — |
 | Автоскейл: буфер + прогноз по истории | ✅ `demand`/`scale` | ❌ | ❌ | ✅ | ✅ |
-| Scale-to-zero флота | ❌ (min 0 задать можно, прогрев/холодный старт не отработан) | ❌ | ❌ | ✅ | ✅ |
+| Scale-to-zero флота | ✅ min 0 + холодный старт при аллокации (ожидание готовности), прогноз по истории | ❌ | ❌ | ✅ | ✅ |
 | Build pipeline: canary / promote / rollback, vCPU-часы | ✅ | ❌ | ❌ | 🟡 | ✅ |
 | SDK сервера: ready/health/labels/players/watch/shutdown | ✅ `/v1/gameserver/*` | ✅ | 🟡 | ✅ | ✅ |
 
@@ -108,7 +108,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 |---|---|---|---|---|---|
 | Серверная логика | ✅ WASM-модули (`musubi-runtime`): rpc, before/after, hook_*, match_*, schedule_* | Kotlin-плагины | Go/Lua/JS | CloudScript | ❌ |
 | Hot reload модулей | ✅ `PUT /v1/admin/runtime/modules/{name}` | ❌ | ❌ | ✅ | — |
-| Канареечный rollout модулей | ❌ (есть для билдов флота, не для модулей) | ❌ | ❌ | ❌ | — |
+| Канареечный rollout модулей | ✅ `/v1/admin/runtime/modules/{name}/canary` (процент/список аккаунтов, promote) | ❌ | ❌ | ❌ | — |
 | Изоляция: fuel, память, дедлайн | ✅ | — | ❌ | ✅ | — |
 | Локальная отладка: dev-сервер, фикстуры, replay запросов | ✅ `musubi dev`; фикстуры `POST /v1/admin/dev/fixtures`, запись/replay запросов `/v1/admin/dev/recording(s)`, канарейки модулей | ✅ | 🟡 | 🟡 | — |
 | Cron / schedule_-хуки | ✅ | ✅ | 🟡 | ✅ | ✅ |
@@ -151,7 +151,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 «нельзя сделать поверх модулем».
 
 1. ~~**Платформенные аккаунты консолей**: Xbox Live XSTS, PSN id_token, Nintendo NSA; импорт друзей с платформ.~~ ✅
-2. ~~**Entitlements**: Steam DLC/ownership, PSN, Xbox → предметы инвентаря, идемпотентный синк; IAP PSN/Xbox/Nintendo.~~ ✅
+2. ~~**Entitlements**: Steam DLC/ownership, PSN, Xbox → предметы инвентаря, идемпотентный синк~~ ✅; IAP PSN/Xbox/Nintendo — **нет** (чеки только Apple/Google/Steam).
 3. ~~**Жалобы на игроков** общего вида с уликами (match id, метка реплея), очередь ревью, решение с баном из той же ручки.~~ ✅
 4. ~~**Limited grants** + per-key квоты и rate-limit.~~ ✅
 5. ~~**End-game report**: один маршрут «результаты матча → рейтинги + награды + статы + квесты», идемпотентный по матчу (замыкает game flow Pragma).~~ ✅
@@ -170,3 +170,34 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 
 Клиентские SDK и GDK намеренно после: wire-протокол мира меняется пунктами 6–8, писать SDK до них —
 переписывать дважды.
+
+## 8. Глубина против спецификации (05-podsistemy) — аудит 2026-10-18
+
+Строка «✅» в матрице означает «функция есть и покрыта тестом», не «реализована на всю глубину дизайн-дока».
+Ниже — что спецификация обещает, а кода нет (или он тоньше). Порядок внутри раздела — по боли.
+
+- **Производительность (6.1).** Замерено (8 vCPU, PG на той же машине, 200 клиентов): HTTP 2.3k/с, storage 3.5k/с,
+  WS ping 39k/с, чат 1.1k/с. Цели v1 — 10k auth/RPC и 5k storage **на 1 vCPU**. Профилирования горячего пути
+  (axum → sqlx → PG, пул соединений, пайплайнинг) ещё не было; это самый большой разрыв между обещанием и фактом.
+- **Статистика игрока (5.6).** Нет вообще: типизированные счётчики per-mode/per-season, публичные/приватные,
+  инкременты из отчёта матча.
+- **Лидерборды (5.6).** Нет запросов by friends / by group / by rank range и истории прошлых окон как API
+  (`leaderboard_ends` есть в БД). Турниры: нет round-robin и таймаутов неявки в брекете.
+- **Матчмейкер (5.7).** Наблюдаемость — только `waiting/open_matches/queues`; нет p50/p95 ожидания по
+  очереди/региону/MMR-бакету и симулятора очереди по историческим тикетам.
+- **Чат и уведомления (5.5).** Нет typing-индикатора, вложений, перевода, внешнего automod-хука; у in-app
+  уведомлений нет TTL; push без шаблонов/расписания по таймзоне/тихих пушей/deep-link, нет Huawei;
+  mailbox не умеет рассылку по аудитории (только все / список).
+- **Присутствие (5.4).** Статус — одна строка; нет `appear_offline` и структурированного rich presence.
+  Импорт платформенных друзей разовый, без периодического рефреша. Войны/челленджи кланов — нет.
+- **Экономика (5.11).** Нет графов прогресса / skill trees, unlockables с таймерами и ускорением,
+  rerolls заданий, модификаторов наград (x2 выходные), витрин per-платформа, синка достижений в
+  Steam/PSN/Xbox, фрод-эвристик по скорости покупок. IAP: только Apple/Google/Steam (нет Epic, PSN, Xbox,
+  Nintendo, Huawei, Samsung, Facebook).
+- **Аутентификация (5.1).** Нет magic-link, custom token, лимита одновременных сессий на аккаунт, SAML.
+- **Storage (5.3).** Patch — только JSON Merge Patch (нет RFC 6902), нет aggregate и full-text.
+- **Оркестрация (5.9).** Нет провайдеров `gamefabric` и `custom (WASM)`, билды не в OCI-реестре, warm-pool
+  «≤ 2 с до готовности» не измерен.
+- **CLI (5.15).** Есть dev/migrate/migrate-nakama/export/import/doctor/config/bench/soak; нет `deploy`,
+  `module publish/rollout/rollback`, `schema migrate`, `fleet push`, миграции с PlayFab/UGS, Terraform.
+- **Realtime (5.8).** Типизированная схема состояния с автодельтами и детерминированный rollback — v2 / SDK.
