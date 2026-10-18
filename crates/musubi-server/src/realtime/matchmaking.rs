@@ -117,7 +117,7 @@ pub fn process_and_deliver(relayed: &RelayedRegistry, mm: &Matchmaker, fanout: &
         return;
     }
     for m in mm.process() {
-        observe(&m);
+        observe(mm, &m);
         let match_id = relayed.new_match_id();
         match mm.start_ready_check(m, &match_id) {
             ReadyStart::Deliver(m) => {
@@ -152,16 +152,18 @@ pub fn process_and_deliver(relayed: &RelayedRegistry, mm: &Matchmaker, fanout: &
 
 /// Wait time per ticket, grade per match and a match counter, labelled by queue and region
 /// (`free` for mutual-query tickets, `any` without ping data).
-fn observe(m: &Matched) {
+fn observe(mm: &Matchmaker, m: &Matched) {
     let queue = m.queue.clone().unwrap_or_else(|| "free".into());
     let region = m.region.clone().unwrap_or_else(|| "any".into());
     for t in &m.tickets {
+        let wait = t.created.elapsed().as_secs_f64();
         metrics::histogram!(
             "musubi_matchmaker_wait_seconds",
             "queue" => queue.clone(),
             "region" => region.clone()
         )
-        .record(t.created.elapsed().as_secs_f64());
+        .record(wait);
+        mm.record_wait(&queue, &region, wait as f32);
     }
     if let Some(q) = m.quality {
         metrics::histogram!("musubi_matchmaker_match_quality", "queue" => queue.clone())

@@ -317,6 +317,16 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Matchmaker observability
+
+`GET /v1/server/matchmaker/stats` adds `wait` — p50/p95/p99/max wait per queue × region over the
+last 2 048 matched tickets — and `waiting_ages` (how long the tickets in each queue have been
+there), next to the Prometheus histogram `musubi_matchmaker_wait_seconds`.
+`POST /v1/server/matchmaker/simulate {queue, arrivals_per_sec, duration_secs, mmr_mean, mmr_sd,
+regions, party_sizes, seed}` dry-runs a queue's rules on virtual time with synthetic players and
+returns matches, wait percentiles and quality (MMR gap, ping) — tune `mmr`/`ping` expansion before
+real players feel it; same seed, same answer.
+
 ### Player statistics
 
 `PUT /v1/server/stats/defs` declares typed counters (`sum` / `max` / `min` / `last`, each

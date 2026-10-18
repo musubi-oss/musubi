@@ -185,8 +185,9 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   `records?friends=1|group_id=|rank_from=&rank_to=`, `GET /v1/leaderboards/{id}/windows` (+ `expiry=` на прошлое окно).
   Турниры: ~~нет round-robin и таймаутов неявки в брекете~~ ✅ `format: round_robin`, `deadline_secs` на готовые матчи,
   `POST …/bracket/matches/{mid}/forfeit` после дедлайна.
-- **Матчмейкер (5.7).** Наблюдаемость — только `waiting/open_matches/queues`; нет p50/p95 ожидания по
-  очереди/региону/MMR-бакету и симулятора очереди по историческим тикетам.
+- **Матчмейкер.** ~~Нет p50/p95 ожидания по очереди/региону и симулятора очереди~~ ✅ `GET /v1/server/matchmaker/stats`
+  отдаёт `wait` (p50/p95/p99/max по очереди×региону, скользящее окно 2048 тикетов) и `waiting_ages`;
+  `POST /v1/server/matchmaker/simulate` гоняет синтетику (MMR, пинги по регионам, пати) через живой конфиг очереди на виртуальном времени.
 - **Чат и уведомления (5.5).** Нет typing-индикатора, вложений, перевода, внешнего automod-хука; у in-app
   уведомлений нет TTL; push без шаблонов/расписания по таймзоне/тихих пушей/deep-link, нет Huawei;
   mailbox не умеет рассылку по аудитории (только все / список).

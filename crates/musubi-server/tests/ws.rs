@@ -15970,3 +15970,103 @@ async fn tournament_round_robin_and_forfeit() {
         .iter()
         .all(|s| s["eliminated"] == false));
 }
+
+/// Queue simulator: synthetic arrivals through the live queue config on virtual time give
+/// matches, wait percentiles and quality without a single real player.
+#[tokio::test]
+async fn matchmaker_simulate_and_wait_stats() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let queue = format!("sim-{}", uuid::Uuid::now_v7().simple());
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/matchmaker/queues",
+        None,
+        true,
+        Some(json!({
+            "name": queue, "min_count": 2, "max_count": 2,
+            "mmr": {"initial_delta": 100.0, "step": 50.0, "every_secs": 5, "max_delta": 500.0},
+            "ping": {"initial_ms": 60.0, "step_ms": 20.0, "every_secs": 5, "max_ms": 200.0}
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/matchmaker/simulate",
+        None,
+        true,
+        Some(json!({
+            "queue": queue, "arrivals_per_sec": 2.0, "duration_secs": 120, "tick_ms": 1000,
+            "mmr_mean": 1500.0, "mmr_sd": 200.0,
+            "regions": [{"name": "eu", "share": 2.0, "ping_ms": 25.0}, {"name": "us", "share": 1.0, "ping_ms": 30.0}],
+            "party_sizes": {"1": 3.0, "2": 1.0}, "seed": 7
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let matches = r["matches"].as_u64().unwrap();
+    assert!(matches > 20, "{r}");
+    assert_eq!(r["matched_players"].as_u64().unwrap(), matches * 2, "{r}");
+    assert!(r["arrivals"]["tickets"].as_u64().unwrap() >= 230, "{r}");
+    assert!(r["wait_secs"]["p50"].as_f64().unwrap() >= 0.0);
+    assert!(r["wait_secs"]["p95"].as_f64().unwrap() >= r["wait_secs"]["p50"].as_f64().unwrap());
+    assert!(r["quality"]["mean_ping_ms"].as_f64().unwrap() > 0.0, "{r}");
+    assert!(
+        !r["matches_by_region"].as_object().unwrap().is_empty(),
+        "{r}"
+    );
+    // same seed → same answer
+    let (_, r2) = http_json(
+        &router,
+        "POST",
+        "/v1/server/matchmaker/simulate",
+        None,
+        true,
+        Some(json!({
+            "queue": queue, "arrivals_per_sec": 2.0, "duration_secs": 120, "tick_ms": 1000,
+            "mmr_mean": 1500.0, "mmr_sd": 200.0,
+            "regions": [{"name": "eu", "share": 2.0, "ping_ms": 25.0}, {"name": "us", "share": 1.0, "ping_ms": 30.0}],
+            "party_sizes": {"1": 3.0, "2": 1.0}, "seed": 7
+        })),
+    )
+    .await;
+    assert_eq!(r2["matches"], r["matches"]);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/matchmaker/simulate",
+        None,
+        true,
+        Some(json!({"queue": "nope", "arrivals_per_sec": 1.0})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/matchmaker/simulate",
+        None,
+        true,
+        Some(json!({"queue": queue, "arrivals_per_sec": 0.0})),
+    )
+    .await;
+    assert_eq!(st, 400);
+    // the live stats carry the new fields (empty here: nobody has matched for real)
+    let (st, s) = http_json(
+        &router,
+        "GET",
+        "/v1/server/matchmaker/stats",
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{s}");
+    assert!(s["wait"].is_array());
+    assert!(s["waiting_ages"].is_object());
+}

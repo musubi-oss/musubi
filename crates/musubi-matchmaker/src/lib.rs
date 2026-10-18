@@ -225,6 +225,38 @@ pub struct Matchmaker {
     ttl: Duration,
     /// Formed matches stay open for backfill this long (`None` = off).
     backfill_ttl: Option<Duration>,
+    /// Recent wait times (seconds) per (queue, region) — the operator's p50/p95 without Prometheus.
+    waits: Mutex<HashMap<(String, String), std::collections::VecDeque<f32>>>,
+}
+
+const WAIT_SAMPLES: usize = 2048;
+
+/// Wait-time percentiles of one (queue, region) over the last `WAIT_SAMPLES` matched tickets.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WaitStat {
+    pub queue: String,
+    pub region: String,
+    pub count: usize,
+    pub p50_secs: f32,
+    pub p95_secs: f32,
+    pub p99_secs: f32,
+    pub max_secs: f32,
+}
+
+/// How long the tickets currently waiting in a queue have been there.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct WaitingAges {
+    pub count: usize,
+    pub oldest_secs: f32,
+    pub mean_secs: f32,
+}
+
+fn percentile(sorted: &[f32], p: f64) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 pub const DEFAULT_TICKET_TTL: Duration = Duration::from_secs(180);
@@ -250,6 +282,7 @@ impl Matchmaker {
             min_wait,
             backfill_ttl: None,
             ttl: DEFAULT_TICKET_TTL,
+            waits: Mutex::new(HashMap::new()),
         }
     }
 
@@ -422,6 +455,63 @@ impl Matchmaker {
         }
         out
     }
+    /// Remember how long a matched ticket waited (seconds) in `queue` / `region`.
+    pub fn record_wait(&self, queue: &str, region: &str, secs: f32) {
+        let mut w = self.waits.lock();
+        let v = w
+            .entry((queue.to_string(), region.to_string()))
+            .or_default();
+        if v.len() >= WAIT_SAMPLES {
+            v.pop_front();
+        }
+        v.push_back(secs);
+    }
+
+    /// p50/p95/p99/max wait per (queue, region) over the recent samples.
+    pub fn wait_stats(&self) -> Vec<WaitStat> {
+        let w = self.waits.lock();
+        let mut keys: Vec<_> = w.keys().cloned().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|k| {
+                let mut v: Vec<f32> = w[&k].iter().copied().collect();
+                v.sort_by(|a, b| a.total_cmp(b));
+                WaitStat {
+                    queue: k.0,
+                    region: k.1,
+                    count: v.len(),
+                    p50_secs: percentile(&v, 0.5),
+                    p95_secs: percentile(&v, 0.95),
+                    p99_secs: percentile(&v, 0.99),
+                    max_secs: v.last().copied().unwrap_or(0.0),
+                }
+            })
+            .collect()
+    }
+
+    /// Age of the tickets waiting right now, per queue (`""` = mutual-query tickets).
+    pub fn waiting_ages(&self) -> BTreeMap<String, WaitingAges> {
+        self.waiting_ages_at(Instant::now())
+    }
+
+    pub fn waiting_ages_at(&self, now: Instant) -> BTreeMap<String, WaitingAges> {
+        let pool = self.pool.lock();
+        let mut out: BTreeMap<String, WaitingAges> = BTreeMap::new();
+        for t in &pool.tickets {
+            let age = now.saturating_duration_since(t.created).as_secs_f32();
+            let e = out.entry(t.queue.clone().unwrap_or_default()).or_default();
+            e.count += 1;
+            e.oldest_secs = e.oldest_secs.max(age);
+            e.mean_secs += age;
+        }
+        for e in out.values_mut() {
+            if e.count > 0 {
+                e.mean_secs /= e.count as f32;
+            }
+        }
+        out
+    }
+
     /// Counts of (queue, reason) a pair of tickets was kept apart since the last call.
     pub fn take_rejections(&self) -> Vec<(String, &'static str, u64)> {
         std::mem::take(&mut *self.rejections.lock())
@@ -572,6 +662,11 @@ impl Matchmaker {
     }
 
     pub fn add(&self, t: AddTicket) -> Result<String> {
+        self.add_at(t, Instant::now())
+    }
+
+    /// `add` with an explicit clock for the ticket's `created`.
+    pub fn add_at(&self, t: AddTicket, now: Instant) -> Result<String> {
         if t.members.is_empty() {
             return Err(Error::InvalidArgument(
                 "ticket needs at least one member".into(),
@@ -579,7 +674,6 @@ impl Matchmaker {
         }
         {
             let pen = self.penalties.lock();
-            let now = Instant::now();
             for m in &t.members {
                 if let Some(left) = pen.remaining(m.presence.account_id, now) {
                     return Err(Error::PermissionDenied(format!(
@@ -656,7 +750,7 @@ impl Matchmaker {
             min_count,
             max_count,
             count_multiple,
-            created: Instant::now(),
+            created: now,
         });
         Ok(id)
     }
@@ -733,7 +827,11 @@ impl Matchmaker {
 
     /// Run one matching pass; returns all groups formed. Call periodically and after `add`.
     pub fn process(&self) -> Vec<Matched> {
-        let now = Instant::now();
+        self.process_at(Instant::now())
+    }
+
+    /// `process` with an explicit clock (the queue simulator runs on virtual time).
+    pub fn process_at(&self, now: Instant) -> Vec<Matched> {
         let mut pool = self.pool.lock();
         let mut out = self.process_queues(&mut pool, now);
         let mut i = 0;
