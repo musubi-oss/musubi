@@ -14,6 +14,7 @@ pub(crate) mod error;
 pub(crate) mod extract;
 mod fleets;
 mod friends;
+pub mod group_challenges;
 mod groups;
 mod integrations;
 mod leaderboards;
@@ -182,6 +183,7 @@ pub fn router(state: AppState) -> Router {
         .merge(passkeys::routes())
         .merge(friends::routes())
         .merge(groups::routes())
+        .merge(group_challenges::routes())
         .merge(notifications::routes())
         .merge(chat::routes())
         .merge(leaderboards::routes())

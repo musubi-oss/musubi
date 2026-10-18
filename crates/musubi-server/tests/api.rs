@@ -16605,3 +16605,272 @@ async fn storage_policies_gate_user_reads_writes_deletes() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// Group wars / challenges (plan 5.4): server-defined windows, member contributions roll up
+/// per group, settlement credits the winner's treasury and reports `group_challenge.settled`.
+#[tokio::test]
+async fn group_challenges_score_standings_and_settle() {
+    let Some(app) = app().await else { return };
+    let mut toks = Vec::new();
+    for _ in 0..3 {
+        let (_, u) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("gc")})),
+        )
+        .await;
+        toks.push(u["access_token"].as_str().unwrap().to_string());
+    }
+    let (ta, tb, tc) = (toks[0].as_str(), toks[1].as_str(), toks[2].as_str());
+    let mut gids = Vec::new();
+    for t in [ta, tb] {
+        let (st, g) = call(
+            &app,
+            "POST",
+            "/v1/groups",
+            Some(t),
+            Some(json!({"name": unique("war"), "open": true, "max_count": 5})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{g}");
+        gids.push(g["id"].as_str().unwrap().to_string());
+    }
+    let (ga, gb) = (gids[0].clone(), gids[1].clone());
+    let (_, me_a) = call(&app, "GET", "/v1/account", Some(ta), None).await;
+    let (_, me_b) = call(&app, "GET", "/v1/account", Some(tb), None).await;
+    let (_, me_c) = call(&app, "GET", "/v1/account", Some(tc), None).await;
+    let (ida, idb, idc) = (
+        me_a["id"].as_str().unwrap(),
+        me_b["id"].as_str().unwrap(),
+        me_c["id"].as_str().unwrap(),
+    );
+
+    let gold = unique("gold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        "defaultkey",
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 1000000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // validation
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/group_challenges",
+        "defaultkey",
+        Some(json!({"name": "x", "kind": "war", "groups": [ga], "duration_secs": 60})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a war needs two groups");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/group_challenges",
+        "defaultkey",
+        Some(json!({"name": "x", "duration_secs": 60, "groups": [uuid::Uuid::now_v7()]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "unknown group");
+
+    let (st, war) = call_server(&app, "POST", "/v1/server/group_challenges", "defaultkey", Some(json!({
+        "name": "Border war", "kind": "war", "metric": "captures", "groups": [ga, gb], "duration_secs": 3600,
+        "rewards": {"treasury": {"currency": gold, "amount": 100}}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{war}");
+    assert_eq!(war["status"], "active");
+    let wid = war["id"].as_str().unwrap().to_string();
+
+    // contributions: a (group A) 10 + 5, b (group B) 4; c is in no participating group
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/score"),
+        "defaultkey",
+        Some(json!({"account_id": ida, "delta": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["group_id"], json!(ga));
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/score"),
+        "defaultkey",
+        Some(json!({"account_id": ida, "delta": 5})),
+    )
+    .await;
+    assert_eq!(r["contribution"], 15);
+    assert_eq!(r["group_total"], 15);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/score"),
+        "defaultkey",
+        Some(json!({"account_id": idb, "delta": 4})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/score"),
+        "defaultkey",
+        Some(json!({"account_id": idc, "delta": 4})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "not a member of a participating group"
+    );
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/score"),
+        "defaultkey",
+        Some(json!({"account_id": idb, "delta": 4, "group_id": ga})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "b is not in group A");
+
+    // standings for players, my contribution, my list
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/group_challenges/{wid}"),
+        Some(tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["standings"][0]["group_id"], json!(ga));
+    assert_eq!(v["standings"][0]["total"], 15);
+    assert_eq!(v["standings"][0]["top"][0]["score"], 15);
+    assert_eq!(v["standings"][1]["total"], 4);
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/group_challenges/{wid}/me"),
+        Some(ta),
+        None,
+    )
+    .await;
+    assert_eq!(m["contributions"][0]["score"], 15);
+    let (_, l) = call(&app, "GET", "/v1/group_challenges", Some(ta), None).await;
+    assert!(l["challenges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == json!(wid)));
+    let (_, l) = call(&app, "GET", "/v1/group_challenges", Some(tc), None).await;
+    assert!(
+        !l["challenges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == json!(wid)),
+        "c's groups are not in the war"
+    );
+
+    // settle early: A wins, its treasury gets the prize; scoring is closed; second settle = 409
+    let (st, done) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/settle"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{done}");
+    assert_eq!(done["winner"], json!(ga));
+    assert_eq!(done["status"], "settled");
+    let (_, tr) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{ga}/treasury"),
+        Some(ta),
+        None,
+    )
+    .await;
+    let gold = tr["balances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(tr.as_array().into_iter().flatten())
+        .find(|b| b["currency"] == json!(gold))
+        .cloned();
+    assert_eq!(gold.map(|b| b["balance"].clone()), Some(json!(100)), "{tr}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/score"),
+        "defaultkey",
+        Some(json!({"account_id": ida, "delta": 1})),
+    )
+    .await;
+    assert!(st.is_client_error(), "settled challenge takes no scores");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/group_challenges/{wid}/settle"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // an open challenge that already ended is settled by the sweep (no scores → no winner)
+    let (st, c) = call_server(
+        &app,
+        "POST",
+        "/v1/server/group_challenges",
+        "defaultkey",
+        Some(json!({"name": "flash", "duration_secs": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (st, sw) = call_server(
+        &app,
+        "POST",
+        "/v1/server/group_challenges/sweep",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sw}");
+    assert!(sw["settled"].as_u64().unwrap() >= 1);
+    let (_, c2) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/group_challenges/{}", c["id"].as_str().unwrap()),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(c2["status"], "settled");
+    assert!(c2["winner"].is_null());
+    let (_, ls) = call_server(
+        &app,
+        "GET",
+        "/v1/server/group_challenges?status=settled",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert!(ls["challenges"].as_array().unwrap().len() >= 2);
+    let (_, d) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/group_challenges/{wid}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(d["removed"], true);
+}

@@ -869,6 +869,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "timer sweep failed"),
                 }
+                match crate::http::group_challenges::settle_due(&st).await {
+                    Ok(n) if n > 0 => tracing::info!(settled = n, "group challenges settled"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "group challenge sweep failed"),
+                }
                 for (name, at) in st.schedules.due() {
                     match st.schedules.run_one(&st.runtime, &name, Some(at)).await {
                         Ok(_) => tracing::info!(schedule = %name, "schedule ran"),
