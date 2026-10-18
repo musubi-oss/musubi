@@ -12591,3 +12591,137 @@ async fn operator_roles_scope_admin_writes() {
     assert_eq!(st, StatusCode::OK);
     assert!(r.to_string().contains("liveops"), "{r}");
 }
+
+/// Leaderboard queries (5.6): friends-only and group-only pages keep full-board ranks, a rank
+/// range replaces cursor paging, and `windows` lists the board's slices.
+#[tokio::test]
+async fn leaderboard_friends_group_rank_range_and_windows() {
+    let Some(app) = app().await else { return };
+    let mut users = vec![];
+    for _ in 0..4 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("lbq")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let lb = unique("alltime");
+    let (st, b) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        "defaultkey",
+        Some(json!({"id": lb, "sort_order": "desc", "operator": "best"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    // ranks: u0=400 (1), u1=300 (2), u2=200 (3), u3=100 (4)
+    for (i, (t, _)) in users.iter().enumerate() {
+        let (st, r) = call(
+            &app,
+            "POST",
+            &format!("/v1/leaderboards/{lb}/records"),
+            Some(t),
+            Some(json!({"score": 400 - 100 * i as i64})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    // rank range 2..3
+    let (st, r) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/records?rank_from=2&rank_to=3"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let recs = r["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0]["rank"], 2);
+    assert_eq!(recs[0]["owner_id"], json!(users[1].1));
+    assert_eq!(recs[1]["rank"], 3);
+    // u3 befriends u1 (mutual add) → friends page = u3 + u1 with board ranks 2 and 4
+    for (t, other) in [(&users[3].0, &users[1].1), (&users[1].0, &users[3].1)] {
+        let (st, r) = call(
+            &app,
+            "POST",
+            "/v1/friends",
+            Some(t),
+            Some(json!({"ids": [other]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let (st, r) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/records?friends=true"),
+        Some(&users[3].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let recs = r["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2, "{r}");
+    assert_eq!(recs[0]["owner_id"], json!(users[1].1));
+    assert_eq!(recs[0]["rank"], 2);
+    assert_eq!(recs[1]["owner_id"], json!(users[3].1));
+    assert_eq!(recs[1]["rank"], 4);
+    // group of u0 + u2 → group page ranks 1 and 3
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(&users[0].0),
+        Some(json!({"name": unique("lbclan"), "open": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/join"),
+        Some(&users[2].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/records?group_id={gid}"),
+        Some(&users[3].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let recs = r["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2, "{r}");
+    assert_eq!(recs[0]["rank"], 1);
+    assert_eq!(recs[1]["rank"], 3);
+    assert_eq!(recs[1]["owner_id"], json!(users[2].1));
+    // windows: one (current, never-expiring) slice with 4 records
+    let (st, w) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{lb}/windows"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+    let ws = w["windows"].as_array().unwrap();
+    assert_eq!(ws.len(), 1, "{w}");
+    assert_eq!(ws[0]["records"], 4);
+    assert_eq!(ws[0]["current"], true);
+}

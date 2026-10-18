@@ -329,6 +329,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ),
     ("DELETE", "/v1/leaderboards/{id}/records", "leaderboards"),
     ("GET", "/v1/leaderboards/{id}/records", "leaderboards"),
+    ("GET", "/v1/leaderboards/{id}/windows", "leaderboards"),
     ("POST", "/v1/leaderboards/{id}/records", "leaderboards"),
     ("GET", "/v1/liveops/flags", "integrations"),
     ("GET", "/v1/liveops/live-events", "integrations"),

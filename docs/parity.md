@@ -181,8 +181,9 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   (axum → sqlx → PG, пул соединений, пайплайнинг) ещё не было; это самый большой разрыв между обещанием и фактом.
 - ~~**Статистика игрока (5.6).**~~ ✅ `stat_defs` (sum/max/min/last, public/friends/private), `/v1/server/stats/*`,
   `/v1/stats[/{account}]` со срезами по scope + глобальным, `top`, фолд из `stats_scope` отчёта матча.
-- **Лидерборды (5.6).** Нет запросов by friends / by group / by rank range и истории прошлых окон как API
-  (`leaderboard_ends` есть в БД). Турниры: нет round-robin и таймаутов неявки в брекете.
+- **Лидерборды (5.6).** ~~Нет запросов by friends / by group / by rank range и истории прошлых окон как API~~ ✅
+  `records?friends=1|group_id=|rank_from=&rank_to=`, `GET /v1/leaderboards/{id}/windows` (+ `expiry=` на прошлое окно).
+  Турниры: нет round-robin и таймаутов неявки в брекете.
 - **Матчмейкер (5.7).** Наблюдаемость — только `waiting/open_matches/queues`; нет p50/p95 ожидания по
   очереди/региону/MMR-бакету и симулятора очереди по историческим тикетам.
 - **Чат и уведомления (5.5).** Нет typing-индикатора, вложений, перевода, внешнего automod-хука; у in-app

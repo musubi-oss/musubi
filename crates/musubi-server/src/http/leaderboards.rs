@@ -18,6 +18,7 @@ pub fn routes() -> Router<AppState> {
             get(records).post(write).delete(delete_own),
         )
         .route("/v1/leaderboards/{id}/around/{owner}", get(around))
+        .route("/v1/leaderboards/{id}/windows", get(windows))
         .route("/v1/leaderboards/{id}/tier", get(tier))
         // server-to-server
         .route("/v1/server/leaderboards", post(create))
@@ -41,6 +42,17 @@ struct ListQuery {
 struct RecordsQuery {
     #[serde(default)]
     owner_ids: Option<String>,
+    /// Only the caller's friends (their records, ranked on the full board).
+    #[serde(default)]
+    friends: bool,
+    /// Only members of this group.
+    #[serde(default)]
+    group_id: Option<uuid::Uuid>,
+    /// Rank range (1-based, inclusive) instead of cursor paging.
+    #[serde(default)]
+    rank_from: Option<i64>,
+    #[serde(default)]
+    rank_to: Option<i64>,
     #[serde(default = "default_limit")]
     limit: usize,
     #[serde(default)]
@@ -89,19 +101,98 @@ async fn records(
     Path(id): Path<String>,
     Query(q): Query<RecordsQuery>,
 ) -> Result<Json<RecordList>, ApiError> {
-    let owners = parse_ids(q.owner_ids.as_deref())?;
-    Ok(Json(
-        s.leaderboards
-            .records(
-                &id,
-                &owners,
-                q.limit,
-                q.cursor.as_deref(),
-                q.expiry,
-                Some(me.account_id),
-            )
-            .await?,
-    ))
+    let mut owners = parse_ids(q.owner_ids.as_deref())?;
+    let filtered = q.friends || q.group_id.is_some();
+    if q.friends {
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "select friend_id from musubi.friends where user_id = $1 and state = 0 limit 1000",
+        )
+        .bind(me.account_id.0)
+        .fetch_all(&s.db)
+        .await
+        .map_err(musubi_core::Error::internal)?;
+        owners.push(me.account_id);
+        owners.extend(ids.into_iter().map(AccountId));
+    }
+    if let Some(g) = q.group_id {
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "select user_id from musubi.group_members where group_id = $1 and state < 3 limit 10000",
+        )
+        .bind(g)
+        .fetch_all(&s.db)
+        .await
+        .map_err(musubi_core::Error::internal)?;
+        owners.extend(ids.into_iter().map(AccountId));
+    }
+    let (mut limit, mut cursor) = (q.limit, q.cursor.clone());
+    if let Some(from) = q.rank_from {
+        if from < 1 {
+            return Err(musubi_core::Error::InvalidArgument("rank_from starts at 1".into()).into());
+        }
+        let to = q.rank_to.unwrap_or(from + q.limit as i64 - 1).max(from);
+        limit = ((to - from + 1) as usize).min(100);
+        cursor = Some((from - 1).to_string());
+    }
+    let mut list = s
+        .leaderboards
+        .records(
+            &id,
+            &owners,
+            limit,
+            cursor.as_deref(),
+            q.expiry,
+            Some(me.account_id),
+        )
+        .await?;
+    if filtered {
+        // the page is the filtered set itself, each record keeping its rank on the full board
+        let mut page = std::mem::take(&mut list.owner_records);
+        page.sort_by_key(|r| r.rank);
+        page.truncate(q.limit.clamp(1, 100));
+        list.records = page;
+        list.next_cursor = None;
+        list.prev_cursor = None;
+    }
+    Ok(Json(list))
+}
+
+/// Past windows of a board (newest first) so a client can ask for `expiry=` of a finished
+/// season; the current window comes first with `current: true`.
+async fn windows(
+    State(s): State<AppState>,
+    Bearer(_): Bearer,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let board = s.leaderboards.get(&id).await?;
+    let rows: Vec<(time::OffsetDateTime, i64, Option<time::OffsetDateTime>)> = sqlx::query_as(
+        "select r.expiry_time, count(*)::bigint, max(e.fired_at)
+         from musubi.leaderboard_records r
+         left join musubi.leaderboard_ends e
+           on e.leaderboard_id = r.leaderboard_id and e.expiry_time = r.expiry_time
+         where r.leaderboard_id = $1 group by r.expiry_time order by r.expiry_time desc limit 100",
+    )
+    .bind(&id)
+    .fetch_all(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let now = time::OffsetDateTime::now_utc();
+    let windows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(exp, n, ended)| {
+            let e = exp.unix_timestamp();
+            serde_json::json!({
+                "expiry": e,
+                "records": n,
+                "current": e == 0 || exp > now,
+                "ended_at": ended.map(|t| t.unix_timestamp()),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "leaderboard_id": board.id,
+        "reset_schedule": board.reset_schedule,
+        "windows": windows,
+    })))
 }
 
 async fn around(
