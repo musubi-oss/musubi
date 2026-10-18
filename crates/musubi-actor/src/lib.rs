@@ -20,6 +20,47 @@ pub struct Input {
     pub op_code: i64,
     pub data: Vec<u8>,
     pub reliable: bool,
+    /// Simulation tick the input belongs to (rollback matches); `None` = next tick.
+    #[serde(default)]
+    pub tick: Option<u64>,
+    /// Client counter echoed in `match_input_ack`.
+    #[serde(default)]
+    pub seq: Option<u64>,
+}
+
+/// `params.rollback = { window, hash_every }`: keep the last `window` pre-tick states so a late
+/// input can be honoured by re-simulating from its tick; publish a state hash every `hash_every`
+/// ticks (0 = never).
+#[derive(Debug, Clone, Copy)]
+pub struct Rollback {
+    pub window: u64,
+    pub hash_every: u64,
+}
+
+impl Rollback {
+    pub fn from_params(params: &serde_json::Value) -> Option<Self> {
+        let r = params.get("rollback")?;
+        if r.is_null() || r == &serde_json::Value::Bool(false) {
+            return None;
+        }
+        let window = r
+            .get("window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8)
+            .clamp(1, 240);
+        let hash_every = r.get("hash_every").and_then(|v| v.as_u64()).unwrap_or(1);
+        Some(Self { window, hash_every })
+    }
+}
+
+/// FNV-1a 64 over the state bytes — cheap, deterministic, same on every client runtime.
+pub fn state_hash(state: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in state {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// Data the handler wants delivered. Empty `to` = everyone in the match.
@@ -462,6 +503,11 @@ async fn run(
     mut sync: Option<state_sync::SyncState>,
 ) {
     let match_id = id.to_string();
+    let rollback = Rollback::from_params(&persist.params);
+    // rollback: (tick, state before the tick, inputs applied in it), oldest first
+    let mut history: std::collections::VecDeque<(u64, Vec<u8>, Vec<Input>)> =
+        std::collections::VecDeque::new();
+    let mut future: std::collections::BTreeMap<u64, Vec<Input>> = std::collections::BTreeMap::new();
     let mut state = init.state;
     let mut label = init.label;
     let mut members: Vec<UserPresence> = Vec::new();
@@ -561,8 +607,38 @@ async fn run(
                         }
                     }
                     Cmd::Data(input) => {
-                        if members.iter().any(|p| p.session_id == input.presence.session_id) {
+                        if !members.iter().any(|p| p.session_id == input.presence.session_id) {
+                            continue;
+                        }
+                        let Some(t) = input.tick else { inputs.push(input); continue; };
+                        let ack = |applied: bool| ServerMessage::MatchInputAck { match_id: match_id.clone(), tick: t, seq: input.seq.unwrap_or(0), applied };
+                        let Some(rb) = rollback else {
+                            deliver(vec![input.presence.session_id], ack(false));
                             inputs.push(input);
+                            continue;
+                        };
+                        if t > tick {
+                            deliver(vec![input.presence.session_id], ack(true));
+                            future.entry(t).or_default().push(input);
+                        } else if let Some(k) = history.iter().position(|(ht, _, _)| *ht == t) {
+                            // late input inside the window: re-simulate from its tick with it added
+                            deliver(vec![input.presence.session_id], ack(true));
+                            history[k].2.push(input);
+                            let mut st = history[k].1.clone();
+                            let mut ok = true;
+                            for (ht, before, ins) in history.iter_mut().skip(k) {
+                                *before = st.clone();
+                                match handler.tick(std::mem::take(&mut st), *ht, ins.clone(), &members) {
+                                    Ok(r) => st = r.state,
+                                    Err(e) => { tracing::error!(%match_id, error = %e, tick = *ht, "rollback re-simulation failed; keeping current state"); ok = false; break; }
+                                }
+                            }
+                            if ok {
+                                state = st;
+                                let _ = rb;
+                            }
+                        } else {
+                            deliver(vec![input.presence.session_id], ack(false));
                         }
                     }
                     Cmd::Terminate { grace_seconds } => { grace = Some(grace_seconds); }
@@ -575,7 +651,14 @@ async fn run(
             }
             _ = interval.tick() => {
                 tick += 1;
-                let batch = std::mem::take(&mut inputs);
+                let mut batch = std::mem::take(&mut inputs);
+                if rollback.is_some() {
+                    let due: Vec<u64> = future.range(..=tick).map(|(t, _)| *t).collect();
+                    for t in due {
+                        if let Some(v) = future.remove(&t) { batch.extend(v); }
+                    }
+                }
+                let before = rollback.map(|_| (state.clone(), batch.clone()));
                 if journaling {
                     journal.push(JournalEntry { tick, op: Op::Tick { inputs: batch.clone() } });
                     if tick % persist.journal_every == 0 {
@@ -594,6 +677,13 @@ async fn run(
                     Err(e) => { tracing::error!(%match_id, error = %e, "tick handler failed; terminating"); break; }
                 };
                 state = res.state;
+                if let (Some(rb), Some((before, ins))) = (rollback, before) {
+                    history.push_back((tick, before, ins));
+                    while history.len() as u64 > rb.window { history.pop_front(); }
+                    if rb.hash_every > 0 && tick % rb.hash_every == 0 {
+                        fan(&deliver, &delays, &mut delayed, tick, watchers(&members, &spectators), ServerMessage::MatchTickHash { match_id: match_id.clone(), tick, hash: state_hash(&state) });
+                    }
+                }
                 if let Some(l) = res.label { label = l; }
                 if let Some(ops) = sync_ops(&mut sync, &state) {
                     fan(&deliver, &delays, &mut delayed, tick, watchers(&members, &spectators), ServerMessage::MatchStateDelta { match_id: match_id.clone(), tick, ops });
@@ -795,5 +885,225 @@ impl MatchHandler for EchoMatch {
     }
     fn terminate(&self, state: Vec<u8>, _g: u32) -> Result<Vec<u8>> {
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    /// state = little-endian u64 total; every tick adds `tick * sum(input bytes)` — the result
+    /// depends on which tick an input lands in, so a late input is only "right" after rollback.
+    struct Ledger;
+
+    fn total(state: &[u8]) -> u64 {
+        if state.len() == 8 {
+            u64::from_le_bytes(state.try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    impl MatchHandler for Ledger {
+        fn init(&self, _params: &serde_json::Value) -> Result<Init> {
+            Ok(Init {
+                state: 0u64.to_le_bytes().to_vec(),
+                tick_rate: 50,
+                label: "ledger".into(),
+            })
+        }
+        fn join_attempt(
+            &self,
+            state: Vec<u8>,
+            _presence: &UserPresence,
+            _metadata: &HashMap<String, String>,
+            _members: &[UserPresence],
+        ) -> Result<(Vec<u8>, Result<()>)> {
+            Ok((state, Ok(())))
+        }
+        fn join(
+            &self,
+            state: Vec<u8>,
+            _j: &[UserPresence],
+            _m: &[UserPresence],
+        ) -> Result<Vec<u8>> {
+            Ok(state)
+        }
+        fn leave(
+            &self,
+            state: Vec<u8>,
+            _l: &[UserPresence],
+            _m: &[UserPresence],
+        ) -> Result<Vec<u8>> {
+            Ok(state)
+        }
+        fn tick(
+            &self,
+            state: Vec<u8>,
+            tick: u64,
+            inputs: Vec<Input>,
+            _members: &[UserPresence],
+        ) -> Result<TickResult> {
+            let add: u64 = inputs
+                .iter()
+                .map(|i| i.data.iter().map(|b| *b as u64).sum::<u64>())
+                .sum();
+            Ok(TickResult {
+                state: (total(&state) + tick * add).to_le_bytes().to_vec(),
+                outbound: vec![],
+                label: None,
+                terminate: false,
+            })
+        }
+        fn terminate(&self, state: Vec<u8>, _g: u32) -> Result<Vec<u8>> {
+            Ok(state)
+        }
+    }
+
+    fn presence() -> UserPresence {
+        serde_json::from_value(serde_json::json!({
+            "account_id": musubi_core::AccountId::new().0,
+            "session_id": musubi_core::SessionId::new().0,
+            "username": "a",
+        }))
+        .unwrap()
+    }
+
+    async fn next_hash(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMessage>) -> (u64, u64) {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("message")
+                .expect("open")
+            {
+                ServerMessage::MatchTickHash { tick, hash, .. } => return (tick, hash),
+                _ => continue,
+            }
+        }
+    }
+
+    async fn next_ack(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
+    ) -> (u64, u64, bool) {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("message")
+                .expect("open")
+            {
+                ServerMessage::MatchInputAck {
+                    tick, seq, applied, ..
+                } => return (tick, seq, applied),
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_inputs_rollback_future_inputs_wait_old_ones_drop() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let deliver: Deliver = Arc::new(move |_to, msg| {
+            let _ = tx.send(msg);
+        });
+        let h = spawn_with(
+            Arc::new(Ledger),
+            Spawn {
+                id: None,
+                module: "ledger".into(),
+                params: serde_json::json!({ "rollback": { "window": 32, "hash_every": 1 } }),
+                resume: None,
+                deliver,
+                on_end: Box::new(|_| {}),
+                on_snapshot: None,
+                snapshot_every: 0,
+                on_journal: None,
+                journal_every: 0,
+                sync: None,
+            },
+        )
+        .unwrap();
+        let me = presence();
+        h.join(me.clone(), HashMap::new(), None).await.unwrap();
+        let input = |tick: u64, seq: u64, byte: u8| Input {
+            presence: me.clone(),
+            op_code: 1,
+            data: vec![byte],
+            reliable: true,
+            tick: Some(tick),
+            seq: Some(seq),
+        };
+
+        // let a few ticks pass; nothing happened yet so the hash is of total 0
+        let (t0, h0) = next_hash(&mut rx).await;
+        assert_eq!(h0, state_hash(&0u64.to_le_bytes()));
+        let (t1, _) = next_hash(&mut rx).await;
+        assert!(t1 > t0);
+
+        // a late input for tick t0 (already simulated) is honoured by rollback: total = t0 * 10
+        h.data(input(t0, 1, 10)).unwrap();
+        let (at, seq, applied) = next_ack(&mut rx).await;
+        assert_eq!((at, seq, applied), (t0, 1, true));
+        let (_, hash) = next_hash(&mut rx).await;
+        assert_eq!(
+            hash,
+            state_hash(&(t0 * 10).to_le_bytes()),
+            "re-simulated from tick {t0}"
+        );
+
+        // an input for a future tick waits for it: total += tf * 1
+        let (now, _) = next_hash(&mut rx).await;
+        let tf = now + 5;
+        h.data(input(tf, 2, 1)).unwrap();
+        assert_eq!(next_ack(&mut rx).await, (tf, 2, true));
+        let expected = state_hash(&(t0 * 10 + tf).to_le_bytes());
+        let mut seen = None;
+        for _ in 0..12 {
+            let (t, hs) = next_hash(&mut rx).await;
+            if t >= tf {
+                seen = Some(hs);
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            Some(expected),
+            "future input applied exactly at tick {tf}"
+        );
+
+        // older than the window: dropped and acknowledged as not applied; state unchanged
+        let (now, _) = next_hash(&mut rx).await;
+        h.data(input(now.saturating_sub(100), 3, 99)).unwrap();
+        let (_, seq, applied) = next_ack(&mut rx).await;
+        assert_eq!((seq, applied), (3, false));
+        let (_, hs) = next_hash(&mut rx).await;
+        assert_eq!(hs, expected);
+
+        // a tick with no rollback config acknowledges `applied: false` but still applies next tick
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let deliver2: Deliver = Arc::new(move |_to, msg| {
+            let _ = tx2.send(msg);
+        });
+        let plain = spawn_with(
+            Arc::new(Ledger),
+            Spawn {
+                id: None,
+                module: "ledger".into(),
+                params: serde_json::json!({}),
+                resume: None,
+                deliver: deliver2,
+                on_end: Box::new(|_| {}),
+                on_snapshot: None,
+                snapshot_every: 0,
+                on_journal: None,
+                journal_every: 0,
+                sync: None,
+            },
+        )
+        .unwrap();
+        plain.join(me.clone(), HashMap::new(), None).await.unwrap();
+        plain.data(input(1, 7, 1)).unwrap();
+        assert_eq!(next_ack(&mut rx2).await, (1, 7, false));
+        h.terminate(0);
+        plain.terminate(0);
     }
 }

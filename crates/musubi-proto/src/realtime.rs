@@ -265,6 +265,21 @@ pub enum ClientMessage {
         #[serde(with = "crate::json_in_binary")]
         input: serde_json::Value,
     },
+    /// Deterministic-rollback matches (`params.rollback`): an input stamped with the simulation
+    /// `tick` it belongs to. Inputs for a future tick wait for it; inputs for a past tick within
+    /// the rollback window make the server re-simulate from that tick; older ones are dropped.
+    /// Each is acknowledged with `match_input_ack`.
+    MatchInput {
+        match_id: String,
+        tick: u64,
+        /// Client-side counter echoed in the ack so the client can trim its input buffer.
+        #[serde(default)]
+        seq: u64,
+        #[serde(default)]
+        op_code: i64,
+        #[serde(default)]
+        data: Vec<u8>,
+    },
     MatchDataSend {
         match_id: String,
         op_code: i64,
@@ -499,6 +514,22 @@ pub enum ServerMessage {
         /// apply when `tick` is newer than the last applied; never carries spawns or despawns.
         #[serde(default)]
         sequenced: bool,
+    },
+    /// `match_input` received: `applied` is `false` when the tick was older than the rollback
+    /// window (or the match does not run with rollback).
+    MatchInputAck {
+        match_id: String,
+        tick: u64,
+        seq: u64,
+        applied: bool,
+    },
+    /// Rollback matches: FNV-1a 64 hash of the authoritative state after `tick` (every
+    /// `params.rollback.hash_every` ticks) — a client whose predicted state hashes differently
+    /// mispredicted and must resync.
+    MatchTickHash {
+        match_id: String,
+        tick: u64,
+        hash: u64,
     },
     /// Typed match state (IDL `[matches.<m>] state` + `sync`): full public snapshot on join.
     MatchState {

@@ -982,6 +982,8 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                         op_code,
                         data,
                         reliable,
+                        tick: None,
+                        seq: None,
                     })
                     .err()
                     .map(|e| ServerMessage::error(&e));
@@ -996,6 +998,34 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                     reliable,
                 },
             )
+        }
+        ClientMessage::MatchInput {
+            match_id,
+            tick,
+            seq,
+            op_code,
+            data,
+        } => {
+            let Some(h) = ctx.matches.get(&match_id) else {
+                return Some(ServerMessage::error(&Error::NotFound(
+                    "tick-stamped inputs need an authoritative match".into(),
+                )));
+            };
+            if h.info().await.spectators.contains(&ctx.presence.session_id) {
+                return Some(ServerMessage::error(&Error::PermissionDenied(
+                    "spectators cannot send match input".into(),
+                )));
+            }
+            h.data(musubi_actor::Input {
+                presence: ctx.presence.clone(),
+                op_code,
+                data,
+                reliable: true,
+                tick: Some(tick),
+                seq: Some(seq),
+            })
+            .err()
+            .map(|e| ServerMessage::error(&e))
         }
         ClientMessage::Ping => Some(ServerMessage::Pong),
         // answered in the run loop (needs the connection); never reaches here

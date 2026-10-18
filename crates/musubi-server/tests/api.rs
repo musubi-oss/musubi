@@ -5272,6 +5272,8 @@ async fn match_failover_replays_the_journal() {
             op_code: 1,
             data: vec![1],
             reliable: true,
+            tick: None,
+            seq: None,
         })
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;

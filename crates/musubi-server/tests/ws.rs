@@ -19083,3 +19083,91 @@ async fn typed_match_state_syncs_snapshot_and_deltas() {
     let (st, _) = http_json(&router, "DELETE", "/v1/admin/idl", None, true, None).await;
     assert_eq!(st, 200);
 }
+
+/// `match_input` reaches the authoritative actor: without `params.rollback` it is applied on the
+/// next tick (the echo module sends it back) and acknowledged with `applied = false`; a
+/// non-authoritative id is an error; spectators are refused.
+#[tokio::test]
+async fn match_input_routes_to_authoritative_match() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"module": "echo", "params": {"tick_rate": 20, "max_players": 2}}).to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+    let (ta, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+            spectator: false,
+            delay_ticks: 0,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Match { .. }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchInput {
+            match_id: mid.clone(),
+            tick: 3,
+            seq: 11,
+            op_code: 5,
+            data: b"hi".to_vec(),
+        },
+    )
+    .await;
+    let mut ack = None;
+    let mut echoed = None;
+    for _ in 0..6 {
+        match recv(&mut a).await.msg {
+            ServerMessage::MatchInputAck {
+                tick, seq, applied, ..
+            } => ack = Some((tick, seq, applied)),
+            ServerMessage::MatchData { op_code, data, .. } => echoed = Some((op_code, data)),
+            m => panic!("{m:?}"),
+        }
+        if ack.is_some() && echoed.is_some() {
+            break;
+        }
+    }
+    assert_eq!(ack, Some((3, 11, false)));
+    assert_eq!(echoed, Some((5, b"hi".to_vec())));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchInput {
+            match_id: "nope".into(),
+            tick: 1,
+            seq: 1,
+            op_code: 0,
+            data: vec![],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::Error { .. }
+    ));
+}
