@@ -44,11 +44,16 @@ measure):
 
 | scenario | ops | ops/s | p50 | p95 | p99 | max | errors |
 |---|---|---|---|---|---|---|---|
-| HTTP `GET /v1/account` | 68 887 | 2 296 | 17.2 ms | 21.0 ms | 24.6 ms | 56.3 ms | 0 |
-| storage write + read-back | 105 408 | 3 514 | 11.2 ms | 15.7 ms | 18.8 ms | 42.7 ms | 0 |
-| WebSocket ping | 1 173 385 | 39 113 | 0.84 ms | 2.4 ms | 3.4 ms | 30.6 ms | 0 |
-| chat message → delivered | 33 558 | 1 119 | 35.3 ms | 43.0 ms | 46.3 ms | 71.0 ms | 0 |
-| relayed match input → echo | 253 651 | 8 455 | 30.0 ms | 34.2 ms | 35.5 ms | 46.5 ms | 0 |
+| HTTP `GET /v1/account` | 143 667 | 4 789 | 7.9 ms | 13.1 ms | 16.1 ms | 26.6 ms | 0 |
+| storage write + read-back | 119 063 | 3 969 | 9.6 ms | 16.3 ms | 19.9 ms | 37.3 ms | 0 |
+| WebSocket ping | 2 205 489 | 73 516 | 0.42 ms | 1.24 ms | 2.47 ms | 20.5 ms | 0 |
+| chat message → delivered | 32 594 | 1 086 | 36.8 ms | 45.9 ms | 52.6 ms | 74.2 ms | 0 |
+| relayed match input → echo | 253 851 | 8 462 | 23.0 ms | 33.8 ms | 35.1 ms | 45.5 ms | 0 |
+
+The same `GET /v1/account` alone with all 200 clients: 24 931 ops/s, p50 7.6 ms, p99 15.9 ms, the
+node at ~1.2 cores and Postgres at ~1.7 — the database is now the ceiling, not the node. Before the
+request state was put behind a single `Arc` (every middleware layer used to clone a struct of ~50
+reference-counted fields) the same run did 5 863 ops/s at p50 32 ms with the node on four cores.
 
 `musubi soak` on the same VM, release build, 3 nodes, 24 clients, 6 worlds split across two nodes
 each with 20 entities shuttling over the border, 75 s, SIGKILL of a node every 12 s (3 incidents):

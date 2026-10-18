@@ -6,7 +6,7 @@ use axum::Router;
 use http_body_util::BodyExt;
 use musubi_auth::AuthService;
 use musubi_core::config::Config;
-use musubi_server::app::AppState;
+use musubi_server::app::{AppState, AppStateInner};
 use musubi_storage::StorageService;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -75,7 +75,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
             .spawn_flusher(std::time::Duration::from_millis(200));
         c
     });
-    let state = AppState {
+    let state = AppState(Arc::new(AppStateInner {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
         dev: Arc::new(musubi_server::dev::DevTools::new()),
         audit: musubi_server::audit::Sink::new(&db),
@@ -143,7 +143,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
                 ..Default::default()
             },
         )),
-    };
+    }));
     state.anticheat.bind(&state);
     musubi_server::runtime_host::install(&state);
     Some(musubi_server::http::router(state))

@@ -110,24 +110,27 @@ impl AccountService {
     }
 
     pub async fn get(&self, id: AccountId) -> Result<Account> {
-        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, Option<String>, Option<String>, serde_json::Value, OffsetDateTime, OffsetDateTime)>(
-            "select username, display_name, avatar_url, lang, timezone, location, metadata, created_at, updated_at from musubi.accounts where id = $1 and deleted_at is null",
+        // one round-trip: the identities ride along as a JSON array
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, Option<String>, Option<String>, serde_json::Value, OffsetDateTime, OffsetDateTime, serde_json::Value)>(
+            "select a.username, a.display_name, a.avatar_url, a.lang, a.timezone, a.location, a.metadata, a.created_at, a.updated_at,
+                    coalesce((select json_agg(json_build_array(i.provider, i.subject, i.verified) order by i.created_at)
+                              from musubi.identities i where i.account_id = a.id), '[]'::json)
+             from musubi.accounts a where a.id = $1 and a.deleted_at is null",
         )
         .bind(id.0)
         .fetch_optional(&self.db)
         .await
         .map_err(Error::internal)?
         .ok_or_else(|| Error::NotFound("account".into()))?;
-        let identities = sqlx::query_as::<_, (String, String, bool)>(
-            "select provider, subject, verified from musubi.identities where account_id = $1 order by created_at",
-        )
-        .bind(id.0)
-        .fetch_all(&self.db)
-        .await
-        .map_err(Error::internal)?
-        .into_iter()
-        .map(|(provider, subject, verified)| Identity { subject: mask_subject(&provider, &subject), provider, verified })
-        .collect();
+        let identities = serde_json::from_value::<Vec<(String, String, bool)>>(row.9)
+            .map_err(Error::internal)?
+            .into_iter()
+            .map(|(provider, subject, verified)| Identity {
+                subject: mask_subject(&provider, &subject),
+                provider,
+                verified,
+            })
+            .collect();
         Ok(Account {
             id,
             username: row.0,

@@ -11,6 +11,7 @@ name = "musubi"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = "0.1"
 musubi-core.workspace = true
 musubi-server.workspace = true
 tokio.workspace = true

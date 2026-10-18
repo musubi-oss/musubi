@@ -23,8 +23,20 @@ use tracing::info;
 use crate::realtime::{Hub, MatchRegistry, PartyRegistry, RelayedRegistry};
 use crate::{db, http};
 
+/// Everything a request handler can reach. One `Arc` for the whole state: every middleware layer
+/// and `State` extractor clones the handle, so a flat struct of ~50 fields cost ~50 refcount
+/// round-trips per layer per request.
 #[derive(Clone)]
-pub struct AppState {
+pub struct AppState(pub Arc<AppStateInner>);
+
+impl std::ops::Deref for AppState {
+    type Target = AppStateInner;
+    fn deref(&self) -> &AppStateInner {
+        &self.0
+    }
+}
+
+pub struct AppStateInner {
     pub audit: crate::audit::Sink,
     pub cfg: Arc<Config>,
     pub db: PgPool,
@@ -547,7 +559,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     if let Some(b) = &blobs {
         tracing::info!(bucket = b.bucket(), "ugc blobs in object storage");
     }
-    let state = AppState {
+    let state = AppState(Arc::new(AppStateInner {
         blobs,
         audit: crate::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
@@ -602,7 +614,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         started_at: std::time::Instant::now(),
         metrics: crate::metrics::install(),
         limits,
-    };
+    }));
     crate::runtime_host::install(&state);
     if let Some(c) = state.cluster.clone() {
         state.limits.start_gossip(c);

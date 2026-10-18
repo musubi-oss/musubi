@@ -10,7 +10,7 @@ use musubi_auth::AuthService;
 use musubi_core::config::Config;
 use musubi_proto::realtime::ChannelKind;
 use musubi_proto::{ClientMessage, Encoding, Envelope, ServerMessage};
-use musubi_server::app::AppState;
+use musubi_server::app::{AppState, AppStateInner};
 use musubi_server::realtime::Hub;
 use musubi_storage::StorageService;
 use serde_json::{json, Value};
@@ -65,12 +65,34 @@ async fn build_state_url(
     build_state_cfg(leader, group, region, cfg, fresh).await
 }
 
+/// Last-minute edits to the state before it is frozen behind its `Arc` (test doubles for
+/// optional integrations).
+type Tweak = Box<dyn FnOnce(&mut AppStateInner) + Send>;
+
+async fn build_state_with(leader: bool, group: &str, tweak: Tweak) -> Option<AppState> {
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
+    let mut cfg = Config::default();
+    cfg.database.url = url;
+    build_state_cfg_with(leader, group, "local", cfg, false, Some(tweak)).await
+}
+
 async fn build_state_cfg(
+    leader: bool,
+    group: &str,
+    region: &str,
+    cfg: Config,
+    fresh: bool,
+) -> Option<AppState> {
+    build_state_cfg_with(leader, group, region, cfg, fresh, None).await
+}
+
+async fn build_state_cfg_with(
     leader: bool,
     group: &str,
     region: &str,
     mut cfg: Config,
     fresh: bool,
+    tweak: Option<Tweak>,
 ) -> Option<AppState> {
     // a node runs world ticks, snapshots, journals, match loops and failover rounds on this
     // pool at once; 3 starved them into 30 s acquire timeouts on the 4-thread CI runner
@@ -129,7 +151,7 @@ async fn build_state_cfg(
     let schedules = Arc::new(musubi_server::schedules::Schedules::from_config(
         &cfg.runtime,
     ));
-    let state = AppState {
+    let mut inner = AppStateInner {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
         dev: Arc::new(musubi_server::dev::DevTools::new()),
         audit: musubi_server::audit::Sink::new(&db),
@@ -193,6 +215,10 @@ async fn build_state_cfg(
             },
         )),
     };
+    if let Some(t) = tweak {
+        t(&mut inner);
+    }
+    let state = AppState(Arc::new(inner));
     state.anticheat.bind(&state);
     musubi_server::app::wire_storage_live(&state.storage, &state.fanout);
     Some(state)
@@ -2881,14 +2907,22 @@ async fn mock_upstreams() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
 
 #[tokio::test]
 async fn zanshin_and_aurix_integrations() {
-    let Some(mut state) = build_state(true, &test_group()).await else {
-        return;
-    };
     let (upstream, seen) = mock_upstreams().await;
     let liveops = musubi_integrations::ZanshinClient::new(&upstream, "zk_s_test");
-    state.liveops = Some(liveops.clone());
+    let (lo, up) = (liveops.clone(), upstream.clone());
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            st.liveops = Some(lo);
+            st.voice = Some(musubi_integrations::AurixClient::new(&up, "ak_test"));
+        }),
+    )
+    .await
+    else {
+        return;
+    };
     state.events.set_liveops(liveops.clone());
-    state.voice = Some(musubi_integrations::AurixClient::new(&upstream, "ak_test"));
     let router = musubi_server::http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -3235,9 +3269,6 @@ async fn http_json(
 
 #[tokio::test]
 async fn iap_apple_and_google_receipts_redeem_once() {
-    let Some(mut state) = build_state(true, &test_group()).await else {
-        return;
-    };
     let suffix = uuid::Uuid::now_v7().simple().to_string();
     let (gem_pack, gems_item, product) = (
         format!("pack-{suffix}"),
@@ -3255,30 +3286,46 @@ async fn iap_apple_and_google_receipts_redeem_once() {
         "/tests/fixtures/google_test_rsa.pem"
     ))
     .unwrap();
-    state.apple_iap = Some(
-        musubi_integrations::AppleStoreClient::new_with_root(
-            &upstream,
-            "ISSUER",
-            "KEYID",
-            "com.musubi.test",
-            &apple_pem,
-            &apple_chain.root,
-        )
-        .unwrap(),
+    let (up, ac, ap, gp) = (
+        upstream.clone(),
+        apple_chain.clone(),
+        apple_pem.clone(),
+        google_pem.clone(),
     );
-    state.steam_iap =
-        Some(musubi_integrations::SteamClient::new(&upstream, "STEAMKEY", 480, true).unwrap());
-    state.google_iap = Some(
-        musubi_integrations::GooglePlayClient::new_with_notifications(
-            &upstream,
-            &format!("{upstream}/token"),
-            "com.musubi.test",
-            "sa@test.iam",
-            &google_pem,
-            "notify-secret",
-        )
-        .unwrap(),
-    );
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            st.apple_iap = Some(
+                musubi_integrations::AppleStoreClient::new_with_root(
+                    &up,
+                    "ISSUER",
+                    "KEYID",
+                    "com.musubi.test",
+                    &ap,
+                    &ac.root,
+                )
+                .unwrap(),
+            );
+            st.steam_iap =
+                Some(musubi_integrations::SteamClient::new(&up, "STEAMKEY", 480, true).unwrap());
+            st.google_iap = Some(
+                musubi_integrations::GooglePlayClient::new_with_notifications(
+                    &up,
+                    &format!("{up}/token"),
+                    "com.musubi.test",
+                    "sa@test.iam",
+                    &gp,
+                    "notify-secret",
+                )
+                .unwrap(),
+            );
+        }),
+    )
+    .await
+    else {
+        return;
+    };
     let router = musubi_server::http::router(state.clone());
     let (ta, _) = token(&router).await;
     let (tb, acc_b) = token(&router).await;
@@ -3473,8 +3520,10 @@ async fn iap_apple_and_google_receipts_redeem_once() {
     assert_eq!(st, 200, "{rc}");
     assert_eq!(rc["receipts"][0]["provider"], "google");
     // without a configured provider the endpoint says so
-    state.apple_iap = None;
-    let router2 = musubi_server::http::router(state);
+    let Some(state2) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router2 = musubi_server::http::router(state2);
     let (st, _) = http_json(
         &router2,
         "POST",
@@ -3760,21 +3809,23 @@ async fn admin_kick_closes_realtime_sessions() {
 #[tokio::test]
 async fn rate_limits_are_cluster_wide_over_the_bus() {
     let group = test_group();
-    let Some(mut n1) = build_state(false, &group).await else {
+    fn strict(st: &mut AppStateInner) {
+        let cfg = musubi_core::config::LimitsConfig {
+            enabled: true,
+            http_per_second_per_account: 1,
+            http_burst: 10,
+            cluster_wide: true,
+            ..Default::default()
+        };
+        st.limits = Arc::new(musubi_server::limits::RateLimiter::new(&cfg));
+    }
+    let Some(n1) = build_state_with(false, &group, Box::new(strict)).await else {
         return;
     };
-    let Some(mut n2) = build_state(false, &group).await else {
+    let Some(n2) = build_state_with(false, &group, Box::new(strict)).await else {
         return;
     };
-    let cfg = musubi_core::config::LimitsConfig {
-        enabled: true,
-        http_per_second_per_account: 1,
-        http_burst: 10,
-        cluster_wide: true,
-        ..Default::default()
-    };
-    for n in [&mut n1, &mut n2] {
-        n.limits = Arc::new(musubi_server::limits::RateLimiter::new(&cfg));
+    for n in [&n1, &n2] {
         n.limits.start_gossip(n.cluster.clone().unwrap());
     }
     // let the two buses discover each other
@@ -8122,14 +8173,19 @@ async fn rtc_drive(
 async fn webrtc_datachannel_ping() {
     use musubi_transport::quic::QuicConnection as Q;
     use musubi_transport::Frame;
-    let Some(mut state) = build_state(true, &test_group()).await else {
-        return;
-    };
     let rtc_server =
         musubi_transport::webrtc::RtcServer::bind("127.0.0.1:0".parse().unwrap(), None)
             .await
             .unwrap();
-    state.rtc = Some(rtc_server);
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| st.rtc = Some(rtc_server)),
+    )
+    .await
+    else {
+        return;
+    };
     let router = musubi_server::http::router(state.clone());
     let (ta, _) = token(&router).await;
 
@@ -9990,9 +10046,6 @@ async fn world_cold_cell_unloads_and_reloads() {
 
 #[tokio::test]
 async fn iap_subscription_redeem_shows_active() {
-    let Some(mut state) = build_state(true, &test_group()).await else {
-        return;
-    };
     let suffix = uuid::Uuid::now_v7().simple().to_string();
     let (gem_pack, gems_item, product) = (
         format!("pack-{suffix}"),
@@ -10010,30 +10063,46 @@ async fn iap_subscription_redeem_shows_active() {
         "/tests/fixtures/google_test_rsa.pem"
     ))
     .unwrap();
-    state.apple_iap = Some(
-        musubi_integrations::AppleStoreClient::new_with_root(
-            &upstream,
-            "ISSUER",
-            "KEYID",
-            "com.musubi.test",
-            &apple_pem,
-            &apple_chain.root,
-        )
-        .unwrap(),
+    let (up, ac, ap, gp) = (
+        upstream.clone(),
+        apple_chain.clone(),
+        apple_pem.clone(),
+        google_pem.clone(),
     );
-    state.steam_iap =
-        Some(musubi_integrations::SteamClient::new(&upstream, "STEAMKEY", 480, true).unwrap());
-    state.google_iap = Some(
-        musubi_integrations::GooglePlayClient::new_with_notifications(
-            &upstream,
-            &format!("{upstream}/token"),
-            "com.musubi.test",
-            "sa@test.iam",
-            &google_pem,
-            "notify-secret",
-        )
-        .unwrap(),
-    );
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            st.apple_iap = Some(
+                musubi_integrations::AppleStoreClient::new_with_root(
+                    &up,
+                    "ISSUER",
+                    "KEYID",
+                    "com.musubi.test",
+                    &ap,
+                    &ac.root,
+                )
+                .unwrap(),
+            );
+            st.steam_iap =
+                Some(musubi_integrations::SteamClient::new(&up, "STEAMKEY", 480, true).unwrap());
+            st.google_iap = Some(
+                musubi_integrations::GooglePlayClient::new_with_notifications(
+                    &up,
+                    &format!("{up}/token"),
+                    "com.musubi.test",
+                    "sa@test.iam",
+                    &gp,
+                    "notify-secret",
+                )
+                .unwrap(),
+            );
+        }),
+    )
+    .await
+    else {
+        return;
+    };
     let router = musubi_server::http::router(state.clone());
     let (ta, _) = token(&router).await;
     let (_tb, _acc_b) = token(&router).await;
@@ -10332,9 +10401,6 @@ async fn smtp_mailer_sends_verification_and_reset() {
 async fn webpush_delivers_encrypted_notification_and_drops_gone_subscriptions() {
     use base64::Engine;
     use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
-    let Some(mut state) = build_state(true, &test_group()).await else {
-        return;
-    };
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
@@ -10346,17 +10412,27 @@ async fn webpush_delivers_encrypted_notification_and_drops_gone_subscriptions() 
         "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
         base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref())
     );
-    let push = std::sync::Arc::new(musubi_server::push::Push::new(
-        musubi_core::config::PushConfig::default(),
-        state.db.clone(),
-    ));
-    push.set_webpush(&musubi_core::config::WebPushConfig {
-        vapid_private_key_pem: pem,
-        subject: "mailto:ops@musubi.test".into(),
-        ttl_secs: 60,
-    })
-    .unwrap();
-    state.notify = state.notify.with_push(push);
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            let push = std::sync::Arc::new(musubi_server::push::Push::new(
+                musubi_core::config::PushConfig::default(),
+                st.db.clone(),
+            ));
+            push.set_webpush(&musubi_core::config::WebPushConfig {
+                vapid_private_key_pem: pem,
+                subject: "mailto:ops@musubi.test".into(),
+                ttl_secs: 60,
+            })
+            .unwrap();
+            st.notify = st.notify.clone().with_push(push);
+        }),
+    )
+    .await
+    else {
+        return;
+    };
     // mock push service: /ok records the request, /gone says the subscription expired
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(axum::http::HeaderMap, Vec<u8>)>();
     let app = axum::Router::new()
@@ -11980,17 +12056,21 @@ async fn anticheat_flags_score_queue_kick_and_vendor_verify() {
             });
         }
     });
-    let Some(mut state) = build_state(true, &test_group()).await else {
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            let cfg = Arc::make_mut(&mut st.cfg);
+            cfg.anticheat.kick_score = 60;
+            cfg.anticheat.battleye_url = vendor;
+            cfg.anticheat.battleye_key = "be-key".into();
+            st.anticheat = Arc::new(musubi_server::anticheat::AntiCheat::new());
+        }),
+    )
+    .await
+    else {
         return;
     };
-    {
-        let cfg = Arc::make_mut(&mut state.cfg);
-        cfg.anticheat.kick_score = 60;
-        cfg.anticheat.battleye_url = vendor;
-        cfg.anticheat.battleye_key = "be-key".into();
-    }
-    state.anticheat = Arc::new(musubi_server::anticheat::AntiCheat::new());
-    state.anticheat.bind(&state);
     let router = musubi_server::http::router(state.clone());
     let (_ta, acc) = token(&router).await;
     let (st, r) = http_json(
@@ -12204,18 +12284,23 @@ async fn mock_http(handler: MockHandler) -> (String, Arc<std::sync::Mutex<Vec<St
 
 #[tokio::test]
 async fn regions_routed_allocation_cold_start_and_external_providers() {
-    let Some(mut state) = build_state(true, &test_group()).await else {
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(|st| {
+            let cfg = Arc::make_mut(&mut st.cfg);
+            cfg.regions.country_map.insert("DE".into(), "eu".into());
+            cfg.regions.regions.push(musubi_core::config::RegionEntry {
+                name: "eu".into(),
+                echo: "eu.example:7000".into(),
+                http: String::new(),
+            });
+        }),
+    )
+    .await
+    else {
         return;
     };
-    {
-        let cfg = Arc::make_mut(&mut state.cfg);
-        cfg.regions.country_map.insert("DE".into(), "eu".into());
-        cfg.regions.regions.push(musubi_core::config::RegionEntry {
-            name: "eu".into(),
-            echo: "eu.example:7000".into(),
-            http: String::new(),
-        });
-    }
     let router = musubi_server::http::router(state.clone());
     let sfx = uuid::Uuid::now_v7().simple().to_string();
     let (ta, _) = token(&router).await;
@@ -13507,9 +13592,6 @@ async fn item_definitions_are_versioned_and_inventories_migrate() {
 async fn operator_sso_mints_scoped_keys() {
     use base64::Engine;
     use ring::signature::KeyPair;
-    let Some(mut state) = build_state(true, &test_group()).await else {
-        return;
-    };
     // ----- mock IdP -----
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
@@ -13588,18 +13670,26 @@ async fn operator_sso_mints_scoped_keys() {
         );
     tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
     // ----- SSO on -----
-    {
-        let cfg = Arc::make_mut(&mut state.cfg);
-        let sso = &mut cfg.operators.sso;
-        sso.issuer = issuer.clone();
-        sso.client_id = "console".into();
-        sso.client_secret = "console-secret".into();
-        sso.redirect_url = "https://api.studio.gg/v1/admin/sso/callback".into();
-        sso.role_map.insert("liveops-team".into(), "liveops".into());
-        sso.role_map.insert("admins".into(), "admin".into());
-        sso.allowed_domains = vec!["studio.gg".into()];
-        sso.session_hours = 8;
-    }
+    let iss = issuer.clone();
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            let sso = &mut Arc::make_mut(&mut st.cfg).operators.sso;
+            sso.issuer = iss;
+            sso.client_id = "console".into();
+            sso.client_secret = "console-secret".into();
+            sso.redirect_url = "https://api.studio.gg/v1/admin/sso/callback".into();
+            sso.role_map.insert("liveops-team".into(), "liveops".into());
+            sso.role_map.insert("admins".into(), "admin".into());
+            sso.allowed_domains = vec!["studio.gg".into()];
+            sso.session_hours = 8;
+        }),
+    )
+    .await
+    else {
+        return;
+    };
     let router = musubi_server::http::router(state.clone());
     let (st, r) = http_json(&router, "GET", "/v1/admin/sso", None, false, None).await;
     assert_eq!(st, 200, "{r}");
@@ -13752,12 +13842,11 @@ async fn operator_sso_mints_scoped_keys() {
         .unwrap();
     state.keys.load(&state.db).await.unwrap();
     assert_eq!(with_key("GET", "/v1/admin/content", admin_key).await, 401);
-    // SSO off → 404
-    {
-        let cfg = Arc::make_mut(&mut state.cfg);
-        cfg.operators.sso.issuer.clear();
-    }
-    let router = musubi_server::http::router(state.clone());
+    // SSO off → 404 (a node without an issuer configured)
+    let Some(off) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(off);
     let (st, r) = http_json(&router, "GET", "/v1/admin/sso", None, false, None).await;
     assert_eq!(st, 200, "{r}");
     assert_eq!(r["enabled"], false);
@@ -13961,13 +14050,15 @@ async fn multi_project_router_isolates_projects() {
 /// environment is refused, and imported collection schemas take effect at once.
 #[tokio::test]
 async fn environments_promote_config_bundles() {
-    let Some(mut state) = build_state(true, &test_group()).await else {
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(|st| Arc::make_mut(&mut st.cfg).node.environment = "stage".into()),
+    )
+    .await
+    else {
         return;
     };
-    {
-        let cfg = Arc::make_mut(&mut state.cfg);
-        cfg.node.environment = "stage".into();
-    }
     let router = musubi_server::http::router(state.clone());
     let (st, node) = http_json(&router, "GET", "/v1/node", None, false, None).await;
     assert_eq!(st, 200, "{node}");
@@ -14261,9 +14352,6 @@ async fn iap_subscription_sweep_marks_grace_and_expired() {
 /// the upload.
 #[tokio::test]
 async fn ugc_blobs_live_in_object_storage() {
-    let Some(mut state) = build_state(true, &test_group()).await else {
-        return;
-    };
     #[derive(Default)]
     struct Bucket {
         objects: std::collections::HashMap<String, Vec<u8>>,
@@ -14381,22 +14469,30 @@ async fn ugc_blobs_live_in_object_storage() {
     tokio::spawn(async move {
         axum::serve(listener, mock).await.unwrap();
     });
-    {
-        let cfg = Arc::make_mut(&mut state.cfg);
-        cfg.ugc.max_blob_bytes = 64;
-        cfg.ugc.s3 = musubi_core::config::S3Config {
-            endpoint: format!("http://{addr}"),
-            bucket: "ugc-bucket".into(),
-            access_key: "AKIDEXAMPLE".into(),
-            secret_key: "s3cr3t".into(),
-            prefix: "game1/".into(),
-            part_bytes: 16,
-            ..Default::default()
-        };
-    }
-    state.blobs = Some(Arc::new(
-        musubi_server::blobstore::S3Store::new(&state.cfg.ugc.s3).unwrap(),
-    ));
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            let cfg = Arc::make_mut(&mut st.cfg);
+            cfg.ugc.max_blob_bytes = 64;
+            cfg.ugc.s3 = musubi_core::config::S3Config {
+                endpoint: format!("http://{addr}"),
+                bucket: "ugc-bucket".into(),
+                access_key: "AKIDEXAMPLE".into(),
+                secret_key: "s3cr3t".into(),
+                prefix: "game1/".into(),
+                part_bytes: 16,
+                ..Default::default()
+            };
+            st.blobs = Some(Arc::new(
+                musubi_server::blobstore::S3Store::new(&st.cfg.ugc.s3).unwrap(),
+            ));
+        }),
+    )
+    .await
+    else {
+        return;
+    };
     let router = musubi_server::http::router(state.clone());
     let (ta, _) = token(&router).await;
     let (st, item) = http_json(
@@ -14898,14 +14994,21 @@ async fn account_export_restore_roundtrip() {
 /// enforced on the next request, cleared again.
 #[tokio::test]
 async fn limits_per_account_and_per_key() {
-    let Some(mut state) = build_state(true, &test_group()).await else {
+    // tests run with rate limiting off; this one needs it on
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(|st| {
+            let mut lc = st.cfg.limits.clone();
+            lc.enabled = true;
+            lc.cluster_wide = false;
+            st.limits = Arc::new(musubi_server::limits::RateLimiter::new(&lc));
+        }),
+    )
+    .await
+    else {
         return;
     };
-    // tests run with rate limiting off; this one needs it on
-    let mut lc = state.cfg.limits.clone();
-    lc.enabled = true;
-    lc.cluster_wide = false;
-    state.limits = Arc::new(musubi_server::limits::RateLimiter::new(&lc));
     let router = musubi_server::http::router(state.clone());
     let (ta, aid) = token(&router).await;
     let (st, r) = http_json(
