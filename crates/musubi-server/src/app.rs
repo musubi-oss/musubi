@@ -594,6 +594,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     wire_storage_live(&storage, &fanout);
     let idl = crate::idl::IdlRegistry::new(db.clone(), storage.clone());
+    matches.set_idl(idl.clone());
     match idl.load().await {
         Ok(true) => tracing::info!("idl loaded"),
         Ok(false) => {}

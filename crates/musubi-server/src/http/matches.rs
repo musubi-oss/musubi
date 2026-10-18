@@ -88,6 +88,7 @@ async fn create(
     ServerKey: ServerKey,
     Json(r): Json<CreateReq>,
 ) -> Result<Json<MatchInfo>, ApiError> {
+    s.idl.check_match_params(&r.module, &r.params)?;
     let h = s.matches.create(s.hub.clone(), &r.module, r.params)?;
     Ok(Json(h.info().await))
 }

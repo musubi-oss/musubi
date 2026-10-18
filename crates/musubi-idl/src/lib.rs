@@ -185,6 +185,32 @@ pub struct RpcDef {
     pub doc: Option<String>,
 }
 
+/// `[matches.<module>]`: typed creation params and JSON state of an authoritative match
+/// module (`match_<module>_*` exports).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchDef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+}
+
+/// `[configs.<name>]`: a typed config document the server writes (`PUT /v1/server/configs/{name}`)
+/// and clients read (`GET /v1/configs/{name}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigDef {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(default = "one")]
+    pub version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+}
+
 /// A parsed, validated schema.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Idl {
@@ -198,6 +224,10 @@ pub struct Idl {
     pub collections: BTreeMap<String, CollectionDef>,
     #[serde(default)]
     pub rpcs: BTreeMap<String, RpcDef>,
+    #[serde(default)]
+    pub matches: BTreeMap<String, MatchDef>,
+    #[serde(default)]
+    pub configs: BTreeMap<String, ConfigDef>,
 }
 
 // ---- TOML surface -------------------------------------------------------------------------
@@ -245,6 +275,8 @@ struct Doc {
     enums: BTreeMap<String, EnumDef>,
     collections: BTreeMap<String, CollectionDef>,
     rpcs: BTreeMap<String, RpcDef>,
+    matches: BTreeMap<String, MatchDef>,
+    configs: BTreeMap<String, ConfigDef>,
 }
 
 fn toml_to_json(v: toml::Value) -> Value {
@@ -259,6 +291,8 @@ impl Idl {
             enums: doc.enums,
             collections: doc.collections,
             rpcs: doc.rpcs,
+            matches: doc.matches,
+            configs: doc.configs,
             ..Default::default()
         };
         for (name, spec) in doc.types {
@@ -371,6 +405,29 @@ impl Idl {
                         return err(format!("rpc `{rname}`: unknown {what} type `{t}`"));
                     }
                 }
+            }
+        }
+        for (mname, m) in &self.matches {
+            if !is_ident(mname) {
+                return err(format!("match `{mname}`: not a valid module name"));
+            }
+            for (what, t) in [("params", &m.params), ("state", &m.state)] {
+                if let Some(t) = t {
+                    if !self.types.contains_key(t) {
+                        return err(format!("match `{mname}`: unknown {what} type `{t}`"));
+                    }
+                }
+            }
+        }
+        for (cname, c) in &self.configs {
+            if !is_ident(cname) {
+                return err(format!("config `{cname}`: not a valid name"));
+            }
+            if !self.types.contains_key(&c.ty) {
+                return err(format!("config `{cname}`: unknown type `{}`", c.ty));
+            }
+            if c.version < 1 {
+                return err(format!("config `{cname}`: version must be >= 1"));
             }
         }
         Ok(())
@@ -569,37 +626,58 @@ impl Idl {
             .map(|p| format!("{p}."))
             .unwrap_or_default();
         let r = |t: &str| json!({ "$ref": format!("#/components/schemas/{prefix}{t}") });
-        self.rpcs
+        let mut paths: Map<String, Value> = self
+            .configs
             .iter()
-            .map(|(name, rpc)| {
-                let security = match rpc.auth {
-                    Auth::Any => json!([{ "bearer": [] }, { "serverKey": [] }]),
-                    Auth::Player => json!([{ "bearer": [] }]),
-                    Auth::Server => json!([{ "serverKey": [] }]),
-                };
-                let mut op = json!({
-                    "operationId": format!("rpc_{name}"),
-                    "tags": ["rpc"],
-                    "summary": rpc.doc.clone().unwrap_or_else(|| format!("RPC `{name}`")),
-                    "security": security,
-                    "responses": {
-                        "200": { "description": "OK" },
-                        "default": { "$ref": "#/components/responses/Error" }
-                    }
-                });
-                if let Some(i) = &rpc.input {
-                    op["requestBody"] = json!({
-                        "required": true,
-                        "content": { "application/json": { "schema": r(i) } }
-                    });
-                }
-                if let Some(o) = &rpc.output {
-                    op["responses"]["200"]["content"] =
-                        json!({ "application/json": { "schema": r(o) } });
-                }
-                (format!("/v1/rpc/{name}"), json!({ "post": op }))
+            .map(|(name, c)| {
+                (
+                    format!("/v1/configs/{name}"),
+                    json!({ "get": {
+                        "operationId": format!("config_{name}"),
+                        "tags": ["configs"],
+                        "summary": c.doc.clone().unwrap_or_else(|| format!("Config `{name}`")),
+                        "security": [{ "bearer": [] }],
+                        "responses": {
+                            "200": { "description": "OK", "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "properties": { "name": { "type": "string" }, "version": { "type": "integer" },
+                                                "updated_at": { "type": "integer" }, "value": r(&c.ty) }
+                            } } } },
+                            "default": { "$ref": "#/components/responses/Error" }
+                        }
+                    } }),
+                )
             })
-            .collect()
+            .collect();
+        paths.extend(self.rpcs.iter().map(|(name, rpc)| {
+            let security = match rpc.auth {
+                Auth::Any => json!([{ "bearer": [] }, { "serverKey": [] }]),
+                Auth::Player => json!([{ "bearer": [] }]),
+                Auth::Server => json!([{ "serverKey": [] }]),
+            };
+            let mut op = json!({
+                "operationId": format!("rpc_{name}"),
+                "tags": ["rpc"],
+                "summary": rpc.doc.clone().unwrap_or_else(|| format!("RPC `{name}`")),
+                "security": security,
+                "responses": {
+                    "200": { "description": "OK" },
+                    "default": { "$ref": "#/components/responses/Error" }
+                }
+            });
+            if let Some(i) = &rpc.input {
+                op["requestBody"] = json!({
+                    "required": true,
+                    "content": { "application/json": { "schema": r(i) } }
+                });
+            }
+            if let Some(o) = &rpc.output {
+                op["responses"]["200"]["content"] =
+                    json!({ "application/json": { "schema": r(o) } });
+            }
+            (format!("/v1/rpc/{name}"), json!({ "post": op }))
+        }));
+        paths
     }
 
     // ---- Rust -------------------------------------------------------------------------------
@@ -662,6 +740,24 @@ impl Idl {
         let r = self.rpcs.get(rpc)?;
         let t = r.output.as_deref()?;
         self.json_schema(t).ok()
+    }
+
+    /// `[matches.<module>] params` as JSON Schema.
+    pub fn match_params_schema(&self, module: &str) -> Option<Value> {
+        let t = self.matches.get(module)?.params.as_deref()?;
+        self.json_schema(t).ok()
+    }
+
+    /// `[matches.<module>] state` as JSON Schema.
+    pub fn match_state_schema(&self, module: &str) -> Option<Value> {
+        let t = self.matches.get(module)?.state.as_deref()?;
+        self.json_schema(t).ok()
+    }
+
+    /// `[configs.<name>] type` as JSON Schema.
+    pub fn config_schema(&self, name: &str) -> Option<Value> {
+        let c = self.configs.get(name)?;
+        self.json_schema(&c.ty).ok()
     }
 }
 
@@ -864,5 +960,46 @@ auth = "player"
             .contains("unknown type `B`"));
         assert!(bad("[rpcs.r]\ninput = \"Z\"").contains("unknown input type"));
         assert!(bad("[types.A]\nx = { type = \"int\", bogus = 1 }").contains("idl:"));
+    }
+
+    #[test]
+    fn matches_and_configs() {
+        let bad = |src: &str| Idl::parse(src).err().map(|e| e.0).unwrap_or_default();
+        let idl = Idl::parse(
+            r#"
+[types.ArenaParams]
+rounds = { type = "int", min = 1, max = 9 }
+[types.ArenaState]
+round = "int"
+scores = "map<int>"
+[types.Tuning]
+speed = "float"
+[matches.arena]
+params = "ArenaParams"
+state = "ArenaState"
+[configs.tuning]
+type = "Tuning"
+version = 2
+"#,
+        )
+        .unwrap();
+        let p = idl.match_params_schema("arena").unwrap();
+        assert_eq!(p["properties"]["rounds"]["minimum"], 1.0);
+        assert!(idl.match_state_schema("arena").unwrap()["properties"]["scores"].is_object());
+        assert!(idl.match_params_schema("other").is_none());
+        assert_eq!(idl.configs["tuning"].version, 2);
+        assert_eq!(
+            idl.config_schema("tuning").unwrap()["properties"]["speed"]["type"],
+            "number"
+        );
+        let paths = idl.openapi_paths();
+        assert!(paths.contains_key("/v1/configs/tuning"));
+        assert!(bad("[types.A]\nx = \"int\"\n[matches.m]\nstate = \"B\"")
+            .contains("unknown state type"));
+        assert!(bad("[types.A]\nx = \"int\"\n[configs.c]\ntype = \"B\"").contains("unknown type"));
+        assert!(
+            bad("[types.A]\nx = \"int\"\n[configs.c]\ntype = \"A\"\nversion = 0")
+                .contains("version")
+        );
     }
 }

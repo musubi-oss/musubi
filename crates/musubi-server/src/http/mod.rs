@@ -4,6 +4,7 @@ mod anticheat;
 mod auth;
 mod chat;
 mod cluster;
+pub mod configs;
 pub mod content;
 mod dev;
 pub mod economy;
@@ -166,6 +167,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/node", get(node_info))
         .merge(admin::routes())
         .merge(crate::idl::router())
+        .merge(configs::router())
         .merge(sso::routes())
         .merge(stats::routes())
         .merge(push::routes())

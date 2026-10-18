@@ -17,6 +17,7 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STA
 pub struct WasmMatchHandler {
     runtime: Arc<Runtime>,
     module: String,
+    idl: Option<Arc<parking_lot::RwLock<Option<crate::idl::IdlRegistry>>>>,
 }
 
 impl WasmMatchHandler {
@@ -24,7 +25,48 @@ impl WasmMatchHandler {
         Self {
             runtime,
             module: module.to_string(),
+            idl: None,
         }
+    }
+
+    /// Validate the module's state against `[matches.<module>] state` of the deployed IDL
+    /// (plan 3.8): a JSON state that violates the schema fails the handler call with
+    /// `Conflict` (the module and the deployed contract disagree).
+    pub fn with_idl(
+        mut self,
+        idl: Arc<parking_lot::RwLock<Option<crate::idl::IdlRegistry>>>,
+    ) -> Self {
+        self.idl = Some(idl);
+        self
+    }
+
+    fn state(&self, b64: &str) -> Result<Vec<u8>> {
+        let state = dec(b64)?;
+        let Some(idl) = &self.idl else {
+            return Ok(state);
+        };
+        let schema = idl
+            .read()
+            .as_ref()
+            .and_then(|r| r.match_state_schema(&self.module));
+        if let Some(schema) = schema {
+            if state.is_empty() {
+                return Ok(state);
+            }
+            let v: serde_json::Value = serde_json::from_slice(&state).map_err(|e| {
+                Error::Conflict(format!(
+                    "match `{}` state must be JSON (declared in the IDL): {e}",
+                    self.module
+                ))
+            })?;
+            musubi_storage::schema::validate(&schema, &v).map_err(|e| {
+                Error::Conflict(format!(
+                    "match `{}` state violates the IDL: {e}",
+                    self.module
+                ))
+            })?;
+        }
+        Ok(state)
     }
 
     fn call<T: for<'de> Deserialize<'de>>(
@@ -115,7 +157,7 @@ impl MatchHandler for WasmMatchHandler {
     fn init(&self, params: &serde_json::Value) -> Result<Init> {
         let r: InitReply = self.call("init", json!({ "params": params }))?;
         Ok(Init {
-            state: dec(&r.state)?,
+            state: self.state(&r.state)?,
             tick_rate: r.tick_rate,
             label: r.label,
         })
@@ -139,7 +181,7 @@ impl MatchHandler for WasmMatchHandler {
                 r.reason.unwrap_or_else(|| "join rejected".into()),
             ))
         };
-        Ok((dec(&r.state)?, verdict))
+        Ok((self.state(&r.state)?, verdict))
     }
 
     fn join(
@@ -152,7 +194,7 @@ impl MatchHandler for WasmMatchHandler {
             "join",
             json!({ "state": enc(&state), "presences": joined, "members": members }),
         )?;
-        dec(&r.state)
+        self.state(&r.state)
     }
 
     fn leave(
@@ -165,7 +207,7 @@ impl MatchHandler for WasmMatchHandler {
             "leave",
             json!({ "state": enc(&state), "presences": left, "members": members }),
         )?;
-        dec(&r.state)
+        self.state(&r.state)
     }
 
     fn tick(
@@ -198,7 +240,7 @@ impl MatchHandler for WasmMatchHandler {
             });
         }
         Ok(TickResult {
-            state: dec(&r.state)?,
+            state: self.state(&r.state)?,
             outbound,
             label: r.label,
             terminate: r.terminate,
@@ -210,6 +252,6 @@ impl MatchHandler for WasmMatchHandler {
             "terminate",
             json!({ "state": enc(&state), "grace_seconds": grace_seconds }),
         )?;
-        dec(&r.state)
+        self.state(&r.state)
     }
 }

@@ -150,6 +150,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
             },
         )),
     }));
+    state.matches.set_idl(state.idl.clone());
     state.anticheat.bind(&state);
     musubi_server::runtime_host::install(&state);
     Some(musubi_server::http::router(state))
@@ -15574,4 +15575,230 @@ auth = "server"
     assert_eq!(st, StatusCode::BAD_REQUEST);
     let (st, _) = call_server(&app, "GET", "/v1/admin/idl", "defaultkey", None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// Plan 3.8: `[matches.*]` types the creation params and the module's JSON state,
+/// `[configs.*]` types server-written / client-read config documents.
+#[tokio::test]
+async fn idl_types_match_params_state_and_configs() {
+    let Some(app) = app().await else { return };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("idlm")})),
+    )
+    .await;
+    let t = s["access_token"].as_str().unwrap();
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let module = format!("tm{}", &sfx[..10]);
+    let cfg = format!("tuning_{}", &sfx[..10]);
+    // a match module whose init state is {"round":"x"} (base64) and whose other parts keep it
+    let reply = |off: usize, name: &str, json: &str| {
+        format!(
+            "  (data (i32.const {off}) \"{}\")\n  (func (export \"match_{module}_{name}\") (param i32 i32 i32 i32) (result i64)\n    i64.const {off} i64.const 32 i64.shl i64.const {} i64.or)\n",
+            json.replace('"', "\\\""),
+            json.len()
+        )
+    };
+    let mut wat = String::from(
+        "(module\n  (memory (export \"memory\") 1)\n  (global $heap (mut i32) (i32.const 4096))\n  (func (export \"alloc\") (param $n i32) (result i32) (local $p i32)\n    global.get $heap local.set $p\n    global.get $heap local.get $n i32.add global.set $heap\n    local.get $p)\n",
+    );
+    wat += &reply(
+        16,
+        "init",
+        r#"{"state":"eyJyb3VuZCI6IngifQ==","tick_rate":10,"label":"t"}"#,
+    );
+    wat += &reply(256, "join_attempt", r#"{"state":"","accept":true}"#);
+    wat += &reply(512, "join", r#"{"state":""}"#);
+    wat += &reply(768, "leave", r#"{"state":""}"#);
+    wat += &reply(1024, "tick", r#"{"state":""}"#);
+    wat += &reply(1280, "terminate", r#"{"state":""}"#);
+    wat += ")";
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/admin/runtime/modules/{module}"))
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/wasm")
+                .body(Body::from(wat.into_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let idl = |typed_state: bool| {
+        format!(
+            r#"
+[types.ArenaParams]
+rounds = {{ type = "int", min = 1, max = 9 }}
+[types.ArenaState]
+round = "int"
+[types.Tuning]
+speed = {{ type = "float", min = 0 }}
+[matches.{module}]
+params = "ArenaParams"
+{}
+[configs.{cfg}]
+type = "Tuning"
+version = 2
+"#,
+            if typed_state {
+                "state = \"ArenaState\""
+            } else {
+                ""
+            }
+        )
+    };
+    let (st, sum) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": idl(true) })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sum}");
+    assert_eq!(sum["matches"][0]["module"], module);
+    assert_eq!(sum["configs"][0]["version"], 2);
+
+    // params are validated before the match is launched
+    let (st, e) = call_server(
+        &app,
+        "POST",
+        "/v1/server/matches",
+        "defaultkey",
+        Some(json!({"module": module, "params": {"rounds": 0}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = call_server(
+        &app,
+        "POST",
+        "/v1/server/matches",
+        "defaultkey",
+        Some(json!({"module": module, "params": {"rounds": 3, "extra": 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    // valid params, but the module's state {"round":"x"} violates ArenaState
+    let (st, e) = call_server(
+        &app,
+        "POST",
+        "/v1/server/matches",
+        "defaultkey",
+        Some(json!({"module": module, "params": {"rounds": 3}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{e}");
+    assert!(e.to_string().contains("violates the IDL"), "{e}");
+    // without a declared state the same module runs
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": idl(false) })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, m) = call_server(
+        &app,
+        "POST",
+        "/v1/server/matches",
+        "defaultkey",
+        Some(json!({"module": module, "params": {"rounds": 3}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["label"], "t");
+
+    // configs: declared ones are typed and carry the declared version
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{cfg}"),
+        "defaultkey",
+        Some(json!({"value": {"speed": "fast"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{cfg}"),
+        "defaultkey",
+        Some(json!({"value": {"speed": -1.0}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, c) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{cfg}"),
+        "defaultkey",
+        Some(json!({"value": {"speed": 1.5}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["version"], 2);
+    // players read them with a token
+    let (st, c) = call(&app, "GET", &format!("/v1/configs/{cfg}"), Some(t), None).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["value"]["speed"], 1.5);
+    let (st, _) = call(&app, "GET", &format!("/v1/configs/{cfg}"), None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, l) = call(&app, "GET", "/v1/configs", Some(t), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        l["configs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == cfg),
+        "{l}"
+    );
+    // undeclared configs are free-form (version 1); names are checked
+    let free = format!("free_{}", &sfx[..10]);
+    let (st, c) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{free}"),
+        "defaultkey",
+        Some(json!({"value": {"anything": [1, 2]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["version"], 1);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/configs/bad%20name",
+        "defaultkey",
+        Some(json!({"value": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // the typed GET shows up in openapi
+    let (_, doc) = call(&app, "GET", "/openapi.json", None, None).await;
+    assert!(doc["paths"][format!("/v1/configs/{cfg}")]["get"].is_object());
+    for name in [&cfg, &free] {
+        let (st, d) = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/configs/{name}"),
+            "defaultkey",
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(d["deleted"], true);
+    }
+    let (st, _) = call(&app, "GET", &format!("/v1/configs/{cfg}"), Some(t), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    call_server(&app, "DELETE", "/v1/admin/idl", "defaultkey", None).await;
 }

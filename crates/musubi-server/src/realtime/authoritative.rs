@@ -38,6 +38,8 @@ pub struct MatchRegistry {
     epoch: i64,
     /// Matches created with `params.record = true`: every journal chunk is also kept for replay.
     recording: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    /// Deployed IDL, for `[matches.<module>] state` checks of WASM handlers.
+    idl: Arc<RwLock<Option<crate::idl::IdlRegistry>>>,
 }
 
 impl Default for MatchRegistry {
@@ -50,6 +52,7 @@ impl MatchRegistry {
     pub fn new(db: Option<PgPool>, node_id: Uuid) -> Self {
         let r = Self {
             handlers: RwLock::new(HashMap::new()),
+            idl: Arc::new(RwLock::new(None)),
             matches: Arc::new(DashMap::new()),
             by_session: DashMap::new(),
             db,
@@ -463,10 +466,19 @@ impl MatchRegistry {
         for m in &mods {
             self.register(
                 m,
-                Arc::new(super::wasm_match::WasmMatchHandler::new(runtime.clone(), m)),
+                Arc::new(
+                    super::wasm_match::WasmMatchHandler::new(runtime.clone(), m)
+                        .with_idl(self.idl.clone()),
+                ),
             );
         }
         mods
+    }
+
+    /// Attach the deployed IDL: WASM handlers validate their JSON state against
+    /// `[matches.<module>] state` (also handlers registered earlier).
+    pub fn set_idl(&self, idl: crate::idl::IdlRegistry) {
+        *self.idl.write() = Some(idl);
     }
 
     /// The handler registered for `module`, if this node loaded it.

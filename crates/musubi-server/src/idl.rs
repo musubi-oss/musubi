@@ -1,5 +1,6 @@
 //! Deployed IDL (plan 3.8): one TOML schema → storage collection contracts, `/v1/rpc/{name}`
-//! request validation and OpenAPI. Stored in `musubi.idl`; one document per cluster.
+//! request validation, typed match params/state, typed configs and OpenAPI. Stored in
+//! `musubi.idl`; one document per cluster.
 
 use std::sync::{Arc, RwLock};
 
@@ -45,6 +46,40 @@ impl IdlRegistry {
 
     pub fn get(&self) -> Option<Arc<Idl>> {
         self.current.read().ok().and_then(|g| g.clone())
+    }
+
+    /// `[matches.<module>] params`: validate the creation params of a match.
+    pub fn check_match_params(&self, module: &str, params: &Value) -> Result<()> {
+        let Some(idl) = self.get() else { return Ok(()) };
+        if let Some(schema) = idl.match_params_schema(module) {
+            let v = if params.is_null() {
+                json!({})
+            } else {
+                params.clone()
+            };
+            musubi_storage::schema::validate(&schema, &v)
+                .map_err(|e| Error::InvalidArgument(format!("match `{module}` params: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// `[matches.<module>] state`: the JSON Schema the module's state must satisfy, if declared.
+    pub fn match_state_schema(&self, module: &str) -> Option<Value> {
+        self.get()?.match_state_schema(module)
+    }
+
+    /// `[configs.<name>]`: validate a config document; returns its declared version
+    /// (undeclared configs are free-form, version 1).
+    pub fn check_config(&self, name: &str, value: &Value) -> Result<i32> {
+        let Some(idl) = self.get() else { return Ok(1) };
+        let Some(c) = idl.configs.get(name) else {
+            return Ok(1);
+        };
+        if let Some(schema) = idl.config_schema(name) {
+            musubi_storage::schema::validate(&schema, value)
+                .map_err(|e| Error::InvalidArgument(format!("config `{name}`: {e}")))?;
+        }
+        Ok(c.version)
     }
 
     /// Load the deployed document (if any) from the database.
@@ -140,6 +175,12 @@ fn summary(idl: &Idl, collections: &[Value]) -> Value {
         "types": idl.types.keys().collect::<Vec<_>>(),
         "enums": idl.enums.keys().collect::<Vec<_>>(),
         "collections": collections,
+        "matches": idl.matches.iter().map(|(n, m)| json!({
+            "module": n, "params": m.params, "state": m.state
+        })).collect::<Vec<_>>(),
+        "configs": idl.configs.iter().map(|(n, c)| json!({
+            "name": n, "type": c.ty, "version": c.version
+        })).collect::<Vec<_>>(),
         "rpcs": idl.rpcs.iter().map(|(n, r)| json!({
             "name": n, "input": r.input, "output": r.output, "auth": r.auth
         })).collect::<Vec<_>>(),

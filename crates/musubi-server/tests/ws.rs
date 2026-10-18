@@ -224,6 +224,7 @@ async fn build_state_cfg_with(
     };
     inner.idl = musubi_server::idl::IdlRegistry::new(inner.db.clone(), inner.storage.clone());
     inner.worlds.set_runtime(inner.runtime.clone());
+    inner.matches.set_idl(inner.idl.clone());
     if let Some(t) = tweak {
         t(&mut inner);
     }
