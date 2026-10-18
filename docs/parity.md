@@ -95,7 +95,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Матчмейкер: MMR-окно по времени, пинг, роли, команды, кроссплей, приоритет, ready-check, dodge | ✅ `QueueConfig` | ✅ | 🟡 query | ✅ | ✅ |
 | Backfill в живой матч / сервер | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Game flow: пати → очередь → инстанс → результаты → награды | ✅ `POST /v1/server/matches/{id}/results` — один отчёт: рейтинг-очередь, награды по рангу (под limited grants), квесты, XP, bracket турнира, шина; идемпотентно по матчу | ✅ | ❌ | 🟡 | ✅ |
-| Dedicated-серверы: провайдеры | ✅ local, docker, kubernetes (Agones-совместимый манифест), firecracker | 🟡 внешние | 🟡 FleetManager API | ✅ | ✅ AMS |
+| Dedicated-серверы: провайдеры | ✅ local, docker, kubernetes (Agones-совместимый манифест), firecracker (snapshot-restore + warm pool микроVM, identity через MMDS) | 🟡 внешние | 🟡 FleetManager API | ✅ | ✅ AMS |
 | Внешние оркестраторы как провайдеры (Edgegap, GameLift) | ✅ `provider = edgegap` (deploy/status/stop) и `gamelift` (CreateGameSession/Describe/Terminate, SigV4) рядом с local/docker/firecracker/k8s/agones | — | ✅ | — | — |
 | Автоскейл: буфер + прогноз по истории | ✅ `demand`/`scale` | ❌ | ❌ | ✅ | ✅ |
 | Scale-to-zero флота | ✅ min 0 + холодный старт при аллокации (ожидание готовности), прогноз по истории | ❌ | ❌ | ✅ | ✅ |

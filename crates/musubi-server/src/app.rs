@@ -1331,7 +1331,7 @@ fn firecracker_settings(
     bin: &str,
     c: &musubi_core::config::FirecrackerConfig,
 ) -> musubi_core::Result<musubi_fleet::firecracker::FirecrackerSettings> {
-    use musubi_fleet::firecracker::{FirecrackerNetwork, FirecrackerSettings};
+    use musubi_fleet::firecracker::{FirecrackerNetwork, FirecrackerSettings, FirecrackerSnapshot};
     let network = match (&c.bridge, &c.subnet, &c.gateway) {
         (None, None, None) => None,
         (Some(bridge), Some(subnet), Some(gateway)) => {
@@ -1363,6 +1363,11 @@ fn firecracker_settings(
         run_dir: c.run_dir.clone().into(),
         boot_args: c.boot_args.clone(),
         network,
+        snapshot: c.snapshot_dir.as_ref().map(|d| FirecrackerSnapshot {
+            dir: d.into(),
+            warm: c.warm_pool,
+            warm_boot_secs: c.warm_boot_secs,
+        }),
     })
 }
 

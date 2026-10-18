@@ -19,6 +19,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets", get(list).post(create))
         .route("/v1/server/fleets/{id}", get(get_one).delete(delete))
         .route("/v1/server/fleets/{id}/scale", post(scale))
+        .route(
+            "/v1/server/fleets/providers/{name}/prepare",
+            post(prepare_provider),
+        )
         .route("/v1/server/fleets/{id}/allocate", post(allocate))
         .route("/v1/server/allocate", post(allocate_routed))
         .route("/v1/server/fleets/{id}/servers", get(servers))
@@ -98,6 +102,14 @@ struct ScaleReq {
     max_servers: Option<i32>,
     min_servers: Option<i32>,
     policy: Option<ScalePolicy>,
+}
+
+async fn prepare_provider(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.fleets.prepare_provider(&name).await?))
 }
 
 async fn scale(

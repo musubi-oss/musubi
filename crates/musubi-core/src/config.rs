@@ -743,6 +743,12 @@ pub struct FirecrackerConfig {
     /// CIDR, e.g. `172.16.0.0/24`.
     pub subnet: Option<String>,
     pub gateway: Option<String>,
+    /// Snapshot-restore: `prepare` writes `vmstate` + `mem` here; starts restore instead of booting.
+    pub snapshot_dir: Option<String>,
+    /// Restored-and-paused VMs kept ahead of demand (needs `snapshot_dir`).
+    pub warm_pool: u32,
+    /// Seconds `prepare` waits for the guest's `musubi: warm` console line.
+    pub warm_boot_secs: u64,
 }
 
 impl Default for FirecrackerConfig {
@@ -758,6 +764,9 @@ impl Default for FirecrackerConfig {
             bridge: None,
             subnet: None,
             gateway: None,
+            snapshot_dir: None,
+            warm_pool: 0,
+            warm_boot_secs: 5,
         }
     }
 }

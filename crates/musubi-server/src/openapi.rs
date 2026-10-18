@@ -487,6 +487,11 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/server/workflows/{id}/signal", "workflows"),
     ("POST", "/v1/server/workflows/{id}/cancel", "workflows"),
     ("POST", "/v1/server/fleets/{id}/scale", "fleets"),
+    (
+        "POST",
+        "/v1/server/fleets/providers/{name}/prepare",
+        "fleets",
+    ),
     ("GET", "/v1/server/fleets/{id}/servers", "fleets"),
     ("DELETE", "/v1/server/gameservers/{id}", "fleets"),
     ("GET", "/v1/server/gameservers/{id}", "fleets"),

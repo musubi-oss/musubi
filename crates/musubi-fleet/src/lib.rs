@@ -369,6 +369,18 @@ pub trait Provider: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
     /// `Some(false)` when the provider knows the process/container is gone.
     fn alive(&self, server_id: Uuid) -> Option<bool>;
+    /// One-off preparation that makes later starts faster (firecracker: boot once, snapshot,
+    /// fill the warm pool). Providers without such a step reject.
+    fn prepare<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(Error::InvalidArgument(
+                "this provider has no prepare step".into(),
+            ))
+        })
+    }
 }
 
 /// Child processes on this node.
@@ -589,6 +601,14 @@ impl FleetService {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), provider);
+    }
+
+    /// `POST /v1/server/fleets/providers/{name}/prepare`.
+    pub async fn prepare_provider(&self, name: &str) -> Result<serde_json::Value> {
+        let p = self
+            .provider_of(name)
+            .ok_or_else(|| Error::NotFound(format!("provider {name}")))?;
+        p.prepare().await
     }
 
     fn provider_of(&self, name: &str) -> Option<Arc<dyn Provider>> {

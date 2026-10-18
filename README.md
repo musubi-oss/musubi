@@ -363,6 +363,21 @@ and stops it with `DELETE {url}/servers/{id}`. Three endpoints put GameFabric, a
 scheduler or a bare-metal panel behind the same fleets, buffers, autoscaling and allocation
 API as Docker, Kubernetes, Firecracker, Edgegap and GameLift.
 
+### Firecracker snapshots and warm pool
+
+A microVM that boots a kernel takes a second; one restored from a snapshot takes tens of
+milliseconds. With `[fleet.firecracker] snapshot_dir = "/var/lib/musubi/firecracker/snap"`,
+`POST /v1/server/fleets/providers/firecracker/prepare` boots one VM with `musubi.warm=1`, waits
+up to `warm_boot_secs` for the guest to print `musubi: warm` (server loaded, nothing bound),
+pauses it and writes a full snapshot (`vmstate` + `mem`). From then on every start spawns a bare
+VMM, `PUT /snapshot/load`s the snapshot paused, hands the identity over MMDS (the kernel command
+line is frozen in the snapshot) and resumes. `warm_pool = N` keeps N VMs restored-and-paused
+ahead of demand — a start then is MMDS + resume — and a background task refills the pool.
+Guest contract on resume: `GET http://169.254.169.254/` returns `{server_id, fleet_id, port,
+api, server_key, env, ip?, gateway?, mask?}`; configure `eth0` from `ip/gateway/mask` when present
+(each VM gets its own tap and address via `network_overrides`) and start the server exactly as
+after a cold boot. Re-run `prepare` after a build change — the snapshot carries the loaded binary.
+
 ### Durable workflows (sagas)
 
 Long-running server logic — a trade with a 24-hour escrow, a tournament payout, a cross-game
