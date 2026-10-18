@@ -134,6 +134,9 @@ pub struct SessionConfig {
     pub login_queue_admit_per_sec: u32,
     /// A queued client that has not polled for this long loses its place.
     pub login_queue_ttl_secs: u64,
+    /// Live sessions (refresh-token families) one account may hold; a new login evicts the oldest
+    /// beyond this. 0 = unlimited.
+    pub max_sessions_per_account: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +195,7 @@ impl Default for SessionConfig {
             lockout_base_secs: 30,
             lockout_max_secs: 15 * 60,
             captcha_after: 3,
+            max_sessions_per_account: 0,
             captcha_verify_url: None,
             captcha_secret: None,
             login_queue_capacity: 0,

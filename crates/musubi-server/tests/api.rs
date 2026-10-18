@@ -13377,3 +13377,182 @@ async fn progress_graphs_skill_tree_and_timed_unlockables() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "nothing to reset");
 }
+
+/// Magic-link login (passwordless, verifies the address), custom auth minted by the server key,
+/// and the per-account session cap.
+#[tokio::test]
+async fn magic_link_custom_auth_and_session_cap() {
+    let Some(app) = app_with(|c| c.session.max_sessions_per_account = 2).await else {
+        return;
+    };
+    let k = "defaultkey";
+    let email = format!("{}@example.test", unique("magic"));
+    // unknown address with create:false → 200 but no link
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/magic/request",
+        None,
+        Some(json!({"email": email, "create": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let token_for = |email: String| {
+        let app = app.clone();
+        async move {
+            let (st, ev) = call_server(
+                &app,
+                "GET",
+                "/v1/server/events?kinds=account.magic_link&limit=1000",
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{ev}");
+            ev["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    if e["payload"].is_object() {
+                        &e["payload"]
+                    } else {
+                        &e["data"]
+                    }
+                })
+                .filter(|p| p["email"] == email)
+                .map(|p| p["token"].as_str().unwrap().to_string())
+                .next_back()
+        }
+    };
+    assert!(
+        token_for(email.clone()).await.is_none(),
+        "create:false must not mint a link"
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/magic/request",
+        None,
+        Some(json!({"email": email})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let token = token_for(email.clone()).await.expect("magic link token");
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/magic",
+        None,
+        Some(json!({"token": token, "vars": {"via": "magic"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/magic",
+        None,
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "single use: {r}");
+    let (_, me) = call(&app, "GET", "/v1/account", Some(&tok), None).await;
+    assert!(
+        me["identities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["provider"] == "email" && i["verified"] == true),
+        "{me}"
+    );
+    // the same address asks again → same account
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/magic/request",
+        None,
+        Some(json!({"email": email})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let token2 = token_for(email.clone()).await.unwrap();
+    assert_ne!(token, token2);
+    let (_, sess2) = call(
+        &app,
+        "POST",
+        "/v1/auth/email/magic",
+        None,
+        Some(json!({"token": token2})),
+    )
+    .await;
+    assert_eq!(sess2["account_id"], sess["account_id"]);
+    // custom auth: server key only, stable mapping id → account
+    let id = unique("launcher");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        None,
+        Some(json!({"id": id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, c1) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c1}");
+    let (_, c2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": id})),
+    )
+    .await;
+    assert_eq!(c1["account_id"], c2["account_id"]);
+    assert!(c2["created"].is_null() || c2["created"] == false);
+    // session cap 2: a third login evicts the oldest session
+    let dev = unique("capdevice00");
+    let mut sessions = Vec::new();
+    for _ in 0..3 {
+        let (st, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": dev})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{s}");
+        sessions.push(s);
+    }
+    let newest = sessions[2]["access_token"].as_str().unwrap().to_string();
+    let (st, list) = call(&app, "GET", "/v1/account/sessions", Some(&newest), None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 2, "{list}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": sessions[0]["refresh_token"]})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "evicted session must not refresh: {r}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": sessions[2]["refresh_token"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}

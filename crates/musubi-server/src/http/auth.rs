@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::app::AppState;
+use crate::http::ServerKey;
 use crate::http::{ApiError, Bearer};
 
 pub fn routes() -> Router<AppState> {
@@ -27,6 +28,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/email/verify", post(verify))
         .route("/v1/auth/email/reset/request", post(reset_request))
         .route("/v1/auth/email/reset", post(reset))
+        .route("/v1/auth/email/magic/request", post(magic_request))
+        .route("/v1/auth/email/magic", post(magic))
+        .route("/v1/server/auth/custom", post(custom))
         .route("/v1/account/me", get(me))
         .route("/v1/account/sessions", get(sessions))
         .route(
@@ -387,6 +391,87 @@ async fn reset_request(
             .await;
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+const MAGIC_TTL_SECS: i64 = 15 * 60;
+
+#[derive(Deserialize)]
+struct MagicReq {
+    email: String,
+    /// Create the account when the address is unknown (default true).
+    #[serde(default = "default_true")]
+    create: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Passwordless login, step 1: always 200 (no account enumeration); emits `account.magic_link`
+/// with the token so the game's mailer sends the link. Unknown addresses get a fresh account
+/// unless `create: false`.
+async fn magic_request(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<MagicReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    if let Some(account) = s.auth.magic_account(&r.email, r.create).await? {
+        let email = r.email.trim().to_lowercase();
+        let token = mint_token(&s, account, "magic", &email, MAGIC_TTL_SECS).await?;
+        s.events
+            .emit(
+                "account.magic_link",
+                Some(account),
+                json!({ "account_id": account, "email": email, "token": token, "expires_in_secs": MAGIC_TTL_SECS }),
+            )
+            .await;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct MagicLoginReq {
+    token: String,
+    #[serde(flatten)]
+    opts: musubi_auth::AuthOptions,
+}
+
+/// Passwordless login, step 2: the single-use token from the link becomes a session and marks
+/// the address verified.
+async fn magic(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<MagicLoginReq>,
+) -> Result<Json<Session>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let Some((account, email)) = consume_token(&s, &r.token, "magic").await? else {
+        return Err(musubi_core::Error::NotFound("token unknown, used or expired".into()).into());
+    };
+    let sess = s.auth.authenticate_magic(account, &email, r.opts).await?;
+    authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0);
+    Ok(Json(sess))
+}
+
+#[derive(Deserialize)]
+struct CustomReq {
+    /// The game's own stable id for the player (already verified by the caller).
+    id: String,
+    #[serde(flatten)]
+    opts: musubi_auth::AuthOptions,
+}
+
+/// Custom authentication: a trusted game server (server key) mints a session for an identity it
+/// verified itself — its own accounts, a launcher token, a publisher SSO…
+async fn custom(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    ip: super::ClientIp,
+    Json(r): Json<CustomReq>,
+) -> Result<Json<Session>, ApiError> {
+    let sess = s.auth.authenticate_custom(&r.id, r.opts).await?;
+    authenticated(&s, &sess, musubi_auth::provider::CUSTOM, &ip.0);
+    Ok(Json(sess))
 }
 
 #[derive(Deserialize)]

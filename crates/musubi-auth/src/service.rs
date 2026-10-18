@@ -78,6 +78,7 @@ pub struct AuthService {
     db: PgPool,
     signer: TokenSigner,
     refresh_ttl_secs: u64,
+    max_sessions: u32,
     lockout: Lockout,
     captcha: Arc<std::sync::RwLock<Option<CaptchaVerifier>>>,
     queue: Arc<std::sync::RwLock<Option<LoginQueue>>>,
@@ -149,6 +150,7 @@ impl AuthService {
             db,
             signer: TokenSigner::from_config(cfg)?,
             refresh_ttl_secs: cfg.refresh_ttl_secs,
+            max_sessions: cfg.max_sessions_per_account,
             lockout: Lockout {
                 threshold: cfg.lockout_threshold,
                 base_secs: cfg.lockout_base_secs.max(1),
@@ -983,6 +985,52 @@ impl AuthService {
         .await
     }
 
+    /// Trusted identity minted by the game server (its own id / token already verified there).
+    pub async fn authenticate_custom(&self, subject: &str, opts: AuthOptions) -> Result<Session> {
+        self.authenticate_external(provider::CUSTOM, subject, opts)
+            .await
+    }
+
+    /// Account a magic link is minted for: the owner of `email`, or a fresh account when
+    /// `create` (the address is verified when the link is used).
+    pub async fn magic_account(&self, email: &str, create: bool) -> Result<Option<AccountId>> {
+        let email = email.trim().to_lowercase();
+        if !email.contains('@') || email.len() > 254 {
+            return Err(Error::InvalidArgument("invalid email".into()));
+        }
+        if let Some(a) = self.account_by_email(&email).await? {
+            return Ok(Some(a));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let opts: AuthOptions = serde_json::from_value(serde_json::json!({}))?;
+        let (a, _) = self
+            .find_or_create(provider::EMAIL, &email, None, &opts)
+            .await?;
+        Ok(Some(a))
+    }
+
+    /// Opens a session for a consumed magic link; proves ownership, so the email is verified.
+    pub async fn authenticate_magic(
+        &self,
+        account_id: AccountId,
+        email: &str,
+        opts: AuthOptions,
+    ) -> Result<Session> {
+        self.mark_email_verified(account_id, email).await?;
+        self.open_session(
+            account_id,
+            false,
+            opts.vars,
+            Device {
+                device_id: None,
+                user_agent: None,
+            },
+        )
+        .await
+    }
+
     pub async fn link_external(
         &self,
         account_id: AccountId,
@@ -1258,6 +1306,17 @@ impl AuthService {
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
+        if self.max_sessions > 0 {
+            sqlx::query(
+                "delete from musubi.sessions where account_id = $1 and id in (
+                   select id from musubi.sessions where account_id = $1 order by expires_at desc, id desc offset $2)",
+            )
+            .bind(account_id.0)
+            .bind(self.max_sessions as i64)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        }
         let claims = Claims {
             sub: account_id,
             sid: session_id,

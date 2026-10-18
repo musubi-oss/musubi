@@ -209,6 +209,9 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ auth: magic-link (`POST /v1/auth/email/magic/request` → событие `account.magic_link` с токеном → `POST /v1/auth/email/magic`,
+  одноразовый, 15 мин, адрес становится verified), custom auth (`POST /v1/server/auth/custom {id}` под серверным ключом),
+  лимит сессий на аккаунт (`session.max_sessions_per_account`, новая вытесняет самую старую).
   ✅ графы прогресса (skill trees + unlockables с таймерами): узлы с пререквизитами, ценой, требованием уровня, рангами,
   таймером (`unlock_seconds`) и ускорением за валюту (`skip_cost_per_hour`), таблицей наград и payload `grants`;
   `GET /v1/graphs`, `unlock`/`claim`/`skip`/`reset` (с частичным возвратом).

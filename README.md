@@ -317,6 +317,15 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Magic links, custom auth, session cap
+
+`POST /v1/auth/email/magic/request {email, create?}` emits `account.magic_link` with a single-use
+token (15 min) for your mailer; `POST /v1/auth/email/magic {token, vars?}` turns it into a session
+and marks the address verified — passwordless login without account enumeration. A trusted game
+server mints sessions for identities it verified itself with `POST /v1/server/auth/custom {id}`
+(server key). `session.max_sessions_per_account` caps live sessions per account; a new login
+evicts the oldest.
+
 ### Progress graphs: skill trees and timed unlockables
 
 `POST /v1/server/graphs` defines a graph of nodes; each node has prerequisites (`requires`), a
