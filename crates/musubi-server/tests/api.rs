@@ -14879,3 +14879,258 @@ async fn server_tx_all_or_nothing() {
     let (st, _) = call_server(&app, "POST", "/v1/server/tx", k, Some(json!({"ops": []}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn inventory_rules_unique_bind_equip_limits() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("inv")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let helmet = unique("helmet");
+    let ring = unique("ring");
+    let badge = unique("badge");
+    let gem = unique("gem");
+    let gem_cat = unique("gemcat");
+    for body in [
+        json!({"id": helmet, "name": "Helmet", "category": "armor", "stackable": false, "unique": true, "bind": "equip",
+               "slots": ["head"], "instance_schema": {"type": "object", "properties": {"durability": {"type": "integer", "minimum": 0, "maximum": 100}}}}),
+        json!({"id": ring, "name": "Ring", "category": "armor", "stackable": false, "slots": ["ring1", "ring2"]}),
+        json!({"id": badge, "name": "Badge", "category": "badge", "stackable": false, "tradeable": false}),
+        json!({"id": gem, "name": "Gem", "category": gem_cat, "stackable": false}),
+    ] {
+        let (st, r) = call_server(&app, "POST", "/v1/server/items", k, Some(body)).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let (_, def) = call_server(&app, "GET", &format!("/v1/server/items/{helmet}"), k, None).await;
+    assert_eq!(def["unique"], true);
+    assert_eq!(def["bind"], "equip");
+    assert_eq!(def["slots"], json!(["head"]));
+    assert_eq!(def["tradeable"], true);
+    // a re-upsert without the rule fields keeps them
+    let (st, def) = call_server(&app, "POST", "/v1/server/items", k, Some(json!({"id": helmet, "name": "Helmet", "category": "armor", "stackable": false, "instance_schema": def["instance_schema"]}))).await;
+    assert_eq!(st, StatusCode::OK, "{def}");
+    assert_eq!(def["bind"], "equip");
+    assert_eq!(def["slots"], json!(["head"]));
+
+    let grant = |item: String, instance: Value| {
+        let app = app.clone();
+        let acc = acc.clone();
+        async move {
+            call_server(&app, "POST", "/v1/server/inventory/grant", k, Some(json!({"account_id": acc, "item_id": item, "quantity": 1, "instance": instance}))).await
+        }
+    };
+    // unique: one per account
+    let (st, h) = grant(helmet.clone(), json!({"durability": 100})).await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    assert_eq!(h["bound"], false);
+    assert!(h["slot"].is_null());
+    let helmet_id = h["id"].as_str().unwrap().to_string();
+    let (st, r) = grant(helmet.clone(), json!({})).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+
+    // equip binds (bind = equip) and refuses foreign slots
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/inventory/equip",
+        Some(&tok),
+        Some(json!({"id": helmet_id, "slot": "ring1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/inventory/equip",
+        Some(&tok),
+        Some(json!({"id": helmet_id, "slot": "head"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["slot"], "head");
+    assert_eq!(r["bound"], true);
+
+    // slots are exclusive: equipping a third ring into ring1 takes the first one off
+    let mut rings = Vec::new();
+    for _ in 0..3 {
+        let (st, r) = grant(ring.clone(), json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        rings.push(r["id"].as_str().unwrap().to_string());
+    }
+    for (id, slot) in [
+        (&rings[0], "ring1"),
+        (&rings[1], "ring2"),
+        (&rings[2], "ring1"),
+    ] {
+        let (st, r) = call(
+            &app,
+            "POST",
+            "/v1/inventory/equip",
+            Some(&tok),
+            Some(json!({"id": id, "slot": slot})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!(r["slot"], slot);
+        assert_eq!(r["bound"], false, "rings do not bind");
+    }
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    let slot_of = |id: &str| {
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .map(|e| e["slot"].clone())
+            .unwrap()
+    };
+    assert!(slot_of(&rings[0]).is_null());
+    assert_eq!(slot_of(&rings[1]), "ring2");
+    assert_eq!(slot_of(&rings[2]), "ring1");
+    assert_eq!(slot_of(&helmet_id), "head");
+
+    // bound / equipped / untradeable entries stay off the market
+    let list = |id: String| {
+        let app = app.clone();
+        let tok = tok.clone();
+        let gold = gold.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/v1/market/listings",
+                Some(&tok),
+                Some(json!({"inventory_id": id, "currency": gold, "buyout": 10})),
+            )
+            .await
+        }
+    };
+    let (st, r) = list(helmet_id.clone()).await;
+    assert_eq!(st, StatusCode::CONFLICT, "bound: {r}");
+    let (st, r) = list(rings[2].clone()).await;
+    assert_eq!(st, StatusCode::CONFLICT, "equipped: {r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/inventory/unequip",
+        Some(&tok),
+        Some(json!({"id": rings[2]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(r["slot"].is_null());
+    let (st, r) = list(rings[2].clone()).await;
+    assert_eq!(st, StatusCode::OK, "unequipped ring lists: {r}");
+    let (st, b) = grant(badge.clone(), json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, r) = list(b["id"].as_str().unwrap().to_string()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "untradeable: {r}");
+    // the helmet stays bound after unequip
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/inventory/unequip",
+        Some(&tok),
+        Some(json!({"id": helmet_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["bound"], true);
+    assert!(r["slot"].is_null());
+
+    // server-side instance patch honours the schema
+    let path = format!("/v1/server/inventory/{helmet_id}/instance");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({"account_id": acc, "merge": {"durability": 40}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["instance"]["durability"], 40);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({"account_id": acc, "merge": {"durability": 500}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({"account_id": uuid::Uuid::now_v7().to_string(), "merge": {"durability": 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    let h = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == helmet_id)
+        .unwrap();
+    assert_eq!(h["instance"]["durability"], 40);
+
+    // per-category entry limits
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/inventory/limits",
+        k,
+        Some(json!({"category": gem_cat, "max_entries": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(r["limits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l["category"] == gem_cat && l["max_entries"] == 2));
+    for _ in 0..2 {
+        let (st, r) = grant(gem.clone(), json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let (st, r) = grant(gem.clone(), json!({})).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/inventory/limits",
+        k,
+        Some(json!({"category": gem_cat, "max_entries": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(!r["limits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l["category"] == gem_cat));
+    let (st, r) = grant(gem.clone(), json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+}

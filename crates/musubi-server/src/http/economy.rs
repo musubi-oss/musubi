@@ -26,6 +26,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/wallet/ledger", get(ledger))
         .route("/v1/inventory", get(inventory))
         .route("/v1/inventory/consume", post(consume))
+        .route("/v1/inventory/equip", post(equip))
+        .route("/v1/inventory/unequip", post(unequip))
         .route("/v1/store", get(store))
         .route("/v1/store/buy", post(buy))
         .route("/v1/rewards/tables", get(reward_tables))
@@ -156,6 +158,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/items/{id}/migrate", post(item_migrate))
         .route("/v1/server/items/{id}/convert", post(item_convert))
         .route("/v1/server/inventory/grant", post(grant_item))
+        .route(
+            "/v1/server/inventory/limits",
+            get(inventory_limits).put(set_inventory_limit),
+        )
+        .route("/v1/server/inventory/{id}/instance", post(update_instance))
         .route(
             "/v1/server/crafting/recipes",
             get(recipes_all).put(put_recipe),
@@ -2589,5 +2596,79 @@ async fn crafting_log(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         json!({ "crafts": s.economy.crafting_log(me.account_id, q.limit).await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct EquipReq {
+    id: Uuid,
+    slot: String,
+}
+
+async fn equip(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<EquipReq>,
+) -> Result<Json<Value>, ApiError> {
+    let e = s.economy.equip(me.account_id, r.id, &r.slot).await?;
+    Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct UnequipReq {
+    id: Uuid,
+}
+
+async fn unequip(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<UnequipReq>,
+) -> Result<Json<Value>, ApiError> {
+    let e = s.economy.unequip(me.account_id, r.id).await?;
+    Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct InstanceReq {
+    account_id: String,
+    merge: Value,
+}
+
+async fn update_instance(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(r): Json<InstanceReq>,
+) -> Result<Json<Value>, ApiError> {
+    let who = account(&r.account_id)?;
+    let e = s.economy.update_instance(who, id, r.merge).await?;
+    Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+}
+
+async fn inventory_limits(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "limits": s.economy.inventory_limits().await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct InventoryLimitReq {
+    category: String,
+    max_entries: i32,
+}
+
+async fn set_inventory_limit(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<InventoryLimitReq>,
+) -> Result<Json<Value>, ApiError> {
+    s.economy
+        .set_inventory_limit(&r.category, r.max_entries)
+        .await?;
+    Ok(Json(
+        json!({ "limits": s.economy.inventory_limits().await? }),
     ))
 }

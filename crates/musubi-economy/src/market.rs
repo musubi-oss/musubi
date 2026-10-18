@@ -299,17 +299,29 @@ impl EconomyService {
         quantity: i64,
     ) -> Result<EscrowItem> {
         check_amount(quantity, "quantity")?;
-        let row: Option<(String, i64, Value)> = sqlx::query_as(
-            "select item_id, quantity, instance from musubi.inventory where id = $1 and account_id = $2 for update",
+        let row: Option<(String, i64, Value, bool, bool)> = sqlx::query_as(
+            "select i.item_id, i.quantity, i.instance, i.bound or i.slot is not null, d.tradeable
+             from musubi.inventory i join musubi.items d on d.id = i.item_id
+             where i.id = $1 and i.account_id = $2 for update of i",
         )
         .bind(entry_id)
         .bind(account.0)
         .fetch_optional(&mut **tx)
         .await
         .map_err(Error::internal)?;
-        let Some((item_id, have, instance)) = row else {
+        let Some((item_id, have, instance, locked, tradeable)) = row else {
             return Err(Error::NotFound("inventory entry".into()));
         };
+        if !tradeable {
+            return Err(Error::PermissionDenied(format!(
+                "{item_id} is not tradeable"
+            )));
+        }
+        if locked {
+            return Err(Error::Conflict(format!(
+                "{item_id} entry is bound or equipped"
+            )));
+        }
         if have < quantity {
             return Err(Error::ResourceExhausted(format!(
                 "have {have} of {item_id}, offering {quantity}"
@@ -347,9 +359,21 @@ impl EconomyService {
         quantity: i64,
     ) -> Result<Vec<EscrowItem>> {
         check_amount(quantity, "quantity")?;
+        let tradeable: Option<(bool,)> =
+            sqlx::query_as("select tradeable from musubi.items where id = $1")
+                .bind(item_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(Error::internal)?;
+        if tradeable.is_some_and(|t| !t.0) {
+            return Err(Error::PermissionDenied(format!(
+                "{item_id} is not tradeable"
+            )));
+        }
+        // bound or equipped entries stay out of trades
         let rows: Vec<(Uuid, i64, Value)> = sqlx::query_as(
             "select id, quantity, instance from musubi.inventory where account_id = $1 and item_id = $2
-             order by created_at for update",
+             and not bound and slot is null order by created_at for update",
         )
         .bind(account.0)
         .bind(item_id)

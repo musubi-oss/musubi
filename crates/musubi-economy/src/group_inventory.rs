@@ -83,8 +83,8 @@ impl EconomyService {
             return Err(Error::InvalidArgument("quantity must be positive".into()));
         }
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        let row: Option<(String, i64, bool)> = sqlx::query_as(
-            "select i.item_id, i.quantity, it.stackable from musubi.inventory i
+        let row: Option<(String, i64, bool, bool)> = sqlx::query_as(
+            "select i.item_id, i.quantity, it.stackable, i.bound or i.slot is not null or not it.tradeable from musubi.inventory i
              join musubi.items it on it.id = i.item_id
              where i.id = $1 and i.account_id = $2 for update of i",
         )
@@ -93,9 +93,14 @@ impl EconomyService {
         .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        let Some((item_id, have, stackable)) = row else {
+        let Some((item_id, have, stackable, locked)) = row else {
             return Err(Error::NotFound("inventory entry".into()));
         };
+        if locked {
+            return Err(Error::Conflict(format!(
+                "{item_id} entry is bound, equipped or not tradeable"
+            )));
+        }
         if !stackable {
             return Err(Error::InvalidArgument(
                 "only stackable items can be pooled in a group inventory".into(),

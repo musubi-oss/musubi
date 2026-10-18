@@ -346,6 +346,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/iap/steam/init", "economy"),
     ("GET", "/v1/inventory", "economy"),
     ("POST", "/v1/inventory/consume", "economy"),
+    ("POST", "/v1/inventory/equip", "economy"),
+    ("POST", "/v1/inventory/unequip", "economy"),
     ("GET", "/v1/leaderboards", "leaderboards"),
     ("GET", "/v1/leaderboards/{id}", "leaderboards"),
     (
@@ -493,6 +495,9 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/iap/receipts", "economy"),
     ("POST", "/v1/server/iap/steam/reconcile", "economy"),
     ("POST", "/v1/server/inventory/grant", "economy"),
+    ("GET", "/v1/server/inventory/limits", "economy"),
+    ("PUT", "/v1/server/inventory/limits", "economy"),
+    ("POST", "/v1/server/inventory/{id}/instance", "economy"),
     ("GET", "/v1/server/grant_limits", "economy"),
     ("PUT", "/v1/server/grant_limits", "economy"),
     ("DELETE", "/v1/server/grant_limits/{kind}/{key}", "economy"),
