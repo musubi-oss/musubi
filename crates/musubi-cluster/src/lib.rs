@@ -582,6 +582,16 @@ impl Cluster {
             set.spawn(async move {
                 let r = tokio::time::timeout(QUIC_SEND_TIMEOUT, bus.send(&p, &bytes)).await;
                 let ok = matches!(r, Ok(Ok(())));
+                // a peer that already failed to connect (backoff) or that SWIM holds suspect is
+                // almost surely down: the first failure got its Postgres copy, repeating that for
+                // every message turns a dead node into a NOTIFY storm against the live ones (the
+                // stand saw ~4000 in 8 s and the bus "resource exhausted"); it catches up from
+                // snapshots and journals when it is back
+                let backoff = matches!(&r, Ok(Err(Error::Unavailable(m))) if m.ends_with("(backoff)"));
+                if backoff || (!ok && p.state == "suspect") {
+                    tracing::debug!(peer = %p.id.0, state = %p.state, "quic bus delivery skipped: peer down");
+                    return (p.id, true);
+                }
                 metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "tx", "ok" => if ok { "true" } else { "false" }).increment(1);
                 metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "tx").increment(bytes.len() as u64);
                 if !ok {
