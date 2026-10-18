@@ -7,7 +7,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p musubi-server && cp target/release/musubi-server /musubi-server
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 musubi
 COPY --from=build /musubi-server /usr/local/bin/musubi-server
 USER musubi

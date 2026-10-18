@@ -1,0 +1,82 @@
+#cloud-config
+package_update: true
+packages: [ca-certificates, curl, gnupg, openssh-client]
+users:
+  - name: musubi
+    system: true
+    shell: /usr/sbin/nologin
+    homedir: /var/lib/musubi
+write_files:
+  - path: /etc/musubi/musubi.toml
+    permissions: "0640"
+    owner: root:musubi
+    defer: true
+    content: |
+      [node]
+      name = "${node_name}"
+      [http]
+      listen = "0.0.0.0:${http_port}"
+      server_key = "${server_key}"
+      [quic]
+      listen = "0.0.0.0:${udp_port}"
+      [database]
+      url = "${database_url}"
+      run_migrations = true
+      [session]
+      secret = "${session_secret}"
+      [cluster]
+%{ if has_fleet ~}
+      [fleet.ssh]
+      hosts = [
+${fleet_hosts_toml}
+      ]
+%{ endif ~}
+      ${indent(6, extra_config)}
+%{ if has_fleet ~}
+  - path: /etc/musubi/fleet_key
+    permissions: "0600"
+    owner: musubi:musubi
+    defer: true
+    content: |
+      ${indent(6, fleet_private_key)}
+%{ endif ~}
+  - path: /etc/systemd/system/musubi.service
+    content: |
+      [Unit]
+      Description=Musubi game backend
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      User=musubi
+      Group=musubi
+      Environment=MUSUBI_CONFIG=/etc/musubi/musubi.toml
+      ExecStart=/usr/local/bin/musubi-server
+      Restart=always
+      RestartSec=2
+      LimitNOFILE=1048576
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/sbin/musubi-pull.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # extract the server binary from the container image and (re)start the service
+      set -euo pipefail
+      docker pull "${musubi_image}"
+      id=$(docker create "${musubi_image}")
+      docker cp "$id:/usr/local/bin/musubi-server" /usr/local/bin/musubi-server.new
+      docker rm "$id" >/dev/null
+      install -m 0755 /usr/local/bin/musubi-server.new /usr/local/bin/musubi-server
+      rm -f /usr/local/bin/musubi-server.new
+      systemctl daemon-reload
+      systemctl enable musubi
+      systemctl restart musubi
+runcmd:
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli
+  - mkdir -p /var/lib/musubi/.ssh && chown -R musubi:musubi /var/lib/musubi
+  - /usr/local/sbin/musubi-pull.sh

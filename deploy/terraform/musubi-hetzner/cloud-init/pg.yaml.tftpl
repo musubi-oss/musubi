@@ -1,0 +1,38 @@
+#cloud-config
+package_update: true
+packages: [postgresql-16, postgresql-contrib]
+write_files:
+  - path: /usr/local/sbin/musubi-pg-setup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      DEV=/dev/disk/by-id/scsi-0HC_Volume_${volume_id}
+      for i in $(seq 1 60); do [ -e "$DEV" ] && break; sleep 2; done
+      systemctl stop postgresql
+      mkdir -p /var/lib/postgresql/16
+      if ! grep -q "$DEV" /etc/fstab; then
+        blkid "$DEV" >/dev/null 2>&1 || mkfs.ext4 -F "$DEV"
+        echo "$DEV /var/lib/postgresql/16 ext4 defaults,nofail 0 2" >> /etc/fstab
+        mount /var/lib/postgresql/16 || true
+        chown -R postgres:postgres /var/lib/postgresql/16
+        [ -d /var/lib/postgresql/16/main ] || sudo -u postgres /usr/lib/postgresql/16/bin/initdb -D /var/lib/postgresql/16/main
+      fi
+      PRIV=$(ip -4 -o addr show | awk '$4 ~ /^10\.90\./ {split($4,a,"/"); print a[1]}' | head -1)
+      CONF=/etc/postgresql/16/main/postgresql.conf
+      sed -i "s/^#\?listen_addresses.*/listen_addresses = 'localhost,$PRIV'/" $CONF
+      sed -i "s/^#\?max_connections.*/max_connections = 500/" $CONF
+      sed -i "s/^#\?shared_buffers.*/shared_buffers = 1GB/" $CONF
+      grep -q "10.90.0.0/16" /etc/postgresql/16/main/pg_hba.conf || echo "host all musubi 10.90.0.0/16 scram-sha-256" >> /etc/postgresql/16/main/pg_hba.conf
+      systemctl enable --now postgresql
+      for i in $(seq 1 30); do sudo -u postgres pg_isready && break; sleep 1; done
+      sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+      do \$\$ begin
+        if not exists (select from pg_roles where rolname = 'musubi') then
+          create role musubi login password '${password}';
+        end if;
+      end \$\$;
+      SQL
+      sudo -u postgres psql -tc "select 1 from pg_database where datname = 'musubi'" | grep -q 1 || sudo -u postgres createdb -O musubi musubi
+runcmd:
+  - [/usr/local/sbin/musubi-pg-setup.sh]

@@ -1,0 +1,21 @@
+#cloud-config
+package_update: true
+packages: [ca-certificates, curl, tar]
+users:
+  - name: musubi
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${fleet_public_key}
+write_files:
+  - path: /etc/sysctl.d/90-musubi.conf
+    content: |
+      net.core.rmem_max = 8388608
+      net.core.wmem_max = 8388608
+      net.ipv4.udp_mem = 262144 524288 1048576
+runcmd:
+  - sysctl --system
+  - mkdir -p /opt/game && chown musubi:musubi /opt/game
+%{ if game_server_url != "" ~}
+  - su -s /bin/bash musubi -c "curl -fsSL '${game_server_url}' | tar -xz -C /opt/game"
+%{ endif ~}
