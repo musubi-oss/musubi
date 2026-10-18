@@ -18912,3 +18912,162 @@ async fn matchmaker_tickets_carry_audiences() {
         ServerMessage::MatchmakerMatched { .. }
     ));
 }
+
+/// Plan 5.8 v2 typed state: a module with `[matches.m] state` gets its public JSON state
+/// pushed to players — a `match_state` snapshot on join and `match_state_delta` patches after
+/// handler calls; `sync_exclude` paths never leave the node.
+#[tokio::test]
+async fn typed_match_state_syncs_snapshot_and_deltas() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let module = format!("sync{}", &sfx[..8]);
+    let reply = |off: usize, name: &str, json: &str| {
+        format!(
+            "  (data (i32.const {off}) \"{}\")\n  (func (export \"match_{module}_{name}\") (param i32 i32 i32 i32) (result i64)\n    i64.const {off} i64.const 32 i64.shl i64.const {} i64.or)\n",
+            json.replace('"', "\\\""),
+            json.len()
+        )
+    };
+    let mut wat = String::from(
+        "(module\n  (memory (export \"memory\") 1)\n  (global $heap (mut i32) (i32.const 4096))\n  (func (export \"alloc\") (param $n i32) (result i32) (local $p i32)\n    global.get $heap local.set $p\n    global.get $heap local.get $n i32.add global.set $heap\n    local.get $p)\n",
+    );
+    wat += &reply(
+        16,
+        "init",
+        r#"{"state":"eyJyb3VuZCI6MSwic2VjcmV0Ijo3fQ==","tick_rate":20,"label":"s"}"#,
+    );
+    wat += &reply(256, "join_attempt", r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ==","accept":true}"#);
+    wat += &reply(512, "join", r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#);
+    wat += &reply(
+        768,
+        "leave",
+        r#"{"state":"eyJyb3VuZCI6Mywic2VjcmV0Ijo5fQ=="}"#,
+    );
+    wat += &reply(
+        1024,
+        "tick",
+        r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#,
+    );
+    wat += &reply(1280, "terminate", r#"{"state":"eyJyb3VuZCI6Miwic2VjcmV0Ijo4fQ=="}"#);
+    wat += ")";
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/admin/runtime/modules/{module}"))
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/wasm")
+                .body(Body::from(wat.into_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let source = format!(
+        "[types.S]\nround = \"int\"\nsecret = \"int\"\n\n[matches.{module}]\nstate = \"S\"\nsync_exclude = [\"/secret\"]\n"
+    );
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/admin/idl",
+        None,
+        true,
+        Some(json!({"source": source})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+
+    let req = Request::post("/v1/server/matches")
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"module": module, "params": {}}).to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let info: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let mid = info["match_id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await; // a few ticks: state is round 2
+
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let join = |mid: String| ClientMessage::MatchJoin {
+        match_id: Some(mid),
+        token: None,
+        metadata: Default::default(),
+        spectator: false,
+        delay_ticks: 0,
+    };
+    send(&mut a, f, None, join(mid.clone())).await;
+    let mut got_match = false;
+    let mut snapshot = None;
+    for _ in 0..6 {
+        match recv(&mut a).await.msg {
+            ServerMessage::Match { match_id, .. } => {
+                assert_eq!(match_id, mid);
+                got_match = true;
+            }
+            ServerMessage::MatchState {
+                match_id, state, ..
+            } => {
+                assert_eq!(match_id, mid);
+                snapshot = Some(state);
+            }
+            m => panic!("{m:?}"),
+        }
+        if got_match && snapshot.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        snapshot,
+        Some(json!({"round": 2})),
+        "public view only, no secret"
+    );
+
+    send(&mut b, f, None, join(mid.clone())).await;
+    // a learns b joined (no state change on join → no delta)
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchPresenceEvent { .. }
+    ));
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    let mut delta = None;
+    let mut presence = false;
+    for _ in 0..6 {
+        match recv(&mut a).await.msg {
+            ServerMessage::MatchStateDelta { match_id, ops, .. } => {
+                assert_eq!(match_id, mid);
+                delta = Some(ops);
+            }
+            ServerMessage::MatchPresenceEvent { .. } => presence = true,
+            m => panic!("{m:?}"),
+        }
+        if delta.is_some() && presence {
+            break;
+        }
+    }
+    assert_eq!(
+        delta,
+        Some(vec![json!({"op": "replace", "path": "/round", "value": 3})]),
+        "leave handler changed round 2 → 3; secret stays private"
+    );
+    let (st, _) = http_json(&router, "DELETE", "/v1/admin/idl", None, true, None).await;
+    assert_eq!(st, 200);
+}

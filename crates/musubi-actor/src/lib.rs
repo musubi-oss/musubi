@@ -2,6 +2,8 @@
 //! the current state and returns the next one, so the latest state is always a complete snapshot
 //! (the basis for failover and migration). The actor owns the tick loop, membership and delivery.
 
+pub mod state_sync;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,6 +208,9 @@ pub struct Spawn {
     pub on_journal: Option<OnJournal>,
     /// Flush journal entries every N ticks (0 = no journal).
     pub journal_every: u64,
+    /// Sync the JSON state to players (`match_state` on join, `match_state_delta` after every
+    /// handler call); the list holds server-private JSON pointers stripped first.
+    pub sync: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +304,16 @@ impl MatchHandle {
     }
 }
 
+/// Delta of the public state view since the last broadcast, when the module syncs JSON state.
+fn sync_ops(
+    sync: &mut Option<state_sync::SyncState>,
+    state: &[u8],
+) -> Option<Vec<serde_json::Value>> {
+    let sy = sync.as_mut()?;
+    let v = state_sync::as_json(state)?;
+    sy.advance(&v)
+}
+
 /// Spawn a match actor.
 pub fn spawn(
     module: &str,
@@ -318,6 +333,7 @@ pub fn spawn(
             on_end,
             on_snapshot: None,
             snapshot_every: 0,
+            sync: None,
             on_journal: None,
             journal_every: 0,
         },
@@ -325,6 +341,7 @@ pub fn spawn(
 }
 
 pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHandle> {
+    let sync = sp.sync.clone().map(state_sync::SyncState::new);
     let mut start_tick = sp.resume.as_ref().map(|r| r.tick).unwrap_or(0);
     let init = match &sp.resume {
         Some(snap) => {
@@ -394,6 +411,7 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
             on_journal: sp.on_journal,
             journal_every: sp.journal_every,
         },
+        sync,
     ));
     Ok(handle)
 }
@@ -441,6 +459,7 @@ async fn run(
     info: Arc<RwLock<MatchInfo>>,
     on_end: Box<dyn FnOnce(MatchId) + Send>,
     persist: Persist,
+    mut sync: Option<state_sync::SyncState>,
 ) {
     let match_id = id.to_string();
     let mut state = init.state;
@@ -500,6 +519,14 @@ async fn run(
                                             journal.push(JournalEntry { tick, op: Op::Join { presence: presence.clone(), metadata: metadata.clone() } });
                                         }
                                         members.push(presence.clone());
+                                        if let Some(sy) = sync.as_mut() {
+                                            if let Some(ops) = state_sync::as_json(&state).and_then(|v| sy.advance(&v)) {
+                                                fan(&deliver, &delays, &mut delayed, tick, others.clone(), ServerMessage::MatchStateDelta { match_id: match_id.clone(), tick, ops });
+                                            }
+                                            if let Some(view) = sy.last.clone() {
+                                                deliver(vec![presence.session_id], ServerMessage::MatchState { match_id: match_id.clone(), tick, state: view });
+                                            }
+                                        }
                                         fan(&deliver, &delays, &mut delayed, tick, others, ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![presence.clone()], leaves: vec![] });
                                         let _ = reply.send(Ok(snapshot(&match_id, &label, &members, &presence)));
                                     }
@@ -526,6 +553,9 @@ async fn run(
                             match handler.leave(std::mem::take(&mut state), std::slice::from_ref(&gone), &members) {
                                 Ok(s) => state = s,
                                 Err(e) => tracing::error!(%match_id, error = %e, "leave handler failed"),
+                            }
+                            if let Some(ops) = sync_ops(&mut sync, &state) {
+                                fan(&deliver, &delays, &mut delayed, tick, watchers(&members, &spectators), ServerMessage::MatchStateDelta { match_id: match_id.clone(), tick, ops });
                             }
                             fan(&deliver, &delays, &mut delayed, tick, watchers(&members, &spectators), ServerMessage::MatchPresenceEvent { match_id: match_id.clone(), joins: vec![], leaves: vec![gone] });
                         }
@@ -565,6 +595,9 @@ async fn run(
                 };
                 state = res.state;
                 if let Some(l) = res.label { label = l; }
+                if let Some(ops) = sync_ops(&mut sync, &state) {
+                    fan(&deliver, &delays, &mut delayed, tick, watchers(&members, &spectators), ServerMessage::MatchStateDelta { match_id: match_id.clone(), tick, ops });
+                }
                 let mut due = Vec::new();
                 delayed.retain(|(at, s, m)| {
                     if *at <= tick {

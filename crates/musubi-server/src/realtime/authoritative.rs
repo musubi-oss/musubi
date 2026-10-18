@@ -266,6 +266,7 @@ impl MatchRegistry {
                 snapshot_every: self.snapshot_every,
                 on_journal: self.on_journal(),
                 journal_every: self.journal_every,
+                sync: self.idl.read().as_ref().and_then(|i| i.match_sync(module)),
             },
         )?;
         if record {

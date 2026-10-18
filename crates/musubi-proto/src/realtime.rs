@@ -500,6 +500,18 @@ pub enum ServerMessage {
         #[serde(default)]
         sequenced: bool,
     },
+    /// Typed match state (IDL `[matches.<m>] state` + `sync`): full public snapshot on join.
+    MatchState {
+        match_id: String,
+        tick: u64,
+        state: serde_json::Value,
+    },
+    /// RFC 6902 patch from the previous synced state to the current one, after a handler call.
+    MatchStateDelta {
+        match_id: String,
+        tick: u64,
+        ops: Vec<serde_json::Value>,
+    },
     MatchData {
         match_id: String,
         presence: Option<UserPresence>,

@@ -68,6 +68,11 @@ impl IdlRegistry {
         self.get()?.match_state_schema(module)
     }
 
+    /// Private paths of a module whose JSON state is synced to players; `None` = no sync.
+    pub fn match_sync(&self, module: &str) -> Option<Vec<String>> {
+        self.get()?.match_sync(module)
+    }
+
     /// `[configs.<name>]`: validate a config document; returns its declared version
     /// (undeclared configs are free-form, version 1).
     pub fn check_config(&self, name: &str, value: &Value) -> Result<i32> {

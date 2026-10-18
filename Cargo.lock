@@ -2548,6 +2548,7 @@ version = "0.1.0"
 dependencies = [
  "musubi-core",
  "musubi-proto",
+ "musubi-storage",
  "serde",
  "serde_json",
  "tokio",

@@ -198,6 +198,14 @@ pub struct MatchDef {
     pub params: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Broadcast the JSON state to players as RFC 6902 deltas after every handler call
+    /// (`match_state` snapshot on join, `match_state_delta` after). Default: on when `state`
+    /// is declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<bool>,
+    /// Server-private JSON pointers stripped before syncing (`/deck`, `/players/*/hand`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_exclude: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
@@ -960,6 +968,15 @@ pub trait {tr} {{\n\
     pub fn match_state_schema(&self, module: &str) -> Option<Value> {
         let t = self.matches.get(module)?.state.as_deref()?;
         self.json_schema(t).ok()
+    }
+
+    /// `Some(private paths)` when the module's JSON state is synced to players.
+    pub fn match_sync(&self, module: &str) -> Option<Vec<String>> {
+        let m = self.matches.get(module)?;
+        if m.state.is_none() || m.sync == Some(false) {
+            return None;
+        }
+        Some(m.sync_exclude.clone())
     }
 
     /// `[configs.<name>] type` as JSON Schema.
