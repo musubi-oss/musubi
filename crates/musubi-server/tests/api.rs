@@ -13103,3 +13103,277 @@ async fn reward_modifiers_scale_xp_and_currency() {
     .await;
     assert_eq!(g["rewards"][0]["amount"], 50);
 }
+
+/// Progress graphs: prerequisites and level gates, paid instant unlocks with rewards, ranks,
+/// a timed node that can be skipped for currency or claimed when the timer ran out, reset
+/// with a partial refund.
+#[tokio::test]
+async fn progress_graphs_skill_tree_and_timed_unlockables() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("gr")})),
+    )
+    .await;
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let bonus = unique("bonus");
+    let track = unique("xp");
+    let g = unique("tree");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": bonus, "kind": "guaranteed", "entries": [{"currency": gold, "amount": 5}]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/tracks",
+        k,
+        Some(json!({"id": track, "levels": [{"xp": 100}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": acc, "currency": gold, "delta": 1000, "reason": "seed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // invalid graphs: cycle, unknown prerequisite
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/graphs",
+        k,
+        Some(json!({"id": unique("bad"), "nodes": [
+        {"id": "a", "requires": ["b"]}, {"id": "b", "requires": ["a"]}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/graphs",
+        k,
+        Some(json!({"id": unique("bad"), "nodes": [{"id": "a", "requires": ["zz"]}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r) = call_server(&app, "POST", "/v1/server/graphs", k, Some(json!({"id": g, "name": "Tree", "reset_cost": {gold.clone(): 10}, "refund_pct": 50, "nodes": [
+        {"id": "root", "cost": {gold.clone(): 100}, "rewards": bonus, "max_rank": 2},
+        {"id": "gated", "requires": ["root"], "min_level": {"track": track, "level": 1}, "cost": {gold.clone(): 50}},
+        {"id": "slow", "requires": ["root"], "cost": {gold.clone(): 20}, "unlock_seconds": 7200, "skip_cost_per_hour": {gold.clone(): 30}},
+        {"id": "blink", "requires": ["root"], "unlock_seconds": 1, "grants": {"speed": 2}}
+    ]}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let node = |v: &Value, id: &str| -> Value {
+        v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let (st, v) = call(&app, "GET", &format!("/v1/graphs/{g}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(node(&v, "root")["state"], "available");
+    assert_eq!(node(&v, "gated")["state"], "locked");
+    assert_eq!(node(&v, "gated")["blocked_by"], json!("requires root"));
+    // prerequisite not met → 409
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/gated/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    // root rank 1: pays 100, gets the 5-gold reward
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/root/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["node"]["rank"], 1);
+    assert_eq!(r["node"]["state"], "available");
+    assert_eq!(r["paid"][&gold], 100);
+    assert_eq!(r["rewards"][0]["amount"], 5);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], 905, "{w}");
+    // root rank 2 → maxed, third attempt 409
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/root/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["node"]["state"], "maxed");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/root/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // level gate: blocked until level 1
+    let (_, v) = call(&app, "GET", &format!("/v1/graphs/{g}"), Some(&tok), None).await;
+    assert_eq!(
+        node(&v, "gated")["blocked_by"],
+        json!(format!("requires level 1 on {track}"))
+    );
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": acc, "track_id": track, "delta": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/gated/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    // timed node: unlocking with a skip price of 2 h × 30
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/slow/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["node"]["state"], "unlocking");
+    assert_eq!(r["node"]["skip_cost"][&gold], 60);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/slow/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "already unlocking");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/slow/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/slow/skip"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["paid"][&gold], 60);
+    assert_eq!(r["node"]["state"], "maxed");
+    // 1-second node: cannot be skipped (no price), claimable once the timer ran out
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/blink/unlock"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/blink/skip"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, v) = call(&app, "GET", &format!("/v1/graphs/{g}"), Some(&tok), None).await;
+    assert_eq!(node(&v, "blink")["state"], "ready");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/nodes/blink/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["node"]["grants"]["speed"], 2);
+    // server view of the player's graph
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/graphs/{g}/progress/{acc}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(node(&v, "root")["rank"], 2);
+    // reset: pay 10, refund 50% of 100+100+50+20+60 = 165, everything locked again
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    let before = w["balances"][0]["balance"].as_i64().unwrap();
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/reset"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["refunded"][&gold], 165);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert_eq!(w["balances"][0]["balance"], before - 10 + 165);
+    let (_, v) = call(&app, "GET", &format!("/v1/graphs/{g}"), Some(&tok), None).await;
+    assert_eq!(node(&v, "root")["rank"], 0);
+    assert_eq!(node(&v, "gated")["state"], "locked");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/graphs/{g}/reset"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "nothing to reset");
+}

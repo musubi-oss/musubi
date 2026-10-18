@@ -317,6 +317,18 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Progress graphs: skill trees and timed unlockables
+
+`POST /v1/server/graphs` defines a graph of nodes; each node has prerequisites (`requires`), a
+price per rank (`cost: {currency: amount}`), an optional level gate (`min_level: {track, level}`),
+`max_rank`, a reward table granted per rank and an opaque `grants` payload for the game. A node
+with `unlock_seconds` is a timed unlockable: `POST /v1/graphs/{g}/nodes/{n}/unlock` pays and
+starts the timer, `…/claim` finishes it once it ran out, `…/skip` pays `skip_cost_per_hour` ×
+remaining time (rounded up) to finish now. `GET /v1/graphs` returns every node with the player's
+`rank`, `state` (`locked` / `available` / `unlocking` / `ready` / `maxed`), `blocked_by`,
+`unlocks_at` and the current `skip_cost`; `POST /v1/graphs/{g}/reset` pays `reset_cost`, refunds
+`refund_pct` of what was spent and locks everything again.
+
 ### Reward modifiers
 
 `PUT /v1/server/rewards/modifiers {id, scope, factor, starts_at?, ends_at?, account_id?}` multiplies

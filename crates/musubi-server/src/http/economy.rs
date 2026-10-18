@@ -6,8 +6,8 @@ use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use musubi_economy::{
     Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, ListingFilter, MarketRules,
-    NewListing, NewOrder, NewTrade, Quest, ReceiptInput, RewardModifier, RewardTable, Season,
-    SendMail, StreakDef, Track,
+    NewListing, NewOrder, NewTrade, ProgressGraph, Quest, ReceiptInput, RewardModifier,
+    RewardTable, Season, SendMail, StreakDef, Track,
 };
 use musubi_integrations::StoreTransaction;
 use musubi_social::notifications::NewNotification;
@@ -37,6 +37,17 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/server/rewards/grant", post(reward_grant))
         .route("/v1/rewards/modifiers", get(my_reward_modifiers))
+        .route("/v1/graphs", get(graphs))
+        .route("/v1/graphs/{graph}", get(graph_one))
+        .route("/v1/graphs/{graph}/nodes/{node}/unlock", post(graph_unlock))
+        .route("/v1/graphs/{graph}/nodes/{node}/claim", post(graph_claim))
+        .route("/v1/graphs/{graph}/nodes/{node}/skip", post(graph_skip))
+        .route("/v1/graphs/{graph}/reset", post(graph_reset))
+        .route("/v1/server/graphs", get(server_graphs).post(upsert_graph))
+        .route(
+            "/v1/server/graphs/{graph}/progress/{account}",
+            get(graph_progress_of),
+        )
         .route(
             "/v1/server/rewards/modifiers",
             get(reward_modifiers).put(upsert_reward_modifier),
@@ -693,6 +704,99 @@ async fn delete_reward_modifier(
         return Err(Error::NotFound(format!("reward modifier {id}")).into());
     }
     Ok(Json(json!({ "deleted": id })))
+}
+
+// ----- progress graphs (skill trees / timed unlockables) -----
+
+async fn graphs(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
+    let g = s
+        .economy
+        .graph_views(me.account_id, None, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(json!({ "graphs": g })))
+}
+
+async fn graph_one(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(graph): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut g = s
+        .economy
+        .graph_views(me.account_id, Some(&graph), OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(g.pop().unwrap_or(Value::Null)))
+}
+
+async fn graph_unlock(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((graph, node)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        s.economy
+            .graph_unlock(me.account_id, &graph, &node, OffsetDateTime::now_utc())
+            .await?,
+    ))
+}
+
+async fn graph_claim(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((graph, node)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        s.economy
+            .graph_claim(me.account_id, &graph, &node, OffsetDateTime::now_utc())
+            .await?,
+    ))
+}
+
+async fn graph_skip(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((graph, node)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        s.economy
+            .graph_skip(me.account_id, &graph, &node, OffsetDateTime::now_utc())
+            .await?,
+    ))
+}
+
+async fn graph_reset(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(graph): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.economy.graph_reset(me.account_id, &graph).await?))
+}
+
+async fn server_graphs(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "graphs": s.economy.graphs(true).await? })))
+}
+
+async fn upsert_graph(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(g): Json<ProgressGraph>,
+) -> Result<Json<ProgressGraph>, ApiError> {
+    Ok(Json(s.economy.upsert_graph(g).await?))
+}
+
+async fn graph_progress_of(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((graph, acc)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let mut g = s
+        .economy
+        .graph_views(account(&acc)?, Some(&graph), OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(g.pop().unwrap_or(Value::Null)))
 }
 
 // ----- progression -----

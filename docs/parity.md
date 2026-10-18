@@ -200,8 +200,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   Импорт платформенных друзей разовый, без периодического рефреша. Войны/челленджи кланов — нет.
   ✅ `status_update {status, rich, appear_offline}`: rich presence — JSON-объект ≤2 КБ рядом со статусом; appear_offline —
   подписчики получают leave и не видят сессию в снапшотах `status_follow`, сервер по-прежнему знает, что она онлайн.
-- **Экономика (5.11).** Нет графов прогресса / skill trees, unlockables с таймерами и ускорением,
-  rerolls заданий, модификаторов наград (x2 выходные), витрин per-платформа, синка достижений в
+- **Экономика (5.11).** Нет синка достижений в
   Steam/PSN/Xbox, фрод-эвристик по скорости покупок. IAP: только Apple/Google/Steam (нет Epic, PSN, Xbox,
   Nintendo, Huawei, Samsung, Facebook).
   ✅ витрины per-платформа: `platforms` у листинга (пусто = везде), `GET /v1/store?platform=`.
@@ -210,6 +209,9 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ графы прогресса (skill trees + unlockables с таймерами): узлы с пререквизитами, ценой, требованием уровня, рангами,
+  таймером (`unlock_seconds`) и ускорением за валюту (`skip_cost_per_hour`), таблицей наград и payload `grants`;
+  `GET /v1/graphs`, `unlock`/`claim`/`skip`/`reset` (с частичным возвратом).
 - **Аутентификация (5.1).** Нет magic-link, custom token, лимита одновременных сессий на аккаунт, SAML.
 - **Storage (5.3).** Patch — только JSON Merge Patch (нет RFC 6902), нет aggregate и full-text.
 - **Оркестрация (5.9).** Нет провайдеров `gamefabric` и `custom (WASM)`, билды не в OCI-реестре, warm-pool

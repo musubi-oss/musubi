@@ -33,6 +33,8 @@ pub use quests::Quest;
 pub use seasons::Season;
 pub use treasury::TreasuryEntry;
 pub mod crafting;
+pub mod graphs;
+pub use graphs::{GraphNode, ProgressGraph};
 pub mod modifiers;
 pub use modifiers::RewardModifier;
 pub mod rewards;
