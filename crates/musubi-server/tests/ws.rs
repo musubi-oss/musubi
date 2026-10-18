@@ -18170,3 +18170,71 @@ async fn iap_huawei_and_samsung_receipts_redeem_once() {
         .sum();
     assert_eq!(q, 200, "{inv}");
 }
+
+#[tokio::test]
+async fn admin_cpu_profile_on_demand() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state);
+    let get = |q: &str, key: bool| {
+        let router = router.clone();
+        let q = q.to_string();
+        async move {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri(format!("/v1/admin/debug/profile{q}"));
+            if key {
+                req = req.header("x-musubi-server-key", "defaultkey");
+            }
+            let res = router
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let st = res.status().as_u16();
+            let ct = res
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            let bytes: Vec<u8> = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+            (st, ct, bytes)
+        }
+    };
+    assert_eq!(get("?seconds=1", false).await.0, 401);
+    assert_eq!(get("?seconds=0", true).await.0, 400);
+    assert_eq!(get("?seconds=1&hz=5000", true).await.0, 400);
+    assert_eq!(get("?seconds=1&format=bogus", true).await.0, 400);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let busy = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut x = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+            }
+            x
+        })
+    };
+    let (st, ct, body) = get("?seconds=1&hz=200&format=folded", true).await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(ct.starts_with("text/plain"), "{ct}");
+    let text = String::from_utf8(body).unwrap();
+    assert!(!text.trim().is_empty(), "no samples collected");
+    assert!(text
+        .lines()
+        .all(|l| l.rsplit(' ').next().unwrap().parse::<u64>().is_ok()));
+    let (st, ct, body) = get("?seconds=1&format=flamegraph", true).await;
+    assert_eq!(st, 200);
+    assert_eq!(ct, "image/svg+xml");
+    assert!(String::from_utf8_lossy(&body).contains("<svg"));
+    let (st, ct, body) = get("?seconds=1&format=pprof", true).await;
+    assert_eq!(st, 200);
+    assert_eq!(ct, "application/vnd.google.protobuf");
+    assert!(!body.is_empty());
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    busy.join().unwrap();
+}

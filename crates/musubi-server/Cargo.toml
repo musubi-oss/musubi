@@ -85,3 +85,6 @@ jsonwebtoken.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
 str0m = "0.24"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pprof = { version = "0.14", default-features = false, features = ["flamegraph", "prost-codec"] }

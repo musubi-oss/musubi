@@ -30,6 +30,7 @@ pub mod notify;
 pub mod openapi;
 pub mod platform_friends;
 pub mod playfab;
+pub mod profile;
 pub mod push;
 pub mod realtime;
 pub mod regions;

@@ -177,8 +177,9 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 Ниже — что спецификация обещает, а кода нет (или он тоньше). Порядок внутри раздела — по боли.
 
 - **Производительность (6.1).** Замерено (8 vCPU, PG на той же машине, 200 клиентов): HTTP 2.3k/с, storage 3.5k/с,
-  WS ping 39k/с, чат 1.1k/с. Цели v1 — 10k auth/RPC и 5k storage **на 1 vCPU**. Профилирования горячего пути
-  (axum → sqlx → PG, пул соединений, пайплайнинг) ещё не было; это самый большой разрыв между обещанием и фактом.
+  WS ping 39k/с, чат 1.1k/с. Цели v1 — 10k auth/RPC и 5k storage **на 1 vCPU**. Горячий путь storage/auth ужат до
+  одного round-trip к PG (`ff12b52`), на ядро ноды ~21k `GET /v1/account` и ~12k storage/с — цели по CPU закрыты;
+  CPU-профиль по запросу — `GET /v1/admin/debug/profile` (flamegraph / pprof / folded) ✅.
 - ~~**Статистика игрока (5.6).**~~ ✅ `stat_defs` (sum/max/min/last, public/friends/private), `/v1/server/stats/*`,
   `/v1/stats[/{account}]` со срезами по scope + глобальным, `top`, фолд из `stats_scope` отчёта матча.
 - **Лидерборды (5.6).** ~~Нет запросов by friends / by group / by rank range и истории прошлых окон как API~~ ✅

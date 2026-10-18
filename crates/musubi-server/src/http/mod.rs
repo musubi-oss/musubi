@@ -160,6 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/metrics", get(crate::metrics::render))
+        .route("/v1/admin/debug/profile", get(crate::profile::handler))
         .route("/openapi.json", get(openapi))
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
