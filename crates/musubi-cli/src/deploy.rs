@@ -101,6 +101,20 @@ pub enum IdlCmd {
         #[command(flatten)]
         api: ApiArgs,
     },
+    /// Convert Colyseus `Schema` classes (TypeScript with `@type(...)` decorators) into an IDL
+    /// with `[types.*]` and `[matches.<module>] state` — the typed state then syncs to clients
+    /// as snapshots + deltas like Colyseus did. Prints the TOML or writes `--out`.
+    FromColyseus {
+        file: PathBuf,
+        /// Match module name for `[matches.<module>]`.
+        #[arg(long, default_value = "game")]
+        module: String,
+        /// State class (default: the class no other class references).
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Generate from a file into a directory: `types.rs`, `openapi.json`,
     /// `schemas/<collection>.json`.
     Gen {
@@ -514,6 +528,25 @@ pub async fn idl(cfg: &Config, cmd: IdlCmd) -> anyhow::Result<()> {
         }
         IdlCmd::Push { file, api } => Api::from_args(cfg, &api).idl_push(&read(&file)?).await?,
         IdlCmd::Show { format, api } => Api::from_args(cfg, &api).idl_show(&format).await?,
+        IdlCmd::FromColyseus {
+            file,
+            module,
+            root,
+            out,
+        } => {
+            let toml = musubi_idl::from_colyseus(&read(&file)?, &module, root.as_deref())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match out {
+                Some(p) => {
+                    std::fs::write(&p, &toml)?;
+                    json!({ "ok": true, "wrote": p.display().to_string() })
+                }
+                None => {
+                    print!("{toml}");
+                    return Ok(());
+                }
+            }
+        }
         IdlCmd::Gen { file, out } => {
             let idl = musubi_idl::Idl::parse(&read(&file)?).map_err(|e| anyhow::anyhow!("{e}"))?;
             std::fs::create_dir_all(out.join("schemas"))?;

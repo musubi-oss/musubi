@@ -1657,3 +1657,205 @@ type = "EchoIn"
         assert!(md.contains("| `tuning` | `EchoIn` | 1 |"));
     }
 }
+
+/// Colyseus `Schema` classes (TypeScript, `@type(...)` decorators) → IDL TOML (plan 6.5
+/// migration). Each `class X extends Schema` becomes `[types.X]`; `"string"` → `string`,
+/// `"number"`/`float32`/`float64` → `float`, `int*`/`uint*` → `int`, `"boolean"` → `bool`,
+/// `Other` → `Other`, `[T]` / `ArraySchema<T>` → `list<T>`, `{ map: T }` / `MapSchema<T>` →
+/// `map<T>`. `root` names the state class (`[matches.<module>] state = Root`); when absent the
+/// class no other class references is used.
+pub fn from_colyseus(ts: &str, module: &str, root: Option<&str>) -> Result<String> {
+    use std::collections::BTreeSet;
+    let mut classes: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
+    let mut i = 0;
+    let bytes = ts.as_bytes();
+    while let Some(off) = ts[i..].find("class ") {
+        let start = i + off + 6;
+        let rest = &ts[start..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let Some(brace) = rest.find('{') else { break };
+        let header = &rest[..brace];
+        if name.is_empty() || !header.contains("extends") {
+            i = start;
+            continue;
+        }
+        // body: match braces
+        let mut depth = 0usize;
+        let mut end = None;
+        for (k, c) in rest[brace..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(brace + k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let body = &rest[brace + 1..end];
+        let mut fields = Vec::new();
+        let mut j = 0;
+        while let Some(at) = body[j..].find("@type(") {
+            let a = j + at + 6;
+            let Some(close) = body[a..].find(')') else {
+                break;
+            };
+            let spec = body[a..a + close].trim();
+            let after = &body[a + close + 1..];
+            // field name: first identifier after the decorator (skipping modifiers)
+            let mut fname = String::new();
+            for tok in after
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|t| !t.is_empty())
+            {
+                if matches!(
+                    tok,
+                    "public" | "private" | "protected" | "readonly" | "declare"
+                ) {
+                    continue;
+                }
+                fname = tok.to_string();
+                break;
+            }
+            let ty = colyseus_type(spec, &mut referenced, false)?;
+            if !fname.is_empty() {
+                fields.push((fname, ty));
+            }
+            j = a + close + 1;
+        }
+        classes.push((name, fields));
+        i = start + end;
+        let _ = bytes;
+    }
+    if classes.is_empty() {
+        return Err(IdlError(
+            "no `class X extends Schema` with @type fields found".into(),
+        ));
+    }
+    let root = match root {
+        Some(r) => r.to_string(),
+        None => classes
+            .iter()
+            .map(|(n, _)| n.clone())
+            .find(|n| !referenced.contains(n))
+            .unwrap_or_else(|| classes[0].0.clone()),
+    };
+    let mut out = String::new();
+    out.push_str("# generated from Colyseus Schema classes by `musubi idl from-colyseus`\n\n");
+    for (name, fields) in &classes {
+        out.push_str(&format!("[types.{name}]\n"));
+        for (f, t) in fields {
+            out.push_str(&format!("{f} = \"{t}\"\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!("[matches.{module}]\nstate = \"{root}\"\n"));
+    Idl::parse(&out)?;
+    Ok(out)
+}
+
+fn colyseus_type(
+    spec: &str,
+    referenced: &mut std::collections::BTreeSet<String>,
+    nested: bool,
+) -> Result<String> {
+    let s = spec.trim();
+    let scalar = |n: &str| -> Option<&'static str> {
+        Some(match n {
+            "string" => "string",
+            "number" | "float32" | "float64" => "float",
+            "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+            | "varint" => "int",
+            "boolean" => "bool",
+            _ => return None,
+        })
+    };
+    if let Some(q) = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        return scalar(q)
+            .map(str::to_string)
+            .ok_or_else(|| IdlError(format!("unknown Colyseus type \"{q}\"")));
+    }
+    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return Ok(format!("list<{}>", colyseus_type(inner, referenced, true)?));
+    }
+    if let Some(inner) = s.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+        let (k, v) = inner
+            .split_once(':')
+            .ok_or_else(|| IdlError(format!("bad collection type {s}")))?;
+        let elem = colyseus_type(v.trim(), referenced, true)?;
+        return Ok(match k.trim() {
+            "map" => format!("map<{elem}>"),
+            "array" | "set" | "collection" => format!("list<{elem}>"),
+            other => return Err(IdlError(format!("unsupported Colyseus collection {other}"))),
+        });
+    }
+    if s.chars().all(|c| c.is_alphanumeric() || c == '_') && !s.is_empty() {
+        referenced.insert(s.to_string());
+        // a bare reference may be unset in Colyseus; inside collections elements always exist
+        return Ok(if nested {
+            s.to_string()
+        } else {
+            format!("{s}?")
+        });
+    }
+    Err(IdlError(format!("cannot map Colyseus type {s}")))
+}
+
+#[cfg(test)]
+mod colyseus_tests {
+    use super::*;
+
+    #[test]
+    fn converts_schema_classes() {
+        let ts = r#"
+import { Schema, type, MapSchema, ArraySchema } from "@colyseus/schema";
+
+export class Card extends Schema {
+  @type("uint8") rank: number = 0;
+  @type("string") suit: string = "";
+}
+
+export class Player extends Schema {
+  @type("string") public name: string;
+  @type("number") hp = 100;
+  @type("boolean") ready: boolean = false;
+  @type([Card]) hand = new ArraySchema<Card>();
+  @type(["string"]) tags = new ArraySchema<string>();
+}
+
+export class GameState extends Schema {
+  @type({ map: Player }) players = new MapSchema<Player>();
+  @type(Player) winner: Player;
+  @type("int32") round: number = 1;
+}
+"#;
+        let out = from_colyseus(ts, "cards", None).unwrap();
+        assert!(
+            out.contains("[types.Card]\nrank = \"int\"\nsuit = \"string\"\n"),
+            "{out}"
+        );
+        assert!(out.contains("hand = \"list<Card>\""), "{out}");
+        assert!(out.contains("tags = \"list<string>\""), "{out}");
+        assert!(out.contains("players = \"map<Player>\""), "{out}");
+        assert!(out.contains("winner = \"Player?\""), "{out}");
+        assert!(
+            out.contains("[matches.cards]\nstate = \"GameState\"\n"),
+            "{out}"
+        );
+        let idl = Idl::parse(&out).unwrap();
+        assert!(idl.match_state_schema("cards").is_some());
+        assert_eq!(idl.match_sync("cards"), Some(vec![]));
+        let forced = from_colyseus(ts, "m", Some("Player")).unwrap();
+        assert!(forced.contains("state = \"Player\""));
+        assert!(from_colyseus("const x = 1;", "m", None).is_err());
+        assert!(from_colyseus("class A extends Schema { @type(\"vec3\") p; }", "m", None).is_err());
+    }
+}
