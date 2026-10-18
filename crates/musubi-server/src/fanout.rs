@@ -139,7 +139,10 @@ enum Wire {
     WorldDrop {
         world: String,
         to_node: uuid::Uuid,
-        ids: Vec<musubi_mesh::EntityId>,
+        from_node: uuid::Uuid,
+        /// Each duplicate with the cell the sender holds it in: the receiver only believes a
+        /// sender its directory names as that cell's host.
+        ids: Vec<(musubi_mesh::EntityId, musubi_mesh::CellId)>,
     },
     /// Cross-cell transaction, coordinator → cluster: hold the listed entities you own and vote.
     WorldTxPrepare {
@@ -189,9 +192,14 @@ enum Wire {
         cell: musubi_mesh::CellId,
         node: uuid::Uuid,
     },
+    /// Several bulk messages (replica/ghost deltas) in one bus frame: the bulk lane drains its
+    /// queue into one frame so one QUIC send carries a whole tick's worth of deltas.
+    WorldBatch(Vec<Wire>),
 }
 
 const TOPIC: &str = "realtime";
+/// Most bulk deltas folded into one bus frame.
+const BULK_BATCH_MAX: usize = 64;
 
 #[derive(Clone)]
 pub struct Fanout {
@@ -522,10 +530,17 @@ impl Fanout {
             ids,
         });
     }
-    pub fn world_drop(&self, world: &str, to_node: uuid::Uuid, ids: Vec<musubi_mesh::EntityId>) {
+    pub fn world_drop(
+        &self,
+        world: &str,
+        to_node: uuid::Uuid,
+        from_node: uuid::Uuid,
+        ids: Vec<(musubi_mesh::EntityId, musubi_mesh::CellId)>,
+    ) {
         self.publish(Wire::WorldDrop {
             world: world.to_string(),
             to_node,
+            from_node,
             ids,
         });
     }
@@ -757,29 +772,41 @@ impl Fanout {
             return;
         }
         match m.decode::<Wire>() {
-            Ok(Wire::Account { account_id, msg }) => {
+            Ok(w) => self.dispatch(w),
+            Err(e) => tracing::warn!(error = %e, "bad fanout message"),
+        }
+    }
+
+    fn dispatch(&self, w: Wire) {
+        match w {
+            Wire::WorldBatch(items) => {
+                for w in items {
+                    self.dispatch(w);
+                }
+            }
+            Wire::Account { account_id, msg } => {
                 self.hub.send_to_account(account_id, msg);
             }
-            Ok(Wire::Channel { channel_id, msg }) => {
+            Wire::Channel { channel_id, msg } => {
                 self.hub.broadcast_channel(&channel_id, msg);
             }
-            Ok(Wire::Presence {
+            Wire::Presence {
                 target,
                 joins,
                 leaves,
-            }) => {
+            } => {
                 self.hub.notify_followers_local(target, joins, leaves);
             }
-            Ok(Wire::SessionSteal(sid)) => {
+            Wire::SessionSteal(sid) => {
                 if self.hub.steal(sid) {
                     tracing::info!(session = %sid, "parked session taken over by another node");
                 }
             }
-            Ok(Wire::Online {
+            Wire::Online {
                 node,
                 account,
                 delta,
-            }) => {
+            } => {
                 let mut e = self.online_remote.entry(account).or_default();
                 let n = e.entry(node).or_insert(0);
                 *n += delta;
@@ -792,18 +819,18 @@ impl Fanout {
                     self.online_remote.remove_if(&account, |_, m| m.is_empty());
                 }
             }
-            Ok(Wire::MmAdd(w)) => {
+            Wire::MmAdd(w) => {
                 if let Err(e) = self.mm.add_replica(w) {
                     tracing::warn!(error = %e, "bad replicated ticket");
                 }
             }
-            Ok(Wire::MmRemove(id)) => {
+            Wire::MmRemove(id) => {
                 self.mm.cancel(&id);
             }
-            Ok(Wire::MmReadyCheck(w)) => self.handle_ready_check(&w),
-            Ok(Wire::MmReady { ticket, session }) => self.handle_ready(&ticket, session),
-            Ok(Wire::MmReadyExpired(w)) => self.handle_ready_expired(&w),
-            Ok(Wire::MmMatched(w)) => {
+            Wire::MmReadyCheck(w) => self.handle_ready_check(&w),
+            Wire::MmReady { ticket, session } => self.handle_ready(&ticket, session),
+            Wire::MmReadyExpired(w) => self.handle_ready_expired(&w),
+            Wire::MmMatched(w) => {
                 let match_id = w.match_id.clone();
                 let server = w.server.clone();
                 match Matched::from_wire(w) {
@@ -823,10 +850,10 @@ impl Fanout {
                     Err(e) => tracing::warn!(error = %e, "bad matched message"),
                 }
             }
-            Ok(Wire::Session { session_id, msg }) => {
+            Wire::Session { session_id, msg } => {
                 self.hub.send_to_session(session_id, msg);
             }
-            Ok(Wire::PartyCmd(env)) => {
+            Wire::PartyCmd(env) => {
                 if self.parties.is_home(&env.party_id) {
                     if let Some(reply) = crate::realtime::party::exec(
                         &self.parties,
@@ -840,7 +867,7 @@ impl Fanout {
                     }
                 }
             }
-            Ok(Wire::SessionGone(sid)) => {
+            Wire::SessionGone(sid) => {
                 for t in self.parties.leave_all(self, sid) {
                     self.mm.cancel(&t);
                     self.mm_remove(&t);
@@ -850,40 +877,40 @@ impl Fanout {
                     w.unsubscribe_all(sid);
                 }
             }
-            Ok(Wire::WorldGhosts { world, delta }) => {
+            Wire::WorldGhosts { world, delta } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_ghosts(&world, delta);
                 }
             }
-            Ok(Wire::WorldRepl {
+            Wire::WorldRepl {
                 world,
                 from_node,
                 epoch,
                 replicas,
                 delta,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_repl(&world, from_node, epoch, &replicas, delta, self);
                 }
             }
-            Ok(Wire::WorldReplAck {
+            Wire::WorldReplAck {
                 world,
                 cell,
                 node,
                 tick,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_repl_ack(&world, cell, node, tick);
                 }
             }
-            Ok(Wire::WorldHandover {
+            Wire::WorldHandover {
                 world,
                 entity,
                 from_node,
                 inputs,
                 forced,
                 base_rev,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get().cloned() {
                     let id = entity.id;
                     if w.accept_handover(&world, entity, from_node, inputs, forced, base_rev, self)
@@ -898,101 +925,102 @@ impl Fanout {
                     }
                 }
             }
-            Ok(Wire::WorldHandoverAck {
+            Wire::WorldHandoverAck {
                 world,
                 entity,
                 from_node,
                 accepted,
                 resend_full,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     if from_node == w.node_id() {
                         w.handover_acked(&world, entity, accepted, resend_full, self);
                     }
                 }
             }
-            Ok(Wire::WorldAdopted {
+            Wire::WorldAdopted {
                 world,
                 cell: _,
                 from_node,
                 ids,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     if from_node != w.node_id() {
                         let dups = w.duplicates_of(&world, &ids);
                         tracing::info!(world = %world, from = %from_node, announced = ids.len(), duplicates = dups.len(), "adopted entities announced by another node");
                         if !dups.is_empty() {
-                            self.world_drop(&world, from_node, dups);
+                            self.world_drop(&world, from_node, w.node_id(), dups);
                         }
                     }
                 }
             }
-            Ok(Wire::WorldDrop {
+            Wire::WorldDrop {
                 world,
                 to_node,
+                from_node,
                 ids,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     if to_node == w.node_id() {
-                        tracing::info!(world = %world, ids = ids.len(), "drop request for duplicate copies");
-                        w.drop_duplicates(&world, &ids);
+                        tracing::info!(world = %world, %from_node, ids = ids.len(), "drop request for duplicate copies");
+                        w.drop_duplicates(&world, from_node, &ids);
                     }
                 }
             }
-            Ok(Wire::WorldTxPrepare {
+            Wire::WorldTxPrepare {
                 world,
                 tx,
                 coordinator,
                 ops,
                 ttl_ticks,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_tx_prepare(&world, tx, coordinator, ops, ttl_ticks, self);
                 }
             }
-            Ok(Wire::WorldTxVote {
+            Wire::WorldTxVote {
                 world,
                 tx,
                 coordinator,
                 entities,
                 reason,
                 ..
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_tx_vote(&world, tx, coordinator, entities, reason, self);
                 }
             }
-            Ok(Wire::WorldTxCommit { world, tx, ops }) => {
+            Wire::WorldTxCommit { world, tx, ops } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_tx_commit(&world, tx, ops);
                 }
             }
-            Ok(Wire::WorldTxAbort { world, tx, reason }) => {
+            Wire::WorldTxAbort { world, tx, reason } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_tx_abort(&world, tx, reason);
                 }
             }
-            Ok(Wire::WorldInput {
+            Wire::WorldInput {
                 world,
                 entity,
                 input,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_remote_input(&world, entity, input);
                 }
             }
-            Ok(Wire::WorldCoLocate {
+            Wire::WorldCoLocate {
                 world,
                 entity,
                 cell,
                 by,
                 ttl_ticks,
-            }) => {
+            } => {
                 if let Some(w) = self.worlds.get() {
                     w.accept_remote_co_locate(&world, entity, cell, by, ttl_ticks);
                 }
             }
-            Ok(Wire::WorldCellAssign { world, cell, node }) => {
+            Wire::WorldCellAssign { world, cell, node } => {
                 if let Some(w) = self.worlds.get().cloned() {
                     let prev = w.cell_host_cached(&world, cell);
                     if node == w.node_id() {
@@ -1025,7 +1053,7 @@ impl Fanout {
                     }
                 }
             }
-            Ok(Wire::WorldCmd(env)) => {
+            Wire::WorldCmd(env) => {
                 if let Some(w) = self.worlds.get().cloned() {
                     let me = self.clone();
                     tokio::spawn(async move {
@@ -1047,7 +1075,7 @@ impl Fanout {
                     });
                 }
             }
-            Ok(Wire::RelayedCmd(env)) => {
+            Wire::RelayedCmd(env) => {
                 if self.relayed.is_home(&env.match_id) {
                     if let Some(reply) = crate::realtime::relayed::exec(
                         &self.relayed,
@@ -1080,7 +1108,6 @@ impl Fanout {
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "bad fanout message"),
         }
     }
 
@@ -1107,11 +1134,28 @@ impl Fanout {
         };
         let tx = lane.get_or_init(|| {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(std::time::Instant, Wire)>();
+            let batch = matches!(w, Wire::WorldGhosts { .. } | Wire::WorldRepl { .. });
             tokio::spawn(async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
                 // one "slow" warning per lane per second, not one per message
                 let last_warn = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
-                while let Some((queued, w)) = rx.recv().await {
+                while let Some((queued, mut w)) = rx.recv().await {
+                    if batch {
+                        // everything already waiting goes out in the same frame: one QUIC send per
+                        // peer instead of one per cell per tick
+                        let mut items = vec![w];
+                        while items.len() < BULK_BATCH_MAX {
+                            match rx.try_recv() {
+                                Ok((_, next)) => items.push(next),
+                                Err(_) => break,
+                            }
+                        }
+                        w = if items.len() == 1 {
+                            items.pop().unwrap()
+                        } else {
+                            Wire::WorldBatch(items)
+                        };
+                    }
                     let Ok(permit) = sem.clone().acquire_owned().await else {
                         break;
                     };

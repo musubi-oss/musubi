@@ -3808,7 +3808,7 @@ impl WorldRegistry {
     /// Of `ids`, the persistent entities this node holds (owned, or in transit towards a host
     /// that may be the dead one — the transfer is cancelled and the entity stays here): the
     /// adopter that just restored them from a dead shard must drop its duplicates.
-    pub fn duplicates_of(&self, name: &str, ids: &[EntityId]) -> Vec<EntityId> {
+    pub fn duplicates_of(&self, name: &str, ids: &[EntityId]) -> Vec<(EntityId, CellId)> {
         let Ok(w) = self.get(name) else {
             return Vec::new();
         };
@@ -3820,24 +3820,35 @@ impl WorldRegistry {
             None => !st.hosted_only,
         };
         ids.iter()
-            .copied()
-            .filter(|id| {
-                st.world
-                    .get(*id)
-                    .is_some_and(|e| e.persistent && hosted_here(e.cell))
+            .filter_map(|id| {
+                let e = st.world.get(*id)?;
+                (e.persistent && hosted_here(e.cell)).then_some((*id, e.cell))
             })
             .collect()
     }
 
     /// Drop restored copies another host still owns live (see `duplicates_of`).
-    pub fn drop_duplicates(&self, name: &str, ids: &[EntityId]) -> usize {
+    pub fn drop_duplicates(
+        &self,
+        name: &str,
+        from_node: Uuid,
+        ids: &[(EntityId, CellId)],
+    ) -> usize {
         let Ok(w) = self.get(name) else {
             return 0;
         };
         let mut st = w.lock();
         let st = &mut *st;
         let mut n = 0;
-        for id in ids {
+        for (id, cell) in ids {
+            // only the node the directory names as host of the cell it claims the entity in
+            // may make us drop ours: a zombie that lost the cell (or has not noticed its
+            // replica took over) is not believed; a lease we have not learned about yet is
+            // covered by the repeated announcements
+            if self.cell_hosts.get(&(name.to_string(), *cell)).map(|h| *h) != Some(from_node) {
+                tracing::debug!(world = name, %id, ?cell, %from_node, "drop request ignored: sender is not the cell's host");
+                continue;
+            }
             if st.world.get(*id).is_none() {
                 continue;
             }
