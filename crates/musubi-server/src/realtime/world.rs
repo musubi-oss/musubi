@@ -3038,6 +3038,7 @@ impl WorldRegistry {
         &self,
         name: &str,
         id: EntityId,
+        acker: Uuid,
         accepted: bool,
         resend_full: bool,
         fanout: &Fanout,
@@ -3054,12 +3055,13 @@ impl WorldRegistry {
             if accepted {
                 if let Some(e) = st.world.get(id).cloned() {
                     let cell = st.world.cell_of(e.pos);
-                    // an unassigned cell (host gone, lease not yet re-taken) is not ours either:
-                    // the node that accepted the entity hosts it now
-                    let elsewhere = match self.cell_hosts.get(&(name.to_string(), cell)) {
-                        Some(h) => *h != self.node_id,
-                        None => true,
-                    };
+                    // only believed from the node the directory names as the cell's host: a
+                    // late ack from a node that has since died (or lost the cell) must not make
+                    // us drop the only live copy
+                    let elsewhere = self
+                        .cell_hosts
+                        .get(&(name.to_string(), cell))
+                        .is_some_and(|h| *h == acker && acker != self.node_id);
                     if elsewhere {
                         tracing::info!(world = name, %id, "late handover ack: stale local copy dropped");
                         st.remote_transit.remove(&id);

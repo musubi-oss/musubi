@@ -119,6 +119,9 @@ enum Wire {
     /// Receiving host → `from_node`: handover taken (or refused: no simulator owns the cell).
     WorldHandoverAck {
         world: String,
+        /// Who answers: a late ack is only believed from the node the directory names as the
+        /// host of the entity's cell.
+        acker: uuid::Uuid,
         entity: musubi_mesh::EntityId,
         from_node: uuid::Uuid,
         accepted: bool,
@@ -508,8 +511,10 @@ impl Fanout {
         accepted: bool,
         resend_full: bool,
     ) {
+        let acker = self.worlds.get().map(|w| w.node_id()).unwrap_or_default();
         self.publish(Wire::WorldHandoverAck {
             world: world.to_string(),
+            acker,
             entity,
             from_node,
             accepted,
@@ -928,6 +933,7 @@ impl Fanout {
             }
             Wire::WorldHandoverAck {
                 world,
+                acker,
                 entity,
                 from_node,
                 accepted,
@@ -935,7 +941,7 @@ impl Fanout {
             } => {
                 if let Some(w) = self.worlds.get() {
                     if from_node == w.node_id() {
-                        w.handover_acked(&world, entity, accepted, resend_full, self);
+                        w.handover_acked(&world, entity, acker, accepted, resend_full, self);
                     }
                 }
             }

@@ -273,7 +273,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             let mut leaves = cluster.subscribe();
             let mut members = cluster.member_events();
             loop {
-                wait_failover_round(&mut tick, &mut leaves, &mut members).await;
+                wait_failover_round(&mut tick, &mut leaves, &mut members, false).await;
                 await_dead_agreement(&cluster).await;
                 if !await_lease(&lease).await {
                     continue;
@@ -369,8 +369,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
             let mut leaves = cluster.subscribe();
             let mut members = cluster.member_events();
+            let mut owed = false;
             loop {
-                wait_failover_round(&mut tick, &mut leaves, &mut members).await;
+                wait_failover_round(&mut tick, &mut leaves, &mut members, owed).await;
+                owed = false;
                 // SWIM's verdict comes within seconds, the heartbeat check a few seconds later:
                 // poll until they agree instead of waiting for the next tick
                 await_dead_agreement(&cluster).await;
@@ -419,6 +421,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                             ?dead,
                             "adopted worlds (dead homes or pending placement)"
                         );
+                        owed = false;
                         // a world adopted from a dead home may have had cells on that same
                         // node: re-home them now, not a whole round later (the stand saw the
                         // mesh settle 15 s after the world for exactly this)
@@ -444,7 +447,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                         }
                     }
                     Ok(Ok(_)) if dead.is_empty() => {}
-                    Ok(Ok(_)) => tracing::info!(?dead, "world failover round: nothing to adopt"),
+                    Ok(Ok(_)) => {
+                        owed = true;
+                        tracing::info!(?dead, "world failover round: nothing to adopt")
+                    }
                     Ok(Err(e)) => tracing::warn!(error = %e, "world failover failed"),
                     Err(_) => tracing::warn!(?dead, "world failover: recover timed out"),
                 }
@@ -1052,10 +1058,15 @@ async fn wait_failover_round(
     tick: &mut tokio::time::Interval,
     leaves: &mut tokio::sync::broadcast::Receiver<musubi_cluster::BusMessage>,
     members: &mut tokio::sync::broadcast::Receiver<musubi_cluster::MemberEvent>,
+    soon: bool,
 ) {
+    // a round that saw dead nodes but could adopt nothing yet (their leases still run) is
+    // retried shortly instead of a whole period later
+    const SOON: std::time::Duration = std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
             _ = tick.tick() => return,
+            _ = tokio::time::sleep(SOON), if soon => return,
             m = members.recv() => match m {
                 Ok(m) if m.state == "dead" => return,
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
