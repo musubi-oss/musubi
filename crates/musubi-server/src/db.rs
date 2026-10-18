@@ -17,8 +17,33 @@ pub async fn connect(cfg: &DatabaseConfig) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
+/// Apply pending migrations. The role is usually called `musubi` like the schema, and with
+/// Postgres' default `search_path` (`"$user", public`) an unqualified `_sqlx_migrations`
+/// resolves to `musubi._sqlx_migrations` as soon as the schema exists — a second process would
+/// then start from an empty ledger and re-run every migration against a filled database. The
+/// ledger is pinned to `public`; a stray `musubi._sqlx_migrations` is merged into it.
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    MIGRATOR.run(pool).await?;
+    let mut conn = pool.acquire().await?;
+    sqlx::query("set search_path to public")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "do $$ begin
+           if to_regclass('musubi._sqlx_migrations') is not null then
+             if to_regclass('public._sqlx_migrations') is null then
+               alter table musubi._sqlx_migrations set schema public;
+             else
+               insert into public._sqlx_migrations
+                 select m.* from musubi._sqlx_migrations m
+                  where not exists (select 1 from public._sqlx_migrations p where p.version = m.version);
+               drop table musubi._sqlx_migrations;
+             end if;
+           end if;
+         end $$",
+    )
+    .execute(&mut *conn)
+    .await?;
+    MIGRATOR.run(&mut *conn).await?;
     info!("migrations applied");
     Ok(())
 }
