@@ -1104,7 +1104,7 @@ pub fn schemas() -> Map<String, Value> {
     m.insert(
         "ControllerConfig".into(),
         obj(
-            json!({ "split_cost": s("number"), "sim_timeout_ticks": s("integer") }),
+            json!({ "split_cost": s("number"), "sim_timeout_ticks": s("integer"), "split_cell_cost": s("number"), "merge_cell_cost": s("number"), "strategy": s("object") }),
             &[],
         ),
     );

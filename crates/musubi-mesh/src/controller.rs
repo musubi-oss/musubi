@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CellId, SimId, World};
+use crate::{CellId, Pos, SimId, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimInfo {
@@ -59,7 +59,31 @@ pub struct ControllerConfig {
     /// rounds merge back into their parent (hysteresis against flapping).
     pub merge_cell_cost: f64,
     pub merge_cell_after_rounds: u32,
+    /// How a free cell picks its simulator (plan 4.3 pluggable placement).
+    pub strategy: Strategy,
 }
+
+/// Placement strategy for `Controller::pick` (SpatialOS-style load-balancing strategies).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Strategy {
+    /// A simulator already owning a neighbouring cell wins (ghost traffic stays local), then
+    /// the lowest cost.
+    #[default]
+    Adjacency,
+    /// Cells within `radius` of a point of interest go to the simulator owning that point's
+    /// cell (a city and its outskirts on one simulator); other cells fall back to adjacency.
+    PointsOfInterest { points: Vec<Pos>, radius: f64 },
+    /// The simulator with the fewest players (interest centres) wins, adjacency only as a
+    /// tie-break — spreads crowds, accepts more ghost traffic.
+    PlayerDensity,
+    /// The embedder's picker (`Controller::set_picker`; on a node the `hook_mesh_place` module
+    /// export) chooses among the live simulators with room; `None` falls back to adjacency.
+    Custom,
+}
+
+/// Custom placement: `(world, cell, candidates) -> chosen simulator`.
+pub type Picker = dyn Fn(&World, CellId, &[SimId]) -> Option<SimId> + Send + Sync;
 
 impl Default for ControllerConfig {
     fn default() -> Self {
@@ -76,6 +100,7 @@ impl Default for ControllerConfig {
             split_cell_after_rounds: 3,
             merge_cell_cost: 60.0,
             merge_cell_after_rounds: 30,
+            strategy: Strategy::Adjacency,
         }
     }
 }
@@ -83,7 +108,7 @@ impl Default for ControllerConfig {
 /// A merge destination must stay this far under `split_cost`, or the next round splits it back.
 const MERGE_HEADROOM: f64 = 0.75;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Controller {
     pub cfg: ControllerConfig,
     sims: BTreeMap<SimId, SimInfo>,
@@ -97,6 +122,17 @@ pub struct Controller {
     hot_rounds: BTreeMap<CellId, u32>,
     /// Control rounds each split parent's children have spent under `merge_cell_cost` in a row.
     cold_rounds: BTreeMap<CellId, u32>,
+    picker: Option<std::sync::Arc<Picker>>,
+}
+
+impl std::fmt::Debug for Controller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Controller")
+            .field("cfg", &self.cfg)
+            .field("sims", &self.sims)
+            .field("picker", &self.picker.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Controller {
@@ -109,6 +145,87 @@ impl Controller {
             quiet_rounds: BTreeMap::new(),
             hot_rounds: BTreeMap::new(),
             cold_rounds: BTreeMap::new(),
+            picker: None,
+        }
+    }
+
+    /// Install the picker the `custom` strategy calls.
+    pub fn set_picker(&mut self, picker: std::sync::Arc<Picker>) {
+        self.picker = Some(picker);
+    }
+
+    /// Players whose interest is centred in one of `sim`'s cells.
+    pub fn players_of(&self, world: &World, sim: SimId) -> usize {
+        world
+            .cells_of(sim)
+            .iter()
+            .map(|c| world.players_in(*c))
+            .sum()
+    }
+
+    /// Adjacency rule: a simulator owning a neighbour of `cell` wins, then the lowest cost.
+    fn pick_adjacent(&self, world: &World, cell: CellId, candidates: &[SimId]) -> Option<SimId> {
+        let mut best: Option<(bool, f64, SimId)> = None;
+        for s in candidates.iter().copied() {
+            let adjacent = world
+                .neighbours(cell)
+                .into_iter()
+                .any(|n| world.owner(n) == Some(s));
+            let load = self.cost(world, s);
+            let key = (adjacent, load, s);
+            best = match best {
+                None => Some(key),
+                Some(b) if (key.0 && !b.0) || (key.0 == b.0 && key.1 < b.1) => Some(key),
+                b => b,
+            };
+        }
+        best.map(|b| b.2)
+    }
+
+    fn pick_by_strategy(&self, world: &World, cell: CellId, candidates: &[SimId]) -> Option<SimId> {
+        match &self.cfg.strategy {
+            Strategy::Adjacency => self.pick_adjacent(world, cell, candidates),
+            Strategy::PointsOfInterest { points, radius } => {
+                let (lo, hi) = world.cell_bounds(cell);
+                let centre = Pos {
+                    x: (lo.x + hi.x) / 2.0,
+                    y: (lo.y + hi.y) / 2.0,
+                };
+                // nearest point of interest within reach whose own cell has an owner with room
+                let mut near: Vec<&Pos> = points
+                    .iter()
+                    .filter(|p| p.dist(&centre) <= *radius)
+                    .collect();
+                near.sort_by(|a, b| a.dist(&centre).total_cmp(&b.dist(&centre)));
+                for p in near {
+                    if let Some(o) = world.owner(world.cell_of(*p)) {
+                        if candidates.contains(&o) {
+                            return Some(o);
+                        }
+                    }
+                }
+                self.pick_adjacent(world, cell, candidates)
+            }
+            Strategy::PlayerDensity => candidates.iter().copied().min_by(|a, b| {
+                let (pa, pb) = (self.players_of(world, *a), self.players_of(world, *b));
+                pa.cmp(&pb).then_with(|| {
+                    let adj = |s: SimId| {
+                        !world
+                            .neighbours(cell)
+                            .into_iter()
+                            .any(|n| world.owner(n) == Some(s))
+                    };
+                    adj(*a)
+                        .cmp(&adj(*b))
+                        .then_with(|| self.cost(world, *a).total_cmp(&self.cost(world, *b)))
+                })
+            }),
+            Strategy::Custom => self
+                .picker
+                .as_ref()
+                .and_then(|p| p(world, cell, candidates))
+                .filter(|s| candidates.contains(s))
+                .or_else(|| self.pick_adjacent(world, cell, candidates)),
         }
     }
 
@@ -232,7 +349,8 @@ impl Controller {
             .is_some_and(|s| (world.cells_of(sim).len() as u32) < s.capacity)
     }
 
-    /// Best simulator for `cell`: alive, with room; owning a neighbour wins, then lowest load.
+    /// Best simulator for `cell` among the live ones with room, by the configured strategy
+    /// (adjacency by default: owning a neighbour wins, then lowest cost).
     pub fn pick(&self, world: &World, cell: CellId, prefer: Option<SimId>) -> Option<SimId> {
         let tick = world.tick;
         if let Some(p) = prefer {
@@ -240,24 +358,16 @@ impl Controller {
                 return Some(p);
             }
         }
-        let mut best: Option<(bool, f64, SimId)> = None;
-        for s in self.sims.keys().copied() {
-            if !self.is_alive(s, tick) || !self.has_room(world, s) {
-                continue;
-            }
-            let adjacent = world
-                .neighbours(cell)
-                .into_iter()
-                .any(|n| world.owner(n) == Some(s));
-            let load = self.cost(world, s);
-            let key = (adjacent, load, s);
-            best = match best {
-                None => Some(key),
-                Some(b) if (key.0 && !b.0) || (key.0 == b.0 && key.1 < b.1) => Some(key),
-                b => b,
-            };
+        let candidates: Vec<SimId> = self
+            .sims
+            .keys()
+            .copied()
+            .filter(|s| self.is_alive(*s, tick) && self.has_room(world, *s))
+            .collect();
+        if candidates.is_empty() {
+            return None;
         }
-        best.map(|b| b.2)
+        self.pick_by_strategy(world, cell, &candidates)
     }
 
     /// Lease `cell` if nobody holds it. Returns the assignment made, if any.
@@ -570,7 +680,75 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Pos, WorldConfig};
+    use crate::WorldConfig;
+
+    #[test]
+    fn placement_strategies_pick_differently() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..WorldConfig::default()
+        });
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        let mk = |strategy: Strategy| {
+            let mut c = Controller::new(ControllerConfig {
+                strategy,
+                cost_player: 0.0,
+                ..ControllerConfig::default()
+            });
+            c.register(s1, 16, 0);
+            c.register(s2, 16, 0);
+            c
+        };
+        // s1 owns (0,0) with two players in it; s2 owns (5,5), empty
+        w.grant_lease(CellId::root(0, 0), s1);
+        w.grant_lease(CellId::root(5, 5), s2);
+        for i in 0..2 {
+            w.subscribe(
+                Uuid::now_v7(),
+                Pos {
+                    x: 10.0 + i as f64,
+                    y: 10.0,
+                },
+                1.0,
+            );
+        }
+        let next = CellId::root(1, 0);
+        // adjacency: s1 owns the neighbour
+        assert_eq!(mk(Strategy::Adjacency).pick(&w, next, None), Some(s1));
+        // player density: s2 has no players
+        assert_eq!(mk(Strategy::PlayerDensity).pick(&w, next, None), Some(s2));
+        // points of interest: a POI at (550, 550) (s2's cell) pulls every cell within 700
+        let poi = mk(Strategy::PointsOfInterest {
+            points: vec![Pos { x: 550.0, y: 550.0 }],
+            radius: 700.0,
+        });
+        assert_eq!(poi.pick(&w, next, None), Some(s2));
+        assert_eq!(
+            poi.pick(&w, CellId::root(-40, -40), None),
+            Some(s1),
+            "out of reach → adjacency"
+        );
+        // custom: the picker decides; a bogus answer falls back to adjacency
+        let mut custom = mk(Strategy::Custom);
+        assert_eq!(custom.pick(&w, next, None), Some(s1), "no picker yet");
+        custom.set_picker(std::sync::Arc::new(
+            move |_w: &World, _c: CellId, cands: &[SimId]| cands.iter().copied().find(|s| *s == s2),
+        ));
+        assert_eq!(custom.pick(&w, next, None), Some(s2));
+        let bogus = Uuid::now_v7();
+        custom.set_picker(std::sync::Arc::new(
+            move |_w: &World, _c: CellId, _: &[SimId]| Some(bogus),
+        ));
+        assert_eq!(custom.pick(&w, next, None), Some(s1));
+        // serde shape
+        let v: ControllerConfig = serde_json::from_value(serde_json::json!({
+            "strategy": {"kind": "points_of_interest", "points": [{"x": 1.0, "y": 2.0}], "radius": 50.0}
+        }))
+        .unwrap();
+        assert!(matches!(v.strategy, Strategy::PointsOfInterest { radius, .. } if radius == 50.0));
+        let d: ControllerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(d.strategy, Strategy::Adjacency);
+    }
 
     #[test]
     fn hot_leaf_splits_and_cold_siblings_merge_after_consolidation() {

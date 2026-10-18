@@ -129,7 +129,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 
 Что есть (`musubi-mesh`, `realtime/world.rs`): авторитет по ячейкам, handover с буферизацией
 ввода и групповой передачей (транспорт + пассажиры), backoff после таймаута Ack, интерес
-(grid + per-client), co-locate, interact через RL, lag-compensation (`rewind`), split/merge по cost, quadtree-ячейки (split горячего листа на 4 / merge остывших с гистерезисом, пины дизайнера),
+(grid + per-client), co-locate, interact через RL, lag-compensation (`rewind`), split/merge по cost, quadtree-ячейки (split горячего листа на 4 / merge остывших с гистерезисом, пины дизайнера), стратегии размещения ячеек (adjacency / points_of_interest / player_density / custom picker),
 soft-cap очередь, hysteresis, time dilation, размещение по регионам, fencing персистенции по term,
 восстановление после падения хоста, provenance при сборке шардов, attach/detach в протоколе.
 
