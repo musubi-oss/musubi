@@ -12823,6 +12823,8 @@ async fn quest_rerolls_are_limited_per_period() {
     .await;
     let tok = s["access_token"].as_str().unwrap().to_string();
     let (a, b, fixed) = (unique("qa"), unique("qb"), unique("qf"));
+    // own event name: quests are global and other tests fire match_won
+    let evt = unique("evt");
     for (id, rerollable) in [(&a, true), (&b, true), (&fixed, false)] {
         let (st, r) = call_server(
             &app,
@@ -12830,7 +12832,7 @@ async fn quest_rerolls_are_limited_per_period() {
             "/v1/server/quests",
             k,
             Some(json!({"id": id, "name": id, "kind": "daily", "rerollable": rerollable, "rerolls_per_period": 1,
-                "objectives": [{"event": "match_won", "target": 1}]})),
+                "objectives": [{"event": evt, "target": 1}]})),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{r}");
@@ -12899,7 +12901,7 @@ async fn quest_rerolls_are_limited_per_period() {
         "POST",
         "/v1/server/quests/event",
         k,
-        Some(json!({"account_id": acc, "event": "match_won", "count": 1})),
+        Some(json!({"account_id": acc, "event": evt, "count": 1})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{r}");
@@ -12915,4 +12917,19 @@ async fn quest_rerolls_are_limited_per_period() {
         st == StatusCode::CONFLICT || st == StatusCode::TOO_MANY_REQUESTS,
         "{st} {r}"
     );
+    // leave nothing enabled behind for the other quest tests
+    for id in [&a, &b, &fixed] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/quests",
+            k,
+            Some(
+                json!({"id": id, "name": id, "kind": "daily", "enabled": false,
+                "objectives": [{"event": evt, "target": 1}]}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
 }
