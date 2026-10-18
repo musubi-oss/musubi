@@ -7767,6 +7767,13 @@ async fn bucketed_league_leaderboard_scopes_ranks_and_rolls_over() {
 
 #[tokio::test]
 async fn private_tournament_requires_join_code() {
+    // the shared test database accumulates tournaments: list by a category only this run uses
+    let cat = 1000
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 1_000_000) as i32;
     let Some(app) = app().await else { return };
     let mut toks = vec![];
     for _ in 0..2 {
@@ -7786,7 +7793,7 @@ async fn private_tournament_requires_join_code() {
         "POST",
         "/v1/server/tournaments",
         "defaultkey",
-        Some(json!({"id": id, "duration": 3600, "join_code": "s3cret", "join_required": false})),
+        Some(json!({"id": id, "duration": 3600, "join_code": "s3cret", "join_required": false, "category": cat})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{t}");
@@ -7848,7 +7855,7 @@ async fn private_tournament_requires_join_code() {
     let (_, l) = call(
         &app,
         "GET",
-        "/v1/tournaments?limit=100",
+        &format!("/v1/tournaments?limit=100&category_start={cat}&category_end={cat}"),
         Some(&toks[1]),
         None,
     )

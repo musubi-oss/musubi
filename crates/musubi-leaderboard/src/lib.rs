@@ -198,6 +198,8 @@ pub fn validate_id(id: &str) -> Result<()> {
 }
 
 /// Window boundaries for a cron reset schedule at `now`: (window start = previous fire or epoch, next fire).
+/// The schedule fires in UTC unless prefixed crontab-style with `CRON_TZ=<IANA zone>` (or `TZ=`),
+/// e.g. `CRON_TZ=Asia/Tokyo 0 0 * * *` resets at local midnight, DST included.
 pub fn window(
     schedule: Option<&str>,
     now: OffsetDateTime,
@@ -205,43 +207,63 @@ pub fn window(
     let Some(s) = schedule else {
         return Ok((OffsetDateTime::UNIX_EPOCH, OffsetDateTime::UNIX_EPOCH));
     };
-    let sched = parse_cron(s)?;
+    let (sched, tz) = parse_cron(s)?;
     let now_c = chrono::DateTime::<chrono::Utc>::from_timestamp(now.unix_timestamp(), 0)
-        .ok_or_else(|| Error::Internal("bad time".into()))?;
+        .ok_or_else(|| Error::Internal("bad time".into()))?
+        .with_timezone(&tz);
     let next = sched
         .after(&now_c)
         .next()
         .ok_or_else(|| Error::InvalidArgument("schedule never fires".into()))?;
-    // cron 0.12 has no `before`; walk back from a bounded start to find the latest fire <= now.
-    let mut prev = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
-    let mut probe = now_c - chrono::Duration::days(366 * 2);
+    // cron 0.12 has no `before`; walk forward from a bounded start to find the latest fire <= now.
+    let mut prev: Option<chrono::DateTime<chrono_tz::Tz>> = None;
+    let probe = now_c - chrono::Duration::days(366 * 2);
     for fire in sched.after(&probe) {
         if fire > now_c {
             break;
         }
-        prev = fire;
-        probe = fire;
+        prev = Some(fire);
     }
-    let _ = probe;
-    let to_t = |d: chrono::DateTime<chrono::Utc>| {
+    let to_t = |d: chrono::DateTime<chrono_tz::Tz>| {
         OffsetDateTime::from_unix_timestamp(d.timestamp()).unwrap_or(OffsetDateTime::UNIX_EPOCH)
     };
-    Ok((to_t(prev), to_t(next)))
+    Ok((
+        prev.map(to_t).unwrap_or(OffsetDateTime::UNIX_EPOCH),
+        to_t(next),
+    ))
 }
 
-pub(crate) fn parse_cron(s: &str) -> Result<cron::Schedule> {
+/// `[CRON_TZ=<zone> ]<5-field crontab>` → schedule + zone (UTC by default).
+pub(crate) fn parse_cron(s: &str) -> Result<(cron::Schedule, chrono_tz::Tz)> {
+    let mut rest = s.trim();
+    let mut tz = chrono_tz::UTC;
+    for prefix in ["CRON_TZ=", "TZ="] {
+        if let Some(r) = rest.strip_prefix(prefix) {
+            let (zone, tail) = r.split_once(char::is_whitespace).ok_or_else(|| {
+                Error::InvalidArgument(
+                    "reset_schedule: CRON_TZ=<zone> must be followed by a cron expression".into(),
+                )
+            })?;
+            tz = zone.parse().map_err(|_| {
+                Error::InvalidArgument(format!("reset_schedule: unknown time zone {zone}"))
+            })?;
+            rest = tail.trim();
+            break;
+        }
+    }
     // Accept standard 5-field crontab; the `cron` crate wants seconds first.
-    let fields = s.split_whitespace().count();
+    let fields = rest.split_whitespace().count();
     let spec = match fields {
-        5 => format!("0 {s}"),
-        6 | 7 => s.to_string(),
+        5 => format!("0 {rest}"),
+        6 | 7 => rest.to_string(),
         _ => {
             return Err(Error::InvalidArgument(
-                "reset_schedule must be a 5-field cron expression".into(),
+                "reset_schedule must be a 5-field cron expression, optionally prefixed with CRON_TZ=<zone>".into(),
             ))
         }
     };
     cron::Schedule::from_str(&spec)
+        .map(|sched| (sched, tz))
         .map_err(|e| Error::InvalidArgument(format!("bad reset_schedule: {e}")))
 }
 
@@ -939,6 +961,16 @@ mod tests {
         assert_eq!(prev.unix_timestamp(), 1_699_920_000); // 2023-11-14 00:00
         assert_eq!(next.unix_timestamp(), 1_700_006_400); // 2023-11-15 00:00
         assert!(window(Some("bad"), now).is_err());
+        // local midnight in Tokyo: 2023-11-15 00:00 JST = 2023-11-14 15:00 UTC
+        let (prev, next) = window(Some("CRON_TZ=Asia/Tokyo 0 0 * * *"), now).unwrap();
+        assert_eq!(prev.unix_timestamp(), 1_699_974_000);
+        assert_eq!(next.unix_timestamp(), 1_700_060_400);
+        // New York, across the DST change: 2023-11-05 02:00 EDT → EST; midnight stays midnight
+        let (prev, next) = window(Some("TZ=America/New_York 0 0 * * *"), now).unwrap();
+        assert_eq!(prev.unix_timestamp(), 1_699_938_000); // 2023-11-14 00:00 EST = 05:00 UTC
+        assert_eq!(next.unix_timestamp(), 1_700_024_400); // 2023-11-15 00:00 EST
+        assert!(window(Some("CRON_TZ=Mars/Olympus 0 0 * * *"), now).is_err());
+        assert!(window(Some("CRON_TZ=Asia/Tokyo"), now).is_err());
         assert_eq!(
             window(None, now).unwrap(),
             (OffsetDateTime::UNIX_EPOCH, OffsetDateTime::UNIX_EPOCH)

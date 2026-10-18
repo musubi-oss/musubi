@@ -63,7 +63,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 
 | Фича | Musubi | Pragma | Nakama (+Hiro) | PlayFab | AccelByte |
 |---|---|---|---|---|---|
-| Лидерборды: операторы, сброс по cron, around | ✅ | 🟡 | ✅ | ✅ | ✅ |
+| Лидерборды: операторы, сброс по cron (с таймзоной `CRON_TZ=`), around | ✅ | 🟡 | ✅ | ✅ | ✅ |
 | Лиги / дивизионы (promote/demote по тирам) | ✅ `League` в `musubi-leaderboard` | ❌ | ❌ | ❌ | ❌ |
 | Турниры: окно, join_code, призы по рангам, командные | ✅ | 🟡 | ✅ | 🟡 | 🟡 |
 | Брекеты (single/double elimination, swiss) | ✅ `POST /v1/server/tournaments/{id}/bracket`: сид по счёту/порядку/рандому/списку, byes, double elim с losers bracket, swiss без рематчей; результат через end-game report (`bracket_match`) | ❌ | ❌ | ❌ | ❌ |
