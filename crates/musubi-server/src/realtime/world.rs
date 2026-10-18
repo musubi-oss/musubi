@@ -4580,6 +4580,7 @@ impl WorldRegistry {
                 })
             })
             .collect();
+        let sim_ids: Vec<Uuid> = st.controller.sims().iter().map(|s| s.id).collect();
         let payload = json!({ "world": name, "tick": st.world.tick, "cells": cells, "sims": sims });
         let hints = st.controller.hints();
         let rt = rt.clone();
@@ -4597,7 +4598,15 @@ impl WorldRegistry {
                     h.clear();
                     for p in v["placements"].as_array().into_iter().flatten() {
                         let cell = serde_json::from_value::<CellId>(p["cell"].clone()).ok();
-                        let sim = p["sim"].as_str().and_then(|s| Uuid::parse_str(s).ok());
+                        // `sim` by id, or `sim_index` into the `sims` list of the request
+                        let sim = p["sim"]
+                            .as_str()
+                            .and_then(|s| Uuid::parse_str(s).ok())
+                            .or_else(|| {
+                                p["sim_index"]
+                                    .as_u64()
+                                    .and_then(|i| sim_ids.get(i as usize).copied())
+                            });
                         if let (Some(c), Some(s)) = (cell, sim) {
                             h.insert(c, s);
                         }

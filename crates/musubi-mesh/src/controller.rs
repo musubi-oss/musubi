@@ -61,6 +61,10 @@ pub struct ControllerConfig {
     pub merge_cell_after_rounds: u32,
     /// How a free cell picks its simulator (plan 4.3 pluggable placement).
     pub strategy: Strategy,
+    /// `custom` without a synchronous picker: ticks a free cell waits for an asynchronous
+    /// hint (the embedder asks its hook once per control round) before falling back to
+    /// adjacency.
+    pub custom_wait_ticks: u64,
 }
 
 /// Placement strategy for `Controller::pick` (SpatialOS-style load-balancing strategies).
@@ -101,6 +105,7 @@ impl Default for ControllerConfig {
             merge_cell_cost: 60.0,
             merge_cell_after_rounds: 30,
             strategy: Strategy::Adjacency,
+            custom_wait_ticks: 60,
         }
     }
 }
@@ -127,6 +132,8 @@ pub struct Controller {
     /// the embedder between control rounds (on a node: the `hook_mesh_place` module export);
     /// consulted before the picker.
     hints: std::sync::Arc<std::sync::Mutex<BTreeMap<CellId, SimId>>>,
+    /// Tick a free cell started waiting for a hint (`custom_wait_ticks`).
+    pending: std::sync::Mutex<BTreeMap<CellId, u64>>,
 }
 
 impl std::fmt::Debug for Controller {
@@ -151,6 +158,7 @@ impl Controller {
             cold_rounds: BTreeMap::new(),
             picker: None,
             hints: Default::default(),
+            pending: Default::default(),
         }
     }
 
@@ -238,14 +246,24 @@ impl Controller {
                     .get(&cell)
                     .copied()
                     .filter(|s| candidates.contains(s));
-                hinted
-                    .or_else(|| {
-                        self.picker
-                            .as_ref()
-                            .and_then(|p| p(world, cell, candidates))
-                            .filter(|s| candidates.contains(s))
-                    })
-                    .or_else(|| self.pick_adjacent(world, cell, candidates))
+                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if hinted.is_some() {
+                    pending.remove(&cell);
+                    return hinted;
+                }
+                if let Some(p) = &self.picker {
+                    if let Some(s) = p(world, cell, candidates).filter(|s| candidates.contains(s)) {
+                        return Some(s);
+                    }
+                } else {
+                    // no synchronous picker: give the asynchronous hook time to answer
+                    let since = *pending.entry(cell).or_insert(world.tick);
+                    if world.tick.saturating_sub(since) < self.cfg.custom_wait_ticks {
+                        return None;
+                    }
+                }
+                pending.remove(&cell);
+                self.pick_adjacent(world, cell, candidates)
             }
         }
     }
@@ -751,7 +769,13 @@ mod tests {
         );
         // custom: the picker decides; a bogus answer falls back to adjacency
         let mut custom = mk(Strategy::Custom);
-        assert_eq!(custom.pick(&w, next, None), Some(s1), "no picker yet");
+        assert_eq!(custom.pick(&w, next, None), None, "waits for a hint");
+        w.tick += 60;
+        assert_eq!(
+            custom.pick(&w, next, None),
+            Some(s1),
+            "no hint came → adjacency"
+        );
         custom.set_picker(std::sync::Arc::new(
             move |_w: &World, _c: CellId, cands: &[SimId]| cands.iter().copied().find(|s| *s == s2),
         ));

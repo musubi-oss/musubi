@@ -223,6 +223,7 @@ async fn build_state_cfg_with(
         )),
     };
     inner.idl = musubi_server::idl::IdlRegistry::new(inner.db.clone(), inner.storage.clone());
+    inner.worlds.set_runtime(inner.runtime.clone());
     if let Some(t) = tweak {
         t(&mut inner);
     }
@@ -18592,4 +18593,169 @@ async fn transport_channels_and_lz4() {
             ..
         }
     ));
+}
+
+/// Plan 4.3 `custom` placement end to end: a module's `hook_mesh_place` export decides where a
+/// free cell goes (here by `sim_index` into the request's `sims`), overriding adjacency.
+#[tokio::test]
+async fn world_custom_placement_follows_module_hook() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let k = "defaultkey";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let world = format!("cp{sfx}");
+    let call = |method: &'static str, path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    // the module always sends cell (1,0) to the second simulator of the request
+    let reply = r#"{\"placements\":[{\"cell\":{\"x\":1,\"y\":0},\"sim_index\":1}]}"#;
+    let wat = format!(
+        r#"(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 1024))
+  (func (export "alloc") (param $n i32) (result i32) (local $p i32)
+    global.get $heap local.set $p
+    global.get $heap local.get $n i32.add global.set $heap
+    local.get $p)
+  (data (i32.const 16) "{reply}")
+  (func (export "hook_mesh_place") (param i32 i32 i32 i32) (result i64)
+    i64.const 16 i64.const 32 i64.shl i64.const {} i64.or))"#,
+        reply.len() - reply.matches('\\').count()
+    );
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/admin/runtime/modules/place{}", &sfx[..8]))
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/wasm")
+                .body(Body::from(wat.into_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (st, _) = call(
+        "POST",
+        "/v1/server/worlds".into(),
+        json!({"name": world, "config": {"cell_size": 100.0},
+               "controller": {"sim_timeout_ticks": 6000, "strategy": {"kind": "custom"}}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    // the request lists simulators by id: `sim_index` 1 is the greater uuid
+    let mut ids = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+    ids.sort();
+    let (low, high) = (ids[0], ids[1]);
+    for sim in [low, high] {
+        let (st, _) = call(
+            "POST",
+            format!("/v1/server/worlds/{world}/sims"),
+            json!({"sim": sim, "capacity": 4}),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    // interest in cell (0,0): no hint for it → after one waiting round adjacency places it
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, "json").await;
+    send(
+        &mut c,
+        "json",
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 50.0,
+            y: 50.0,
+            radius: 10.0,
+            budget_bytes: None,
+            filter: None,
+            max_hz: None,
+            unreliable_updates: false,
+        },
+    )
+    .await;
+    let owner_of = |info: &Value, x: i64| -> Option<uuid::Uuid> {
+        info["cells"].as_array().unwrap().iter().find_map(|c| {
+            (c[0]["x"] == x && c[0]["y"] == 0)
+                .then(|| uuid::Uuid::parse_str(c[1].as_str().unwrap()).unwrap())
+        })
+    };
+    let mut first = None;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, info) = call("GET", format!("/v1/server/worlds/{world}"), json!({})).await;
+        first = owner_of(&info, 0);
+        if first.is_some() {
+            break;
+        }
+    }
+    let first = first.expect("cell (0,0) placed by the adjacency fallback");
+    // interest in cell (1,0): adjacency would keep it with (0,0)'s owner, the hook says `high`
+    let (tc2, _) = token(&router).await;
+    let mut c2 = connect(&addr, &tc2, "json").await;
+    send(
+        &mut c2,
+        "json",
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 150.0,
+            y: 50.0,
+            radius: 10.0,
+            budget_bytes: None,
+            filter: None,
+            max_hz: None,
+            unreliable_updates: false,
+        },
+    )
+    .await;
+    let mut second = None;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, info) = call("GET", format!("/v1/server/worlds/{world}"), json!({})).await;
+        second = owner_of(&info, 1);
+        if second.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        second,
+        Some(high),
+        "hook placement (first owner was {first})"
+    );
+    let (_, ev) = call(
+        "GET",
+        format!("/v1/server/worlds/{world}/events?sim={high}"),
+        json!({}),
+    )
+    .await;
+    assert!(
+        ev["events"].as_array().unwrap().iter().any(|e| {
+            e["type"] == "cell_assigned" && e["cell"]["x"] == 1 && e["cell"]["y"] == 0
+        }),
+        "{ev}"
+    );
 }
