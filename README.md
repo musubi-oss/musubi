@@ -398,6 +398,8 @@ api, server_key, env, ip?, gateway?, mask?}`; configure `eth0` from `ip/gateway/
 (each VM gets its own tap and address via `network_overrides`) and start the server exactly as
 after a cold boot. Re-run `prepare` after a build change — the snapshot carries the loaded binary.
 
+Bare metal over SSH (plan 6.6 `hybrid`: control plane anywhere, servers on Hetzner/OVH boxes): `[fleet.ssh] hosts = [{ addr, public_addr?, user, port, key, capacity }]` registers the `ssh` provider — no agent to install, the game binary just has to be on the box. A start picks the host with the most free slots and runs `ssh user@addr 'cd <working_dir> && env <spec.env> MUSUBI_SERVER_ID=… MUSUBI_PORT=… nohup <spec.command> … & echo $!'`, the pid is kept, `stop` sends TERM then KILL, `probe` re-checks pids with `kill -0`; `ssh_command` / `ssh_args` / `connect_timeout_secs` tune the client.
+
 ### Durable workflows (sagas)
 
 Long-running server logic — a trade with a 24-hour escrow, a tournament payout, a cross-game

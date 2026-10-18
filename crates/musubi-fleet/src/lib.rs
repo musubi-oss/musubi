@@ -23,6 +23,7 @@ pub mod edgegap;
 pub mod firecracker;
 pub mod gamelift;
 pub mod kubernetes;
+pub mod ssh;
 pub mod webhook;
 
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);

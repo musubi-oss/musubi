@@ -750,6 +750,9 @@ pub struct FleetConfig {
     pub edgegap: EdgegapConfig,
     pub webhook: WebhookFleetConfig,
     pub gamelift: GameLiftConfig,
+    /// Bare-metal / VPS hosts reached over SSH (`hybrid` profile: control plane anywhere,
+    /// dedicated servers on Hetzner/OVH boxes).
+    pub ssh: SshFleetConfig,
 }
 
 /// Firecracker microVM fleet provider; registered when `binary` is set. Needs KVM, a kernel
@@ -1791,6 +1794,59 @@ pub struct WebhookFleetConfig {
     pub token: String,
     pub poll_secs: u64,
     pub ready_timeout_secs: u64,
+}
+
+/// `[fleet.ssh]`: a pool of machines the node starts dedicated servers on over SSH. Each host
+/// needs the game server binary (`spec.command`) present; the node runs
+/// `ssh user@addr 'cd dir && env … nohup cmd args … & echo $!'` and later `kill`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshFleetConfig {
+    pub hosts: Vec<SshHost>,
+    /// `ssh` binary (tests point it at a fake).
+    pub ssh_command: String,
+    /// Extra `ssh` options (`-o StrictHostKeyChecking=accept-new` by default).
+    pub ssh_args: Vec<String>,
+    pub connect_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshHost {
+    /// Address `ssh` connects to.
+    pub addr: String,
+    /// Address players connect to (defaults to `addr`).
+    pub public_addr: Option<String>,
+    pub user: String,
+    pub port: u16,
+    /// Private key path (`-i`); empty = ssh agent / default keys.
+    pub key: String,
+    /// Servers this host runs at once.
+    pub capacity: u32,
+}
+
+impl Default for SshFleetConfig {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            ssh_command: "ssh".into(),
+            ssh_args: vec!["-o".into(), "StrictHostKeyChecking=accept-new".into()],
+            connect_timeout_secs: 10,
+        }
+    }
+}
+
+impl Default for SshHost {
+    fn default() -> Self {
+        Self {
+            addr: String::new(),
+            public_addr: None,
+            user: "musubi".into(),
+            port: 22,
+            key: String::new(),
+            capacity: 8,
+        }
+    }
 }
 
 impl Default for WebhookFleetConfig {
