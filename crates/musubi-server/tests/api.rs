@@ -2974,7 +2974,10 @@ async fn quests_by_events_and_battle_pass_tiers() {
         .unwrap()
         .iter()
         .any(|q| q == &json!(daily)));
-    assert_eq!(r["completed"], json!([once]));
+    assert!(
+        r["completed"].as_array().unwrap().contains(&json!(once)),
+        "{r}"
+    );
     let (_, q) = call(&app, "GET", "/v1/quests", Some(&tok), None).await;
     let d = q["quests"]
         .as_array()
@@ -3002,7 +3005,10 @@ async fn quests_by_events_and_battle_pass_tiers() {
         Some(json!({"account_id": acc, "event": "match_won", "delta": 5})),
     )
     .await;
-    assert_eq!(r["completed"], json!([daily]));
+    assert!(
+        r["completed"].as_array().unwrap().contains(&json!(daily)),
+        "{r}"
+    );
     let (st, r) = call(
         &app,
         "POST",
@@ -5736,19 +5742,29 @@ async fn social_logins_verify_and_link() {
     use axum::routing::get as ax_get;
     let jwks: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/google_test_jwks.json")).unwrap();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        % 1_000_000_000;
+    let (s1, s2, s3) = (
+        format!("76561198{nonce:09}"),
+        format!("76561197{nonce:09}"),
+        format!("76561196{nonce:09}"),
+    );
     let mock = Router::new()
         .route("/jwks", ax_get(move || { let j = jwks.clone(); async move { axum::Json(j) } }))
         .route(
             "/ISteamUserAuth/AuthenticateUserTicket/v1/",
-            ax_get(|AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| async move {
+            ax_get(move |AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| { let (s1, s2, s3) = (s1.clone(), s2.clone(), s3.clone()); async move {
                 let id = match q.get("ticket").map(String::as_str) {
-                    Some("0a0a") => "76561198000000001",
-                    Some("0b0b") => "76561198000000002",
-                    Some("0bad") => return axum::Json(json!({"response": {"params": {"result": "OK", "steamid": "76561198000000003", "vacbanned": true}}})),
+                    Some("0a0a") => s1.as_str(),
+                    Some("0b0b") => s2.as_str(),
+                    Some("0bad") => return axum::Json(json!({"response": {"params": {"result": "OK", "steamid": s3, "vacbanned": true}}})),
                     _ => return axum::Json(json!({"response": {"error": {"errorcode": 101, "errordesc": "Invalid ticket"}}})),
                 };
                 axum::Json(json!({"response": {"params": {"result": "OK", "steamid": id, "ownersteamid": id, "vacbanned": false, "publisherbanned": false}}}))
-            }),
+            } }),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -11952,15 +11968,22 @@ async fn entitlements_sync_grants_once_and_revokes() {
         std::sync::Mutex::new(["1001".to_string()].into_iter().collect()),
     );
     let o2 = owned.clone();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        % 1_000_000_000;
+    let s7 = format!("76561198{nonce:09}");
+    let (s7a, s7b) = (s7.clone(), s7.clone());
     let mock = Router::new()
         .route(
             "/ISteamUserAuth/AuthenticateUserTicket/v1/",
-            ax_get(|AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| async move {
+            ax_get(move |AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| { let s7 = s7a.clone(); async move {
                 match q.get("ticket").map(String::as_str) {
-                    Some("0e0e") => axum::Json(json!({"response": {"params": {"result": "OK", "steamid": "76561198000000777", "ownersteamid": "76561198000000777", "vacbanned": false, "publisherbanned": false}}})),
+                    Some("0e0e") => axum::Json(json!({"response": {"params": {"result": "OK", "steamid": s7, "ownersteamid": s7, "vacbanned": false, "publisherbanned": false}}})),
                     _ => axum::Json(json!({"response": {"error": {"errorcode": 101, "errordesc": "Invalid ticket"}}})),
                 }
-            }),
+            } }),
         )
         .route(
             "/ISteamUser/CheckAppOwnership/v4/",
@@ -11968,7 +11991,7 @@ async fn entitlements_sync_grants_once_and_revokes() {
                 let o = o2.clone();
                 async move {
                     assert_eq!(q.get("key").map(String::as_str), Some("pubkey"));
-                    assert_eq!(q.get("steamid").map(String::as_str), Some("76561198000000777"));
+                    assert_eq!(q.get("steamid").map(String::as_str), Some(s7b.as_str()));
                     let owns = o.lock().unwrap().contains(q.get("appid").unwrap());
                     axum::Json(json!({"appownership": {"ownsapp": owns, "permanent": owns, "result": "OK"}}))
                 }

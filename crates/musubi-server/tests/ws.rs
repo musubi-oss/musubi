@@ -3164,6 +3164,7 @@ async fn mock_console_stores(
     let (t1, c1, c2) = (tokens.clone(), consumed.clone(), consumed.clone());
     let prod = product.to_string();
     let (p1, p2, p3) = (prod.clone(), prod.clone(), prod.clone());
+    let (p0, p4) = (prod.clone(), prod.clone());
     let app = axum::Router::new()
         .route("/token", post(move |headers: axum::http::HeaderMap, body: String| async move {
             t1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3181,7 +3182,7 @@ async fn mock_console_stores(
                     return Json(json!({"entitlements": []}));
                 }
                 Json(json!({"entitlements": [{
-                    "id": "ent-1", "entitlementName": q["entitlementName"], "catalogItemId": "cat-1",
+                    "id": format!("ent-{p0}"), "entitlementName": q["entitlementName"], "catalogItemId": "cat-1",
                     "status": "ACTIVE", "consumable": true, "useCount": 0, "originalUseCount": 3,
                     "grantDate": "2024-01-01T00:00:00Z"
                 }]}))
@@ -3190,7 +3191,7 @@ async fn mock_console_stores(
         .route(
             "/epic/ecom/v1/identities/{user}/entitlements/{ent}/redeem",
             post(move |Path((user, ent)): Path<(String, String)>| async move {
-                assert!(user.starts_with("epic-u1") && ent == "ent-1", "{user} {ent}");
+                assert!(user.starts_with("epic-u1") && ent == format!("ent-{p4}"), "{user} {ent}");
                 c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Json(json!({}))
             }),
@@ -3202,7 +3203,7 @@ async fn mock_console_stores(
                 assert_eq!(q.get("service_label").map(String::as_str), Some("0"));
                 assert_eq!(q.get("entitlement_label").map(String::as_str), Some(p1.as_str()));
                 Json(json!({"entitlements": [{
-                    "id": "psn-ent", "entitlement_label": p1, "active_flag": true, "use_limit": 0,
+                    "id": format!("psn-{p1}"), "entitlement_label": p1, "active_flag": true, "use_limit": 0,
                     "active_date": "2024-01-02T00:00:00Z"
                 }]}))
             }),
@@ -3213,7 +3214,7 @@ async fn mock_console_stores(
                 assert_eq!(b["beneficiaries"][0]["identityValue"], "b2b-key");
                 assert_eq!(b["productSkuIds"][0]["productId"], p2);
                 Json(json!({"items": [{
-                    "id": "xb-item", "productId": p2, "status": "Active", "productKind": "Consumable",
+                    "id": format!("xb-{p2}"), "productId": p2, "status": "Active", "productKind": "Consumable",
                     "quantity": 2, "acquiredDate": "2024-01-03T00:00:00Z"
                 }]}))
             }),
@@ -13144,9 +13145,10 @@ async fn regions_routed_allocation_cold_start_and_external_providers() {
     assert_eq!(servers[0].port, 7777);
     {
         let log = wh_log.lock().unwrap();
+        let sid = format!("\"server_id\":\"{}\"", servers[0].id);
         let start = log
             .iter()
-            .find(|l| l.starts_with("POST /servers"))
+            .find(|l| l.starts_with("POST /servers") && l.contains(&sid))
             .expect("start call");
         assert!(
             start.contains(&format!("\"name\":\"wh-{sfx}\""))
