@@ -12,6 +12,7 @@ pub mod dev;
 pub mod edge;
 pub mod events;
 pub mod fanout;
+pub mod fraud;
 pub mod grant_limits;
 pub mod hooks;
 pub mod http;

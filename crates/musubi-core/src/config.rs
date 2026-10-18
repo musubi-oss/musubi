@@ -58,6 +58,7 @@ pub struct Config {
     pub anticheat: AntiCheatConfig,
     pub chat: ChatConfig,
     pub compliance: ComplianceConfig,
+    pub fraud: FraudConfig,
     pub regions: RegionsConfig,
     pub operators: OperatorsConfig,
     pub ugc: UgcConfig,
@@ -1761,6 +1762,36 @@ impl Default for S3Config {
             path_style: true,
             prefix: String::new(),
             part_bytes: 8 << 20,
+        }
+    }
+}
+
+/// Purchase-velocity heuristics: too many store purchases / too much spend / too many IAP
+/// receipts from one account inside `window_secs`. `action = "flag"` records a fraud flag and
+/// emits `economy.fraud_flag`; `"block"` additionally rejects the purchase with 429.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FraudConfig {
+    pub enabled: bool,
+    pub window_secs: u64,
+    /// Store purchases per window (0 = no limit).
+    pub max_purchases: u32,
+    /// Spend per currency per window, e.g. `{ gold = 100000 }`.
+    pub max_spend: std::collections::HashMap<String, i64>,
+    /// IAP receipts redeemed per window (0 = no limit).
+    pub max_iap: u32,
+    pub action: String,
+}
+
+impl Default for FraudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_secs: 3600,
+            max_purchases: 0,
+            max_spend: Default::default(),
+            max_iap: 0,
+            action: "flag".into(),
         }
     }
 }

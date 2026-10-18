@@ -1863,6 +1863,183 @@ async fn fleet_docker_provider_runs_a_container() {
 }
 
 #[tokio::test]
+async fn fraud_velocity_flags_and_blocks() {
+    let gold = unique("fgold");
+    let g = gold.clone();
+    let Some(app) = app_with(move |c| {
+        c.fraud.enabled = true;
+        c.fraud.max_spend.insert(g, 250);
+        c.fraud.action = "block".into();
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("fraud")})),
+    )
+    .await;
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let (potion, offer) = (unique("fpotion"), unique("foffer"));
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": acc, "currency": gold, "delta": 5000, "reason": "seed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": potion, "name": "Potion", "stackable": true, "max_stack": 999})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/store",
+        k,
+        Some(json!({"id": offer, "item_id": potion, "quantity": 1, "prices": {gold.clone(): 100}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    // 100 + 100 = 200 < 250: allowed; the third attempt sees 200... then 300 >= 250 blocks the fourth
+    for i in 0..3 {
+        let (st, r) = call(&app, "POST", "/v1/store/buy", Some(&tok),
+            Some(json!({"store_item_id": offer, "currency": gold, "idempotency_key": format!("b{i}")}))).await;
+        assert_eq!(st, StatusCode::OK, "buy {i}: {r}");
+    }
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": offer, "currency": gold, "idempotency_key": "b3"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{r}");
+    let (st, f) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/economy/fraud/{acc}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["spend"][&gold]["spent"], 300);
+    assert_eq!(f["spend"][&gold]["limit"], 250);
+    assert_eq!(f["flags"].as_array().unwrap().len(), 1, "{f}");
+    assert_eq!(f["flags"][0]["rule"], format!("spend:{gold}"));
+    assert_eq!(f["flags"][0]["blocked"], true);
+    let id = f["flags"][0]["id"].as_str().unwrap().to_string();
+    // still blocked, no duplicate open flag
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/store/buy",
+        Some(&tok),
+        Some(json!({"store_item_id": offer, "currency": gold, "idempotency_key": "b4"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    let (_, open) = call_server(&app, "GET", "/v1/server/economy/fraud/flags", k, None).await;
+    assert!(
+        open["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["id"] == id),
+        "{open}"
+    );
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/economy/fraud/flags/{id}/resolve"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(r["resolved_at"].is_number());
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/economy/fraud/flags/{id}/resolve"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // flag-only mode: purchases keep going, the flag is recorded
+    let Some(app2) = app_with(|c| {
+        c.fraud.enabled = true;
+        c.fraud.max_purchases = 1;
+    })
+    .await
+    else {
+        return;
+    };
+    let (_, sess) = call(
+        &app2,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("fraud2")})),
+    )
+    .await;
+    let tok2 = sess["access_token"].as_str().unwrap().to_string();
+    let acc2 = sess["account_id"].as_str().unwrap().to_string();
+    let (st, _) = call_server(
+        &app2,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": acc2, "currency": gold, "delta": 1000, "reason": "seed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for i in 0..3 {
+        let (st, r) = call(&app2, "POST", "/v1/store/buy", Some(&tok2),
+            Some(json!({"store_item_id": offer, "currency": gold, "idempotency_key": format!("c{i}")}))).await;
+        assert_eq!(st, StatusCode::OK, "buy {i}: {r}");
+    }
+    let (_, f) = call_server(
+        &app2,
+        "GET",
+        &format!("/v1/server/economy/fraud/{acc2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(f["purchases"]["count"], 3);
+    assert_eq!(f["flags"].as_array().unwrap().len(), 1, "{f}");
+    assert_eq!(f["flags"][0]["rule"], "purchases");
+    assert_eq!(f["flags"][0]["blocked"], false);
+}
+
+#[tokio::test]
 async fn economy_wallet_ledger_inventory_and_store() {
     let Some(app) = app().await else { return };
     let k = "defaultkey";

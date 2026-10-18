@@ -72,6 +72,12 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/iap/apple", post(iap_apple))
         .route("/v1/iap/google", post(iap_google))
         .route("/v1/iap/{platform}", post(iap_console))
+        .route("/v1/server/economy/fraud/flags", get(fraud_flags))
+        .route(
+            "/v1/server/economy/fraud/flags/{id}/resolve",
+            post(fraud_resolve),
+        )
+        .route("/v1/server/economy/fraud/{account}", get(fraud_status))
         .route("/v1/iap/receipts", get(iap_receipts))
         .route("/v1/iap/subscriptions", get(iap_subscriptions))
         .route("/v1/iap/apple/notifications", post(iap_apple_notifications))
@@ -265,6 +271,7 @@ async fn buy(
     Json(r): Json<BuyReq>,
 ) -> Result<Json<Value>, ApiError> {
     s.age.check(me.account_id, "purchases")?;
+    crate::fraud::check_store(&s, me.account_id, &r.currency).await?;
     let p = s
         .economy
         .buy(
@@ -1025,6 +1032,7 @@ async fn iap_apple(
     Json(r): Json<AppleReq>,
 ) -> Result<Json<Value>, ApiError> {
     s.age.check(me.account_id, "purchases")?;
+    crate::fraud::check_iap(&s, me.account_id).await?;
     let Some(c) = &s.apple_iap else {
         return Err(Error::NotFound("apple iap is not configured".into()).into());
     };
@@ -1052,6 +1060,7 @@ async fn iap_google(
     Json(r): Json<GoogleReq>,
 ) -> Result<Json<Value>, ApiError> {
     s.age.check(me.account_id, "purchases")?;
+    crate::fraud::check_iap(&s, me.account_id).await?;
     let Some(c) = &s.google_iap else {
         return Err(Error::NotFound("google iap is not configured".into()).into());
     };
@@ -1116,6 +1125,7 @@ async fn iap_console(
         return Err(Error::NotFound("unknown iap platform".into()).into());
     };
     s.age.check(me.account_id, "purchases")?;
+    crate::fraud::check_iap(&s, me.account_id).await?;
     let Some(c) = s.console_iap.get(p.as_str()) else {
         return Err(Error::NotFound(format!("{platform} iap is not configured")).into());
     };
@@ -1147,6 +1157,38 @@ async fn iap_console(
         )
         .await;
     Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
+}
+
+async fn fraud_status(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(account): Path<uuid::Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::fraud::status(&s, AccountId(account)).await?))
+}
+
+#[derive(Deserialize)]
+struct FraudFlagsQ {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn fraud_flags(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<FraudFlagsQ>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        crate::fraud::open_flags(&s, q.limit.unwrap_or(100)).await?,
+    ))
+}
+
+async fn fraud_resolve(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::fraud::resolve(&s, id).await?))
 }
 
 async fn iap_receipts(
@@ -1714,6 +1756,7 @@ async fn iap_steam_init(
     Json(r): Json<SteamInitReq>,
 ) -> Result<Json<Value>, ApiError> {
     s.age.check(me.account_id, "purchases")?;
+    crate::fraud::check_iap(&s, me.account_id).await?;
     let Some(c) = &s.steam_iap else {
         return Err(Error::NotFound("steam iap is not configured".into()).into());
     };
