@@ -1,5 +1,6 @@
 //! Musubi node: wires config, database, services and HTTP/realtime listeners together.
 
+pub mod achievement_sync;
 pub mod anticheat;
 pub mod app;
 pub mod audit;

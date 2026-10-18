@@ -200,8 +200,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   Импорт платформенных друзей разовый, без периодического рефреша. Войны/челленджи кланов — нет.
   ✅ `status_update {status, rich, appear_offline}`: rich presence — JSON-объект ≤2 КБ рядом со статусом; appear_offline —
   подписчики получают leave и не видят сессию в снапшотах `status_follow`, сервер по-прежнему знает, что она онлайн.
-- **Экономика (5.11).** Нет синка достижений в
-  Steam/PSN/Xbox, ~~фрод-эвристик по скорости покупок~~ ✅ `[fraud]`: лимиты покупок/трат/IAP в окне → флаг (`economy.fraud_flag`, `/v1/server/economy/fraud/*`) или 429. ~~IAP: только Apple/Google/Steam~~ ✅ PSN/Xbox/Nintendo/Epic через
+- **Экономика (5.11).** ~~Нет синка достижений в Steam/PSN/Xbox~~ ✅ `platform_ids` у достижения: Steam — s2s `SetUserStatsForGame` под publisher key, PSN/Xbox — id в событии `achievement.unlocked` для клиентского SDK; ~~фрод-эвристик по скорости покупок~~ ✅ `[fraud]`: лимиты покупок/трат/IAP в окне → флаг (`economy.fraud_flag`, `/v1/server/economy/fraud/*`) или 429. ~~IAP: только Apple/Google/Steam~~ ✅ PSN/Xbox/Nintendo/Epic через
   `POST /v1/iap/{platform}` (s2s entitlements + consume); Huawei/Samsung/Facebook — нет.
   ✅ витрины per-платформа: `platforms` у листинга (пусто = везде), `GET /v1/store?platform=`.
   ✅ rerolls квестов: `rerollable` + `rerolls_per_period` у квеста, `POST /v1/quests/{id}/reroll` прячет его до конца

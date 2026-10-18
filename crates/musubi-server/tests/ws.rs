@@ -3234,6 +3234,129 @@ async fn mock_console_stores(
 }
 
 #[tokio::test]
+async fn achievement_platform_ids_and_steam_sync() {
+    use std::sync::{Arc, Mutex};
+    let calls: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>> = Default::default();
+    let c2 = calls.clone();
+    let mock = axum::Router::new().route(
+        "/ISteamUserStats/SetUserStatsForGame/v1/",
+        axum::routing::post(move |axum::Form(f): axum::Form<Vec<(String, String)>>| {
+            let c2 = c2.clone();
+            async move {
+                c2.lock().unwrap().push(f.into_iter().collect());
+                axum::Json(json!({"response": {"result": 1}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            let cfg = std::sync::Arc::make_mut(&mut st.cfg);
+            cfg.iap.steam.url = url;
+            cfg.iap.steam.key = "pubkey".into();
+            cfg.iap.steam.app_id = 480;
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let steam_id = format!("7656119{}", &suffix[..10]);
+    sqlx::query(
+        "insert into musubi.identities (id, account_id, provider, subject, verified) values ($1, $2, 'steam', $3, true)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid::Uuid::parse_str(&acc_a).unwrap())
+    .bind(&steam_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let ach = format!("ach_{}", &suffix[..12]);
+    let (st, r) = http_json(&router, "POST", "/v1/server/achievements", None, true,
+        Some(json!({"id": ach, "name": "Win twice", "target": 2, "platform_ids": {"steam": "ACH_WIN", "psn": "trophy_7"}}))).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["platform_ids"]["psn"], "trophy_7");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/achievements/progress",
+        None,
+        true,
+        Some(json!({"account_id": acc_a, "achievement_id": ach, "delta": 1})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["unlocked"], false);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "no steam call before unlock"
+    );
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/achievements/progress",
+        None,
+        true,
+        Some(json!({"account_id": acc_a, "achievement_id": ach, "delta": 1})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["unlocked"], true);
+    assert_eq!(r["platform_ids"]["steam"], "ACH_WIN");
+    let mut got = None;
+    for _ in 0..40 {
+        if let Some(f) = calls.lock().unwrap().first().cloned() {
+            got = Some(f);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let f = got.expect("steam SetUserStatsForGame called");
+    assert_eq!(f["key"], "pubkey");
+    assert_eq!(f["appid"], "480");
+    assert_eq!(f["steamid"], steam_id);
+    assert_eq!(f["count"], "1");
+    assert_eq!(f["name[0]"], "ACH_WIN");
+    assert_eq!(f["value[0]"], "1");
+    // player view carries the platform ids for the client SDK (psn trophy)
+    let (_, mine) = http_json(&router, "GET", "/v1/achievements", Some(&ta), false, None).await;
+    let e = mine["achievements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["achievement_id"] == ach)
+        .cloned()
+        .unwrap();
+    assert_eq!(e["unlocked"], true);
+    assert_eq!(e["platform_ids"]["steam"], "ACH_WIN");
+    assert_eq!(e["platform_ids"]["psn"], "trophy_7");
+    // no linked steam identity: unlock still works, nothing is sent to Steam
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/server/achievements/progress",
+        None,
+        true,
+        Some(json!({"account_id": acc_b, "achievement_id": ach, "delta": 2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["unlocked"], true);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let _ = tb;
+}
+
+#[tokio::test]
 async fn console_iap_redeems_via_platform_entitlements() {
     use musubi_core::config::ConsoleStoreConfig;
     use musubi_integrations::{ConsolePlatform, ConsoleStoreClient};

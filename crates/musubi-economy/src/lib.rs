@@ -15,7 +15,7 @@ pub mod iap;
 pub mod mailbox;
 pub mod market;
 pub mod orderbook;
-pub use achievements::Achievement;
+pub use achievements::{Achievement, AchievementUpdate};
 pub use mailbox::{Audience, Mail, SendMail};
 pub use market::{
     EscrowItem, Listing, ListingFilter, MarketRules, NewListing, NewTrade, OfferItem, Sale,

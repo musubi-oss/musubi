@@ -18,6 +18,10 @@ pub struct Achievement {
     pub rewards: Option<String>,
     pub hidden: bool,
     pub enabled: bool,
+    /// Platform achievement / trophy ids keyed by provider (`steam`, `psn`, `xbox`, ...). Steam is
+    /// unlocked server-to-server when `[iap.steam]` is configured; the rest ride on the
+    /// `achievement.unlocked` event for the client SDK.
+    pub platform_ids: std::collections::HashMap<String, String>,
 }
 
 impl Default for Achievement {
@@ -30,6 +34,7 @@ impl Default for Achievement {
             rewards: None,
             hidden: false,
             enabled: true,
+            platform_ids: Default::default(),
         }
     }
 }
@@ -42,9 +47,19 @@ pub struct AchievementUpdate {
     /// True only on the call that reached the target.
     pub unlocked: bool,
     pub rewards: Vec<RewardEntry>,
+    pub platform_ids: std::collections::HashMap<String, String>,
 }
 
-type AchRow = (String, String, String, i32, Option<String>, bool, bool);
+type AchRow = (
+    String,
+    String,
+    String,
+    i32,
+    Option<String>,
+    bool,
+    bool,
+    Value,
+);
 type ProgressRow = (
     String,
     String,
@@ -53,6 +68,7 @@ type ProgressRow = (
     bool,
     Option<i32>,
     Option<OffsetDateTime>,
+    Value,
 );
 
 fn ach(r: AchRow) -> Achievement {
@@ -64,10 +80,11 @@ fn ach(r: AchRow) -> Achievement {
         rewards: r.4,
         hidden: r.5,
         enabled: r.6,
+        platform_ids: serde_json::from_value(r.7).unwrap_or_default(),
     }
 }
 
-const COLS: &str = "id, name, description, target, rewards, hidden, enabled";
+const COLS: &str = "id, name, description, target, rewards, hidden, enabled, platform_ids";
 
 impl EconomyService {
     pub async fn upsert_achievement(&self, a: Achievement) -> Result<Achievement> {
@@ -76,9 +93,10 @@ impl EconomyService {
             return Err(Error::InvalidArgument("target must be positive".into()));
         }
         sqlx::query(
-            "insert into musubi.achievements (id, name, description, target, rewards, hidden, enabled) values ($1, $2, $3, $4, $5, $6, $7)
+            "insert into musubi.achievements (id, name, description, target, rewards, hidden, enabled, platform_ids)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)
              on conflict (id) do update set name = excluded.name, description = excluded.description, target = excluded.target,
-             rewards = excluded.rewards, hidden = excluded.hidden, enabled = excluded.enabled",
+             rewards = excluded.rewards, hidden = excluded.hidden, enabled = excluded.enabled, platform_ids = excluded.platform_ids",
         )
         .bind(&a.id)
         .bind(&a.name)
@@ -87,6 +105,7 @@ impl EconomyService {
         .bind(&a.rewards)
         .bind(a.hidden)
         .bind(a.enabled)
+        .bind(serde_json::to_value(&a.platform_ids).map_err(Error::internal)?)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -106,7 +125,7 @@ impl EconomyService {
     /// Player view: enabled achievements; hidden ones only once there is progress.
     pub async fn achievement_progress(&self, account: AccountId) -> Result<Vec<Value>> {
         let rows: Vec<ProgressRow> = sqlx::query_as(
-            "select a.id, a.name, a.description, a.target, a.hidden, p.progress, p.unlocked_at from musubi.achievements a
+            "select a.id, a.name, a.description, a.target, a.hidden, p.progress, p.unlocked_at, a.platform_ids from musubi.achievements a
              left join musubi.achievement_progress p on p.achievement_id = a.id and p.account_id = $1
              where a.enabled and (not a.hidden or coalesce(p.progress, 0) > 0) order by a.id",
         )
@@ -121,6 +140,7 @@ impl EconomyService {
                     "achievement_id": r.0, "name": r.1, "description": r.2, "target": r.3, "hidden": r.4,
                     "progress": r.5.unwrap_or(0), "unlocked": r.6.is_some(),
                     "unlocked_at": r.6.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+                    "platform_ids": r.7,
                 })
             })
             .collect())
@@ -196,6 +216,7 @@ impl EconomyService {
         .map_err(Error::internal)?;
         tx.commit().await.map_err(Error::internal)?;
         Ok(AchievementUpdate {
+            platform_ids: a.platform_ids.clone(),
             achievement_id: achievement_id.into(),
             progress: next,
             target: a.target,

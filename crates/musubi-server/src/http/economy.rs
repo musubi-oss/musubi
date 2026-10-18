@@ -1396,6 +1396,7 @@ async fn achievement_progress(
             OffsetDateTime::now_utc(),
         )
         .await?;
+    crate::achievement_sync::after_update(&s, account(&r.account_id)?, &u).await;
     Ok(Json(serde_json::to_value(u).map_err(Error::internal)?))
 }
 

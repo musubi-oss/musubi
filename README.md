@@ -297,6 +297,8 @@ Keys issued through `POST /v1/admin/keys {name, role}` carry a role: `server` (g
 
 ### Subscriptions
 
+Achievements carry `platform_ids` (`{"steam": "ACH_WIN", "psn": "trophy_7", "xbox": "..."}`): on unlock the `achievement.unlocked` event lists them for the client SDK (PSN trophies / Xbox achievements can only be unlocked on the device), and Steam is unlocked server-to-server through `ISteamUserStats/SetUserStatsForGame` with the publisher key from `[iap.steam]` for the player's linked Steam identity (`achievement.sync_failed` on error).
+
 Mail broadcasts take an `audience` instead of `account_ids`/`all`: `{"audience": {"lang": ["de"], "location": ["eu"], "platform": ["psn"], "age_bracket": ["adult"], "track": "xp", "min_level": 10, "active_within_days": 7 | "inactive_days": 30, "created_after": <unix>, "metadata": {"cohort": "b"}}}` — every listed condition must hold; `POST /v1/server/mail/audience/count` previews the reach before sending.
 
 Purchase-velocity heuristics: `[fraud] enabled = true`, `window_secs`, `max_purchases`, `max_spend = { gold = 100000 }`, `max_iap`, `action = "flag" | "block"` — an account over a limit inside the window gets a fraud flag (`economy.fraud_flag` event, `GET /v1/server/economy/fraud/flags`, `POST …/flags/{id}/resolve`, `GET /v1/server/economy/fraud/{account}` for live counters) and with `block` the purchase or IAP redeem is rejected with 429.
