@@ -5067,6 +5067,8 @@ async fn modules_hot_load_over_admin_api() {
 /// Social graph, groups and leaderboard writes leave events in the outbox.
 #[tokio::test]
 async fn social_and_leaderboard_events_reach_the_outbox() {
+    // uuid v7 ids are time-ordered: everything this test produces sorts after this cursor
+    let after = uuid::Uuid::now_v7();
     let Some(app) = app().await else {
         return;
     };
@@ -5149,7 +5151,7 @@ async fn social_and_leaderboard_events_reach_the_outbox() {
     let (st, ev) = call_server(
         &app,
         "GET",
-        "/v1/server/events?kinds=friend.added,friend.removed,group.created,leaderboard.record&limit=200",
+        &format!("/v1/server/events?kinds=friend.added,friend.removed,group.created,leaderboard.record&limit=1000&after={after}"),
         "defaultkey",
         None,
     )

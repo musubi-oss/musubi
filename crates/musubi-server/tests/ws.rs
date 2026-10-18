@@ -14945,7 +14945,10 @@ async fn iap_subscription_sweep_marks_grace_and_expired() {
     let moved = musubi_server::http::economy::sweep_subscriptions(&state)
         .await
         .unwrap();
-    assert_eq!(moved, 2, "grace + expired, the live one untouched");
+    assert!(
+        moved >= 2,
+        "grace + expired, the live one untouched (shared db may add more): {moved}"
+    );
     let statuses: Vec<(String, String)> = sqlx::query_as(
         "select product_id, status from musubi.iap_subscriptions where account_id = $1 order by expires_at_ms, product_id",
     )
