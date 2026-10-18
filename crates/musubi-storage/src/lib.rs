@@ -765,13 +765,16 @@ impl StorageService {
             }
             self.policy_allows(
                 caller,
-                "write",
-                &op.collection,
-                &op.key,
-                owner,
-                cur_write,
-                Some(&value),
-                None,
+                policy::Env {
+                    me: None,
+                    owner,
+                    key: &op.key,
+                    collection: &op.collection,
+                    op: "write",
+                    permission: cur_write,
+                    value: Some(&value),
+                    new: None,
+                },
             )?;
             if matches!(op.version.as_deref(), Some(v) if v != cur_version) {
                 return Err(Error::Conflict(format!(
@@ -1106,13 +1109,16 @@ impl StorageService {
             .map_err(Error::internal)?;
             self.policy_allows(
                 caller,
-                "write",
-                &op.collection,
-                &op.key,
-                owner,
-                cur.as_ref().map(|c| c.1).unwrap_or(op.write_permission),
-                cur.as_ref().map(|c| &c.0),
-                Some(&op.value),
+                policy::Env {
+                    me: None,
+                    owner,
+                    key: &op.key,
+                    collection: &op.collection,
+                    op: "write",
+                    permission: cur.as_ref().map(|c| c.1).unwrap_or(op.write_permission),
+                    value: cur.as_ref().map(|c| &c.0),
+                    new: Some(&op.value),
+                },
             )?;
         }
         let create_only = op.version.as_deref() == Some("*");
@@ -1398,13 +1404,16 @@ impl StorageService {
             }
             self.policy_allows(
                 caller,
-                "delete",
-                &op.collection,
-                &op.key,
-                owner,
-                cur_write,
-                Some(&cur_value),
-                None,
+                policy::Env {
+                    me: None,
+                    owner,
+                    key: &op.key,
+                    collection: &op.collection,
+                    op: "delete",
+                    permission: cur_write,
+                    value: Some(&cur_value),
+                    new: None,
+                },
             )?;
             if matches!(&op.version, Some(v) if *v != cur_version) {
                 return Err(Error::Conflict(format!(
@@ -1462,24 +1471,17 @@ impl StorageService {
     }
 
     /// `policy.write` / `policy.delete` gate for user callers (`None` rule = allowed).
-    fn policy_allows(
-        &self,
-        caller: Caller,
-        op: &str,
-        collection: &str,
-        key: &str,
-        owner: Uuid,
-        permission: i16,
-        value: Option<&serde_json::Value>,
-        new: Option<&serde_json::Value>,
-    ) -> Result<()> {
+    fn policy_allows(&self, caller: Caller, env: policy::Env<'_>) -> Result<()> {
         let Caller::User(a) = caller else {
             return Ok(());
         };
-        let Some(p) = self.schema_of(collection).and_then(|s| s.policy.clone()) else {
+        let Some(p) = self
+            .schema_of(env.collection)
+            .and_then(|s| s.policy.clone())
+        else {
             return Ok(());
         };
-        let rule = if op == "delete" {
+        let rule = if env.op == "delete" {
             p.delete_rule().map(str::to_string)
         } else {
             p.write.clone()
@@ -1487,24 +1489,16 @@ impl StorageService {
         let Some(rule) = rule else {
             return Ok(());
         };
-        let ok = policy::allows(
-            &rule,
-            &policy::Env {
-                me: Some(a.0),
-                owner,
-                key,
-                collection,
-                op,
-                permission,
-                value,
-                new,
-            },
-        );
-        if ok {
+        let env = policy::Env {
+            me: Some(a.0),
+            ..env
+        };
+        if policy::allows(&rule, &env) {
             Ok(())
         } else {
             Err(Error::PermissionDenied(format!(
-                "{collection}/{key}: policy denies {op}"
+                "{}/{}: policy denies {}",
+                env.collection, env.key, env.op
             )))
         }
     }
