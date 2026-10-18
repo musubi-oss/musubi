@@ -25,7 +25,11 @@ quinn.workspace = true
 musubi-transport.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
+urlencoding = "2"
 tokio-tungstenite.workspace = true
 futures.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

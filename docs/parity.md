@@ -209,6 +209,8 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ CLI: `musubi module publish/canary/promote/rollback/versions`, `musubi fleet push/list`, `musubi deploy` —
+  раскатка модулей и флотов из CI поверх админ-API, тест на мок-сервере.
   ✅ оркестрация: провайдер `webhook` — любой оркестратор за `POST /servers`, `GET /servers/{id}`, `DELETE /servers/{id}`
   (`[fleet.webhook] url/token`), тест на мок-сервере.
   ✅ storage: JSON Patch RFC 6902 (`ops` в `/v1/storage/patch`, `test` → 409), агрегаты
@@ -223,6 +225,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
 - **Storage (5.3).** Patch — только JSON Merge Patch (нет RFC 6902), нет aggregate и full-text.
 - **Оркестрация (5.9).** Любой внешний оркестратор (GameFabric, свой планировщик) — провайдер `webhook` (start/status/stop по HTTP); нет, билды не в OCI-реестре, warm-pool
   «≤ 2 с до готовности» не измерен.
-- **CLI (5.15).** Есть dev/migrate/migrate-nakama/export/import/doctor/config/bench/soak; нет `deploy`,
-  `module publish/rollout/rollback`, `schema migrate`, `fleet push`, миграции с PlayFab/UGS, Terraform.
+- **CLI (5.15).** Есть dev/migrate/migrate-nakama/export/import/doctor/config/bench/soak,
+  `module publish/canary/promote/rollback/versions`, `fleet push/list`, `deploy` (манифест модули+флоты);
+  нет `schema migrate` (контракты коллекций применяются через API), миграции с PlayFab/UGS, Terraform.
 - **Realtime (5.8).** Типизированная схема состояния с автодельтами и детерминированный rollback — v2 / SDK.

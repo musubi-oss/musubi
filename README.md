@@ -29,6 +29,9 @@ Configuration: TOML/YAML file via `--config`, every key overridable with
 | `musubi migrate` | apply migrations and exit |
 | `musubi export --out dump.jsonl` / `musubi import --input dump.jsonl [--replace]` | move game data between environments (every `musubi` table except runtime state, foreign-key order, idempotent import) |
 | `musubi bench --url … --clients 50 --duration-secs 10 --scenario http\|storage\|ws\|chat\|match\|world\|all [--match-size 8]` | load generator with p50/p95/p99, throughput, errors and 429s (`chat`: rooms of 50, send → own echo; `match`: relayed matches of `match_size` players at 30 Hz, relay latency measured at the receivers) |
+| `musubi module publish NAME game.wasm` / `module canary NAME game.wasm --percent 10 [--accounts a,b]` / `module promote NAME [--drop]` / `module rollback NAME 3` / `module versions [NAME]` | ship WASM modules to a running cluster: straight to active, or as a canary taking a share of RPCs (plus pinned accounts) that you promote or drop; roll back to any earlier version |
+| `musubi fleet push fleet.toml` / `musubi fleet list` | create the fleet in the file or update the existing one of that name (buffer/min/max/policy); a `[build]` section adds a build version — canary (`canary_percent > 0`) or active |
+| `musubi deploy [--file musubi.deploy.toml]` | one manifest with `[[modules]]` (`name`, `path`, `canary_percent`) and `[[fleets]]` (same shape as `fleet push`), applied in order — the CI step after `cargo build --target wasm32-wasip1` |
 | `musubi config --format json` | effective configuration (secrets included — do not paste it anywhere) |
 
 Server-to-server keys: `http.server_key` is the bootstrap admin key; issue scoped keys with

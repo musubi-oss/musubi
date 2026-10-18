@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 mod bench;
+mod deploy;
 mod doctor;
 mod soak;
 mod transfer;
@@ -31,6 +32,23 @@ enum Cmd {
         /// HTTP listen address.
         #[arg(long, default_value = "127.0.0.1:7350")]
         listen: String,
+    },
+    /// Publish, canary, promote or roll back WASM modules on a running cluster.
+    Module {
+        #[command(subcommand)]
+        cmd: deploy::ModuleCmd,
+    },
+    /// Create/update fleets and their builds from a TOML/JSON file.
+    Fleet {
+        #[command(subcommand)]
+        cmd: deploy::FleetCmd,
+    },
+    /// Apply a deploy manifest (`[[modules]]` + `[[fleets]]`) against a running cluster.
+    Deploy {
+        #[arg(long, default_value = "musubi.deploy.toml")]
+        file: PathBuf,
+        #[command(flatten)]
+        api: deploy::ApiArgs,
     },
     /// Apply pending database migrations and exit.
     Migrate,
@@ -178,6 +196,9 @@ async fn main() -> anyhow::Result<()> {
             musubi_server::run(cfg).await
         }
         Cmd::Doctor => doctor::run(&cfg).await,
+        Cmd::Module { cmd } => deploy::module(&cfg, cmd).await,
+        Cmd::Fleet { cmd } => deploy::fleet(&cfg, cmd).await,
+        Cmd::Deploy { file, api } => deploy::deploy(&cfg, file, api).await,
         Cmd::Export { out, tables } => {
             let pool = musubi_server::db::connect(&cfg.database).await?;
             let counts = match out {
