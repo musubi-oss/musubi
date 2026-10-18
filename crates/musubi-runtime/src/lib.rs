@@ -125,6 +125,39 @@ interface notify {
     send: func(account: string, subject: string, content: string, code: s32, persistent: bool) -> result<string, string>;
 }
 
+interface time {
+    /// Unix time in milliseconds (host clock; matches use the deterministic tick instead).
+    now-ms: func() -> u64;
+}
+interface rng {
+    /// `seed` makes the sequence a pure function of the seed (replayable); none = OS randomness.
+    /// `max` bounds each value to `0..max`.
+    random: func(seed: option<string>, count: u32, max: option<u64>) -> result<list<u64>, string>;
+}
+interface secrets {
+    /// `[runtime.secrets]` by name — modules never see the process environment.
+    get: func(name: string) -> result<string, string>;
+}
+interface metrics {
+    /// `musubi_module_<name>` counter / gauge on `/metrics`; `labels` is a JSON object or empty.
+    inc: func(name: string, value: f64, labels: string) -> result<_, string>;
+    gauge: func(name: string, value: f64, labels: string) -> result<_, string>;
+}
+interface http {
+    /// Only hosts in `[runtime] http_allow`; `headers` is a JSON object; the answer is the JSON
+    /// `{status, headers, body, json}` the `http.fetch` host op returns.
+    fetch: func(method: string, url: string, headers: string, body: option<list<u8>>) -> result<string, string>;
+}
+interface timers {
+    /// Durable one-shot: `target` is `rpc:<id>` or `hook:<name>`, `payload` JSON, due `in-secs`
+    /// from now or at RFC 3339 `at`; `key` makes scheduling idempotent. Returns the timer JSON.
+    schedule: func(target: string, payload: string, in-secs: option<u64>, at: option<string>, key: option<string>) -> result<string, string>;
+    cancel: func(id: option<string>, key: option<string>) -> result<bool, string>;
+}
+interface audiences {
+    /// Named audiences the account is in right now (defaults to the calling account).
+    of: func(account: option<string>) -> result<list<string>, string>;
+}
 interface guest-api {
     exports: func() -> list<string>;
     call: func(name: string, ctx: string, payload: list<u8>) -> result<list<u8>, string>;
@@ -137,6 +170,13 @@ world guest {
     import wallet;
     import inventory;
     import notify;
+    import time;
+    import rng;
+    import secrets;
+    import metrics;
+    import http;
+    import timers;
+    import audiences;
     export guest-api;
 }
 "#;
@@ -177,6 +217,39 @@ interface notify {
     send: func(account: string, subject: string, content: string, code: s32, persistent: bool) -> result<string, string>;
 }
 
+interface time {
+    /// Unix time in milliseconds (host clock; matches use the deterministic tick instead).
+    now-ms: func() -> u64;
+}
+interface rng {
+    /// `seed` makes the sequence a pure function of the seed (replayable); none = OS randomness.
+    /// `max` bounds each value to `0..max`.
+    random: func(seed: option<string>, count: u32, max: option<u64>) -> result<list<u64>, string>;
+}
+interface secrets {
+    /// `[runtime.secrets]` by name — modules never see the process environment.
+    get: func(name: string) -> result<string, string>;
+}
+interface metrics {
+    /// `musubi_module_<name>` counter / gauge on `/metrics`; `labels` is a JSON object or empty.
+    inc: func(name: string, value: f64, labels: string) -> result<_, string>;
+    gauge: func(name: string, value: f64, labels: string) -> result<_, string>;
+}
+interface http {
+    /// Only hosts in `[runtime] http_allow`; `headers` is a JSON object; the answer is the JSON
+    /// `{status, headers, body, json}` the `http.fetch` host op returns.
+    fetch: func(method: string, url: string, headers: string, body: option<list<u8>>) -> result<string, string>;
+}
+interface timers {
+    /// Durable one-shot: `target` is `rpc:<id>` or `hook:<name>`, `payload` JSON, due `in-secs`
+    /// from now or at RFC 3339 `at`; `key` makes scheduling idempotent. Returns the timer JSON.
+    schedule: func(target: string, payload: string, in-secs: option<u64>, at: option<string>, key: option<string>) -> result<string, string>;
+    cancel: func(id: option<string>, key: option<string>) -> result<bool, string>;
+}
+interface audiences {
+    /// Named audiences the account is in right now (defaults to the calling account).
+    of: func(account: option<string>) -> result<list<string>, string>;
+}
 interface guest-api {
     exports: func() -> list<string>;
     call: func(name: string, ctx: string, payload: list<u8>) -> result<list<u8>, string>;
@@ -189,6 +262,13 @@ world guest {
     import wallet;
     import inventory;
     import notify;
+    import time;
+    import rng;
+    import secrets;
+    import metrics;
+    import http;
+    import timers;
+    import audiences;
     export guest-api;
 }
 "#,
@@ -300,6 +380,136 @@ impl wit::musubi::runtime::notify::Host for State {
             "op": "notify.send", "account_id": account, "subject": subject,
             "content": json_or_string(content), "code": code, "persistent": persistent,
         }))
+    }
+}
+
+impl wit::musubi::runtime::time::Host for State {
+    fn now_ms(&mut self) -> u64 {
+        self.op(json!({ "op": "time.now" }))
+            .ok()
+            .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+            .and_then(|v| v["unix_ms"].as_u64())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            })
+    }
+}
+
+impl wit::musubi::runtime::rng::Host for State {
+    fn random(
+        &mut self,
+        seed: Option<String>,
+        count: u32,
+        max: Option<u64>,
+    ) -> std::result::Result<Vec<u64>, String> {
+        let out =
+            self.op(json!({ "op": "rng.random", "seed": seed, "count": count, "max": max }))?;
+        let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        v["values"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_u64).collect())
+            .ok_or_else(|| "rng.random: no values".to_string())
+    }
+}
+
+impl wit::musubi::runtime::secrets::Host for State {
+    fn get(&mut self, name: String) -> std::result::Result<String, String> {
+        let out = self.op(json!({ "op": "secrets.get", "name": name }))?;
+        let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        v["value"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "secrets.get: no value".to_string())
+    }
+}
+
+impl wit::musubi::runtime::metrics::Host for State {
+    fn inc(&mut self, name: String, value: f64, labels: String) -> std::result::Result<(), String> {
+        self.op(json!({ "op": "metrics.inc", "name": name, "value": value, "labels": json_or_string(labels) }))
+            .map(|_| ())
+    }
+
+    fn gauge(
+        &mut self,
+        name: String,
+        value: f64,
+        labels: String,
+    ) -> std::result::Result<(), String> {
+        self.op(json!({ "op": "metrics.gauge", "name": name, "value": value, "labels": json_or_string(labels) }))
+            .map(|_| ())
+    }
+}
+
+impl wit::musubi::runtime::http::Host for State {
+    fn fetch(
+        &mut self,
+        method: String,
+        url: String,
+        headers: String,
+        body: Option<Vec<u8>>,
+    ) -> std::result::Result<String, String> {
+        let body = body.map(|b| String::from_utf8_lossy(&b).into_owned());
+        self.op(json!({
+            "op": "http.fetch", "method": method, "url": url,
+            "headers": json_or_string(headers), "body": body,
+        }))
+    }
+}
+
+impl wit::musubi::runtime::timers::Host for State {
+    fn schedule(
+        &mut self,
+        target: String,
+        payload: String,
+        in_secs: Option<u64>,
+        at: Option<String>,
+        key: Option<String>,
+    ) -> std::result::Result<String, String> {
+        let (kind, id) = target
+            .split_once(':')
+            .ok_or_else(|| "timers.schedule: target is rpc:<id> or hook:<name>".to_string())?;
+        let mut req =
+            json!({ "op": "timer.schedule", "payload": json_or_string(payload), "key": key });
+        match kind {
+            "rpc" => req["rpc"] = json!(id),
+            "hook" => req["hook"] = json!(id),
+            _ => return Err("timers.schedule: target is rpc:<id> or hook:<name>".into()),
+        }
+        if let Some(secs) = in_secs {
+            req["in_secs"] = json!(secs);
+        }
+        if let Some(at) = at {
+            req["at"] = json!(at);
+        }
+        self.op(req)
+    }
+
+    fn cancel(
+        &mut self,
+        id: Option<String>,
+        key: Option<String>,
+    ) -> std::result::Result<bool, String> {
+        let out = self.op(json!({ "op": "timer.cancel", "id": id, "key": key }))?;
+        let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        Ok(v["cancelled"].as_bool().unwrap_or(false))
+    }
+}
+
+impl wit::musubi::runtime::audiences::Host for State {
+    fn of(&mut self, account: Option<String>) -> std::result::Result<Vec<String>, String> {
+        let out = self.op(json!({ "op": "audiences.of", "account_id": account }))?;
+        let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        Ok(v["audiences"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -1293,6 +1503,213 @@ mod component_tests {
                 other => Err(Error::InvalidArgument(format!("unknown op {other:?}"))),
             }
         }
+    }
+
+    /// Records every request and answers each op with a canned JSON document.
+    struct CannedHost {
+        calls: parking_lot::Mutex<Vec<Value>>,
+        answers: HashMap<&'static str, Value>,
+    }
+
+    impl HostApi for CannedHost {
+        fn call(&self, _ctx: &CallContext, request: Value) -> Result<Value> {
+            self.calls.lock().push(request.clone());
+            let op = request["op"].as_str().unwrap_or("");
+            self.answers
+                .get(op)
+                .cloned()
+                .ok_or_else(|| Error::InvalidArgument(format!("unknown op {op}")))
+        }
+    }
+
+    #[test]
+    fn typed_wit_imports_map_to_host_ops() {
+        use wit::musubi::runtime::{audiences, http, metrics, rng, secrets, time, timers};
+        let host = Arc::new(CannedHost {
+            calls: Default::default(),
+            answers: HashMap::from([
+                (
+                    "time.now",
+                    json!({ "unix": 1700000000, "unix_ms": 1700000000123u64, "iso": "x" }),
+                ),
+                ("rng.random", json!({ "values": [3, 1, 4], "max": 6 })),
+                ("secrets.get", json!({ "name": "steam", "value": "s3cret" })),
+                ("metrics.inc", json!({ "ok": true })),
+                ("metrics.gauge", json!({ "ok": true })),
+                (
+                    "http.fetch",
+                    json!({ "status": 200, "headers": {}, "body": "pong", "json": null }),
+                ),
+                (
+                    "timer.schedule",
+                    json!({ "id": "t1", "due_at": "2030-01-01T00:00:00Z" }),
+                ),
+                ("timer.cancel", json!({ "cancelled": true })),
+                (
+                    "audiences.of",
+                    json!({ "account_id": "a", "audiences": ["vip", "eu"] }),
+                ),
+            ]),
+        });
+        let mut st = State {
+            limits: StoreLimitsBuilder::new().build(),
+            error: None,
+            module: "m".into(),
+            ctx: CallContext::default(),
+            host: host.clone(),
+        };
+        assert_eq!(time::Host::now_ms(&mut st), 1700000000123);
+        assert_eq!(
+            rng::Host::random(&mut st, Some("seed".into()), 3, Some(6)).unwrap(),
+            vec![3, 1, 4]
+        );
+        assert_eq!(
+            secrets::Host::get(&mut st, "steam".into()).unwrap(),
+            "s3cret"
+        );
+        metrics::Host::inc(&mut st, "kills".into(), 1.0, r#"{"team":"red"}"#.into()).unwrap();
+        metrics::Host::gauge(&mut st, "players".into(), 7.5, String::new()).unwrap();
+        let resp = http::Host::fetch(
+            &mut st,
+            "POST".into(),
+            "https://api.example/ping".into(),
+            r#"{"x-a":"b"}"#.into(),
+            Some(b"ping".to_vec()),
+        )
+        .unwrap();
+        assert!(resp.contains("\"pong\""));
+        let t = timers::Host::schedule(
+            &mut st,
+            "rpc:daily_reset".into(),
+            r#"{"day":1}"#.into(),
+            Some(60),
+            None,
+            Some("reset".into()),
+        )
+        .unwrap();
+        assert!(t.contains("\"t1\""));
+        assert!(
+            timers::Host::schedule(&mut st, "cron:x".into(), "{}".into(), None, None, None)
+                .is_err()
+        );
+        assert!(timers::Host::cancel(&mut st, None, Some("reset".into())).unwrap());
+        assert_eq!(
+            audiences::Host::of(&mut st, None).unwrap(),
+            vec!["vip".to_string(), "eu".to_string()]
+        );
+        assert!(
+            secrets::Host::get(&mut st, "missing".into()).is_ok(),
+            "canned host answers any name"
+        );
+
+        let calls = host.calls.lock();
+        assert_eq!(calls[0], json!({ "op": "time.now" }));
+        assert_eq!(
+            calls[1],
+            json!({ "op": "rng.random", "seed": "seed", "count": 3, "max": 6 })
+        );
+        assert_eq!(calls[2], json!({ "op": "secrets.get", "name": "steam" }));
+        assert_eq!(
+            calls[3],
+            json!({ "op": "metrics.inc", "name": "kills", "value": 1.0, "labels": { "team": "red" } })
+        );
+        assert_eq!(calls[4]["labels"], json!(""));
+        assert_eq!(
+            calls[5],
+            json!({ "op": "http.fetch", "method": "POST", "url": "https://api.example/ping", "headers": { "x-a": "b" }, "body": "ping" })
+        );
+        assert_eq!(
+            calls[6],
+            json!({ "op": "timer.schedule", "rpc": "daily_reset", "payload": { "day": 1 }, "in_secs": 60, "key": "reset" })
+        );
+        assert_eq!(
+            calls[7],
+            json!({ "op": "timer.cancel", "id": null, "key": "reset" })
+        );
+        assert_eq!(
+            calls[8],
+            json!({ "op": "audiences.of", "account_id": null })
+        );
+    }
+
+    /// A component importing the typed `secrets` interface: `call` returns the secret as bytes.
+    const SECRETS_COMPONENT: &str = r#"
+(component
+  (import "musubi:runtime/secrets@0.1.0" (instance $secrets
+    (export "get" (func (param "name" string) (result (result string (error string)))))))
+  (core module $M
+    (memory (export "memory") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (global.get $heap))
+      (global.set $heap (i32.add (global.get $heap) (local.get 3)))
+      (local.get $p)))
+  (core instance $m (instantiate $M))
+  (core func $get_l (canon lower (func $secrets "get")
+    (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (core module $N
+    (import "env" "memory" (memory 1))
+    (import "secrets" "get" (func $get (param i32 i32 i32)))
+    (data (i32.const 16) "rpc_sec")
+    (data (i32.const 32) "steam")
+    (func (export "exports") (result i32)
+      (i32.store (i32.const 64) (i32.const 16)) (i32.store (i32.const 68) (i32.const 7))
+      (i32.store (i32.const 96) (i32.const 64)) (i32.store (i32.const 100) (i32.const 1))
+      (i32.const 96))
+    (func (export "call") (param i32 i32 i32 i32 i32 i32) (result i32)
+      (call $get (i32.const 32) (i32.const 5) (i32.const 240))
+      (i32.store (i32.const 128) (i32.load (i32.const 240)))
+      (i32.store (i32.const 132) (i32.load (i32.const 244)))
+      (i32.store (i32.const 136) (i32.load (i32.const 248)))
+      (i32.const 128)))
+  (core instance $n (instantiate $N
+    (with "env" (instance (export "memory" (memory $m "memory"))))
+    (with "secrets" (instance (export "get" (func $get_l))))))
+  (func $exports (result (list string))
+    (canon lift (core func $n "exports") (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (func $call (param "name" string) (param "ctx" string) (param "payload" (list u8))
+    (result (result (list u8) (error string)))
+    (canon lift (core func $n "call") (memory (core memory $m "memory")) (realloc (core func $m "realloc")) string-encoding=utf8))
+  (instance $api (export "exports" (func $exports)) (export "call" (func $call)))
+  (export "musubi:runtime/guest-api@0.1.0" (instance $api))
+)
+"#;
+
+    #[tokio::test]
+    async fn component_guest_uses_typed_secrets_import() {
+        let rt = Arc::new(Runtime::new(Limits::default()).unwrap());
+        let host = Arc::new(CannedHost {
+            calls: Default::default(),
+            answers: HashMap::from([(
+                "secrets.get",
+                json!({ "name": "steam", "value": "s3cret" }),
+            )]),
+        });
+        rt.set_host(host.clone());
+        assert_eq!(
+            rt.load_bytes("sec", SECRETS_COMPONENT.as_bytes()).unwrap(),
+            vec!["sec".to_string()]
+        );
+        let out = rt
+            .call("sec", CallContext::default(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(out, b"s3cret");
+        assert_eq!(
+            host.calls.lock()[0],
+            json!({ "op": "secrets.get", "name": "steam" })
+        );
+        // the host refusing (unknown secret) surfaces as the guest's error
+        let strict = Arc::new(CannedHost {
+            calls: Default::default(),
+            answers: HashMap::new(),
+        });
+        rt.set_host(strict);
+        assert!(rt
+            .call("sec", CallContext::default(), vec![])
+            .await
+            .is_err());
     }
 
     #[tokio::test]
