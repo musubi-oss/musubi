@@ -190,7 +190,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   `POST /v1/server/matchmaker/simulate` гоняет синтетику (MMR, пинги по регионам, пати) через живой конфиг очереди на виртуальном времени.
 - **Чат и уведомления (5.5).** Нет typing-индикатора, вложений, перевода, внешнего automod-хука; у in-app
   уведомлений нет TTL; push без шаблонов/расписания по таймзоне/тихих пушей/deep-link, нет Huawei;
-  mailbox не умеет рассылку по аудитории (только все / список).
+  ~~mailbox не умеет рассылку по аудитории~~ ✅ `audience` у `POST /v1/server/mail` (язык, регион, платформа, возраст, уровень трека, активность, дата регистрации, metadata) + `…/mail/audience/count`.
   ✅ typing (`channel_typing` → `ChannelTyping`, 1/2 с на канал, без хранения), вложения (`content.attachments` ≤10,
   https/ugc-ссылки, размер ≤25 МиБ — контракт проверяется сервером), внешний automod-вебхук (`chat.automod_url`:
   allow/block/replace, таймаут, fail-open/closed). ✅ TTL in-app уведомлений (`ttl_secs` → `expires_at`, скрытие и очистка), шаблоны push (`{{var}}`, `{{username}}`),

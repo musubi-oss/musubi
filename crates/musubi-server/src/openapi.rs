@@ -324,6 +324,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/iap/google/notifications", "economy"),
     ("POST", "/v1/iap/{platform}", "economy"),
     ("GET", "/v1/server/economy/fraud/flags", "economy"),
+    ("POST", "/v1/server/mail/audience/count", "economy"),
     (
         "POST",
         "/v1/server/economy/fraud/flags/{id}/resolve",

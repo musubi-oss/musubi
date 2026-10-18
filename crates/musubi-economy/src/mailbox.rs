@@ -3,6 +3,7 @@
 use musubi_core::{AccountId, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::{Postgres, QueryBuilder};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -15,6 +16,8 @@ pub struct SendMail {
     pub account_ids: Vec<Uuid>,
     /// Send to every account (ignores `account_ids`).
     pub all: bool,
+    /// Send to every account matching the filter (ignores `account_ids`); empty filter = all.
+    pub audience: Option<Audience>,
     pub title: String,
     pub body: String,
     pub metadata: Value,
@@ -23,11 +26,112 @@ pub struct SendMail {
     pub expires_in_seconds: Option<i64>,
 }
 
+/// Audience filter for broadcasts: every listed condition must hold. Days are relative to `now`,
+/// times are unix seconds, `platform` matches a linked identity provider (steam, psn, ...),
+/// `metadata` is a JSON containment check on `accounts.metadata`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Audience {
+    pub lang: Vec<String>,
+    pub location: Vec<String>,
+    pub platform: Vec<String>,
+    pub age_bracket: Vec<String>,
+    pub created_after: Option<i64>,
+    pub created_before: Option<i64>,
+    pub track: Option<String>,
+    pub min_level: Option<i32>,
+    pub max_level: Option<i32>,
+    pub active_within_days: Option<i64>,
+    pub inactive_days: Option<i64>,
+    pub metadata: Option<Value>,
+}
+
+impl Audience {
+    fn validate(&self) -> Result<()> {
+        if (self.min_level.is_some() || self.max_level.is_some()) && self.track.is_none() {
+            return Err(Error::InvalidArgument(
+                "min_level/max_level need track".into(),
+            ));
+        }
+        for d in [self.active_within_days, self.inactive_days]
+            .into_iter()
+            .flatten()
+        {
+            if !(1..=3650).contains(&d) {
+                return Err(Error::InvalidArgument("days must be 1..=3650".into()));
+            }
+        }
+        if let Some(m) = &self.metadata {
+            if !m.is_object() {
+                return Err(Error::InvalidArgument("metadata must be an object".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_where(&self, qb: &mut QueryBuilder<'_, Postgres>, now: OffsetDateTime) {
+        qb.push(" where a.deleted_at is null and a.disabled_at is null");
+        for (col, vals) in [
+            ("a.lang", &self.lang),
+            ("a.location", &self.location),
+            ("a.age_bracket", &self.age_bracket),
+        ] {
+            if !vals.is_empty() {
+                qb.push(format!(" and {col} = any("))
+                    .push_bind(vals.clone())
+                    .push(")");
+            }
+        }
+        if !self.platform.is_empty() {
+            qb.push(" and exists (select 1 from musubi.identities i where i.account_id = a.id and i.provider = any(")
+                .push_bind(self.platform.clone())
+                .push("))");
+        }
+        if let Some(t) = self
+            .created_after
+            .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
+        {
+            qb.push(" and a.created_at >= ").push_bind(t);
+        }
+        if let Some(t) = self
+            .created_before
+            .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
+        {
+            qb.push(" and a.created_at < ").push_bind(t);
+        }
+        if let Some(track) = &self.track {
+            qb.push(" and exists (select 1 from musubi.progress p where p.account_id = a.id and p.track_id = ")
+                .push_bind(track.clone());
+            if let Some(min) = self.min_level {
+                qb.push(" and p.level >= ").push_bind(min);
+            }
+            if let Some(max) = self.max_level {
+                qb.push(" and p.level <= ").push_bind(max);
+            }
+            qb.push(")");
+        }
+        if let Some(d) = self.active_within_days {
+            qb.push(" and exists (select 1 from musubi.sessions s where s.account_id = a.id and s.last_seen_at >= ")
+                .push_bind(now - Duration::days(d))
+                .push(")");
+        }
+        if let Some(d) = self.inactive_days {
+            qb.push(" and not exists (select 1 from musubi.sessions s where s.account_id = a.id and s.last_seen_at >= ")
+                .push_bind(now - Duration::days(d))
+                .push(")");
+        }
+        if let Some(m) = &self.metadata {
+            qb.push(" and a.metadata @> ").push_bind(m.clone());
+        }
+    }
+}
+
 impl Default for SendMail {
     fn default() -> Self {
         Self {
             account_ids: Vec::new(),
             all: false,
+            audience: None,
             title: String::new(),
             body: String::new(),
             metadata: json!({}),
@@ -89,9 +193,12 @@ impl EconomyService {
                 "title 1..=200 chars, body <= 16 KiB".into(),
             ));
         }
-        if !m.all && (m.account_ids.is_empty() || m.account_ids.len() > 10_000) {
+        if !m.all
+            && m.audience.is_none()
+            && (m.account_ids.is_empty() || m.account_ids.len() > 10_000)
+        {
             return Err(Error::InvalidArgument(
-                "account_ids 1..=10000 (or all=true)".into(),
+                "account_ids 1..=10000 (or all=true / audience)".into(),
             ));
         }
         let expires_at = match m.expires_in_seconds {
@@ -109,14 +216,36 @@ impl EconomyService {
                 return Err(Error::NotFound(format!("reward table {t}")));
             }
         }
-        let sql = if m.all {
-            "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at)
-             select gen_random_uuid(), a.id, $2, $3, $4, $5, $6, $7 from musubi.accounts a"
+        let n = if m.all || m.audience.is_some() {
+            let aud = m.audience.clone().unwrap_or_default();
+            aud.validate()?;
+            let mut qb = QueryBuilder::new(
+                "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at) \
+                 select gen_random_uuid(), a.id, ",
+            );
+            qb.push_bind(&m.title)
+                .push(", ")
+                .push_bind(&m.body)
+                .push(", ")
+                .push_bind(&m.metadata)
+                .push(", ")
+                .push_bind(&m.rewards)
+                .push(", ")
+                .push_bind(expires_at)
+                .push(", ")
+                .push_bind(now)
+                .push(" from musubi.accounts a");
+            aud.push_where(&mut qb, now);
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?
+                .rows_affected()
         } else {
-            "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at)
-             select gen_random_uuid(), a.id, $2, $3, $4, $5, $6, $7 from unnest($1::uuid[]) as a(id)"
-        };
-        let n = sqlx::query(sql)
+            sqlx::query(
+                "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at)
+                 select gen_random_uuid(), a.id, $2, $3, $4, $5, $6, $7 from unnest($1::uuid[]) as a(id)",
+            )
             .bind(&m.account_ids)
             .bind(&m.title)
             .bind(&m.body)
@@ -127,9 +256,21 @@ impl EconomyService {
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?
-            .rows_affected();
+            .rows_affected()
+        };
         tx.commit().await.map_err(Error::internal)?;
         Ok(n as i64)
+    }
+
+    /// How many accounts a broadcast `audience` would reach right now.
+    pub async fn count_audience(&self, aud: &Audience, now: OffsetDateTime) -> Result<i64> {
+        aud.validate()?;
+        let mut qb = QueryBuilder::new("select count(*) from musubi.accounts a");
+        aud.push_where(&mut qb, now);
+        qb.build_query_scalar::<i64>()
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::internal)
     }
 
     pub async fn mail(

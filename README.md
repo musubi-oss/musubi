@@ -297,6 +297,8 @@ Keys issued through `POST /v1/admin/keys {name, role}` carry a role: `server` (g
 
 ### Subscriptions
 
+Mail broadcasts take an `audience` instead of `account_ids`/`all`: `{"audience": {"lang": ["de"], "location": ["eu"], "platform": ["psn"], "age_bracket": ["adult"], "track": "xp", "min_level": 10, "active_within_days": 7 | "inactive_days": 30, "created_after": <unix>, "metadata": {"cohort": "b"}}}` — every listed condition must hold; `POST /v1/server/mail/audience/count` previews the reach before sending.
+
 Purchase-velocity heuristics: `[fraud] enabled = true`, `window_secs`, `max_purchases`, `max_spend = { gold = 100000 }`, `max_iap`, `action = "flag" | "block"` — an account over a limit inside the window gets a fraud flag (`economy.fraud_flag` event, `GET /v1/server/economy/fraud/flags`, `POST …/flags/{id}/resolve`, `GET /v1/server/economy/fraud/{account}` for live counters) and with `block` the purchase or IAP redeem is rejected with 429.
 
 Console and launcher stores verify server-to-server: `POST /v1/iap/{psn|xbox|nintendo|epic}` `{product_id, token?}` asks the platform what the player's linked identity owns (PSN Entitlement Web API, Microsoft Store Collections — `token` is the user collections id from the client —, Nintendo consumable service items, Epic Ecom), consumes one use of a consumable, and grants the mapped catalog product through the same receipt path as Apple/Google (idempotent per entitlement / consumption id). `[iap.psn] / [iap.xbox] / [iap.nintendo] / [iap.epic]`: `client_id`, `client_secret` (+ `tenant_id` for Xbox, `sandbox_id`/`deployment_id` for Epic, `url` for Nintendo); endpoints and the `verify_path`/`consume_path` templates default per platform and are overridable.

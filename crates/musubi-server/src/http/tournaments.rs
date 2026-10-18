@@ -322,6 +322,7 @@ pub async fn pay_prizes(s: &AppState, id: &str, expiry: i64) -> Result<usize, mu
                 musubi_economy::SendMail {
                     account_ids: vec![r.owner_id.0],
                     all: false,
+                    audience: None,
                     title,
                     body: p.body.clone(),
                     metadata: json!({

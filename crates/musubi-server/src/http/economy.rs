@@ -5,9 +5,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
 use musubi_economy::{
-    Achievement, CreateItem, CreateStoreItem, EnergyDef, IapProduct, ListingFilter, MarketRules,
-    NewListing, NewOrder, NewTrade, ProgressGraph, Quest, ReceiptInput, RewardModifier,
-    RewardTable, Season, SendMail, StreakDef, Track,
+    Achievement, Audience, CreateItem, CreateStoreItem, EnergyDef, IapProduct, ListingFilter,
+    MarketRules, NewListing, NewOrder, NewTrade, ProgressGraph, Quest, ReceiptInput,
+    RewardModifier, RewardTable, Season, SendMail, StreakDef, Track,
 };
 use musubi_integrations::StoreTransaction;
 use musubi_social::notifications::NewNotification;
@@ -129,6 +129,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/mail/{id}/read", post(mail_read))
         .route("/v1/mail/{id}/claim", post(mail_claim))
         .route("/v1/server/mail", post(mail_send))
+        .route("/v1/server/mail/audience/count", post(mail_audience_count))
         .route("/v1/achievements", get(achievements_mine))
         .route(
             "/v1/server/achievements",
@@ -1309,9 +1310,11 @@ async fn mail_send(
 ) -> Result<Json<Value>, ApiError> {
     let recipients = m.account_ids.clone();
     let title = m.title.clone();
-    let all = m.all;
+    // broadcasts (all / audience) resolve recipients inside the insert; only explicit lists get
+    // a per-recipient in-app notification
+    let broadcast = m.all || m.audience.is_some();
     let n = s.economy.send_mail(m, OffsetDateTime::now_utc()).await?;
-    if !all {
+    if !broadcast {
         let batch = recipients
             .into_iter()
             .map(|id| NewNotification {
@@ -1327,6 +1330,18 @@ async fn mail_send(
         s.notify.send(batch).await?;
     }
     Ok(Json(json!({ "sent": n })))
+}
+
+async fn mail_audience_count(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(a): Json<Audience>,
+) -> Result<Json<Value>, ApiError> {
+    let n = s
+        .economy
+        .count_audience(&a, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(json!({ "count": n })))
 }
 
 // ----- achievements -----

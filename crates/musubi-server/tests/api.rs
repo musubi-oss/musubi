@@ -1863,6 +1863,149 @@ async fn fleet_docker_provider_runs_a_container() {
 }
 
 #[tokio::test]
+async fn mail_audience_broadcast() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    // accounts.lang is capped at 16 chars
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let lang = format!("l{:x}", nanos % 0xFFFF_FFFF_FFFF);
+    let other = format!("o{:x}", nanos % 0xFFFF_FFFF_FFFF);
+    let (loc1, loc2, tag, track) = (
+        unique("loc"),
+        unique("loc"),
+        unique("cohort"),
+        unique("trk"),
+    );
+    let mut toks = Vec::new();
+    let mut accs = Vec::new();
+    for (l, loc, md) in [
+        (lang.clone(), loc1.clone(), json!({"cohort": tag})),
+        (lang.clone(), loc2.clone(), json!({})),
+        (other, loc1.clone(), json!({"cohort": tag})),
+    ] {
+        let (_, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("aud")})),
+        )
+        .await;
+        let tok = sess["access_token"].as_str().unwrap().to_string();
+        let (st, r) = call(
+            &app,
+            "PATCH",
+            "/v1/account",
+            Some(&tok),
+            Some(json!({"lang": l, "location": loc, "metadata": md})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        accs.push(sess["account_id"].as_str().unwrap().to_string());
+        toks.push(tok);
+    }
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/tracks",
+        k,
+        Some(json!({"id": track, "name": "XP", "levels": [{"xp": 100}, {"xp": 250}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": accs[0], "track_id": track, "delta": 120})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+
+    // second account gets a progress row at level 0 so the max_level range has something to match
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/progression/xp",
+        k,
+        Some(json!({"account_id": accs[1], "track_id": track, "delta": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let count = |aud: Value| {
+        let app = app.clone();
+        async move {
+            let (st, r) =
+                call_server(&app, "POST", "/v1/server/mail/audience/count", k, Some(aud)).await;
+            assert_eq!(st, StatusCode::OK, "{r}");
+            r["count"].as_i64().unwrap()
+        }
+    };
+    assert_eq!(count(json!({"lang": [lang]})).await, 2);
+    assert_eq!(count(json!({"lang": [lang], "location": [loc1]})).await, 1);
+    assert_eq!(
+        count(json!({"lang": [lang], "track": track, "min_level": 1})).await,
+        1
+    );
+    assert_eq!(
+        count(json!({"lang": [lang], "track": track, "max_level": 0})).await,
+        1
+    );
+    assert_eq!(
+        count(json!({"lang": [lang], "metadata": {"cohort": tag}})).await,
+        1
+    );
+    assert_eq!(
+        count(json!({"lang": [lang], "platform": ["device"]})).await,
+        2
+    );
+    assert_eq!(
+        count(json!({"lang": [lang], "platform": ["steam"]})).await,
+        0
+    );
+    assert_eq!(
+        count(json!({"lang": [lang], "active_within_days": 1})).await,
+        2
+    );
+    assert_eq!(count(json!({"lang": [lang], "inactive_days": 1})).await, 0);
+    assert_eq!(count(json!({"lang": [lang], "created_before": 0})).await, 0);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/mail/audience/count",
+        k,
+        Some(json!({"min_level": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, r) = call_server(&app, "POST", "/v1/server/mail", k,
+        Some(json!({"audience": {"lang": [lang], "location": [loc1]}, "title": "Region drop", "body": "hi"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["sent"], 1);
+    let (_, m) = call(&app, "GET", "/v1/mail", Some(&toks[0]), None).await;
+    assert_eq!(m["mail"].as_array().unwrap().len(), 1, "{m}");
+    let (_, m) = call(&app, "GET", "/v1/mail", Some(&toks[1]), None).await;
+    assert!(m["mail"].as_array().unwrap().is_empty(), "{m}");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/mail",
+        k,
+        Some(json!({"audience": {"lang": [lang]}, "title": "Lang drop", "body": "hi"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["sent"], 2);
+    let (_, m) = call(&app, "GET", "/v1/mail", Some(&toks[2]), None).await;
+    assert!(m["mail"].as_array().unwrap().is_empty(), "{m}");
+}
+
+#[tokio::test]
 async fn fraud_velocity_flags_and_blocks() {
     let gold = unique("fgold");
     let g = gold.clone();
