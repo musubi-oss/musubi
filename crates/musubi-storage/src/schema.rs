@@ -84,6 +84,8 @@ pub enum WhereKind {
     Number,
     Text,
     Bool,
+    /// `"$q"`: websearch-style full-text query over the whole value (`path` unused).
+    FullText,
 }
 
 pub fn parse_path(field: &str) -> Result<Vec<String>> {
@@ -103,7 +105,7 @@ pub fn parse_path(field: &str) -> Result<Vec<String>> {
     Ok(path)
 }
 
-fn pg_path(path: &[String]) -> String {
+pub fn pg_path(path: &[String]) -> String {
     format!("'{{{}}}'", path.join(","))
 }
 
@@ -146,8 +148,26 @@ pub fn split_where(filter: Option<&Value>) -> Result<(Option<Value>, Vec<WhereOp
     let Some(obj) = f.as_object() else {
         return Err(Error::InvalidArgument("where must be a JSON object".into()));
     };
+    let mut ops = Vec::new();
+    if let Some(q) = obj.get("$q") {
+        let q = q.as_str().map(str::trim).unwrap_or_default();
+        if q.is_empty() || q.len() > 256 {
+            return Err(Error::InvalidArgument(
+                "$q must be a non-empty string of at most 256 chars".into(),
+            ));
+        }
+        ops.push(WhereOp {
+            path: vec![],
+            op: "@@",
+            kind: WhereKind::FullText,
+            value: q.to_string(),
+        });
+    }
     let Some(raw) = obj.get("$where") else {
-        return Ok((Some(f.clone()), vec![]));
+        let mut rest = obj.clone();
+        rest.remove("$q");
+        let rest = (!rest.is_empty()).then_some(Value::Object(rest));
+        return Ok((rest, ops));
     };
     let Some(items) = raw.as_array() else {
         return Err(Error::InvalidArgument(
@@ -159,7 +179,7 @@ pub fn split_where(filter: Option<&Value>) -> Result<(Option<Value>, Vec<WhereOp
             "$where: at most {MAX_WHERE_OPS} conditions"
         )));
     }
-    let mut ops = Vec::with_capacity(items.len());
+    ops.reserve(items.len());
     for it in items {
         let bad = || Error::InvalidArgument(format!("$where: bad condition {it}"));
         let arr = it.as_array().filter(|a| a.len() == 3).ok_or_else(bad)?;
@@ -191,6 +211,7 @@ pub fn split_where(filter: Option<&Value>) -> Result<(Option<Value>, Vec<WhereOp
     }
     let mut rest = obj.clone();
     rest.remove("$where");
+    rest.remove("$q");
     let rest = if rest.is_empty() {
         None
     } else {
@@ -204,10 +225,15 @@ pub fn where_sql(ops: &[WhereOp], first_param: usize) -> String {
     let mut sql = String::new();
     for (i, o) in ops.iter().enumerate() {
         let p = first_param + i;
-        let path = pg_path(&o.path);
+        let path = if o.path.is_empty() {
+            String::new()
+        } else {
+            pg_path(&o.path)
+        };
         match o.kind {
+            // CASE guarantees the cast only runs on numbers (a text value would abort the query)
             WhereKind::Number => sql.push_str(&format!(
-                " and (value #>> {path})::numeric {} ${p}::numeric",
+                " and (case when jsonb_typeof(value #> {path}) = 'number' then (value #>> {path})::numeric end) {} ${p}::numeric",
                 o.op
             )),
             WhereKind::Text => {
@@ -216,6 +242,9 @@ pub fn where_sql(ops: &[WhereOp], first_param: usize) -> String {
             WhereKind::Bool => {
                 sql.push_str(&format!(" and (value #> {path}) {} ${p}::jsonb", o.op))
             }
+            WhereKind::FullText => sql.push_str(&format!(
+                " and to_tsvector('simple', value) @@ websearch_to_tsquery('simple', ${p}::text)"
+            )),
         }
     }
     sql
@@ -816,7 +845,7 @@ mod tests {
         assert_eq!(ops.len(), 3);
         let sql = where_sql(&ops, 6);
         assert!(
-            sql.contains("(value #>> '{stats,wins}')::numeric >= $6::numeric"),
+            sql.contains("(case when jsonb_typeof(value #> '{stats,wins}') = 'number' then (value #>> '{stats,wins}')::numeric end) >= $6::numeric"),
             "{sql}"
         );
         assert!(sql.contains("(value #>> '{name}') < $7::text"), "{sql}");

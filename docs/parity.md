@@ -209,6 +209,8 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ storage: JSON Patch RFC 6902 (`ops` в `/v1/storage/patch`, `test` → 409), агрегаты
+  (`GET /v1/storage/{collection}/aggregate?field&group&where`), полнотекст (`"$q"` в `where`, GIN по `to_tsvector`).
   ✅ auth: magic-link (`POST /v1/auth/email/magic/request` → событие `account.magic_link` с токеном → `POST /v1/auth/email/magic`,
   одноразовый, 15 мин, адрес становится verified), custom auth (`POST /v1/server/auth/custom {id}` под серверным ключом),
   лимит сессий на аккаунт (`session.max_sessions_per_account`, новая вытесняет самую старую).

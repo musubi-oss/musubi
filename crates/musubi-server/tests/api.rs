@@ -13556,3 +13556,219 @@ async fn magic_link_custom_auth_and_session_cap() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// RFC 6902 JSON Patch next to merge-patch, numeric aggregates and full-text `$q`.
+#[tokio::test]
+async fn storage_json_patch_aggregate_and_fulltext() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("sj-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let col = unique("inv");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/write",
+        Some(&tok),
+        Some(json!({"objects": [
+            {"collection": col, "key": "sword", "value": {"kind": "weapon", "name": "Flaming sword of dawn", "level": 5, "tags": ["fire"]}},
+            {"collection": col, "key": "shield", "value": {"kind": "armor", "name": "Tower shield", "level": 7}},
+            {"collection": col, "key": "potion", "value": {"kind": "consumable", "name": "Healing potion", "level": 1}},
+            {"collection": col, "key": "note", "value": {"kind": "misc", "name": "Note about a sword", "level": "n/a"}}
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // JSON Patch: test guards, add/replace/remove/move/copy, array append
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/patch",
+        Some(&tok),
+        Some(
+            json!({"objects": [{"collection": col, "key": "sword", "ops": [
+                {"op": "test", "path": "/level", "value": 5},
+                {"op": "replace", "path": "/level", "value": 6},
+                {"op": "add", "path": "/tags/-", "value": "legendary"},
+                {"op": "add", "path": "/stats", "value": {"atk": 10}},
+                {"op": "copy", "from": "/stats/atk", "path": "/stats/def"},
+                {"op": "move", "from": "/kind", "path": "/slot"},
+                {"op": "remove", "path": "/name"}
+            ]}]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, r) = call(
+        &app,
+        "POST",
+        "/v1/storage/read",
+        Some(&tok),
+        Some(json!({"objects": [{"collection": col, "key": "sword"}]})),
+    )
+    .await;
+    let sword = &r["objects"][0]["value"];
+    assert_eq!(
+        sword,
+        &json!({"level": 6, "tags": ["fire", "legendary"], "stats": {"atk": 10, "def": 10}, "slot": "weapon"}),
+        "{r}"
+    );
+    // failing test → 409 and nothing applied
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/storage/patch",
+        Some(&tok),
+        Some(
+            json!({"objects": [{"collection": col, "key": "sword", "ops": [
+                {"op": "replace", "path": "/level", "value": 99},
+                {"op": "test", "path": "/level", "value": 5}
+            ]}]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (_, r) = call(
+        &app,
+        "POST",
+        "/v1/storage/read",
+        Some(&tok),
+        Some(json!({"objects": [{"collection": col, "key": "sword"}]})),
+    )
+    .await;
+    assert_eq!(r["objects"][0]["value"]["level"], 6, "{r}");
+    for bad in [
+        json!([{"op": "remove", "path": "/nope"}]),
+        json!([{"op": "frobnicate", "path": "/level"}]),
+        json!([{"op": "add", "path": "level", "value": 1}]),
+        json!([{"op": "move", "from": "/stats", "path": "/stats/inner"}]),
+    ] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/storage/patch",
+            Some(&tok),
+            Some(json!({"objects": [{"collection": col, "key": "sword", "ops": bad}]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    // aggregates: numeric levels only (the note's "n/a" is skipped)
+    let (st, a) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}/aggregate?field=level"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let g = &a["groups"][0];
+    assert_eq!(g["count"], 3, "{a}");
+    assert_eq!(g["sum"], 14.0, "{a}");
+    assert_eq!(g["min"], 1.0, "{a}");
+    assert_eq!(g["max"], 7.0, "{a}");
+    let (st, a) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/storage/{col}/aggregate?field=level&where={}",
+            urlencoding(r#"{"$where":[["level",">=",6]]}"#)
+        ),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["groups"][0]["count"], 2, "{a}");
+    assert_eq!(a["groups"][0]["avg"], 6.5, "{a}");
+    let (st, a) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}/aggregate?field=level&group=slot"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let groups = a["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{a}");
+    assert!(
+        groups
+            .iter()
+            .any(|g| g["group"] == "weapon" && g["count"] == 1 && g["sum"] == 6.0),
+        "{a}"
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|g| g["group"].is_null() && g["count"] == 2),
+        "{a}"
+    );
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}/aggregate"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // full-text over the value, combinable with containment / $where
+    let q = |w: &str| format!("/v1/storage/{col}?where={}", urlencoding(w));
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        v["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["key"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (st, v) = call(&app, "GET", &q(r#"{"$q":"sword"}"#), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(keys(&v), vec!["note"], "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &q(r#"{"$q":"shield OR potion"}"#),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(keys(&v), vec!["potion", "shield"], "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &q(r#"{"$q":"shield OR potion","kind":"armor"}"#),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(keys(&v), vec!["shield"], "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/storage/{col}/count?where={}",
+            urlencoding(r#"{"$q":"sword","$where":[["level",">",1]]}"#)
+        ),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 0, "{v}");
+    let (st, _) = call(&app, "GET", &q(r#"{"$q":""}"#), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}

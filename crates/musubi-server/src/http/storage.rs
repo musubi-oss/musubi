@@ -17,6 +17,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/storage/patch", post(patch))
         .route("/v1/storage/{collection}", get(list))
         .route("/v1/storage/{collection}/count", get(count))
+        .route("/v1/storage/{collection}/aggregate", get(aggregate))
 }
 
 #[derive(Deserialize)]
@@ -68,6 +69,49 @@ async fn patch(
         .patch(Caller::User(me.account_id), None, &r.objects)
         .await?;
     Ok(Json(json!({ "acks": acks })))
+}
+
+#[derive(Deserialize)]
+struct AggregateQuery {
+    #[serde(flatten)]
+    list: ListQuery,
+    /// Dotted path of the numeric field to roll up.
+    field: String,
+    /// Dotted path to group by (its text value).
+    #[serde(default)]
+    group: Option<String>,
+}
+
+async fn aggregate(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(collection): Path<String>,
+    Query(q): Query<AggregateQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let filter = q
+        .list
+        .filter
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|e| musubi_core::Error::InvalidArgument(format!("where: {e}")))?;
+    let groups = s
+        .storage
+        .aggregate(
+            Caller::User(me.account_id),
+            &collection,
+            q.list.owner_id,
+            &q.field,
+            q.group.as_deref(),
+            musubi_storage::ListFilter {
+                cursor: None,
+                filter: filter.as_ref(),
+                key_prefix: q.list.prefix.as_deref(),
+                sort: None,
+            },
+        )
+        .await?;
+    Ok(Json(json!({ "field": q.field, "groups": groups })))
 }
 
 async fn count(

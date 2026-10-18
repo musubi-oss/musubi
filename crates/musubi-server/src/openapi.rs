@@ -229,6 +229,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("DELETE", "/v1/account/sessions/{id}", "account"),
     ("POST", "/v1/storage/patch", "storage"),
     ("GET", "/v1/storage/{collection}/count", "storage"),
+    ("GET", "/v1/storage/{collection}/aggregate", "storage"),
     ("POST", "/v1/groups/{id}/ban", "groups"),
     ("DELETE", "/v1/groups/{id}/ban", "groups"),
     ("GET", "/v1/groups/{id}/bans", "groups"),

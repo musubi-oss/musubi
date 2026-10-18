@@ -317,6 +317,16 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Storage: JSON Patch, aggregates, full-text
+
+`POST /v1/storage/patch` takes either a merge patch (`patch`, RFC 7386) or RFC 6902 operations
+(`ops`: add / remove / replace / move / copy / test — a failing `test` rejects the batch with 409,
+so read-modify-write races become guarded patches). `GET /v1/storage/{collection}/aggregate?field=stats.score&group=mode`
+rolls a numeric field up (count / sum / avg / min / max, optionally per group) under the same
+`where` / `prefix` / `owner_id` filters as listing. `"$q": "flaming sword"` inside `where`
+is a websearch-style full-text match over the whole value (GIN-indexed), combinable with
+containment and `$where` on `list` and `count`.
+
 ### Magic links, custom auth, session cap
 
 `POST /v1/auth/email/magic/request {email, create?}` emits `account.magic_link` with a single-use

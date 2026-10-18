@@ -253,9 +253,197 @@ pub struct StorageService {
 pub struct PatchOp {
     pub collection: String,
     pub key: String,
+    /// RFC 7386 merge patch; ignored when `ops` is given.
+    #[serde(default)]
     pub patch: serde_json::Value,
+    /// RFC 6902 operations (`add` / `remove` / `replace` / `move` / `copy` / `test`), applied in
+    /// order and atomically per object; a failing `test` rejects the whole batch with 409.
+    #[serde(default)]
+    pub ops: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub version: Option<String>,
+}
+
+const MAX_PATCH_OPS: usize = 64;
+
+/// RFC 6901 pointer → path segments (`""` is the whole document).
+fn pointer(p: &str) -> Result<Vec<String>> {
+    if p.is_empty() {
+        return Ok(vec![]);
+    }
+    let Some(rest) = p.strip_prefix('/') else {
+        return Err(Error::InvalidArgument(format!("bad JSON pointer {p:?}")));
+    };
+    Ok(rest
+        .split('/')
+        .map(|s| s.replace("~1", "/").replace("~0", "~"))
+        .collect())
+}
+
+fn pointer_get<'a>(doc: &'a serde_json::Value, path: &[String]) -> Option<&'a serde_json::Value> {
+    path.iter().try_fold(doc, |cur, seg| match cur {
+        serde_json::Value::Object(m) => m.get(seg),
+        serde_json::Value::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get(i)),
+        _ => None,
+    })
+}
+
+fn pointer_parent<'a>(
+    doc: &'a mut serde_json::Value,
+    path: &'a [String],
+) -> Result<(&'a mut serde_json::Value, &'a str)> {
+    let Some((last, parents)) = path.split_last() else {
+        return Err(Error::InvalidArgument(
+            "patch: operation needs a non-root path".into(),
+        ));
+    };
+    let mut cur = doc;
+    for seg in parents {
+        cur = match cur {
+            serde_json::Value::Object(m) => m.get_mut(seg),
+            serde_json::Value::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get_mut(i)),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("patch: path /{} not found", parents.join("/")))
+        })?;
+    }
+    Ok((cur, last))
+}
+
+fn pointer_add(doc: &mut serde_json::Value, path: &[String], v: serde_json::Value) -> Result<()> {
+    if path.is_empty() {
+        *doc = v;
+        return Ok(());
+    }
+    let (parent, last) = pointer_parent(doc, path)?;
+    match parent {
+        serde_json::Value::Object(m) => {
+            m.insert(last.to_string(), v);
+        }
+        serde_json::Value::Array(a) => {
+            let i = if last == "-" {
+                a.len()
+            } else {
+                last.parse::<usize>()
+                    .ok()
+                    .filter(|i| *i <= a.len())
+                    .ok_or_else(|| Error::InvalidArgument(format!("patch: bad index {last:?}")))?
+            };
+            a.insert(i, v);
+        }
+        _ => {
+            return Err(Error::InvalidArgument(
+                "patch: parent is neither object nor array".into(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn pointer_remove(doc: &mut serde_json::Value, path: &[String]) -> Result<serde_json::Value> {
+    if path.is_empty() {
+        return Ok(std::mem::take(doc));
+    }
+    let (parent, last) = pointer_parent(doc, path)?;
+    let missing = || Error::InvalidArgument(format!("patch: /{} not found", path.join("/")));
+    match parent {
+        serde_json::Value::Object(m) => m.remove(last).ok_or_else(missing),
+        serde_json::Value::Array(a) => {
+            let i = last
+                .parse::<usize>()
+                .ok()
+                .filter(|i| *i < a.len())
+                .ok_or_else(missing)?;
+            Ok(a.remove(i))
+        }
+        _ => Err(missing()),
+    }
+}
+
+/// RFC 6902 JSON Patch. Errors leave `doc` partially modified; callers work on a copy.
+pub fn apply_json_patch(doc: &mut serde_json::Value, ops: &[serde_json::Value]) -> Result<()> {
+    if ops.len() > MAX_PATCH_OPS {
+        return Err(Error::InvalidArgument(format!(
+            "patch: at most {MAX_PATCH_OPS} operations"
+        )));
+    }
+    for op in ops {
+        let kind = op["op"].as_str().unwrap_or_default();
+        let path = pointer(
+            op["path"]
+                .as_str()
+                .ok_or_else(|| Error::InvalidArgument("patch: missing path".into()))?,
+        )?;
+        let value = || {
+            op.get("value")
+                .cloned()
+                .ok_or_else(|| Error::InvalidArgument(format!("patch: {kind} needs value")))
+        };
+        let from = || {
+            op["from"]
+                .as_str()
+                .ok_or_else(|| Error::InvalidArgument(format!("patch: {kind} needs from")))
+                .and_then(pointer)
+        };
+        match kind {
+            "add" => pointer_add(doc, &path, value()?)?,
+            "remove" => {
+                pointer_remove(doc, &path)?;
+            }
+            "replace" => {
+                if pointer_get(doc, &path).is_none() {
+                    return Err(Error::InvalidArgument(format!(
+                        "patch: /{} not found",
+                        path.join("/")
+                    )));
+                }
+                pointer_remove(doc, &path)?;
+                pointer_add(doc, &path, value()?)?;
+            }
+            "move" => {
+                let from = from()?;
+                if path.len() > from.len() && path.starts_with(&from) {
+                    return Err(Error::InvalidArgument(
+                        "patch: cannot move a value into itself".into(),
+                    ));
+                }
+                let v = pointer_remove(doc, &from)?;
+                pointer_add(doc, &path, v)?;
+            }
+            "copy" => {
+                let v = pointer_get(doc, &from()?)
+                    .cloned()
+                    .ok_or_else(|| Error::InvalidArgument("patch: from not found".into()))?;
+                pointer_add(doc, &path, v)?;
+            }
+            "test" => {
+                if pointer_get(doc, &path) != Some(&value()?) {
+                    return Err(Error::Conflict(format!(
+                        "patch: test failed at /{}",
+                        path.join("/")
+                    )));
+                }
+            }
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "patch: unknown op {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Numeric roll-up of one field across the objects a `list` with the same filters would return.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Aggregate {
+    pub group: Option<String>,
+    pub count: i64,
+    pub sum: Option<f64>,
+    pub avg: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
 }
 
 /// RFC 7386: objects merge recursively, `null` removes a member, anything else replaces.
@@ -447,6 +635,72 @@ impl StorageService {
         q.fetch_one(&self.db).await.map_err(Error::internal)
     }
 
+    /// count / sum / avg / min / max of the numeric `field` (dotted path) over the objects visible
+    /// to `caller` under the same filters as `list`; `group` (dotted path) splits the roll-up by
+    /// that field's text value (top 100 groups by count). Non-numeric values are ignored.
+    pub async fn aggregate(
+        &self,
+        caller: Caller,
+        collection: &str,
+        owner_id: Option<Uuid>,
+        field: &str,
+        group: Option<&str>,
+        f: ListFilter<'_>,
+    ) -> Result<Vec<Aggregate>> {
+        validate_name(collection, "collection")?;
+        let field = schema::pg_path(&schema::parse_path(field)?);
+        let group = group.map(schema::parse_path).transpose()?;
+        let (filter, ops) = schema::split_where(f.filter)?;
+        let (owner_id, min_read) = visibility(caller, owner_id);
+        let prefix_like = like_prefix(f.key_prefix);
+        let group_expr = match &group {
+            Some(g) => format!("(value #>> {})", schema::pg_path(g)),
+            None => "null::text".to_string(),
+        };
+        let sql = format!(
+            "select {group_expr} as g, count(*), sum(n)::float8, avg(n)::float8, min(n)::float8, max(n)::float8
+             from (select value, (case when jsonb_typeof(value #> {field}) = 'number' then (value #>> {field})::float8 end) as n from musubi.storage_objects
+                   where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
+                     and (expires_at is null or expires_at > now())
+                     and ($4::jsonb is null or value @> $4)
+                     and ($5::text is null or key like $5)
+                     and jsonb_typeof(value #> {field}) = 'number'{}) t
+             group by g order by count(*) desc, g limit 100",
+            schema::where_sql(&ops, 6)
+        );
+        let mut q = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                i64,
+                Option<f64>,
+                Option<f64>,
+                Option<f64>,
+                Option<f64>,
+            ),
+        >(&sql)
+        .bind(collection)
+        .bind(owner_id)
+        .bind(min_read)
+        .bind(filter)
+        .bind(prefix_like);
+        for o in &ops {
+            q = q.bind(&o.value);
+        }
+        let rows = q.fetch_all(&self.db).await.map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(group, count, sum, avg, min, max)| Aggregate {
+                group,
+                count,
+                sum,
+                avg,
+                min,
+                max,
+            })
+            .collect())
+    }
+
     /// Merge-patch existing objects (missing ones are an error) under the write rules of `write`.
     pub async fn patch(
         &self,
@@ -474,7 +728,7 @@ impl StorageService {
         for op in ops {
             validate_name(&op.collection, "collection")?;
             validate_name(&op.key, "key")?;
-            if !op.patch.is_object() {
+            if op.ops.is_none() && !op.patch.is_object() {
                 return Err(Error::InvalidArgument("patch must be a JSON object".into()));
             }
             let current = sqlx::query_as::<_, (serde_json::Value, String, i16, i32)>(
@@ -509,7 +763,10 @@ impl StorageService {
             if let Some(sc) = self.schema_of(&op.collection) {
                 schema::migrate(&sc, &mut value, cur_sv);
             }
-            merge_patch(&mut value, &op.patch);
+            match &op.ops {
+                Some(ops) => apply_json_patch(&mut value, ops)?,
+                None => merge_patch(&mut value, &op.patch),
+            }
             let schema_version = self.check_schema(&op.collection, &value)?;
             let changed_value = &value;
             let bytes = serde_json::to_vec(&value)?;
