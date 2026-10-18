@@ -355,6 +355,8 @@ impl RelayedRegistry {
             op_code,
             data,
             reliable,
+            channel: None,
+            seq: None,
         };
         let targets: Vec<SessionId> = if only.is_empty() {
             m.sessions()

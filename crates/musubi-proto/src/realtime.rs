@@ -3,6 +3,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::UserPresence;
 
+/// Delivery semantics of a realtime frame, the same names on every transport.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Channel {
+    /// Arrives, in order (TCP/WebSocket, QUIC stream, UDP channel 0).
+    ReliableOrdered,
+    /// Arrives, any order; degrades to reliable_ordered on today's transports.
+    ReliableUnordered,
+    /// May be lost; stale frames are dropped by `seq` (QUIC/WebTransport datagram, WebRTC
+    /// unordered unreliable channel, UDP channel 1).
+    UnreliableSequenced,
+    /// May be lost, any order (datagrams).
+    Unreliable,
+}
+
+impl Channel {
+    pub fn reliable(self) -> bool {
+        matches!(self, Channel::ReliableOrdered | Channel::ReliableUnordered)
+    }
+
+    /// Channels a transport implements natively; anything else degrades to reliable_ordered.
+    pub fn native(transport: &str) -> Vec<Channel> {
+        match transport {
+            "quic" | "webtransport" | "webrtc" => vec![
+                Channel::ReliableOrdered,
+                Channel::UnreliableSequenced,
+                Channel::Unreliable,
+            ],
+            "udp" => vec![Channel::ReliableOrdered, Channel::UnreliableSequenced],
+            _ => vec![Channel::ReliableOrdered],
+        }
+    }
+}
+
 /// Client → server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +274,18 @@ pub enum ClientMessage {
         presences: Vec<UserPresence>,
         #[serde(default = "yes")]
         reliable: bool,
+        /// Delivery channel; overrides `reliable` when set. Transports without the channel
+        /// degrade (see `transport` → `channels`): WebSocket delivers everything reliable_ordered.
+        #[serde(default)]
+        channel: Option<Channel>,
+    },
+    /// What this connection can do: reply `transport` lists the native channels of the transport
+    /// in use and the frame limit; `compress: "lz4"` turns on per-frame lz4 for binary (`postcard`)
+    /// sessions — every binary frame from then on, both ways, is tagged `0` raw / `1` lz4 block
+    /// (`lz4_wrap`), frames over 256 bytes compressed.
+    Transport {
+        #[serde(default)]
+        compress: Option<String>,
     },
     /// Invite an account into my party; the invitee may then `party_join` a closed party directly.
     PartyInvite {
@@ -460,6 +506,21 @@ pub enum ServerMessage {
         op_code: i64,
         data: Vec<u8>,
         reliable: bool,
+        /// Channel the frame was sent on: `unreliable_sequenced` frames carry `seq` (per match,
+        /// per session, from 0) — drop one whose `seq` is below the last applied.
+        #[serde(default)]
+        channel: Option<Channel>,
+        #[serde(default)]
+        seq: Option<u64>,
+    },
+    /// Reply to `transport`: the transport in use (`ws`, `quic`, `webtransport`, `webrtc`, `udp`),
+    /// its native channels, the frame limit, supported compression and whether it is on now.
+    Transport {
+        transport: String,
+        channels: Vec<Channel>,
+        max_frame_bytes: usize,
+        compression: Vec<String>,
+        compressed: bool,
     },
     MatchPresenceEvent {
         match_id: String,

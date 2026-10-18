@@ -8,7 +8,8 @@ use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use musubi_auth::AuthService;
 use musubi_core::config::Config;
-use musubi_proto::realtime::ChannelKind;
+use musubi_core::Code;
+use musubi_proto::realtime::{Channel, ChannelKind};
 use musubi_proto::{ClientMessage, Encoding, Envelope, ServerMessage};
 use musubi_server::app::{AppState, AppStateInner};
 use musubi_server::realtime::Hub;
@@ -1071,6 +1072,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             data: vec![9],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -1100,6 +1102,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
             data: vec![],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -1491,6 +1494,7 @@ async fn authoritative_echo_match_lifecycle() {
             data: vec![1, 2],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -2091,6 +2095,7 @@ async fn quic_unreliable_match_data_uses_datagrams() {
         data: vec![4, 2],
         presences: vec![],
         reliable: false,
+        channel: None,
     })))
     .unwrap();
     let d = tokio::time::timeout(std::time::Duration::from_secs(3), conn.read_datagram())
@@ -2167,6 +2172,7 @@ async fn cross_node_relayed_match() {
             data: vec![5],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -9141,6 +9147,7 @@ async fn spectator_watches_without_playing() {
             data: vec![9],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -9162,6 +9169,7 @@ async fn spectator_watches_without_playing() {
             data: vec![1, 2],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -9205,6 +9213,7 @@ async fn spectator_watches_without_playing() {
             data: vec![7],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -9252,6 +9261,7 @@ async fn spectator_watches_without_playing() {
             data: vec![3],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -9310,6 +9320,7 @@ async fn match_recording_produces_replay() {
             data: vec![4, 2],
             presences: vec![],
             reliable: true,
+            channel: None,
         },
     )
     .await;
@@ -10020,6 +10031,7 @@ async fn match_fenced_node_cannot_persist_after_takeover() {
                 match_id: mid.clone(),
                 op_code: 1,
                 reliable: true,
+                channel: None,
                 data: b"x".to_vec(),
                 presences: vec![],
             },
@@ -18237,4 +18249,244 @@ async fn admin_cpu_profile_on_demand() {
     assert!(!body.is_empty());
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     busy.join().unwrap();
+}
+
+#[tokio::test]
+async fn transport_channels_and_lz4() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let f = "binary";
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+
+    // capabilities: WebSocket is reliable_ordered only, lz4 offered for the binary wire
+    send(
+        &mut a,
+        f,
+        Some("t"),
+        ClientMessage::Transport { compress: None },
+    )
+    .await;
+    let r = recv(&mut a).await;
+    assert_eq!(r.cid.as_deref(), Some("t"));
+    match r.msg {
+        ServerMessage::Transport {
+            transport,
+            channels,
+            max_frame_bytes,
+            compression,
+            compressed,
+        } => {
+            assert_eq!(transport, "ws");
+            assert_eq!(channels, vec![Channel::ReliableOrdered]);
+            assert!(max_frame_bytes >= 64 * 1024);
+            assert_eq!(compression, vec!["lz4".to_string()]);
+            assert!(!compressed);
+        }
+        m => panic!("{m:?}"),
+    }
+    // json sessions cannot compress
+    let mut j = connect(&addr, &tb, "json").await;
+    send(
+        &mut j,
+        "json",
+        None,
+        ClientMessage::Transport {
+            compress: Some("lz4".into()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut j).await.msg,
+        ServerMessage::Error {
+            code: Code::InvalidArgument,
+            ..
+        }
+    ));
+
+    // channel semantics on a relayed match: unreliable_sequenced frames carry seq 0, 1, …;
+    // reliable ones say reliable_ordered without seq (ws degrades delivery, labels stay honest)
+    send(
+        &mut a,
+        f,
+        Some("m"),
+        ClientMessage::MatchCreate { name: None },
+    )
+    .await;
+    let mid = match recv(&mut a).await.msg {
+        ServerMessage::Match { match_id, .. } => match_id,
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+            spectator: false,
+            delay_ticks: 0,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::Match { .. }
+    ));
+    assert!(matches!(
+        recv(&mut a).await.msg,
+        ServerMessage::MatchPresenceEvent { .. }
+    ));
+    for (i, ch) in [Channel::UnreliableSequenced, Channel::Unreliable]
+        .into_iter()
+        .enumerate()
+    {
+        send(
+            &mut a,
+            f,
+            None,
+            ClientMessage::MatchDataSend {
+                match_id: mid.clone(),
+                op_code: 5,
+                data: vec![i as u8],
+                presences: vec![],
+                reliable: true,
+                channel: Some(ch),
+            },
+        )
+        .await;
+        match recv(&mut b).await.msg {
+            ServerMessage::MatchData {
+                reliable,
+                channel,
+                seq,
+                data,
+                ..
+            } => {
+                assert!(!reliable);
+                assert_eq!(channel, Some(Channel::UnreliableSequenced));
+                assert_eq!(seq, Some(i as u64));
+                assert_eq!(data, vec![i as u8]);
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 6,
+            data: vec![9],
+            presences: vec![],
+            reliable: false,
+            channel: Some(Channel::ReliableOrdered),
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::MatchData {
+            reliable,
+            channel,
+            seq,
+            ..
+        } => {
+            assert!(reliable);
+            assert_eq!(channel, Some(Channel::ReliableOrdered));
+            assert_eq!(seq, None);
+        }
+        m => panic!("{m:?}"),
+    }
+
+    // lz4: after the switch every binary frame both ways is tagged 0 (raw) / 1 (lz4 block)
+    send(
+        &mut b,
+        f,
+        Some("z"),
+        ClientMessage::Transport {
+            compress: Some("lz4".into()),
+        },
+    )
+    .await;
+    let raw = match b.next().await.unwrap().unwrap() {
+        Message::Binary(x) => x,
+        m => panic!("{m:?}"),
+    };
+    assert_eq!(raw[0], 0, "short reply stays raw");
+    let env: Envelope<ServerMessage> = Encoding::Postcard
+        .decode(&musubi_proto::lz4_unwrap(&raw, 1 << 20).unwrap())
+        .unwrap();
+    assert_eq!(env.cid.as_deref(), Some("z"));
+    assert!(matches!(
+        env.msg,
+        ServerMessage::Transport {
+            compressed: true,
+            ..
+        }
+    ));
+    // a compressible 2 KB payload from a goes out to b as an lz4 block, much smaller
+    let big = vec![42u8; 2048];
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 7,
+            data: big.clone(),
+            presences: vec![],
+            reliable: true,
+            channel: None,
+        },
+    )
+    .await;
+    let raw = match b.next().await.unwrap().unwrap() {
+        Message::Binary(x) => x,
+        m => panic!("{m:?}"),
+    };
+    assert_eq!(raw[0], 1);
+    assert!(raw.len() < 300, "{} bytes", raw.len());
+    let env: Envelope<ServerMessage> = Encoding::Postcard
+        .decode(&musubi_proto::lz4_unwrap(&raw, 1 << 20).unwrap())
+        .unwrap();
+    assert!(matches!(env.msg, ServerMessage::MatchData { op_code: 7, data, .. } if data == big));
+    // b now sends compressed frames too; a (not switched) receives plain binary
+    let env = Envelope {
+        cid: Some("c".into()),
+        msg: ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 8,
+            data: vec![1u8; 1024],
+            presences: vec![],
+            reliable: true,
+            channel: None,
+        },
+    };
+    let wrapped = musubi_proto::lz4_wrap(Encoding::Postcard.encode(&env).unwrap());
+    assert_eq!(wrapped[0], 1);
+    b.send(Message::Binary(wrapped.to_vec())).await.unwrap();
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::MatchData { op_code: 8, data, .. } if data == vec![1u8; 1024])
+    );
+    // garbage tag is rejected, session stays up
+    b.send(Message::Binary(vec![7, 1, 2, 3])).await.unwrap();
+    let raw = match b.next().await.unwrap().unwrap() {
+        Message::Binary(x) => x,
+        m => panic!("{m:?}"),
+    };
+    let env: Envelope<ServerMessage> = Encoding::Postcard
+        .decode(&musubi_proto::lz4_unwrap(&raw, 1 << 20).unwrap())
+        .unwrap();
+    assert!(matches!(
+        env.msg,
+        ServerMessage::Error {
+            code: Code::InvalidArgument,
+            ..
+        }
+    ));
 }

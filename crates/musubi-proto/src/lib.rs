@@ -163,6 +163,47 @@ pub struct Envelope<M> {
     pub msg: M,
 }
 
+/// Binary frames once `transport {compress: "lz4"}` was negotiated: a 1-byte tag, `0` = raw
+/// payload, `1` = `lz4_flex` block with the uncompressed size prepended. Payloads up to
+/// `LZ4_MIN_BYTES` are never compressed (the tag alone costs a byte, the block header four).
+pub const LZ4_MIN_BYTES: usize = 256;
+
+pub fn lz4_wrap(bytes: Bytes) -> Bytes {
+    let mut out = Vec::with_capacity(bytes.len() + 5);
+    if bytes.len() > LZ4_MIN_BYTES {
+        out.push(1);
+        out.extend_from_slice(&lz4_flex::compress_prepend_size(&bytes));
+        if out.len() < bytes.len() + 1 {
+            return Bytes::from(out);
+        }
+        out.clear();
+    }
+    out.push(0);
+    out.extend_from_slice(&bytes);
+    Bytes::from(out)
+}
+
+pub fn lz4_unwrap(b: &[u8], max_bytes: usize) -> Result<Bytes, ProtoError> {
+    match b.first() {
+        Some(0) => Ok(Bytes::copy_from_slice(&b[1..])),
+        Some(1) => {
+            let body = &b[1..];
+            if body.len() < 4 {
+                return Err(ProtoError("lz4 frame too short".into()));
+            }
+            let size = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+            if size > max_bytes {
+                return Err(ProtoError(format!("lz4 frame expands to {size} bytes")));
+            }
+            lz4_flex::decompress_size_prepended(body)
+                .map(Bytes::from)
+                .map_err(|e| ProtoError(format!("lz4: {e}")))
+        }
+        Some(t) => Err(ProtoError(format!("unknown compression tag {t}"))),
+        None => Err(ProtoError("empty frame".into())),
+    }
+}
+
 /// A connected user as seen by other users.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct UserPresence {

@@ -87,7 +87,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 
 | Фича | Musubi | Pragma | Nakama | PlayFab | AccelByte |
 |---|---|---|---|---|---|
-| WebSocket, QUIC, WebTransport, UDP, WebRTC DataChannel | ✅ `musubi-transport` (все пять) | — | WS | WS/UDP | WS |
+| WebSocket, QUIC, WebTransport, UDP, WebRTC DataChannel | ✅ `musubi-transport` (все пять); единая семантика каналов `reliable_ordered`/`reliable_unordered`/`unreliable_sequenced`/`unreliable` (`channel` у match data, `seq` у unreliable), capability-ответ `transport` (нативные каналы транспорта, лимит кадра), lz4 на кадр >256 байт по согласованию | — | WS | WS/UDP | WS |
 | Relay-матчи, host migration по RTT | ✅ | ❌ | ✅ relayed | ✅ | ❌ |
 | Authoritative-матчи (акторы), снапшоты + журнал, failover, fencing | ✅ | ❌ (game instances на DS) | ✅ (без failover) | 🟡 | ❌ |
 | Spectator, запись и экспорт реплеев | ✅ | ❌ | ❌ | ❌ | ❌ |

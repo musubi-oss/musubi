@@ -16,6 +16,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 postcard.workspace = true
 bytes.workspace = true
 uuid.workspace = true
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }

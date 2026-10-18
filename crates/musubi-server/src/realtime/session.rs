@@ -5,7 +5,7 @@ use std::time::Duration;
 use musubi_chat::{Channel, ChatService};
 use musubi_core::{AccountId, Error, GroupId};
 use musubi_matchmaker::{AddTicket, Matchmaker};
-use musubi_proto::realtime::{ChannelKind, MatchmakerUser};
+use musubi_proto::realtime::{Channel as WireChannel, ChannelKind, MatchmakerUser};
 use musubi_proto::{ClientMessage, Encoding, Envelope, ServerMessage, UserPresence};
 use musubi_runtime::{CallContext, Runtime};
 
@@ -349,6 +349,11 @@ async fn run_loop_inner(
     let sid = ctx.presence.session_id;
     let mut idle = tokio::time::interval(limits.idle_timeout);
     idle.reset();
+    let mut wire = Wire {
+        encoding,
+        lz4: false,
+    };
+    let mut match_seq: HashMap<String, u64> = HashMap::new();
     loop {
         tokio::select! {
             out = rx.recv() => {
@@ -357,14 +362,23 @@ async fn run_loop_inner(
                 // deltas under load) goes out as one burst with a single flush
                 let mut next = Some(first);
                 let mut batch: Vec<Frame> = Vec::new();
-                while let Some(msg) = next.take().or_else(|| rx.try_recv().ok()) {
+                while let Some(mut msg) = next.take().or_else(|| rx.try_recv().ok()) {
+                    if let ServerMessage::MatchData { match_id, reliable, channel, seq, .. } = &mut msg {
+                        if *reliable {
+                            channel.get_or_insert(WireChannel::ReliableOrdered);
+                        } else {
+                            let n = match_seq.entry(match_id.clone()).or_default();
+                            *seq = Some(*n);
+                            *n += 1;
+                            *channel = Some(WireChannel::UnreliableSequenced);
+                        }
+                    }
                     let unreliable = matches!(
                         &msg,
                         ServerMessage::MatchData { reliable: false, .. }
                             | ServerMessage::WorldDelta { sequenced: true, .. }
                     );
-                    let bytes = encoding.encode(&Envelope { cid: None, msg })?;
-                    let frame = Frame::encoded(encoding, bytes);
+                    let frame = wire.frame(&Envelope { cid: None, msg })?;
                     if unreliable {
                         if !batch.is_empty() {
                             conn.send_many(std::mem::take(&mut batch)).await?;
@@ -389,21 +403,39 @@ async fn run_loop_inner(
                     send(conn, encoding, None, ServerMessage::error(&Error::InvalidArgument("frame too large".into()))).await?;
                     continue;
                 }
-                let env: Envelope<ClientMessage> = match encoding.decode(payload) {
+                let env: Envelope<ClientMessage> = match wire.decode(&frame, payload, limits.max_frame_bytes) {
                     Ok(e) => e,
                     Err(e) => {
-                        send(conn, encoding, None, ServerMessage::error(&Error::InvalidArgument(format!("bad frame: {e}")))).await?;
+                        conn.send(wire.frame(&Envelope { cid: None, msg: ServerMessage::error(&Error::InvalidArgument(format!("bad frame: {e}"))) })?).await?;
                         continue;
                     }
                 };
                 if let Err(e) = ctx.rate.socket(ctx.presence.account_id) {
-                    let bytes = encoding.encode(&Envelope { cid: env.cid, msg: ServerMessage::error(&e) })?;
-                    conn.send(Frame::encoded(encoding, bytes)).await?;
+                    conn.send(wire.frame(&Envelope { cid: env.cid, msg: ServerMessage::error(&e) })?).await?;
+                    continue;
+                }
+                if let ClientMessage::Transport { compress } = &env.msg {
+                    let reply = match compress.as_deref() {
+                        None => Ok(()),
+                        Some("lz4") if encoding == Encoding::Postcard => { wire.lz4 = true; Ok(()) }
+                        Some("lz4") => Err(Error::InvalidArgument("lz4 needs the binary (postcard) wire format".into())),
+                        Some(other) => Err(Error::InvalidArgument(format!("unknown compression {other}; supported: lz4"))),
+                    };
+                    let msg = match reply {
+                        Ok(()) => ServerMessage::Transport {
+                            transport: conn.kind().to_string(),
+                            channels: WireChannel::native(conn.kind()),
+                            max_frame_bytes: limits.max_frame_bytes,
+                            compression: if encoding == Encoding::Postcard { vec!["lz4".into()] } else { vec![] },
+                            compressed: wire.lz4,
+                        },
+                        Err(e) => ServerMessage::error(&e),
+                    };
+                    conn.send(wire.frame(&Envelope { cid: env.cid, msg })?).await?;
                     continue;
                 }
                 if let Some(reply) = handle(ctx, env.msg).await {
-                    let bytes = encoding.encode(&Envelope { cid: env.cid, msg: reply })?;
-                    conn.send(Frame::encoded(encoding, bytes)).await?;
+                    conn.send(wire.frame(&Envelope { cid: env.cid, msg: reply })?).await?;
                 }
             }
             _ = signals.kick.notified() => {
@@ -422,6 +454,38 @@ async fn run_loop_inner(
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 return Ok(Exit::Idle);
             }
+        }
+    }
+}
+
+/// Encoding plus the negotiated per-frame compression (`transport {compress: "lz4"}`).
+#[derive(Clone, Copy)]
+struct Wire {
+    encoding: Encoding,
+    lz4: bool,
+}
+
+impl Wire {
+    fn frame<T: serde::Serialize>(&self, v: &T) -> Result<Frame, musubi_proto::ProtoError> {
+        let bytes = self.encoding.encode(v)?;
+        Ok(match (self.encoding, self.lz4) {
+            (Encoding::Postcard, true) => Frame::Binary(musubi_proto::lz4_wrap(bytes)),
+            _ => Frame::encoded(self.encoding, bytes),
+        })
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(
+        &self,
+        frame: &Frame,
+        payload: &[u8],
+        max_bytes: usize,
+    ) -> Result<T, musubi_proto::ProtoError> {
+        match (frame, self.lz4) {
+            (Frame::Binary(_), true) => {
+                let raw = musubi_proto::lz4_unwrap(payload, max_bytes)?;
+                self.encoding.decode(&raw)
+            }
+            _ => self.encoding.decode(payload),
         }
     }
 }
@@ -847,7 +911,9 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             data,
             presences,
             reliable,
+            channel,
         } => {
+            let reliable = channel.map_or(reliable, WireChannel::reliable);
             if let Some(h) = ctx.matches.get(&match_id) {
                 if h.info().await.spectators.contains(&ctx.presence.session_id) {
                     return Some(ServerMessage::error(&Error::PermissionDenied(
@@ -904,6 +970,8 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             )
         }
         ClientMessage::Ping => Some(ServerMessage::Pong),
+        // answered in the run loop (needs the connection); never reaches here
+        ClientMessage::Transport { .. } => None,
         ClientMessage::StatusUpdate {
             status,
             rich,

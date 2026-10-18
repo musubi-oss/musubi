@@ -567,7 +567,7 @@ async fn run(
                 }
                 for out in res.outbound {
                     let to = if out.to.is_empty() { watchers(&members, &spectators) } else { out.to };
-                    fan(&deliver, &delays, &mut delayed, tick, to, ServerMessage::MatchData { match_id: match_id.clone(), presence: None, op_code: out.op_code, data: out.data, reliable: out.reliable });
+                    fan(&deliver, &delays, &mut delayed, tick, to, ServerMessage::MatchData { match_id: match_id.clone(), presence: None, op_code: out.op_code, data: out.data, reliable: out.reliable, channel: None, seq: None });
                 }
                 {
                     let mut i = info.write().await;
