@@ -63,6 +63,16 @@ enum Cmd {
         #[arg(long)]
         replace: bool,
     },
+    /// Import PlayFab (`GetPlayerCombinedInfo`) or Unity Gaming Services player exports from a
+    /// directory of JSON/JSONL files into this database.
+    MigratePlayfab {
+        /// Directory (or single file) with the exported player records.
+        #[arg(long)]
+        from: PathBuf,
+        /// Overwrite rows that already exist here with the exported version.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Dump game data (every `musubi` table except runtime state, or `--tables`) as JSONL.
     Export {
         /// Output file (default: stdout).
@@ -244,6 +254,16 @@ async fn main() -> anyhow::Result<()> {
             musubi_server::init_tracing(&cfg);
             let pool = musubi_server::db::connect(&cfg.database).await?;
             musubi_server::db::migrate(&pool).await
+        }
+        Cmd::MigratePlayfab { from, replace } => {
+            musubi_server::init_tracing(&cfg);
+            let dst = musubi_server::db::connect(&cfg.database).await?;
+            musubi_server::db::migrate(&dst).await?;
+            let report = musubi_server::playfab::import_dir(&from, &dst, replace).await?;
+            for (t, c) in &report {
+                eprintln!("{t:<22} written {:<8} kept {}", c.written, c.kept);
+            }
+            Ok(())
         }
         Cmd::MigrateNakama { from, replace } => {
             musubi_server::init_tracing(&cfg);

@@ -209,6 +209,8 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   ✅ модификаторы наград: `PUT /v1/server/rewards/modifiers` — множитель с окном времени, глобально или per-аккаунт,
   на `xp`/`xp:<track>`, `currency`/`currency:<code>`, `table:<id>`; применяется в XP и во всех выдачах таблиц; игрок видит
   активные в `GET /v1/rewards/modifiers`.
+  ✅ миграция с PlayFab/UGS: `musubi migrate-playfab --from dir` — аккаунты со стабильными id, привязки платформ,
+  user data → storage, валюты → кошельки, инвентарь, статистики → лидерборды; старый id логинится через custom auth.
   ✅ CLI: `musubi module publish/canary/promote/rollback/versions`, `musubi fleet push/list`, `musubi deploy` —
   раскатка модулей и флотов из CI поверх админ-API, тест на мок-сервере.
   ✅ оркестрация: провайдер `webhook` — любой оркестратор за `POST /servers`, `GET /servers/{id}`, `DELETE /servers/{id}`
@@ -227,5 +229,6 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   «≤ 2 с до готовности» не измерен.
 - **CLI (5.15).** Есть dev/migrate/migrate-nakama/export/import/doctor/config/bench/soak,
   `module publish/canary/promote/rollback/versions`, `fleet push/list`, `deploy` (манифест модули+флоты);
-  нет `schema migrate` (контракты коллекций применяются через API), миграции с PlayFab/UGS, Terraform.
+  `migrate-playfab` (PlayFab / UGS экспорт);
+  нет `schema migrate` (контракты коллекций применяются через API), Terraform.
 - **Realtime (5.8).** Типизированная схема состояния с автодельтами и детерминированный rollback — v2 / SDK.

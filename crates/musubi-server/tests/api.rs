@@ -13772,3 +13772,157 @@ async fn storage_json_patch_aggregate_and_fulltext() {
     let (st, _) = call(&app, "GET", &q(r#"{"$q":""}"#), Some(&tok), None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn migrate_playfab_and_ugs_exports() {
+    let Some(app) = app().await else { return };
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let k = "defaultkey";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let pf = format!("PF{}", sfx[..14].to_ascii_uppercase());
+    let ug = format!("ugs-{sfx}");
+    let dir = std::env::temp_dir().join(format!("musubi-pf-{sfx}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("players.json"),
+        json!({"Players": [{
+            "PlayFabId": pf,
+            "InfoResultPayload": {
+                "PlayerProfile": {
+                    "PlayerId": pf, "DisplayName": "Pf Hero",
+                    "LinkedAccounts": [{"Platform": "Steam", "PlatformUserId": format!("7656{}", &sfx[..10])}],
+                    "Statistics": [{"Name": "wins", "Value": 12}]
+                },
+                "AccountInfo": {
+                    "Username": format!("pf_{}", &sfx[..12]),
+                    "PrivateInfo": {"Email": format!("{}@example.test", pf.to_ascii_lowercase())}
+                },
+                "UserData": {
+                    "loadout": {"Value": "{\"primary\":\"ak\"}", "Permission": "Public"},
+                    "note": {"Value": "hi", "Permission": "Private"}
+                },
+                "UserReadOnlyData": {"vip": {"Value": "true"}},
+                "UserVirtualCurrency": {"GC": 150, "GM": -5},
+                "UserInventory": [{"ItemId": "sword_pf", "ItemInstanceId": "inst-1", "RemainingUses": 3,
+                                   "ItemClass": "weapon", "DisplayName": "Sword", "CustomData": {"lvl": "2"}}],
+                "PlayerStatistics": [{"StatisticName": "wins", "Value": 12}]
+            }
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ugs.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({
+                "playerId": ug, "username": format!("ugs_{}", &sfx[..12]),
+                "externalIds": [{"providerId": "google-play-games", "externalId": format!("g-{ug}")}],
+                "cloudSave": {"progress": {"value": {"level": 7}}},
+                "currencies": {"GEM": 20},
+                "inventory": [{"inventoryItemId": "shield_ugs", "playersInventoryItemId": "pi-1", "quantity": 2}],
+                "leaderboards": {"wins": 3}
+            }),
+            json!({"garbage": true})
+        ),
+    )
+    .unwrap();
+
+    let report = musubi_server::playfab::import_dir(&dir, &db, false)
+        .await
+        .unwrap();
+    let get = |n: &str| report.iter().find(|(t, _)| *t == n).unwrap().1;
+    assert_eq!(get("accounts").written, 2, "{report:?}");
+    assert_eq!(get("skipped_records").kept, 1);
+    assert_eq!(get("wallets").written, 3);
+    assert_eq!(get("inventory").written, 2);
+    assert_eq!(get("leaderboard_records").written, 2);
+    assert_eq!(get("storage_objects").written, 4);
+    // identities: steam + custom + email for PlayFab, google + custom for UGS
+    assert_eq!(get("identities").written, 5);
+    // re-running the same export writes nothing
+    let again = musubi_server::playfab::import_dir(&dir, &db, false)
+        .await
+        .unwrap();
+    for (t, c) in &again {
+        if *t != "skipped_records" {
+            assert_eq!(c.written, 0, "{t}: {again:?}");
+        }
+    }
+
+    // the old PlayFab id still logs in (custom auth) and lands on the imported account
+    let (st, s) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": format!("playfab:{pf}")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s}");
+    assert_eq!(
+        s["account_id"],
+        musubi_server::playfab::stable_id(&format!("playfab:{pf}")).to_string()
+    );
+    let tok = s["access_token"].as_str().unwrap().to_string();
+    let (st, me) = call(&app, "GET", "/v1/account", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    assert_eq!(me["display_name"], "Pf Hero");
+    let ms = me.to_string();
+    assert!(ms.contains("\"steam\"") && ms.contains("\"email\""), "{me}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    let ws = w.to_string();
+    assert!(
+        ws.contains("\"GC\"") && ws.contains("150") && !ws.contains("-5"),
+        "{w}"
+    );
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    assert!(inv.to_string().contains("sword_pf"), "{inv}");
+    let (st, so) = call(
+        &app,
+        "GET",
+        "/v1/storage/playfab_user_data",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{so}");
+    assert!(so.to_string().contains("\"primary\":\"ak\""), "{so}");
+    let (_, ro) = call(
+        &app,
+        "GET",
+        "/v1/storage/playfab_readonly",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert!(ro.to_string().contains("vip"), "{ro}");
+    let score: Option<(i64,)> = sqlx::query_as(
+        "select score from musubi.leaderboard_records where leaderboard_id = 'wins' and owner_id = $1",
+    )
+    .bind(musubi_server::playfab::stable_id(&format!("playfab:{pf}")))
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert_eq!(score, Some((12,)));
+
+    // UGS player
+    let (st, s2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": format!("ugs:{ug}")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    let tok2 = s2["access_token"].as_str().unwrap().to_string();
+    let (_, cs) = call(&app, "GET", "/v1/storage/cloud_save", Some(&tok2), None).await;
+    assert!(cs.to_string().contains("\"level\":7"), "{cs}");
+    let (_, w2) = call(&app, "GET", "/v1/wallet", Some(&tok2), None).await;
+    assert!(w2.to_string().contains("\"GEM\""), "{w2}");
+    let (_, inv2) = call(&app, "GET", "/v1/inventory", Some(&tok2), None).await;
+    assert!(inv2.to_string().contains("shield_ugs"), "{inv2}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
