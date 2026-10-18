@@ -29,6 +29,37 @@ pub struct Pity {
     pub rarity: String,
 }
 
+/// Deferred delivery: the outcome is frozen into a mailbox message the player claims later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Deferred {
+    /// Seconds until the message becomes claimable (0 = right away).
+    pub delay_secs: i64,
+    /// Seconds after it becomes claimable until it expires (`null` = never).
+    pub ttl_secs: Option<i64>,
+    pub title: String,
+    pub body: String,
+}
+
+impl Default for Deferred {
+    fn default() -> Self {
+        Self {
+            delay_secs: 0,
+            ttl_secs: None,
+            title: "Reward".into(),
+            body: String::new(),
+        }
+    }
+}
+
+/// Result of a server-side table grant.
+#[derive(Debug, Clone, Serialize)]
+pub struct Granted {
+    pub rewards: Vec<RewardEntry>,
+    /// Mailbox message holding the rewards when the table defers delivery.
+    pub mail_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RewardTable {
@@ -39,6 +70,8 @@ pub struct RewardTable {
     pub entries: Vec<RewardEntry>,
     pub pity: Pity,
     pub enabled: bool,
+    /// Deliver through the mailbox (after a delay, with a TTL) instead of straight to wallet/inventory.
+    pub deferred: Option<Deferred>,
 }
 
 impl Default for RewardTable {
@@ -50,6 +83,7 @@ impl Default for RewardTable {
             entries: Vec::new(),
             pity: Pity::default(),
             enabled: true,
+            deferred: None,
         }
     }
 }
@@ -74,6 +108,9 @@ pub struct Roll {
     pub rewards: Vec<RewardEntry>,
     pub pity_forced: bool,
     pub replayed: bool,
+    /// Mailbox message the rewards went to when the table defers delivery.
+    #[serde(default)]
+    pub deferred: Option<Uuid>,
 }
 
 pub fn roll_hash(server_seed: &str, client_seed: &str, nonce: i64) -> String {
@@ -107,6 +144,18 @@ impl RewardTable {
             return Err(Error::InvalidArgument(
                 "kind: guaranteed|weighted|tiered".into(),
             ));
+        }
+        if let Some(d) = &self.deferred {
+            if d.delay_secs < 0 || d.ttl_secs.is_some_and(|t| t <= 0) {
+                return Err(Error::InvalidArgument(
+                    "deferred: delay_secs >= 0, ttl_secs > 0".into(),
+                ));
+            }
+            if d.title.is_empty() || d.title.len() > 200 {
+                return Err(Error::InvalidArgument(
+                    "deferred.title: 1..=200 chars".into(),
+                ));
+            }
         }
         if self.entries.is_empty() {
             return Err(Error::InvalidArgument("entries required".into()));
@@ -186,7 +235,7 @@ impl RewardTable {
     }
 }
 
-type TableRow = (String, String, String, Value, Value, bool);
+type TableRow = (String, String, String, Value, Value, bool, Option<Value>);
 
 fn table(r: TableRow) -> RewardTable {
     RewardTable {
@@ -196,19 +245,20 @@ fn table(r: TableRow) -> RewardTable {
         entries: serde_json::from_value(r.3).unwrap_or_default(),
         pity: serde_json::from_value(r.4).unwrap_or_default(),
         enabled: r.5,
+        deferred: r.6.and_then(|v| serde_json::from_value(v).ok()),
     }
 }
 
-const TABLE_COLS: &str = "id, name, kind, entries, pity, enabled";
+const TABLE_COLS: &str = "id, name, kind, entries, pity, enabled, deferred";
 
 impl EconomyService {
     pub async fn upsert_reward_table(&self, t: RewardTable) -> Result<RewardTable> {
         crate::check_code(&t.id)?;
         t.validate()?;
         sqlx::query(
-            "insert into musubi.reward_tables (id, name, kind, entries, pity, enabled) values ($1, $2, $3, $4, $5, $6)
+            "insert into musubi.reward_tables (id, name, kind, entries, pity, enabled, deferred) values ($1, $2, $3, $4, $5, $6, $7)
              on conflict (id) do update set name = excluded.name, kind = excluded.kind, entries = excluded.entries,
-             pity = excluded.pity, enabled = excluded.enabled",
+             pity = excluded.pity, enabled = excluded.enabled, deferred = excluded.deferred",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -216,6 +266,7 @@ impl EconomyService {
         .bind(serde_json::to_value(&t.entries)?)
         .bind(serde_json::to_value(&t.pity)?)
         .bind(t.enabled)
+        .bind(t.deferred.as_ref().map(serde_json::to_value).transpose()?)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -254,6 +305,7 @@ impl EconomyService {
                 roll: r.5,
                 rewards: serde_json::from_value(r.6["rewards"].clone()).unwrap_or_default(),
                 pity_forced: r.6["pity_forced"].as_bool().unwrap_or(false),
+                deferred: r.6["deferred"].as_str().and_then(|s| s.parse().ok()),
                 replayed: true,
             })
             .collect())
@@ -288,6 +340,7 @@ impl EconomyService {
                     roll: p.4,
                     rewards: serde_json::from_value(p.5["rewards"].clone()).unwrap_or_default(),
                     pity_forced: p.5["pity_forced"].as_bool().unwrap_or(false),
+                    deferred: p.5["deferred"].as_str().and_then(|s| s.parse().ok()),
                     replayed: true,
                 });
             }
@@ -331,15 +384,28 @@ impl EconomyService {
             return Err(Error::Internal("empty outcome".into()));
         }
         let id = Uuid::now_v7();
-        let rewards = Self::apply_rewards_for(
-            &mut tx,
-            account,
-            Some(table_id),
-            &rewards,
-            "reward.roll",
-            &id.to_string(),
-        )
-        .await?;
+        let (rewards, deferred) = match &t.deferred {
+            Some(d) => {
+                let rewards =
+                    Self::modified_rewards(&mut tx, account, Some(table_id), &rewards).await?;
+                let mail =
+                    Self::defer_rewards(&mut tx, account, d, &rewards, table_id, &id.to_string())
+                        .await?;
+                (rewards, Some(mail))
+            }
+            None => (
+                Self::apply_rewards_for(
+                    &mut tx,
+                    account,
+                    Some(table_id),
+                    &rewards,
+                    "reward.roll",
+                    &id.to_string(),
+                )
+                .await?,
+                None,
+            ),
+        };
         let hit = t.pity.after > 0 && rewards.iter().any(|e| e.rarity == t.pity.rarity);
         sqlx::query("update musubi.reward_pity set counter = $3, nonce = $4 where account_id = $1 and table_id = $2")
             .bind(account.0)
@@ -360,7 +426,7 @@ impl EconomyService {
         .bind(client_seed)
         .bind(nonce)
         .bind(&hash)
-        .bind(json!({ "rewards": rewards, "pity_forced": pity_forced }))
+        .bind(json!({ "rewards": rewards, "pity_forced": pity_forced, "deferred": deferred }))
         .bind(idempotency_key)
         .execute(&mut *tx)
         .await
@@ -376,6 +442,7 @@ impl EconomyService {
             rewards,
             pity_forced,
             replayed: false,
+            deferred,
         })
     }
 
@@ -386,6 +453,19 @@ impl EconomyService {
         table_id: &str,
         reference: &str,
     ) -> Result<Vec<RewardEntry>> {
+        Ok(self
+            .grant_table_detailed(account, table_id, reference)
+            .await?
+            .rewards)
+    }
+
+    /// Same, reporting the mailbox message when the table defers delivery.
+    pub async fn grant_table_detailed(
+        &self,
+        account: AccountId,
+        table_id: &str,
+        reference: &str,
+    ) -> Result<Granted> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let row: Option<TableRow> = sqlx::query_as(&format!(
             "select {TABLE_COLS} from musubi.reward_tables where id = $1"
@@ -397,17 +477,29 @@ impl EconomyService {
         let Some(t) = row.map(table) else {
             return Err(Error::NotFound(format!("reward table {table_id}")));
         };
-        let applied = Self::apply_rewards_for(
-            &mut tx,
-            account,
-            Some(table_id),
-            &t.entries,
-            "reward.grant",
-            reference,
-        )
-        .await?;
+        let (rewards, mail_id) = match &t.deferred {
+            Some(d) => {
+                let rewards =
+                    Self::modified_rewards(&mut tx, account, Some(table_id), &t.entries).await?;
+                let mail =
+                    Self::defer_rewards(&mut tx, account, d, &rewards, table_id, reference).await?;
+                (rewards, Some(mail))
+            }
+            None => (
+                Self::apply_rewards_for(
+                    &mut tx,
+                    account,
+                    Some(table_id),
+                    &t.entries,
+                    "reward.grant",
+                    reference,
+                )
+                .await?,
+                None,
+            ),
+        };
         tx.commit().await.map_err(Error::internal)?;
-        Ok(applied)
+        Ok(Granted { rewards, mail_id })
     }
 
     pub(crate) async fn load_table(

@@ -331,6 +331,8 @@ pub async fn pay_prizes(s: &AppState, id: &str, expiry: i64) -> Result<usize, mu
                     }),
                     rewards: Some(p.reward_table.clone()),
                     expires_in_seconds: None,
+                    reward_entries: None,
+                    available_in_seconds: None,
                 },
                 now,
             )

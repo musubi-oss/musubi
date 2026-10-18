@@ -679,12 +679,12 @@ async fn reward_grant(
 ) -> Result<Json<Value>, ApiError> {
     let who = account(&r.account_id)?;
     crate::grant_limits::check(&s.db, who, "reward_table", &r.table_id, 1).await?;
-    let rewards = s
+    let g = s
         .economy
-        .grant_table(who, &r.table_id, &r.reference)
+        .grant_table_detailed(who, &r.table_id, &r.reference)
         .await?;
     crate::grant_limits::record(&s.db, who, "reward_table", &r.table_id, 1).await?;
-    Ok(Json(json!({ "rewards": rewards })))
+    Ok(Json(json!({ "rewards": g.rewards, "mail_id": g.mail_id })))
 }
 
 // ----- reward modifiers -----

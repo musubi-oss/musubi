@@ -15134,3 +15134,227 @@ async fn inventory_rules_unique_bind_equip_limits() {
     let (st, r) = grant(gem.clone(), json!({})).await;
     assert_eq!(st, StatusCode::OK, "{r}");
 }
+
+#[tokio::test]
+async fn deferred_rewards_go_through_the_mailbox() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dr")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let now_t = unique("now");
+    let later_t = unique("later");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({
+            "id": now_t, "name": "Daily", "kind": "guaranteed",
+            "entries": [{"weight": 1, "rarity": "common", "currency": gold, "amount": 50}],
+            "deferred": {"delay_secs": 0, "title": "Daily gift", "body": "claim me"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["deferred"]["title"], "Daily gift");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({
+            "id": later_t, "name": "Later", "kind": "guaranteed",
+            "entries": [{"weight": 1, "rarity": "common", "currency": gold, "amount": 500}],
+            "deferred": {"delay_secs": 3600, "ttl_secs": 7200, "title": "Tomorrow"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({
+            "id": unique("bad"), "name": "Bad", "kind": "guaranteed",
+            "entries": [{"weight": 1, "rarity": "common", "currency": gold, "amount": 1}],
+            "deferred": {"delay_secs": -1}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+
+    let balance = |app: axum::Router| {
+        let tok = tok.clone();
+        let gold = gold.clone();
+        async move {
+            let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+            w["balances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["currency"] == gold)
+                .map(|b| b["balance"].as_i64().unwrap())
+                .unwrap_or(0)
+        }
+    };
+
+    // a roll on a deferred table freezes the outcome into a mail instead of paying out
+    let (st, roll) = call(
+        &app,
+        "POST",
+        &format!("/v1/rewards/{now_t}/roll"),
+        Some(&tok),
+        Some(json!({"client_seed": "s1", "idempotency_key": "d1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{roll}");
+    assert_eq!(roll["rewards"][0]["amount"], 50);
+    let mail_id = roll["deferred"]
+        .as_str()
+        .expect("deferred mail id")
+        .to_string();
+    assert_eq!(balance(app.clone()).await, 0, "nothing paid out yet");
+    // replay reports the same mail
+    let (st, again) = call(
+        &app,
+        "POST",
+        &format!("/v1/rewards/{now_t}/roll"),
+        Some(&tok),
+        Some(json!({"client_seed": "s1", "idempotency_key": "d1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(again["replayed"], true);
+    assert_eq!(again["deferred"], mail_id);
+    let (_, inbox) = call(&app, "GET", "/v1/mail", Some(&tok), None).await;
+    let m = inbox["mail"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == mail_id)
+        .expect("mail listed")
+        .clone();
+    assert_eq!(m["title"], "Daily gift");
+    assert_eq!(m["reward_entries"][0]["amount"], 50);
+    assert!(m["available_at"].is_string());
+    let (st, c) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{mail_id}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(balance(app.clone()).await, 50);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{mail_id}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // server grant of a delayed table: mail exists, claim refused until available_at
+    let (st, g) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/grant",
+        k,
+        Some(json!({"account_id": acc, "table_id": later_t, "reference": "login"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["rewards"][0]["amount"], 500);
+    let late_id = g["mail_id"].as_str().expect("mail id").to_string();
+    let (st, c) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{late_id}/claim"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{c}");
+    assert_eq!(balance(app.clone()).await, 50);
+    let (st, c) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/mail/{late_id}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "unclaimed inline rewards block delete: {c}"
+    );
+
+    // inline reward entries on a server mail
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/mail",
+        k,
+        Some(json!({
+            "account_ids": [acc], "title": "Compensation", "body": "sorry",
+            "reward_entries": [{"currency": gold, "amount": 0}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/mail",
+        k,
+        Some(json!({
+            "account_ids": [acc], "title": "Compensation", "body": "sorry",
+            "reward_entries": [{"currency": gold, "amount": 7}], "available_in_seconds": 0
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (_, inbox) = call(&app, "GET", "/v1/mail", Some(&tok), None).await;
+    let comp = inbox["mail"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["title"] == "Compensation")
+        .expect("compensation mail")
+        .clone();
+    assert_eq!(comp["reward_entries"][0]["amount"], 7);
+    let (st, c) = call(
+        &app,
+        "POST",
+        &format!("/v1/mail/{}/claim", comp["id"].as_str().unwrap()),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(balance(app.clone()).await, 57);
+}

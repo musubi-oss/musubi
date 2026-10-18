@@ -23,6 +23,10 @@ pub struct SendMail {
     pub metadata: Value,
     /// Reward table attached to the message.
     pub rewards: Option<String>,
+    /// Frozen reward entries attached inline (claimed as-is, no table lookup).
+    pub reward_entries: Option<Vec<RewardEntry>>,
+    /// Seconds until the attached rewards can be claimed.
+    pub available_in_seconds: Option<i64>,
     pub expires_in_seconds: Option<i64>,
 }
 
@@ -137,6 +141,8 @@ impl Default for SendMail {
             metadata: json!({}),
             rewards: None,
             expires_in_seconds: None,
+            reward_entries: None,
+            available_in_seconds: None,
         }
     }
 }
@@ -148,6 +154,11 @@ pub struct Mail {
     pub body: String,
     pub metadata: Value,
     pub rewards: Option<String>,
+    /// Inline rewards (deferred table outcome or server-attached entries).
+    pub reward_entries: Option<Vec<RewardEntry>>,
+    /// Rewards cannot be claimed before this.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub available_at: Option<OffsetDateTime>,
     pub read: bool,
     pub claimed: bool,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -166,6 +177,8 @@ type MailRow = (
     Option<OffsetDateTime>,
     Option<OffsetDateTime>,
     OffsetDateTime,
+    Option<Value>,
+    Option<OffsetDateTime>,
 );
 
 fn mail(r: MailRow) -> Mail {
@@ -179,13 +192,49 @@ fn mail(r: MailRow) -> Mail {
         claimed: r.6.is_some(),
         expires_at: r.7,
         created_at: r.8,
+        reward_entries: r.9.and_then(|v| serde_json::from_value(v).ok()),
+        available_at: r.10,
     }
 }
 
 const COLS: &str =
-    "id, title, body, metadata, rewards, read_at, claimed_at, expires_at, created_at";
+    "id, title, body, metadata, rewards, read_at, claimed_at, expires_at, created_at, reward_entries, available_at";
 
 impl EconomyService {
+    /// Freezes `rewards` into a mailbox message for `account` (deferred table delivery).
+    pub(crate) async fn defer_rewards(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        account: AccountId,
+        d: &crate::rewards::Deferred,
+        rewards: &[RewardEntry],
+        table_id: &str,
+        reference: &str,
+    ) -> Result<Uuid> {
+        let now = OffsetDateTime::now_utc();
+        let available_at = now + time::Duration::seconds(d.delay_secs);
+        let expires_at = d
+            .ttl_secs
+            .map(|t| available_at + time::Duration::seconds(t));
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "insert into musubi.mail (id, account_id, title, body, metadata, reward_entries, available_at, expires_at, created_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(id)
+        .bind(account.0)
+        .bind(&d.title)
+        .bind(&d.body)
+        .bind(serde_json::json!({ "table_id": table_id, "reference": reference }))
+        .bind(serde_json::to_value(rewards)?)
+        .bind(available_at)
+        .bind(expires_at)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        Ok(id)
+    }
+
     /// Returns the number of messages created.
     pub async fn send_mail(&self, m: SendMail, now: OffsetDateTime) -> Result<i64> {
         if m.title.is_empty() || m.title.len() > 200 || m.body.len() > 16 * 1024 {
@@ -216,11 +265,36 @@ impl EconomyService {
                 return Err(Error::NotFound(format!("reward table {t}")));
             }
         }
+        if let Some(es) = &m.reward_entries {
+            if es.is_empty()
+                || es
+                    .iter()
+                    .any(|e| e.amount <= 0 || e.currency.is_none() == e.item_id.is_none())
+            {
+                return Err(Error::InvalidArgument(
+                    "reward_entries: amount > 0 and exactly one of currency / item_id".into(),
+                ));
+            }
+        }
+        let available_at = match m.available_in_seconds {
+            Some(s) if s < 0 => {
+                return Err(Error::InvalidArgument(
+                    "available_in_seconds must be >= 0".into(),
+                ))
+            }
+            Some(s) => Some(now + time::Duration::seconds(s)),
+            None => None,
+        };
+        let reward_entries = m
+            .reward_entries
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
         let n = if m.all || m.audience.is_some() {
             let aud = m.audience.clone().unwrap_or_default();
             aud.validate()?;
             let mut qb = QueryBuilder::new(
-                "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at) \
+                "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at, reward_entries, available_at) \
                  select gen_random_uuid(), a.id, ",
             );
             qb.push_bind(&m.title)
@@ -234,6 +308,10 @@ impl EconomyService {
                 .push_bind(expires_at)
                 .push(", ")
                 .push_bind(now)
+                .push(", ")
+                .push_bind(&reward_entries)
+                .push(", ")
+                .push_bind(available_at)
                 .push(" from musubi.accounts a");
             aud.push_where(&mut qb, now);
             qb.build()
@@ -243,8 +321,8 @@ impl EconomyService {
                 .rows_affected()
         } else {
             sqlx::query(
-                "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at)
-                 select gen_random_uuid(), a.id, $2, $3, $4, $5, $6, $7 from unnest($1::uuid[]) as a(id)",
+                "insert into musubi.mail (id, account_id, title, body, metadata, rewards, expires_at, created_at, reward_entries, available_at)
+                 select gen_random_uuid(), a.id, $2, $3, $4, $5, $6, $7, $8, $9 from unnest($1::uuid[]) as a(id)",
             )
             .bind(&m.account_ids)
             .bind(&m.title)
@@ -253,6 +331,8 @@ impl EconomyService {
             .bind(&m.rewards)
             .bind(expires_at)
             .bind(now)
+            .bind(&reward_entries)
+            .bind(available_at)
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?
@@ -337,8 +417,41 @@ impl EconomyService {
         if m.expires_at.is_some_and(|e| e <= now) {
             return Err(Error::PermissionDenied("mail expired".into()));
         }
+        if let Some(a) = m.available_at.filter(|a| *a > now) {
+            return Err(Error::PermissionDenied(format!(
+                "rewards claimable in {} s",
+                (a - now).whole_seconds().max(1)
+            )));
+        }
         let mut rewards = Vec::new();
-        if let Some(t) = &m.rewards {
+        if let Some(es) = &m.reward_entries {
+            for e in es {
+                if let Some(c) = &e.currency {
+                    Self::adjust_tx(
+                        &mut tx,
+                        account,
+                        c,
+                        e.amount,
+                        "mail.claim",
+                        &id.to_string(),
+                        None,
+                        serde_json::json!({}),
+                    )
+                    .await?;
+                }
+                if let Some(i) = &e.item_id {
+                    Self::grant_item_tx(
+                        &mut tx,
+                        account,
+                        i,
+                        e.amount,
+                        Value::Object(Default::default()),
+                    )
+                    .await?;
+                }
+            }
+            rewards = es.clone();
+        } else if let Some(t) = &m.rewards {
             let Some(table) = Self::load_table(&mut tx, t).await? else {
                 return Err(Error::NotFound(format!("reward table {t}")));
             };
@@ -372,7 +485,7 @@ impl EconomyService {
         now: OffsetDateTime,
     ) -> Result<()> {
         let row: Option<(Option<String>, Option<OffsetDateTime>, Option<OffsetDateTime>)> =
-            sqlx::query_as("select rewards, claimed_at, expires_at from musubi.mail where id = $1 and account_id = $2")
+            sqlx::query_as("select coalesce(rewards, case when reward_entries is not null then 'inline' end), claimed_at, expires_at from musubi.mail where id = $1 and account_id = $2")
                 .bind(id)
                 .bind(account.0)
                 .fetch_optional(&self.db)
