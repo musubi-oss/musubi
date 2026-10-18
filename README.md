@@ -432,6 +432,11 @@ instant, or at a wall-clock time in each recipient's own timezone (`accounts.tim
 out zone by zone by the `push_schedule` lease holder every 30 s) — and
 `GET/DELETE /v1/server/push/schedule`.
 
+Platforms: `fcm`, `apns`, `webpush` and `hms` (Huawei Push Kit: `[push.hms] app_id/app_secret`,
+app-level OAuth token cached until it expires). `data.silent = true` sends a background push —
+FCM data-only message, APNs `content-available: 1` with `apns-push-type: background`, HMS data
+message — so the app wakes and reads `data` without showing a banner.
+
 ### Chat: typing, attachments, automod
 
 `channel_typing {channel_id}` fans a `channel_typing {channel_id, user}` event to everyone else

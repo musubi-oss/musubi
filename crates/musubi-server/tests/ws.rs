@@ -16866,6 +16866,114 @@ const WORKFLOW_WAT: &str = r#"(module
 )
 "#;
 
+/// Huawei Push Kit provider against a mock: OAuth token once, data message for silent pushes,
+/// notification for loud ones, "illegal token" removes the registration.
+#[tokio::test]
+async fn hms_push_provider_and_silent_pushes() {
+    let calls: Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let c2 = calls.clone();
+    let c3 = calls.clone();
+    let hms = axum::Router::new()
+        .route(
+            "/oauth2/v3/token",
+            axum::routing::post(move |body: String| {
+                let calls = c2.clone();
+                async move {
+                    calls.lock().unwrap().push(("token".into(), json!(body)));
+                    axum::Json(json!({"access_token": "hms-at", "expires_in": 3600}))
+                }
+            }),
+        )
+        .route(
+            "/v1/app-1/messages:send",
+            axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(v): axum::Json<Value>| {
+                let calls = c3.clone();
+                async move {
+                    let auth = headers.get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+                    let gone = v["message"]["token"][0] == "dead";
+                    calls.lock().unwrap().push(("send".into(), json!({"auth": auth, "body": v})));
+                    axum::Json(json!({"code": if gone { "80300007" } else { "80000000" }, "msg": "ok"}))
+                }
+            }),
+        );
+    let hl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", hl.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(hl, hms).await.unwrap() });
+    let (token_url, base_url) = (format!("{base}/oauth2/v3/token"), base.clone());
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            let cfg = Arc::make_mut(&mut st.cfg);
+            cfg.push.hms.app_id = "app-1".into();
+            cfg.push.hms.app_secret = "s3cret".into();
+            cfg.push.hms.token_url = token_url;
+            cfg.push.hms.base_url = base_url;
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let push = musubi_server::push::Push::new(state.cfg.push.clone(), state.db.clone());
+    let acc = musubi_core::AccountId(uuid::Uuid::now_v7());
+    sqlx::query("insert into musubi.accounts (id, username) values ($1, $2)")
+        .bind(acc.0)
+        .bind(format!("hms-{}", uuid::Uuid::now_v7().simple()))
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert!(push.register(acc, "hms", "tok-1").await.is_ok());
+    assert!(push.register(acc, "hms", "dead").await.is_ok());
+    assert!(push.register(acc, "nope", "x").await.is_err());
+    // loud push: notification + data, token fetched once
+    let n = push
+        .send(acc, "Hello", &json!({"body": "world", "k": "v"}), 7)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "dead token is dropped, live one delivered");
+    {
+        let c = calls.lock().unwrap();
+        assert_eq!(c.iter().filter(|(k, _)| k == "token").count(), 1, "{c:?}");
+        let sends: Vec<&Value> = c
+            .iter()
+            .filter(|(k, _)| k == "send")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(sends.len(), 2);
+        let live = sends
+            .iter()
+            .find(|v| v["body"]["message"]["token"][0] == "tok-1")
+            .unwrap();
+        assert_eq!(live["auth"], "Bearer hms-at");
+        assert_eq!(live["body"]["message"]["notification"]["title"], "Hello");
+        let data: Value =
+            serde_json::from_str(live["body"]["message"]["data"].as_str().unwrap()).unwrap();
+        assert_eq!(data["k"], "v");
+        assert_eq!(data["code"], 7);
+    }
+    let left = push.list(acc).await.unwrap();
+    assert_eq!(left.len(), 1, "{left:?}");
+    // silent push: data message only, no second token fetch
+    let n = push
+        .send(
+            acc,
+            "ignored",
+            &json!({"silent": true, "sync": "inventory"}),
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    let c = calls.lock().unwrap();
+    assert_eq!(c.iter().filter(|(k, _)| k == "token").count(), 1);
+    let last = &c.last().unwrap().1["body"]["message"];
+    assert!(last.get("notification").is_none(), "{last}");
+    let data: Value = serde_json::from_str(last["data"].as_str().unwrap()).unwrap();
+    assert_eq!(data["sync"], "inventory");
+}
+
 async fn recv_account(router: &axum::Router, token: &str) -> Value {
     http_json(router, "GET", "/v1/account", Some(token), false, None)
         .await

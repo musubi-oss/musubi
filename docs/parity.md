@@ -195,7 +195,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   https/ugc-ссылки, размер ≤25 МиБ — контракт проверяется сервером), внешний automod-вебхук (`chat.automod_url`:
   allow/block/replace, таймаут, fail-open/closed). ✅ TTL in-app уведомлений (`ttl_secs` → `expires_at`, скрытие и очистка), шаблоны push (`{{var}}`, `{{username}}`),
   рассылка списку/всем с токеном, расписание по UTC или по локальному времени получателя (`accounts.timezone`,
-  раскатка по часовым поясам, лидерский цикл 30 с). Перевод чата — вебхук (`translate_url`). Остались: Huawei push, тихие пуши.
+  раскатка по часовым поясам, лидерский цикл 30 с). Перевод чата — вебхук (`translate_url`), Huawei Push Kit (`hms`) и тихие пуши (`data.silent`) — есть.
 - **Присутствие (5.4).** Статус — одна строка; нет `appear_offline` и структурированного rich presence.
   Импорт платформенных друзей разовый, без периодического рефреша. Войны/челленджи кланов — нет.
   ✅ `status_update {status, rich, appear_offline}`: rich presence — JSON-объект ≤2 КБ рядом со статусом; appear_offline —

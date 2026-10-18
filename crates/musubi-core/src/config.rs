@@ -1208,6 +1208,7 @@ pub struct PushConfig {
     pub fcm: FcmConfig,
     pub apns: ApnsConfig,
     pub webpush: WebPushConfig,
+    pub hms: HmsConfig,
 }
 
 /// Firebase Cloud Messaging HTTP v1 with a service account; empty project_id = off.
@@ -1230,6 +1231,27 @@ impl Default for FcmConfig {
             private_key_pem: String::new(),
             token_url: "https://oauth2.googleapis.com/token".into(),
             base_url: "https://fcm.googleapis.com".into(),
+        }
+    }
+}
+
+/// Huawei Push Kit (HMS) with an app-level OAuth client; empty app_id = off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HmsConfig {
+    pub app_id: String,
+    pub app_secret: String,
+    pub token_url: String,
+    pub base_url: String,
+}
+
+impl Default for HmsConfig {
+    fn default() -> Self {
+        Self {
+            app_id: String::new(),
+            app_secret: String::new(),
+            token_url: "https://oauth-login.cloud.huawei.com/oauth2/v3/token".into(),
+            base_url: "https://push-api.cloud.huawei.com".into(),
         }
     }
 }

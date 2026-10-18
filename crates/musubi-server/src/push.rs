@@ -21,6 +21,7 @@ pub struct Push {
     db: PgPool,
     http: reqwest::Client,
     fcm_token: Mutex<Option<(String, Instant)>>,
+    hms_token: Mutex<Option<(String, Instant)>>,
     webpush: OnceLock<WebPushKeys>,
 }
 
@@ -47,6 +48,7 @@ impl Push {
                 .build()
                 .expect("reqwest client"),
             fcm_token: Mutex::new(None),
+            hms_token: Mutex::new(None),
             webpush: OnceLock::new(),
         };
         if !p.cfg.webpush.vapid_private_key_pem.is_empty() {
@@ -92,13 +94,14 @@ impl Push {
     pub fn enabled(&self) -> bool {
         !self.cfg.fcm.project_id.is_empty()
             || !self.cfg.apns.key_id.is_empty()
+            || !self.cfg.hms.app_id.is_empty()
             || self.webpush.get().is_some()
     }
 
     pub async fn register(&self, account: AccountId, platform: &str, token: &str) -> Result<()> {
-        if !matches!(platform, "fcm" | "apns" | "webpush") {
+        if !matches!(platform, "fcm" | "apns" | "webpush" | "hms") {
             return Err(Error::InvalidArgument(
-                "platform must be fcm, apns or webpush".into(),
+                "platform must be fcm, apns, webpush or hms".into(),
             ));
         }
         if platform == "webpush" {
@@ -172,6 +175,9 @@ impl Push {
                 }
                 "apns" if !self.cfg.apns.key_id.is_empty() => {
                     self.apns(&token, title, data, code).await
+                }
+                "hms" if !self.cfg.hms.app_id.is_empty() => {
+                    self.hms(&token, title, data, code).await
                 }
                 "webpush" => match self.webpush.get() {
                     Some(k) => self.webpush(k, &token, title, data, code).await,
@@ -269,7 +275,14 @@ impl Push {
             .http
             .post(url)
             .bearer_auth(access)
-            .json(&json!({ "message": { "token": token, "notification": { "title": title }, "data": strings } }))
+            .json(&if silent(data) {
+                json!({ "message": { "token": token, "data": strings,
+                    "android": { "priority": "high" },
+                    "apns": { "headers": { "apns-push-type": "background", "apns-priority": "5" },
+                              "payload": { "aps": { "content-available": 1 } } } } })
+            } else {
+                json!({ "message": { "token": token, "notification": { "title": title }, "data": strings } })
+            })
             .send()
             .await
             .map_err(|e| Error::Internal(format!("fcm send: {e}")))?;
@@ -300,9 +313,16 @@ impl Push {
             .post(url)
             .header("authorization", format!("bearer {jwt}"))
             .header("apns-topic", &c.bundle_id)
-            .header("apns-push-type", "alert")
-            .header("apns-priority", "10")
-            .json(&json!({ "aps": { "alert": { "title": title } }, "code": code, "data": data }))
+            .header(
+                "apns-push-type",
+                if silent(data) { "background" } else { "alert" },
+            )
+            .header("apns-priority", if silent(data) { "5" } else { "10" })
+            .json(&if silent(data) {
+                json!({ "aps": { "content-available": 1 }, "code": code, "data": data })
+            } else {
+                json!({ "aps": { "alert": { "title": title } }, "code": code, "data": data })
+            })
             .send()
             .await
             .map_err(|e| Error::Internal(format!("apns send: {e}")))?;
@@ -319,6 +339,86 @@ impl Push {
         }
         Err(Error::Internal(format!("apns send: {status} {body}")))
     }
+    async fn hms_access_token(&self) -> Result<String> {
+        if let Some((t, until)) = self.hms_token.lock().unwrap().clone() {
+            if Instant::now() < until {
+                return Ok(t);
+            }
+        }
+        let c = &self.cfg.hms;
+        let res = self
+            .http
+            .post(&c.token_url)
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", c.app_id.as_str()),
+                ("client_secret", c.app_secret.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("hms token: {e}")))?;
+        let status = res.status();
+        let v: Value = res.json().await.unwrap_or(Value::Null);
+        let Some(t) = v["access_token"].as_str() else {
+            return Err(Error::Internal(format!("hms token: {status} {v}")));
+        };
+        let ttl = v["expires_in"]
+            .as_u64()
+            .unwrap_or(3600)
+            .saturating_sub(60)
+            .max(60);
+        *self.hms_token.lock().unwrap() = Some((
+            t.to_string(),
+            Instant::now() + std::time::Duration::from_secs(ttl),
+        ));
+        Ok(t.to_string())
+    }
+
+    /// Huawei Push Kit. Ok(false) = token is gone (80300007 / 80200003 illegal token).
+    async fn hms(&self, token: &str, title: &str, data: &Value, code: i32) -> Result<bool> {
+        let access = self.hms_access_token().await?;
+        let mut payload = data.clone();
+        if !payload.is_object() {
+            payload = json!({});
+        }
+        payload["code"] = json!(code);
+        let message = if silent(data) {
+            json!({ "data": payload.to_string(), "token": [token] })
+        } else {
+            json!({
+                "data": payload.to_string(),
+                "notification": { "title": title, "body": data["body"].as_str().unwrap_or("") },
+                "android": { "notification": { "title": title, "body": data["body"].as_str().unwrap_or(""),
+                    "click_action": { "type": 3 } } },
+                "token": [token],
+            })
+        };
+        let url = format!(
+            "{}/v1/{}/messages:send",
+            self.cfg.hms.base_url.trim_end_matches('/'),
+            self.cfg.hms.app_id
+        );
+        let res = self
+            .http
+            .post(url)
+            .bearer_auth(access)
+            .json(&json!({ "validate_only": false, "message": message }))
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("hms send: {e}")))?;
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let rc = v["code"].as_str().unwrap_or("");
+        if status.is_success() && (rc == "80000000" || rc.is_empty()) {
+            return Ok(true);
+        }
+        if matches!(rc, "80300007" | "80200003" | "80100003") || status.as_u16() == 404 {
+            return Ok(false);
+        }
+        Err(Error::Internal(format!("hms send: {status} {body}")))
+    }
+
     /// Ok(false) = subscription is gone (404 / 410).
     async fn webpush(
         &self,
@@ -516,6 +616,12 @@ fn vapid(k: &WebPushKeys, endpoint: &str) -> Result<String> {
         b64.encode(sig.as_ref()),
         b64.encode(&k.public)
     ))
+}
+
+/// `data.silent == true`: deliver as a background/data-only push — no banner, the app wakes
+/// and reads `data` (FCM data message, APNs `content-available`, HMS data message).
+fn silent(data: &Value) -> bool {
+    data.get("silent") == Some(&Value::Bool(true))
 }
 
 #[cfg(test)]
