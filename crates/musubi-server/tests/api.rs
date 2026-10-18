@@ -16676,6 +16676,15 @@ async fn group_challenges_score_standings_and_settle() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "unknown group");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/group_challenges",
+        "defaultkey",
+        Some(json!({"name": "x", "duration_secs": 60, "rewards": {"treasury": {"currency": unique("nocur"), "amount": 5}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "unknown prize currency");
 
     let (st, war) = call_server(&app, "POST", "/v1/server/group_challenges", "defaultkey", Some(json!({
         "name": "Border war", "kind": "war", "metric": "captures", "groups": [ga, gb], "duration_secs": 3600,

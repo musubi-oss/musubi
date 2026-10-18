@@ -167,6 +167,15 @@ async fn create(
             )
             .into());
         }
+        let known: bool =
+            sqlx::query_scalar("select exists(select 1 from musubi.currencies where code = $1)")
+                .bind(&t.currency)
+                .fetch_one(&s.db)
+                .await
+                .map_err(Error::internal)?;
+        if !known {
+            return Err(Error::NotFound(format!("currency {}", t.currency)).into());
+        }
     }
     if !r.groups.is_empty() {
         let known: i64 =
