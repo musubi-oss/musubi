@@ -12783,15 +12783,25 @@ async fn content_bundle_export_import_diff_rollback() {
         find(&v["bundle"], "currencies", "code", &cur)["name"],
         "Bundle Gold"
     );
-    // rollback to v1 restores the name
-    let (st, r) = call_server(
-        &app,
-        "POST",
-        &format!("/v1/admin/content/versions/{v1}/rollback"),
-        k,
-        Some(json!({})),
-    )
-    .await;
+    // rollback to v1 restores the name. The bundle is a snapshot of the whole catalog, so on
+    // the shared test database rows of other tests may be mid-flight: retry a transient
+    // conflict a few times.
+    let mut last = (StatusCode::OK, json!({}));
+    for _ in 0..5 {
+        last = call_server(
+            &app,
+            "POST",
+            &format!("/v1/admin/content/versions/{v1}/rollback"),
+            k,
+            Some(json!({})),
+        )
+        .await;
+        if last.0 == StatusCode::OK {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let (st, r) = last;
     assert_eq!(st, StatusCode::OK, "{r}");
     assert_eq!(r["applied"], true);
     let (_, b) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
