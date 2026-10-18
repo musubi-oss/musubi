@@ -281,7 +281,15 @@ impl Push {
                     "apns": { "headers": { "apns-push-type": "background", "apns-priority": "5" },
                               "payload": { "aps": { "content-available": 1 } } } } })
             } else {
-                json!({ "message": { "token": token, "notification": { "title": title }, "data": strings } })
+                let mut m = json!({ "message": { "token": token, "notification": { "title": title }, "data": strings } });
+                if let Some(l) = link(data) {
+                    if is_http(l) {
+                        m["message"]["webpush"] = json!({ "fcm_options": { "link": l } });
+                    } else {
+                        m["message"]["android"] = json!({ "notification": { "click_action": l } });
+                    }
+                }
+                m
             })
             .send()
             .await
@@ -321,7 +329,15 @@ impl Push {
             .json(&if silent(data) {
                 json!({ "aps": { "content-available": 1 }, "code": code, "data": data })
             } else {
-                json!({ "aps": { "alert": { "title": title } }, "code": code, "data": data })
+                let mut m =
+                    json!({ "aps": { "alert": { "title": title } }, "code": code, "data": data });
+                if let Some(l) = link(data) {
+                    m["link"] = json!(l);
+                    if is_http(l) {
+                        m["aps"]["url-args"] = json!([l]);
+                    }
+                }
+                m
             })
             .send()
             .await
@@ -389,7 +405,11 @@ impl Push {
                 "data": payload.to_string(),
                 "notification": { "title": title, "body": data["body"].as_str().unwrap_or("") },
                 "android": { "notification": { "title": title, "body": data["body"].as_str().unwrap_or(""),
-                    "click_action": { "type": 3 } } },
+                    "click_action": match link(data) {
+                        Some(l) if is_http(l) => json!({ "type": 2, "url": l }),
+                        Some(l) => json!({ "type": 1, "intent": l }),
+                        None => json!({ "type": 3 }),
+                    } } },
                 "token": [token],
             })
         };
@@ -429,7 +449,11 @@ impl Push {
         code: i32,
     ) -> Result<bool> {
         let sub = parse_subscription(token)?;
-        let payload = json!({ "title": title, "code": code, "data": data }).to_string();
+        let mut payload = json!({ "title": title, "code": code, "data": data });
+        if let Some(l) = link(data) {
+            payload["url"] = json!(l);
+        }
+        let payload = payload.to_string();
         if payload.len() > 3_900 {
             return Err(Error::InvalidArgument(
                 "webpush payload must stay under 3900 bytes".into(),
@@ -616,6 +640,22 @@ fn vapid(k: &WebPushKeys, endpoint: &str) -> Result<String> {
         b64.encode(sig.as_ref()),
         b64.encode(&k.public)
     ))
+}
+
+/// `data.link` (or `data.deep_link`): where a tap should land — an `https://` page or an app
+/// scheme / intent (`mygame://shop/offer/7`). FCM: web `fcm_options.link`, otherwise Android
+/// `click_action`; APNs: top-level `link` (+ `url-args` for Safari web pushes); HMS:
+/// `click_action` type 2 (URL) / 1 (intent); Web Push: `url` for the service worker. The raw
+/// value stays in `data` for the app either way.
+fn link(data: &Value) -> Option<&str> {
+    data.get("link")
+        .or_else(|| data.get("deep_link"))
+        .and_then(Value::as_str)
+        .filter(|l| !l.is_empty() && l.len() <= 2048)
+}
+
+fn is_http(l: &str) -> bool {
+    l.starts_with("https://") || l.starts_with("http://")
 }
 
 /// `data.silent == true`: deliver as a background/data-only push — no banner, the app wakes

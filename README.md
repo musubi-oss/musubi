@@ -459,7 +459,7 @@ out zone by zone by the `push_schedule` lease holder every 30 s) — and
 Platforms: `fcm`, `apns`, `webpush` and `hms` (Huawei Push Kit: `[push.hms] app_id/app_secret`,
 app-level OAuth token cached until it expires). `data.silent = true` sends a background push —
 FCM data-only message, APNs `content-available: 1` with `apns-push-type: background`, HMS data
-message — so the app wakes and reads `data` without showing a banner.
+message — so the app wakes and reads `data` without showing a banner. `data.link` (or `data.deep_link`) is where a tap lands — an `https://` page or an app scheme like `mygame://shop/offer/7`: FCM `fcm_options.link` / Android `click_action`, APNs top-level `link` (+ `url-args`), HMS `click_action` URL/intent, Web Push `url`; templates can build it (`"link": "mygame://quest/{{id}}"`).
 
 ### Chat: typing, attachments, automod
 

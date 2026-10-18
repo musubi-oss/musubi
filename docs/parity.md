@@ -53,7 +53,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Присутствие / статус | ✅ hub + шина (`online_remote`) | ✅ | ✅ | ❌ | ✅ |
 | Пати, лобби, ready, команды | ✅ parties (home-node) + `/v1/lobbies` | ✅ | ✅ | ✅ | ✅ |
 | Уведомления in-app | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Push FCM / APNs / Huawei, тихие пуши | ✅ `push.rs` (`fcm`/`apns`/`hms`, `data.silent`) | ❌ | ❌ | ✅ | ❌ |
+| Push FCM / APNs / Huawei, тихие пуши, deep links | ✅ `push.rs` (`fcm`/`apns`/`hms`, `data.silent`, `data.link`) | ❌ | ❌ | ✅ | ❌ |
 | WebPush | ✅ `push.rs`: RFC 8030/8291 aes128gcm + VAPID, `platform: webpush` в `/v1/account/push_tokens` | ❌ | ❌ | ❌ | ❌ |
 | UGC (моды, карты, скины) | ✅ `/v1/ugc`: реестр с версиями, blob ≤ 16 MiB или URL, теги/поиск/сортировка, рейтинг, подписки, модерация draft→pending→approved/rejected/hidden | ❌ | ❌ | ✅ | ✅ |
 | GDPR export / delete с retention | ✅ | ✅ | ✅ | ✅ | ✅ |

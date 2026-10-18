@@ -17460,7 +17460,12 @@ async fn hms_push_provider_and_silent_pushes() {
     assert!(push.register(acc, "nope", "x").await.is_err());
     // loud push: notification + data, token fetched once
     let n = push
-        .send(acc, "Hello", &json!({"body": "world", "k": "v"}), 7)
+        .send(
+            acc,
+            "Hello",
+            &json!({"body": "world", "k": "v", "link": "https://shop.example/offer/7"}),
+            7,
+        )
         .await
         .unwrap();
     assert_eq!(n, 1, "dead token is dropped, live one delivered");
@@ -17479,6 +17484,11 @@ async fn hms_push_provider_and_silent_pushes() {
             .unwrap();
         assert_eq!(live["auth"], "Bearer hms-at");
         assert_eq!(live["body"]["message"]["notification"]["title"], "Hello");
+        assert_eq!(
+            live["body"]["message"]["android"]["notification"]["click_action"],
+            json!({"type": 2, "url": "https://shop.example/offer/7"}),
+            "deep link opens the URL"
+        );
         let data: Value =
             serde_json::from_str(live["body"]["message"]["data"].as_str().unwrap()).unwrap();
         assert_eq!(data["k"], "v");
