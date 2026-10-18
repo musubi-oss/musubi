@@ -61,6 +61,12 @@ enum Wire {
     },
     /// Leader: a ready-check ran out; confirmed tickets come back, dodgers are penalised.
     MmReadyExpired(ReadyExpiredWire),
+    /// A running match freed `slots` (a member left, the game server asked for more) or ended
+    /// (`None`); only the leader's backfill pool acts.
+    MmRelease {
+        match_id: String,
+        slots: Option<usize>,
+    },
     Session {
         session_id: SessionId,
         msg: ServerMessage,
@@ -650,6 +656,18 @@ impl Fanout {
 
     /// The bus does not echo to the publisher, so every matchmaker message is handled here first
     /// and then sent to the other nodes.
+    /// A running match wants players again (`Some(n)`) or ended (`None`): the leader's backfill
+    /// pool learns of it wherever the member left or the request came in.
+    pub fn mm_release(&self, match_id: &str, slots: Option<usize>) {
+        if self.is_leader() {
+            self.mm.release_slots(match_id, slots);
+        }
+        self.publish(Wire::MmRelease {
+            match_id: match_id.to_string(),
+            slots,
+        });
+    }
+
     pub fn mm_ready(&self, ticket: &str, session: SessionId) {
         self.handle_ready(ticket, session);
         self.publish(Wire::MmReady {
@@ -835,6 +853,11 @@ impl Fanout {
             }
             Wire::MmReadyCheck(w) => self.handle_ready_check(&w),
             Wire::MmReady { ticket, session } => self.handle_ready(&ticket, session),
+            Wire::MmRelease { match_id, slots } => {
+                if self.is_leader() {
+                    self.mm.release_slots(&match_id, slots);
+                }
+            }
             Wire::MmReadyExpired(w) => self.handle_ready_expired(&w),
             Wire::MmMatched(w) => {
                 let match_id = w.match_id.clone();

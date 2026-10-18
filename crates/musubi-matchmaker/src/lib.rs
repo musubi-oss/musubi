@@ -484,7 +484,34 @@ impl Matchmaker {
     }
 
     pub fn open_count(&self) -> usize {
-        self.pool.lock().open.len()
+        self.pool
+            .lock()
+            .open
+            .iter()
+            .filter(|o| o.size < o.max)
+            .count()
+    }
+
+    /// A running match wants players again: `Some(n)` frees `n` slots (a member left, or the game
+    /// server asked for more) and restarts the backfill window; `None` closes the match for good
+    /// (it ended). Unknown matches — formed before this leader, or not by the matchmaker — are
+    /// ignored. Returns whether the match was known.
+    pub fn release_slots(&self, match_id: &str, slots: Option<usize>) -> bool {
+        let mut pool = self.pool.lock();
+        let Some(k) = pool.open.iter().position(|o| o.match_id == match_id) else {
+            return false;
+        };
+        match slots {
+            None => {
+                pool.open.remove(k);
+            }
+            Some(n) => {
+                let o = &mut pool.open[k];
+                o.size = o.size.saturating_sub(n);
+                o.created = Instant::now();
+            }
+        }
+        true
     }
 
     /// Send waiting tickets into open matches they are compatible with (every member already there
@@ -496,9 +523,10 @@ impl Matchmaker {
         };
         let now = Instant::now();
         let mut pool = self.pool.lock();
-        pool.open
-            .retain(|o| o.size < o.max && now.duration_since(o.created) < ttl);
-        if pool.open.is_empty() {
+        // full matches stay remembered until the ttl runs out: a leaver (or the game server)
+        // may release slots in them, see `release_slots`
+        pool.open.retain(|o| now.duration_since(o.created) < ttl);
+        if pool.open.iter().all(|o| o.size >= o.max) {
             return vec![];
         }
         let mut out = Vec::new();
@@ -507,7 +535,8 @@ impl Matchmaker {
             let t = pool.tickets[i].clone();
             let n = t.members.len();
             let slot = pool.open.iter().position(|o| {
-                o.size + n <= o.max
+                o.size < o.max
+                    && o.size + n <= o.max
                     && (o.size + n) % t.count_multiple == 0
                     && o.size + n >= t.min_count
                     && o.size + n <= t.max_count
@@ -1154,7 +1183,22 @@ mod tests {
         mm.add(ticket(vec![cand("eu", 13.0)], "+region:eu", 2, 3))
             .unwrap();
         assert!(mm.process_backfill().is_empty());
-        assert_eq!(mm.open_count(), 0, "full matches are dropped");
+        assert_eq!(mm.open_count(), 0, "a full match takes nobody");
+        // a member leaves the running match: the slot is offered again and the waiting eu ticket
+        // takes it; the game server closing the match ends backfill for good
+        assert!(mm.release_slots("match-1", Some(1)));
+        assert_eq!(mm.open_count(), 1);
+        let b = mm.process_backfill();
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!(b[0].1, "match-1");
+        assert!(mm.release_slots("match-1", None));
+        assert!(
+            !mm.release_slots("match-1", Some(1)),
+            "closed matches are forgotten"
+        );
+        mm.add(ticket(vec![cand("eu", 14.0)], "+region:eu", 2, 3))
+            .unwrap();
+        assert!(mm.process_backfill().is_empty());
 
         let off = Matchmaker::new(Duration::from_millis(0));
         off.register_open("x", &m[0]);

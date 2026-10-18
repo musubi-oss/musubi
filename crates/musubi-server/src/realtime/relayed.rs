@@ -102,6 +102,11 @@ impl RelayedRegistry {
         format!("{}.{}", MatchId::new(), self.node_id)
     }
 
+    /// Was `match_id` formed by the matchmaker (and is it still running here)?
+    pub fn token_match_known(&self, match_id: &str) -> bool {
+        self.by_token.iter().any(|e| e.value() == match_id)
+    }
+
     pub fn token_match(&self, token: &str) -> Option<String> {
         self.by_token.get(token).map(|v| v.clone())
     }
@@ -224,9 +229,17 @@ impl RelayedRegistry {
             }
         }
         drop(m);
+        // a match the matchmaker formed gets the seat offered to waiting tickets again (or is
+        // closed for backfill once nobody is left)
+        let formed = self.by_token.iter().any(|e| e.value() == match_id);
         if empty {
             self.matches.remove(match_id);
             self.by_token.retain(|_, v| v != match_id);
+            if formed {
+                fanout.mm_release(match_id, None);
+            }
+        } else if formed {
+            fanout.mm_release(match_id, Some(1));
         }
         Ok(())
     }

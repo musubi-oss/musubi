@@ -13,6 +13,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/matches", get(list))
         .route("/v1/server/matches", post(create))
         .route("/v1/server/matches/{id}", get(get_one).delete(terminate))
+        .route("/v1/server/matches/{id}/backfill", post(backfill))
         .route("/v1/matches/{id}/replay", get(replay))
         .route(
             "/v1/server/matches/{id}/replay",
@@ -102,6 +103,31 @@ async fn terminate(
         .ok_or_else(|| musubi_core::Error::NotFound("match".into()))?;
     h.terminate(0);
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+struct BackfillReq {
+    /// Seats to offer to waiting matchmaker tickets (`0` closes the match for backfill).
+    slots: usize,
+}
+
+/// `POST /v1/server/matches/{id}/backfill {slots}` — a running match formed by the matchmaker
+/// asks for `slots` more players (members dropped, a bot seat opened): compatible waiting tickets
+/// join it with the original token. `slots: 0` ends backfill for the match. Matches the
+/// matchmaker did not form, or formed before the current leader, are not re-opened.
+async fn backfill(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(req): Json<BackfillReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let known = s.relayed.token_match_known(&id);
+    if !known {
+        return Err(musubi_core::Error::NotFound("match formed by the matchmaker".into()).into());
+    }
+    s.fanout
+        .mm_release(&id, (req.slots > 0).then_some(req.slots));
+    Ok(Json(json!({ "ok": true, "slots": req.slots })))
 }
 
 /// Replay of a recorded match (`params.record = true` at creation): the recording header and
