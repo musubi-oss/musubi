@@ -849,6 +849,64 @@ pub struct IapConfig {
     pub xbox: ConsoleStoreConfig,
     pub nintendo: ConsoleStoreConfig,
     pub epic: ConsoleStoreConfig,
+    pub huawei: HuaweiIapConfig,
+    pub samsung: SamsungIapConfig,
+}
+
+/// Huawei AppGallery IAP (Order Service). Enabled when `app_id` is set; the client sends the
+/// `purchase_token` it got from the IAP SDK, the server verifies it with an app-level OAuth token
+/// and (for consumables) confirms delivery so the token cannot be redeemed twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HuaweiIapConfig {
+    /// Order Service site for your region (`orders-dre`, `orders-drru`, `orders-dra`…).
+    pub url: String,
+    /// Subscription Service site.
+    pub sub_url: String,
+    pub token_url: String,
+    pub app_id: String,
+    pub app_secret: String,
+    /// Confirm consumables server-to-server after granting (default true).
+    pub confirm: bool,
+}
+
+impl Default for HuaweiIapConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://orders-drcn.iap.cloud.huawei.com.cn".into(),
+            sub_url: "https://subscr-drcn.iap.cloud.huawei.com.cn".into(),
+            token_url: "https://oauth-login.cloud.huawei.com/oauth2/v3/token".into(),
+            app_id: String::new(),
+            app_secret: String::new(),
+            confirm: true,
+        }
+    }
+}
+
+/// Samsung Galaxy Store IAP. Enabled when `private_key_pem_path` is set: a Galaxy Store
+/// Developer API service account (id + RSA key) signs a JWT for an access token, receipts are
+/// verified with `GET /iap/v6/receipt?purchaseID=`. `acknowledge_path` (empty = off) is POSTed
+/// with `{purchaseID}` after a consumable is granted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SamsungIapConfig {
+    pub url: String,
+    pub token_url: String,
+    pub service_account_id: String,
+    pub private_key_pem_path: String,
+    pub acknowledge_path: String,
+}
+
+impl Default for SamsungIapConfig {
+    fn default() -> Self {
+        Self {
+            url: "https://iap.samsungapps.com".into(),
+            token_url: "https://devapi.samsungapps.com/auth/accessToken".into(),
+            service_account_id: String::new(),
+            private_key_pem_path: String::new(),
+            acknowledge_path: String::new(),
+        }
+    }
 }
 
 /// Console / launcher store with server-to-server entitlement lookup (PSN Entitlement Web API,

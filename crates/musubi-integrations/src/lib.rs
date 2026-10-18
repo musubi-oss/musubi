@@ -12,7 +12,10 @@ pub mod email;
 pub mod iap;
 pub use console::{ConsolePlatform, ConsoleStoreClient, Entitlement};
 pub use email::{Mail, Mailer};
-pub use iap::{AppleStoreClient, GooglePlayClient, SteamClient, SteamInitTxn, StoreTransaction};
+pub use iap::{
+    AppleStoreClient, GooglePlayClient, HuaweiIapClient, SamsungIapClient, SteamClient,
+    SteamInitTxn, StoreTransaction,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;

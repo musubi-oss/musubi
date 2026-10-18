@@ -109,10 +109,18 @@ impl EconomyService {
     pub async fn upsert_iap_product(&self, p: IapProduct) -> Result<IapProduct> {
         if !matches!(
             p.provider.as_str(),
-            "apple" | "google" | "steam" | "psn" | "xbox" | "nintendo" | "epic"
+            "apple"
+                | "google"
+                | "steam"
+                | "psn"
+                | "xbox"
+                | "nintendo"
+                | "epic"
+                | "huawei"
+                | "samsung"
         ) {
             return Err(Error::InvalidArgument(
-                "provider: apple|google|steam|psn|xbox|nintendo|epic".into(),
+                "provider: apple|google|steam|psn|xbox|nintendo|epic|huawei|samsung".into(),
             ));
         }
         if p.product_id.is_empty() || p.product_id.len() > 128 {

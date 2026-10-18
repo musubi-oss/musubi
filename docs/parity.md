@@ -74,7 +74,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Крафт | ✅ рецепты `PUT /v1/server/crafting/recipes` (входы: предметы/валюта; выходы: предметы/валюта/таблицы наград; requires_item, max_batch, лимит на аккаунт), `POST /v1/crafting/craft` атомарно + идемпотентно, под limited grants | ✅ | Hiro | ❌ | ❌ |
 | Гача с pity и публичным seed (commit-reveal) | ✅ | ❌ | Hiro | ❌ | ❌ |
 | Аукционы, P2P-трейд, ордербук | ✅ | ❌ | ❌ | ❌ | ❌ |
-| IAP: Apple / Google / Steam, уведомления, отзыв | ✅ `iap.rs` | ✅ | ✅ | ✅ | ✅ |
+| IAP: Apple / Google / Steam, уведомления, отзыв + Huawei / Samsung | ✅ `iap.rs` (`POST /v1/iap/{huawei|samsung}` по токену покупки) | ✅ | ✅ | ✅ | ✅ |
 | IAP: PSN / Xbox / Nintendo / Epic | ✅ `POST /v1/iap/{platform}`: s2s entitlement lookup + consume, `[iap.<platform>]` с переопределяемыми путями | ✅ | ❌ | ✅ | ✅ |
 | Подписки с продлением / grace | ✅ `iap_products.kind = subscription` + `grace_secs`, продление по чеку и Apple V2 / Google RTDN, `GET /v1/iap/subscriptions` | 🟡 | ✅ | ✅ | ✅ |
 | Entitlements: платформенные покупки / DLC → предметы | ✅ `/v1/entitlements` (+`/sync` по Steam-ownership), серверный каталог/grant/revoke | ✅ | ❌ | ✅ | ✅ |

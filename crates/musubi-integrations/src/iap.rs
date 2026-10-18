@@ -397,6 +397,380 @@ impl GooglePlayClient {
     }
 }
 
+/// Huawei AppGallery Order Service: `purchase_token` from the client → verified purchase.
+pub struct HuaweiIapClient {
+    http: reqwest::Client,
+    url: String,
+    sub_url: String,
+    token_url: String,
+    app_id: String,
+    app_secret: String,
+    confirm: bool,
+    token: Mutex<Option<(String, Instant)>>,
+}
+
+impl HuaweiIapClient {
+    pub fn new(
+        url: &str,
+        sub_url: &str,
+        token_url: &str,
+        app_id: &str,
+        app_secret: &str,
+        confirm: bool,
+    ) -> Result<Arc<Self>> {
+        if app_id.is_empty() || app_secret.is_empty() {
+            return Err(Error::InvalidArgument(
+                "huawei: app_id and app_secret are required".into(),
+            ));
+        }
+        Ok(Arc::new(Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(Error::internal)?,
+            url: url.trim_end_matches('/').to_string(),
+            sub_url: sub_url.trim_end_matches('/').to_string(),
+            token_url: token_url.into(),
+            app_id: app_id.into(),
+            app_secret: app_secret.into(),
+            confirm,
+            token: Mutex::new(None),
+        }))
+    }
+
+    /// App-level access token (client credentials), cached until shortly before expiry.
+    async fn access_token(&self) -> Result<String> {
+        if let Some((t, exp)) = self.token.lock().await.as_ref() {
+            if Instant::now() < *exp {
+                return Ok(t.clone());
+            }
+        }
+        let res = self
+            .http
+            .post(&self.token_url)
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", self.app_id.as_str()),
+                ("client_secret", self.app_secret.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("huawei token: {e}")))?;
+        if !res.status().is_success() {
+            return Err(Error::Internal(format!(
+                "huawei: token endpoint status {}",
+                res.status()
+            )));
+        }
+        let v: Value = res.json().await.map_err(Error::internal)?;
+        let Some(t) = v["access_token"].as_str() else {
+            return Err(Error::Internal(
+                "huawei: token response without access_token".into(),
+            ));
+        };
+        let ttl = v["expires_in"]
+            .as_u64()
+            .unwrap_or(3600)
+            .saturating_sub(60)
+            .max(30);
+        *self.token.lock().await = Some((t.to_string(), Instant::now() + Duration::from_secs(ttl)));
+        Ok(t.to_string())
+    }
+
+    fn auth_header(token: &str) -> String {
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("APPAT:{token}"))
+        )
+    }
+
+    async fn call(&self, url: String, body: Value) -> Result<Value> {
+        let token = self.access_token().await?;
+        let res = self
+            .http
+            .post(url)
+            .header("Authorization", Self::auth_header(&token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("huawei: {e}")))?;
+        let status = res.status().as_u16();
+        let v: Value = res.json().await.unwrap_or(Value::Null);
+        match status {
+            200 => {}
+            401 | 403 => {
+                return Err(Error::Internal(
+                    "huawei: rejected server credentials".into(),
+                ))
+            }
+            s => return Err(Error::Unavailable(format!("huawei: status {s}"))),
+        }
+        let code = v["responseCode"].as_str().unwrap_or("");
+        match code {
+            "0" => Ok(v),
+            // 6: purchase token invalid or already consumed (Order Service codes)
+            "6" | "8" => Err(Error::NotFound("huawei purchase".into())),
+            c => Err(Error::Unavailable(format!(
+                "huawei: responseCode {c} {}",
+                v["responseMessage"].as_str().unwrap_or("")
+            ))),
+        }
+    }
+
+    /// Verify a purchase token; `subscription` routes to the Subscription Service.
+    pub async fn purchase(
+        &self,
+        product_id: &str,
+        purchase_token: &str,
+        subscription: bool,
+    ) -> Result<StoreTransaction> {
+        if product_id.is_empty() || purchase_token.is_empty() || purchase_token.len() > 2048 {
+            return Err(Error::InvalidArgument("product_id / purchase_token".into()));
+        }
+        let v = if subscription {
+            self.call(
+                format!("{}/sub/applications/v2/purchases/get", self.sub_url),
+                json!({ "purchaseToken": purchase_token, "subscriptionId": product_id }),
+            )
+            .await?
+        } else {
+            self.call(
+                format!("{}/applications/purchases/tokens/verify", self.url),
+                json!({ "purchaseToken": purchase_token, "productId": product_id }),
+            )
+            .await?
+        };
+        let data_str = v["purchaseTokenData"]
+            .as_str()
+            .or_else(|| v["inAppPurchaseData"].as_str())
+            .unwrap_or("{}");
+        let d: Value = serde_json::from_str(data_str).unwrap_or(Value::Null);
+        if d["productId"].as_str().is_some_and(|p| p != product_id) {
+            return Err(Error::InvalidArgument(
+                "product_id does not match the purchase".into(),
+            ));
+        }
+        let state = d["purchaseState"].as_i64().unwrap_or(-1);
+        if state != 0 {
+            return Err(Error::PermissionDenied(format!(
+                "huawei: purchase not completed (state {state})"
+            )));
+        }
+        let order_id = d["orderId"].as_str().unwrap_or(purchase_token).to_string();
+        Ok(StoreTransaction {
+            provider: "huawei".into(),
+            transaction_id: order_id,
+            product_id: product_id.into(),
+            environment: if d["purchaseType"].as_i64() == Some(0) {
+                "Test".into()
+            } else {
+                "Production".into()
+            },
+            purchased_at_ms: d["purchaseTime"].as_i64().unwrap_or(0),
+            quantity: d["quantity"].as_i64().unwrap_or(1).max(1),
+            original_transaction_id: d["subscriptionId"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| Some(purchase_token.to_string())),
+            expires_at_ms: d["expirationDate"].as_i64(),
+            raw: {
+                let mut d = d;
+                d["purchaseToken"] = json!(purchase_token);
+                d
+            },
+        })
+    }
+
+    /// Confirm delivery of a consumable (no-op when `confirm = false`).
+    pub async fn confirm(&self, product_id: &str, purchase_token: &str) -> Result<()> {
+        if !self.confirm {
+            return Ok(());
+        }
+        self.call(
+            format!("{}/applications/v2/purchases/confirm", self.url),
+            json!({ "purchaseToken": purchase_token, "productId": product_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// Samsung Galaxy Store IAP v6: `purchase_id` from the client → verified receipt.
+pub struct SamsungIapClient {
+    http: reqwest::Client,
+    url: String,
+    token_url: String,
+    service_account_id: String,
+    acknowledge_path: String,
+    key: EncodingKey,
+    token: Mutex<Option<(String, Instant)>>,
+}
+
+impl SamsungIapClient {
+    pub fn new(
+        url: &str,
+        token_url: &str,
+        service_account_id: &str,
+        private_key_pem: &str,
+        acknowledge_path: &str,
+    ) -> Result<Arc<Self>> {
+        if service_account_id.is_empty() {
+            return Err(Error::InvalidArgument(
+                "samsung: service_account_id is required".into(),
+            ));
+        }
+        let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+            .map_err(|e| Error::InvalidArgument(format!("samsung private key: {e}")))?;
+        Ok(Arc::new(Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(Error::internal)?,
+            url: url.trim_end_matches('/').to_string(),
+            token_url: token_url.into(),
+            service_account_id: service_account_id.into(),
+            acknowledge_path: acknowledge_path.into(),
+            key,
+            token: Mutex::new(None),
+        }))
+    }
+
+    /// Galaxy Store Developer API access token from a service-account JWT, cached.
+    async fn access_token(&self) -> Result<String> {
+        if let Some((t, exp)) = self.token.lock().await.as_ref() {
+            if Instant::now() < *exp {
+                return Ok(t.clone());
+            }
+        }
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let claims = json!({
+            "iss": self.service_account_id, "scopes": ["publishing", "gss"],
+            "iat": now, "exp": now + 1200,
+        });
+        let jwt = jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.key)
+            .map_err(Error::internal)?;
+        let res = self
+            .http
+            .post(&self.token_url)
+            .bearer_auth(jwt)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("samsung token: {e}")))?;
+        if !res.status().is_success() {
+            return Err(Error::Internal(format!(
+                "samsung: token endpoint status {}",
+                res.status()
+            )));
+        }
+        let v: Value = res.json().await.map_err(Error::internal)?;
+        let Some(t) = v["createdItem"]["accessToken"]
+            .as_str()
+            .or_else(|| v["accessToken"].as_str())
+        else {
+            return Err(Error::Internal(
+                "samsung: token response without accessToken".into(),
+            ));
+        };
+        *self.token.lock().await = Some((
+            t.to_string(),
+            Instant::now() + Duration::from_secs(1200 - 60),
+        ));
+        Ok(t.to_string())
+    }
+
+    pub async fn purchase(&self, product_id: &str, purchase_id: &str) -> Result<StoreTransaction> {
+        if product_id.is_empty() || purchase_id.is_empty() || purchase_id.len() > 1024 {
+            return Err(Error::InvalidArgument("product_id / purchase_id".into()));
+        }
+        let token = self.access_token().await?;
+        let res = self
+            .http
+            .get(format!("{}/iap/v6/receipt", self.url))
+            .query(&[("purchaseID", purchase_id)])
+            .bearer_auth(token)
+            .header("service-account-id", &self.service_account_id)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("samsung: {e}")))?;
+        match res.status().as_u16() {
+            200 => {}
+            400 | 404 => return Err(Error::NotFound("samsung purchase".into())),
+            401 | 403 => {
+                return Err(Error::Internal(
+                    "samsung: rejected server credentials".into(),
+                ))
+            }
+            s => return Err(Error::Unavailable(format!("samsung: status {s}"))),
+        }
+        let v: Value = res.json().await.map_err(Error::internal)?;
+        let status = v["status"].as_str().unwrap_or("");
+        if status != "success" {
+            return Err(Error::PermissionDenied(format!(
+                "samsung: purchase not completed (status {status:?})"
+            )));
+        }
+        if v["itemId"].as_str().is_some_and(|p| p != product_id) {
+            return Err(Error::InvalidArgument(
+                "product_id does not match the purchase".into(),
+            ));
+        }
+        let purchased_at_ms = v["purchaseDate"]
+            .as_str()
+            .and_then(|s| {
+                let f = time::macros::format_description!(
+                    "[year]-[month]-[day] [hour]:[minute]:[second]"
+                );
+                time::PrimitiveDateTime::parse(s, &f).ok()
+            })
+            .map(|t| t.assume_utc().unix_timestamp() * 1000)
+            .unwrap_or(0);
+        Ok(StoreTransaction {
+            provider: "samsung".into(),
+            transaction_id: v["paymentId"]
+                .as_str()
+                .or_else(|| v["orderId"].as_str())
+                .unwrap_or(purchase_id)
+                .to_string(),
+            product_id: product_id.into(),
+            environment: if v["mode"].as_str() == Some("TEST") {
+                "Test".into()
+            } else {
+                "Production".into()
+            },
+            purchased_at_ms,
+            quantity: 1,
+            original_transaction_id: Some(purchase_id.to_string()),
+            expires_at_ms: None,
+            raw: v,
+        })
+    }
+
+    /// Acknowledge a consumable (no-op without `acknowledge_path`).
+    pub async fn acknowledge(&self, purchase_id: &str) -> Result<()> {
+        if self.acknowledge_path.is_empty() {
+            return Ok(());
+        }
+        let token = self.access_token().await?;
+        let res = self
+            .http
+            .post(format!("{}{}", self.url, self.acknowledge_path))
+            .bearer_auth(token)
+            .header("service-account-id", &self.service_account_id)
+            .json(&json!({ "purchaseID": purchase_id }))
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("samsung: {e}")))?;
+        if !res.status().is_success() {
+            return Err(Error::Unavailable(format!(
+                "samsung: acknowledge status {}",
+                res.status()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Apple Root CA - G3 (DER), the trust anchor for App Store Server API signed payloads.
 pub const APPLE_ROOT_CA_G3: &[u8] = include_bytes!("../certs/AppleRootCA-G3.der");
 /// Extension Apple places on App Store receipt/transaction signing certificates.

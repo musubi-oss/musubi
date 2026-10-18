@@ -71,6 +71,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/streaks", get(streak_defs).post(upsert_streak))
         .route("/v1/iap/apple", post(iap_apple))
         .route("/v1/iap/google", post(iap_google))
+        .route("/v1/iap/huawei", post(iap_huawei))
+        .route("/v1/iap/samsung", post(iap_samsung))
         .route("/v1/iap/{platform}", post(iap_console))
         .route("/v1/server/economy/fraud/flags", get(fraud_flags))
         .route(
@@ -1044,6 +1046,88 @@ async fn iap_apple(
             "iap.redeemed",
             Some(me.account_id),
             json!({ "provider": "apple" }),
+        )
+        .await;
+    Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct HuaweiReq {
+    product_id: String,
+    purchase_token: String,
+}
+
+/// Huawei AppGallery: verify the SDK's purchase token, grant, confirm consumables.
+async fn iap_huawei(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<HuaweiReq>,
+) -> Result<Json<Value>, ApiError> {
+    s.age.check(me.account_id, "purchases")?;
+    crate::fraud::check_iap(&s, me.account_id).await?;
+    let Some(c) = &s.huawei_iap else {
+        return Err(Error::NotFound("huawei iap is not configured".into()).into());
+    };
+    let kind = s
+        .economy
+        .iap_product("huawei", &r.product_id)
+        .await?
+        .map(|p| p.kind)
+        .unwrap_or_default();
+    let t = c
+        .purchase(&r.product_id, &r.purchase_token, kind == "subscription")
+        .await?;
+    let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
+    if kind == "consumable" && !rc.replayed {
+        if let Err(e) = c.confirm(&r.product_id, &r.purchase_token).await {
+            tracing::warn!(error = %e, "huawei: confirm failed; the token will verify as unconfirmed");
+        }
+    }
+    s.events
+        .emit(
+            "iap.redeemed",
+            Some(me.account_id),
+            json!({ "provider": "huawei" }),
+        )
+        .await;
+    Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct SamsungReq {
+    product_id: String,
+    purchase_id: String,
+}
+
+/// Samsung Galaxy Store: verify the receipt by purchase id, grant, acknowledge consumables.
+async fn iap_samsung(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(r): Json<SamsungReq>,
+) -> Result<Json<Value>, ApiError> {
+    s.age.check(me.account_id, "purchases")?;
+    crate::fraud::check_iap(&s, me.account_id).await?;
+    let Some(c) = &s.samsung_iap else {
+        return Err(Error::NotFound("samsung iap is not configured".into()).into());
+    };
+    let kind = s
+        .economy
+        .iap_product("samsung", &r.product_id)
+        .await?
+        .map(|p| p.kind)
+        .unwrap_or_default();
+    let t = c.purchase(&r.product_id, &r.purchase_id).await?;
+    let rc = s.economy.redeem(me.account_id, receipt_input(t)).await?;
+    if kind == "consumable" && !rc.replayed {
+        if let Err(e) = c.acknowledge(&r.purchase_id).await {
+            tracing::warn!(error = %e, "samsung: acknowledge failed");
+        }
+    }
+    s.events
+        .emit(
+            "iap.redeemed",
+            Some(me.account_id),
+            json!({ "provider": "samsung" }),
         )
         .await;
     Ok(Json(serde_json::to_value(rc).map_err(Error::internal)?))

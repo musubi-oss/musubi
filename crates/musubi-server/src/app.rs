@@ -63,6 +63,8 @@ pub struct AppStateInner {
     pub rtc: Option<Arc<musubi_transport::webrtc::RtcServer>>,
     pub apple_iap: Option<Arc<musubi_integrations::AppleStoreClient>>,
     pub google_iap: Option<Arc<musubi_integrations::GooglePlayClient>>,
+    pub huawei_iap: Option<Arc<musubi_integrations::HuaweiIapClient>>,
+    pub samsung_iap: Option<Arc<musubi_integrations::SamsungIapClient>>,
     pub steam_iap: Option<Arc<musubi_integrations::SteamClient>>,
     pub console_iap:
         std::collections::HashMap<&'static str, Arc<musubi_integrations::ConsoleStoreClient>>,
@@ -529,6 +531,33 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             }
         }
     };
+    let huawei_iap = if cfg.iap.huawei.app_id.is_empty() {
+        None
+    } else {
+        match musubi_integrations::HuaweiIapClient::new(
+            &cfg.iap.huawei.url,
+            &cfg.iap.huawei.sub_url,
+            &cfg.iap.huawei.token_url,
+            &cfg.iap.huawei.app_id,
+            &cfg.iap.huawei.app_secret,
+            cfg.iap.huawei.confirm,
+        ) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(provider = "huawei", error = %e, "iap provider disabled");
+                None
+            }
+        }
+    };
+    let samsung_iap = iap_client("samsung", &cfg.iap.samsung.private_key_pem_path, |pem| {
+        musubi_integrations::SamsungIapClient::new(
+            &cfg.iap.samsung.url,
+            &cfg.iap.samsung.token_url,
+            &cfg.iap.samsung.service_account_id,
+            pem,
+            &cfg.iap.samsung.acknowledge_path,
+        )
+    });
     let mut console_iap = std::collections::HashMap::new();
     for p in musubi_integrations::ConsolePlatform::ALL {
         let c = match p {
@@ -634,6 +663,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         rtc,
         apple_iap,
         google_iap,
+        huawei_iap,
+        samsung_iap,
         steam_iap,
         console_iap,
         runtime,

@@ -190,6 +190,8 @@ async fn build_state_cfg_with(
         rtc: None,
         apple_iap: None,
         google_iap: None,
+        huawei_iap: None,
+        samsung_iap: None,
         console_iap: Default::default(),
         steam_iap: None,
         runtime: runtime.clone(),
@@ -17944,4 +17946,227 @@ async fn friend_suggestions_rank_platform_groups_and_recent() {
     let s = v["suggestions"].as_array().unwrap();
     assert_eq!(s.len(), 1, "{v}");
     assert_eq!(s[0]["user"]["id"], acc_b);
+}
+
+/// Huawei and Samsung purchases: token verified against the store, catalog grant once per order,
+/// consumables confirmed / acknowledged server-to-server.
+#[tokio::test]
+async fn iap_huawei_and_samsung_receipts_redeem_once() {
+    use axum::routing::{get, post};
+    use axum::Json;
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let product = format!("gems_{suffix}");
+    let confirms: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let acks: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let (c1, a1, p1, p2) = (
+        confirms.clone(),
+        acks.clone(),
+        product.clone(),
+        product.clone(),
+    );
+    let mock = axum::Router::new()
+        .route("/oauth2/v3/token", post(|body: String| async move {
+            assert!(body.contains("grant_type=client_credentials") && body.contains("client_id=HWAPP") && body.contains("client_secret=HWSECRET"), "{body}");
+            Json(json!({"access_token": "hwtok", "expires_in": 3600}))
+        }))
+        .route("/applications/purchases/tokens/verify", post(move |headers: axum::http::HeaderMap, Json(b): Json<Value>| async move {
+            assert_eq!(headers.get("authorization").unwrap(), "Basic QVBQQVQ6aHd0b2s=");
+            let tok = b["purchaseToken"].as_str().unwrap().to_string();
+            if tok == "bad" {
+                return Json(json!({"responseCode": "6", "responseMessage": "invalid token"}));
+            }
+            let data = json!({"purchaseState": if tok == "pending" { -1 } else { 0 }, "orderId": format!("hw-{tok}"),
+                "productId": p2, "purchaseTime": 1700000000000i64, "purchaseType": 0, "kind": 0, "quantity": 1});
+            Json(json!({"responseCode": "0", "purchaseTokenData": data.to_string()}))
+        }))
+        .route("/applications/v2/purchases/confirm", post(move |Json(b): Json<Value>| async move {
+            c1.lock().unwrap().push(b["purchaseToken"].as_str().unwrap().to_string());
+            Json(json!({"responseCode": "0"}))
+        }))
+        .route("/auth/accessToken", post(|headers: axum::http::HeaderMap| async move {
+            assert!(headers.get("authorization").unwrap().to_str().unwrap().starts_with("Bearer ey"));
+            Json(json!({"createdItem": {"accessToken": "sstok"}}))
+        }))
+        .route("/iap/v6/receipt", get(move |headers: axum::http::HeaderMap, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer sstok");
+            assert_eq!(headers.get("service-account-id").unwrap(), "SA1");
+            let id = q["purchaseID"].clone();
+            if id == "missing" {
+                return (axum::http::StatusCode::NOT_FOUND, Json(json!({"status": "fail"})));
+            }
+            (axum::http::StatusCode::OK, Json(json!({"status": "success", "itemId": p1, "paymentId": format!("ss-{id}"), "orderId": format!("o-{id}"),
+                "purchaseDate": "2024-01-02 03:04:05", "mode": "TEST"})))
+        }))
+        .route("/iap/v6/acknowledge", post(move |Json(b): Json<Value>| async move {
+            a1.lock().unwrap().push(b["purchaseID"].as_str().unwrap().to_string());
+            Json(json!({"status": "success"}))
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let pem = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/google_test_rsa.pem"
+    ))
+    .unwrap();
+    let u = up.clone();
+    let Some(state) = build_state_with(
+        true,
+        &test_group(),
+        Box::new(move |st| {
+            st.huawei_iap = Some(
+                musubi_integrations::HuaweiIapClient::new(
+                    &u,
+                    &u,
+                    &format!("{u}/oauth2/v3/token"),
+                    "HWAPP",
+                    "HWSECRET",
+                    true,
+                )
+                .unwrap(),
+            );
+            st.samsung_iap = Some(
+                musubi_integrations::SamsungIapClient::new(
+                    &u,
+                    &format!("{u}/auth/accessToken"),
+                    "SA1",
+                    &pem,
+                    "/iap/v6/acknowledge",
+                )
+                .unwrap(),
+            );
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _) = token(&router).await;
+    let gems_item = format!("gems-item-{suffix}");
+    let gem_pack = format!("gem-pack-{suffix}");
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/items",
+        None,
+        true,
+        Some(json!({"id": gems_item, "name": "Gems", "stackable": true, "max_stack": 100000})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/store",
+        None,
+        true,
+        Some(json!({"id": gem_pack, "item_id": gems_item, "quantity": 100, "prices": {}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    for prov in ["huawei", "samsung"] {
+        let (st, b) = http_json(&router, "POST", "/v1/server/iap/products", None, true, Some(json!({"provider": prov, "product_id": product, "store_item_id": gem_pack, "kind": "consumable"}))).await;
+        assert_eq!(st, 200, "{b}");
+    }
+    // huawei: grant + confirm, replay is idempotent and does not confirm twice
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/huawei",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "purchase_token": format!("t-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["quantity"], 100);
+    assert_eq!(r["replayed"], false);
+    assert_eq!(r["environment"], "Test");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/huawei",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "purchase_token": format!("t-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["replayed"], true);
+    assert_eq!(confirms.lock().unwrap().as_slice(), [format!("t-{suffix}")]);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/huawei",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "purchase_token": "bad"})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/huawei",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "purchase_token": "pending"})),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/huawei",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": "other", "purchase_token": "x"})),
+    )
+    .await;
+    assert_eq!(st, 400);
+    // samsung: grant + acknowledge once, missing receipt → 404
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/samsung",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "purchase_id": format!("p-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["quantity"], 100);
+    assert_eq!(r["replayed"], false);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/samsung",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "purchase_id": format!("p-{suffix}")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["replayed"], true);
+    assert_eq!(acks.lock().unwrap().as_slice(), [format!("p-{suffix}")]);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/iap/samsung",
+        Some(&ta),
+        false,
+        Some(json!({"product_id": product, "purchase_id": "missing"})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (_, inv) = http_json(&router, "GET", "/v1/inventory", Some(&ta), false, None).await;
+    let q: i64 = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["item_id"] == json!(gems_item))
+        .map(|e| e["quantity"].as_i64().unwrap())
+        .sum();
+    assert_eq!(q, 200, "{inv}");
 }

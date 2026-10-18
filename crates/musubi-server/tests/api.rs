@@ -115,6 +115,8 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         rtc: None,
         apple_iap: None,
         google_iap: None,
+        huawei_iap: None,
+        samsung_iap: None,
         console_iap: Default::default(),
         steam_iap: None,
         runtime: runtime.clone(),
