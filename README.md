@@ -44,16 +44,31 @@ measure):
 
 | scenario | ops | ops/s | p50 | p95 | p99 | max | errors |
 |---|---|---|---|---|---|---|---|
-| HTTP `GET /v1/account` | 143 667 | 4 789 | 7.9 ms | 13.1 ms | 16.1 ms | 26.6 ms | 0 |
-| storage write + read-back | 119 063 | 3 969 | 9.6 ms | 16.3 ms | 19.9 ms | 37.3 ms | 0 |
-| WebSocket ping | 2 205 489 | 73 516 | 0.42 ms | 1.24 ms | 2.47 ms | 20.5 ms | 0 |
-| chat message → delivered | 32 594 | 1 086 | 36.8 ms | 45.9 ms | 52.6 ms | 74.2 ms | 0 |
-| relayed match input → echo | 253 851 | 8 462 | 23.0 ms | 33.8 ms | 35.1 ms | 45.5 ms | 0 |
+| HTTP `GET /v1/account` | 162 370 | 5 412 | 7.1 ms | 11.4 ms | 14.8 ms | 42.6 ms | 0 |
+| storage write + read-back | 129 444 | 4 315 | 8.8 ms | 15.1 ms | 19.8 ms | 56.8 ms | 0 |
+| WebSocket ping | 1 056 846 | 35 228 | 0.97 ms | 2.4 ms | 3.8 ms | 29.3 ms | 0 |
+| chat message → delivered (rooms of 50) | 559 927 | 18 664 | 0.86 ms | 2.4 ms | 4.2 ms | 26.4 ms | 23* |
+| relayed match input → echo | 253 936 | 8 465 | 1.35 ms | 3.4 ms | 5.1 ms | 33.1 ms | 0 |
 
-The same `GET /v1/account` alone with all 200 clients: 24 931 ops/s, p50 7.6 ms, p99 15.9 ms, the
-node at ~1.2 cores and Postgres at ~1.7 — the database is now the ceiling, not the node. Before the
-request state was put behind a single `Arc` (every middleware layer used to clone a struct of ~50
-reference-counted fields) the same run did 5 863 ops/s at p50 32 ms with the node on four cores.
+\* the 23 chat "errors" are sessions the node closed as slow consumers (see below): one bench
+process pretending to be 200 clients cannot drain ~1 M chat deliveries per second.
+
+Two things made the realtime rows what they are. The request state used to be a flat struct of
+~50 reference-counted fields cloned by every middleware layer; behind one `Arc`,
+`GET /v1/account` alone with all 200 clients went from 5 863 to 24 931 ops/s (p50 32 → 7.6 ms)
+and the node from four cores to ~1.2, with Postgres (~1.7 cores) now the ceiling. And accepted
+sockets run with `TCP_NODELAY`: a room fan-out is many small frames per connection, so Nagle plus
+the peer's 40 ms delayed ACK had pinned chat at p50 44 ms and 6k messages/s whatever the CPU did;
+without it the same run does 43 598 messages/s at p50 3.0 ms. Set it in your own clients too.
+
+A session whose outgoing queue (256 messages) overflows is closed with
+`unavailable: slow consumer: outgoing queue full` and counted in
+`musubi_session_send_full_total`, like Nakama does — a gapped stream is worse than a reconnect,
+and the client resumes with its subscriptions.
+
+`database.max_connections` (default 32, sized so three local nodes fit under Postgres' default
+100) is the next knob: at 96 the same box does 28 439 ops/s on `GET /v1/account` and 17 108 ops/s
+on storage write+read-back (200 clients, one scenario at a time) against 24 931 / 14 674 at 32.
 
 `musubi soak` on the same VM, release build, 3 nodes, 24 clients, 6 worlds split across two nodes
 each with 20 entities shuttling over the border, 75 s, SIGKILL of a node every 12 s (3 incidents):

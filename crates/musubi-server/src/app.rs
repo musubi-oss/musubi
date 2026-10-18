@@ -916,6 +916,14 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     };
     let draining = main.clone();
     let others: Vec<AppState> = extra.iter().map(|(_, _, s)| s.clone()).collect();
+    // many small realtime frames per connection: Nagle + the peer's delayed ACK would hold
+    // every second frame for up to 40 ms
+    let listener = {
+        use axum::serve::ListenerExt;
+        listener.tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        })
+    };
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),

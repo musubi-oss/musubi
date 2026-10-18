@@ -714,6 +714,7 @@ impl ChatService {
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
+        self.moderation.forget_restriction(&channel.id(), account.0);
         Ok(())
     }
 
@@ -727,6 +728,7 @@ impl ChatService {
         .await
         .map_err(Error::internal)?
         .rows_affected();
+        self.moderation.forget_restriction(&channel.id(), account.0);
         Ok(n > 0)
     }
 
@@ -769,15 +771,22 @@ impl ChatService {
         channel: &Channel,
         account: AccountId,
     ) -> Result<Option<String>> {
-        sqlx::query_scalar(
+        let id = channel.id();
+        if let Some(hit) = self.moderation.cached_restriction(&id, account.0) {
+            return Ok(hit);
+        }
+        let kind: Option<String> = sqlx::query_scalar(
             "select kind from musubi.chat_moderation
              where channel_id = $1 and account_id = $2 and (until is null or until > now())",
         )
-        .bind(channel.id())
+        .bind(&id)
         .bind(account.0)
         .fetch_optional(&self.db)
         .await
-        .map_err(Error::internal)
+        .map_err(Error::internal)?;
+        self.moderation
+            .remember_restriction(&id, account.0, kind.clone());
+        Ok(kind)
     }
 
     /// Delete any message on behalf of a moderator (no sender check); true if it existed.

@@ -2,6 +2,7 @@
 //! reports that carry the channel's recent messages, and shadow bans (handled by the caller: a
 //! shadowed sender gets an ack but nobody else gets the message).
 
+use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,10 @@ pub struct Report {
 /// Messages of the channel captured with a report.
 pub const REPORT_CONTEXT: usize = 20;
 const FILTER_TTL: Duration = Duration::from_secs(30);
+/// Per-channel settings and per-sender restrictions are read on every message; they are cached
+/// this long (writes on this node drop the entry at once, other nodes see them within the TTL).
+const META_TTL: Duration = Duration::from_secs(2);
+const META_CAP: usize = 100_000;
 
 struct Compiled {
     filter: Filter,
@@ -65,6 +70,50 @@ struct Compiled {
 #[derive(Default)]
 pub(crate) struct ModerationState {
     filters: RwLock<Option<(Instant, std::sync::Arc<Vec<Compiled>>)>>,
+    settings: RwLock<HashMap<String, (Instant, i64)>>,
+    restrictions: RwLock<Restrictions>,
+}
+
+type Restrictions = HashMap<(String, Uuid), (Instant, Option<String>)>;
+
+/// Read-through TTL cache over a `HashMap`; bounded by dropping everything when it grows past
+/// `META_CAP` (a reload costs one query per key, so this is just a memory guard).
+fn cached<K: std::hash::Hash + Eq + Clone, V: Clone>(
+    map: &RwLock<HashMap<K, (Instant, V)>>,
+    key: &K,
+) -> Option<V> {
+    let g = map.read().unwrap_or_else(|p| p.into_inner());
+    g.get(key)
+        .filter(|(at, _)| at.elapsed() < META_TTL)
+        .map(|(_, v)| v.clone())
+}
+
+fn remember<K: std::hash::Hash + Eq, V>(map: &RwLock<HashMap<K, (Instant, V)>>, key: K, v: V) {
+    let mut g = map.write().unwrap_or_else(|p| p.into_inner());
+    if g.len() >= META_CAP {
+        g.clear();
+    }
+    g.insert(key, (Instant::now(), v));
+}
+
+fn forget<K: std::hash::Hash + Eq, V>(map: &RwLock<HashMap<K, (Instant, V)>>, key: &K) {
+    map.write().unwrap_or_else(|p| p.into_inner()).remove(key);
+}
+
+impl ModerationState {
+    pub(crate) fn cached_restriction(
+        &self,
+        channel: &str,
+        account: Uuid,
+    ) -> Option<Option<String>> {
+        cached(&self.restrictions, &(channel.to_string(), account))
+    }
+    pub(crate) fn remember_restriction(&self, channel: &str, account: Uuid, kind: Option<String>) {
+        remember(&self.restrictions, (channel.to_string(), account), kind);
+    }
+    pub(crate) fn forget_restriction(&self, channel: &str, account: Uuid) {
+        forget(&self.restrictions, &(channel.to_string(), account));
+    }
 }
 
 /// Lower-case, fold leet-speak and drop separators so `s.h-1.t` and `5hit` both read `shit`.
@@ -369,6 +418,7 @@ impl ChatService {
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
+        forget(&self.moderation.settings, &channel_id.to_string());
         Ok(ChannelSettings {
             channel_id: channel_id.to_string(),
             slow_mode_secs,
@@ -376,16 +426,25 @@ impl ChatService {
     }
 
     pub async fn channel_settings(&self, channel_id: &str) -> Result<ChannelSettings> {
-        let s: Option<i32> = sqlx::query_scalar(
-            "select slow_mode_secs from musubi.chat_channel_settings where channel_id = $1",
-        )
-        .bind(channel_id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(Error::internal)?;
+        let key = channel_id.to_string();
+        let slow_mode_secs = match cached(&self.moderation.settings, &key) {
+            Some(v) => v,
+            None => {
+                let s: Option<i32> = sqlx::query_scalar(
+                    "select slow_mode_secs from musubi.chat_channel_settings where channel_id = $1",
+                )
+                .bind(channel_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+                let v = s.unwrap_or(0) as i64;
+                remember(&self.moderation.settings, key.clone(), v);
+                v
+            }
+        };
         Ok(ChannelSettings {
-            channel_id: channel_id.to_string(),
-            slow_mode_secs: s.unwrap_or(0) as i64,
+            channel_id: key,
+            slow_mode_secs,
         })
     }
 

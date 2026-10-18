@@ -81,10 +81,12 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
     let sid = presence.session_id;
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(256);
     let kick = std::sync::Arc::new(tokio::sync::Notify::new());
+    let overflow = std::sync::Arc::new(tokio::sync::Notify::new());
     hub.join(SessionHandle {
         presence: presence.clone(),
         tx: tx.clone(),
         kick: kick.clone(),
+        overflow: overflow.clone(),
     });
     info!(session = %sid, account = %presence.account_id, transport = conn.kind(), "realtime connected");
 
@@ -166,7 +168,10 @@ pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: Connect
             limits,
             tx.clone(),
             &mut rx,
-            &kick,
+            Signals {
+                kick: &kick,
+                overflow: &overflow,
+            },
         )
         .await;
         let Exit::Lost(err) = exit else {
@@ -292,6 +297,14 @@ struct Ctx<'a> {
     resume: Option<Arc<super::resume::ResumeTracker>>,
 }
 
+/// Out-of-band ways to end a session loop.
+struct Signals<'a> {
+    /// Admin kick.
+    kick: &'a tokio::sync::Notify,
+    /// Outgoing queue overflowed (a message was lost).
+    overflow: &'a tokio::sync::Notify,
+}
+
 async fn run_loop(
     ctx: &Ctx<'_>,
     conn: &mut dyn Connection,
@@ -299,9 +312,9 @@ async fn run_loop(
     limits: Limits,
     tx: mpsc::Sender<ServerMessage>,
     rx: &mut mpsc::Receiver<ServerMessage>,
-    kick: &tokio::sync::Notify,
+    signals: Signals<'_>,
 ) -> Exit {
-    match run_loop_inner(ctx, conn, encoding, limits, tx, rx, kick).await {
+    match run_loop_inner(ctx, conn, encoding, limits, tx, rx, signals).await {
         Ok(exit) => exit,
         Err(e) => Exit::Lost(e),
     }
@@ -314,7 +327,7 @@ async fn run_loop_inner(
     limits: Limits,
     tx: mpsc::Sender<ServerMessage>,
     rx: &mut mpsc::Receiver<ServerMessage>,
-    kick: &tokio::sync::Notify,
+    signals: Signals<'_>,
 ) -> Result<Exit, Box<dyn std::error::Error + Send + Sync>> {
     let sid = ctx.presence.session_id;
     let mut idle = tokio::time::interval(limits.idle_timeout);
@@ -376,9 +389,14 @@ async fn run_loop_inner(
                     conn.send(Frame::encoded(encoding, bytes)).await?;
                 }
             }
-            _ = kick.notified() => {
+            _ = signals.kick.notified() => {
                 warn!(session = %sid, "kicked by admin");
                 send(conn, encoding, None, ServerMessage::error(&Error::PermissionDenied("kicked".into()))).await?;
+                return Ok(Exit::Kicked);
+            }
+            _ = signals.overflow.notified() => {
+                warn!(session = %sid, "outgoing queue full: closing slow consumer");
+                send(conn, encoding, None, ServerMessage::error(&Error::Unavailable("slow consumer: outgoing queue full".into()))).await?;
                 return Ok(Exit::Kicked);
             }
             _ = idle.tick() => {

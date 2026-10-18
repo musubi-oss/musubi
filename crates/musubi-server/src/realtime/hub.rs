@@ -13,6 +13,15 @@ pub struct SessionHandle {
     pub tx: mpsc::Sender<ServerMessage>,
     /// Fired by `Hub::kick_account`; the session loop closes the socket.
     pub kick: std::sync::Arc<tokio::sync::Notify>,
+    /// Fired when this session's outgoing queue overflowed: a message was lost, so the session
+    /// loop closes the socket with `Unavailable("slow consumer")` instead of delivering a gapped
+    /// stream (the client reconnects and resumes).
+    pub overflow: std::sync::Arc<tokio::sync::Notify>,
+}
+
+fn queue_full(h: &SessionHandle) {
+    metrics::counter!("musubi_session_send_full_total").increment(1);
+    h.overflow.notify_one();
 }
 
 /// A reconnected transport handed to a parked session loop.
@@ -293,8 +302,10 @@ impl Hub {
         let mut n = 0;
         for sid in targets {
             if let Some(h) = self.sessions.get(sid) {
-                if h.tx.try_send(msg.clone()).is_ok() {
-                    n += 1;
+                match h.tx.try_send(msg.clone()) {
+                    Ok(()) => n += 1,
+                    Err(mpsc::error::TrySendError::Full(_)) => queue_full(&h),
+                    Err(_) => {}
                 }
             }
         }
@@ -359,7 +370,7 @@ impl Hub {
         match self.sessions.get(&session_id) {
             Some(h) => h.tx.try_send(msg).map_err(|e| {
                 if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                    metrics::counter!("musubi_session_send_full_total").increment(1);
+                    queue_full(&h);
                 }
                 e.into_inner()
             }),
@@ -445,6 +456,7 @@ mod tests {
                 presence,
                 tx,
                 kick: Default::default(),
+                overflow: Default::default(),
             },
             rx,
         )

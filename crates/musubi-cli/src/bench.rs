@@ -650,7 +650,19 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn ws_connect(url: &str, token: &str) -> Option<WsStream> {
-    tokio_tungstenite::connect_async(format!("{}?token={token}&format=json", ws_url(url)))
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let req = format!("{}?token={token}&format=json", ws_url(url))
+        .into_client_request()
+        .ok()?;
+    let host = req.uri().host()?.to_string();
+    let port = req.uri().port_u16().unwrap_or(80);
+    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
+        .ok()?;
+    // like a real game client: no Nagle, or the server's fan-out stalls on our delayed ACKs
+    let _ = tcp.set_nodelay(true);
+    let stream = tokio_tungstenite::MaybeTlsStream::Plain(tcp);
+    tokio_tungstenite::client_async(req, stream)
         .await
         .ok()
         .map(|(ws, _)| ws)
