@@ -1727,13 +1727,21 @@ async fn fleet_autoscale_scales_down_idle_and_forecasts_demand() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+    // reconcile is cluster-wide: other tests' fleets may start servers in the same pass, so
+    // count only this fleet's
     let (started, _) = svc.reconcile().await.unwrap();
-    assert_eq!(started, 1);
-    for s in svc.servers(fuid, Some("starting")).await.unwrap() {
+    assert!(started >= 1, "{started}");
+    let starting = svc.servers(fuid, Some("starting")).await.unwrap();
+    assert_eq!(starting.len(), 1);
+    for s in starting {
         svc.sdk_ready(s.id).await.unwrap();
     }
-    let (_, reaped) = svc.reconcile().await.unwrap();
-    assert_eq!(reaped, 0); // the floor is never scaled down
+    svc.reconcile().await.unwrap();
+    assert_eq!(
+        svc.servers(fuid, Some("ready")).await.unwrap().len(),
+        1,
+        "the floor is never scaled down"
+    );
 
     // 12 allocations in this hour-of-week slot → 12/h; a 10-minute horizon wants 2 ready
     let now = time::OffsetDateTime::now_utc();
@@ -9344,15 +9352,25 @@ async fn fleet_builds_canary_promote_and_usage() {
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let svc =
         musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
-    let _ = svc.reconcile().await.unwrap();
-    let (_, list) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/server/fleets/{fid}/servers"),
-        k,
-        None,
-    )
-    .await;
+    // reconcile is cluster-wide and other tests reconcile concurrently; retry until this
+    // fleet's server shows up
+    let mut list = json!({});
+    for _ in 0..10 {
+        let _ = svc.reconcile().await.unwrap();
+        list = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/fleets/{fid}/servers"),
+            k,
+            None,
+        )
+        .await
+        .1;
+        if list["servers"].as_array().is_some_and(|a| !a.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     let servers = list["servers"].as_array().unwrap();
     assert!(!servers.is_empty(), "{list}");
     assert!(
