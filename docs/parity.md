@@ -37,7 +37,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Линковка / слияние аккаунтов | ✅ link/unlink, `POST /v1/account/merge` с журналом | ✅ | ✅ (link) | ✅ | ✅ |
 | Сессии: refresh-семейства, revoke, device list, IP | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Отправка e-mail (verify/reset) | ✅ `[email]` SMTP (STARTTLS/implicit/none, AUTH PLAIN) в `musubi-integrations/email.rs`, события `email.sent/failed`; плюс событие в шину для своего мейлера | 🟡 | ❌ | ✅ | ✅ |
-| Хранилище объектов (коллекции, права, версии, TTL) | ✅ `musubi-storage` | ✅ player data | ✅ | ✅ | ✅ |
+| Хранилище объектов (коллекции, права, версии, TTL), серверные транзакции storage+кошелёк+инвентарь | ✅ `musubi-storage` + `POST /v1/server/tx` | ✅ player data | ✅ | ✅ | ✅ |
 | Запросы по полям | ✅ `list_where` (фильтр по JSON-полям) | 🟡 | 🟡 | ❌ | ❌ |
 | Вторичные индексы / full-text | ✅ expression-индексы по полям `value` (`indexes` в контракте коллекции) + `$where` range-фильтры в `where`; full-text — нет | ❌ | 🟡 | ❌ | ❌ |
 | Live-подписка на изменения объектов | ✅ `storage_subscribe` / `storage_update` в сокете | ❌ | ❌ | ❌ | ❌ |

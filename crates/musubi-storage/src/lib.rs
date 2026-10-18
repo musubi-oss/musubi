@@ -224,6 +224,12 @@ pub enum Caller {
 }
 
 /// One committed write/patch/delete, handed to the change hook (live subscriptions).
+/// Acks and not-yet-announced live changes of a `write_tx`.
+pub struct Pending {
+    pub acks: Vec<Ack>,
+    changes: Vec<Change>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Change {
     pub collection: String,
@@ -973,12 +979,12 @@ impl StorageService {
         Ok((objs, next))
     }
 
-    pub async fn write(
+    fn prepare_write(
         &self,
         caller: Caller,
         owner_override: Option<Uuid>,
         ops: &[WriteOp],
-    ) -> Result<Vec<Ack>> {
+    ) -> Result<Uuid> {
         if ops.len() > MAX_BATCH {
             return Err(Error::InvalidArgument(format!(
                 "at most {MAX_BATCH} objects per write"
@@ -1003,6 +1009,44 @@ impl StorageService {
                 return Err(Error::InvalidArgument("invalid permission code".into()));
             }
         }
+        Ok(owner)
+    }
+
+    /// `write` on a caller-owned connection/transaction: nothing is committed or announced here.
+    /// Call `commit_pending` after the transaction commits so live subscribers hear about it.
+    pub async fn write_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        caller: Caller,
+        owner_override: Option<Uuid>,
+        ops: &[WriteOp],
+    ) -> Result<Pending> {
+        let owner = self.prepare_write(caller, owner_override, ops)?;
+        let mut acks = Vec::with_capacity(ops.len());
+        let mut changes = Vec::with_capacity(ops.len());
+        for op in ops {
+            self.write_one(&mut *tx, caller, owner, op, &mut acks, &mut changes)
+                .await?;
+        }
+        if owner != SYSTEM_OWNER && (self.max_objects > 0 || self.max_bytes > 0) {
+            self.enforce_quota(tx, owner).await?;
+        }
+        Ok(Pending { acks, changes })
+    }
+
+    /// Announce the changes of a committed `write_tx`.
+    pub fn commit_pending(&self, p: Pending) -> Vec<Ack> {
+        self.fire(p.changes);
+        p.acks
+    }
+
+    pub async fn write(
+        &self,
+        caller: Caller,
+        owner_override: Option<Uuid>,
+        ops: &[WriteOp],
+    ) -> Result<Vec<Ack>> {
+        let owner = self.prepare_write(caller, owner_override, ops)?;
         let quota = owner != SYSTEM_OWNER && (self.max_objects > 0 || self.max_bytes > 0);
         let mut acks = Vec::with_capacity(ops.len());
         let mut changes = Vec::with_capacity(ops.len());

@@ -31,6 +31,7 @@ mod sso;
 pub mod stats;
 mod storage;
 pub mod tournaments;
+mod tx;
 mod ugc;
 mod workflows;
 mod worlds;
@@ -168,6 +169,7 @@ pub fn router(state: AppState) -> Router {
         .merge(push::routes())
         .merge(crate::events::routes())
         .merge(auth::routes())
+        .merge(tx::routes())
         .merge(account::routes())
         .merge(passkeys::routes())
         .merge(friends::routes())

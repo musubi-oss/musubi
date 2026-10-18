@@ -551,7 +551,7 @@ impl EconomyService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn adjust_tx(
+    pub async fn adjust_tx(
         tx: &mut Transaction<'_, Postgres>,
         account: AccountId,
         currency: &str,
@@ -1018,7 +1018,7 @@ impl EconomyService {
         Ok(e)
     }
 
-    pub(crate) async fn grant_item_tx(
+    pub async fn grant_item_tx(
         tx: &mut Transaction<'_, Postgres>,
         account: AccountId,
         item_id: &str,
@@ -1138,12 +1138,27 @@ impl EconomyService {
             return Err(Error::InvalidArgument("quantity must be positive".into()));
         }
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let r = Self::consume_tx(&mut tx, account, entry_id, quantity).await?;
+        tx.commit().await.map_err(Error::internal)?;
+        Ok(r)
+    }
+
+    /// `consume` inside a caller-owned transaction (server-side atomic transactions).
+    pub async fn consume_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        account: AccountId,
+        entry_id: Uuid,
+        quantity: i64,
+    ) -> Result<Option<InventoryEntry>> {
+        if quantity <= 0 {
+            return Err(Error::InvalidArgument("quantity must be positive".into()));
+        }
         let row: Option<(String, i64, Value, i32)> = sqlx::query_as(
             "select item_id, quantity, instance, item_version from musubi.inventory where id = $1 and account_id = $2 for update",
         )
         .bind(entry_id)
         .bind(account.0)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(Error::internal)?;
         let Some((item_id, have, instance, item_version)) = row else {
@@ -1158,7 +1173,7 @@ impl EconomyService {
         if left == 0 {
             sqlx::query("delete from musubi.inventory where id = $1")
                 .bind(entry_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(Error::internal)?;
         } else {
@@ -1167,11 +1182,10 @@ impl EconomyService {
             )
             .bind(entry_id)
             .bind(left)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(Error::internal)?;
         }
-        tx.commit().await.map_err(Error::internal)?;
         Ok((left > 0).then_some(InventoryEntry {
             id: entry_id,
             item_id,

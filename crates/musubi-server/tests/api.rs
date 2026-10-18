@@ -14761,3 +14761,117 @@ async fn facebook_gamecenter_logins_and_password_policy() {
     .await;
     assert_eq!(st, StatusCode::OK, "{r}");
 }
+
+/// `POST /v1/server/tx`: storage write + wallet debit + inventory grant land together; a CAS
+/// miss or an overdrawn wallet rolls everything back.
+#[tokio::test]
+async fn server_tx_all_or_nothing() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("tx")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gold = unique("gold");
+    let sword = unique("sword");
+    let coll = unique("txc");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/items", k, Some(json!({"id": sword, "name": "Sword", "category": "weapon", "stackable": false, "properties": {}}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(json!({"account_id": acc, "currency": gold, "delta": 150, "reason": "seed", "reference": "t"}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 1) buy: -100 gold, +sword, quest object created (create-only) — all land
+    let ops = |version: &str, price: i64| {
+        json!({"ops": [
+            {"type": "storage_write", "owner_id": acc, "collection": coll, "key": "quest", "value": {"state": "done"}, "version": version},
+            {"type": "wallet_adjust", "account_id": acc, "currency": gold, "delta": -price, "reason": "buy", "reference": sword},
+            {"type": "inventory_grant", "account_id": acc, "item_id": sword, "quantity": 1},
+        ]})
+    };
+    let (st, r) = call_server(&app, "POST", "/v1/server/tx", k, Some(ops("*", 100))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let res = r["results"].as_array().unwrap();
+    assert_eq!(res.len(), 3);
+    assert!(res[0]["ack"]["version"].is_string(), "{r}");
+    assert_eq!(res[1]["entry"]["delta"], -100, "{r}");
+    let entry_id = res[2]["entry"]["id"].as_str().unwrap().to_string();
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    let bal = w["balances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["currency"] == json!(gold))
+        .map(|b| b["balance"].as_i64().unwrap());
+    assert_eq!(bal, Some(50), "{w}");
+
+    // 2) same create-only write again → 409 and the wallet/inventory untouched
+    let (st, r) = call_server(&app, "POST", "/v1/server/tx", k, Some(ops("*", 10))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    // 3) wallet cannot go negative → everything rolled back, including the storage write
+    let (st, r) = call_server(&app, "POST", "/v1/server/tx", k, Some(json!({"ops": [
+        {"type": "storage_write", "owner_id": acc, "collection": coll, "key": "quest", "value": {"state": "again"}},
+        {"type": "wallet_adjust", "account_id": acc, "currency": gold, "delta": -500, "reason": "buy", "reference": "x"},
+    ]}))).await;
+    assert_ne!(st, StatusCode::OK, "{r}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    let bal = w["balances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["currency"] == json!(gold))
+        .map(|b| b["balance"].as_i64().unwrap());
+    assert_eq!(bal, Some(50), "{w}");
+    let (st, o) = call(
+        &app,
+        "POST",
+        "/v1/storage/read",
+        Some(&tok),
+        Some(json!({"objects": [{"collection": coll, "key": "quest", "owner_id": acc}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{o}");
+    assert_eq!(o["objects"][0]["value"]["state"], "done", "{o}");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    assert_eq!(
+        inv["items"]
+            .as_array()
+            .map(|e| e.iter().filter(|e| e["item_id"] == json!(sword)).count()),
+        Some(1),
+        "{inv}"
+    );
+
+    // 4) consume the sword and refund in one go
+    let (st, r) = call_server(&app, "POST", "/v1/server/tx", k, Some(json!({"ops": [
+        {"type": "inventory_consume", "account_id": acc, "entry_id": entry_id, "quantity": 1},
+        {"type": "wallet_adjust", "account_id": acc, "currency": gold, "delta": 100, "reason": "refund", "reference": sword},
+    ]}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert!(r["results"][0]["entry"].is_null(), "{r}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    let bal = w["balances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["currency"] == json!(gold))
+        .map(|b| b["balance"].as_i64().unwrap());
+    assert_eq!(bal, Some(150), "{w}");
+    // limits: 0 and 101 ops
+    let (st, _) = call_server(&app, "POST", "/v1/server/tx", k, Some(json!({"ops": []}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
