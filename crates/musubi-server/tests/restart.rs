@@ -65,9 +65,13 @@ async fn get(client: &reqwest::Client, n: &Node, path: &str) -> Option<Value> {
         .ok()
 }
 
+/// Every test here runs three real server processes; two of them at once (plus their migrations)
+/// on a small CI runner is enough for no quorum to form within the budget, so they take turns.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Wait until every node reports a leader and three voters; return the leader's raft id.
 async fn wait_quorum(client: &reqwest::Client, nodes: &[Node]) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let mut leaders = Vec::new();
         for n in nodes {
@@ -84,7 +88,7 @@ async fn wait_quorum(client: &reqwest::Client, nodes: &[Node]) -> u64 {
         }
         assert!(
             Instant::now() < deadline,
-            "no quorum within 90s: {leaders:?}"
+            "no quorum within 120s: {leaders:?}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -110,6 +114,7 @@ async fn node_ids(client: &reqwest::Client, nodes: &[Node]) -> Vec<String> {
 
 #[tokio::test]
 async fn cluster_survives_full_restart_from_disk() {
+    let _serial = SERIAL.lock().await;
     let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
         return;
     };
@@ -218,6 +223,7 @@ async fn cluster_survives_full_restart_from_disk() {
 /// (not after the 15 s dead-node timeout).
 #[tokio::test]
 async fn draining_node_hands_off_its_worlds() {
+    let _serial = SERIAL.lock().await;
     let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
         return;
     };
@@ -339,6 +345,7 @@ async fn draining_node_hands_off_its_worlds() {
 /// take effect on another within a couple of seconds, without a restart.
 #[tokio::test]
 async fn keys_and_bans_replicate_across_processes() {
+    let _serial = SERIAL.lock().await;
     let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
         return;
     };
@@ -476,6 +483,7 @@ async fn keys_and_bans_replicate_across_processes() {
 /// again by the survivors: SWIM's Dead verdict is per incarnation, and a restart outranks it.
 #[tokio::test]
 async fn killed_node_rejoins_with_same_identity() {
+    let _serial = SERIAL.lock().await;
     let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
         return;
     };
@@ -607,6 +615,7 @@ async fn killed_node_rejoins_with_same_identity() {
 /// directory and the epoch-checked ownership row are the fence — and it rejoins as a live member.
 #[tokio::test]
 async fn stalled_node_is_fenced_and_rejoins_after_thaw() {
+    let _serial = SERIAL.lock().await;
     let Ok(db) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
         return;
     };
