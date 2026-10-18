@@ -317,6 +317,16 @@ An IAP product mapped with `kind: "subscription"` (plus `grace_secs`) is auto-re
 
 `POST /v1/ugc {kind: map|mod|skin|blueprint|replay|level|other, title, description?, tags?, url?, visibility?: public|unlisted|private}` registers a draft; `PUT /v1/ugc/{id}/blob` (raw body, ≤ 16 MiB, `Content-Type` kept) stores the content with its sha256 and bumps `version`; `POST …/submit` hands it to moderation. Moderators (`support`/`admin`) see `GET /v1/admin/ugc?status=pending` and decide with `POST /v1/admin/ugc/{id} {status: approved|rejected|hidden|pending, reason?}`; only approved items are browsable (`GET /v1/ugc?kind&tag&q&sort=new|top|downloads&owner_id`) and downloadable (`GET …/blob`, counts downloads, `ETag` = sha256, `x-ugc-version`). A new blob on an approved item goes back to `pending`, so subscribers (`POST …/subscribe`, `GET /v1/ugc/subscriptions` with current versions) only ever get moderated revisions. Ratings are 1–5 stars, one per account (`POST …/rate`), and everything emits `ugc.*` events.
 
+### Player statistics
+
+`PUT /v1/server/stats/defs` declares typed counters (`sum` / `max` / `min` / `last`, each
+`public`, `friends` or `private`); `POST /v1/server/stats/update {account_id, scope?, stats}` folds
+values into a scope slice (mode, season, map …) and the global slice at once;
+`GET /v1/server/stats/{account_id}`, `GET /v1/server/stats/top?stat&scope&limit`. Players read
+their own with `GET /v1/stats[?scope]` and others' with `GET /v1/stats/{account_id}` (public, plus
+`friends` stats for friends). `POST /v1/server/matches/{id}/results` with `stats_scope` folds each
+player's `stats` object in the same report that settles rating, rewards, quests and XP.
+
 ### Anti-cheat signals
 
 Every match input in an authoritative match passes a per-session guard (`[anticheat] max_input_bytes`, `max_inputs_per_sec`): an oversized or too-frequent input is rejected and recorded as a signal. Game servers add their own with `POST /v1/server/anticheat/flag {account_id, kind, severity: 1..=100, details?, match_id?}`, modules with the `anticheat.flag` host op. Signals sum into a per-account score over `window_hours`; when it reaches `kick_score` the account is kicked from every node (`anticheat.kicked`). Moderators read `GET /v1/admin/anticheat?min_score` (worst accounts first) and `GET /v1/admin/accounts/{id}/anticheat`. `POST /v1/server/anticheat/verify {provider: eac|battleye, account_id, ticket}` relays a client session ticket to the configured vendor endpoint (`eac_url` / `battleye_url`, bearer key) and treats a rejection as a `vendor_rejected` signal. Everything emits `anticheat.signal`.

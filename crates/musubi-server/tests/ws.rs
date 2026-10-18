@@ -15624,3 +15624,194 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// Player statistics (5.6): typed folds (sum/max/min/last), scope + global slices, visibility
+/// (public / friends / private), top list, and the end-game report feeding them.
+#[tokio::test]
+async fn player_stats_fold_visibility_and_match_report() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, acc_a) = token(&router).await;
+    let (tb, acc_b) = token(&router).await;
+    let (tc, _acc_c) = token(&router).await;
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (kills, best, fastest, last_map, secret) = (
+        format!("kills-{sfx}"),
+        format!("best-{sfx}"),
+        format!("fastest-{sfx}"),
+        format!("lastmap-{sfx}"),
+        format!("secret-{sfx}"),
+    );
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/stats/defs",
+        None,
+        true,
+        Some(json!({"defs": [
+            {"id": kills, "name": "Kills"},
+            {"id": best, "kind": "max", "visibility": "friends"},
+            {"id": fastest, "kind": "min"},
+            {"id": last_map, "kind": "last"},
+            {"id": secret, "visibility": "private"},
+        ]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(r["defs"].as_array().unwrap().len() >= 5);
+    let (st, r) = http_json(
+        &router,
+        "PUT",
+        "/v1/server/stats/defs",
+        None,
+        true,
+        Some(json!({"defs": [{"id": "bad id!"}]})),
+    )
+    .await;
+    assert_eq!(st, 400, "{r}");
+
+    // two updates in scope "ranked": sum adds, max/min keep the extreme, last overwrites;
+    // the global slice "" gets the same folds
+    for (k, b, f, m) in [(3.0, 10.0, 42.0, 1.0), (2.0, 7.0, 39.5, 2.0)] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            "/v1/server/stats/update",
+            None,
+            true,
+            Some(json!({"account_id": acc_a, "scope": "ranked",
+                "stats": {&kills: k, &best: b, &fastest: f, &last_map: m, &secret: 1.0, "nope": 1.0}})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        assert_eq!(r["unknown"], json!(["nope"]));
+    }
+    let (st, r) = http_json(&router, "GET", "/v1/stats", Some(&ta), false, None).await;
+    assert_eq!(st, 200, "{r}");
+    let s = &r["stats"];
+    assert_eq!(s[&kills]["scopes"]["ranked"]["value"], json!(5.0));
+    assert_eq!(s[&kills]["scopes"][""]["samples"], json!(2));
+    assert_eq!(s[&best]["scopes"]["ranked"]["value"], json!(10.0));
+    assert_eq!(s[&fastest]["scopes"]["ranked"]["value"], json!(39.5));
+    assert_eq!(s[&last_map]["scopes"]["ranked"]["value"], json!(2.0));
+    assert_eq!(s[&secret]["scopes"][""]["value"], json!(2.0));
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        "/v1/stats?scope=ranked",
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(r["stats"][&kills]["scopes"].get("").is_none());
+
+    // a stranger sees public only; a friend also sees `friends`; private never leaves the owner
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/stats/{acc_a}"),
+        Some(&tc),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert!(r["stats"].get(&kills).is_some());
+    assert!(r["stats"].get(&best).is_none());
+    assert!(r["stats"].get(&secret).is_none());
+    for (t, other) in [(&ta, &acc_b), (&tb, &acc_a)] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            "/v1/friends",
+            Some(t),
+            false,
+            Some(json!({"ids": [other]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/stats/{acc_a}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["stats"][&best]["scopes"]["ranked"]["value"], json!(10.0));
+    assert!(r["stats"].get(&secret).is_none());
+    // server key reads everything
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/stats/{acc_a}?scope="),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["stats"][&secret]["scopes"][""]["value"], json!(2.0));
+
+    // top: min stats rank ascending
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/stats/update",
+        None,
+        true,
+        Some(json!({"account_id": acc_b, "scope": "ranked", "stats": {&fastest: 30.0}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/stats/top?stat={fastest}&scope=ranked&limit=10"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["entries"][0]["account_id"], json!(acc_b));
+    assert_eq!(r["entries"][0]["value"], json!(30.0));
+    assert_eq!(r["entries"][1]["account_id"], json!(acc_a));
+
+    // the end-game report folds each player's stats under `stats_scope`
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/matches/stats-{sfx}/results"),
+        None,
+        true,
+        Some(json!({
+            "stats_scope": "ranked",
+            "teams": [
+                {"rank": 1, "players": [{"account_id": acc_a, "stats": {&kills: 4, &fastest: 35.0, "note": "ignored"}}]},
+                {"rank": 2, "players": [{"account_id": acc_b, "stats": {&kills: 1}}]}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let pa = &r["players"][0];
+    assert_eq!(
+        pa["stats_applied"]["applied"][&kills]["scope"]["value"],
+        json!(9.0)
+    );
+    assert_eq!(
+        pa["stats_applied"]["applied"][&fastest]["scope"]["value"],
+        json!(35.0)
+    );
+    let (st, r) = http_json(&router, "GET", "/v1/stats", Some(&tb), false, None).await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["stats"][&kills]["scopes"]["ranked"]["value"], json!(1.0));
+}

@@ -53,6 +53,10 @@ struct Report {
     /// Decide a tournament bracket match with this result: the rank-1 team's participant wins.
     #[serde(default)]
     bracket_match: Option<BracketRef>,
+    /// Fold each player's `stats` object into their player statistics under this scope
+    /// (`""` = global slice only); absent = stats are only echoed back.
+    #[serde(default)]
+    stats_scope: Option<String>,
     #[serde(default)]
     metadata: Value,
 }
@@ -203,6 +207,18 @@ async fn report(
                 }
             }
             pj["stats"] = p.stats.clone();
+            if let (Some(scope), Some(obj)) = (&r.stats_scope, p.stats.as_object()) {
+                let nums: std::collections::BTreeMap<String, f64> = obj
+                    .iter()
+                    .filter_map(|(k, v)| v.as_f64().map(|n| (k.clone(), n)))
+                    .collect();
+                if !nums.is_empty() {
+                    match crate::http::stats::apply(&s.db, acc, scope, &nums).await {
+                        Ok(res) => pj["stats_applied"] = res,
+                        Err(e) => pj["stats_error"] = json!(e.to_string()),
+                    }
+                }
+            }
             out["players"].as_array_mut().unwrap().push(pj);
         }
     }

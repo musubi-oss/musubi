@@ -27,6 +27,7 @@ pub mod reports;
 mod rpc;
 mod rtc;
 mod sso;
+pub mod stats;
 mod storage;
 pub mod tournaments;
 mod ugc;
@@ -161,6 +162,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/node", get(node_info))
         .merge(admin::routes())
         .merge(sso::routes())
+        .merge(stats::routes())
         .merge(crate::events::routes())
         .merge(auth::routes())
         .merge(account::routes())
