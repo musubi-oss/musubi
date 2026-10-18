@@ -51,15 +51,19 @@ measure):
 | relayed match input → echo | 253 651 | 8 455 | 30.0 ms | 34.2 ms | 35.5 ms | 46.5 ms | 0 |
 
 `musubi soak` on the same VM, release build, 3 nodes, 24 clients, 6 worlds split across two nodes
-each with 20 entities shuttling over the border, 75 s, one SIGKILL of the raft leader: survivors
-marked it dead after 4.6 s, its 2 worlds and 2 matches were re-homed 6.8 s after the kill, the
-restarted process rejoined in 1.0 s; 25 381 verified storage writes with 0 lost, 3 WS sessions
-resumed (0 fresh reconnects), 5 528 match inputs echoed with 0 resets, 0 entities lost. The same
-run also showed a real defect: two of the six border worlds counted 36 and 33 entities instead of
-20 after the re-home (duplicates, not losses), so the stand reports the incident as not settled —
-that is the next thing being fixed, and the stand exists precisely so such numbers are not
-promised away. Run both against your own deployment; numbers from real hardware and a real network
-are the ones that matter.
+each with 20 entities shuttling over the border, 75 s, SIGKILL of a node every 12 s (3 incidents):
+survivors marked the victim dead after 4.7 s, its worlds and matches were re-homed 4.7 s (p50) to
+10.8 s (max) after the kill, every entity of every split world was accounted for on a survivor
+again 4.7 s (p50) / 10.8 s (max) after the kill with 0 lost and 0 duplicated, the restarted
+process rejoined in 1.0–2.0 s (one slow rejoin at 8.5 s); 25 175 verified storage writes with
+0 lost, 8 WS sessions resumed (6 fresh reconnects), 5 537 match inputs echoed with 0 resets. An
+earlier run of this stand found duplicates after a re-home (two border worlds with 36 and 33
+entities instead of 20): a cross-node handover cancelled during the failover kept its copy while
+the new host had already accepted it, and control messages were queuing tens of seconds behind
+chat and replication traffic in a single bus queue. Adoption announcements answered with drops,
+directory-based ownership checks and separate bus lanes are what made the numbers above settle —
+the stand exists precisely so such numbers are not promised away. Run both against your own
+deployment; numbers from real hardware and a real network are the ones that matter.
 
 ### Micro-benchmarks (criterion)
 

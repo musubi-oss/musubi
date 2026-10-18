@@ -15157,3 +15157,174 @@ async fn cloud_save_merges_on_conflict() {
     .await;
     assert!(st == 400 || st == 422, "{st}");
 }
+
+/// An entity hands over from B's cell to A's cell, then B dies before its journal recorded the
+/// departure. The home re-homes B's cell from B's shard snapshot — which still lists the entity —
+/// and must end up with one copy (on A), not two.
+#[tokio::test]
+async fn world_adopted_cell_drops_handed_over_duplicates() {
+    let group = format!("xdup-{}", uuid::Uuid::now_v7().simple());
+    let Some(state_home) = build_state(true, &group).await else {
+        return;
+    };
+    let Some(state_a) = build_state(false, &group).await else {
+        return;
+    };
+    let Some(state_b) = build_state(false, &group).await else {
+        return;
+    };
+    let router_home = musubi_server::http::router(state_home.clone());
+    let router_a = musubi_server::http::router(state_a.clone());
+    let router_b = musubi_server::http::router(state_b.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router_home,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": name, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let node_a = state_a.worlds.node_id();
+    let node_b = state_b.worlds.node_id();
+    for (cell, node) in [("0/0", node_a), ("1/0", node_b)] {
+        let (st, v) = http_json(
+            &router_home,
+            "POST",
+            &format!("/v1/admin/worlds/{name}/cells/{cell}/host"),
+            None,
+            true,
+            Some(json!({"node_id": node})),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let sim_a = uuid::Uuid::now_v7();
+    let sim_b = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router_a,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim_a, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    let (st, l) = http_json(
+        &router_b,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim_b, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    let (st, e) = http_json(
+        &router_b,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim_b, "x": 150.0, "y": 50.0, "components": {"kind": "crate"}, "persistent": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let id = e["id"].as_str().unwrap().to_string();
+    // B's shard snapshot still has the entity in (1,0) …
+    state_b.worlds.snapshot_now(&name).await.unwrap();
+    // … then it walks over the border into A's cell
+    let (st, r) = http_json(
+        &router_b,
+        "POST",
+        &format!("/v1/server/worlds/{name}/apply"),
+        None,
+        true,
+        Some(json!({"sim": sim_b, "entity": id, "x": 50.0, "y": 50.0})),
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let owned_ids = |v: &Value| -> Vec<String> {
+        v["owned"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| g["id"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (st, va) = http_json(
+            &router_a,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/0/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        if st == 200 && owned_ids(&va) == vec![id.clone()] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handover to A did not complete: {st} {va}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // B dies without flushing the departure; the home adopts (1,0) from B's snapshot
+    let cells = state_home
+        .worlds
+        .recover_cells(&[node_b], &state_home.fanout)
+        .await
+        .unwrap();
+    assert_eq!(
+        cells,
+        vec![(name.clone(), musubi_mesh::CellId { x: 1, y: 0 })]
+    );
+    // the registry tick announces the restored ids; A answers with a drop
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        state_home.worlds.tick(&state_home.fanout);
+        let (st, vh) = http_json(
+            &router_home,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{vh}");
+        if owned_ids(&vh).is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "duplicate restored from B's shard was not dropped: {vh}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (st, va) = http_json(
+        &router_a,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/0/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        owned_ids(&va),
+        vec![id.clone()],
+        "A keeps the live copy: {va}"
+    );
+}

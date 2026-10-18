@@ -127,6 +127,20 @@ enum Wire {
         #[serde(default)]
         resend_full: bool,
     },
+    /// A node restored these entities of `cell` from a dead host's shard; a host that owns a live
+    /// copy of any of them answers `WorldDrop`.
+    WorldAdopted {
+        world: String,
+        cell: musubi_mesh::CellId,
+        from_node: uuid::Uuid,
+        ids: Vec<musubi_mesh::EntityId>,
+    },
+    /// Reply to `WorldAdopted`: `to_node` holds duplicates of these — drop them.
+    WorldDrop {
+        world: String,
+        to_node: uuid::Uuid,
+        ids: Vec<musubi_mesh::EntityId>,
+    },
     /// Cross-cell transaction, coordinator → cluster: hold the listed entities you own and vote.
     WorldTxPrepare {
         world: String,
@@ -196,7 +210,9 @@ pub struct Fanout {
     social: Arc<OnceLock<musubi_social::SocialService>>,
     /// Bus messages leave in the order they were published: one publisher task per node, fed by
     /// this queue (a task per message would let two inputs from one source overtake each other).
-    bus: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<Wire>>>,
+    bus: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    bus_bulk: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    bus_user: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
 }
 
 impl Fanout {
@@ -216,6 +232,8 @@ impl Fanout {
             leader: Arc::new(AtomicBool::new(true)),
             fleets: Arc::new(OnceLock::new()),
             bus: Arc::new(OnceLock::new()),
+            bus_bulk: Arc::new(OnceLock::new()),
+            bus_user: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
             social: Arc::new(OnceLock::new()),
             online_remote: Arc::new(dashmap::DashMap::new()),
@@ -269,15 +287,30 @@ impl Fanout {
             });
             let mut rx = c.subscribe();
             let me = f.clone();
+            // the broadcast ring drops messages for a slow subscriber; applying a message takes
+            // world locks and can be slow under replication traffic, so a trivial forwarder drains
+            // the ring into an unbounded queue and a worker applies from there — nothing is lost,
+            // a burst only grows the queue for a moment
+            let (q_tx, mut q_rx) =
+                tokio::sync::mpsc::unbounded_channel::<musubi_cluster::BusMessage>();
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(m) => me.apply(&m),
+                        Ok(m) => {
+                            if q_tx.send(m).is_err() {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(dropped = n, "fanout bus lagged");
                         }
                         Err(_) => break,
                     }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some(m) = q_rx.recv().await {
+                    me.apply(&m);
                 }
             });
         }
@@ -472,6 +505,28 @@ impl Fanout {
             from_node,
             accepted,
             resend_full,
+        });
+    }
+
+    pub fn world_adopted(
+        &self,
+        world: &str,
+        cell: musubi_mesh::CellId,
+        from_node: uuid::Uuid,
+        ids: Vec<musubi_mesh::EntityId>,
+    ) {
+        self.publish(Wire::WorldAdopted {
+            world: world.to_string(),
+            cell,
+            from_node,
+            ids,
+        });
+    }
+    pub fn world_drop(&self, world: &str, to_node: uuid::Uuid, ids: Vec<musubi_mesh::EntityId>) {
+        self.publish(Wire::WorldDrop {
+            world: world.to_string(),
+            to_node,
+            ids,
         });
     }
 
@@ -856,6 +911,34 @@ impl Fanout {
                     }
                 }
             }
+            Ok(Wire::WorldAdopted {
+                world,
+                cell: _,
+                from_node,
+                ids,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    if from_node != w.node_id() {
+                        let dups = w.duplicates_of(&world, &ids);
+                        tracing::info!(world = %world, from = %from_node, announced = ids.len(), duplicates = dups.len(), "adopted entities announced by another node");
+                        if !dups.is_empty() {
+                            self.world_drop(&world, from_node, dups);
+                        }
+                    }
+                }
+            }
+            Ok(Wire::WorldDrop {
+                world,
+                to_node,
+                ids,
+            }) => {
+                if let Some(w) = self.worlds.get() {
+                    if to_node == w.node_id() {
+                        tracing::info!(world = %world, ids = ids.len(), "drop request for duplicate copies");
+                        w.drop_duplicates(&world, &ids);
+                    }
+                }
+            }
             Ok(Wire::WorldTxPrepare {
                 world,
                 tx,
@@ -1005,17 +1088,74 @@ impl Fanout {
         let Some(c) = self.cluster.clone() else {
             return;
         };
-        let tx = self.bus.get_or_init(|| {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Wire>();
+        // three lanes, each its own queue, so one kind of traffic cannot starve another: bulk
+        // replication (ghost and replica deltas, their acks — ordered, one at a time), user
+        // traffic (chat, presence, relayed match input — high volume, published with bounded
+        // concurrency) and mesh/session control (handovers, acks, adoption/drop reconciliation,
+        // matchmaking — ordered, must not wait behind the other two; the stand saw control
+        // messages queue 48 s behind chat in a single queue)
+        let (lane, concurrency) = match w {
+            Wire::WorldGhosts { .. } | Wire::WorldRepl { .. } | Wire::WorldReplAck { .. } => {
+                (&self.bus_bulk, 1)
+            }
+            Wire::Channel { .. }
+            | Wire::Account { .. }
+            | Wire::Presence { .. }
+            | Wire::Online { .. }
+            | Wire::RelayedCmd { .. } => (&self.bus_user, 32),
+            _ => (&self.bus, 1),
+        };
+        let tx = lane.get_or_init(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(std::time::Instant, Wire)>();
             tokio::spawn(async move {
-                while let Some(w) = rx.recv().await {
-                    if let Err(e) = c.publish(TOPIC, &w).await {
-                        tracing::warn!(error = %e, "fanout publish failed");
+                let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+                // one "slow" warning per lane per second, not one per message
+                let last_warn = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+                while let Some((queued, w)) = rx.recv().await {
+                    let Ok(permit) = sem.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let c = c.clone();
+                    let last_warn = last_warn.clone();
+                    let one = async move {
+                        let waited = queued.elapsed();
+                        let started = std::time::Instant::now();
+                        if let Err(e) = c.publish(TOPIC, &w).await {
+                            tracing::warn!(error = %e, "fanout publish failed");
+                        }
+                        let took = started.elapsed();
+                        let slow = waited.as_millis() > 1000 || took.as_millis() > 1000;
+                        let report = slow && {
+                            let mut l = last_warn.lock().unwrap();
+                            let due = l.is_none_or(|t| t.elapsed().as_secs() >= 1);
+                            if due {
+                                *l = Some(std::time::Instant::now());
+                            }
+                            due
+                        };
+                        if report {
+                            let kind = serde_json::to_value(&w)
+                                .ok()
+                                .and_then(|v| v.as_object().and_then(|o| o.keys().next().cloned()))
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                kind,
+                                waited_ms = waited.as_millis() as u64,
+                                publish_ms = took.as_millis() as u64,
+                                "fanout bus slow"
+                            );
+                        }
+                        drop(permit);
+                    };
+                    if concurrency > 1 {
+                        tokio::spawn(one);
+                    } else {
+                        one.await;
                     }
                 }
             });
             tx
         });
-        let _ = tx.send(w);
+        let _ = tx.send((std::time::Instant::now(), w));
     }
 }

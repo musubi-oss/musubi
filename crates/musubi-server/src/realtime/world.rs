@@ -463,6 +463,11 @@ struct SubOpts {
     unconfirmed: std::collections::HashSet<musubi_mesh::EntityId>,
 }
 
+/// Registry ticks an adopted cell keeps re-announcing the entity ids restored from a dead shard.
+const ADOPT_ANNOUNCE_TICKS: u32 = 60;
+/// Every N of those ticks an announcement goes out (60, 40, 20 ticks left).
+const ADOPT_ANNOUNCE_EVERY: u32 = 20;
+
 pub struct WorldRegistry {
     node_id: Uuid,
     /// `node.cluster_group`: worlds of other clusters sharing the database are invisible here.
@@ -498,6 +503,9 @@ pub struct WorldRegistry {
     /// (world, cell, previous host) shards already merged after a hand-back, so a later
     /// reconciliation round does not resurrect entities despawned since.
     adopted_from: DashSet<(String, CellId, Uuid)>,
+    /// Entities restored from a dead host's shard, not yet announced to the other hosts of the
+    /// world (they drop duplicates of copies that had handed over before the crash).
+    adopted_pending: DashMap<(String, CellId), (Vec<EntityId>, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +645,7 @@ impl WorldRegistry {
             peers: std::sync::RwLock::new(Vec::new()),
             host_terms: DashMap::new(),
             adopted_from: DashSet::new(),
+            adopted_pending: DashMap::new(),
             cluster: std::sync::OnceLock::new(),
             region: std::sync::OnceLock::new(),
             events: std::sync::OnceLock::new(),
@@ -919,7 +928,18 @@ impl WorldRegistry {
                 .filter(|e| st.world.cell_of(e.pos) == cell && st.world.get(e.id).is_none())
                 .collect();
             let n = ents.len();
+            let ids: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
             st.world.restore(ents);
+            if !ids.is_empty() {
+                {
+                    let mut e = self
+                        .adopted_pending
+                        .entry((name.to_string(), cell))
+                        .or_insert((Vec::new(), 0));
+                    e.0.extend(ids);
+                    e.1 = ADOPT_ANNOUNCE_TICKS;
+                }
+            }
             n
         };
         self.adopted_from.insert((name.to_string(), cell, prev));
@@ -1623,6 +1643,7 @@ impl WorldRegistry {
                         .filter(|e| st.world.get(e.id).is_none())
                         .collect();
                     let n = ents.len();
+                    self.queue_adopted(&name, ents.iter().map(|e| (e.id, e.cell)));
                     st.world.restore(ents);
                     st.hosted_only = false;
                     st.home_node = None;
@@ -1650,6 +1671,9 @@ impl WorldRegistry {
             // shards of cell hosts that are still alive keep living there
             let live: Vec<Uuid> = assigned.get(&name).cloned().unwrap_or_default().into_iter().filter(|h| !dead_nodes.contains(h) && is_live(h)).collect();
             let replayed = Self::load_shards(db, &name, &live, false, &mut world).await?;
+            // everything here came from shards of nodes that are gone: a live host may still own
+            // an entity that handed over before the crash
+            self.queue_adopted(&name, world.snapshot_persistent().iter().map(|e| (e.id, e.cell)));
             if replayed > 0 {
                 tracing::info!(world = %name, ops = replayed, tick = world.tick, "world journal replayed");
             }
@@ -1991,7 +2015,18 @@ impl WorldRegistry {
                         let mut ents = m.cache.drain();
                         ents.retain(|e| st.world.get(e.id).is_none());
                         let n = ents.len();
+                        let adopted: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
                         st.world.restore(ents);
+                        if !adopted.is_empty() {
+                            {
+                                let mut e = self
+                                    .adopted_pending
+                                    .entry((name.clone(), cell))
+                                    .or_insert((Vec::new(), 0));
+                                e.0.extend(adopted);
+                                e.1 = ADOPT_ANNOUNCE_TICKS;
+                            }
+                        }
                         tracing::info!(world = %name, ?cell, node = %dead, tick = m.tick, entities = n, "cell taken over from its replica mirror");
                         mirrored = true;
                     }
@@ -2014,7 +2049,18 @@ impl WorldRegistry {
                         ents.retain(|e| st.world.get(e.id).is_none());
                         // cells restored from a mirror are complete and newer than the shard
                         ents.retain(|e| !mirrored_cells.contains(&(name.clone(), e.cell)));
+                        let adopted: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
                         st.world.restore(ents);
+                        if !adopted.is_empty() {
+                            {
+                                let mut e = self
+                                    .adopted_pending
+                                    .entry((name.clone(), cell))
+                                    .or_insert((Vec::new(), 0));
+                                e.0.extend(adopted);
+                                e.1 = ADOPT_ANNOUNCE_TICKS;
+                            }
+                        }
                     }
                     tracing::info!(world = %name, node = %dead, replayed = n, "dead cell host's shard restored");
                     sqlx::query(
@@ -2983,9 +3029,11 @@ impl WorldRegistry {
             if accepted {
                 if let Some(e) = st.world.get(id).cloned() {
                     let cell = st.world.cell_of(e.pos);
+                    // an unassigned cell (host gone, lease not yet re-taken) is not ours either:
+                    // the node that accepted the entity hosts it now
                     let elsewhere = match self.cell_hosts.get(&(name.to_string(), cell)) {
                         Some(h) => *h != self.node_id,
-                        None => st.hosted_only,
+                        None => true,
                     };
                     if elsewhere {
                         tracing::info!(world = name, %id, "late handover ack: stale local copy dropped");
@@ -3714,6 +3762,78 @@ impl WorldRegistry {
         }
     }
 
+    /// Remember ids restored from the shards of hosts that are gone, per cell, so the next
+    /// registry ticks announce them and a live owner elsewhere can answer with a drop.
+    fn queue_adopted(&self, name: &str, ents: impl IntoIterator<Item = (EntityId, CellId)>) {
+        for (id, cell) in ents {
+            let mut e = self
+                .adopted_pending
+                .entry((name.to_string(), cell))
+                .or_insert((Vec::new(), 0));
+            e.0.push(id);
+            e.1 = ADOPT_ANNOUNCE_TICKS;
+        }
+    }
+
+    /// Of `ids`, the persistent entities this node holds (owned, or in transit towards a host
+    /// that may be the dead one — the transfer is cancelled and the entity stays here): the
+    /// adopter that just restored them from a dead shard must drop its duplicates.
+    pub fn duplicates_of(&self, name: &str, ids: &[EntityId]) -> Vec<EntityId> {
+        let Ok(w) = self.get(name) else {
+            return Vec::new();
+        };
+        let st = w.lock();
+        // the directory decides who hosts the cell, not a local lease: a host that lost the cell
+        // (or a zombie that still believes it has it) must not make the new owner drop its copy
+        let hosted_here = |cell: CellId| match self.cell_hosts.get(&(name.to_string(), cell)) {
+            Some(h) => *h == self.node_id,
+            None => !st.hosted_only,
+        };
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                st.world
+                    .get(*id)
+                    .is_some_and(|e| e.persistent && hosted_here(e.cell))
+            })
+            .collect()
+    }
+
+    /// Drop restored copies another host still owns live (see `duplicates_of`).
+    pub fn drop_duplicates(&self, name: &str, ids: &[EntityId]) -> usize {
+        let Ok(w) = self.get(name) else {
+            return 0;
+        };
+        let mut st = w.lock();
+        let st = &mut *st;
+        let mut n = 0;
+        for id in ids {
+            if st.world.get(*id).is_none() {
+                continue;
+            }
+            st.world.forget_for_clients(*id);
+            if st.world.despawn(*id) {
+                n += 1;
+                st.journal.push(WorldOp {
+                    tick: st.world.tick,
+                    op: WorldMutation::Despawn { id: *id },
+                    source: Some(Provenance {
+                        by: "dedupe".into(),
+                        sim: None,
+                    }),
+                });
+            }
+        }
+        if n > 0 {
+            tracing::info!(
+                world = name,
+                dropped = n,
+                "duplicate copies restored from a dead shard dropped"
+            );
+        }
+        n
+    }
+
     /// One tick of one world: simulation step, handovers, admission, decay, then the per-client
     /// delta fan-out. Worlds are independent, so the ticker runs these concurrently.
     /// Stream every hosted cell to its standby replicas (`WorldConfig::replicas`): one delta per
@@ -3757,7 +3877,34 @@ impl WorldRegistry {
         }
     }
 
+    /// Entities restored from a dead shard (or kept after a cancelled handover) are announced so a
+    /// host already owning a live copy answers with a drop; see `queue_adopted`.
+    fn announce_adopted(&self, name: &str, fanout: &Fanout) {
+        // announce what we restored from a dead shard: a host already owning a live copy (the
+        // entity handed over before the crash, the Despawn never reached the journal) answers
+        // with a drop
+        // announced several times over ADOPT_ANNOUNCE_TICKS: a transfer from the dead host may
+        // still be in flight to its target, or the target may still hold the entity in transit
+        // towards the dead host and only claim it back once it notices the death
+        let mut announce: Vec<((String, CellId), Vec<EntityId>)> = Vec::new();
+        self.adopted_pending.retain(|key, (ids, left)| {
+            if key.0 != name {
+                return true;
+            }
+            if *left % ADOPT_ANNOUNCE_EVERY == 0 {
+                announce.push((key.clone(), ids.clone()));
+            }
+            *left = left.saturating_sub(1);
+            *left > 0
+        });
+        for ((name, cell), ids) in announce {
+            tracing::info!(world = %name, ?cell, ids = ids.len(), "announcing entities adopted from a dead shard");
+            fanout.world_adopted(&name, cell, self.node_id, ids);
+        }
+    }
+
     pub fn tick_world(&self, name: &str, fanout: &Fanout) {
+        self.announce_adopted(name, fanout);
         let Some(w) = self.worlds.get(name).map(|w| w.clone()) else {
             return;
         };
@@ -3985,9 +4132,14 @@ impl WorldRegistry {
                                     .filter(|h| *h != self.node_id)
                             });
                         let Some(host) = fresh else {
-                            // the cell is ours now: the entity simply stays
+                            // the cell is ours now: the entity stays — but the copy we shipped may
+                            // have been accepted by a host whose ack never arrived, so announce it
+                            // like a restored one and let a live owner answer with a drop
                             st.remote_transit.remove(&entity);
                             st.world.cancel_handover(entity);
+                            if let Some(c) = st.world.get(entity).map(|e| e.cell) {
+                                self.queue_adopted(&name, std::iter::once((entity, c)));
+                            }
                             tracing::info!(world = %name, %entity, was = %stale, "cross-node handover dropped: target cell is local now");
                             continue;
                         };

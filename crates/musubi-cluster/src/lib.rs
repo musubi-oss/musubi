@@ -142,7 +142,7 @@ pub struct BusMessage {
 impl Cluster {
     pub fn new(db: PgPool, name: &str, region: &str, roles: Vec<String>, advertise: &str) -> Self {
         let now = OffsetDateTime::now_utc();
-        let (bus_tx, _) = broadcast::channel(4096);
+        let (bus_tx, _) = broadcast::channel(65536);
         Self {
             db,
             me: NodeInfo {
