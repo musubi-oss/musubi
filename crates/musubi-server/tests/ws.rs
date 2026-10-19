@@ -187,6 +187,13 @@ async fn build_state_cfg_with(
                 fanout.clone(),
             ),
         ),
+        turns: musubi_server::turns::TurnService::new(
+            db.clone(),
+            musubi_server::notify::Notifier::new(
+                musubi_social::NotificationService::new(db.clone()),
+                fanout.clone(),
+            ),
+        ),
         notify: musubi_server::notify::Notifier::new(
             musubi_social::NotificationService::new(db.clone()),
             fanout.clone(),

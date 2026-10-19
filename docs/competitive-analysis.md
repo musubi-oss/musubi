@@ -445,7 +445,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Group events / group rewards |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Group petition / apply / invite / kick / role change |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Group recommended & availability (name/tag availability) |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — Name uniqueness check exists; no recommendations |
-| Async turn-based matches |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no turn-based async match service (grep `turn` none); would be modelled over storage + no… |
+| Async turn-based matches |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `/v1/turns` — seats, invites/open/code join, round-robin + explicit next seat, board + version OCC, deadlines with skip|resign, move history, rematch, `turn_match.*` events + no… |
 | Group Entities |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Group leaderboards |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — leaderboards filter by group members (`http/leaderboards.rs`), group challenges/wars; no… |
 | Group monitoring (portal) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — admin group routes exist; no UI |
@@ -4553,7 +4553,7 @@ Features only one report listed (after normalization). Each line: priority · co
 
 **P1 · social** — owner: musubi-social (`/v1/friends*`, `/v1/notifications*`, realtime `status_*`/`party_*`)
 
-- ❌ **brainCloud** · Async turn-based matches — `CreateMatch[WithInitialTurn]`, `SubmitTurn(version, matchState, statistics, pushContent, summary)`, `UpdateMatchSummaryData`, `UpdateMatch… — *no turn-based async match service (grep `turn` none); would be modelled over storage + notifications* — [source](https://docs.braincloudservers.com/api/capi/asyncmatch)
+- ✅ **brainCloud** · Async turn-based matches — `CreateMatch[WithInitialTurn]`, `SubmitTurn(version, matchState, statistics, pushContent, summary)`, `UpdateMatchSummaryData`, `UpdateMatch… — *no turn-based async match service (grep `turn` none); would be modelled over storage + notifications* — [source](https://docs.braincloudservers.com/api/capi/asyncmatch)
 - ❌ **Nakama** · Friend codes guide (runtime-generated short codes via storage index + RPC) — pattern, not built-in — OSS guide — *no friend-code primitive in musubi either (rg -i friend_code → none); would be a WASM module pattern as in Nakama* — [source](https://heroiclabs.com/docs/nakama/guides/concepts/friend-codes/)
 - ❌ **SpacetimeDB** · Submodules (TS only) — Namespaced tables/functions/views/scheduled tables/HTTP handlers; lifecycle reducers root-only; reusable library (cron, crypto, rate-limit,… — *musubi modules are separate WASM units with host API; no composable module namespaces/library ecosystem*
 

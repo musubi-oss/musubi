@@ -123,6 +123,14 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
             )
             .with_push(push.clone()),
         ),
+        turns: musubi_server::turns::TurnService::new(
+            db.clone(),
+            musubi_server::notify::Notifier::new(
+                musubi_social::NotificationService::new(db.clone()),
+                fanout.clone(),
+            )
+            .with_push(push.clone()),
+        ),
         notify: musubi_server::notify::Notifier::new(
             musubi_social::NotificationService::new(db.clone()),
             fanout.clone(),
@@ -18459,7 +18467,7 @@ async fn offers_and_placements_lifecycle() {
     let (st, _) = call_server(
         &app,
         "PUT",
-        &format!("/v1/server/session_placements/{pl}"),
+        &format!("/v1/server/placements/{pl}"),
         k,
         Some(json!({"name": "Shop banner", "max_offers": 0})),
     )
@@ -18468,7 +18476,7 @@ async fn offers_and_placements_lifecycle() {
     let (st, r) = call_server(
         &app,
         "PUT",
-        &format!("/v1/server/session_placements/{pl}"),
+        &format!("/v1/server/placements/{pl}"),
         k,
         Some(json!({"name": "Shop banner", "max_offers": 2})),
     )
@@ -18644,7 +18652,7 @@ async fn offers_and_placements_lifecycle() {
     let (st, pv) = call_server(
         &app,
         "GET",
-        &format!("/v1/server/session_placements/{pl}/offers?account_id={bid}"),
+        &format!("/v1/server/placements/{pl}/offers?account_id={bid}"),
         k,
         None,
     )
@@ -18697,7 +18705,7 @@ async fn offers_and_placements_lifecycle() {
     let _ = call_server(
         &app,
         "DELETE",
-        &format!("/v1/server/session_placements/{pl}"),
+        &format!("/v1/server/placements/{pl}"),
         k,
         None,
     )
@@ -33380,4 +33388,507 @@ async fn placements_queue_until_capacity_or_timeout() {
     assert_ne!(g["allocation"]["server_id"], sid);
 
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+}
+
+#[tokio::test]
+async fn turn_based_matches_flow() {
+    let Some((app, state)) = app_and_state_with(|_| {}).await else {
+        return;
+    };
+    let k = "defaultkey";
+    async fn user(app: &Router, tag: &str) -> (String, String) {
+        let (st, s) = call(
+            app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(tag)})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{s}");
+        (
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        )
+    }
+    let (a, a_id) = user(&app, "turn-a").await;
+    let (b, b_id) = user(&app, "turn-b").await;
+    let (c, _c_id) = user(&app, "turn-c").await;
+
+    // validation
+    for (bad, want) in [
+        (json!({"game": "Bad Game"}), StatusCode::BAD_REQUEST),
+        (
+            json!({"game": "chess", "max_players": 1}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"game": "chess", "turn_secs": 5}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"game": "chess", "timeout_action": "explode"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"game": "chess", "invite": [a_id]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"game": "chess", "invite": [b_id, b_id], "max_players": 3}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"game": "chess", "metadata": 1}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"game": "chess", "invite": [uuid::Uuid::now_v7()]}),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (st, v) = call(&app, "POST", "/v1/turns", Some(&a), Some(bad.clone())).await;
+        assert_eq!(st, want, "{bad} -> {v}");
+    }
+
+    // private invitation match
+    let (st, m) = call(
+        &app,
+        "POST",
+        "/v1/turns",
+        Some(&a),
+        Some(
+            json!({"game": "chess", "visibility": "private", "invite": [b_id], "turn_secs": 60,
+            "board": {"fen": "start"}, "metadata": {"rated": true}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let id = m["id"].as_str().unwrap().to_string();
+    assert_eq!(m["state"], "open");
+    assert!(m["code"].is_string());
+    assert_eq!(m["players"][0]["seat"], 0);
+    assert_eq!(m["players"][0]["status"], "active");
+    assert_eq!(m["players"][1]["account_id"], b_id);
+    assert_eq!(m["players"][1]["status"], "invited");
+
+    // outsider: private → forbidden to join, invisible to get
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/turns/join",
+        Some(&c),
+        Some(json!({"id": id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(&app, "GET", &format!("/v1/turns/{id}"), Some(&c), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "POST", "/v1/turns/join", Some(&c), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, mine) = call(&app, "GET", "/v1/turns/mine", Some(&b), None).await;
+    assert_eq!(st, StatusCode::OK, "{mine}");
+    assert_eq!(mine["matches"][0]["id"], id);
+    assert_eq!(mine["matches"][0]["my_status"], "invited");
+
+    // invitee joins → full → auto start
+    let (st, m) = call(
+        &app,
+        "POST",
+        "/v1/turns/join",
+        Some(&b),
+        Some(json!({"id": id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["state"], "active");
+    assert_eq!(m["turn"], 1);
+    assert_eq!(m["current_seat"], 0);
+    assert!(m["deadline_at"].as_i64().unwrap() > m["started_at"].as_i64().unwrap());
+    assert!(m["code"].is_null());
+    let v0 = m["version"].as_i64().unwrap();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/turns/join",
+        Some(&b),
+        Some(json!({"id": id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // moves: wrong seat, stale version, ok
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/move"),
+        Some(&b),
+        Some(json!({"data": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/move"),
+        Some(&c),
+        Some(json!({"data": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/move"),
+        Some(&a),
+        Some(json!({"data": {}, "version": v0 - 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/move"),
+        Some(&a),
+        Some(json!({"data": {}, "next_seat": 7})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, m) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/move"),
+        Some(&a),
+        Some(json!({"data": {"from": "e2", "to": "e4"}, "board": {"fen": "after-e4"}, "version": v0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["turn"], 2);
+    assert_eq!(m["current_seat"], 1);
+    assert_eq!(m["version"], v0 + 1);
+    assert_eq!(m["board"]["fen"], "after-e4");
+
+    let (st, g) = call(&app, "GET", &format!("/v1/turns/{id}"), Some(&a), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(g["moves"].as_array().unwrap().len(), 1);
+    assert_eq!(g["moves"][0]["kind"], "move");
+    assert_eq!(g["moves"][0]["data"]["to"], "e4");
+    let (_, g) = call(
+        &app,
+        "GET",
+        &format!("/v1/turns/{id}?since_turn=1"),
+        Some(&a),
+        None,
+    )
+    .await;
+    assert_eq!(g["moves"].as_array().unwrap().len(), 0);
+    let (_, mine) = call(&app, "GET", "/v1/turns/mine?state=active", Some(&b), None).await;
+    assert_eq!(mine["matches"][0]["my_turn"], true);
+    let (_, mine) = call(&app, "GET", "/v1/turns/mine?state=active", Some(&a), None).await;
+    assert_eq!(mine["matches"][0]["my_turn"], false);
+
+    // deadline passes → skip (timeout_action skip, max_skips 3)
+    sqlx::query(
+        "update musubi.turn_matches set deadline_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&id).unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (st, sw) = call_server(&app, "POST", "/v1/server/turns/sweep", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{sw}");
+    assert_eq!(sw["timed_out"], 1);
+    let (_, g) = call(&app, "GET", &format!("/v1/turns/{id}"), Some(&a), None).await;
+    assert_eq!(g["state"], "active");
+    assert_eq!(g["turn"], 3);
+    assert_eq!(g["current_seat"], 0);
+    assert_eq!(g["players"][1]["skips"], 1);
+    assert_eq!(g["moves"][1]["kind"], "skip");
+    assert_eq!(g["moves"][1]["seat"], 1);
+
+    // resign → last player standing wins
+    let (st, m) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/resign"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["state"], "finished");
+    assert_eq!(m["winners"], json!([0]));
+    assert_eq!(m["result"]["reason"], "last_player_standing");
+    assert_eq!(m["players"][1]["status"], "resigned");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/move"),
+        Some(&a),
+        Some(json!({"data": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (_, g) = call(&app, "GET", &format!("/v1/turns/{id}"), Some(&a), None).await;
+    assert_eq!(
+        g["moves"].as_array().unwrap().last().unwrap()["kind"],
+        "resign"
+    );
+
+    // rematch: same settings, loser hosts, winner invited; declared finish
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{id}/rematch"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let rid = r["id"].as_str().unwrap().to_string();
+    assert_eq!(r["rematch_of"], id);
+    assert_eq!(r["game"], "chess");
+    assert_eq!(r["turn_secs"], 60);
+    assert_eq!(r["metadata"]["rated"], true);
+    assert_eq!(r["players"][0]["account_id"], b_id);
+    assert_eq!(r["players"][1]["status"], "invited");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{rid}/rematch"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/turns/join",
+        Some(&a),
+        Some(json!({"id": rid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["state"], "active");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{rid}/move"),
+        Some(&b),
+        Some(json!({"data": {"mate": true}, "finish": {"winners": [9]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{rid}/move"),
+        Some(&b),
+        Some(
+            json!({"data": {"mate": true}, "finish": {"winners": [0], "result": {"score": "1-0"}}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["state"], "finished");
+    assert_eq!(r["winners"], json!([0]));
+    assert_eq!(r["result"]["score"], "1-0");
+
+    // public open match: listing, join by code is for private; creator starts early; server API
+    let game = format!("go-{}", &uuid::Uuid::now_v7().simple().to_string()[..16]);
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/turns",
+        Some(&c),
+        Some(json!({"game": game, "max_players": 3, "min_players": 2, "timeout_action": "resign", "turn_secs": 30})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    let pid = p["id"].as_str().unwrap().to_string();
+    let (st, open) = call(
+        &app,
+        "GET",
+        &format!("/v1/turns?game={game}"),
+        Some(&a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(open["matches"].as_array().unwrap().len(), 1);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{pid}/start"),
+        Some(&c),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "needs min players");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/turns/join",
+        Some(&a),
+        Some(json!({"id": pid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{pid}/start"),
+        Some(&a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "only creator starts");
+    let (st, p) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{pid}/start"),
+        Some(&c),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    assert_eq!(p["state"], "active");
+    assert_eq!(p["players"].as_array().unwrap().len(), 2);
+    let (_, open) = call(
+        &app,
+        "GET",
+        &format!("/v1/turns?game={game}"),
+        Some(&a),
+        None,
+    )
+    .await;
+    assert_eq!(open["matches"].as_array().unwrap().len(), 0);
+    // timeout_action resign: the overdue seat loses on the spot
+    sqlx::query(
+        "update musubi.turn_matches set deadline_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&pid).unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (_, sw) = call_server(&app, "POST", "/v1/server/turns/sweep", k, None).await;
+    assert_eq!(sw["timed_out"], 1);
+    let (_, p) = call(&app, "GET", &format!("/v1/turns/{pid}"), Some(&a), None).await;
+    assert_eq!(p["state"], "finished", "{p}");
+    assert_eq!(p["winners"], json!([1]));
+    assert_eq!(p["players"][0]["status"], "timed_out");
+    assert_eq!(p["moves"][0]["kind"], "timeout");
+
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/turns?game={game}&state=finished"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["matches"].as_array().unwrap().len(), 1);
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/turns?account_id={b_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["matches"].as_array().unwrap().len(), 2);
+    let (st, _) = call_server(&app, "GET", "/v1/server/turns?state=weird", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // leave / cancel / forced finish / delete / expired open
+    let (st, q) = call(
+        &app,
+        "POST",
+        "/v1/turns",
+        Some(&c),
+        Some(json!({"game": game, "max_players": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{q}");
+    let qid = q["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/turns/join",
+        Some(&b),
+        Some(json!({"id": qid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, q) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{qid}/leave"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{q}");
+    assert_eq!(q["players"].as_array().unwrap().len(), 1);
+    let (st, q) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/turns/{qid}/finish"),
+        k,
+        Some(json!({"result": {"reason": "abuse"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{q}");
+    assert_eq!(q["state"], "cancelled");
+    assert_eq!(q["result"]["reason"], "abuse");
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/turns/{qid}"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "GET", &format!("/v1/server/turns/{qid}"), k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, q) = call(
+        &app,
+        "POST",
+        "/v1/turns",
+        Some(&c),
+        Some(json!({"game": game})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{q}");
+    let qid = q["id"].as_str().unwrap().to_string();
+    let (st, q) = call(
+        &app,
+        "POST",
+        &format!("/v1/turns/{qid}/leave"),
+        Some(&c),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{q}");
+    assert_eq!(q["state"], "cancelled");
+    let (st, q) = call(
+        &app,
+        "POST",
+        "/v1/turns",
+        Some(&c),
+        Some(json!({"game": game})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{q}");
+    let qid = q["id"].as_str().unwrap().to_string();
+    sqlx::query(
+        "update musubi.turn_matches set created_at = now() - interval '2 days' where id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&qid).unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (_, sw) = call_server(&app, "POST", "/v1/server/turns/sweep", k, None).await;
+    assert!(sw["cancelled"].as_i64().unwrap() >= 1, "{sw}");
+    let (_, q) = call_server(&app, "GET", &format!("/v1/server/turns/{qid}"), k, None).await;
+    assert_eq!(q["state"], "cancelled");
+    assert_eq!(q["result"]["reason"], "expired");
 }

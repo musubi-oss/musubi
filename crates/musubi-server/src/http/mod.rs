@@ -68,6 +68,7 @@ pub mod streams;
 pub(crate) mod subscriptions;
 pub mod timers;
 pub mod tournaments;
+mod turns;
 mod tx;
 mod ugc;
 mod workflows;
@@ -229,6 +230,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(leaderboards::routes())
         .merge(lobbies::routes())
+        .merge(turns::routes())
         .merge(tournaments::routes())
         .merge(rpc::routes())
         .merge(cluster::routes())

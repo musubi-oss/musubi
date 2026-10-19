@@ -50,6 +50,7 @@ pub struct AppStateInner {
     pub groups: GroupService,
     pub notify: Notifier,
     pub lobbies: crate::lobby::LobbyService,
+    pub turns: crate::turns::TurnService,
     pub game_sessions: crate::game_sessions::GameSessionService,
     pub async_mm: crate::async_mm::AsyncMatchService,
     pub auth_providers: crate::auth_providers::AuthProviderService,
@@ -720,6 +721,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         lobbies: crate::lobby::LobbyService::new(db.clone(), notify.clone()),
+        turns: crate::turns::TurnService::new(db.clone(), notify.clone()),
         game_sessions: crate::game_sessions::GameSessionService::new(db.clone()),
         async_mm: crate::async_mm::AsyncMatchService::new(db.clone()),
         auth_providers: crate::auth_providers::AuthProviderService::new(db.clone()),
@@ -828,6 +830,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     if let Some(c) = state.cluster.clone() {
         let lease = c.lease("placements", musubi_cluster::DEAD_AFTER);
         crate::http::placements::spawn_worker(state.clone(), move || lease.held());
+    }
+    state.turns.bind_events(state.events.clone());
+    if let Some(c) = state.cluster.clone() {
+        let lease = c.lease("turns", musubi_cluster::DEAD_AFTER);
+        state.turns.clone().spawn_sweeper(move || lease.held());
     }
     if let Some(c) = state.cluster.clone() {
         let ev = state.events.clone();

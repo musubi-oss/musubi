@@ -51,6 +51,7 @@ pub mod scopes;
 pub mod security;
 pub mod telemetry;
 pub mod translate;
+pub mod turns;
 pub mod workflows;
 
 pub use app::run;
