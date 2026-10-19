@@ -36438,3 +36438,249 @@ async fn config_sources_sync_csv_json_and_errors() {
     let (st, _) = call_server(&app, "POST", &sync, k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn title_files_tags_and_manifest_queries() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let raw = |method: &'static str,
+               path: String,
+               headers: Vec<(&'static str, String)>,
+               body: Vec<u8>| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder().method(method).uri(path);
+            for (h, v) in headers {
+                req = req.header(h, v);
+            }
+            let res = app
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let st = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let dir = unique("tags").to_lowercase();
+    let hs = || {
+        vec![
+            ("x-musubi-server-key", k.to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]
+    };
+    // bad tags
+    let (st, v) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/a.txt?tags=Bad%20Tag"),
+        hs(),
+        b"a".to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let many: Vec<String> = (0..17).map(|i| format!("t{i}")).collect();
+    let (st, v) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/a.txt?tags={}", many.join(",")),
+        hs(),
+        b"a".to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // upload three files with tags
+    let (st, v) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/a.txt?tags=HD,season-3,%20hd%20"),
+        hs(),
+        b"a".to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["tags"],
+        json!(["hd", "season-3"]),
+        "lower-cased, deduplicated: {v}"
+    );
+    let (_, v) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/b.txt?tags=sd,season-3"),
+        hs(),
+        b"bb".to_vec(),
+    )
+    .await;
+    assert_eq!(v["tags"], json!(["sd", "season-3"]));
+    let (_, v) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/c.txt"),
+        hs(),
+        b"ccc".to_vec(),
+    )
+    .await;
+    assert_eq!(v["tags"], json!([]));
+    // re-upload without tags keeps them
+    let (_, v) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/a.txt"),
+        hs(),
+        b"a2".to_vec(),
+    )
+    .await;
+    assert_eq!(v["tags"], json!(["hd", "season-3"]), "{v}");
+    assert_eq!(v["version"], 2);
+    // manifest filters
+    let names = |m: &Value| -> Vec<String> {
+        m["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                f["path"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let (st, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(names(&m), vec!["a.txt", "b.txt", "c.txt"]);
+    assert_eq!(m["files"][0]["tags"], json!(["hd", "season-3"]));
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&tags=season-3"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(names(&m), vec!["a.txt", "b.txt"]);
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&tags=season-3,hd"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(names(&m), vec!["a.txt"], "all-of: {m}");
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&any_tags=hd,sd"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(names(&m), vec!["a.txt", "b.txt"], "any-of: {m}");
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&tags=nope"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(names(&m), Vec::<String>::new());
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&omit_tags=true"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(names(&m).len(), 3);
+    assert!(m["files"][0].get("tags").is_none(), "omit_tags: {m}");
+    let (st, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&tags=bad%20tag"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{m}");
+    // tag index
+    let (st, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/tags?prefix={dir}/"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(
+        t["tags"],
+        json!([{"tag": "hd", "files": 1}, {"tag": "sd", "files": 1}, {"tag": "season-3", "files": 2}]),
+        "{t}"
+    );
+    // patch replaces the set; [] clears
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/files/{dir}/b.txt"),
+        k,
+        Some(json!({"tags": ["Legacy"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["tags"], json!(["legacy"]));
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/files/{dir}/b.txt"),
+        k,
+        Some(json!({"tags": ["bad tag"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/files/{dir}/a.txt"),
+        k,
+        Some(json!({"tags": []})),
+    )
+    .await;
+    assert_eq!(v["tags"], json!([]));
+    // server list by tag
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/files?prefix={dir}/&tag=LEGACY"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let files = l["files"]
+        .as_array()
+        .or_else(|| l.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(files.len(), 1, "{l}");
+    assert!(files[0]["path"].as_str().unwrap().ends_with("/b.txt"));
+    let (_, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/tags?prefix={dir}/"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(t["tags"], json!([{"tag": "legacy", "files": 1}]), "{t}");
+}

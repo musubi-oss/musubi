@@ -331,7 +331,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | **Typed collections / schema-as-code / automatic migrations** |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  | 🟡 0/1/0 · P2 |
 | *single-competitor features* |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | |
 | Cloud Save upload/download URLs & manifest commit |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — Blob presigned S3 routes exist for UGC/storage blobs; no manifest/commit semantics |
-| Content tags & tag-based `ContentQuery`; `OmitContentManifestTags` |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — No tags on content entries |
+| Content tags & tag-based `ContentQuery`; `OmitContentManifestTags` |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ title files carry `tags` (upload `?tags=hd,season-3`, `PATCH {tags}`), manifest filters `?tags=` (all of) / `?any_tags=` (any of) and `?omit_tags=true` drops them from items (`OmitContentManifestTags`), `GET /v1/files/tags` tag index with counts, server list `?tag=` |
 | Content validation (`MustReferenceContent`, field validators, Issues badge) |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — JSON-schema validation for storage schemas and IDL configs; no reference validators |
 | Environments dev→staging→prod & promotion |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `node.environment` + multi-project + content bundle import/export; promotion is manual ex… |
 | Old vs new Cloud Save services |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — — SDK-side |

@@ -21,6 +21,7 @@ use crate::http::{ApiError, ServerKey};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/files/manifest", get(manifest))
+        .route("/v1/files/tags", get(tags_index))
         .route("/v1/files/{*path}", get(download))
         .route("/v1/server/files", get(list_server))
         .route(
@@ -69,10 +70,38 @@ type FileRow = (
     i32,
     i64,
     Option<String>,
+    Vec<String>,
 );
 
 const FILE_COLS: &str = "path, size, sha256, mime, public, selector, metadata, version, \
-                         extract(epoch from updated_at)::bigint, blob_key";
+                         extract(epoch from updated_at)::bigint, blob_key, tags";
+
+const MAX_TAGS: usize = 16;
+
+/// `a,b, C` → `["a", "b", "c"]`: lower-case, trimmed, deduplicated, `[a-z0-9_.:-]{1,32}`, ≤ 16.
+fn parse_tags(raw: &str) -> Result<Vec<String>, ApiError> {
+    let mut out: Vec<String> = Vec::new();
+    for t in raw.split(',') {
+        let t = t.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() > 32
+            || !t
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.:-".contains(c))
+        {
+            return Err(Error::InvalidArgument(format!("tag `{t}`: [a-z0-9_.:-]{{1,32}}")).into());
+        }
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    if out.len() > MAX_TAGS {
+        return Err(Error::InvalidArgument("at most 16 tags per file".into()).into());
+    }
+    Ok(out)
+}
 
 fn url_for(s: &AppState, path: &str, public: bool) -> String {
     let base = s.cfg.files.public_base_url.trim_end_matches('/');
@@ -86,7 +115,7 @@ fn url_for(s: &AppState, path: &str, public: bool) -> String {
 fn file_doc(s: &AppState, r: &FileRow) -> Value {
     json!({ "path": r.0, "size": r.1, "sha256": r.2, "mime": r.3, "public": r.4, "selector": r.5,
         "metadata": r.6, "version": r.7, "updated_at": r.8, "url": url_for(s, &r.0, r.4),
-        "storage": if r.9.is_some() { "s3" } else { "db" } })
+        "storage": if r.9.is_some() { "s3" } else { "db" }, "tags": r.10 })
 }
 
 #[derive(Deserialize)]
@@ -99,6 +128,8 @@ struct UploadQ {
     environment: Option<String>,
     countries: Option<String>,
     metadata: Option<String>,
+    /// Comma-separated content tags (`hd,season-3`); omitted on re-upload = keep the current set.
+    tags: Option<String>,
 }
 
 fn yes() -> bool {
@@ -163,6 +194,10 @@ async fn upload(
         None => json!({}),
     };
     let selector = selector_from(&q);
+    let tags = match &q.tags {
+        Some(t) => Some(parse_tags(t)?),
+        None => None,
+    };
     let sha = hex::encode(sha2::Sha256::digest(&bytes));
     let size = bytes.len() as i64;
     let (blob, key): (Option<Vec<u8>>, Option<String>) = match &s.blobs {
@@ -174,12 +209,13 @@ async fn upload(
         None => (Some(bytes.to_vec()), None),
     };
     let row: FileRow = sqlx::query_as(&format!(
-        "insert into musubi.files (path, size, sha256, mime, blob, blob_key, public, selector, metadata)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "insert into musubi.files (path, size, sha256, mime, blob, blob_key, public, selector, metadata, tags)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, coalesce($10, '{{}}'::text[]))
          on conflict (path) do update set size = excluded.size, sha256 = excluded.sha256,
              mime = excluded.mime, blob = excluded.blob, blob_key = excluded.blob_key,
              public = excluded.public, selector = excluded.selector,
              metadata = musubi.files.metadata || excluded.metadata,
+             tags = coalesce($10, musubi.files.tags),
              version = musubi.files.version + 1, updated_at = now()
          returning {FILE_COLS}"
     ))
@@ -192,6 +228,7 @@ async fn upload(
     .bind(q.public)
     .bind(&selector)
     .bind(&metadata)
+    .bind(&tags)
     .fetch_one(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -210,6 +247,8 @@ struct MetaBody {
     public: Option<bool>,
     selector: Option<Value>,
     metadata: Option<Value>,
+    /// Replaces the tag set (`[]` clears it).
+    tags: Option<Vec<String>>,
 }
 
 async fn patch_meta(
@@ -223,15 +262,20 @@ async fn patch_meta(
             return Err(Error::InvalidArgument("selector must be an object".into()).into());
         }
     }
+    let tags = match &b.tags {
+        Some(t) => Some(parse_tags(&t.join(","))?),
+        None => None,
+    };
     let row: Option<FileRow> = sqlx::query_as(&format!(
         "update musubi.files set public = coalesce($2, public), selector = coalesce($3, selector),
-             metadata = coalesce($4, metadata), updated_at = now()
+             metadata = coalesce($4, metadata), tags = coalesce($5, tags), updated_at = now()
          where path = $1 returning {FILE_COLS}"
     ))
     .bind(&path)
     .bind(b.public)
     .bind(&b.selector)
     .bind(&b.metadata)
+    .bind(&tags)
     .fetch_optional(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -268,6 +312,7 @@ async fn delete(
 #[derive(Deserialize)]
 struct ListQ {
     prefix: Option<String>,
+    tag: Option<String>,
 }
 
 async fn list_server(
@@ -276,9 +321,11 @@ async fn list_server(
     Query(q): Query<ListQ>,
 ) -> Result<Json<Value>, ApiError> {
     let rows: Vec<FileRow> = sqlx::query_as(&format!(
-        "select {FILE_COLS} from musubi.files where path like $1 || '%' order by path"
+        "select {FILE_COLS} from musubi.files where path like $1 || '%'
+           and ($2::text is null or $2 = any(tags)) order by path"
     ))
     .bind(q.prefix.unwrap_or_default())
+    .bind(q.tag.map(|t| t.trim().to_ascii_lowercase()))
     .fetch_all(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -305,13 +352,68 @@ fn maybe_account(s: &AppState, headers: &HeaderMap) -> Result<bool, ApiError> {
 
 /// `GET /v1/files/manifest?prefix&platform&version` — public files for anyone, private too
 /// with a token; entries filtered by their selector; `ETag` = checksum of (path, sha256) pairs.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ManifestQ {
+    #[serde(flatten)]
+    ctx: Ctx,
+    /// All of these tags must be present (`tags=hd,season-3`).
+    tags: Option<String>,
+    /// At least one of these tags must be present.
+    any_tags: Option<String>,
+    /// `omit_tags=true` leaves `tags` out of the manifest items (smaller payload; Unity CCD
+    /// `OmitContentManifestTags`).
+    omit_tags: Option<String>,
+}
+
+/// `GET /v1/files/tags?prefix` — every tag in use with its file count (public files; with a
+/// bearer also private ones). Lets a client build a content browser without the manifest.
+async fn tags_index(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ListQ>,
+) -> Result<Json<Value>, ApiError> {
+    let authed = maybe_account(&s, &headers)?;
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "select t, count(*) from musubi.files, unnest(tags) t
+         where path like $1 || '%' and (public or $2) group by t order by t",
+    )
+    .bind(q.prefix.unwrap_or_default())
+    .bind(authed)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let tags: Vec<Value> = rows
+        .iter()
+        .map(|(t, n)| json!({ "tag": t, "files": n }))
+        .collect();
+    Ok(Json(json!({ "tags": tags })))
+}
+
 async fn manifest(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<Ctx>,
+    Query(mq): Query<ManifestQ>,
 ) -> Result<Response, ApiError> {
     let authed = maybe_account(&s, &headers)?;
+    let q = mq.ctx;
     let prefix = q.prefix.clone().unwrap_or_default();
+    let all_of = mq
+        .tags
+        .as_deref()
+        .map(parse_tags)
+        .transpose()?
+        .unwrap_or_default();
+    let any_of = mq
+        .any_tags
+        .as_deref()
+        .map(parse_tags)
+        .transpose()?
+        .unwrap_or_default();
+    let omit_tags = mq
+        .omit_tags
+        .as_deref()
+        .is_some_and(|v| v == "true" || v == "1");
     let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let rows: Vec<FileRow> = sqlx::query_as(&format!(
         "select {FILE_COLS} from musubi.files where path like $1 || '%' and (public or $2) order by path"
@@ -325,14 +427,20 @@ async fn manifest(
     let rows: Vec<&FileRow> = rows
         .iter()
         .filter(|r| selector_matches(&r.5, env, &ctx, None))
+        .filter(|r| all_of.iter().all(|t| r.10.contains(t)))
+        .filter(|r| any_of.is_empty() || any_of.iter().any(|t| r.10.contains(t)))
         .collect();
     let items: Vec<(String, String)> = rows.iter().map(|r| (r.0.clone(), r.2.clone())).collect();
     let sum = manifest_checksum(&items);
     let files: Vec<Value> = rows
         .iter()
         .map(|r| {
-            json!({ "path": r.0, "size": r.1, "sha256": r.2, "mime": r.3, "version": r.7,
-                "updated_at": r.8, "public": r.4, "url": url_for(&s, &r.0, r.4), "metadata": r.6 })
+            let mut v = json!({ "path": r.0, "size": r.1, "sha256": r.2, "mime": r.3, "version": r.7,
+                "updated_at": r.8, "public": r.4, "url": url_for(&s, &r.0, r.4), "metadata": r.6 });
+            if !omit_tags {
+                v["tags"] = json!(r.10);
+            }
+            v
         })
         .collect();
     Ok(etag_json(
