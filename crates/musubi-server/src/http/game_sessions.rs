@@ -32,6 +32,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/server/sessions", post(create))
         .route("/v1/server/sessions/search", post(search_server))
+        .route("/v1/server/sessions/stop", post(stop_many))
         .route(
             "/v1/server/sessions/{id}",
             get(get_server)
@@ -355,6 +356,77 @@ async fn do_terminate(s: &AppState, id: Uuid, by: Option<AccountId>) -> Result<V
         }
         None => Ok(json!({ "ok": true, "terminated": false })),
     }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct StopMany {
+    ids: Vec<String>,
+    /// Alternative to `ids`: every live session matching this server search (≤ 500 per call).
+    search: Option<crate::game_sessions::SearchSessions>,
+    reason: Option<String>,
+    dry_run: bool,
+}
+
+/// Bulk stop: by explicit ids or by search (same body as `/v1/server/sessions/search`) — empty a
+/// region before maintenance, kill every session of a broken build, clear a test namespace.
+async fn stop_many(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<StopMany>,
+) -> Result<Json<Value>, ApiError> {
+    if r.ids.is_empty() == r.search.is_none() {
+        return Err(
+            musubi_core::Error::InvalidArgument("stop: give either ids or search".into()).into(),
+        );
+    }
+    if r.ids.len() > 500 {
+        return Err(musubi_core::Error::InvalidArgument("stop: at most 500 ids".into()).into());
+    }
+    let ids: Vec<Uuid> = if let Some(mut q) = r.search {
+        q.include_terminated = false;
+        q.limit = Some(q.limit.unwrap_or(500).clamp(1, 500));
+        q.offset = None;
+        s.game_sessions
+            .search(&q, false)
+            .await?
+            .sessions
+            .into_iter()
+            .map(|x| x.id)
+            .collect()
+    } else {
+        r.ids
+            .iter()
+            .map(|i| parse_id(i))
+            .collect::<Result<_, _>>()?
+    };
+    if r.dry_run {
+        return Ok(Json(
+            json!({ "dry_run": true, "matched": ids.len(), "ids": ids }),
+        ));
+    }
+    let mut stopped = Vec::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        match s.game_sessions.terminate(id).await {
+            Ok(Some(before)) => {
+                stop_backend(&s, &before).await;
+                s.events
+                    .emit(
+                        "session.terminated",
+                        None,
+                        json!({ "id": id, "kind": before.kind, "bulk": true, "reason": r.reason }),
+                    )
+                    .await;
+                stopped.push(id);
+            }
+            Ok(None) | Err(musubi_core::Error::NotFound(_)) => missing.push(id),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Json(
+        json!({ "stopped": stopped.len(), "ids": stopped, "missing": missing, "reason": r.reason }),
+    ))
 }
 
 async fn terminate_server(

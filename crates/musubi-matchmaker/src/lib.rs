@@ -447,6 +447,37 @@ impl Matchmaker {
         self.queues.write().insert(q.name.clone(), q);
         Ok(())
     }
+    /// Operator control: `paused` holds the queue (no matching, no new tickets), `draining`
+    /// lets waiting tickets finish but refuses new ones; both false = resume.
+    pub fn set_queue_state(
+        &self,
+        name: &str,
+        paused: bool,
+        draining: bool,
+        reason: Option<String>,
+    ) -> Result<QueueConfig> {
+        let mut queues = self.queues.write();
+        let q = queues
+            .get_mut(name)
+            .ok_or_else(|| Error::NotFound(format!("matchmaker queue {name} does not exist")))?;
+        let active = paused || draining;
+        let changed = q.paused != paused || q.draining != draining;
+        q.paused = paused;
+        q.draining = draining;
+        q.status_reason = if active { reason } else { None };
+        if !active {
+            q.status_since = None;
+        } else if changed || q.status_since.is_none() {
+            q.status_since = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            );
+        }
+        Ok(q.clone())
+    }
+
     pub fn remove_queue(&self, name: &str) -> bool {
         self.queues.write().remove(name).is_some()
     }
@@ -722,6 +753,13 @@ impl Matchmaker {
                 let q = queues.get(name).ok_or_else(|| {
                     Error::NotFound(format!("matchmaker queue {name} does not exist"))
                 })?;
+                if q.paused || q.draining {
+                    let why = q.status_reason.as_deref().unwrap_or("maintenance");
+                    return Err(Error::Unavailable(format!(
+                        "matchmaker queue {name} is {}: {why}",
+                        if q.paused { "paused" } else { "draining" }
+                    )));
+                }
                 if t.members.len() > q.max_count
                     || q.teams.is_some_and(|tm| t.members.len() > tm.size)
                 {
@@ -991,6 +1029,9 @@ impl Matchmaker {
         let mut out = Vec::new();
         let mut remove: Vec<usize> = Vec::new();
         for (name, cfg) in queues.iter() {
+            if cfg.paused {
+                continue;
+            }
             let idx: Vec<usize> = pool
                 .tickets
                 .iter()
@@ -1652,6 +1693,52 @@ mod tests {
         };
         assert_eq!(mm.remove_session(s2), vec![id2]);
         assert_eq!(mm.ticket_count(), 0);
+    }
+
+    #[test]
+    fn paused_queue_holds_tickets_and_refuses_new_ones_while_drain_still_matches() {
+        let mm = Matchmaker::new(Duration::ZERO)
+            .with_queues(vec![QueueConfig {
+                name: "ranked".into(),
+                min_count: 2,
+                max_count: 2,
+                ..Default::default()
+            }])
+            .unwrap();
+        let t0 = Instant::now();
+        let mk = |rank: f64| {
+            let mut c = cand("eu", rank);
+            c.string_properties.insert("queue".into(), "ranked".into());
+            ticket(vec![c], "", 2, 2)
+        };
+        mm.add_at(mk(1000.0), t0).unwrap();
+        mm.set_queue_state("ranked", true, false, Some("hotfix".into()))
+            .unwrap();
+        let err = mm.add_at(mk(1000.0), t0).unwrap_err().to_string();
+        assert!(err.contains("paused") && err.contains("hotfix"), "{err}");
+        assert!(
+            mm.process_at(t0 + Duration::from_secs(5)).is_empty(),
+            "paused: nothing forms"
+        );
+        assert_eq!(mm.ticket_count(), 1, "held, not dropped");
+        let q = mm.set_queue_state("ranked", false, true, None).unwrap();
+        assert!(q.draining && !q.paused && q.status_since.is_some());
+        assert!(mm
+            .add_at(mk(1000.0), t0)
+            .unwrap_err()
+            .to_string()
+            .contains("draining"));
+        mm.set_queue_state("ranked", false, false, None).unwrap();
+        mm.add_at(mk(1000.0), t0).unwrap();
+        mm.set_queue_state("ranked", false, true, None).unwrap();
+        assert_eq!(
+            mm.process_at(t0 + Duration::from_secs(5)).len(),
+            1,
+            "draining still matches"
+        );
+        let q = mm.set_queue_state("ranked", false, false, None).unwrap();
+        assert!(q.status_since.is_none() && q.status_reason.is_none());
+        assert!(mm.set_queue_state("nope", true, false, None).is_err());
     }
 }
 

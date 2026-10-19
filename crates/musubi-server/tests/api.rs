@@ -35097,3 +35097,195 @@ async fn cors_allowlist_for_browser_clients() {
     assert_eq!(hdr(&r, "access-control-allow-origin"), Some("*"));
     assert!(hdr(&r, "access-control-allow-credentials").is_none());
 }
+
+#[tokio::test]
+async fn matchmaker_queue_controls_and_session_bulk_stop() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let qn = format!("ctl-{}", &unique("q").to_ascii_lowercase()[..8]);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/matchmaker/queues",
+        k,
+        Some(json!({"name": qn, "min_count": 2, "max_count": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["queue"]["paused"], false);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/matchmaker/queues/nope-q/pause",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matchmaker/queues/{qn}/pause"),
+        k,
+        Some(json!({"reason": "x".repeat(201)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matchmaker/queues/{qn}/pause"),
+        k,
+        Some(json!({"reason": "hotfix 1.2.3"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "paused");
+    assert_eq!(v["queue"]["paused"], true);
+    assert_eq!(v["queue"]["status_reason"], "hotfix 1.2.3");
+    assert!(v["queue"]["status_since"].is_i64());
+    let (_, s) = call_server(&app, "GET", "/v1/server/matchmaker/stats", k, None).await;
+    assert!(
+        s["paused"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(qn)),
+        "{s}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matchmaker/queues/{qn}/drain"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "draining");
+    assert_eq!(v["queue"]["paused"], false);
+    assert_eq!(v["queue"]["draining"], true);
+    let (_, s) = call_server(&app, "GET", "/v1/server/matchmaker/stats", k, None).await;
+    assert!(
+        s["draining"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(qn)),
+        "{s}"
+    );
+    assert!(
+        !s["paused"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(qn)),
+        "{s}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matchmaker/queues/{qn}/resume"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "open");
+    assert!(
+        v["queue"]["status_since"].is_null() && v["queue"]["status_reason"].is_null(),
+        "{v}"
+    );
+    let (_, q) = call_server(&app, "GET", "/v1/server/matchmaker/queues", k, None).await;
+    assert!(q.to_string().contains(&qn));
+    call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/matchmaker/queues/{qn}"),
+        k,
+        None,
+    )
+    .await;
+
+    // bulk stop
+    let (st, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("bs")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+    let owner = u["account_id"].as_str().unwrap().to_string();
+    let map = unique("bulkmap");
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let (st, s1) = call_server(&app, "POST", "/v1/server/sessions", k, Some(json!({"name": "custom", "connect": {"address": "1.2.3.4", "port": 7000 + i}, "owner_id": owner,
+            "properties": {"map": map}, "max_players": 4}))).await;
+        assert_eq!(st, StatusCode::OK, "{s1}");
+        ids.push(s1["id"].as_str().unwrap().to_string());
+    }
+    let (st, v) = call_server(&app, "POST", "/v1/server/sessions/stop", k, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/sessions/stop",
+        k,
+        Some(json!({"ids": [ids[0]], "search": {"filters": []}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let search = json!({"filters": [{"key": "map", "op": "eq", "value": map}]});
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/sessions/stop",
+        k,
+        Some(json!({"search": search, "dry_run": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["matched"], 3, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/sessions/stop",
+        k,
+        Some(json!({"ids": [ids[0], uuid::Uuid::nil().to_string()], "reason": "test"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stopped"], 1);
+    assert_eq!(v["missing"].as_array().unwrap().len(), 1, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/sessions/stop",
+        k,
+        Some(json!({"search": search, "reason": "maintenance"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stopped"], 2, "{v}");
+    assert_eq!(v["reason"], "maintenance");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/sessions/stop",
+        k,
+        Some(json!({"search": search})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stopped"], 0, "{v}");
+    for id in &ids {
+        let (_, g) = call_server(&app, "GET", &format!("/v1/server/sessions/{id}"), k, None).await;
+        assert!(
+            g["state"] == "terminated" || g["terminated_at"].is_i64() || g["error"].is_string(),
+            "{g}"
+        );
+    }
+}

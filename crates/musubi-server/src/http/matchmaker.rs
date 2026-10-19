@@ -19,6 +19,18 @@ pub fn routes() -> Router<AppState> {
             get(list_queues).put(put_queue),
         )
         .route("/v1/server/matchmaker/queues/{name}", delete(delete_queue))
+        .route(
+            "/v1/server/matchmaker/queues/{name}/pause",
+            post(pause_queue),
+        )
+        .route(
+            "/v1/server/matchmaker/queues/{name}/drain",
+            post(drain_queue),
+        )
+        .route(
+            "/v1/server/matchmaker/queues/{name}/resume",
+            post(resume_queue),
+        )
         .route("/v1/server/matchmaker/stats", get(stats))
         .route("/v1/server/matchmaker/simulate", post(simulate))
         .route(
@@ -61,13 +73,81 @@ async fn delete_queue(
     Ok(Json(json!({ "removed": name })))
 }
 
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct QueueStateReq {
+    reason: Option<String>,
+}
+
+async fn queue_state(
+    s: &AppState,
+    name: &str,
+    paused: bool,
+    draining: bool,
+    reason: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    if reason.as_ref().is_some_and(|r| r.chars().count() > 200) {
+        return Err(musubi_core::Error::InvalidArgument("reason: at most 200 chars".into()).into());
+    }
+    let q = s
+        .matchmaker
+        .set_queue_state(name, paused, draining, reason.clone())?;
+    let state = if paused {
+        "paused"
+    } else if draining {
+        "draining"
+    } else {
+        "open"
+    };
+    s.events
+        .emit(
+            &format!("matchmaker.queue_{state}"),
+            None,
+            json!({ "queue": name, "reason": reason, "waiting": s.matchmaker.waiting().get(name).copied().unwrap_or(0) }),
+        )
+        .await;
+    Ok(Json(json!({ "queue": q, "state": state })))
+}
+
+/// Hold the queue: nothing forms, waiting tickets stay (they still age out by TTL), new tickets
+/// get 503 with the reason.
+async fn pause_queue(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+    body: Option<Json<QueueStateReq>>,
+) -> Result<Json<Value>, ApiError> {
+    queue_state(&s, &name, true, false, body.and_then(|b| b.0.reason)).await
+}
+
+/// Drain the queue before a config change or shutdown: waiting tickets still match, new ones refused.
+async fn drain_queue(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+    body: Option<Json<QueueStateReq>>,
+) -> Result<Json<Value>, ApiError> {
+    queue_state(&s, &name, false, true, body.and_then(|b| b.0.reason)).await
+}
+
+async fn resume_queue(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    queue_state(&s, &name, false, false, None).await
+}
+
 async fn stats(State(s): State<AppState>, ServerKey: ServerKey) -> Result<Json<Value>, ApiError> {
+    let queues = s.matchmaker.queues();
     Ok(Json(json!({
+        "paused": queues.iter().filter(|q| q.paused).map(|q| q.name.clone()).collect::<Vec<_>>(),
+        "draining": queues.iter().filter(|q| q.draining).map(|q| q.name.clone()).collect::<Vec<_>>(),
         "waiting": s.matchmaker.waiting(),
         "waiting_ages": s.matchmaker.waiting_ages(),
         "wait": s.matchmaker.wait_stats(),
         "open_matches": s.matchmaker.open_count(),
-        "queues": s.matchmaker.queues(),
+        "queues": queues,
     })))
 }
 

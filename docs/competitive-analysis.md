@@ -673,7 +673,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Search & browse with filter/sort language |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — Fixed query params on `GET /v1/matches`/`/v1/lobbies`; no expression language or custom s… |
 | Server Token vs Client Token |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Server-to-server proxy pattern |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
-| Session bulk stop |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 |
+| Session bulk stop |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `POST /v1/server/sessions/stop {ids | search, reason, dry_run}` — ≤500 per call, same filters as session search, `missing` reported |
 | Best display name resolution (online platform name vs Epic display name; EOS_UserInfo_CopyBestDisplayName / E… |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — musubi profile has display_name + linked provider ids; no per-platform display-name selec… |
 | Mirror session management on remote (non-owner) clients (local copy of session state) |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — — no client SDK state mirror; WS MatchState sync exists for authoritative matches |
 | Permission levels: PublicAdvertised (searchable), JoinViaPresence (unlisted, friends join via overlay/presenc… |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — musubi public/private(+6-letter code, password); no presence-join / unlisted-but-joinable… |

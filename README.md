@@ -852,6 +852,7 @@ a message back. Plug in DeepL, Google, Azure or an LLM behind that one endpoint.
 ### Matchmaker observability
 
 `GET /v1/server/matchmaker/stats` adds `wait` — p50/p95/p99/max wait per queue × region over the
+| `POST /v1/server/matchmaker/queues/{name}/pause|drain|resume {reason}` | Operator queue controls: pause holds waiting tickets and forms nothing, drain lets them finish, both refuse new tickets with 503 + reason; `stats` lists paused/draining queues, events `matchmaker.queue_paused|draining|open` |
 last 2 048 matched tickets — and `waiting_ages` (how long the tickets in each queue have been
 there), next to the Prometheus histogram `musubi_matchmaker_wait_seconds`.
 `POST /v1/server/matchmaker/simulate {queue, arrivals_per_sec, duration_secs, mmr_mean, mmr_sd,

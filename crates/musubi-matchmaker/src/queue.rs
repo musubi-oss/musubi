@@ -45,6 +45,14 @@ pub struct QueueConfig {
     pub mmf: Option<MmfConfig>,
     /// Opaque game-specific payload passed to the match function with every call.
     pub extensions: serde_json::Value,
+    /// Operator pause: no groups are formed, waiting tickets are held, new tickets are refused.
+    pub paused: bool,
+    /// Operator drain: waiting tickets still get matched, new tickets are refused.
+    pub draining: bool,
+    /// Why the queue is paused/draining (shown to clients in the refusal).
+    pub status_reason: Option<String>,
+    /// Unix seconds since the queue entered its current paused/draining state.
+    pub status_since: Option<i64>,
 }
 
 /// Pluggable match function for one queue.
@@ -107,6 +115,10 @@ impl Default for QueueConfig {
             dodge_penalty_secs: None,
             mmf: None,
             extensions: serde_json::Value::Null,
+            paused: false,
+            draining: false,
+            status_reason: None,
+            status_since: None,
         }
     }
 }
