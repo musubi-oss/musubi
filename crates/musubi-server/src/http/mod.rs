@@ -189,6 +189,7 @@ impl tower::Service<axum::http::Request<axum::body::Body>> for ProjectDispatch {
 }
 
 pub fn router(state: AppState) -> Router {
+    crate::realtime::netsim::configure(&state.cfg.dev.netsim);
     Router::new()
         .route("/healthz", get(healthz))
         .route("/.well-known/jwks.json", get(jwks))

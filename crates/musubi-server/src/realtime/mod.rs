@@ -5,6 +5,7 @@ pub mod authoritative;
 pub mod connect;
 mod hub;
 pub mod matchmaking;
+pub mod netsim;
 pub mod party;
 pub mod quic;
 pub mod relayed;

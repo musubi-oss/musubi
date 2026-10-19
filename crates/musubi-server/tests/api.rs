@@ -28891,3 +28891,85 @@ async fn storage_query_operators_or_random_and_rank() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
 }
+
+/// P1-62: simulated network conditions — global profile, per-session overrides, counters.
+#[tokio::test]
+async fn dev_netsim_profiles_and_session_overrides() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, v) = call_server(&app, "DELETE", "/v1/admin/dev/netsim", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    for bad in [
+        json!({"latency_ms": 20000}),
+        json!({"latency_ms": 100, "jitter_ms": 200}),
+        json!({"loss_pct": 101}),
+        json!({"direction": "sideways"}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", "/v1/admin/dev/netsim", k, Some(bad.clone())).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/dev/netsim",
+        k,
+        Some(json!({"latency_ms": 120, "jitter_ms": 30, "loss_pct": 5, "direction": "out"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["active"], true);
+    assert_eq!(v["global"]["latency_ms"], 120);
+    assert_eq!(v["global"]["direction"], "out");
+    let sid = uuid::Uuid::now_v7();
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/dev/netsim/sessions/{sid}"),
+        k,
+        Some(json!({"latency_ms": 500, "loss_pct": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["replaced"], false);
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["sessions"][0]["params"]["loss_pct"], 100.0);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/dev/netsim/sessions/{sid}"),
+        k,
+        Some(json!({"latency_ms": 50})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["replaced"], true);
+    let (st, v) = call_server(&app, "GET", "/v1/admin/dev/netsim", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["config_enabled"], false);
+    assert!(v["counters"]["delayed_out"].is_number(), "{v}");
+    let (st, v) = call_server(&app, "POST", "/v1/admin/dev/netsim/reset", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counters"]["dropped_in"], 0);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/dev/netsim/sessions/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/dev/netsim/sessions/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(&app, "DELETE", "/v1/admin/dev/netsim", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["active"], false);
+    assert!(v["global"].is_null());
+}

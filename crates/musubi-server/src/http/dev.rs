@@ -25,6 +25,15 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/dev/recordings/{id}/replay", post(replay))
         .route("/v1/admin/dev/fixtures", get(fixtures).post(fixture_apply))
         .route("/v1/admin/dev/fixtures/{name}", delete(fixture_drop))
+        .route(
+            "/v1/admin/dev/netsim",
+            get(netsim_get).put(netsim_put).delete(netsim_clear),
+        )
+        .route("/v1/admin/dev/netsim/reset", post(netsim_reset))
+        .route(
+            "/v1/admin/dev/netsim/sessions/{id}",
+            axum::routing::put(netsim_session_put).delete(netsim_session_delete),
+        )
 }
 
 async fn recording_get(_k: ServerKey, State(s): State<AppState>) -> Json<Value> {
@@ -157,4 +166,66 @@ async fn fixture_drop(
         Some(v) => Ok(Json(v)),
         None => Err(Error::NotFound(format!("fixture {name}")).into()),
     }
+}
+
+// ---------- P1-62 simulated network conditions ----------
+
+use crate::realtime::netsim;
+
+/// `GET /v1/admin/dev/netsim` — global profile, per-session overrides and counters.
+async fn netsim_get(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let mut v = netsim::snapshot();
+    v["config_enabled"] = json!(s.cfg.dev.netsim.enabled);
+    Ok(Json(v))
+}
+
+/// `PUT /v1/admin/dev/netsim {latency_ms, jitter_ms, loss_pct, direction}` — apply to every
+/// realtime connection on this node (new frames immediately, existing sessions included).
+async fn netsim_put(
+    _k: ServerKey,
+    State(_s): State<AppState>,
+    Json(p): Json<netsim::Params>,
+) -> Result<Json<Value>, ApiError> {
+    p.validate()?;
+    netsim::set_global(Some(p));
+    Ok(Json(netsim::snapshot()))
+}
+
+async fn netsim_clear(_k: ServerKey, State(_s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    netsim::set_global(None);
+    let n = netsim::clear_sessions();
+    let mut v = netsim::snapshot();
+    v["cleared_sessions"] = json!(n);
+    Ok(Json(v))
+}
+
+async fn netsim_reset(_k: ServerKey, State(_s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    netsim::reset_counters();
+    Ok(Json(netsim::snapshot()))
+}
+
+/// `PUT /v1/admin/dev/netsim/sessions/{id}` — conditions for one live session (QA on a single
+/// client while the rest of the playtest stays clean).
+async fn netsim_session_put(
+    _k: ServerKey,
+    State(_s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(p): Json<netsim::Params>,
+) -> Result<Json<Value>, ApiError> {
+    p.validate()?;
+    let replaced = netsim::set_session(musubi_core::SessionId(id), Some(p));
+    let mut v = netsim::snapshot();
+    v["replaced"] = json!(replaced);
+    Ok(Json(v))
+}
+
+async fn netsim_session_delete(
+    _k: ServerKey,
+    State(_s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    if !netsim::set_session(musubi_core::SessionId(id), None) {
+        return Err(Error::NotFound("netsim override for this session".into()).into());
+    }
+    Ok(Json(netsim::snapshot()))
 }

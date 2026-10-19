@@ -47,6 +47,8 @@ pub struct Config {
     pub ads: AdsConfig,
     /// P1-30: master keys for secrets stored in Postgres (see `musubi_core::secrets`).
     pub security: SecurityConfig,
+    /// P1-62: development aids (simulated network conditions).
+    pub dev: DevConfig,
     /// Config paths whose values contained `${env:…}` / `${file:…}` references (filled by `load`).
     #[serde(skip)]
     pub resolved_refs: Vec<String>,
@@ -421,6 +423,38 @@ impl Config {
         c.resolved_refs = refs;
         crate::secrets::install(&c.security.master_keys).map_err(config::ConfigError::Message)?;
         Ok(c)
+    }
+}
+
+/// `[dev]` — development aids, never meant for production nodes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DevConfig {
+    pub netsim: NetsimConfig,
+}
+
+/// `[dev.netsim]` — inject latency/jitter/loss around every realtime connection at startup; the
+/// same knobs are switchable at runtime through `/v1/admin/dev/netsim`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetsimConfig {
+    pub enabled: bool,
+    pub latency_ms: u64,
+    pub jitter_ms: u64,
+    pub loss_pct: f64,
+    /// `both` | `in` | `out`.
+    pub direction: String,
+}
+
+impl Default for NetsimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            latency_ms: 0,
+            jitter_ms: 0,
+            loss_pct: 0.0,
+            direction: "both".into(),
+        }
     }
 }
 

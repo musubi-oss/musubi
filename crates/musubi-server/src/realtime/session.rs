@@ -59,7 +59,11 @@ pub struct ConnectParams {
 
 /// Drive one realtime connection until it closes. Registers with the hub on entry and
 /// always unregisters on exit.
-pub async fn serve(hub: Arc<Hub>, mut conn: Box<dyn Connection>, params: ConnectParams) {
+pub async fn serve(hub: Arc<Hub>, conn: Box<dyn Connection>, params: ConnectParams) {
+    let mut conn: Box<dyn Connection> = Box::new(super::netsim::NetsimConn::new(
+        conn,
+        params.presence.session_id,
+    ));
     let ConnectParams {
         presence,
         mut encoding,
