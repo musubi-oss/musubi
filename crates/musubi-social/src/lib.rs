@@ -147,6 +147,18 @@ impl SocialService {
     /// Add friends: sends an invite, or accepts an incoming one. Blocked (by either side) is a no-op.
     /// Returns `(other, accepted)` for every relationship that actually changed.
     pub async fn add(&self, me: AccountId, others: &[AccountId]) -> Result<Vec<(AccountId, bool)>> {
+        self.add_via(me, others, false).await
+    }
+
+    /// [`add`](Self::add) with the recipient's friend-request privacy applied to new invites
+    /// (accepting an incoming invite is always allowed); `via_code` = the sender presented the
+    /// recipient's friend code, which bypasses the policy.
+    pub async fn add_via(
+        &self,
+        me: AccountId,
+        others: &[AccountId],
+        via_code: bool,
+    ) -> Result<Vec<(AccountId, bool)>> {
         check_batch(me, others)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let count: i64 = sqlx::query_scalar(
@@ -192,6 +204,39 @@ impl SocialService {
                 upsert(&mut tx, *other, me, 0).await?;
                 changed.push((*other, true));
             } else {
+                if !via_code {
+                    let policy: Option<String> = sqlx::query_scalar(
+                        "select requests from musubi.friend_settings where account_id = $1",
+                    )
+                    .bind(other.0)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(Error::internal)?;
+                    match policy.as_deref().unwrap_or("anyone") {
+                        "anyone" => {}
+                        "friends_of_friends" => {
+                            let mutual: Option<i64> = sqlx::query_scalar(
+                                "select 1::bigint from musubi.friends a join musubi.friends b on a.friend_id = b.friend_id \
+                                 where a.user_id = $1 and a.state = 0 and b.user_id = $2 and b.state = 0 limit 1",
+                            )
+                            .bind(me.0)
+                            .bind(other.0)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(Error::internal)?;
+                            if mutual.is_none() {
+                                return Err(Error::PermissionDenied(format!(
+                                    "{other} accepts friend requests from friends of friends only"
+                                )));
+                            }
+                        }
+                        p => {
+                            return Err(Error::PermissionDenied(format!(
+                                "{other} does not accept friend requests ({p})"
+                            )))
+                        }
+                    }
+                }
                 upsert(&mut tx, me, *other, 1).await?;
                 upsert(&mut tx, *other, me, 2).await?;
                 changed.push((*other, false));
@@ -587,4 +632,150 @@ fn check_batch(me: AccountId, others: &[AccountId]) -> Result<()> {
         return Err(Error::InvalidArgument("cannot befriend yourself".into()));
     }
     Ok(())
+}
+
+pub const FRIEND_REQUEST_POLICIES: [&str; 4] =
+    ["anyone", "friends_of_friends", "code_only", "nobody"];
+
+/// A player's shareable friend code (`XXXX-XXXX`), optionally limited in uses or time.
+#[derive(Debug, Clone, Serialize)]
+pub struct FriendCode {
+    pub code: String,
+    pub created_at: i64,
+    pub rotated_at: Option<i64>,
+    pub uses: i32,
+    pub max_uses: Option<i32>,
+    pub expires_at: Option<i64>,
+}
+
+type FriendCodeRow = (
+    String,
+    OffsetDateTime,
+    Option<OffsetDateTime>,
+    i32,
+    Option<i32>,
+    Option<OffsetDateTime>,
+);
+
+fn friend_code_from(r: FriendCodeRow) -> FriendCode {
+    FriendCode {
+        code: r.0,
+        created_at: r.1.unix_timestamp(),
+        rotated_at: r.2.map(|t| t.unix_timestamp()),
+        uses: r.3,
+        max_uses: r.4,
+        expires_at: r.5.map(|t| t.unix_timestamp()),
+    }
+}
+
+const FRIEND_CODE_COLS: &str = "code, created_at, rotated_at, uses, max_uses, expires_at";
+
+impl SocialService {
+    /// The account's current friend code; `fresh` is used when none exists yet.
+    pub async fn friend_code(&self, me: AccountId, fresh: &str) -> Result<FriendCode> {
+        let row: Option<FriendCodeRow> = sqlx::query_as(&format!(
+            "select {FRIEND_CODE_COLS} from musubi.friend_codes where account_id = $1"
+        ))
+        .bind(me.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        if let Some(r) = row {
+            return Ok(friend_code_from(r));
+        }
+        let row: FriendCodeRow = sqlx::query_as(&format!(
+            "insert into musubi.friend_codes (account_id, code) values ($1, $2) \
+             on conflict (account_id) do update set account_id = excluded.account_id returning {FRIEND_CODE_COLS}"
+        ))
+        .bind(me.0)
+        .bind(fresh)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(friend_code_from(row))
+    }
+
+    /// Replace the code (old one stops working immediately) with optional use/time limits.
+    pub async fn rotate_friend_code(
+        &self,
+        me: AccountId,
+        fresh: &str,
+        max_uses: Option<i32>,
+        expires_in_secs: Option<i64>,
+    ) -> Result<FriendCode> {
+        if max_uses.is_some_and(|m| !(1..=100_000).contains(&m)) {
+            return Err(Error::InvalidArgument("max_uses must be 1..=100000".into()));
+        }
+        if expires_in_secs.is_some_and(|e| !(1..=365 * 86_400).contains(&e)) {
+            return Err(Error::InvalidArgument(
+                "expires_in_secs must be 1..=31536000".into(),
+            ));
+        }
+        let row: FriendCodeRow = sqlx::query_as(&format!(
+            "insert into musubi.friend_codes (account_id, code, max_uses, expires_at) \
+             values ($1, $2, $3, case when $4::bigint is null then null else now() + make_interval(secs => $4::bigint) end) \
+             on conflict (account_id) do update set code = excluded.code, rotated_at = now(), uses = 0, \
+               max_uses = excluded.max_uses, expires_at = excluded.expires_at returning {FRIEND_CODE_COLS}"
+        ))
+        .bind(me.0)
+        .bind(fresh)
+        .bind(max_uses)
+        .bind(expires_in_secs)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(friend_code_from(row))
+    }
+
+    /// Owner of a still-valid (not expired / exhausted) friend code.
+    pub async fn resolve_friend_code(&self, code: &str) -> Result<Option<AccountId>> {
+        let r: Option<(Uuid,)> = sqlx::query_as(
+            "select account_id from musubi.friend_codes where code = $1 \
+             and (expires_at is null or expires_at > now()) and (max_uses is null or uses < max_uses)",
+        )
+        .bind(code)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(r.map(|(id,)| AccountId(id)))
+    }
+
+    pub async fn consume_friend_code(&self, code: &str) -> Result<()> {
+        sqlx::query("update musubi.friend_codes set uses = uses + 1 where code = $1")
+            .bind(code)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    /// Who may send this account friend requests (`anyone` by default).
+    pub async fn friend_request_policy(&self, me: AccountId) -> Result<String> {
+        let r: Option<(String,)> =
+            sqlx::query_as("select requests from musubi.friend_settings where account_id = $1")
+                .bind(me.0)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        Ok(r.map(|x| x.0).unwrap_or_else(|| "anyone".into()))
+    }
+
+    pub async fn set_friend_request_policy(&self, me: AccountId, policy: &str) -> Result<()> {
+        if !FRIEND_REQUEST_POLICIES.contains(&policy) {
+            return Err(Error::InvalidArgument(format!(
+                "requests must be one of {}",
+                FRIEND_REQUEST_POLICIES.join("|")
+            )));
+        }
+        sqlx::query(
+            "insert into musubi.friend_settings (account_id, requests) values ($1, $2) \
+             on conflict (account_id) do update set requests = excluded.requests, updated_at = now()",
+        )
+        .bind(me.0)
+        .bind(policy)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
+    }
 }

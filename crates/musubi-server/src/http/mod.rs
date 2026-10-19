@@ -29,6 +29,7 @@ mod files;
 pub mod fleet_hosts;
 pub mod fleet_metrics;
 pub mod fleets;
+mod friend_codes;
 mod friends;
 pub mod game_sessions;
 pub mod group_challenges;
@@ -226,6 +227,7 @@ pub fn router(state: AppState) -> Router {
         .merge(account::routes())
         .merge(passkeys::routes())
         .merge(friends::routes())
+        .merge(friend_codes::routes())
         .merge(groups::routes())
         .merge(group_challenges::routes())
         .merge(notifications::routes())

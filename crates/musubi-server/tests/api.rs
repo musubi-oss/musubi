@@ -34703,3 +34703,273 @@ async fn oauth_authorization_code_flow() {
     let (st, e) = tok(json!({"grant_type": "refresh_token", "client_id": conf_id, "client_secret": conf_secret, "refresh_token": t5["refresh_token"]})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
 }
+
+#[tokio::test]
+async fn friend_codes_and_request_privacy() {
+    let Some(app) = app().await else { return };
+    async fn user(app: &Router, tag: &str) -> (String, String) {
+        let (st, s) = call(
+            app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(tag)})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{s}");
+        (
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        )
+    }
+    let (a, a_id) = user(&app, "fc-a").await;
+    let (b, b_id) = user(&app, "fc-b").await;
+    let (c, c_id) = user(&app, "fc-c").await;
+    let (d, _d_id) = user(&app, "fc-d").await;
+
+    // my code is stable until rotated
+    let (st, c1) = call(&app, "GET", "/v1/friends/code", Some(&a), None).await;
+    assert_eq!(st, StatusCode::OK, "{c1}");
+    let code = c1["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 9);
+    assert_eq!(&code[4..5], "-");
+    let (_, c2) = call(&app, "GET", "/v1/friends/code", Some(&a), None).await;
+    assert_eq!(c2["code"], code);
+    assert_eq!(c2["uses"], 0);
+
+    // lookup tolerates sloppy input; unknown → 404; short → 400
+    let sloppy = code.replace('-', "").to_ascii_lowercase();
+    let (st, l) = call(
+        &app,
+        "GET",
+        &format!("/v1/friends/code/{sloppy}"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["account_id"], a_id);
+    assert!(l["user"]["username"].is_string(), "{l}");
+    let (st, _) = call(&app, "GET", "/v1/friends/code/ZZZZ-ZZZZ", Some(&b), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", "/v1/friends/code/ABC", Some(&b), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/friends/code/{code}/add"),
+        Some(&a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "own code");
+
+    // add by code → invite sent, counted; owner accepts normally
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/friends/code/{sloppy}/add"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (_, c3) = call(&app, "GET", "/v1/friends/code", Some(&a), None).await;
+    assert_eq!(c3["uses"], 1);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&a),
+        Some(json!({"ids": [b_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, fl) = call(&app, "GET", "/v1/friends", Some(&a), None).await;
+    assert!(fl.to_string().contains(&b_id), "{fl}");
+
+    // privacy: nobody / code_only / friends_of_friends
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/friends/settings",
+        Some(&c),
+        Some(json!({"requests": "sometimes"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, g) = call(&app, "GET", "/v1/friends/settings", Some(&c), None).await;
+    assert_eq!(g["requests"], "anyone");
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/friends/settings",
+        Some(&c),
+        Some(json!({"requests": "nobody"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&a),
+        Some(json!({"ids": [c_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    // a one-use code still lets a through, then b hits the exhausted code
+    let (st, rc) = call(
+        &app,
+        "POST",
+        "/v1/friends/code/rotate",
+        Some(&c),
+        Some(json!({"max_uses": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rc}");
+    assert_eq!(rc["max_uses"], 1);
+    let ccode = rc["code"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/friends/code/{ccode}/add"),
+        Some(&a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/friends/code/{ccode}"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "exhausted");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/friends/code/{ccode}/add"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // accepting an incoming invite is always allowed, whatever the policy
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&c),
+        Some(json!({"ids": [a_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/friends/settings",
+        Some(&c),
+        Some(json!({"requests": "code_only"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&b),
+        Some(json!({"ids": [c_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/friends/settings",
+        Some(&c),
+        Some(json!({"requests": "friends_of_friends"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&d),
+        Some(json!({"ids": [c_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "no mutual friend: {v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&b),
+        Some(json!({"ids": [c_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "b and c share a: {v}");
+
+    // rotation kills the old code; expiry
+    let (st, rc) = call(
+        &app,
+        "POST",
+        "/v1/friends/code/rotate",
+        Some(&a),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rc}");
+    assert_ne!(rc["code"], code);
+    assert!(rc["rotated_at"].is_i64());
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/friends/code/{code}"),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/friends/code/{}", rc["code"].as_str().unwrap()),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends/code/rotate",
+        Some(&a),
+        Some(json!({"max_uses": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, rc) = call(
+        &app,
+        "POST",
+        "/v1/friends/code/rotate",
+        Some(&a),
+        Some(json!({"expires_in_secs": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rc}");
+    assert!(rc["expires_at"].is_i64());
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/friends/code/{}", rc["code"].as_str().unwrap()),
+        Some(&b),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "expired");
+}

@@ -455,12 +455,12 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Social restrictions surfaced in overlay (social ban days remaining, parental-control / console-settings disab… |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — musubi has bans/age-bracket feature closure in API responses; nothing rendered |
 | User Info Interface: query by Epic account id, display name, or external account id; display name, nickname (… |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | OTA delivery: client auto-downloads published config at session start; connected sessions keep negotiated ver… |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — content versions served via `/v1/content/*` + `/v1/configs`; no session-pinned negotiated… |
-| Friend codes guide (runtime-generated short codes via storage index + RPC) — pattern, not built-in |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  | ❌ · P1 — no friend-code primitive in musubi either (rg -i friend_code → none); would be a WASM mod… |
+| Friend codes guide (runtime-generated short codes via storage index + RPC) — pattern, not built-in |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  | ✅ `GET /v1/friends/code` / rotate / lookup / add-by-code (use- and time-limited) — no friend-code primitive before; would be a WASM mod… |
 | Friend metadata (per-edge JSON, runtime-set, 3.26) |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  | ✅ |
 | Shared Group Data (legacy): small KV blobs shared by ≤~12 players, not scalable, server/client APIs |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  | ✅ |
 | Account data reference |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
 | Account search in portal |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
-| Disable incoming friend invites |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | 🟡 · P2 — blocklist and appear-offline exist, but no account-level "refuse all friend requests" fla… |
+| Disable incoming friend invites |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ `PUT /v1/friends/settings {requests: anyone|friends_of_friends|code_only|nobody}` — blocklist and appear-offline exist, plus an account-level request policy; was: no "refuse all friend requests" fla… |
 | Friend invites by display name or Social ID |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
 | Friend task: SendFriendInviteV1 / AcceptFriendInviteV1 / DeclineFriendInviteV1 / CancelFriendInviteV1 |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
 | Identity/friend cache eviction & GDPR note |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | — — musubi reads from Postgres; retention cleanup job handles PII TTLs. |

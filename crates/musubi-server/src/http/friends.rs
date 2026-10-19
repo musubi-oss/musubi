@@ -183,20 +183,30 @@ async fn add(
     Bearer(me): Bearer,
     Json(b): Json<Ids>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    s.age.check(me.account_id, "friends")?;
     let ids = resolve(&s, b).await?;
-    let outcomes = s.social.add(me.account_id, &ids).await?;
+    add_targets(&s, me.account_id, ids, false).await
+}
+
+/// Shared by `POST /v1/friends` and add-by-friend-code: invites/accepts, events, notifications.
+pub(super) async fn add_targets(
+    s: &AppState,
+    me_id: AccountId,
+    ids: Vec<AccountId>,
+    via_code: bool,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.age.check(me_id, "friends")?;
+    let outcomes = s.social.add_via(me_id, &ids, via_code).await?;
     s.events
         .emit(
             "friend.added",
-            Some(me.account_id),
+            Some(me_id),
             json!({ "ids": ids, "outcomes": outcomes }),
         )
         .await;
     if !outcomes.is_empty() {
         let username = s
             .accounts
-            .get_users(&[me.account_id], &[])
+            .get_users(&[me_id], &[])
             .await?
             .pop()
             .map(|u| u.username)
@@ -205,7 +215,7 @@ async fn add(
             .into_iter()
             .map(|(other, accepted)| NewNotification {
                 user_id: other,
-                sender_id: Some(me.account_id),
+                sender_id: Some(me_id),
                 subject: if accepted {
                     format!("{username} accepted your friend request")
                 } else {
