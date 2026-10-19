@@ -2409,9 +2409,9 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **Why it matters:** Real games need more than one port and a memory cap.
 - **Implementation sketch (musubi terms):** FleetSpec has `vcpu` + one port. Extend FleetSpec: `memory_mb`, `ports[{name,proto,range}]`, `env`, `secrets_ref`, `grace_secs`, `restart_policy`, provider-specific `template` passthrough.
 - **What the reports found weaker/missing (merged rows):**
-  - ❌ Agones/OM: *Port policy `None` (no hostPort, e.g. host networking / service mesh) — stable since 1.60* — No way to declare a port-less server; `port` is mandatory in `game_servers`
-  - ❌ Agones/OM: *Multiple ports per GameServer (`spec.ports[]` with name)* — Single `port` column per server (mig 0010)
-  - ❌ Agones/OM: *Port `protocol` `UDP`, `TCP`, `TCPUDP` (opens both)* — No protocol field; providers open whatever the process binds (docker provider publishes UDP+TCP of the same number implicitly) — `rg -i 'protocol.*udp'` in musubi-fleet: 0 hits
+  - ✅ Agones/OM: *Port policy `None` (no hostPort, e.g. host networking / service mesh)* — `spec.port_policy: none` (Docker/Kubernetes publish nothing, Agones `portPolicy: None`)
+  - ✅ Agones/OM: *Multiple ports per GameServer (`spec.ports[]` with name)* — `spec.ports [{name, protocol, container_port}]`, per-server host ports from the fleet range, `MUSUBI_PORT_<NAME>`, `ports.{name}` on servers/allocations
+  - ✅ Agones/OM: *Port `protocol` `UDP`, `TCP`, `TCPUDP` (opens both)* — `spec.port_protocol` and per-port `protocol: udp|tcp|both`
   - ❌ Edgegap: *GPU field* — `rg -i gpu` → none
   - ❌ Edgegap: *Secret environment variables* — No encrypted/hidden env class in fleet spec (`rg is_hidden\|secret_env\|redact` → none); `musubi config` prints secrets
   - ❌ GameLift: *Container group definitions* — no sidecar/per-instance group model; `rg -i sidecar` → none

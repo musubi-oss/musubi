@@ -56,14 +56,16 @@ impl Provider for DockerProvider {
                 "--rm".into(),
                 "--name".into(),
                 name,
-                "-p".into(),
-                format!("{port}:{port}/udp"),
-                "-p".into(),
-                format!("{port}:{port}/tcp"),
                 "--label".into(),
                 format!("musubi.fleet={}", req.fleet.id),
             ];
             args.extend(req.fleet.spec.resources.docker_args());
+            if !crate::port_policy_none(&req.fleet.spec) {
+                for (_, host, container, proto) in crate::port_bindings(&req.fleet.spec, req.port) {
+                    args.push("-p".into());
+                    args.push(format!("{host}:{container}/{proto}"));
+                }
+            }
             let envs = [
                 ("MUSUBI_SERVER_ID", req.server_id.to_string()),
                 ("MUSUBI_FLEET_ID", req.fleet.id.to_string()),

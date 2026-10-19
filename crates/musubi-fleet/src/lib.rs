@@ -109,9 +109,31 @@ pub fn pump_lines<R>(
     });
 }
 
+/// An extra named port of a game server (P0-7): the fleet's port range supplies a host port per
+/// server (`MUSUBI_PORT_<NAME>` in the environment, `ports.{name}` on the server/allocation),
+/// providers publish it with `protocol` (`udp` | `tcp` | `both`) onto `container_port` (defaults
+/// to the same number).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct PortSpec {
+    pub name: String,
+    pub protocol: String,
+    pub container_port: Option<i32>,
+    /// Filled per server at start time; not part of the stored spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FleetSpec {
+    /// Extra named ports besides the primary `MUSUBI_PORT` (P0-7).
+    pub ports: Vec<PortSpec>,
+    /// Protocol(s) published for the primary port: `udp` | `tcp` | `both` (default).
+    pub port_protocol: String,
+    /// `dynamic` (default: a host port from the fleet range is published) | `none` (no host port —
+    /// host networking / service mesh; the process still gets `MUSUBI_PORT` as a hint).
+    pub port_policy: String,
     /// Executable + args for the `local` provider (or image for container providers).
     pub command: Vec<String>,
     pub image: Option<String>,
@@ -830,6 +852,89 @@ pub fn webhook_target(replicas: i32, busy: i32, max: i32) -> i32 {
     (replicas.clamp(0, max) - busy).max(0)
 }
 
+fn protos(p: &str) -> &'static [&'static str] {
+    match p {
+        "udp" => &["udp"],
+        "tcp" => &["tcp"],
+        _ => &["udp", "tcp"],
+    }
+}
+
+pub fn port_policy_none(spec: &FleetSpec) -> bool {
+    spec.port_policy == "none"
+}
+
+/// Every (name, host port, container port, protocol) a server exposes: the primary `game` port
+/// plus `spec.ports` (with their per-server `host_port`); `both` expands to udp + tcp.
+pub fn port_bindings(spec: &FleetSpec, primary: i32) -> Vec<(String, i32, i32, &'static str)> {
+    let mut out = Vec::new();
+    for proto in protos(&spec.port_protocol) {
+        out.push(("game".to_string(), primary, primary, *proto));
+    }
+    for p in &spec.ports {
+        let Some(host) = p.host_port else { continue };
+        for proto in protos(&p.protocol) {
+            out.push((
+                p.name.clone(),
+                host,
+                p.container_port.unwrap_or(host),
+                *proto,
+            ));
+        }
+    }
+    out
+}
+
+pub fn validate_ports(spec: &FleetSpec) -> Result<()> {
+    let proto_ok = |p: &str| matches!(p, "" | "udp" | "tcp" | "both");
+    if !proto_ok(&spec.port_protocol) {
+        return Err(Error::InvalidArgument(
+            "spec.port_protocol must be udp|tcp|both".into(),
+        ));
+    }
+    if !matches!(spec.port_policy.as_str(), "" | "dynamic" | "none") {
+        return Err(Error::InvalidArgument(
+            "spec.port_policy must be dynamic|none".into(),
+        ));
+    }
+    if spec.ports.len() > 16 {
+        return Err(Error::InvalidArgument("spec.ports: at most 16".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for p in &spec.ports {
+        let name_ok = !p.name.is_empty()
+            && p.name.len() <= 10
+            && p.name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !name_ok || p.name == "game" {
+            return Err(Error::InvalidArgument(format!(
+                "spec.ports: name `{}` must be 1..=10 of [a-z0-9-] and not `game`",
+                p.name
+            )));
+        }
+        if !seen.insert(p.name.clone()) {
+            return Err(Error::InvalidArgument(format!(
+                "spec.ports: duplicate name `{}`",
+                p.name
+            )));
+        }
+        if !proto_ok(&p.protocol) {
+            return Err(Error::InvalidArgument(format!(
+                "spec.ports `{}`: protocol must be udp|tcp|both",
+                p.name
+            )));
+        }
+        if p.container_port.is_some_and(|c| !(1..=65535).contains(&c)) {
+            return Err(Error::InvalidArgument(format!(
+                "spec.ports `{}`: container_port in 1..=65535",
+                p.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_shape(min: i32, buffer: i32, max: i32, policy: &ScalePolicy) -> Result<()> {
     if max < 1 || buffer < 0 || buffer > max || min < 0 || min > max {
         return Err(Error::InvalidArgument(
@@ -1017,6 +1122,9 @@ pub struct GameServer {
     pub slots_used: i32,
     /// `ssh` provider: host-pool entry the server runs on.
     pub host_id: Option<Uuid>,
+    /// Extra named host ports `{name: port}` (P0-7).
+    #[serde(default)]
+    pub ports: serde_json::Value,
 }
 
 /// Which servers an allocation may take (all conditions must hold).
@@ -1611,7 +1719,7 @@ fn push_server_filters(
     Ok(())
 }
 
-const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
+const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, g.ports, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
 /// `canary_percent` of new servers (optionally only in `canary_regions`), `retired` is kept for rollback.
@@ -1691,6 +1799,9 @@ pub struct Allocation {
     /// Index into the request's selector chain that matched (0 = the primary selector).
     #[serde(default)]
     pub matched_selector: usize,
+    /// Extra named host ports of the server `{name: port}` (P0-7).
+    #[serde(default)]
+    pub ports: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -1927,6 +2038,7 @@ struct ServerRow {
     lists: serde_json::Value,
     slots_used: i32,
     host_id: Option<Uuid>,
+    ports: serde_json::Value,
 }
 
 fn row_to_server(r: ServerRow) -> GameServer {
@@ -1951,13 +2063,14 @@ fn row_to_server(r: ServerRow) -> GameServer {
         lists: r.lists,
         slots_used: r.slots_used,
         host_id: r.host_id,
+        ports: r.ports,
     }
 }
 
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports";
 
 impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
@@ -2246,6 +2359,7 @@ impl FleetService {
             )));
         }
         validate_shape(c.min_servers, c.buffer, c.max_servers, &c.policy)?;
+        validate_ports(&c.spec)?;
         if c.port_start < 1 || c.port_end < c.port_start || c.port_end > 65535 {
             return Err(Error::InvalidArgument("bad port range".into()));
         }
@@ -2640,6 +2754,7 @@ impl FleetService {
                     connect_token: token,
                     backfill: true,
                     matched_selector: 0,
+                    ports: serde_json::json!({}),
                 })
             }
             _ => None,
@@ -2709,6 +2824,7 @@ impl FleetService {
             connect_token: token,
             backfill: true,
             matched_selector: matched,
+            ports: gs.ports.clone(),
         }))
     }
 
@@ -2905,6 +3021,7 @@ impl FleetService {
             connect_token: token,
             backfill: shared,
             matched_selector: matched,
+            ports: gs.ports.clone(),
         })
     }
 
@@ -3561,19 +3678,29 @@ impl FleetService {
         Ok(surge.min(remaining).max(0))
     }
 
-    async fn free_port(&self, f: &Fleet) -> Result<i32> {
-        let used: Vec<i32> = sqlx::query_scalar(
-            "select port from musubi.game_servers where node_id = $1 and state <> 'terminated'",
+    /// `n` distinct free ports of the fleet's range on this node (primary + named extras).
+    async fn free_ports(&self, f: &Fleet, n: usize) -> Result<Vec<i32>> {
+        let mut used: Vec<i32> = sqlx::query_scalar(
+            "select port from musubi.game_servers where node_id = $1 and state <> 'terminated'
+             union all
+             select (jsonb_each_text(ports)).value::int from musubi.game_servers
+              where node_id = $1 and state <> 'terminated'",
         )
         .bind(self.node_id)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
-        (f.port_start..=f.port_end)
-            .find(|p| !used.contains(p))
-            .ok_or_else(|| {
-                Error::ResourceExhausted("fleet port range exhausted on this node".into())
-            })
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let p = (f.port_start..=f.port_end)
+                .find(|p| !used.contains(p))
+                .ok_or_else(|| {
+                    Error::ResourceExhausted("fleet port range exhausted on this node".into())
+                })?;
+            used.push(p);
+            out.push(p);
+        }
+        Ok(out)
     }
 
     /// Start one server of the fleet on this node.
@@ -3583,19 +3710,36 @@ impl FleetService {
             .provider_of(&f.provider)
             .ok_or_else(|| Error::InvalidArgument(format!("unknown provider {}", f.provider)))?;
         let id = Uuid::now_v7();
-        let port = self.free_port(f).await?;
         let build = self.pick_build(f).await?;
         let mut with_build = f.clone();
         if let Some(b) = &build {
             with_build.spec = b.spec.clone();
         }
+        let all_ports = self.free_ports(f, 1 + with_build.spec.ports.len()).await?;
+        let port = all_ports[0];
+        let mut named = serde_json::Map::new();
+        for (ps, hp) in with_build
+            .spec
+            .ports
+            .iter_mut()
+            .zip(all_ports.iter().skip(1))
+        {
+            ps.host_port = Some(*hp);
+            with_build.spec.env.insert(
+                format!("MUSUBI_PORT_{}", ps.name.to_uppercase().replace('-', "_")),
+                hp.to_string(),
+            );
+            named.insert(ps.name.clone(), serde_json::json!(hp));
+        }
+        let named = serde_json::Value::Object(named);
         let f = &with_build;
-        sqlx::query("insert into musubi.game_servers (id, fleet_id, state, node_id, port, build_version) values ($1, $2, 'starting', $3, $4, $5)")
+        sqlx::query("insert into musubi.game_servers (id, fleet_id, state, node_id, port, build_version, ports) values ($1, $2, 'starting', $3, $4, $5, $6)")
             .bind(id)
             .bind(f.id)
             .bind(self.node_id)
             .bind(port)
             .bind(build.as_ref().map(|b| b.version.clone()))
+            .bind(&named)
             .execute(&self.db)
             .await
             .map_err(Error::internal)?;
@@ -3604,7 +3748,7 @@ impl FleetService {
             Some(id),
             "server.starting",
             "server starting",
-            serde_json::json!({ "port": port, "build_version": build.as_ref().map(|b| b.version.clone()), "node_id": self.node_id }),
+            serde_json::json!({ "port": port, "ports": named, "build_version": build.as_ref().map(|b| b.version.clone()), "node_id": self.node_id }),
         )
         .await;
         match provider
@@ -4496,6 +4640,7 @@ mod lifecycle_tests {
             lists: serde_json::json!({}),
             slots_used: 0,
             host_id: None,
+            ports: serde_json::json!({}),
         }
     }
 
@@ -4604,6 +4749,7 @@ mod alloc_pick_tests {
             lists: serde_json::json!({"players": {"values": ["a", "b"], "capacity": 10}}),
             slots_used,
             host_id: None,
+            ports: serde_json::json!({}),
         }
     }
 
@@ -4786,5 +4932,85 @@ mod autoscale_tests {
         assert!(p.validate(4).is_err(), "webhook scheme");
         p.webhook.as_mut().unwrap().url = "https://scaler.internal/review".into();
         assert!(p.validate(4).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod ports_tests {
+    use super::*;
+
+    fn spec(ports: Vec<PortSpec>) -> FleetSpec {
+        FleetSpec {
+            ports,
+            ..FleetSpec::default()
+        }
+    }
+
+    fn port(name: &str, protocol: &str) -> PortSpec {
+        PortSpec {
+            name: name.into(),
+            protocol: protocol.into(),
+            container_port: None,
+            host_port: None,
+        }
+    }
+
+    #[test]
+    fn validation_covers_names_protocols_and_policy() {
+        assert!(validate_ports(&FleetSpec::default()).is_ok());
+        assert!(validate_ports(&spec(vec![port("query", "tcp"), port("voice", "udp")])).is_ok());
+        assert!(
+            validate_ports(&spec(vec![port("game", "udp")])).is_err(),
+            "reserved"
+        );
+        assert!(
+            validate_ports(&spec(vec![port("Query", "udp")])).is_err(),
+            "case"
+        );
+        assert!(validate_ports(&spec(vec![port("a-very-long-name", "udp")])).is_err());
+        assert!(
+            validate_ports(&spec(vec![port("q", "udp"), port("q", "tcp")])).is_err(),
+            "dup"
+        );
+        assert!(
+            validate_ports(&spec(vec![port("q", "sctp")])).is_err(),
+            "protocol"
+        );
+        let mut bad = spec(vec![port("q", "udp")]);
+        bad.ports[0].container_port = Some(70000);
+        assert!(validate_ports(&bad).is_err(), "container port");
+        let mut s = FleetSpec {
+            port_protocol: "quic".into(),
+            ..FleetSpec::default()
+        };
+        assert!(validate_ports(&s).is_err());
+        s.port_protocol = "udp".into();
+        s.port_policy = "static".into();
+        assert!(validate_ports(&s).is_err());
+        s.port_policy = "none".into();
+        assert!(validate_ports(&s).is_ok());
+        assert!(port_policy_none(&s));
+    }
+
+    #[test]
+    fn bindings_expand_protocols_and_skip_unassigned_extras() {
+        let mut s = spec(vec![port("query", "tcp"), port("voice", "both")]);
+        s.port_protocol = "udp".into();
+        s.ports[0].host_port = Some(7001);
+        s.ports[0].container_port = Some(27015);
+        s.ports[1].host_port = Some(7002);
+        let b = port_bindings(&s, 7000);
+        assert_eq!(
+            b,
+            vec![
+                ("game".to_string(), 7000, 7000, "udp"),
+                ("query".to_string(), 7001, 27015, "tcp"),
+                ("voice".to_string(), 7002, 7002, "udp"),
+                ("voice".to_string(), 7002, 7002, "tcp"),
+            ]
+        );
+        // default primary protocol is both; an extra port without a host port is not published
+        let s = spec(vec![port("query", "tcp")]);
+        assert_eq!(port_bindings(&s, 7000).len(), 2);
     }
 }

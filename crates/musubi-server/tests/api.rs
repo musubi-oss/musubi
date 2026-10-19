@@ -31113,3 +31113,93 @@ async fn fleet_autoscaler_rules_suspend_and_webhook() {
     let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     assert!(st.is_success() || st == StatusCode::NO_CONTENT);
 }
+
+/// P0-7: extra named ports with protocols on a local fleet — distinct host ports from the fleet
+/// range per server, visible on the server row and the allocation; bad specs are rejected.
+#[tokio::test]
+async fn fleet_named_ports_and_protocols() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("portfleet");
+    for bad in [
+        json!({"ports": [{"name": "game", "protocol": "udp"}]}),
+        json!({"ports": [{"name": "q", "protocol": "udp"}, {"name": "q", "protocol": "tcp"}]}),
+        json!({"ports": [{"name": "q", "protocol": "sctp"}]}),
+        json!({"port_protocol": "quic"}),
+        json!({"port_policy": "static"}),
+    ] {
+        let mut spec = json!({"command": ["sleep", "60"]});
+        for (kk, vv) in bad.as_object().unwrap() {
+            spec[kk] = vv.clone();
+        }
+        let (st, v) = call_server(&app, "POST", "/v1/server/fleets", k,
+            Some(json!({"name": unique("badports"), "provider": "local", "region": "eu-west", "buffer": 0, "max_servers": 1, "spec": spec}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad} → {v}");
+    }
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "region": "eu-west", "buffer": 2, "max_servers": 2,
+            "port_start": 42000, "port_end": 42010,
+            "spec": {"command": ["sleep", "60"], "port_protocol": "udp",
+                "ports": [{"name": "query", "protocol": "tcp", "container_port": 27015}, {"name": "voice", "protocol": "both"}]}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    assert_eq!(f["spec"]["ports"][0]["name"], "query");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["started"], 2);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let servers = v["servers"].as_array().unwrap();
+    assert_eq!(servers.len(), 2, "{v}");
+    let mut all: Vec<i64> = Vec::new();
+    for s in servers {
+        let p = s["port"].as_i64().unwrap();
+        let q = s["ports"]["query"].as_i64().unwrap();
+        let vo = s["ports"]["voice"].as_i64().unwrap();
+        all.extend([p, q, vo]);
+    }
+    assert!(all.iter().all(|p| (42000..=42010).contains(p)), "{all:?}");
+    let mut dedup = all.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(dedup.len(), 6, "six distinct host ports: {all:?}");
+    // the ports travel with the allocation
+    let sid = servers[0]["id"].as_str().unwrap().to_string();
+    let req = Request::post("/v1/gameserver/ready")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let (st, a) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["server_id"], sid);
+    assert_eq!(a["ports"]["query"], servers[0]["ports"]["query"], "{a}");
+    assert!(a["ports"]["voice"].is_number());
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert!(st.is_success() || st == StatusCode::NO_CONTENT);
+}

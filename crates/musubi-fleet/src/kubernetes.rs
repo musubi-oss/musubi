@@ -149,10 +149,18 @@ impl KubernetesProvider {
         }
         Ok(match self.mode {
             Mode::Pods => {
-                container["ports"] = json!([
-                    { "name": "game-udp", "containerPort": port, "hostPort": port, "protocol": "UDP" },
-                    { "name": "game-tcp", "containerPort": port, "hostPort": port, "protocol": "TCP" },
-                ]);
+                let publish = !crate::port_policy_none(&req.fleet.spec);
+                let ports: Vec<Value> = crate::port_bindings(&req.fleet.spec, port)
+                    .into_iter()
+                    .map(|(n, host, container, proto)| {
+                        let mut p = json!({ "name": format!("{n}-{proto}"), "containerPort": container, "protocol": proto.to_uppercase() });
+                        if publish {
+                            p["hostPort"] = json!(host);
+                        }
+                        p
+                    })
+                    .collect();
+                container["ports"] = json!(ports);
                 json!({
                     "apiVersion": "v1",
                     "kind": "Pod",
@@ -165,7 +173,10 @@ impl KubernetesProvider {
                 "kind": "GameServer",
                 "metadata": { "name": name, "labels": labels },
                 "spec": {
-                    "ports": [{ "name": "game", "portPolicy": "Dynamic", "containerPort": port, "protocol": "UDP" }],
+                    "ports": crate::port_bindings(&req.fleet.spec, port).into_iter().map(|(n, _, container, proto)| json!({
+                        "name": format!("{n}-{proto}"),
+                        "portPolicy": if crate::port_policy_none(&req.fleet.spec) { "None" } else { "Dynamic" },
+                        "containerPort": container, "protocol": proto.to_uppercase() })).collect::<Vec<Value>>(),
                     "health": { "disabled": true },
                     "template": { "metadata": { "labels": labels }, "spec": { "containers": [container] } },
                 },
