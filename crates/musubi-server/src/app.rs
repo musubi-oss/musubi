@@ -834,6 +834,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "account purge failed"),
                 }
+                match crate::http::account_policy::dormant_pass(&st).await {
+                    Ok(k) if k > 0 => tracing::info!(accounts = k, "dormant accounts processed"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "dormant pass failed"),
+                }
             }
         });
     }

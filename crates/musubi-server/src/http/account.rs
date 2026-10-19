@@ -68,7 +68,19 @@ async fn update_account(
     Bearer(me): Bearer,
     Json(u): Json<UpdateAccount>,
 ) -> Result<Json<Account>, ApiError> {
-    s.accounts.update(me.account_id, u).await?;
+    let changed = s
+        .accounts
+        .update_with_policy(me.account_id, u, time::OffsetDateTime::now_utc())
+        .await?;
+    if !changed.is_empty() {
+        s.events
+            .emit(
+                "account.profile_updated",
+                Some(me.account_id),
+                serde_json::json!({ "fields": changed }),
+            )
+            .await;
+    }
     Ok(Json(s.accounts.get(me.account_id).await?))
 }
 

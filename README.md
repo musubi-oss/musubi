@@ -322,6 +322,15 @@ paid to every participant of the tier at rollover (`rollover.rewarded`, `league.
 `ending_soon`, `resting`/`resting_until`, `rank`/`group_size`/`score`, `promote_cut`/`demote_cut`, the effective
 `rule` and `projected: promote|demote|stay` (idle players see the demotion coming).
 
+Account policy: `PUT /v1/admin/accounts/policy {fields: {username|display_name|avatar_url|lang|location: {min_len, max_len,
+regex, ascii_only, blocked_words, reserved, edit: unlimited|interval|creation_only, interval_days}}, dormant: {days,
+notice_days, action: disable|delete}}` — player `PATCH /v1/account` is validated against the field rules (400) and the
+edit cadence (403 with `next_allowed_at`; `creation_only` fields can be set once), `GET /v1/account/policy` gives the client
+the rules plus its own per-field `edit_status`; the leader's retention loop (and `POST /v1/admin/accounts/dormant/sweep`)
+notices accounts `notice_days` before the dormancy threshold (`account.dormant_notice`) and then disables or soft-deletes
+them (`account.dormant_actioned`; activity = last session seen). Support lookup `GET /v1/admin/accounts/lookup?id|username|
+identity=provider:subject|email` returns the player card: account, status, last seen, sessions/devices/IPs, dormancy, edit status.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

@@ -1,4 +1,5 @@
 mod account;
+pub mod account_policy;
 pub mod admin;
 mod analytics;
 mod anticheat;
@@ -238,6 +239,7 @@ pub fn router(state: AppState) -> Router {
         .merge(bans::routes())
         .merge(group_pools::routes())
         .merge(challenges::routes())
+        .merge(account_policy::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())

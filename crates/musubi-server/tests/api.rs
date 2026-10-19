@@ -22272,3 +22272,193 @@ async fn league_depth_overrides_score_targets_idle_demotion_rest_and_projection(
     assert_eq!(t["resting"], true, "{t}");
     assert!(t["resting_until"].as_i64().unwrap() > expiry - 86_400);
 }
+
+#[tokio::test]
+async fn account_policy_edit_cadence_lookup_and_dormancy() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let dev = unique("ap0");
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    let ta = sess["access_token"].as_str().unwrap().to_string();
+    let (_, acc) = call(&app, "GET", "/v1/account", Some(&ta), None).await;
+    let a = acc["id"].as_str().unwrap().to_string();
+    let uname = acc["username"].as_str().unwrap().to_string();
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("ap1")})),
+    )
+    .await;
+    let tb = sess["access_token"].as_str().unwrap().to_string();
+
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/accounts/policy",
+        k,
+        Some(json!({"fields": {"email": {}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/accounts/policy",
+        k,
+        Some(json!({"dormant": {"days": 5, "notice_days": 7}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/accounts/policy",
+        k,
+        Some(json!({"fields": {
+            "display_name": {"max_len": 64, "blocked_words": ["zzzblocked"]},
+            "avatar_url": {"regex": "^https://", "edit": "interval", "interval_days": 7},
+            "location": {"edit": "creation_only", "ascii_only": true}
+        }, "dormant": {"days": 30, "notice_days": 7, "action": "disable"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call_server(&app, "GET", "/v1/admin/accounts/policy", k, None).await;
+    assert_eq!(v["fields"]["avatar_url"]["interval_days"], 7);
+
+    let patch = |t: String, body: Value| {
+        let app = app.clone();
+        async move { call(&app, "PATCH", "/v1/account", Some(&t), Some(body)).await }
+    };
+    let (st, v) = patch(ta.clone(), json!({"display_name": "Mr zzzBlocked"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = patch(ta.clone(), json!({"avatar_url": "http://x/a.png"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "regex: {v}");
+    let (st, v) = patch(
+        ta.clone(),
+        json!({"avatar_url": "https://x/a.png", "location": "Tokyo"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = patch(ta.clone(), json!({"avatar_url": "https://x/b.png"})).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "interval: {v}");
+    assert!(v.to_string().contains("next_allowed_at"), "{v}");
+    let (st, _) = patch(ta.clone(), json!({"avatar_url": "https://x/a.png"})).await;
+    assert_eq!(st, StatusCode::OK, "same value is not a change");
+    let (st, v) = patch(ta.clone(), json!({"location": "Osaka"})).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "creation-only: {v}");
+    let (st, _) = patch(tb.clone(), json!({"location": "Ōsaka"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "ascii only");
+    let (st, _) = patch(tb.clone(), json!({"location": "Osaka"})).await;
+    assert_eq!(st, StatusCode::OK, "first set is allowed");
+    let (st, v) = call(&app, "GET", "/v1/account/policy", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let es = v["edit_status"].as_array().unwrap();
+    let f = |name: &str| es.iter().find(|e| e["field"] == name).cloned().unwrap();
+    assert_eq!(f("avatar_url")["editable"], false);
+    assert!(f("avatar_url")["next_allowed_at"].is_string());
+    assert_eq!(f("location")["editable"], false);
+    assert!(f("location")["next_allowed_at"].is_null(), "never: {v}");
+    assert_eq!(f("display_name")["editable"], true);
+    assert_eq!(v["fields"]["avatar_url"]["edit"], "interval");
+
+    // lookup card
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/admin/accounts/lookup?username={}",
+            uname.to_uppercase()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["account"]["id"], a);
+    assert_eq!(v["account"]["location"], "Tokyo");
+    assert!(v["active_sessions"].as_i64().unwrap() >= 1);
+    assert!(v["dormancy"].is_null());
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/lookup?identity=device:{dev}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["account"]["id"], a);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/accounts/lookup?username=no-such-user-xyz",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "GET", "/v1/admin/accounts/lookup", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // dormancy: a goes quiet for 40 days
+    let db = sqlx::PgPool::connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "update musubi.accounts set created_at = now() - interval '40 days' where id = $1::uuid",
+    )
+    .bind(&a)
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("update musubi.sessions set last_seen_at = now() - interval '40 days' where account_id = $1::uuid").bind(&a).execute(&db).await.unwrap();
+    let (st, v) = call_server(&app, "POST", "/v1/admin/accounts/dormant/sweep", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["noticed"].as_array().unwrap().contains(&json!(a)), "{v}");
+    assert!(
+        !v["actioned"].as_array().unwrap().contains(&json!(a)),
+        "notice first: {v}"
+    );
+    let (_, v) = call_server(&app, "POST", "/v1/admin/accounts/dormant/sweep", k, None).await;
+    assert!(
+        !v["actioned"].as_array().unwrap().contains(&json!(a)),
+        "notice period not over: {v}"
+    );
+    sqlx::query("update musubi.account_dormancy set noticed_at = now() - interval '8 days' where account_id = $1::uuid").bind(&a).execute(&db).await.unwrap();
+    let (_, v) = call_server(&app, "POST", "/v1/admin/accounts/dormant/sweep", k, None).await;
+    assert!(v["actioned"].as_array().unwrap().contains(&json!(a)), "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "disabled accounts cannot log in: {v}");
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&tb), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/lookup?id={a}"),
+        k,
+        None,
+    )
+    .await;
+    assert!(v["status"]["disabled_at"].is_string(), "{v}");
+    assert_eq!(v["dormancy"]["action"], "disable");
+    let (st, _) = call_server(&app, "PUT", "/v1/admin/accounts/policy", k, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::OK, "reset for the other tests");
+}
