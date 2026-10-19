@@ -14,10 +14,14 @@ use crate::fanout::Fanout;
 
 pub const MAX_PARTY_SIZE: u32 = 256;
 
+pub const MAX_LABEL: usize = 256;
+
 struct Party {
     id: String,
     open: bool,
     max_size: u32,
+    label: String,
+    hidden: bool,
     leader: SessionId,
     members: Vec<UserPresence>,
     requests: Vec<UserPresence>,
@@ -36,6 +40,8 @@ impl Party {
             party_id: self.id.clone(),
             open: self.open,
             max_size: self.max_size,
+            label: self.label.clone(),
+            hidden: self.hidden,
             me: me.clone(),
             leader: self
                 .member(self.leader)
@@ -48,12 +54,69 @@ impl Party {
     fn sessions(&self) -> Vec<SessionId> {
         self.members.iter().map(|p| p.session_id).collect()
     }
+
+    fn row(&self) -> DirRow {
+        DirRow {
+            party_id: self.id.clone(),
+            label: self.label.clone(),
+            open: self.open,
+            hidden: self.hidden,
+            max_size: self.max_size,
+            size: self.members.len() as u32,
+            leader_id: self.member(self.leader).map(|p| p.account_id.0),
+        }
+    }
+}
+
+/// Directory row for `musubi.party_directory` (listing across nodes).
+#[derive(Debug, Clone)]
+pub struct DirRow {
+    pub party_id: String,
+    pub label: String,
+    pub open: bool,
+    pub hidden: bool,
+    pub max_size: u32,
+    pub size: u32,
+    pub leader_id: Option<Uuid>,
+}
+
+enum DirOp {
+    Upsert(DirRow),
+    Remove(String),
+}
+
+/// Leader-side changes (`party_update`); `None` keeps the current value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PartyUpdate {
+    pub label: Option<String>,
+    pub open: Option<bool>,
+    pub hidden: Option<bool>,
+    pub max_size: Option<u32>,
+}
+
+/// Listing filter (`party_list` / `GET /v1/parties`).
+#[derive(Debug, Default, Clone)]
+pub struct ListFilter {
+    pub label: Option<String>,
+    pub label_prefix: Option<String>,
+    pub open: Option<bool>,
+    pub limit: u32,
+}
+
+fn validate_label(label: &str) -> Result<()> {
+    if label.chars().count() > MAX_LABEL {
+        return Err(Error::InvalidArgument(format!(
+            "label must be ≤ {MAX_LABEL} chars"
+        )));
+    }
+    Ok(())
 }
 
 pub struct PartyRegistry {
     node_id: Uuid,
     parties: DashMap<String, Party>,
     by_session: DashMap<SessionId, String>,
+    dir: Option<tokio::sync::mpsc::UnboundedSender<DirOp>>,
 }
 
 fn broadcast(fanout: &Fanout, sessions: &[SessionId], msg: &ServerMessage) {
@@ -75,7 +138,164 @@ impl PartyRegistry {
             node_id,
             parties: DashMap::new(),
             by_session: DashMap::new(),
+            dir: None,
         }
+    }
+
+    /// Publish parties of this node to the shared directory (best effort, off the hot path).
+    pub fn with_directory(mut self, db: sqlx::PgPool) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DirOp>();
+        let node = self.node_id;
+        tokio::spawn(async move {
+            while let Some(op) = rx.recv().await {
+                let res = match op {
+                    DirOp::Upsert(r) => sqlx::query(
+                        "insert into musubi.party_directory
+                            (party_id, node_id, label, open, hidden, max_size, size, leader_id)
+                         values ($1, $2, $3, $4, $5, $6, $7, $8)
+                         on conflict (party_id) do update set label = excluded.label,
+                            open = excluded.open, hidden = excluded.hidden,
+                            max_size = excluded.max_size, size = excluded.size,
+                            leader_id = excluded.leader_id, updated_at = now()",
+                    )
+                    .bind(&r.party_id)
+                    .bind(node)
+                    .bind(&r.label)
+                    .bind(r.open)
+                    .bind(r.hidden)
+                    .bind(r.max_size as i32)
+                    .bind(r.size as i32)
+                    .bind(r.leader_id)
+                    .execute(&db)
+                    .await
+                    .map(|_| ()),
+                    DirOp::Remove(id) => {
+                        sqlx::query("delete from musubi.party_directory where party_id = $1")
+                            .bind(&id)
+                            .execute(&db)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "party directory write failed");
+                }
+            }
+        });
+        self.dir = Some(tx);
+        self
+    }
+
+    fn publish(&self, p: &Party) {
+        if let Some(tx) = &self.dir {
+            let _ = tx.send(DirOp::Upsert(p.row()));
+        }
+    }
+
+    fn unpublish(&self, id: &str) {
+        if let Some(tx) = &self.dir {
+            let _ = tx.send(DirOp::Remove(id.to_string()));
+        }
+    }
+
+    /// Re-publish every local party (heartbeat so readers can drop rows of dead nodes).
+    pub fn republish(&self) {
+        for p in self.parties.iter() {
+            self.publish(p.value());
+        }
+    }
+
+    /// Cluster-wide listing: visible parties with a free seat; rows a home node stopped
+    /// refreshing (dead node) age out after two heartbeats.
+    pub async fn list(
+        db: &sqlx::PgPool,
+        f: &ListFilter,
+    ) -> Result<Vec<musubi_proto::PartyListing>> {
+        type Row = (String, String, bool, i32, i32, Option<Uuid>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "select d.party_id, d.label, d.open, d.max_size, d.size, d.leader_id
+             from musubi.party_directory d
+             where not d.hidden and d.size < d.max_size
+               and d.updated_at > now() - interval '120 seconds'
+               and ($1::text is null or d.label = $1)
+               and ($2::text is null or d.label like $2 || '%')
+               and ($3::boolean is null or d.open = $3)
+             order by d.created_at desc limit $4",
+        )
+        .bind(f.label.as_deref())
+        .bind(f.label_prefix.as_deref().map(|p| {
+            p.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        }))
+        .bind(f.open)
+        .bind(f.limit.clamp(1, 200) as i64)
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(party_id, label, open, max_size, size, leader)| musubi_proto::PartyListing {
+                    party_id,
+                    label,
+                    open,
+                    max_size: max_size as u32,
+                    size: size as u32,
+                    leader_id: leader.map(|l| l.to_string()),
+                },
+            )
+            .collect())
+    }
+
+    /// Leader only: change label / open / hidden / max_size; every member gets a fresh snapshot.
+    pub fn update(
+        &self,
+        fanout: &Fanout,
+        me: SessionId,
+        party_id: &str,
+        u: PartyUpdate,
+    ) -> Result<ServerMessage> {
+        let PartyUpdate {
+            label,
+            open,
+            hidden,
+            max_size,
+        } = u;
+        let mut p = self.leader_party(me, party_id)?;
+        if let Some(l) = &label {
+            validate_label(l)?;
+        }
+        if let Some(m) = max_size {
+            if !(1..=MAX_PARTY_SIZE).contains(&m) {
+                return Err(Error::InvalidArgument(format!(
+                    "max_size must be 1..={MAX_PARTY_SIZE}"
+                )));
+            }
+            if (p.members.len() as u32) > m {
+                return Err(Error::Conflict(
+                    "max_size below the current member count".into(),
+                ));
+            }
+            p.max_size = m;
+        }
+        if let Some(l) = label {
+            p.label = l;
+        }
+        if let Some(o) = open {
+            p.open = o;
+        }
+        if let Some(h) = hidden {
+            p.hidden = h;
+        }
+        self.publish(&p);
+        let leader = p.member(me).cloned();
+        for m in p.members.clone() {
+            if m.session_id != me {
+                fanout.session(m.session_id, p.snapshot(&m));
+            }
+        }
+        Ok(p.snapshot(leader.as_ref().unwrap_or(&p.members[0])))
     }
 
     pub fn node_id(&self) -> Uuid {
@@ -90,7 +310,16 @@ impl PartyRegistry {
         self.parties.len()
     }
 
-    pub fn create(&self, me: &UserPresence, open: bool, max_size: u32) -> Result<ServerMessage> {
+    pub fn create(
+        &self,
+        me: &UserPresence,
+        open: bool,
+        max_size: u32,
+        label: Option<String>,
+        hidden: bool,
+    ) -> Result<ServerMessage> {
+        let label = label.unwrap_or_default();
+        validate_label(&label)?;
         if !(1..=MAX_PARTY_SIZE).contains(&max_size) {
             return Err(Error::InvalidArgument(format!(
                 "max_size must be 1..={MAX_PARTY_SIZE}"
@@ -104,6 +333,8 @@ impl PartyRegistry {
             id: id.clone(),
             open,
             max_size,
+            label,
+            hidden,
             leader: me.session_id,
             members: vec![me.clone()],
             requests: vec![],
@@ -111,6 +342,7 @@ impl PartyRegistry {
             invited: Vec::new(),
         };
         let snap = party.snapshot(me);
+        self.publish(&party);
         self.by_session.insert(me.session_id, id.clone());
         self.parties.insert(id, party);
         Ok(snap)
@@ -141,6 +373,7 @@ impl PartyRegistry {
             }
             let others = p.sessions();
             p.members.push(me.clone());
+            self.publish(&p);
             self.by_session.insert(me.session_id, party_id.to_string());
             broadcast(
                 fanout,
@@ -195,6 +428,7 @@ impl PartyRegistry {
         }
         let others = p.sessions();
         p.members.push(joiner.clone());
+        self.publish(&p);
         self.by_session
             .insert(joiner.session_id, party_id.to_string());
         broadcast(
@@ -274,6 +508,7 @@ impl PartyRegistry {
             return Err(Error::NotFound("not a member".into()));
         };
         let gone = p.members.remove(idx);
+        self.publish(&p);
         self.by_session.remove(&gone.session_id);
         let msg = ServerMessage::PartyPresenceEvent {
             party_id: party_id.into(),
@@ -323,6 +558,7 @@ impl PartyRegistry {
         let Some((_, p)) = self.parties.remove(party_id) else {
             return Err(Error::NotFound("party".into()));
         };
+        self.unpublish(party_id);
         for s in p.sessions() {
             self.by_session.remove(&s);
         }
@@ -356,8 +592,10 @@ impl PartyRegistry {
         if p.members.is_empty() {
             drop(p);
             self.parties.remove(party_id);
+            self.unpublish(party_id);
             return Ok(tickets);
         }
+        self.publish(&p);
         let sessions = p.sessions();
         broadcast(
             fanout,
@@ -513,6 +751,7 @@ pub enum PartyCmd {
     Invite {
         who: musubi_core::AccountId,
     },
+    Update(PartyUpdate),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -605,6 +844,7 @@ pub fn exec(
             Ok(Some(msg))
         }
         PartyCmd::Invite { who } => parties.invite(fanout, me, party_id, who).map(|_| None),
+        PartyCmd::Update(u) => parties.update(fanout, sid, party_id, u).map(Some),
         PartyCmd::MatchmakerRemove { ticket } => {
             parties.untrack_ticket(sid, party_id, &ticket)?;
             mm.cancel(&ticket);

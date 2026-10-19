@@ -202,7 +202,17 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     let cluster = Arc::new(cluster);
     cluster.start().await?;
-    let parties = Arc::new(PartyRegistry::new(cluster.node_id().0));
+    let parties = Arc::new(PartyRegistry::new(cluster.node_id().0).with_directory(db.clone()));
+    {
+        let p = parties.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                p.republish();
+            }
+        });
+    }
     let mut fleets = FleetService::new(
         db.clone(),
         cluster.node_id().0,

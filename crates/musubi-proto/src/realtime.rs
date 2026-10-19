@@ -143,6 +143,35 @@ pub enum ClientMessage {
         open: bool,
         #[serde(default = "default_party_size")]
         max_size: u32,
+        /// Free-form label (≤ 256 chars) that `party_list` can search by.
+        #[serde(default)]
+        label: Option<String>,
+        /// Hidden parties never show up in `party_list`.
+        #[serde(default)]
+        hidden: bool,
+    },
+    /// Leader only: change label / open / hidden / max_size; members get a fresh `party`.
+    PartyUpdate {
+        party_id: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        open: Option<bool>,
+        #[serde(default)]
+        hidden: Option<bool>,
+        #[serde(default)]
+        max_size: Option<u32>,
+    },
+    /// Cluster-wide listing of visible parties with a free seat.
+    PartyList {
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        label_prefix: Option<String>,
+        #[serde(default)]
+        open: Option<bool>,
+        #[serde(default = "default_party_list_limit")]
+        limit: u32,
     },
     PartyJoin {
         party_id: String,
@@ -313,6 +342,10 @@ fn yes() -> bool {
     true
 }
 
+fn default_party_list_limit() -> u32 {
+    50
+}
+
 fn default_party_size() -> u32 {
     4
 }
@@ -447,6 +480,10 @@ pub enum ServerMessage {
         party_id: String,
         open: bool,
         max_size: u32,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        hidden: bool,
         #[serde(rename = "self")]
         me: UserPresence,
         leader: UserPresence,
@@ -478,6 +515,10 @@ pub enum ServerMessage {
     },
     PartyClose {
         party_id: String,
+    },
+    /// Reply to `party_list`.
+    PartyList {
+        parties: Vec<PartyListing>,
     },
     /// Reply to `MatchCreate` / `MatchJoin`.
     Match {
@@ -711,4 +752,16 @@ pub struct Reaction {
 
 fn one_f64() -> f64 {
     1.0
+}
+
+/// One row of `party_list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartyListing {
+    pub party_id: String,
+    pub label: String,
+    pub open: bool,
+    pub max_size: u32,
+    pub size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_id: Option<String>,
 }

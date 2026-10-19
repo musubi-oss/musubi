@@ -108,9 +108,10 @@ async fn build_state_cfg_with(
     let runtime = test_runtime();
     let cluster = test_cluster_in(&db, group, region).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
-    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
-        cluster.as_ref().unwrap().node_id().0,
-    ));
+    let parties = Arc::new(
+        musubi_server::realtime::PartyRegistry::new(cluster.as_ref().unwrap().node_id().0)
+            .with_directory(db.clone()),
+    );
     let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
     ));
@@ -750,6 +751,8 @@ async fn parties_create_join_requests_leader_data_and_party_matchmaking() {
         ClientMessage::PartyCreate {
             open: false,
             max_size: 2,
+            label: None,
+            hidden: false,
         },
     )
     .await;
@@ -980,6 +983,8 @@ async fn parties_create_join_requests_leader_data_and_party_matchmaking() {
         ClientMessage::PartyCreate {
             open: true,
             max_size: 4,
+            label: None,
+            hidden: false,
         },
     )
     .await;
@@ -1995,6 +2000,8 @@ async fn cross_node_party() {
         ClientMessage::PartyCreate {
             open: true,
             max_size: 4,
+            label: None,
+            hidden: false,
         },
     )
     .await;
@@ -3026,6 +3033,8 @@ async fn zanshin_and_aurix_integrations() {
         ClientMessage::PartyCreate {
             open: true,
             max_size: 4,
+            label: None,
+            hidden: false,
         },
     )
     .await;
@@ -6126,6 +6135,8 @@ async fn party_invite_lets_invitee_join_closed_party() {
         ClientMessage::PartyCreate {
             open: false,
             max_size: 4,
+            label: None,
+            hidden: false,
         },
     )
     .await;
@@ -19171,4 +19182,267 @@ async fn match_input_routes_to_authoritative_match() {
         recv(&mut a).await.msg,
         ServerMessage::Error { .. }
     ));
+}
+
+/// Party labels, hidden flag and the cluster-wide directory (competitive P0-23).
+#[tokio::test]
+async fn party_labels_update_and_listing() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    let tag = uuid::Uuid::now_v7().simple().to_string();
+    let label = format!("ranked-eu-{tag}");
+
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyCreate {
+            open: true,
+            max_size: 3,
+            label: Some(label.clone()),
+            hidden: false,
+        },
+    )
+    .await;
+    let pid = match recv(&mut a).await.msg {
+        ServerMessage::Party {
+            party_id,
+            label: l,
+            hidden,
+            ..
+        } => {
+            assert_eq!(l, label);
+            assert!(!hidden);
+            party_id
+        }
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::PartyCreate {
+            open: true,
+            max_size: 2,
+            label: Some(format!("secret-{tag}")),
+            hidden: true,
+        },
+    )
+    .await;
+    let hidden_pid = match recv(&mut b).await.msg {
+        ServerMessage::Party {
+            party_id, hidden, ..
+        } => {
+            assert!(hidden);
+            party_id
+        }
+        m => panic!("{m:?}"),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await; // directory writes are async
+
+    // HTTP directory: the labelled open party is visible with its size, the hidden one is not
+    let (st, l) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/parties?label_prefix=ranked-eu-{tag}"),
+        Some(&tc),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    let rows = l["parties"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{l}");
+    assert_eq!(rows[0]["party_id"], serde_json::json!(pid));
+    assert_eq!(rows[0]["size"], 1);
+    assert_eq!(rows[0]["max_size"], 3);
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/parties?label=secret-{tag}"),
+        Some(&tc),
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        l["parties"].as_array().unwrap().is_empty(),
+        "hidden party listed: {l}"
+    );
+    let _ = hidden_pid;
+
+    // realtime listing sees the same
+    send(
+        &mut c,
+        f,
+        Some("l"),
+        ClientMessage::PartyList {
+            label: Some(label.clone()),
+            label_prefix: None,
+            open: Some(true),
+            limit: 10,
+        },
+    )
+    .await;
+    match recv(&mut c).await.msg {
+        ServerMessage::PartyList { parties } => {
+            assert_eq!(parties.len(), 1);
+            assert_eq!(parties[0].party_id, pid);
+            assert_eq!(parties[0].label, label);
+        }
+        m => panic!("{m:?}"),
+    }
+
+    // C joins → size 2 in the directory
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::PartyJoin {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    match recv(&mut c).await.msg {
+        ServerMessage::Party { presences, .. } => assert_eq!(presences.len(), 2),
+        m => panic!("{m:?}"),
+    }
+    let _ = recv(&mut a).await; // presence event
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/parties?label={label}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(l["parties"][0]["size"], 2, "{l}");
+
+    // only the leader may update; the update reaches every member and the directory
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::PartyUpdate {
+            party_id: pid.clone(),
+            label: Some("x".into()),
+            open: None,
+            hidden: None,
+            max_size: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut c).await.msg,
+        ServerMessage::Error { .. }
+    ));
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyUpdate {
+            party_id: pid.clone(),
+            label: Some(format!("casual-{tag}")),
+            open: Some(false),
+            hidden: Some(true),
+            max_size: Some(2),
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::Party {
+            label: l,
+            open,
+            hidden,
+            max_size,
+            ..
+        } => {
+            assert_eq!(l, format!("casual-{tag}"));
+            assert!(!open && hidden);
+            assert_eq!(max_size, 2);
+        }
+        m => panic!("{m:?}"),
+    }
+    match recv(&mut c).await.msg {
+        ServerMessage::Party { label: l, .. } => assert_eq!(l, format!("casual-{tag}")),
+        m => panic!("{m:?}"),
+    }
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyUpdate {
+            party_id: pid.clone(),
+            label: None,
+            open: None,
+            hidden: None,
+            max_size: Some(1),
+        },
+    )
+    .await;
+    assert!(
+        matches!(recv(&mut a).await.msg, ServerMessage::Error { .. }),
+        "max_size below member count"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/parties?label_prefix=ranked-eu-{tag}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        l["parties"].as_array().unwrap().is_empty(),
+        "renamed+hidden party still listed: {l}"
+    );
+
+    // closing removes the row
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyUpdate {
+            party_id: pid.clone(),
+            label: None,
+            open: None,
+            hidden: Some(false),
+            max_size: None,
+        },
+    )
+    .await;
+    let _ = recv(&mut a).await;
+    let _ = recv(&mut c).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::PartyClose {
+            party_id: pid.clone(),
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/parties?label=casual-{tag}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert!(l["parties"].as_array().unwrap().is_empty(), "{l}");
 }

@@ -770,10 +770,52 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             }
             Err(e) => Some(ServerMessage::error(&e)),
         },
-        ClientMessage::PartyCreate { open, max_size } => Some(
+        ClientMessage::PartyCreate {
+            open,
+            max_size,
+            label,
+            hidden,
+        } => Some(
             ctx.parties
-                .create(ctx.presence, open, max_size)
+                .create(ctx.presence, open, max_size, label, hidden)
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
+        ),
+        ClientMessage::PartyUpdate {
+            party_id,
+            label,
+            open,
+            hidden,
+            max_size,
+        } => party_dispatch(
+            ctx,
+            &party_id,
+            PartyCmd::Update(super::party::PartyUpdate {
+                label,
+                open,
+                hidden,
+                max_size,
+            }),
+        ),
+        ClientMessage::PartyList {
+            label,
+            label_prefix,
+            open,
+            limit,
+        } => Some(
+            match super::party::PartyRegistry::list(
+                ctx.db,
+                &super::party::ListFilter {
+                    label,
+                    label_prefix,
+                    open,
+                    limit,
+                },
+            )
+            .await
+            {
+                Ok(parties) => ServerMessage::PartyList { parties },
+                Err(e) => ServerMessage::error(&e),
+            },
         ),
         ClientMessage::PartyJoin { party_id } => party_dispatch(ctx, &party_id, PartyCmd::Join),
         ClientMessage::PartyInvite {

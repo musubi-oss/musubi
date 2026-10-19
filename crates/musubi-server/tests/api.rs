@@ -38,9 +38,10 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     )));
     let cluster = test_cluster(&db, &unique("grp")).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
-    let parties = Arc::new(musubi_server::realtime::PartyRegistry::new(
-        cluster.as_ref().unwrap().node_id().0,
-    ));
+    let parties = Arc::new(
+        musubi_server::realtime::PartyRegistry::new(cluster.as_ref().unwrap().node_id().0)
+            .with_directory(db.clone()),
+    );
     let relayed = Arc::new(musubi_server::realtime::RelayedRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
     ));

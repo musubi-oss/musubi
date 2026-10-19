@@ -357,6 +357,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/server/group_challenges/{id}/settle", "groups"),
     ("POST", "/v1/server/group_challenges/sweep", "groups"),
     ("GET", "/v1/group_challenges", "groups"),
+    ("GET", "/v1/parties", "social"),
     ("GET", "/v1/group_challenges/{id}", "groups"),
     ("GET", "/v1/group_challenges/{id}/me", "groups"),
     ("POST", "/v1/groups/{id}/treasury/deposit", "groups"),

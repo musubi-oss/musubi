@@ -53,7 +53,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Перевод сообщений | ✅ вебхук `chat.translate_url`: языки присутствующих, `content.translations` | ❌ | ❌ | ❌ | ❌ |
 | Голос | ✅ через Aurix (токены, позиционный канал мира, модерация) | ❌ | ❌ | ✅ | ❌ |
 | Присутствие / статус | ✅ hub + шина (`online_remote`) | ✅ | ✅ | ❌ | ✅ |
-| Пати, лобби, ready, команды | ✅ parties (home-node) + `/v1/lobbies` | ✅ | ✅ | ✅ | ✅ |
+| Пати (label/hidden, кластерный листинг), лобби, ready, команды | ✅ parties (home-node) + `party_list`/`GET /v1/parties` + `/v1/lobbies` | ✅ | ✅ | ✅ | ✅ |
 | Уведомления in-app | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Push FCM / APNs / Huawei, тихие пуши, deep links | ✅ `push.rs` (`fcm`/`apns`/`hms`, `data.silent`, `data.link`) | ❌ | ❌ | ✅ | ❌ |
 | WebPush | ✅ `push.rs`: RFC 8030/8291 aes128gcm + VAPID, `platform: webpush` в `/v1/account/push_tokens` | ❌ | ❌ | ❌ | ❌ |
