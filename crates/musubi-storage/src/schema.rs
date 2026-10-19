@@ -80,6 +80,10 @@ pub struct WhereOp {
     pub kind: WhereKind,
     /// Bound as text and cast in SQL (`::numeric` / `::jsonb`).
     pub value: String,
+    /// `0` = top-level `and`; `n > 0` = member of the n-th `$or` group.
+    pub group: u32,
+    /// Alternative within the `$or` group; conditions sharing `(group, alt)` are `and`-ed.
+    pub alt: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +93,23 @@ pub enum WhereKind {
     Bool,
     /// `"$q"`: websearch-style full-text query over the whole value (`path` unused).
     FullText,
+    /// `in` / `nin`: value is a JSON array; scalar membership through jsonb containment.
+    In,
+    NotIn,
+    /// `like` / `ilike` / `prefix` (prefix is escaped into a `like` pattern).
+    Like,
+    ILike,
+    /// `regex` (`~`) / `iregex` (`~*`): POSIX regular expression over the text value.
+    Regex,
+    IRegex,
+    /// `exists`: whether the field is present (value `true` / `false`).
+    Exists,
+    /// `contains` (`@>`): jsonb containment — array has element(s), object has pairs.
+    Contains,
+    /// `size`, `size>=`, `size<=`: array length (`op` carries the comparison).
+    Size,
+    /// `between`: `[lo, hi]` numbers, inclusive.
+    Between,
 }
 
 pub fn parse_path(field: &str) -> Result<Vec<String>> {
@@ -164,18 +185,16 @@ pub fn split_where(filter: Option<&Value>) -> Result<(Option<Value>, Vec<WhereOp
             op: "@@",
             kind: WhereKind::FullText,
             value: q.to_string(),
+            group: 0,
+            alt: 0,
         });
     }
-    let Some(raw) = obj.get("$where") else {
-        let mut rest = obj.clone();
-        rest.remove("$q");
-        let rest = (!rest.is_empty()).then_some(Value::Object(rest));
-        return Ok((rest, ops));
-    };
-    let Some(items) = raw.as_array() else {
-        return Err(Error::InvalidArgument(
-            "$where must be an array of [field, op, value]".into(),
-        ));
+    let empty = Vec::new();
+    let items: &Vec<Value> = match obj.get("$where") {
+        None => &empty,
+        Some(raw) => raw.as_array().ok_or_else(|| {
+            Error::InvalidArgument("$where must be an array of [field, op, value]".into())
+        })?,
     };
     if items.len() > MAX_WHERE_OPS {
         return Err(Error::InvalidArgument(format!(
@@ -184,36 +203,41 @@ pub fn split_where(filter: Option<&Value>) -> Result<(Option<Value>, Vec<WhereOp
     }
     ops.reserve(items.len());
     for it in items {
-        let bad = || Error::InvalidArgument(format!("$where: bad condition {it}"));
-        let arr = it.as_array().filter(|a| a.len() == 3).ok_or_else(bad)?;
-        let path = parse_path(arr[0].as_str().ok_or_else(bad)?)?;
-        let op = match arr[1].as_str().ok_or_else(bad)? {
-            "=" | "==" => "=",
-            "!=" => "<>",
-            "<" => "<",
-            "<=" => "<=",
-            ">" => ">",
-            ">=" => ">=",
-            _ => return Err(bad()),
-        };
-        let (kind, value) = match &arr[2] {
-            Value::Number(n) => (WhereKind::Number, n.to_string()),
-            Value::String(s) => (WhereKind::Text, s.clone()),
-            Value::Bool(b) => (WhereKind::Bool, b.to_string()),
-            _ => return Err(bad()),
-        };
-        if kind == WhereKind::Bool && op != "=" && op != "<>" {
-            return Err(bad());
+        ops.push(parse_cond(it, 0, 0)?);
+    }
+    if let Some(or) = obj.get("$or") {
+        let groups = or
+            .as_array()
+            .filter(|g| !g.is_empty() && g.len() <= 16)
+            .ok_or_else(|| {
+                Error::InvalidArgument(
+                    "$or must be a non-empty array of up to 16 alternatives".into(),
+                )
+            })?;
+        for (alt, g) in groups.iter().enumerate() {
+            let conds: Vec<&Value> = match g.as_array() {
+                // a single [field, op, value] triple or a list of triples (and-ed)
+                Some(a) if a.first().is_some_and(|x| x.is_string()) => vec![g],
+                Some(a) if !a.is_empty() => a.iter().collect(),
+                _ => {
+                    return Err(Error::InvalidArgument(format!(
+                        "$or: alternative {alt} must be a condition or a list of conditions"
+                    )))
+                }
+            };
+            for c in conds {
+                ops.push(parse_cond(c, 1, alt as u32)?);
+            }
         }
-        ops.push(WhereOp {
-            path,
-            op,
-            kind,
-            value,
-        });
+        if ops.len() > MAX_WHERE_OPS {
+            return Err(Error::InvalidArgument(format!(
+                "$where/$or: at most {MAX_WHERE_OPS} conditions"
+            )));
+        }
     }
     let mut rest = obj.clone();
     rest.remove("$where");
+    rest.remove("$or");
     rest.remove("$q");
     let rest = if rest.is_empty() {
         None
@@ -223,32 +247,180 @@ pub fn split_where(filter: Option<&Value>) -> Result<(Option<Value>, Vec<WhereOp
     Ok((rest, ops))
 }
 
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// One `[field, op, value]` condition.
+fn parse_cond(it: &Value, group: u32, alt: u32) -> Result<WhereOp> {
+    let bad = || Error::InvalidArgument(format!("$where: bad condition {it}"));
+    let arr = it.as_array().filter(|a| a.len() == 3).ok_or_else(bad)?;
+    let path = parse_path(arr[0].as_str().ok_or_else(bad)?)?;
+    let op_s = arr[1].as_str().ok_or_else(bad)?;
+    let v = &arr[2];
+    let scalar = |v: &Value| -> Result<(WhereKind, String)> {
+        match v {
+            Value::Number(n) => Ok((WhereKind::Number, n.to_string())),
+            Value::String(s) => Ok((WhereKind::Text, s.clone())),
+            Value::Bool(b) => Ok((WhereKind::Bool, b.to_string())),
+            _ => Err(bad()),
+        }
+    };
+    let text = |v: &Value| -> Result<String> {
+        let s = v.as_str().ok_or_else(bad)?;
+        if s.is_empty() || s.len() > 256 {
+            return Err(bad());
+        }
+        Ok(s.to_string())
+    };
+    let (op, kind, value): (&'static str, WhereKind, String) = match op_s {
+        "=" | "==" | "!=" | "<" | "<=" | ">" | ">=" => {
+            let op = match op_s {
+                "=" | "==" => "=",
+                "!=" => "<>",
+                o => match o {
+                    "<" => "<",
+                    "<=" => "<=",
+                    ">" => ">",
+                    _ => ">=",
+                },
+            };
+            let (kind, value) = scalar(v)?;
+            if kind == WhereKind::Bool && op != "=" && op != "<>" {
+                return Err(bad());
+            }
+            (op, kind, value)
+        }
+        "in" | "nin" | "not in" => {
+            let a = v
+                .as_array()
+                .filter(|a| !a.is_empty() && a.len() <= 100)
+                .ok_or_else(bad)?;
+            if !a
+                .iter()
+                .all(|x| x.is_number() || x.is_string() || x.is_boolean())
+            {
+                return Err(bad());
+            }
+            let kind = if op_s == "in" {
+                WhereKind::In
+            } else {
+                WhereKind::NotIn
+            };
+            ("", kind, v.to_string())
+        }
+        "like" => ("like", WhereKind::Like, text(v)?),
+        "ilike" => ("ilike", WhereKind::ILike, text(v)?),
+        "prefix" => (
+            "like",
+            WhereKind::Like,
+            format!("{}%", escape_like(&text(v)?)),
+        ),
+        "regex" | "~" => ("~", WhereKind::Regex, text(v)?),
+        "iregex" | "~*" => ("~*", WhereKind::IRegex, text(v)?),
+        "exists" => (
+            "",
+            WhereKind::Exists,
+            v.as_bool().ok_or_else(bad)?.to_string(),
+        ),
+        "contains" | "@>" => {
+            if v.is_null() {
+                return Err(bad());
+            }
+            ("", WhereKind::Contains, v.to_string())
+        }
+        "size" | "size>=" | "size<=" | "size>" | "size<" => {
+            let n = v.as_i64().filter(|n| *n >= 0).ok_or_else(bad)?;
+            let op = match op_s {
+                "size" => "=",
+                "size>=" => ">=",
+                "size<=" => "<=",
+                "size>" => ">",
+                _ => "<",
+            };
+            (op, WhereKind::Size, n.to_string())
+        }
+        "between" => {
+            let a = v.as_array().filter(|a| a.len() == 2).ok_or_else(bad)?;
+            if !a.iter().all(Value::is_number) {
+                return Err(bad());
+            }
+            ("", WhereKind::Between, v.to_string())
+        }
+        _ => return Err(bad()),
+    };
+    Ok(WhereOp {
+        path,
+        op,
+        kind,
+        value,
+        group,
+        alt,
+    })
+}
+
+/// SQL expression of one condition with its value bound as `$p`.
+fn cond_sql(o: &WhereOp, p: usize) -> String {
+    let path = if o.path.is_empty() {
+        String::new()
+    } else {
+        pg_path(&o.path)
+    };
+    let num = format!(
+        "(case when jsonb_typeof(value #> {path}) = 'number' then (value #>> {path})::numeric end)"
+    );
+    match o.kind {
+        // CASE guarantees the cast only runs on numbers (a text value would abort the query)
+        WhereKind::Number => format!("{num} {} ${p}::numeric", o.op),
+        WhereKind::Text => format!("(value #>> {path}) {} ${p}::text", o.op),
+        WhereKind::Bool => format!("(value #> {path}) {} ${p}::jsonb", o.op),
+        WhereKind::FullText => format!(
+            "to_tsvector('simple', value) @@ websearch_to_tsquery('simple', ${p}::text)"
+        ),
+        WhereKind::In => format!("coalesce(value #> {path}, 'null'::jsonb) <@ ${p}::jsonb"),
+        WhereKind::NotIn => format!("not (coalesce(value #> {path}, 'null'::jsonb) <@ ${p}::jsonb)"),
+        WhereKind::Like | WhereKind::ILike | WhereKind::Regex | WhereKind::IRegex => {
+            format!("(value #>> {path}) {} ${p}::text", o.op)
+        }
+        WhereKind::Exists => format!("((value #> {path}) is not null) = (${p}::text = 'true')"),
+        WhereKind::Contains => format!("(value #> {path}) @> ${p}::jsonb"),
+        WhereKind::Size => format!(
+            "(case when jsonb_typeof(value #> {path}) = 'array' then jsonb_array_length(value #> {path}) end) {} ${p}::int",
+            o.op
+        ),
+        WhereKind::Between => format!(
+            "{num} between (${p}::jsonb->>0)::numeric and (${p}::jsonb->>1)::numeric"
+        ),
+    }
+}
+
 /// `and …` clauses for `ops`, binding their values as `$first_param, $first_param+1, …` (text).
+/// Top-level conditions are `and`-ed; `$or` members become `and ((a1 and a2) or (b1) …)`.
 pub fn where_sql(ops: &[WhereOp], first_param: usize) -> String {
     let mut sql = String::new();
+    let mut groups: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, Vec<String>>> =
+        Default::default();
     for (i, o) in ops.iter().enumerate() {
-        let p = first_param + i;
-        let path = if o.path.is_empty() {
-            String::new()
+        let expr = cond_sql(o, first_param + i);
+        if o.group == 0 {
+            sql.push_str(&format!(" and {expr}"));
         } else {
-            pg_path(&o.path)
-        };
-        match o.kind {
-            // CASE guarantees the cast only runs on numbers (a text value would abort the query)
-            WhereKind::Number => sql.push_str(&format!(
-                " and (case when jsonb_typeof(value #> {path}) = 'number' then (value #>> {path})::numeric end) {} ${p}::numeric",
-                o.op
-            )),
-            WhereKind::Text => {
-                sql.push_str(&format!(" and (value #>> {path}) {} ${p}::text", o.op))
-            }
-            WhereKind::Bool => {
-                sql.push_str(&format!(" and (value #> {path}) {} ${p}::jsonb", o.op))
-            }
-            WhereKind::FullText => sql.push_str(&format!(
-                " and to_tsvector('simple', value) @@ websearch_to_tsquery('simple', ${p}::text)"
-            )),
+            groups
+                .entry(o.group)
+                .or_default()
+                .entry(o.alt)
+                .or_default()
+                .push(expr);
         }
+    }
+    for alts in groups.values() {
+        let parts: Vec<String> = alts
+            .values()
+            .map(|c| format!("({})", c.join(" and ")))
+            .collect();
+        sql.push_str(&format!(" and ({})", parts.join(" or ")));
     }
     sql
 }

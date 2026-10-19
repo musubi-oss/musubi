@@ -28700,3 +28700,194 @@ async fn secrets_at_rest_status_and_reencrypt() {
     .await;
     assert!(st.is_success(), "{st}");
 }
+
+/// P1-38: storage query operators (`in`, `like`, `regex`, `exists`, `contains`, `size`,
+/// `between`), `$or` groups, random samples and full-text rank ordering.
+#[tokio::test]
+async fn storage_query_operators_or_random_and_rank() {
+    let Some(app) = app().await else { return };
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("sq-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let col = unique("items");
+    let (st, v) = call(&app, "POST", "/v1/storage/write", Some(&tok), Some(json!({"objects": [
+        {"collection": col, "key": "sword", "value": {"kind": "weapon", "name": "Flaming sword of dawn", "level": 5, "tags": ["fire", "rare"], "stats": {"atk": 12}}},
+        {"collection": col, "key": "shield", "value": {"kind": "armor", "name": "Tower shield", "level": 7, "tags": ["rare"]}},
+        {"collection": col, "key": "potion", "value": {"kind": "consumable", "name": "Healing potion", "level": 1, "tags": []}},
+        {"collection": col, "key": "note", "value": {"kind": "misc", "name": "Note about a sword and a sword", "level": "n/a"}},
+        {"collection": col, "key": "bow", "value": {"kind": "weapon", "name": "Longbow", "level": 3, "tags": ["ranged", "wood", "common"]}}
+    ]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let keys = |filter: &str, extra: &str| {
+        let app = app.clone();
+        let tok = tok.clone();
+        let col = col.clone();
+        let path = format!("/v1/storage/{col}?where={}{extra}", urlencoding(filter));
+        async move {
+            let (st, v) = call(&app, "GET", &path, Some(&tok), None).await;
+            let mut ks: Vec<String> = v["objects"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|o| o["key"].as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            ks.sort();
+            (st, ks, v)
+        }
+    };
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        (
+            r#"{"$where":[["kind","in",["weapon","armor"]]]}"#,
+            vec!["bow", "shield", "sword"],
+        ),
+        (
+            r#"{"$where":[["level","in",[1,3]]]}"#,
+            vec!["bow", "potion"],
+        ),
+        (
+            r#"{"$where":[["kind","nin",["weapon","armor"]]]}"#,
+            vec!["note", "potion"],
+        ),
+        (
+            r#"{"$where":[["name","like","%sword%"]]}"#,
+            vec!["note", "sword"],
+        ),
+        (r#"{"$where":[["name","like","Flaming%"]]}"#, vec!["sword"]),
+        (
+            r#"{"$where":[["name","ilike","%SWORD%"]]}"#,
+            vec!["note", "sword"],
+        ),
+        (r#"{"$where":[["name","prefix","Tower"]]}"#, vec!["shield"]),
+        (r#"{"$where":[["name","prefix","%"]]}"#, vec![]),
+        (
+            r#"{"$where":[["name","regex","^[A-Z][a-z]+ [a-z]+$"]]}"#,
+            vec!["potion", "shield"],
+        ),
+        (r#"{"$where":[["name","iregex","^long"]]}"#, vec!["bow"]),
+        (r#"{"$where":[["stats.atk","exists",true]]}"#, vec!["sword"]),
+        (
+            r#"{"$where":[["stats","exists",false],["kind","=","weapon"]]}"#,
+            vec!["bow"],
+        ),
+        (
+            r#"{"$where":[["tags","contains",["rare"]]]}"#,
+            vec!["shield", "sword"],
+        ),
+        (
+            r#"{"$where":[["tags","contains",["rare","fire"]]]}"#,
+            vec!["sword"],
+        ),
+        (
+            r#"{"$where":[["stats","contains",{"atk":12}]]}"#,
+            vec!["sword"],
+        ),
+        (r#"{"$where":[["tags","size",0]]}"#, vec!["potion"]),
+        (r#"{"$where":[["tags","size>=",2]]}"#, vec!["bow", "sword"]),
+        (
+            r#"{"$where":[["tags","size<",2]]}"#,
+            vec!["potion", "shield"],
+        ),
+        (
+            r#"{"$where":[["level","between",[3,5]]]}"#,
+            vec!["bow", "sword"],
+        ),
+        (
+            r#"{"$or":[["kind","=","armor"],["level","<",2]]}"#,
+            vec!["potion", "shield"],
+        ),
+        (
+            r#"{"$or":[[["kind","=","weapon"],["level",">",4]],["kind","=","misc"]],"$where":[["name","ilike","%s%"]]}"#,
+            vec!["note", "sword"],
+        ),
+        (
+            r#"{"kind":"weapon","$or":[["level","=",3],["level","=",5]]}"#,
+            vec!["bow", "sword"],
+        ),
+    ];
+    for (f, expect) in cases {
+        let (st, ks, v) = keys(f, "").await;
+        assert_eq!(st, StatusCode::OK, "{f}: {v}");
+        assert_eq!(ks, expect, "{f}");
+    }
+    for bad in [
+        r#"{"$where":[["kind","in",[]]]}"#,
+        r#"{"$where":[["kind","in","weapon"]]}"#,
+        r#"{"$where":[["kind","like",""]]}"#,
+        r#"{"$where":[["tags","size",-1]]}"#,
+        r#"{"$where":[["level","between",[1]]]}"#,
+        r#"{"$where":[["kind","exists","yes"]]}"#,
+        r#"{"$where":[["kind","???","x"]]}"#,
+        r#"{"$or":[]}"#,
+        r#"{"$or":[5]}"#,
+    ] {
+        let (st, _, v) = keys(bad, "").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    // count/aggregate share the operators
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/storage/{col}/count?where={}",
+            urlencoding(r#"{"$or":[["kind","=","weapon"],["kind","=","armor"]]}"#)
+        ),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 3, "{v}");
+    // random sample: right size, only matching objects, no cursor
+    let (st, ks, v) = keys(
+        r#"{"$where":[["kind","=","weapon"]]}"#,
+        "&sort=random&limit=1",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(ks.len(), 1);
+    assert!(ks[0] == "sword" || ks[0] == "bow", "{ks:?}");
+    assert!(
+        v["next_cursor"].is_null() || v.get("next_cursor").is_none(),
+        "{v}"
+    );
+    let (_, ks, _) = keys("{}", "&sort=random&limit=10").await;
+    assert_eq!(ks.len(), 5);
+    // rank: the object mentioning "sword" twice outranks the one mentioning it once
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/storage/{col}?where={}&sort=rank",
+            urlencoding(r#"{"$q":"sword"}"#)
+        ),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ranked: Vec<&str> = v["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(ranked, vec!["note", "sword"], "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/storage/{col}?sort=rank"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+}

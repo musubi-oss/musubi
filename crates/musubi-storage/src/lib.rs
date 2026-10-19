@@ -920,6 +920,63 @@ impl StorageService {
 
     /// `list` with an optional JSONB containment filter: only objects whose `value` contains
     /// `filter` (`value @> filter`, served by the GIN index) are returned.
+    /// `sort=random` — a random sample of the matching objects (no cursor); `sort=rank` — best
+    /// full-text matches first (`$q` required).
+    #[allow(clippy::too_many_arguments)]
+    async fn list_special(
+        &self,
+        caller: Caller,
+        collection: &str,
+        owner_id: Option<Uuid>,
+        limit: i64,
+        filter: Option<&serde_json::Value>,
+        key_prefix: Option<&str>,
+        rank: bool,
+    ) -> Result<(Vec<Object>, Option<String>)> {
+        let (filter, ops) = schema::split_where(filter)?;
+        let limit = limit.clamp(1, 100);
+        let prefix_like = like_prefix(key_prefix);
+        let (owner_id, min_read) = visibility(caller, owner_id);
+        let order = if rank {
+            let Some(qi) = ops
+                .iter()
+                .position(|o| o.kind == schema::WhereKind::FullText)
+            else {
+                return Err(Error::InvalidArgument(
+                    "sort=rank needs a \"$q\" full-text query in the filter".into(),
+                ));
+            };
+            format!(
+                "ts_rank(to_tsvector('simple', value), websearch_to_tsquery('simple', ${}::text)) desc, owner_id, key",
+                7 + qi
+            )
+        } else {
+            "random()".to_string()
+        };
+        let sql = format!(
+            "select {COLS} from musubi.storage_objects
+             where collection = $1 and ($2::uuid is null or owner_id = $2) and read_permission >= $3
+               and (expires_at is null or expires_at > now())
+               and ($4::jsonb is null or value @> $4)
+               and ($5::text is null or key like $5){}
+             order by {order} limit $6",
+            schema::where_sql(&ops, 7)
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(collection)
+            .bind(owner_id)
+            .bind(min_read)
+            .bind(filter)
+            .bind(prefix_like)
+            .bind(limit);
+        for o in &ops {
+            q = q.bind(&o.value);
+        }
+        let rows = q.fetch_all(&self.db).await.map_err(Error::internal)?;
+        let objs: Vec<Object> = self.finish(rows.into_iter().map(to_object).collect());
+        Ok((objs, None))
+    }
+
     pub async fn list_where(
         &self,
         caller: Caller,
@@ -934,6 +991,19 @@ impl StorageService {
             key_prefix,
             sort,
         } = f;
+        if matches!(sort, Some("random") | Some("rank")) {
+            return self
+                .list_special(
+                    caller,
+                    collection,
+                    owner_id,
+                    limit,
+                    filter,
+                    key_prefix,
+                    sort == Some("rank"),
+                )
+                .await;
+        }
         if let Some(sort) = sort {
             return self
                 .list_sorted(
