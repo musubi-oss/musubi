@@ -268,6 +268,16 @@ hands one out per redemption (`no keys left` → 409, nothing granted). Players
 `{reward: [...], keys: [...], metadata}`; `GET /v1/codes/redemptions` is their history. Event
 `code.redeemed`.
 
+Energy (stamina-style resources) lives next door: `POST /v1/server/energy {id, max, regen_seconds,
+initial, refill_count, max_overfill, reward_on_spend?}` — `refill_count` units per tick, grants may
+push the bar up to `max_overfill` (regeneration never does), `reward_on_spend` grants a reward table
+per spend (XP per stamina); `GET /v1/energy`, `POST /v1/energy/{id}/spend {amount, at?}` where `at`
+books an offline spend at the moment it happened (regeneration runs to `at`, then on to now);
+`POST /v1/server/energy/grant`. Per-player timed modifiers — `POST /v1/server/energy/modifiers
+{account_id, energy_id, kind: infinite|set_refill_count|set_refill_sec|set_max_count, value,
+duration_secs?}`, `GET …?account_id`, `DELETE …/{id}` — make spends free or override refill/max for
+the duration; `GET /v1/energy` reports effective values and active modifiers.
+
 Lobbies carry typed attributes: `attributes {key: string|number|bool}` (public, searchable, ≤ 32
 keys) and `private_attributes` (members only) on create/PATCH, plus per-member `data`
 (`PUT /v1/lobbies/{id}/me {data}` — loadout, colour, platform; everyone in the lobby gets `updated`).

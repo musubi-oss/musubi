@@ -70,6 +70,14 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/progression/xp", post(add_xp))
         .route("/v1/server/energy", get(energies).post(upsert_energy))
         .route("/v1/server/energy/grant", post(energy_grant))
+        .route(
+            "/v1/server/energy/modifiers",
+            get(energy_modifiers).post(energy_modifier_add),
+        )
+        .route(
+            "/v1/server/energy/modifiers/{id}",
+            axum::routing::delete(energy_modifier_remove),
+        )
         .route("/v1/server/streaks", get(streak_defs).post(upsert_streak))
         .route("/v1/iap/apple", post(iap_apple))
         .route("/v1/iap/google", post(iap_google))
@@ -849,6 +857,9 @@ async fn energy(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Va
 struct AmountReq {
     #[serde(default = "one_i32")]
     amount: i32,
+    /// Unix seconds when an offline spend actually happened (energy spends only).
+    #[serde(default)]
+    at: Option<i64>,
 }
 
 fn one_i32() -> i32 {
@@ -864,11 +875,73 @@ async fn energy_spend(
     if r.amount <= 0 {
         return Err(Error::InvalidArgument("amount must be positive".into()).into());
     }
+    let at =
+        r.at.map(|t| {
+            OffsetDateTime::from_unix_timestamp(t).map_err(|_| Error::InvalidArgument("at".into()))
+        })
+        .transpose()?;
     let st = s
         .economy
-        .adjust_energy(me.account_id, &id, -r.amount, OffsetDateTime::now_utc())
+        .adjust_energy_at(me.account_id, &id, -r.amount, OffsetDateTime::now_utc(), at)
         .await?;
     Ok(Json(serde_json::to_value(st).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct ModifierReq {
+    account_id: String,
+    energy_id: String,
+    /// `infinite` | `set_refill_count` | `set_refill_sec` | `set_max_count`
+    kind: String,
+    #[serde(default)]
+    value: i64,
+    #[serde(default)]
+    duration_secs: Option<i64>,
+}
+
+async fn energy_modifier_add(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(r): Json<ModifierReq>,
+) -> Result<Json<Value>, ApiError> {
+    let m = s
+        .economy
+        .add_energy_modifier(
+            account(&r.account_id)?,
+            &r.energy_id,
+            &r.kind,
+            r.value,
+            r.duration_secs,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    Ok(Json(serde_json::to_value(m).map_err(Error::internal)?))
+}
+
+#[derive(Deserialize)]
+struct ModifiersQ {
+    account_id: String,
+}
+
+async fn energy_modifiers(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Query(q): axum::extract::Query<ModifiersQ>,
+) -> Result<Json<Value>, ApiError> {
+    let m = s
+        .economy
+        .energy_modifiers(account(&q.account_id)?, OffsetDateTime::now_utc())
+        .await?;
+    Ok(Json(json!({ "modifiers": m })))
+}
+
+async fn energy_modifier_remove(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    s.economy.remove_energy_modifier(id).await?;
+    Ok(Json(json!({ "removed": id })))
 }
 
 async fn streaks(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {

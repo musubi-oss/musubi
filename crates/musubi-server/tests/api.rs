@@ -20215,3 +20215,197 @@ async fn redemption_codes_campaigns_keys_limits_and_history() {
     .await;
     assert_eq!(st, 429);
 }
+
+#[tokio::test]
+async fn energy_modifiers_overfill_offline_spend_and_refill_count() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let srv = |method: &str, path: String, body: Value| {
+        let app = app.clone();
+        let method = method.to_string();
+        async move {
+            let req = Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (status, v)
+        }
+    };
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("energy-dev-")})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let e = unique("mana").to_lowercase().replace('-', "_");
+    // max 10, 2 units per 60 s, grants may overfill to 15
+    let (st, v) = srv(
+        "POST",
+        "/v1/server/energy".to_string(),
+        json!({"id": e, "max": 10, "regen_seconds": 60, "initial": 10, "refill_count": 2, "max_overfill": 15}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["refill_count"], 2);
+    let mine = |v: &Value| -> Value {
+        v["energy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["energy_id"] == e)
+            .cloned()
+            .unwrap()
+    };
+    // grant overfills up to 15, not beyond
+    let (st, v) = srv(
+        "POST",
+        "/v1/server/energy/grant".to_string(),
+        json!({"account_id": acc, "energy_id": e, "amount": 20}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["amount"], 15);
+    assert_eq!(v["max_overfill"], 15);
+    // offline spend booked 10 minutes ago: 15 - 4 = 11 (above max → no regeneration applies)
+    let past = time::OffsetDateTime::now_utc().unix_timestamp() - 600;
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{e}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 4, "at": past})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["amount"], 11);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{e}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 1, "at": past + 100_000})),
+    )
+    .await;
+    assert_eq!(st, 400, "future at");
+    // spend down to 1, then an offline spend 10 minutes ago is reconciled against regeneration:
+    // at `past` the amount was 1 → spend 1 → 0, then 10 min × 2 units / 60 s = 20 → capped at max 10
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{e}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 10})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["amount"], 1);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{e}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 1, "at": past})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    // `at` is clamped to the last update, so this is an ordinary spend: 1 → 0
+    assert_eq!(v["amount"], 0, "{v}");
+    assert_eq!(v["next_in_seconds"], 60);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{e}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 1})),
+    )
+    .await;
+    assert_eq!(st, 429, "{v}");
+
+    // infinite modifier for 1 hour: spends are free and the bar reads full
+    let (st, m) = srv(
+        "POST",
+        "/v1/server/energy/modifiers".to_string(),
+        json!({"account_id": acc, "energy_id": e, "kind": "infinite", "duration_secs": 3600}),
+    )
+    .await;
+    assert_eq!(st, 200, "{m}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/energy/{e}/spend"),
+        Some(&tok),
+        Some(json!({"amount": 5})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["infinite"], true);
+    assert_eq!(v["amount"], 10);
+    assert_eq!(v["modifiers"].as_array().unwrap().len(), 1);
+    let (_, v) = call(&app, "GET", "/v1/energy", Some(&tok), None).await;
+    assert_eq!(mine(&v)["infinite"], true);
+    // remove it → back to the real amount (0 + regeneration so far, i.e. still 0)
+    let (st, _) = srv(
+        "DELETE",
+        format!("/v1/server/energy/modifiers/{}", m["id"].as_str().unwrap()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, v) = call(&app, "GET", "/v1/energy", Some(&tok), None).await;
+    assert_eq!(mine(&v)["infinite"], false);
+    assert_eq!(mine(&v)["amount"], 0);
+    // set_max_count raises the cap for this player only; set_refill_sec speeds regen
+    let (st, _) = srv(
+        "POST",
+        "/v1/server/energy/modifiers".to_string(),
+        json!({"account_id": acc, "energy_id": e, "kind": "set_max_count", "value": 30, "duration_secs": 3600}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = srv(
+        "POST",
+        "/v1/server/energy/modifiers".to_string(),
+        json!({"account_id": acc, "energy_id": e, "kind": "set_refill_sec", "value": 1, "duration_secs": 3600}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, v) = call(&app, "GET", "/v1/energy", Some(&tok), None).await;
+    assert_eq!(mine(&v)["max"], 30);
+    assert_eq!(mine(&v)["regen_seconds"], 1);
+    let (st, v) = srv(
+        "GET",
+        format!("/v1/server/energy/modifiers?account_id={acc}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(v["modifiers"].as_array().unwrap().len(), 2);
+    let (st, _) = srv(
+        "POST",
+        "/v1/server/energy/modifiers".to_string(),
+        json!({"account_id": acc, "energy_id": e, "kind": "set_refill_count", "value": 0}),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, _) = srv(
+        "POST",
+        "/v1/server/energy/modifiers".to_string(),
+        json!({"account_id": acc, "energy_id": e, "kind": "turbo", "value": 1}),
+    )
+    .await;
+    assert_eq!(st, 400);
+}

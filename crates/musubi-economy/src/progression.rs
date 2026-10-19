@@ -5,6 +5,7 @@ use musubi_core::{AccountId, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 
 use crate::rewards::RewardEntry;
 use crate::EconomyService;
@@ -54,6 +55,12 @@ pub struct EnergyDef {
     pub max: i32,
     pub regen_seconds: i64,
     pub initial: i32,
+    /// Units restored per `regen_seconds` tick (default 1).
+    pub refill_count: i32,
+    /// Grants may push the amount up to this cap (0 = `max`); regeneration never does.
+    pub max_overfill: i32,
+    /// Reward table granted on every spend (e.g. XP per stamina used).
+    pub reward_on_spend: Option<String>,
 }
 
 impl Default for EnergyDef {
@@ -64,6 +71,9 @@ impl Default for EnergyDef {
             max: 0,
             regen_seconds: 0,
             initial: -1,
+            refill_count: 1,
+            max_overfill: 0,
+            reward_on_spend: None,
         }
     }
 }
@@ -76,6 +86,43 @@ pub struct EnergyState {
     pub regen_seconds: i64,
     /// Seconds until the next unit regenerates (None when full).
     pub next_in_seconds: Option<i64>,
+    pub refill_count: i32,
+    pub max_overfill: i32,
+    /// An `infinite` modifier is active: spends cost nothing.
+    pub infinite: bool,
+    pub modifiers: Vec<EnergyModifier>,
+}
+
+pub const ENERGY_MODIFIERS: &[&str] = &[
+    "infinite",
+    "set_refill_count",
+    "set_refill_sec",
+    "set_max_count",
+];
+
+/// A timed per-account override of an energy definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnergyModifier {
+    pub id: Uuid,
+    pub energy_id: String,
+    pub kind: String,
+    pub value: i64,
+    pub expires_at: Option<i64>,
+}
+
+/// Applies modifiers to a definition; returns whether spends are free (`infinite`).
+pub fn apply_modifiers(def: &mut EnergyDef, mods: &[EnergyModifier]) -> bool {
+    let mut infinite = false;
+    for m in mods {
+        match m.kind.as_str() {
+            "infinite" => infinite = true,
+            "set_refill_count" => def.refill_count = m.value.clamp(1, i32::MAX as i64) as i32,
+            "set_refill_sec" => def.regen_seconds = m.value.max(1),
+            "set_max_count" => def.max = m.value.clamp(1, i32::MAX as i64) as i32,
+            _ => {}
+        }
+    }
+    infinite
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -140,14 +187,16 @@ pub fn regenerate(
         return (amount, now);
     }
     let elapsed = (now - updated_at).whole_seconds().max(0);
-    let units = (elapsed / def.regen_seconds).min((def.max - amount) as i64);
+    let ticks = elapsed / def.regen_seconds;
+    let per_tick = def.refill_count.max(1) as i64;
+    let units = (ticks * per_tick).min((def.max - amount) as i64);
     let cur = amount + units as i32;
     if cur >= def.max {
         (cur, now)
     } else {
         (
             cur,
-            updated_at + Duration::seconds(units * def.regen_seconds),
+            updated_at + Duration::seconds(ticks * def.regen_seconds),
         )
     }
 }
@@ -166,6 +215,10 @@ fn energy_state(
         max: def.max,
         regen_seconds: def.regen_seconds,
         next_in_seconds: next,
+        refill_count: def.refill_count,
+        max_overfill: def.max_overfill.max(def.max),
+        infinite: false,
+        modifiers: Vec::new(),
     }
 }
 
@@ -190,7 +243,7 @@ pub fn next_streak(
 }
 
 type TrackRow = (String, String, Value);
-type EnergyRow = (String, String, i32, i64, i32);
+type EnergyRow = (String, String, i32, i64, i32, i32, i32, Option<String>);
 type StreakRow = (String, String, i64, i64, Value);
 type EnergyStateRow = (
     String,
@@ -198,6 +251,9 @@ type EnergyStateRow = (
     i32,
     i64,
     i32,
+    i32,
+    i32,
+    Option<String>,
     Option<i32>,
     Option<OffsetDateTime>,
 );
@@ -217,6 +273,9 @@ fn energy(r: EnergyRow) -> EnergyDef {
         max: r.2,
         regen_seconds: r.3,
         initial: r.4,
+        refill_count: r.5,
+        max_overfill: r.6,
+        reward_on_spend: r.7,
     }
 }
 fn streak(r: StreakRow) -> StreakDef {
@@ -372,14 +431,20 @@ impl EconomyService {
             d.initial = d.max;
         }
         sqlx::query(
-            "insert into musubi.energies (id, name, max, regen_seconds, initial) values ($1, $2, $3, $4, $5)
-             on conflict (id) do update set name = excluded.name, max = excluded.max, regen_seconds = excluded.regen_seconds, initial = excluded.initial",
+            "insert into musubi.energies (id, name, max, regen_seconds, initial, refill_count, max_overfill, reward_on_spend)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)
+             on conflict (id) do update set name = excluded.name, max = excluded.max, regen_seconds = excluded.regen_seconds,
+                initial = excluded.initial, refill_count = excluded.refill_count, max_overfill = excluded.max_overfill,
+                reward_on_spend = excluded.reward_on_spend",
         )
         .bind(&d.id)
         .bind(&d.name)
         .bind(d.max)
         .bind(d.regen_seconds)
         .bind(d.initial.min(d.max))
+        .bind(d.refill_count.max(1))
+        .bind(d.max_overfill.max(0))
+        .bind(&d.reward_on_spend)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -388,7 +453,7 @@ impl EconomyService {
 
     pub async fn energies(&self) -> Result<Vec<EnergyDef>> {
         let rows: Vec<EnergyRow> = sqlx::query_as(
-            "select id, name, max, regen_seconds, initial from musubi.energies order by id",
+            "select id, name, max, regen_seconds, initial, refill_count, max_overfill, reward_on_spend from musubi.energies order by id",
         )
         .fetch_all(&self.db)
         .await
@@ -402,22 +467,32 @@ impl EconomyService {
         now: OffsetDateTime,
     ) -> Result<Vec<EnergyState>> {
         let rows: Vec<EnergyStateRow> = sqlx::query_as(
-            "select e.id, e.name, e.max, e.regen_seconds, e.initial, s.amount, s.updated_at from musubi.energies e
+            "select e.id, e.name, e.max, e.regen_seconds, e.initial, e.refill_count, e.max_overfill, e.reward_on_spend, s.amount, s.updated_at from musubi.energies e
              left join musubi.energy_state s on s.energy_id = e.id and s.account_id = $1 order by e.id",
         )
         .bind(account.0)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
+        let mods = self.energy_modifiers(account, now).await?;
         Ok(rows
             .into_iter()
             .map(|r| {
-                let def = energy((r.0, r.1, r.2, r.3, r.4));
-                let (amount, at) = match (r.5, r.6) {
+                let mut def = energy((r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7));
+                let mine: Vec<EnergyModifier> = mods
+                    .iter()
+                    .filter(|m| m.energy_id == def.id)
+                    .cloned()
+                    .collect();
+                let infinite = apply_modifiers(&mut def, &mine);
+                let (amount, at) = match (r.8, r.9) {
                     (Some(a), Some(at)) => regenerate(a, at, &def, now),
-                    _ => (def.initial, now),
+                    _ => (def.initial.min(def.max), now),
                 };
-                energy_state(&def, amount, at, now)
+                let mut st = energy_state(&def, if infinite { def.max } else { amount }, at, now);
+                st.infinite = infinite;
+                st.modifiers = mine;
+                st
             })
             .collect())
     }
@@ -430,16 +505,43 @@ impl EconomyService {
         delta: i32,
         now: OffsetDateTime,
     ) -> Result<EnergyState> {
+        self.adjust_energy_at(account, energy_id, delta, now, None)
+            .await
+    }
+
+    /// Spend (`delta < 0`) or grant energy. `at` (≤ now) books an offline spend at the moment it
+    /// happened: regeneration runs to `at`, the spend applies, then regeneration continues to now.
+    /// Modifiers apply (`infinite` makes spends free), grants may overfill up to `max_overfill`,
+    /// and `reward_on_spend` is granted per spend.
+    pub async fn adjust_energy_at(
+        &self,
+        account: AccountId,
+        energy_id: &str,
+        delta: i32,
+        now: OffsetDateTime,
+        at: Option<OffsetDateTime>,
+    ) -> Result<EnergyState> {
+        let mods = self.energy_modifiers(account, now).await?;
+        let mine: Vec<EnergyModifier> = mods
+            .into_iter()
+            .filter(|m| m.energy_id == energy_id)
+            .collect();
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let row: Option<EnergyRow> = sqlx::query_as(
-            "select id, name, max, regen_seconds, initial from musubi.energies where id = $1",
+            "select id, name, max, regen_seconds, initial, refill_count, max_overfill, reward_on_spend from musubi.energies where id = $1",
         )
         .bind(energy_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        let Some(def) = row.map(energy) else {
+        let Some(mut def) = row.map(energy) else {
             return Err(Error::NotFound(format!("energy {energy_id}")));
+        };
+        let infinite = apply_modifiers(&mut def, &mine);
+        let spend_at = match at {
+            Some(a) if a > now => return Err(Error::InvalidArgument("at is in the future".into())),
+            Some(a) => a,
+            None => now,
         };
         sqlx::query(
             "insert into musubi.energy_state (account_id, energy_id, amount, updated_at) values ($1, $2, $3, $4) on conflict do nothing",
@@ -458,18 +560,25 @@ impl EconomyService {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(Error::internal)?;
-        let (cur, at) = regenerate(amount, at, &def, now);
-        let next = if delta < 0 {
-            if cur + delta < 0 {
-                return Err(Error::ResourceExhausted(format!(
-                    "not enough {energy_id}: {cur} available"
-                )));
+        let spend_at = spend_at.max(at);
+        let (cur, at) = regenerate(amount, at, &def, spend_at);
+        let (next, at) = if delta < 0 {
+            if infinite {
+                (cur, at)
+            } else {
+                if cur + delta < 0 {
+                    return Err(Error::ResourceExhausted(format!(
+                        "not enough {energy_id}: {cur} available"
+                    )));
+                }
+                let at = if cur >= def.max { spend_at } else { at };
+                regenerate(cur + delta, at, &def, now)
             }
-            cur + delta
         } else {
-            (cur + delta).min(def.max)
+            let cap = def.max_overfill.max(def.max);
+            ((cur + delta).min(cap).max(cur), at)
         };
-        let at = if cur >= def.max { now } else { at };
+        let at = if next >= def.max { now } else { at };
         sqlx::query("update musubi.energy_state set amount = $3, updated_at = $4 where account_id = $1 and energy_id = $2")
             .bind(account.0)
             .bind(energy_id)
@@ -479,7 +588,118 @@ impl EconomyService {
             .await
             .map_err(Error::internal)?;
         tx.commit().await.map_err(Error::internal)?;
-        Ok(energy_state(&def, next, at, now))
+        if delta < 0 && !infinite {
+            if let Some(table) = &def.reward_on_spend {
+                let reference = format!("energy:{energy_id}:{}:{}", account.0, Uuid::now_v7());
+                // a missing or empty table must not fail the spend itself
+                let _ = self.grant_table(account, table, &reference).await;
+            }
+        }
+        let mut st = energy_state(&def, if infinite { def.max } else { next }, at, now);
+        st.infinite = infinite;
+        st.modifiers = mine;
+        Ok(st)
+    }
+
+    /// Active modifiers of an account (expired ones are ignored and pruned lazily).
+    pub async fn energy_modifiers(
+        &self,
+        account: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<Vec<EnergyModifier>> {
+        let rows: Vec<(Uuid, String, String, i64, Option<OffsetDateTime>)> = sqlx::query_as(
+            "select id, energy_id, kind, value, expires_at from musubi.energy_modifiers
+             where account_id = $1 and (expires_at is null or expires_at > $2) order by created_at",
+        )
+        .bind(account.0)
+        .bind(now)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, energy_id, kind, value, expires_at)| EnergyModifier {
+                id,
+                energy_id,
+                kind,
+                value,
+                expires_at: expires_at.map(|t| t.unix_timestamp()),
+            })
+            .collect())
+    }
+
+    pub async fn add_energy_modifier(
+        &self,
+        account: AccountId,
+        energy_id: &str,
+        kind: &str,
+        value: i64,
+        duration_secs: Option<i64>,
+        now: OffsetDateTime,
+    ) -> Result<EnergyModifier> {
+        if !ENERGY_MODIFIERS.contains(&kind) {
+            return Err(Error::InvalidArgument(format!(
+                "kind must be one of {ENERGY_MODIFIERS:?}"
+            )));
+        }
+        if kind != "infinite" && value <= 0 {
+            return Err(Error::InvalidArgument("value must be positive".into()));
+        }
+        if duration_secs.is_some_and(|d| d <= 0) {
+            return Err(Error::InvalidArgument(
+                "duration_secs must be positive".into(),
+            ));
+        }
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from musubi.energies where id = $1)")
+                .bind(energy_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        if !exists {
+            return Err(Error::NotFound(format!("energy {energy_id}")));
+        }
+        let id = Uuid::now_v7();
+        let expires_at = duration_secs.map(|d| now + Duration::seconds(d));
+        sqlx::query(
+            "insert into musubi.energy_modifiers (id, account_id, energy_id, kind, value, expires_at) values ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(account.0)
+        .bind(energy_id)
+        .bind(kind)
+        .bind(value)
+        .bind(expires_at)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        sqlx::query(
+            "delete from musubi.energy_modifiers where expires_at is not null and expires_at <= $1",
+        )
+        .bind(now)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(EnergyModifier {
+            id,
+            energy_id: energy_id.into(),
+            kind: kind.into(),
+            value,
+            expires_at: expires_at.map(|t| t.unix_timestamp()),
+        })
+    }
+
+    pub async fn remove_energy_modifier(&self, id: Uuid) -> Result<()> {
+        let n = sqlx::query("delete from musubi.energy_modifiers where id = $1")
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+        if n == 0 {
+            return Err(Error::NotFound(format!("modifier {id}")));
+        }
+        Ok(())
     }
 
     // ----- streaks -----
@@ -621,6 +841,9 @@ mod tests {
             max: 10,
             regen_seconds: 60,
             initial: 10,
+            refill_count: 1,
+            max_overfill: 0,
+            reward_on_spend: None,
         }
     }
 
