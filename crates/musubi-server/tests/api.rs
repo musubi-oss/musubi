@@ -31944,3 +31944,107 @@ async fn audiences_overrides_and_managed_imports() {
         .await;
     }
 }
+
+/// Fleet `spec.secret_env`: sealed at rest, `***` in the API, plaintext only in the started process.
+#[tokio::test]
+async fn fleet_secret_env_sealed_and_redacted() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    musubi_core::secrets::install(&["ab".repeat(32)]).unwrap();
+    let marker = format!("/tmp/musubi-secret-{}.txt", uuid::Uuid::now_v7().simple());
+    let cmd = json!([
+        "sh",
+        "-c",
+        format!("echo \"$API_TOKEN:$PUBLIC\" > {marker}; sleep 60")
+    ]);
+    // validation: bad key, key in both env and secret_env
+    for bad in [
+        json!({"command": cmd, "secret_env": {"1BAD": "x"}}),
+        json!({"command": cmd, "env": {"DUP": "a"}, "secret_env": {"DUP": "b"}}),
+    ] {
+        let (st, r) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+            "name": unique("secenv-bad"), "provider": "local", "region": "eu-west", "buffer": 0, "max_servers": 1, "spec": bad
+        }))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    }
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+        "name": unique("secenv"), "provider": "local", "region": "eu-west", "buffer": 1, "max_servers": 1,
+        "port_start": 43000, "port_end": 43010,
+        "spec": {"command": cmd, "env": {"PUBLIC": "open"}, "secret_env": {"API_TOKEN": "hunter2"}}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    assert_eq!(f["spec"]["secret_env"]["API_TOKEN"], "***");
+    assert_eq!(f["spec"]["env"]["PUBLIC"], "open");
+    let (_, g) = call_server(&app, "GET", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert_eq!(g["spec"]["secret_env"]["API_TOKEN"], "***");
+    let (_, l) = call_server(&app, "GET", "/v1/server/fleets", k, None).await;
+    let mine = l["fleets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == json!(fid))
+        .unwrap();
+    assert_eq!(mine["spec"]["secret_env"]["API_TOKEN"], "***");
+    // sealed in the database
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let stored: String = sqlx::query_scalar(
+        "select spec->'secret_env'->>'API_TOKEN' from musubi.fleets where id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&fid).unwrap())
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(stored.starts_with("enc:v1:"), "{stored}");
+    assert_ne!(stored, "hunter2");
+    // the process got the plaintext (the reconcile loop is not running in tests — run one pass)
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let mut content = String::new();
+    for _ in 0..100 {
+        if let Ok(c) = std::fs::read_to_string(&marker) {
+            content = c;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(content.trim(), "hunter2:open");
+    // builds carry their own spec — sealed and redacted the same way
+    let (st, b) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        Some(json!({
+            "version": "1.1", "spec": {"command": cmd, "secret_env": {"API_TOKEN": "hunter3"}}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["spec"]["secret_env"]["API_TOKEN"], "***");
+    let (_, bs) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(bs["builds"][0]["spec"]["secret_env"]["API_TOKEN"], "***");
+    let stored: String = sqlx::query_scalar("select spec->'secret_env'->>'API_TOKEN' from musubi.fleet_builds where fleet_id = $1 and version = '1.1'")
+        .bind(uuid::Uuid::parse_str(&fid).unwrap())
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(stored.starts_with("enc:v1:"), "{stored}");
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    let _ = std::fs::remove_file(&marker);
+}

@@ -109,7 +109,7 @@ fn self_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
 
 async fn list(State(s): State<AppState>, ServerKey: ServerKey) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        json!({ "fleets": s.fleets.list().await?, "providers": s.fleets.providers() }),
+        json!({ "fleets": s.fleets.list().await?.into_iter().map(Fleet::redacted).collect::<Vec<_>>(), "providers": s.fleets.providers() }),
     ))
 }
 
@@ -118,7 +118,7 @@ async fn create(
     ServerKey: ServerKey,
     Json(c): Json<CreateFleet>,
 ) -> Result<Json<Fleet>, ApiError> {
-    Ok(Json(s.fleets.create(c).await?))
+    Ok(Json(s.fleets.create(c).await?.redacted()))
 }
 
 async fn get_one(
@@ -126,7 +126,7 @@ async fn get_one(
     ServerKey: ServerKey,
     Path(id): Path<String>,
 ) -> Result<Json<Fleet>, ApiError> {
-    Ok(Json(s.fleets.get(parse(&id)?).await?))
+    Ok(Json(s.fleets.get(parse(&id)?).await?.redacted()))
 }
 
 async fn delete(
@@ -212,7 +212,8 @@ async fn scale(
                 r.min_servers,
                 r.policy,
             )
-            .await?,
+            .await?
+            .redacted(),
     ))
 }
 
@@ -514,7 +515,13 @@ async fn builds(
 ) -> Result<Json<Value>, ApiError> {
     let id = parse(&id)?;
     s.fleets.get(id).await?;
-    let builds: Vec<musubi_fleet::FleetBuild> = s.fleets.builds(id).await?;
+    let builds: Vec<musubi_fleet::FleetBuild> = s
+        .fleets
+        .builds(id)
+        .await?
+        .into_iter()
+        .map(musubi_fleet::FleetBuild::redacted)
+        .collect();
     Ok(Json(json!({ "builds": builds })))
 }
 
@@ -525,7 +532,7 @@ async fn add_build(
     Json(c): Json<musubi_fleet::CreateBuild>,
 ) -> Result<Json<musubi_fleet::FleetBuild>, ApiError> {
     let id = parse(&id)?;
-    let b = s.fleets.add_build(id, c).await?;
+    let b = s.fleets.add_build(id, c).await?.redacted();
     Ok(Json(b))
 }
 
@@ -535,7 +542,7 @@ async fn promote_build(
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Json<musubi_fleet::FleetBuild>, ApiError> {
     let id = parse(&id)?;
-    let b = s.fleets.promote_build(id, &version).await?;
+    let b = s.fleets.promote_build(id, &version).await?.redacted();
     Ok(Json(b))
 }
 

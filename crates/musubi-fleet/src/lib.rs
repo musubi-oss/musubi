@@ -159,6 +159,10 @@ pub struct FleetSpec {
     pub command: Vec<String>,
     pub image: Option<String>,
     pub env: HashMap<String, String>,
+    /// Secret environment (P1): values are sealed with the `[security] master_keys` ring when
+    /// the fleet/build is stored, shown as `***` by the API, and decrypted only on the node
+    /// that starts the server, where they join `env` for the provider.
+    pub secret_env: HashMap<String, String>,
     pub working_dir: Option<String>,
     /// vCPUs one server uses, for usage accounting (default 1).
     pub vcpu: Option<f64>,
@@ -904,6 +908,79 @@ pub fn port_bindings(spec: &FleetSpec, primary: i32) -> Vec<(String, i32, i32, &
         }
     }
     out
+}
+
+pub fn validate_secret_env(spec: &FleetSpec) -> Result<()> {
+    if spec.secret_env.len() > 64 {
+        return Err(Error::InvalidArgument(
+            "spec.secret_env: at most 64 entries".into(),
+        ));
+    }
+    for k in spec.secret_env.keys() {
+        let ok = !k.is_empty()
+            && k.len() <= 128
+            && !k.as_bytes()[0].is_ascii_digit()
+            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !ok {
+            return Err(Error::InvalidArgument(format!(
+                "spec.secret_env key `{k}`: [A-Za-z_][A-Za-z0-9_]*"
+            )));
+        }
+        if spec.env.contains_key(k) {
+            return Err(Error::InvalidArgument(format!(
+                "`{k}` is in both env and secret_env"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Seal plaintext `secret_env` values with the current master key (no-op for already sealed
+/// values or when no key ring is configured — then the value is stored as given).
+pub fn seal_secret_env(spec: &mut FleetSpec) {
+    for v in spec.secret_env.values_mut() {
+        if !musubi_core::secrets::is_sealed(v) {
+            *v = musubi_core::secrets::seal(v);
+        }
+    }
+}
+
+/// Decrypt `secret_env` into `env` for the process/container about to start.
+pub fn open_secret_env(spec: &mut FleetSpec) -> Result<()> {
+    let sealed = std::mem::take(&mut spec.secret_env);
+    for (k, v) in sealed {
+        let plain = musubi_core::secrets::open(&v).map_err(|e| {
+            Error::internal(std::io::Error::other(format!("fleet secret `{k}`: {e}")))
+        })?;
+        spec.env.insert(k, plain);
+    }
+    Ok(())
+}
+
+pub const REDACTED: &str = "***";
+
+impl FleetSpec {
+    /// Copy for API responses: secret values replaced by `***`.
+    pub fn redacted(mut self) -> Self {
+        for v in self.secret_env.values_mut() {
+            *v = REDACTED.into();
+        }
+        self
+    }
+}
+
+impl Fleet {
+    pub fn redacted(mut self) -> Self {
+        self.spec = self.spec.redacted();
+        self
+    }
+}
+
+impl FleetBuild {
+    pub fn redacted(mut self) -> Self {
+        self.spec = self.spec.redacted();
+        self
+    }
 }
 
 pub fn validate_kubernetes(spec: &FleetSpec) -> Result<()> {
@@ -2401,8 +2478,10 @@ impl FleetService {
             .collect()
     }
 
-    pub async fn create(&self, c: CreateFleet) -> Result<Fleet> {
+    pub async fn create(&self, mut c: CreateFleet) -> Result<Fleet> {
         validate_slots(&c.spec)?;
+        validate_secret_env(&c.spec)?;
+        seal_secret_env(&mut c.spec);
         if c.name.is_empty() || c.name.len() > 64 {
             return Err(Error::InvalidArgument("fleet name 1..=64 chars".into()));
         }
@@ -3770,6 +3849,7 @@ impl FleetService {
         if let Some(b) = &build {
             with_build.spec = b.spec.clone();
         }
+        open_secret_env(&mut with_build.spec)?;
         let all_ports = self.free_ports(f, 1 + with_build.spec.ports.len()).await?;
         let port = all_ports[0];
         let mut named = serde_json::Map::new();
@@ -3884,7 +3964,9 @@ impl FleetService {
 
     /// Register a build. `canary_percent` 0 makes it active right away (the previous active build
     /// is retired, kept for rollback); > 0 makes it a canary alongside the current active build.
-    pub async fn add_build(&self, fleet_id: Uuid, c: CreateBuild) -> Result<FleetBuild> {
+    pub async fn add_build(&self, fleet_id: Uuid, mut c: CreateBuild) -> Result<FleetBuild> {
+        validate_secret_env(&c.spec)?;
+        seal_secret_env(&mut c.spec);
         let v = c.version.trim();
         if v.is_empty()
             || v.len() > 64

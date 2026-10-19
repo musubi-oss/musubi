@@ -2413,7 +2413,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
   - ✅ Agones/OM: *Multiple ports per GameServer (`spec.ports[]` with name)* — `spec.ports [{name, protocol, container_port}]`, per-server host ports from the fleet range, `MUSUBI_PORT_<NAME>`, `ports.{name}` on servers/allocations
   - ✅ Agones/OM: *Port `protocol` `UDP`, `TCP`, `TCPUDP` (opens both)* — `spec.port_protocol` and per-port `protocol: udp|tcp|both`
   - ❌ Edgegap: *GPU field* — `rg -i gpu` → none
-  - ❌ Edgegap: *Secret environment variables* — No encrypted/hidden env class in fleet spec (`rg is_hidden\|secret_env\|redact` → none); `musubi config` prints secrets
+  - ✅ Edgegap: *Secret environment variables* — `spec.secret_env {K: v}` on fleets and builds: sealed with the `[security] master_keys` ring at rest (`enc:v1:…`), `***` in every fleet/build API response, decrypted only on the node starting the server and merged into the process/container env
   - ❌ GameLift: *Container group definitions* — no sidecar/per-instance group model; `rg -i sidecar` → none
   - ❌ Meshing vendors: *Memory limit* — no memory-pressure admission control (`rg memory_limit` 6 hits unrelated)
   - 🟡 Agones/OM: *Port policy `Static` (`hostPort` fixed)* — Fixed port only indirectly via `port_start == port_end`; no per-server static port field
