@@ -44,6 +44,7 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     pub aurix: AurixConfig,
     pub iap: IapConfig,
+    pub ads: AdsConfig,
     pub market: MarketConfig,
     pub fleet: FleetConfig,
     pub limits: LimitsConfig,
@@ -942,6 +943,39 @@ impl Default for AurixConfig {
 }
 
 /// In-app purchase validation providers. A provider is enabled when its key path is set.
+/// Rewarded video / ad placements (competitive P1-53): server-to-server reward callbacks from ad
+/// networks. `ironsource` verifies the documented `signature = md5(timestamp + eventId + userId +
+/// privateKey)` and answers `eventId:OK`; `custom` is the generic scheme for any mediation or your
+/// own ad server: `sig = hex(hmac_sha256(secret, sorted "k=v" pairs joined by "&", without sig))`
+/// plus a `ts` within `callback_ttl_secs`. `allowed_ips` (CIDR or exact) further pins a provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdsConfig {
+    pub providers: Vec<AdProviderConfig>,
+    pub callback_ttl_secs: u64,
+}
+
+impl Default for AdsConfig {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            callback_ttl_secs: 600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdProviderConfig {
+    /// Name in the callback URL: `/v1/ads/callback/{name}`.
+    pub name: String,
+    /// `ironsource` | `custom`.
+    pub kind: String,
+    /// Private key (ironSource) or HMAC secret (custom).
+    pub secret: String,
+    pub allowed_ips: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct IapConfig {

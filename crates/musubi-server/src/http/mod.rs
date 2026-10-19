@@ -1,6 +1,7 @@
 mod account;
 pub mod account_policy;
 pub mod admin;
+pub mod ads;
 mod analytics;
 mod anticheat;
 pub mod async_mm;
@@ -269,6 +270,7 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics::routes())
         .merge(crashes::routes())
         .merge(steam_ownership::routes())
+        .merge(ads::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -27185,3 +27185,432 @@ async fn fleet_health_policy_report_and_reaping() {
     let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     assert!(st.is_success() || st == StatusCode::NOT_FOUND, "{st}");
 }
+
+/// P1-53: rewarded ad placements — views, ironSource / generic HMAC S2S callbacks, dedupe by
+/// event, daily caps, trust_client placements, stats.
+#[tokio::test]
+async fn rewarded_ad_placements_callbacks_and_caps() {
+    use hmac::Mac as _;
+    use md5::Digest as _;
+    let Some(app) = app_with(|c| {
+        c.ads.providers = vec![
+            musubi_core::config::AdProviderConfig {
+                name: "irn".into(),
+                kind: "ironsource".into(),
+                secret: "k".into(),
+                allowed_ips: vec![],
+            },
+            musubi_core::config::AdProviderConfig {
+                name: "cst".into(),
+                kind: "custom".into(),
+                secret: "s".into(),
+                allowed_ips: vec![],
+            },
+        ];
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    // event ids are unique per (provider, event) forever and the test database persists across runs
+    let salt = unique("ev");
+    let e = |n: &str| format!("{salt}-{n}");
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("ad-a")})),
+    )
+    .await;
+    let (ta, aid) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        a["account_id"].as_str().unwrap().to_string(),
+    );
+    let (_, b) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("ad-b")})),
+    )
+    .await;
+    let bid = b["account_id"].as_str().unwrap().to_string();
+    let item = unique("adcoin");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": item, "name": item, "stackable": true, "max_stack": 999})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let table = unique("adtbl");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({
+            "id": table, "name": "Ad reward", "kind": "weighted",
+            "entries": [{"weight": 1, "rarity": "common", "item_id": item, "amount": 1}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let pid = unique("rv");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/ad_placements/{pid}"),
+        k,
+        Some(json!({"reward_table": ""})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/ad_placements/bad%20id",
+        k,
+        Some(json!({"reward_table": table})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/ad_placements/{pid}"),
+        k,
+        Some(json!({
+            "name": "Double coins", "reward_table": table, "daily_cap": 2, "platforms": ["ios"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["daily_cap"], 2);
+    assert_eq!(v["enabled"], true);
+
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/ads/placements?platform=ios",
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let p = v["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == pid)
+        .expect("listed");
+    assert_eq!(p["available"], true);
+    assert_eq!(p["remaining_today"], 2);
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/ads/placements?platform=android",
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert!(!v["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == pid));
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/ads/placements/{pid}/start"),
+        Some(&ta),
+        Some(json!({"platform": "android"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let start = |app: &Router, tok: &str| {
+        let app = app.clone();
+        let tok = tok.to_string();
+        let pid = pid.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                &format!("/v1/ads/placements/{pid}/start"),
+                Some(&tok),
+                Some(json!({"platform": "ios"})),
+            )
+            .await
+        }
+    };
+    let (st, v) = start(&app, &ta).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let view1 = v["view_id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/ads/placements/{pid}/complete"),
+        Some(&ta),
+        Some(json!({"view_id": view1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "S2S-only placement");
+
+    // ironSource callback: signature = md5(timestamp + eventId + userId + privateKey)
+    let irn = |user: &str, event: &str, secret: &str| {
+        let ts = "1700000000";
+        let mut h = md5::Md5::new();
+        h.update(ts.as_bytes());
+        h.update(event.as_bytes());
+        h.update(user.as_bytes());
+        h.update(secret.as_bytes());
+        format!("/v1/ads/callback/irn?appUserId={user}&eventId={event}&rewards=1&itemName={pid}&timestamp={ts}&signature={}", hex::encode(h.finalize()))
+    };
+    let (st, _, v) = raw_call(&app, "GET", &irn(&view1, &e("e1"), "wrong"), &[], None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, _, _) = raw_call(&app, "GET", "/v1/ads/callback/nope?x=1", &[], None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, v) = raw_call(&app, "GET", &irn(&view1, &e("e1"), "k"), &[], None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v, Value::String(format!("{}:OK", e("e1"))));
+    let (_, v) = call(&app, "GET", "/v1/ads/rewards", Some(&ta), None).await;
+    assert_eq!(v["rewards"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["rewards"][0]["status"], "granted");
+    assert_eq!(v["rewards"][0]["provider"], "irn");
+    assert!(v["rewards"][0]["rewards"].is_array());
+    // the same event again is acknowledged but not granted twice
+    let (st, _, v) = raw_call(&app, "GET", &irn(&view1, &e("e1"), "k"), &[], None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/ads/rewards?account_id={aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["rewards"].as_array().unwrap().len(), 1);
+
+    // generic HMAC callback
+    let cst = |params: &[(&str, &str)], secret: &str| {
+        let mut m: std::collections::BTreeMap<String, String> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let canonical = m
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(canonical.as_bytes());
+        m.insert("sig".into(), hex::encode(mac.finalize().into_bytes()));
+        format!(
+            "/v1/ads/callback/cst?{}",
+            m.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        )
+    };
+    let now = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+    let (_, v) = start(&app, &ta).await;
+    let view2 = v["view_id"].as_str().unwrap().to_string();
+    let (st, _, v) = raw_call(
+        &app,
+        "GET",
+        &cst(
+            &[("view_id", &view2), ("event_id", &e("e2")), ("ts", &now)],
+            "bad",
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, _, v) = raw_call(
+        &app,
+        "GET",
+        &cst(
+            &[("view_id", &view2), ("event_id", &e("e2")), ("ts", "1000")],
+            "s",
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "expired: {v}");
+    let (st, _, v) = raw_call(
+        &app,
+        "GET",
+        &cst(
+            &[("view_id", &view2), ("event_id", &e("e2")), ("ts", &now)],
+            "s",
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "granted");
+    // daily cap reached: third view is refused up front, and a callback for it is recorded as rejected
+    let (st, v) = start(&app, &ta).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/ads/placements?platform=ios",
+        Some(&ta),
+        None,
+    )
+    .await;
+    let p = v["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == pid)
+        .unwrap();
+    assert_eq!(p["available"], false);
+    assert_eq!(p["unavailable_reason"], "daily_cap");
+    assert_eq!(p["remaining_today"], 0);
+    let (st, _, v) = raw_call(
+        &app,
+        "GET",
+        &cst(
+            &[
+                ("user_id", &aid),
+                ("placement", &pid),
+                ("event_id", &e("e3")),
+                ("ts", &now),
+            ],
+            "s",
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "rejected");
+    assert_eq!(v["reason"], "daily_cap");
+    // another player by account id (no view)
+    let (st, _, v) = raw_call(
+        &app,
+        "GET",
+        &cst(
+            &[
+                ("user_id", &bid),
+                ("placement", &pid),
+                ("event_id", &e("e4")),
+                ("ts", &now),
+            ],
+            "s",
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "granted");
+    let (st, _, v) = raw_call(
+        &app,
+        "GET",
+        &cst(
+            &[("user_id", &bid), ("event_id", &e("e5")), ("ts", &now)],
+            "s",
+        ),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "placement required: {v}");
+    // stats
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/ad_placements/{pid}/stats?days=1"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["granted"], 3);
+    assert_eq!(v["rejected"], 1);
+    assert_eq!(v["views_started"], 2);
+    assert_eq!(v["views_rewarded"], 2);
+    assert_eq!(v["fill_rate_pct"], 100.0);
+    // trust_client placement: the client completes its own view, once
+    let pid2 = unique("rv2");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/ad_placements/{pid2}"),
+        k,
+        Some(json!({"reward_table": table, "trust_client": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/ads/placements/{pid2}/start"),
+        Some(&ta),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let view3 = v["view_id"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/ads/placements/{pid2}/complete"),
+        Some(&ta),
+        Some(json!({"view_id": view3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "granted");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/ads/placements/{pid2}/complete"),
+        Some(&ta),
+        Some(json!({"view_id": view3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "duplicate");
+    let (_, v) = call(&app, "GET", "/v1/ads/rewards", Some(&ta), None).await;
+    // e1, e2, e3 (rejected), client view
+    assert_eq!(v["rewards"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        v["rewards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["status"] == "granted")
+            .count(),
+        3
+    );
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/ad_placements/{pid2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/ad_placements/{pid2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
