@@ -243,7 +243,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | DLC ownership for connected player |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | ✅ |
 | Encrypted application tickets |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | ❌ · P1 — no encrypted-app-ticket decryption path; `rg -i "EncryptedAppTicket\|encrypted_app"` → 0… |
 | Encryption by default |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | ✅ |
-| Free-weekend / timed-trial awareness |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | ❌ · P1 — no license-type metadata in entitlements |
+| Free-weekend / timed-trial awareness |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | ✅ catalog `license full|trial|free_weekend|demo|subscription` + `trial_secs`; grants carry `license/expires_at/source` (server grant `license, expires_at|duration_secs, source`), `GET /v1/entitlements` shows `license, expires_at, remaining_secs, expired, active`; live trial upgraded in place by a full grant (`entitlement.upgraded`), sweeper (lease `entitlements`, 30 s / `POST /v1/server/entitlements/sweep`) expires due grants → `entitlement.expired` |
 | IP country / server real time |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | ✅ |
 | Message-oriented API |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | 🟡 · P2 — `match_data_send` targeted/broadcast in relayed matches (≤64 players) covers the same use… |
 | Partner-only secure host |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  | — — self-hosted: musubi separates `/v1/server/*` + `/v1/admin/*` (X-Musubi-Server-Key) from p… |

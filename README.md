@@ -738,6 +738,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 | `GET/PUT/DELETE /v1/server/configs/{name}/source`, `POST …/source/sync`, `GET /v1/server/config_sources` | Config sources: keep a config in sync with a published Google Sheet / CSV / JSON URL — polled on an interval (ETag + hash, new version only on change), manual sync, status/errors inline |
 | title files `?tags=`, manifest `?tags&any_tags&omit_tags`, `GET /v1/files/tags` | Content tags on title files: tag-based manifest queries (all-of / any-of), tag index with counts, optional tag-less manifest |
 | `PUT/GET/DELETE /v1/server/builds/{name}/{version}`, `…/download?token=`, `spec.artifact`, `spec.cost`, `GET /v1/server/fleets/{id}/cost` | Build artifact store (versioned binaries with sha256 and capability download URLs, resolved into `MUSUBI_ARTIFACT_*` env for fleets/builds) and fleet cost attribute with live spend estimates |
+| entitlement `license` / `trial_secs`, grant `license, expires_at | duration_secs, source`, `POST /v1/server/entitlements/sweep` | Timed trials / free weekends / demos / subscriptions on entitlements: expiring grants with in-place upgrade to full, client sees license and remaining time, sweeper emits `entitlement.expired` |
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

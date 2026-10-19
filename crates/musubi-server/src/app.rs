@@ -841,6 +841,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         crate::http::config_sources::spawn_worker(state.clone(), move || lease.held());
     }
     if let Some(c) = state.cluster.clone() {
+        let lease = c.lease("entitlements", musubi_cluster::DEAD_AFTER);
+        crate::http::entitlements::spawn_sweeper(state.clone(), move || lease.held());
+    }
+    if let Some(c) = state.cluster.clone() {
         let ev = state.events.clone();
         let lease = c.lease("webhooks", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {

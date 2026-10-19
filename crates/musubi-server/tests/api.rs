@@ -37012,3 +37012,200 @@ async fn build_artifacts_store_fleet_reference_and_cost() {
         "deleted artifact can no longer be referenced: {v}"
     );
 }
+
+#[tokio::test]
+async fn entitlement_timed_trials_upgrade_and_expiry() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let it = unique("trial-item");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": it, "name": it, "category": "dlc", "stackable": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let table = format!("{it}-t");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(json!({
+            "id": table, "name": "t", "kind": "weighted",
+            "entries": [{"weight": 1, "rarity": "common", "item_id": it, "amount": 1}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ext = unique("GAME");
+    for bad in [
+        json!({"provider": "steam", "external_id": ext, "reward_table": table, "license": "rental"}),
+        json!({"provider": "steam", "external_id": ext, "reward_table": table, "license": "trial", "trial_secs": 5}),
+        json!({"provider": "steam", "external_id": ext, "reward_table": table, "trial_secs": 3600}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", "/v1/server/entitlements", k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(&app, "PUT", "/v1/server/entitlements", k,
+        Some(json!({"provider": "steam", "external_id": ext, "reward_table": table, "license": "trial", "trial_secs": 3600}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("trial")})),
+    )
+    .await;
+    let acc = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let grant = "/v1/server/entitlements/grant";
+    for bad in [
+        json!({"account_id": acc, "provider": "steam", "external_id": ext, "license": "rental"}),
+        json!({"account_id": acc, "provider": "steam", "external_id": ext, "duration_secs": 5}),
+        json!({"account_id": acc, "provider": "steam", "external_id": ext, "duration_secs": 3600, "expires_at": 1}),
+        json!({"account_id": acc, "provider": "steam", "external_id": ext, "expires_at": 1000}),
+    ] {
+        let (st, v) = call_server(&app, "POST", grant, k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    // catalog default: trial for 3600 s
+    let (st, v) = call_server(&app, "POST", grant, k, Some(json!({"account_id": acc, "provider": "steam", "external_id": ext, "source": "steam-free-weekend"}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["granted"], true);
+    assert_eq!(v["rewards"].as_array().unwrap().len(), 1, "{v}");
+    let mine = || call(&app, "GET", "/v1/entitlements", Some(&tok), None);
+    let (_, m) = mine().await;
+    let e = m["entitlements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["external_id"] == ext)
+        .unwrap()
+        .clone();
+    assert_eq!(e["license"], "trial");
+    assert_eq!(e["active"], true);
+    assert_eq!(e["source"], "steam-free-weekend");
+    let rem = e["remaining_secs"].as_i64().unwrap();
+    assert!((3500..=3600).contains(&rem), "{e}");
+    // same grant again: nothing new
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        grant,
+        k,
+        Some(json!({"account_id": acc, "provider": "steam", "external_id": ext})),
+    )
+    .await;
+    assert_eq!(v["granted"], false, "{v}");
+    // a longer free weekend extends in place (no rewards twice)
+    let (_, v) = call_server(&app, "POST", grant, k, Some(json!({"account_id": acc, "provider": "steam", "external_id": ext, "license": "free_weekend", "duration_secs": 86400}))).await;
+    assert_eq!(v["granted"], true, "{v}");
+    assert_eq!(v["rewards"], json!([]), "upgrade delivers no rewards: {v}");
+    let (_, m) = mine().await;
+    let e = m["entitlements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["external_id"] == ext)
+        .unwrap()
+        .clone();
+    assert_eq!(e["license"], "free_weekend");
+    assert!(e["remaining_secs"].as_i64().unwrap() > 80000, "{e}");
+    // a shorter one does not shorten it
+    let (_, v) = call_server(&app, "POST", grant, k, Some(json!({"account_id": acc, "provider": "steam", "external_id": ext, "license": "trial", "duration_secs": 60}))).await;
+    assert_eq!(v["granted"], false, "{v}");
+    // buying the game: full, no expiry
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        grant,
+        k,
+        Some(
+            json!({"account_id": acc, "provider": "steam", "external_id": ext, "license": "full"}),
+        ),
+    )
+    .await;
+    assert_eq!(v["granted"], true, "{v}");
+    let (_, m) = mine().await;
+    let e = m["entitlements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["external_id"] == ext)
+        .unwrap()
+        .clone();
+    assert_eq!(e["license"], "full");
+    assert!(e["expires_at"].is_null(), "{e}");
+    assert_eq!(e["active"], true);
+    // a full grant is never downgraded
+    let (_, v) = call_server(&app, "POST", grant, k, Some(json!({"account_id": acc, "provider": "steam", "external_id": ext, "license": "trial", "duration_secs": 3600}))).await;
+    assert_eq!(v["granted"], false, "{v}");
+
+    // expiry: second account, 60-second trial expiring via explicit past-ish expires_at is rejected,
+    // so use a short duration and let the sweeper catch it
+    let (_, u2) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("trial2")})),
+    )
+    .await;
+    let acc2 = u2["account_id"].as_str().unwrap().to_string();
+    let tok2 = u2["access_token"].as_str().unwrap().to_string();
+    let soon = time::OffsetDateTime::now_utc().unix_timestamp() + 1;
+    let (st, v) = call_server(&app, "POST", grant, k, Some(json!({"account_id": acc2, "provider": "steam", "external_id": ext, "license": "demo", "expires_at": soon}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["granted"], true);
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (_, m) = call(&app, "GET", "/v1/entitlements", Some(&tok2), None).await;
+    let e = m["entitlements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["external_id"] == ext)
+        .unwrap()
+        .clone();
+    assert_eq!(e["expired"], true, "{e}");
+    assert_eq!(e["active"], false);
+    assert_eq!(e["remaining_secs"], 0);
+    let (st, v) = call_server(&app, "POST", "/v1/server/entitlements/sweep", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["expired"].as_i64().unwrap() >= 1, "{v}");
+    let (_, m) = call(&app, "GET", "/v1/entitlements", Some(&tok2), None).await;
+    let e = m["entitlements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["external_id"] == ext)
+        .unwrap()
+        .clone();
+    assert!(e["revoked_at"].is_string(), "sweep closed the grant: {e}");
+    // after expiry a new grant re-activates
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        grant,
+        k,
+        Some(
+            json!({"account_id": acc2, "provider": "steam", "external_id": ext, "license": "full"}),
+        ),
+    )
+    .await;
+    assert_eq!(v["granted"], true, "{v}");
+    let (_, m) = call(&app, "GET", "/v1/entitlements", Some(&tok2), None).await;
+    let e = m["entitlements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["external_id"] == ext)
+        .unwrap()
+        .clone();
+    assert_eq!(e["active"], true);
+    assert_eq!(e["license"], "full");
+}

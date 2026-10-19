@@ -1105,6 +1105,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ),
     ("POST", "/v1/server/entitlements/grant", "economy"),
     ("POST", "/v1/server/entitlements/revoke", "economy"),
+    ("POST", "/v1/server/entitlements/sweep", "economy"),
     ("POST", "/v1/rewards/{table}/roll", "economy"),
     ("GET", "/v1/rpc", "rpc"),
     ("POST", "/v1/rpc/{id}", "rpc"),
