@@ -18317,3 +18317,332 @@ async fn native_flags_experiments_and_live_events() {
         let _ = call_server(&app, "DELETE", &format!("/v1/server/{path}/{id}"), k, None).await;
     }
 }
+
+/// Offers & placements (competitive P0-57): activation on first read, priority / max_offers,
+/// audience targeting, offer price, purchase limit, precursor chain, force-enable, stats.
+#[tokio::test]
+async fn offers_and_placements_lifecycle() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let cur = unique("ofc")
+        .replace('-', "")
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": cur, "name": "Gems"})),
+    )
+    .await;
+    assert!(st.is_success());
+    let item = unique("ofitem");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": item, "name": "Chest", "stackable": true, "max_stack": 99})),
+    )
+    .await;
+    assert!(st.is_success(), "{r}");
+    let sku = unique("ofsku");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/store",
+        k,
+        Some(json!({"id": sku, "item_id": item, "quantity": 1, "prices": {cur.clone(): 100}})),
+    )
+    .await;
+    assert!(st.is_success(), "{r}");
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("of-a")})),
+    )
+    .await;
+    let (_, b) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("of-b")})),
+    )
+    .await;
+    let (ta, aid) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        a["account_id"].as_str().unwrap().to_string(),
+    );
+    let bid = b["account_id"].as_str().unwrap().to_string();
+    let aud = unique("ofaud").replace('-', "_");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{aud}"),
+        k,
+        Some(json!({"rules": {"include": [bid]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let pl = unique("shop_banner");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/placements/{pl}"),
+        k,
+        Some(json!({"name": "Shop banner", "max_offers": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/placements/{pl}"),
+        k,
+        Some(json!({"name": "Shop banner", "max_offers": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let o1 = unique("starter");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/offers/{o1}"),
+        k,
+        Some(json!({"placement_id": pl, "name": "x", "store_item_id": "nope-sku"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/offers/{o1}"), k, Some(json!({
+        "placement_id": pl, "name": "Starter pack", "store_item_id": sku, "prices": {cur.clone(): 60},
+        "priority": 10, "max_purchases": 1, "cooldown_secs": 3600, "duration_secs": 600
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let o2 = unique("vip_only");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/offers/{o2}"), k, Some(json!({
+        "placement_id": pl, "name": "VIP deal", "store_item_id": sku, "priority": 5, "audience": aud
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let o3 = unique("upgrade");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/offers/{o3}"),
+        k,
+        Some(json!({"placement_id": pl, "name": "Upgrade", "store_item_id": sku, "precursor": o3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/offers/{o3}"), k, Some(json!({"placement_id": pl, "name": "Upgrade", "store_item_id": sku, "priority": 1, "precursor": o1}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+
+    // A: only the starter (VIP deal is audience-gated, upgrade needs the starter purchased)
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/placements/{pl}/offers"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let offers = v["offers"].as_array().unwrap();
+    assert_eq!(offers.len(), 1, "{v}");
+    assert_eq!(offers[0]["offer_id"], json!(o1));
+    assert_eq!(offers[0]["prices"][&cur], 60);
+    assert_eq!(offers[0]["new"], true);
+    let act = offers[0]["activation_id"].clone();
+    let (_, v2) = call(
+        &app,
+        "GET",
+        &format!("/v1/placements/{pl}/offers"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(v2["offers"][0]["activation_id"], act, "same activation");
+    assert_eq!(v2["offers"][0]["new"], false);
+    assert_eq!(v2["offers"][0]["seen"], true);
+    // buy at the offer price
+    let (st, e) = call(
+        &app,
+        "POST",
+        &format!("/v1/placements/{pl}/offers/{o1}/buy"),
+        Some(&ta),
+        Some(json!({"currency": cur})),
+    )
+    .await;
+    assert!(!st.is_success(), "no funds: {e}");
+    let (st, _) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(json!({"account_id": aid, "currency": cur, "delta": 100, "reason": "test", "reference": unique("of-fund")}))).await;
+    assert!(st.is_success());
+    let (st, p) = call(
+        &app,
+        "POST",
+        &format!("/v1/placements/{pl}/offers/{o1}/buy"),
+        Some(&ta),
+        Some(json!({"currency": cur})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    assert_eq!(p["purchase"]["amount"], 60, "{p}");
+    assert_eq!(p["purchase"]["balance"], 40);
+    let (st, e) = call(
+        &app,
+        "POST",
+        &format!("/v1/placements/{pl}/offers/{o1}/buy"),
+        Some(&ta),
+        Some(json!({"currency": cur})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "activation consumed: {e}");
+    // starter exhausted → the upgrade chain opens
+    let (_, v3) = call(
+        &app,
+        "GET",
+        &format!("/v1/placements/{pl}/offers"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    let ids: Vec<String> = v3["offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["offer_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec![o3.clone()], "{v3}");
+    // force-enable the VIP deal for A, then dismiss it
+    let (st, f) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/offers/{o2}/force/{aid}"),
+        k,
+        Some(json!({"enabled": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let (_, v4) = call(
+        &app,
+        "GET",
+        &format!("/v1/placements/{pl}/offers"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    let ids: Vec<String> = v4["offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["offer_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec![o2.clone(), o3.clone()], "priority order: {v4}");
+    let (st, d) = call(
+        &app,
+        "POST",
+        &format!("/v1/placements/{pl}/offers/{o2}/dismiss"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/offers/{o2}/force/{aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v5) = call(
+        &app,
+        "GET",
+        &format!("/v1/placements/{pl}/offers"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    let ids: Vec<String> = v5["offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["offer_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec![o3.clone()], "{v5}");
+    // B (in the audience) previews starter + VIP deal, no upgrade
+    let (st, pv) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/placements/{pl}/offers?account_id={bid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{pv}");
+    let ids: Vec<String> = pv["offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["offer_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec![o1.clone(), o2.clone()], "{pv}");
+    assert_eq!(
+        pv["offers"][1]["prices"][&cur], 100,
+        "listing price when the offer has none"
+    );
+    // stats
+    let (st, st1) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/offers/{o1}/stats"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{st1}");
+    assert_eq!(st1["activations"], 2, "{st1}");
+    assert_eq!(st1["seen"], 1);
+    assert_eq!(st1["purchased"], 1);
+    assert_eq!(st1["conversion"], 1.0);
+    assert_eq!(st1["revenue"][0]["amount"], 60);
+    let (_, st2) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/offers/{o2}/stats"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st2["dismissed"], 1, "{st2}");
+    let (_, lo) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/offers?placement_id={pl}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(lo["offers"].as_array().unwrap().len(), 3);
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/placements/{pl}"),
+        k,
+        None,
+    )
+    .await;
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/audiences/{aud}"),
+        k,
+        None,
+    )
+    .await;
+}

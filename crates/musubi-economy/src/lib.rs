@@ -1821,6 +1821,28 @@ impl EconomyService {
         idempotency_key: Option<&str>,
         coupon: Option<&str>,
     ) -> Result<Purchase> {
+        self.buy_with_price(
+            account,
+            store_item_id,
+            currency,
+            idempotency_key,
+            coupon,
+            None,
+        )
+        .await
+    }
+
+    /// `buy` with an explicit price (offers): replaces the listing price and its discount;
+    /// coupons still apply on top.
+    pub async fn buy_with_price(
+        &self,
+        account: AccountId,
+        store_item_id: &str,
+        currency: &str,
+        idempotency_key: Option<&str>,
+        coupon: Option<&str>,
+        price_override: Option<i64>,
+    ) -> Result<Purchase> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         if let Some(k) = idempotency_key {
             let prior: Option<(Uuid, String, i64)> = sqlx::query_as(
@@ -1917,7 +1939,10 @@ impl EconomyService {
             .ok_or_else(|| {
                 Error::InvalidArgument(format!("{store_item_id} is not sold for {currency}"))
             })?;
-        let mut price = list_price - list_price * listing.discount_now(now) as i64 / 100;
+        let mut price = match price_override {
+            Some(p) => p.max(0),
+            None => list_price - list_price * listing.discount_now(now) as i64 / 100,
+        };
         if let Some(code) = coupon {
             type CouponRow = (Option<String>, i32, Option<i32>, bool, Option<i64>);
             let c: Option<CouponRow> = sqlx::query_as(

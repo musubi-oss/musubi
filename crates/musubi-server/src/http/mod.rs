@@ -25,6 +25,7 @@ pub mod match_results;
 mod matches;
 mod matchmaker;
 mod notifications;
+mod offers;
 mod parties;
 mod passkeys;
 pub mod push;
@@ -228,6 +229,7 @@ pub fn router(state: AppState) -> Router {
         .merge(parties::routes())
         .merge(subscriptions::routes())
         .merge(liveops::routes())
+        .merge(offers::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::hooks::before_after,
