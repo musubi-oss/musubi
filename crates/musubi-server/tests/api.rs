@@ -5269,6 +5269,7 @@ impl musubi_actor::MatchHandler for Counter {
             state: 0u64.to_le_bytes().to_vec(),
             tick_rate: 30,
             label: "0".into(),
+            crash_policy: Default::default(),
         })
     }
     fn join_attempt(
@@ -5318,6 +5319,193 @@ impl musubi_actor::MatchHandler for Counter {
 
 /// Failover replays the journal on top of the last snapshot: the resumed match is at (about) the
 /// tick the dead node reached, not at the snapshot taken when the player joined.
+#[tokio::test]
+async fn match_crash_policy_sleep_parks_snapshot_and_join_wakes_it() {
+    let Ok(url) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+        return;
+    };
+    let mut cfg = Config::default();
+    cfg.database.url = url;
+    cfg.database.max_connections = 3;
+    let db = musubi_server::db::connect(&cfg.database).await.unwrap();
+    migrate_once(&db).await;
+    let node_a = uuid::Uuid::now_v7();
+    let hub = Arc::new(musubi_server::realtime::Hub::new());
+    let mut a = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), node_a);
+    a.snapshot_every = 100_000;
+    a.register("crashy", Arc::new(Crashy));
+    assert!(a
+        .create(hub.clone(), "crashy", json!({ "crash_policy": "nope" }))
+        .is_err());
+
+    // sleep: the first failing tick parks the pre-crash snapshot without an owner
+    let h = a
+        .create(
+            hub.clone(),
+            "crashy",
+            json!({ "crash": true, "crash_policy": "sleep" }),
+        )
+        .unwrap();
+    let id = h.id.to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!h.is_alive());
+    assert_eq!(h.info().await.status, "sleeping");
+    assert!(a.get(&id).is_none());
+    let row: (bool, Option<uuid::Uuid>, Vec<u8>) = sqlx::query_as(
+        "select sleeping, node_id, state from musubi.match_snapshots where match_id = $1",
+    )
+    .bind(h.id.0)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(row.0 && row.1.is_none(), "{row:?}");
+    assert_eq!(row.2, vec![1, 0]);
+
+    // failover does not adopt a sleeping match
+    let b = musubi_server::realtime::MatchRegistry::new(Some(db.clone()), uuid::Uuid::now_v7());
+    b.register("crashy", Arc::new(Crashy));
+    let resumed = b.recover(hub.clone(), &[node_a]).await.unwrap();
+    assert!(!resumed.contains(&id), "{resumed:?}");
+
+    // a join wakes it on this node; the join is applied before the first tick, so the woken
+    // actor (which only crashes while empty) runs
+    let me: musubi_proto::UserPresence = serde_json::from_value(json!({
+        "account_id": uuid::Uuid::now_v7(), "session_id": uuid::Uuid::now_v7(), "username": "p1", "status": null
+    }))
+    .unwrap();
+    assert!(a.wake("not-a-uuid").await.unwrap().is_none());
+    assert!(a
+        .wake(&uuid::Uuid::now_v7().to_string())
+        .await
+        .unwrap()
+        .is_none());
+    a.join(&me, &id, Default::default(), None).await.unwrap();
+    let woken = a.get(&id).expect("woken match registered");
+    assert!(woken.is_alive());
+    let (sleeping, node): (bool, Option<uuid::Uuid>) =
+        sqlx::query_as("select sleeping, node_id from musubi.match_snapshots where match_id = $1")
+            .bind(h.id.0)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(!sleeping && node == Some(node_a), "{sleeping} {node:?}");
+    // op 9 clears the crash flag for good
+    woken
+        .data(musubi_actor::Input {
+            presence: me.clone(),
+            op_code: 9,
+            data: vec![],
+            reliable: true,
+            tick: None,
+            seq: None,
+        })
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let info = woken.info().await;
+    assert_eq!(info.status, "running", "{info:?}");
+    assert!(info.tick >= 2, "{info:?}");
+    assert!(
+        a.wake(&id).await.unwrap().is_none(),
+        "awake: nothing to wake"
+    );
+
+    // config override beats the module default (restart): destroy ends the match at once
+    a.crash_policies
+        .write()
+        .unwrap()
+        .insert("crashy".into(), musubi_actor::CrashPolicy::Destroy);
+    let h2 = a
+        .create(hub.clone(), "crashy", json!({ "crash": true }))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!h2.is_alive());
+    assert!(a.get(&h2.id.to_string()).is_none());
+    let gone: Option<(bool,)> =
+        sqlx::query_as("select sleeping from musubi.match_snapshots where match_id = $1")
+            .bind(h2.id.0)
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+    assert!(gone.is_none(), "destroyed match leaves no snapshot");
+    // params win over the config override
+    let h3 = a
+        .create(
+            hub.clone(),
+            "crashy",
+            json!({ "crash": true, "crash_policy": "restart" }),
+        )
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(h3.is_alive());
+    assert_eq!(h3.info().await.status, "crash_loop_backoff");
+    h3.terminate(0);
+}
+
+/// Fails `tick` while `state[0] == 1` and nobody is in the match; an op-9 input clears the flag.
+struct Crashy;
+
+impl musubi_actor::MatchHandler for Crashy {
+    fn init(&self, params: &Value) -> musubi_core::Result<musubi_actor::Init> {
+        let crash = params
+            .get("crash")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(musubi_actor::Init {
+            state: vec![crash as u8, 0],
+            tick_rate: 30,
+            label: String::new(),
+            crash_policy: Default::default(),
+        })
+    }
+    fn join_attempt(
+        &self,
+        state: Vec<u8>,
+        _presence: &musubi_proto::UserPresence,
+        _metadata: &std::collections::HashMap<String, String>,
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<(Vec<u8>, musubi_core::Result<()>)> {
+        Ok((state, Ok(())))
+    }
+    fn join(
+        &self,
+        state: Vec<u8>,
+        _joined: &[musubi_proto::UserPresence],
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<Vec<u8>> {
+        Ok(state)
+    }
+    fn leave(
+        &self,
+        state: Vec<u8>,
+        _left: &[musubi_proto::UserPresence],
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<Vec<u8>> {
+        Ok(state)
+    }
+    fn tick(
+        &self,
+        mut state: Vec<u8>,
+        _tick: u64,
+        inputs: Vec<musubi_actor::Input>,
+        _members: &[musubi_proto::UserPresence],
+    ) -> musubi_core::Result<musubi_actor::TickResult> {
+        if inputs.iter().any(|i| i.op_code == 9) {
+            state[0] = 0;
+        }
+        if state[0] == 1 && _members.is_empty() {
+            return Err(musubi_core::Error::Internal("boom".into()));
+        }
+        state[1] = state[1].wrapping_add(1);
+        Ok(musubi_actor::TickResult {
+            state,
+            ..Default::default()
+        })
+    }
+    fn terminate(&self, state: Vec<u8>, _grace: u32) -> musubi_core::Result<Vec<u8>> {
+        Ok(state)
+    }
+}
+
 #[tokio::test]
 async fn match_failover_replays_the_journal() {
     let Ok(url) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {

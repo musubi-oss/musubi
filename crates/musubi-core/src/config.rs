@@ -664,6 +664,9 @@ pub struct RuntimeConfig {
     /// are loaded, removed ones unloaded; a module that fails to load keeps its old version).
     /// `musubi dev` turns it on.
     pub watch_modules: bool,
+    /// Per-module crash policy (`restart` | `sleep` | `destroy`) overriding what the module's
+    /// `init` declares; `params.crash_policy` on a match beats both.
+    pub crash_policies: std::collections::HashMap<String, String>,
     /// Cron-driven calls into module exports named `schedule_<name>` (one runner cluster-wide).
     pub schedules: Vec<ScheduleConfig>,
     /// Hosts modules may reach through the `http.fetch` host op (`api.example.com`,
@@ -697,6 +700,7 @@ impl Default for RuntimeConfig {
             max_payload_kb: 1024,
             schedules: Vec::new(),
             watch_modules: false,
+            crash_policies: Default::default(),
             http_allow: Vec::new(),
             http_timeout_ms: 5000,
             http_max_body_kb: 256,

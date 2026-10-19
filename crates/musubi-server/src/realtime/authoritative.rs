@@ -38,6 +38,10 @@ pub struct MatchRegistry {
     epoch: i64,
     /// Matches created with `params.record = true`: every journal chunk is also kept for replay.
     recording: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    /// Set by the first launch; lets `join` wake a sleeping match without a hub parameter.
+    hub: std::sync::OnceLock<Arc<Hub>>,
+    /// Per-module `crash_policy` overrides (config), beating the module's `Init` default.
+    pub crash_policies: std::sync::RwLock<HashMap<String, musubi_actor::CrashPolicy>>,
     /// Deployed IDL, for `[matches.<module>] state` checks of WASM handlers.
     idl: Arc<RwLock<Option<crate::idl::IdlRegistry>>>,
 }
@@ -65,6 +69,8 @@ impl MatchRegistry {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch: 0,
             recording: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            hub: std::sync::OnceLock::new(),
+            crash_policies: Default::default(),
         };
         r.register("echo", Arc::new(musubi_actor::EchoMatch));
         r
@@ -182,7 +188,7 @@ impl MatchRegistry {
                     Some(s) => sqlx::query(
                         "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group, node_epoch)
                          values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
-                         on conflict (match_id) do update set module = excluded.module, params = excluded.params, label = excluded.label, state = excluded.state, tick = excluded.tick, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, node_epoch = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_epoch else musubi.match_snapshots.node_epoch end, updated_at = now()
+                         on conflict (match_id) do update set module = excluded.module, params = excluded.params, label = excluded.label, state = excluded.state, tick = excluded.tick, sleeping = false, node_id = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_id else musubi.match_snapshots.node_id end, node_epoch = case when musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id then excluded.node_epoch else musubi.match_snapshots.node_epoch end, updated_at = now()
                          where musubi.match_snapshots.node_id is null or musubi.match_snapshots.node_id = excluded.node_id",
                     )
                     .bind(id.0)
@@ -251,6 +257,8 @@ impl MatchRegistry {
             .ok_or_else(|| Error::NotFound(format!("match module {module}")))?;
         let matches = self.matches.clone();
         let record = recorded(&params);
+        let _ = self.hub.set(hub.clone());
+        let crash_policy = self.crash_policies.read().unwrap().get(module).copied();
         let handle = musubi_actor::spawn_with(
             handler,
             Spawn {
@@ -267,6 +275,9 @@ impl MatchRegistry {
                 on_journal: self.on_journal(),
                 journal_every: self.journal_every,
                 sync: self.idl.read().as_ref().and_then(|i| i.match_sync(module)),
+                crash_policy,
+                on_crash: self.on_crash(),
+                on_sleep: self.on_sleep(),
             },
         )?;
         if record {
@@ -284,7 +295,7 @@ impl MatchRegistry {
         // Claim atomically so two surviving nodes never resume the same match.
         let rows = sqlx::query_as::<_, (Uuid, String, String, serde_json::Value, Vec<u8>, i64)>(
             "update musubi.match_snapshots set node_id = $2, node_epoch = $4, updated_at = now()
-             where cluster_group = $3 and (node_id is null or node_id = any($1)
+             where cluster_group = $3 and not sleeping and (node_id is null or node_id = any($1)
                     or (node_id = $2 and node_epoch <> $4)
                     or exists (select 1 from musubi.nodes n where n.id = match_snapshots.node_id and n.epoch > match_snapshots.node_epoch
                                  and n.started_at < now() - interval '10 seconds'))
@@ -351,6 +362,96 @@ impl MatchRegistry {
             }
         }
         Ok(out)
+    }
+
+    fn on_crash(&self) -> Option<musubi_actor::OnCrash> {
+        let events = self.events.get().cloned()?;
+        let node = self.node_id;
+        Some(Arc::new(move |c: musubi_actor::Crash| {
+            let kind = if c.slept {
+                "match.slept"
+            } else if c.destroyed {
+                "match.crashed"
+            } else {
+                "match.restarted"
+            };
+            let payload = serde_json::json!({
+                "match_id": c.match_id, "module": c.module, "tick": c.tick, "error": c.error,
+                "policy": c.policy, "crashes": c.crashes, "restart_in_ms": c.restart_in_ms,
+                "destroyed": c.destroyed, "node_id": node,
+            });
+            let ev = events.clone();
+            tokio::spawn(async move {
+                ev.emit(kind, None, payload).await;
+            });
+        }))
+    }
+
+    /// `crash_policy = sleep`: park the pre-crash snapshot with no owner; `wake` picks it up.
+    fn on_sleep(&self) -> Option<musubi_actor::OnSleep> {
+        let db = self.db.clone()?;
+        let group = self.group.clone();
+        Some(Arc::new(move |id: MatchId, s: Snapshot| {
+            let db = db.clone();
+            let group = group.clone();
+            tokio::spawn(async move {
+                if let Err(e) = sqlx::query(
+                    "insert into musubi.match_snapshots (match_id, module, label, params, state, tick, node_id, updated_at, cluster_group, sleeping)
+                     values ($1, $2, $3, $4, $5, $6, null, now(), $7, true)
+                     on conflict (match_id) do update set module = excluded.module, params = excluded.params, label = excluded.label,
+                         state = excluded.state, tick = excluded.tick, node_id = null, sleeping = true, updated_at = now()",
+                )
+                .bind(id.0)
+                .bind(&s.module)
+                .bind(&s.label)
+                .bind(&s.params)
+                .bind(&s.state)
+                .bind(s.tick as i64)
+                .bind(&group)
+                .execute(&db)
+                .await
+                {
+                    tracing::warn!(match_id = %id, error = %e, "sleeping match snapshot not stored");
+                }
+            });
+        }))
+    }
+
+    /// Wake a match that `crash_policy = sleep` parked (claims the row, resumes from its snapshot).
+    pub async fn wake(&self, match_id: &str) -> Result<Option<MatchHandle>> {
+        let (Some(db), Some(hub), Ok(id)) = (&self.db, self.hub.get(), Uuid::parse_str(match_id))
+        else {
+            return Ok(None);
+        };
+        let row = sqlx::query_as::<_, (String, String, serde_json::Value, Vec<u8>, i64)>(
+            "update musubi.match_snapshots set sleeping = false, node_id = $2, node_epoch = $3, updated_at = now()
+             where match_id = $1 and sleeping and cluster_group = $4
+             returning module, label, params, state, tick",
+        )
+        .bind(id)
+        .bind(self.node_id)
+        .bind(self.epoch)
+        .bind(&self.group)
+        .fetch_optional(db)
+        .await
+        .map_err(Error::internal)?;
+        let Some((module, label, params, state, tick)) = row else {
+            return Ok(None);
+        };
+        let snap = Snapshot {
+            module: module.clone(),
+            label,
+            params: params.clone(),
+            state,
+            tick: tick as u64,
+            replay: vec![],
+        };
+        let h = self.launch(hub.clone(), &module, params, Some(MatchId(id)), Some(snap))?;
+        self.emit(
+            "match.woken",
+            serde_json::json!({ "match_id": h.id, "module": module, "node_id": self.node_id }),
+        );
+        Ok(Some(h))
     }
 
     fn on_journal(&self) -> Option<musubi_actor::OnJournal> {
@@ -531,9 +632,13 @@ impl MatchRegistry {
         metadata: HashMap<String, String>,
         spectator: Option<u64>,
     ) -> Result<ServerMessage> {
-        let h = self
-            .get(match_id)
-            .ok_or_else(|| Error::NotFound("match".into()))?;
+        let h = match self.get(match_id) {
+            Some(h) => h,
+            None => self
+                .wake(match_id)
+                .await?
+                .ok_or_else(|| Error::NotFound("match".into()))?,
+        };
         let snap = h.join(me.clone(), metadata, spectator).await?;
         self.by_session
             .entry(me.session_id)

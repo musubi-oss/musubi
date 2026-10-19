@@ -103,6 +103,8 @@ struct InitReply {
     tick_rate: u32,
     #[serde(default)]
     label: String,
+    #[serde(default)]
+    crash_policy: Option<String>,
 }
 
 fn ten() -> u32 {
@@ -160,6 +162,14 @@ impl MatchHandler for WasmMatchHandler {
             state: self.state(&r.state)?,
             tick_rate: r.tick_rate,
             label: r.label,
+            crash_policy: match r.crash_policy.as_deref() {
+                None => Default::default(),
+                Some(p) => musubi_actor::CrashPolicy::parse(p).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "init.crash_policy `{p}`: restart | sleep | destroy"
+                    ))
+                })?,
+            },
         })
     }
 

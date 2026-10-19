@@ -942,10 +942,17 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             spectator,
             delay_ticks,
         } => {
-            if let Some(id) = match_id
+            let mut hosted = match_id
                 .as_deref()
-                .filter(|id| ctx.matches.get(id).is_some())
-            {
+                .filter(|id| ctx.matches.get(id).is_some());
+            if hosted.is_none() {
+                if let Some(id) = match_id.as_deref() {
+                    if matches!(ctx.matches.wake(id).await, Ok(Some(_))) {
+                        hosted = Some(id);
+                    }
+                }
+            }
+            if let Some(id) = hosted {
                 return Some(
                     ctx.matches
                         .join(ctx.presence, id, metadata, spectator.then_some(delay_ticks))

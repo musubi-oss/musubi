@@ -333,6 +333,18 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             .with_group(&cfg.node.cluster_group)
             .with_region(&cfg.node.region),
     );
+    for (module, policy) in &cfg.runtime.crash_policies {
+        let p = musubi_actor::CrashPolicy::parse(policy).ok_or_else(|| {
+            musubi_core::Error::InvalidArgument(format!(
+                "runtime.crash_policies.{module}: `{policy}` is not restart | sleep | destroy"
+            ))
+        })?;
+        matches
+            .crash_policies
+            .write()
+            .unwrap()
+            .insert(module.clone(), p);
+    }
     let wasm_mods = matches.register_wasm(&runtime);
     if cfg.runtime.watch_modules {
         if let Some(dir) = &cfg.runtime.modules_dir {

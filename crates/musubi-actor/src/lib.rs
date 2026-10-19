@@ -77,6 +77,8 @@ pub struct Init {
     pub state: Vec<u8>,
     pub tick_rate: u32,
     pub label: String,
+    /// Module default; `Spawn::crash_policy` and `params.crash_policy` override it.
+    pub crash_policy: CrashPolicy,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,6 +88,56 @@ pub struct TickResult {
     pub label: Option<String>,
     pub terminate: bool,
 }
+
+/// What happens when the tick handler fails (`Err` / wasm trap) mid-match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashPolicy {
+    /// Roll back to the state before the failing tick and keep running; the inputs of that tick
+    /// are dropped. Consecutive crashes back off exponentially (1 s, 2 s, … 30 s) and more than
+    /// `MAX_RESTARTS` within `CRASH_WINDOW` destroy the match.
+    #[default]
+    Restart,
+    /// Snapshot the pre-crash state and stop; players get a leave event and the next join wakes
+    /// the match from the snapshot (`Spawn::on_sleep` stores it).
+    Sleep,
+    /// Terminate the match.
+    Destroy,
+}
+
+impl CrashPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "restart" => Some(Self::Restart),
+            "sleep" => Some(Self::Sleep),
+            "destroy" => Some(Self::Destroy),
+            _ => None,
+        }
+    }
+}
+
+pub const MAX_RESTARTS: u32 = 5;
+pub const CRASH_WINDOW: Duration = Duration::from_secs(60);
+
+/// A handler failure and what the actor did about it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Crash {
+    pub match_id: MatchId,
+    pub module: String,
+    pub tick: u64,
+    pub error: String,
+    pub policy: CrashPolicy,
+    /// Consecutive crashes within `CRASH_WINDOW`, this one included.
+    pub crashes: u32,
+    /// `restart`: how long the match pauses before the next tick.
+    pub restart_in_ms: Option<u64>,
+    /// `destroy`, or `restart` that exhausted `MAX_RESTARTS`.
+    pub destroyed: bool,
+    pub slept: bool,
+}
+
+pub type OnCrash = Arc<dyn Fn(Crash) + Send + Sync>;
+pub type OnSleep = Arc<dyn Fn(MatchId, Snapshot) + Send + Sync>;
 
 /// Match logic. Implemented natively in Rust today; the WebAssembly binding exposes the same shape.
 pub trait MatchHandler: Send + Sync {
@@ -121,6 +173,10 @@ pub trait MatchHandler: Send + Sync {
 }
 
 pub type Deliver = Arc<dyn Fn(Vec<SessionId>, ServerMessage) + Send + Sync>;
+
+fn running() -> String {
+    "running".into()
+}
 
 /// Persisted view of a match; `None` state on `on_snapshot` means the match ended.
 #[derive(Debug, Clone)]
@@ -252,6 +308,11 @@ pub struct Spawn {
     /// Sync the JSON state to players (`match_state` on join, `match_state_delta` after every
     /// handler call); the list holds server-private JSON pointers stripped first.
     pub sync: Option<Vec<String>>,
+    /// Overrides the module's `Init::crash_policy` (`params.crash_policy` wins over both).
+    pub crash_policy: Option<CrashPolicy>,
+    pub on_crash: Option<OnCrash>,
+    /// Receives the snapshot of a match put to sleep by `CrashPolicy::Sleep`.
+    pub on_sleep: Option<OnSleep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +326,12 @@ pub struct MatchInfo {
     pub state_bytes: usize,
     /// Sessions watching without playing.
     pub spectators: Vec<SessionId>,
+    /// `running` | `crash_loop_backoff` | `sleeping`.
+    #[serde(default = "running")]
+    pub status: String,
+    /// Consecutive tick-handler crashes within `CRASH_WINDOW`.
+    #[serde(default)]
+    pub crashes: u32,
     /// Player cap from `params.max_players` (listing by open slots needs it).
     #[serde(default)]
     pub max_players: Option<u32>,
@@ -377,12 +444,21 @@ pub fn spawn(
             sync: None,
             on_journal: None,
             journal_every: 0,
+            crash_policy: None,
+            on_crash: None,
+            on_sleep: None,
         },
     )
 }
 
 pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHandle> {
     let sync = sp.sync.clone().map(state_sync::SyncState::new);
+    let param_policy = match sp.params.get("crash_policy") {
+        None => None,
+        Some(v) => Some(v.as_str().and_then(CrashPolicy::parse).ok_or_else(|| {
+            Error::InvalidArgument("crash_policy: restart | sleep | destroy".into())
+        })?),
+    };
     let mut start_tick = sp.resume.as_ref().map(|r| r.tick).unwrap_or(0);
     let init = match &sp.resume {
         Some(snap) => {
@@ -402,6 +478,7 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
                 state,
                 tick_rate: fresh.tick_rate,
                 label,
+                crash_policy: fresh.crash_policy,
             }
         }
         None => handler.init(&sp.params)?,
@@ -413,6 +490,9 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
         return Err(Error::InvalidArgument("label ≤ 2 KB".into()));
     }
     let id = sp.id.unwrap_or_default();
+    let policy = param_policy
+        .or(sp.crash_policy)
+        .unwrap_or(init.crash_policy);
     let info = Arc::new(RwLock::new(MatchInfo {
         spectators: Vec::new(),
         match_id: id.to_string(),
@@ -428,6 +508,8 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         region: String::new(),
+        status: running(),
+        crashes: 0,
     }));
     let (tx, rx) = mpsc::channel(1024);
     let handle = MatchHandle {
@@ -451,6 +533,9 @@ pub fn spawn_with(handler: Arc<dyn MatchHandler>, sp: Spawn) -> Result<MatchHand
             start_tick,
             on_journal: sp.on_journal,
             journal_every: sp.journal_every,
+            policy,
+            on_crash: sp.on_crash,
+            on_sleep: sp.on_sleep,
         },
         sync,
     ));
@@ -465,9 +550,32 @@ struct Persist {
     start_tick: u64,
     on_journal: Option<OnJournal>,
     journal_every: u64,
+    policy: CrashPolicy,
+    on_crash: Option<OnCrash>,
+    on_sleep: Option<OnSleep>,
 }
 
 impl Persist {
+    fn crash(&self, c: Crash) {
+        if let Some(cb) = &self.on_crash {
+            cb(c);
+        }
+    }
+    fn sleep(&self, id: MatchId, label: &str, state: &[u8], tick: u64) {
+        if let Some(cb) = &self.on_sleep {
+            cb(
+                id,
+                Snapshot {
+                    module: self.module.clone(),
+                    label: label.to_string(),
+                    params: self.params.clone(),
+                    state: state.to_vec(),
+                    tick,
+                    replay: vec![],
+                },
+            );
+        }
+    }
     fn save(&self, id: MatchId, label: &str, state: &[u8], tick: u64) {
         if let Some(cb) = &self.on_snapshot {
             cb(
@@ -524,8 +632,14 @@ async fn run(
     let mut tick: u64 = persist.start_tick;
     let mut interval = tokio::time::interval(Duration::from_millis(1000 / init.tick_rate as u64));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // first tick after a full period, so commands already queued (the join that woke a sleeping
+    // match) are applied before the handler runs
+    interval.reset();
     let sessions = |m: &[UserPresence]| m.iter().map(|p| p.session_id).collect::<Vec<_>>();
     let mut grace: Option<u32> = None;
+    let mut crashes: u32 = 0;
+    let mut last_crash: Option<std::time::Instant> = None;
+    let mut sleeping = false;
     let journaling = persist.on_journal.is_some() && persist.journal_every > 0;
     let mut journal: Vec<JournalEntry> = Vec::new();
     loop {
@@ -672,9 +786,56 @@ async fn run(
                         }
                     }
                 }
+                let before_crash = if persist.policy == CrashPolicy::Destroy { Vec::new() } else { state.clone() };
                 let res = match handler.tick(std::mem::take(&mut state), tick, batch, &members) {
                     Ok(r) => r,
-                    Err(e) => { tracing::error!(%match_id, error = %e, "tick handler failed; terminating"); break; }
+                    Err(e) => {
+                        let now = std::time::Instant::now();
+                        if last_crash.is_some_and(|t| now.duration_since(t) > CRASH_WINDOW) {
+                            crashes = 0;
+                        }
+                        crashes += 1;
+                        last_crash = Some(now);
+                        state = before_crash;
+                        let exhausted = persist.policy == CrashPolicy::Restart && crashes > MAX_RESTARTS;
+                        let destroyed = persist.policy == CrashPolicy::Destroy || exhausted;
+                        let slept = persist.policy == CrashPolicy::Sleep;
+                        let restart_in = (!destroyed && !slept)
+                            .then(|| Duration::from_secs(1u64 << (crashes - 1).min(5)).min(Duration::from_secs(30)));
+                        tracing::error!(%match_id, error = %e, tick, crashes, policy = ?persist.policy, destroyed, slept,
+                            "tick handler failed");
+                        persist.crash(Crash {
+                            match_id: id,
+                            module: persist.module.clone(),
+                            tick,
+                            error: e.to_string(),
+                            policy: persist.policy,
+                            crashes,
+                            restart_in_ms: restart_in.map(|d| d.as_millis() as u64),
+                            destroyed,
+                            slept,
+                        });
+                        if slept {
+                            persist.sleep(id, &label, &state, tick);
+                            sleeping = true;
+                            break;
+                        }
+                        if destroyed {
+                            break;
+                        }
+                        let delay = restart_in.unwrap_or_default();
+                        {
+                            let mut i = info.write().await;
+                            i.status = "crash_loop_backoff".into();
+                            i.crashes = crashes;
+                        }
+                        tokio::time::sleep(delay).await;
+                        // a full period before the next tick: commands queued during the pause
+                        // (joins, inputs that may fix the state) are applied first
+                        interval.reset();
+                        info.write().await.status = running();
+                        continue;
+                    }
                 };
                 state = res.state;
                 if let (Some(rb), Some((before, ins))) = (rollback, before) {
@@ -721,7 +882,9 @@ async fn run(
             }
         }
     }
-    if let Err(e) = handler.terminate(std::mem::take(&mut state), 0) {
+    if sleeping {
+        info.write().await.status = "sleeping".into();
+    } else if let Err(e) = handler.terminate(std::mem::take(&mut state), 0) {
         tracing::warn!(%match_id, error = %e, "terminate handler failed");
     }
     let all = watchers(&members, &spectators);
@@ -735,7 +898,9 @@ async fn run(
             },
         );
     }
-    persist.clear(id);
+    if !sleeping {
+        persist.clear(id);
+    }
     on_end(id);
 }
 
@@ -824,6 +989,7 @@ impl MatchHandler for EchoMatch {
                 .and_then(|v| v.as_str())
                 .unwrap_or("echo")
                 .to_string(),
+            crash_policy: Default::default(),
         })
     }
     fn join_attempt(
@@ -892,6 +1058,183 @@ impl MatchHandler for EchoMatch {
 mod rollback_tests {
     use super::*;
 
+    /// Fails `tick` while the state's first byte is 1; otherwise counts ticks in the second byte.
+    struct Crashy;
+
+    impl MatchHandler for Crashy {
+        fn init(&self, params: &serde_json::Value) -> Result<Init> {
+            let crash = params
+                .get("crash")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Ok(Init {
+                state: vec![crash as u8, 0],
+                tick_rate: 50,
+                label: String::new(),
+                crash_policy: Default::default(),
+            })
+        }
+        fn join_attempt(
+            &self,
+            state: Vec<u8>,
+            _: &UserPresence,
+            _: &HashMap<String, String>,
+            _: &[UserPresence],
+        ) -> Result<(Vec<u8>, Result<()>)> {
+            Ok((state, Ok(())))
+        }
+        fn join(&self, state: Vec<u8>, _: &[UserPresence], _: &[UserPresence]) -> Result<Vec<u8>> {
+            Ok(state)
+        }
+        fn leave(&self, state: Vec<u8>, _: &[UserPresence], _: &[UserPresence]) -> Result<Vec<u8>> {
+            Ok(state)
+        }
+        fn tick(
+            &self,
+            mut state: Vec<u8>,
+            _: u64,
+            inputs: Vec<Input>,
+            _: &[UserPresence],
+        ) -> Result<TickResult> {
+            if inputs.iter().any(|i| i.op_code == 9) {
+                state[0] = 0;
+            }
+            if state[0] == 1 {
+                return Err(Error::Internal("boom".into()));
+            }
+            state[1] = state[1].wrapping_add(1);
+            Ok(TickResult {
+                state,
+                ..Default::default()
+            })
+        }
+        fn terminate(&self, state: Vec<u8>, _: u32) -> Result<Vec<u8>> {
+            Ok(state)
+        }
+    }
+
+    type Crashes = Arc<std::sync::Mutex<Vec<Crash>>>;
+    type Slept = Arc<std::sync::Mutex<Option<Snapshot>>>;
+
+    fn crashy_spawn(policy: &str, crashes: Crashes, slept: Slept) -> Spawn {
+        Spawn {
+            id: None,
+            module: "crashy".into(),
+            params: serde_json::json!({ "crash": true, "crash_policy": policy }),
+            resume: None,
+            deliver: Arc::new(|_, _| {}),
+            on_end: Box::new(|_| {}),
+            on_snapshot: None,
+            snapshot_every: 0,
+            on_journal: None,
+            journal_every: 0,
+            sync: None,
+            crash_policy: None,
+            on_crash: Some(Arc::new(move |c| crashes.lock().unwrap().push(c))),
+            on_sleep: Some(Arc::new(move |_, s| *slept.lock().unwrap() = Some(s))),
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_policy_restart_rolls_back_and_backs_off_destroy_ends_sleep_snapshots() {
+        let crashes: Crashes = Default::default();
+        let slept: Slept = Default::default();
+        assert!(spawn_with(
+            Arc::new(Crashy),
+            Spawn {
+                params: serde_json::json!({ "crash_policy": "nope" }),
+                ..crashy_spawn("restart", crashes.clone(), slept.clone())
+            }
+        )
+        .is_err());
+
+        // restart: first tick crashes, 1 s backoff, state rolled back; op 9 clears the flag
+        let h = spawn_with(
+            Arc::new(Crashy),
+            crashy_spawn("restart", crashes.clone(), slept.clone()),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let info = h.info().await;
+        assert_eq!(info.status, "crash_loop_backoff");
+        assert_eq!(info.crashes, 1);
+        assert!(h.is_alive());
+        {
+            let c = crashes.lock().unwrap();
+            assert_eq!(c.len(), 1);
+            assert_eq!(c[0].policy, CrashPolicy::Restart);
+            assert_eq!(c[0].restart_in_ms, Some(1000));
+            assert!(!c[0].destroyed && !c[0].slept);
+            assert!(c[0].error.contains("boom"));
+        }
+        let me: UserPresence = serde_json::from_value(serde_json::json!({
+            "account_id": musubi_core::AccountId::new().0, "session_id": musubi_core::SessionId::new().0, "username": "p"
+        }))
+        .unwrap();
+        // commands queue up behind the backoff; a non-member's inputs are ignored, so join first
+        h.join(me.clone(), HashMap::new(), None).await.unwrap();
+        h.data(Input {
+            presence: me,
+            op_code: 9,
+            data: vec![],
+            reliable: true,
+            tick: None,
+            seq: None,
+        })
+        .unwrap();
+        // the flag-clearing input may land after a second crashing tick (2 s backoff): poll
+        let mut info = h.info().await;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            info = h.info().await;
+            if info.status == "running" && info.tick > 2 {
+                break;
+            }
+        }
+        assert_eq!(info.status, "running", "{info:?}");
+        assert!(h.is_alive());
+        assert!(info.tick > 2, "{info:?}");
+        let n = crashes.lock().unwrap().len();
+        assert!(n <= 2, "crashes: {n}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            crashes.lock().unwrap().len(),
+            n,
+            "no crash after the flag cleared"
+        );
+
+        // destroy: ends at the first crash
+        crashes.lock().unwrap().clear();
+        let h = spawn_with(
+            Arc::new(Crashy),
+            crashy_spawn("destroy", crashes.clone(), slept.clone()),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!h.is_alive());
+        {
+            let c = crashes.lock().unwrap();
+            assert_eq!(c.len(), 1);
+            assert!(c[0].destroyed && !c[0].slept && c[0].restart_in_ms.is_none());
+        }
+
+        // sleep: snapshot of the pre-crash state handed out, actor gone
+        crashes.lock().unwrap().clear();
+        let h = spawn_with(
+            Arc::new(Crashy),
+            crashy_spawn("sleep", crashes.clone(), slept.clone()),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!h.is_alive());
+        assert_eq!(h.info().await.status, "sleeping");
+        let snap = slept.lock().unwrap().clone().expect("on_sleep called");
+        assert_eq!(snap.state, vec![1, 0]);
+        assert_eq!(snap.module, "crashy");
+        let c = crashes.lock().unwrap();
+        assert!(c[0].slept && !c[0].destroyed);
+    }
+
     /// state = little-endian u64 total; every tick adds `tick * sum(input bytes)` — the result
     /// depends on which tick an input lands in, so a late input is only "right" after rollback.
     struct Ledger;
@@ -910,6 +1253,7 @@ mod rollback_tests {
                 state: 0u64.to_le_bytes().to_vec(),
                 tick_rate: 50,
                 label: "ledger".into(),
+                crash_policy: Default::default(),
             })
         }
         fn join_attempt(
@@ -1019,6 +1363,9 @@ mod rollback_tests {
                 on_journal: None,
                 journal_every: 0,
                 sync: None,
+                crash_policy: None,
+                on_crash: None,
+                on_sleep: None,
             },
         )
         .unwrap();
@@ -1097,6 +1444,9 @@ mod rollback_tests {
                 on_journal: None,
                 journal_every: 0,
                 sync: None,
+                crash_policy: None,
+                on_crash: None,
+                on_sleep: None,
             },
         )
         .unwrap();
