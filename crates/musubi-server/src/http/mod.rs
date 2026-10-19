@@ -7,6 +7,7 @@ mod auth;
 mod bans;
 mod chat;
 mod cluster;
+mod codes;
 pub mod configs;
 pub mod content;
 mod dev;
@@ -231,6 +232,7 @@ pub fn router(state: AppState) -> Router {
             )),
         )
         .merge(bans::routes())
+        .merge(codes::routes())
         .merge(legal::routes())
         .merge(parties::routes())
         .merge(subscriptions::routes())

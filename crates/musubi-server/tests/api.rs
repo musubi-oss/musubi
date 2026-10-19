@@ -19942,3 +19942,276 @@ async fn legal_documents_versions_consent_gate_and_withdrawal() {
     let (st, _) = srv("POST", format!("/v1/admin/legal/{tos}/3/retire"), json!({})).await;
     assert_eq!(st, 404);
 }
+
+#[tokio::test]
+async fn redemption_codes_campaigns_keys_limits_and_history() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let srv = |method: &str, path: String, body: Value| {
+        let app = app.clone();
+        let method = method.to_string();
+        async move {
+            let req = Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (status, v)
+        }
+    };
+    let login = |dev: String| {
+        let app = app.clone();
+        async move {
+            let (st, sess) = call(
+                &app,
+                "POST",
+                "/v1/auth/device",
+                None,
+                Some(json!({"id": dev})),
+            )
+            .await;
+            assert_eq!(st, 200, "{sess}");
+            sess["access_token"].as_str().unwrap().to_string()
+        }
+    };
+    let ta = login(unique("codes-a-")).await;
+    let tb = login(unique("codes-b-")).await;
+    let u = unique("").to_lowercase();
+    let group = format!("steam{u}");
+    let camp = format!("launch{u}");
+
+    // key group with two Steam keys
+    let (st, v) = srv(
+        "PUT",
+        format!("/v1/server/key_groups/{group}"),
+        json!({"name": "Steam launch keys", "platform": "steam"}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = srv(
+        "POST",
+        format!("/v1/server/key_groups/{group}/keys"),
+        json!({"keys": ["AAAAA-BBBBB-CCCCC", "DDDDD-EEEEE-FFFFF", "AAAAA-BBBBB-CCCCC"]}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["added"], 2);
+    assert_eq!(v["available"], 2);
+
+    // campaign needs a reward or keys; unknown reward table is refused
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/server/codes/campaigns/{camp}"),
+        json!({"name": "Launch"}),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/server/codes/campaigns/{camp}"),
+        json!({"name": "Launch", "reward_table": "no-such-table"}),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, v) = srv(
+        "PUT",
+        format!("/v1/server/codes/campaigns/{camp}"),
+        json!({"name": "Launch", "key_group": group, "per_account": 1, "metadata": {"promo": "launch"}}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+
+    // generated single-use batch + a shared code
+    let (st, v) = srv(
+        "POST",
+        format!("/v1/server/codes/campaigns/{camp}/generate"),
+        json!({"count": 3, "length": 8, "prefix": "lnch-", "batch": "influencers"}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let codes: Vec<String> = v["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(codes.len(), 3);
+    assert!(codes.iter().all(|c| c.starts_with("LNCH") && c.len() == 12));
+    let shared = format!("WELCOME{}", u.replace('-', "")[..6].to_uppercase());
+    let (st, _) = srv(
+        "POST",
+        format!("/v1/server/codes/campaigns/{camp}/codes"),
+        json!({"code": shared, "max_uses": 5}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = srv(
+        "POST",
+        format!("/v1/server/codes/campaigns/{camp}/codes"),
+        json!({"code": shared}),
+    )
+    .await;
+    assert_eq!(st, 409);
+
+    // A redeems a generated code (lowercase, with dashes) → gets a key; code is spent
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&ta),
+        Some(json!({"code": codes[0].to_lowercase().replace("LNCH", "lnch-")})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["campaign"], camp);
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(v["metadata"]["promo"], "launch");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&tb),
+        Some(json!({"code": codes[0]})),
+    )
+    .await;
+    assert_eq!(st, 409, "{v}");
+    // per-account limit: A cannot use another code of the same campaign
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&ta),
+        Some(json!({"code": shared})),
+    )
+    .await;
+    assert_eq!(st, 409, "{v}");
+    // B takes the shared code and the last key; C finds no keys left
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&tb),
+        Some(json!({"code": shared})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    let tc = login(unique("codes-c-")).await;
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&tc),
+        Some(json!({"code": codes[1]})),
+    )
+    .await;
+    assert_eq!(st, 409, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("no keys left"));
+    let (_, v) = srv("GET", format!("/v1/server/key_groups/{group}"), json!({})).await;
+    assert_eq!(v["available"], 0);
+    assert_eq!(v["claimed"], 2);
+
+    // revoked and unknown codes look the same to players
+    let (st, _) = srv(
+        "POST",
+        format!("/v1/server/codes/{}/revoke", codes[2]),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&tc),
+        Some(json!({"code": codes[2]})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&tc),
+        Some(json!({"code": "NOPE-NOPE"})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    // disabled campaign
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/server/codes/campaigns/{camp}"),
+        json!({"name": "Launch", "key_group": group, "enabled": false}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&tc),
+        Some(json!({"code": shared})),
+    )
+    .await;
+    assert_eq!(st, 409, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("not active"));
+
+    // admin views and player history
+    let (_, v) = srv(
+        "GET",
+        format!("/v1/server/codes/campaigns/{camp}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["stats"]["codes"], 4);
+    assert_eq!(v["stats"]["revoked"], 1);
+    assert_eq!(v["stats"]["redemptions"], 2);
+    assert_eq!(v["stats"]["accounts"], 2);
+    let (_, v) = srv(
+        "GET",
+        format!("/v1/server/codes/campaigns/{camp}/codes?unused=true&batch=influencers"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["codes"].as_array().unwrap().len(), 1, "{v}");
+    let (_, v) = srv(
+        "GET",
+        format!("/v1/server/codes/campaigns/{camp}/redemptions"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["redemptions"].as_array().unwrap().len(), 2);
+    assert_eq!(v["redemptions"][0]["keys"], 1);
+    let (st, v) = call(&app, "GET", "/v1/codes/redemptions", Some(&ta), None).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["redemptions"][0]["keys"][0], "AAAAA-BBBBB-CCCCC");
+
+    // brute-force guard: the 11th attempt within a minute is throttled
+    for _ in 0..8 {
+        let _ = call(
+            &app,
+            "POST",
+            "/v1/codes/redeem",
+            Some(&tc),
+            Some(json!({"code": "ZZZZ"})),
+        )
+        .await;
+    }
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/codes/redeem",
+        Some(&tc),
+        Some(json!({"code": "ZZZZ"})),
+    )
+    .await;
+    assert_eq!(st, 429);
+}
