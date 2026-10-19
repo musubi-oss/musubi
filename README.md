@@ -304,6 +304,15 @@ decay by missed periods instead of a hard reset, a repeating reward every N-th c
 `claims`, `missed`, `in_grace`, `broken`, `next_milestone`, `max_count_reached`; operators read
 `GET /v1/server/streaks/{id}/state/{account_id}` and `POST …/{id}/reset {account_id, count?}`.
 
+Player statistics depth: definitions (`PUT /v1/server/stats/defs`) carry a fold kind `sum|max|min|last|avg|avgrate`
+(`avgrate` = `{value, length}` samples over a `window_secs` sliding window, Steam-style), `visibility`,
+constraints (`min_value`/`max_value` clamps, `max_change` per write, `increment_only`, `default_value`),
+`cycles: [{kind: daily|weekly|monthly|custom, period_seconds, reset_hour}]` (every update also lands in the
+current cycle slice; `GET /v1/stats/history?stat&cycle&limit` lists past cycles, `GET /v1/server/stats/top?stat&cycle`
+ranks the current one), `global: true` (a game-wide aggregate per scope and cycle — `GET /v1/stats/global`,
+`GET /v1/server/stats/global`) and `client_writable: true` (players post their own via `POST /v1/stats {scope, stats}`,
+every other stat is 403). `POST /v1/server/stats/update {…, transaction_id}` is idempotent per id.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

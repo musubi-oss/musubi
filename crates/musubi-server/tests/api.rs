@@ -21847,3 +21847,226 @@ async fn quest_pools_player_challenges_and_streak_depth() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn player_stats_depth_constraints_cycles_global_and_client_writes() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let mut users = Vec::new();
+    for i in 0..2 {
+        let (_, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(&format!("st{i}"))})),
+        )
+        .await;
+        let t = sess["access_token"].as_str().unwrap().to_string();
+        let (_, acc) = call(&app, "GET", "/v1/account", Some(&t), None).await;
+        users.push((t, acc["id"].as_str().unwrap().to_string()));
+    }
+    let (ta, a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let kills = unique("kills").to_lowercase();
+    let best = unique("best").to_lowercase();
+    let acc_ = unique("acc").to_lowercase();
+    let level = unique("lvl").to_lowercase();
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/stats/defs",
+        k,
+        Some(json!({"defs": [{"id": kills, "kind": "weird"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/stats/defs",
+        k,
+        Some(json!({"defs": [{"id": kills, "cycles": [{"kind": "daily"}, {"kind": "daily"}]}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "duplicate cycle: {v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/stats/defs",
+        k,
+        Some(json!({"defs": [
+            {"id": kills, "kind": "sum", "cycles": [{"kind": "daily"}, {"kind": "monthly"}], "global": true, "max_change": 50},
+            {"id": best, "kind": "min"},
+            {"id": acc_, "kind": "avgrate", "window_secs": 100, "visibility": "private"},
+            {"id": level, "kind": "last", "increment_only": true, "client_writable": true, "max_value": 100}
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let got = v["defs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == kills)
+        .cloned()
+        .unwrap();
+    assert_eq!(got["cycles"].as_array().unwrap().len(), 2);
+    assert_eq!(got["global"], true);
+
+    let upd = |body: Value| {
+        let app = app.clone();
+        async move { call_server(&app, "POST", "/v1/server/stats/update", k, Some(body)).await }
+    };
+    let (st, v) = upd(json!({"account_id": a, "scope": "ranked", "stats": {kills.clone(): 10, best.clone(): 30}, "transaction_id": unique("tx")})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["duplicate"], false);
+    assert_eq!(v["applied"][&kills]["scope"]["value"], 10.0);
+    assert_eq!(v["applied"][&kills]["all"]["value"], 10.0);
+    assert_eq!(v["applied"][&kills]["cycles"]["daily"]["value"], 10.0);
+    assert_eq!(v["applied"][&kills]["cycles"]["monthly"]["samples"], 1);
+    assert_eq!(v["applied"][&kills]["global"]["all"]["value"], 10.0);
+    assert!(v["applied"][&best].get("global").is_none());
+    let tx = unique("tx");
+    let (st, v) =
+        upd(json!({"account_id": a, "stats": {kills.clone(): 5}, "transaction_id": tx})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["applied"][&kills]["all"]["value"], 15.0);
+    let (st, v) =
+        upd(json!({"account_id": a, "stats": {kills.clone(): 5}, "transaction_id": tx})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["duplicate"], true, "{v}");
+    let (st, v) = upd(json!({"account_id": a, "stats": {kills.clone(): 60}})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "max_change: {v}");
+    let (st, v) =
+        upd(json!({"account_id": b, "stats": {kills.clone(): 7, best.clone(): 45}})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["applied"][&kills]["global"]["all"]["value"], 22.0);
+    let (st, v) =
+        upd(json!({"account_id": a, "stats": {acc_.clone(): {"value": 10, "length": 50}}})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["applied"][&acc_]["all"]["value"], 0.2);
+    let (st, v) =
+        upd(json!({"account_id": a, "stats": {acc_.clone(): {"value": 1, "length": 0}}})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // client writes
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/stats",
+        Some(&ta),
+        Some(json!({"stats": {kills.clone(): 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/stats",
+        Some(&ta),
+        Some(json!({"stats": {level.clone(): 5}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/stats",
+        Some(&ta),
+        Some(json!({"stats": {level.clone(): 3}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "increment-only");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/stats",
+        Some(&ta),
+        Some(json!({"stats": {level.clone(): 500}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["applied"][&level]["all"]["value"], 100.0, "clamped");
+
+    // reads
+    let (st, v) = call(&app, "GET", "/v1/stats", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stats"][&kills]["scopes"][""]["value"], 15.0);
+    assert_eq!(v["stats"][&kills]["scopes"]["ranked"]["value"], 10.0);
+    assert_eq!(v["stats"][&kills]["cycles"]["daily"]["value"], 15.0);
+    assert!(
+        v["stats"][&kills]["cycles"]["daily"]["resets_at"]
+            .as_i64()
+            .unwrap()
+            > v["stats"][&kills]["cycles"]["daily"]["period_start"]
+                .as_i64()
+                .unwrap()
+    );
+    assert_eq!(v["stats"][&acc_]["scopes"][""]["value"], 0.2);
+    let (_, v) = call(&app, "GET", &format!("/v1/stats/{a}"), Some(&tb), None).await;
+    assert!(v["stats"].get(&acc_).is_none(), "private stat hidden: {v}");
+    assert_eq!(v["stats"][&kills]["scopes"][""]["value"], 15.0);
+    let (st, h) = call(
+        &app,
+        "GET",
+        &format!("/v1/stats/history?stat={kills}&cycle=daily"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    assert_eq!(h["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(h["entries"][0]["current"], true);
+    assert_eq!(h["entries"][0]["value"], 15.0);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/stats/history?stat={kills}&cycle=weekly"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, g) = call(&app, "GET", "/v1/stats/global", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["stats"][&kills]["scopes"][""]["value"], 22.0);
+    assert_eq!(g["stats"][&kills]["cycles"]["daily"]["value"], 22.0);
+    assert_eq!(g["stats"][&kills]["scopes"]["ranked"]["value"], 10.0);
+    assert!(g["stats"].get(&best).is_none(), "not a global stat");
+    let (st, t) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/stats/top?stat={kills}&cycle=daily"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["entries"][0]["account_id"], a);
+    assert_eq!(t["entries"][0]["value"], 15.0);
+    assert_eq!(t["entries"][1]["account_id"], b);
+    let (_, t) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/stats/top?stat={best}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(
+        t["entries"][0]["value"], 30.0,
+        "min stats rank ascending: {t}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/stats/top?stat={kills}&cycle=weekly"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
