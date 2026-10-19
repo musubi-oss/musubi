@@ -108,6 +108,10 @@ impl IdlRegistry {
     /// `PUT /v1/admin/storage/schemas`: version bumps need migrations), persist and activate.
     pub async fn apply(&self, source: &str) -> Result<Value> {
         let idl = Idl::parse(source).map_err(bad)?;
+        let env_problems = crate::module_env::lint(&idl);
+        if !env_problems.is_empty() {
+            return Err(Error::InvalidArgument(env_problems.join("; ")));
+        }
         let mut collections = Vec::new();
         for c in idl.collection_schemas().map_err(bad)? {
             let s: CollectionSchema = serde_json::from_value(c)

@@ -40,6 +40,16 @@ pub fn routes() -> Router<AppState> {
             post(canary_promote),
         )
         .route(
+            "/v1/admin/runtime/modules/{name}/env",
+            get(module_env_get)
+                .put(module_env_put)
+                .delete(module_env_clear),
+        )
+        .route(
+            "/v1/admin/runtime/modules/{name}/env/{key}",
+            delete(module_env_delete),
+        )
+        .route(
             "/v1/admin/runtime/modules/{name}/versions",
             get(module_versions),
         )
@@ -723,13 +733,69 @@ async fn modules_list(_k: ServerKey, State(s): State<AppState>) -> Result<Json<V
 
 /// Upload a module (`.wasm` binary, WAT text or a component) under `name`; it goes live on every
 /// node without a restart. Re-uploading replaces the previous version.
+#[derive(Deserialize, Default)]
+struct ForceQ {
+    /// Publish even when required module env is unbound (P1-63).
+    #[serde(default)]
+    force: bool,
+}
+
 async fn module_put(
     _k: ServerKey,
     State(s): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<ForceQ>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    crate::module_env::check_publish(&s, &name, q.force).await?;
     Ok(Json(crate::modules::put(&s, &name, &body).await?))
+}
+
+#[derive(Deserialize)]
+struct ModuleEnvBody {
+    values: serde_json::Map<String, Value>,
+    /// Keys to seal even though the IDL does not mark them secret (or undeclared ones).
+    #[serde(default)]
+    secrets: Vec<String>,
+}
+
+async fn module_env_get(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::module_env::describe(&s, &name).await?))
+}
+
+async fn module_env_put(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(b): Json<ModuleEnvBody>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        crate::module_env::bind(&s, &name, &b.values, &b.secrets, "server_key").await?,
+    ))
+}
+
+async fn module_env_clear(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let n = crate::module_env::unbind(&s, &name, None, "server_key").await?;
+    Ok(Json(json!({ "module": name, "removed": n })))
+}
+
+async fn module_env_delete(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path((name, key)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    if crate::module_env::unbind(&s, &name, Some(&key), "server_key").await? == 0 {
+        return Err(Error::NotFound(format!("env `{name}/{key}`")).into());
+    }
+    Ok(Json(json!({ "module": name, "key": key, "removed": true })))
 }
 
 async fn module_delete(
@@ -1296,6 +1362,8 @@ async fn schema_migrate(
 #[serde(default)]
 struct CanaryQuery {
     percent: i32,
+    /// Publish even when required module env is unbound (P1-63).
+    force: bool,
     /// Comma-separated account ids always routed to the canary.
     accounts: String,
     note: String,
@@ -1322,6 +1390,7 @@ async fn canary_put(
                 .map_err(|_| Error::InvalidArgument(format!("bad account id {a}")))?,
         );
     }
+    crate::module_env::check_publish(&s, &name, q.force).await?;
     Ok(Json(
         crate::modules::put_canary(&s, &name, &body, q.percent, accounts, &q.note).await?,
     ))

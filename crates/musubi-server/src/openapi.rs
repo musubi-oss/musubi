@@ -264,6 +264,14 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
         "admin",
     ),
     ("GET", "/v1/admin/runtime/modules/{name}/versions", "admin"),
+    ("GET", "/v1/admin/runtime/modules/{name}/env", "admin"),
+    ("PUT", "/v1/admin/runtime/modules/{name}/env", "admin"),
+    ("DELETE", "/v1/admin/runtime/modules/{name}/env", "admin"),
+    (
+        "DELETE",
+        "/v1/admin/runtime/modules/{name}/env/{key}",
+        "admin",
+    ),
     (
         "POST",
         "/v1/admin/runtime/modules/{name}/versions/{version}/rollback",

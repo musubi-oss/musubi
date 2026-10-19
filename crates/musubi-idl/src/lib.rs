@@ -244,6 +244,26 @@ pub struct Idl {
     /// mounted at `/v1/x/{module}/{name}`.
     #[serde(default)]
     pub http: BTreeMap<String, HttpDef>,
+    /// Module environment (P1-63): key `module/KEY` → typed setting the module reads through the
+    /// `env` host interface; values are bound per deployment (`/v1/admin/runtime/modules/{m}/env`).
+    #[serde(default)]
+    pub env: BTreeMap<String, EnvDef>,
+}
+
+/// `[env."module/KEY"] type = "string" | "int" | "float" | "bool" | "json", required, default,
+/// secret, doc`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct EnvDef {
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    /// Sealed at rest, redacted in the admin API, never written to logs/events.
+    pub secret: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
 }
 
 /// Who may call a module HTTP handler.
@@ -347,6 +367,7 @@ struct Doc {
     matches: BTreeMap<String, MatchDef>,
     configs: BTreeMap<String, ConfigDef>,
     http: BTreeMap<String, HttpDef>,
+    env: BTreeMap<String, EnvDef>,
 }
 
 fn toml_to_json(v: toml::Value) -> Value {
@@ -364,6 +385,7 @@ impl Idl {
             matches: doc.matches,
             configs: doc.configs,
             http: doc.http,
+            env: doc.env,
             ..Default::default()
         };
         for (name, spec) in doc.types {

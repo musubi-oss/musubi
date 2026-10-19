@@ -33,6 +33,7 @@ pub mod loadtest;
 pub mod lobby;
 pub mod logins;
 pub mod metrics;
+pub mod module_env;
 pub mod modules;
 pub mod nakama;
 pub mod notify;

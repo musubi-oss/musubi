@@ -138,6 +138,13 @@ interface secrets {
     /// `[runtime.secrets]` by name — modules never see the process environment.
     get: func(name: string) -> result<string, string>;
 }
+interface env {
+    /// Typed per-module setting declared in the IDL (`[env."module/KEY"]`) and bound per
+    /// deployment; the JSON-encoded value (strings come quoted).
+    get: func(key: string) -> result<string, string>;
+    /// Every declared key with its JSON value (secrets included — the module owns them).
+    all: func() -> result<string, string>;
+}
 interface metrics {
     /// `musubi_module_<name>` counter / gauge on `/metrics`; `labels` is a JSON object or empty.
     inc: func(name: string, value: f64, labels: string) -> result<_, string>;
@@ -173,6 +180,7 @@ world guest {
     import time;
     import rng;
     import secrets;
+    import env;
     import metrics;
     import http;
     import timers;
@@ -230,6 +238,13 @@ interface secrets {
     /// `[runtime.secrets]` by name — modules never see the process environment.
     get: func(name: string) -> result<string, string>;
 }
+interface env {
+    /// Typed per-module setting declared in the IDL (`[env."module/KEY"]`) and bound per
+    /// deployment; the JSON-encoded value (strings come quoted).
+    get: func(key: string) -> result<string, string>;
+    /// Every declared key with its JSON value (secrets included — the module owns them).
+    all: func() -> result<string, string>;
+}
 interface metrics {
     /// `musubi_module_<name>` counter / gauge on `/metrics`; `labels` is a JSON object or empty.
     inc: func(name: string, value: f64, labels: string) -> result<_, string>;
@@ -265,6 +280,7 @@ world guest {
     import time;
     import rng;
     import secrets;
+    import env;
     import metrics;
     import http;
     import timers;
@@ -278,7 +294,10 @@ world guest {
 
 impl State {
     /// Route a typed import through the same `HostApi` as `host.call`.
-    fn op(&mut self, req: Value) -> std::result::Result<String, String> {
+    fn op(&mut self, mut req: Value) -> std::result::Result<String, String> {
+        if let Some(o) = req.as_object_mut() {
+            o.insert("__module".into(), Value::String(self.module.clone()));
+        }
         match self.host.call(&self.ctx, req) {
             Ok(v) => Ok(v.to_string()),
             Err(e) => Err(e.to_string()),
@@ -426,6 +445,22 @@ impl wit::musubi::runtime::secrets::Host for State {
     }
 }
 
+impl wit::musubi::runtime::env::Host for State {
+    fn get(&mut self, key: String) -> std::result::Result<String, String> {
+        let out = self.op(json!({ "op": "env.get", "key": key }))?;
+        let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        v.get("value")
+            .map(|v| v.to_string())
+            .ok_or_else(|| "env.get: no value".to_string())
+    }
+
+    fn all(&mut self) -> std::result::Result<String, String> {
+        let out = self.op(json!({ "op": "env.all" }))?;
+        let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        Ok(v["values"].to_string())
+    }
+}
+
 impl wit::musubi::runtime::metrics::Host for State {
     fn inc(&mut self, name: String, value: f64, labels: String) -> std::result::Result<(), String> {
         self.op(json!({ "op": "metrics.inc", "name": name, "value": value, "labels": json_or_string(labels) }))
@@ -562,7 +597,13 @@ struct State {
 fn host_call(state: &State, request: &[u8]) -> Vec<u8> {
     let out = serde_json::from_slice::<Value>(request)
         .map_err(|e| Error::InvalidArgument(format!("host request is not json: {e}")))
-        .and_then(|req| state.host.call(&state.ctx, req));
+        .and_then(|mut req| {
+            // host ops that are scoped to the calling module (env) trust this, not the guest
+            if let Some(o) = req.as_object_mut() {
+                o.insert("__module".into(), Value::String(state.module.clone()));
+            }
+            state.host.call(&state.ctx, req)
+        });
     let v = match out {
         Ok(v) => serde_json::json!({ "ok": v }),
         Err(e) => serde_json::json!({ "error": e.to_string() }),

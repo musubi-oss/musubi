@@ -30483,3 +30483,340 @@ async fn economy_changesets_review_publish_and_strings() {
         "{v}"
     );
 }
+
+/// P1-63: typed per-module env — IDL declarations, bindings with redaction, publish gate and the
+/// `env.get` / `env.all` host ops scoped to the calling module (`example` carries the `host` RPC).
+#[tokio::test]
+async fn module_env_bindings_gate_and_host_ops() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let _ = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        None,
+    )
+    .await;
+    let _ = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/envgate/env",
+        "defaultkey",
+        None,
+    )
+    .await;
+
+    // IDL lint: unknown type / default of the wrong type / bare key are rejected.
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": "[env.\"example/MODE\"]\ntype = \"enum\"\n" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert!(e.to_string().contains("unknown type"), "{e}");
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": "[env.\"example/MAX\"]\ntype = \"int\"\ndefault = \"ten\"\n" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": "[env.\"nomodule\"]\ntype = \"string\"\n" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+
+    let source = r#"
+[env."example/API_KEY"]
+type = "string"
+required = true
+secret = true
+doc = "partner key"
+
+[env."example/MAX_CART"]
+type = "int"
+default = 50
+
+[env."example/FEATURES"]
+type = "json"
+default = { beta = false }
+
+[env."example/VERBOSE"]
+type = "bool"
+
+[env."envgate/TOKEN"]
+type = "string"
+required = true
+secret = true
+"#;
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": source })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Describe before anything is bound: sources and the missing list.
+    let (st, d) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["ok"], false);
+    assert_eq!(d["missing"], json!(["API_KEY"]));
+    let by_key = |d: &Value, k: &str| -> Value {
+        d["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == k)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(by_key(&d, "API_KEY")["source"], "missing");
+    assert_eq!(by_key(&d, "API_KEY")["secret"], true);
+    assert_eq!(by_key(&d, "API_KEY")["doc"], "partner key");
+    assert_eq!(by_key(&d, "MAX_CART")["source"], "default");
+    assert_eq!(by_key(&d, "MAX_CART")["value"], 50);
+    assert_eq!(by_key(&d, "VERBOSE")["source"], "missing");
+    assert_eq!(by_key(&d, "VERBOSE")["required"], false);
+
+    // Typed coercion: bad values → 400, nothing stored.
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        Some(json!({ "values": { "MAX_CART": "lots" } })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        Some(json!({ "values": { "bad-key": 1 } })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        Some(json!({ "values": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+
+    // Bind: strings are coerced to the declared type, secrets are redacted in the response.
+    let (st, d) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        Some(json!({
+            "values": { "API_KEY": "sk_live_123", "MAX_CART": "80", "VERBOSE": "yes", "EXTRA": {"x": 1} },
+            "secrets": ["EXTRA"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["ok"], true);
+    assert_eq!(d["missing"], json!([]));
+    assert_eq!(by_key(&d, "API_KEY")["value"], "***");
+    assert_eq!(by_key(&d, "API_KEY")["source"], "binding");
+    assert_eq!(by_key(&d, "MAX_CART")["value"], 80);
+    assert_eq!(by_key(&d, "VERBOSE")["value"], true);
+    assert_eq!(by_key(&d, "EXTRA")["declared"], false);
+    assert_eq!(by_key(&d, "EXTRA")["secret"], true);
+    assert_eq!(by_key(&d, "EXTRA")["value"], "***");
+    assert_eq!(by_key(&d, "FEATURES")["source"], "default");
+    assert!(!d.to_string().contains("sk_live_123"), "secret leaked: {d}");
+
+    // Sealed at rest.
+    let db = sqlx::PgPool::connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let raw: String = sqlx::query_scalar(
+        "select value from musubi.module_env where module = 'example' and key = 'API_KEY'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    // The key ring is process-global and owned by the secrets test; without one, `seal` is the
+    // documented plaintext passthrough (P1-30) — so only insist on `enc:` when a key is loaded.
+    if musubi_core::secrets::current_kid().is_some() {
+        assert!(
+            !raw.contains("sk_live_123") && raw.starts_with("enc:"),
+            "{raw}"
+        );
+        assert_eq!(musubi_core::secrets::open(&raw).unwrap(), "\"sk_live_123\"");
+    } else {
+        assert_eq!(raw, "\"sk_live_123\"");
+    }
+    let raw: String = sqlx::query_scalar(
+        "select value from musubi.module_env where module = 'example' and key = 'MAX_CART'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(raw, "80");
+
+    // Module code reads the effective values (module-scoped; the guest cannot pick another module).
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("env-dev-")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let host = |body: Value| call(&app, "POST", "/v1/rpc/host", Some(&tok), Some(body));
+    // the `host` RPC answers `{ok: <host result>}` / `{error: …}` with HTTP 200
+    let (st, v) = host(json!({"op": "env.get", "key": "API_KEY", "__module": "envgate"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"]["module"], "example", "{v}");
+    assert_eq!(v["ok"]["value"], "sk_live_123");
+    let (_, v) = host(json!({"op": "env.get", "key": "MAX_CART"})).await;
+    assert_eq!(v["ok"]["value"], 80, "{v}");
+    let (_, v) = host(json!({"op": "env.get", "key": "FEATURES"})).await;
+    assert_eq!(v["ok"]["value"], json!({"beta": false}), "{v}");
+    let (_, v) = host(json!({"op": "env.get", "key": "NOPE"})).await;
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("example/NOPE"),
+        "{v}"
+    );
+    let (_, v) = host(json!({"op": "env.all"})).await;
+    assert_eq!(v["ok"]["values"]["API_KEY"], "sk_live_123", "{v}");
+    assert_eq!(v["ok"]["values"]["VERBOSE"], true);
+    assert_eq!(v["ok"]["values"]["EXTRA"], json!({"x": 1}));
+    assert!(
+        v["ok"]["values"].get("TOKEN").is_none(),
+        "other module's key leaked: {v}"
+    );
+
+    // Publish gate: `envgate` declares a required secret with no binding.
+    let put_mod = |method: &'static str, path: String| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/wasm")
+                .body(Body::from(musubi_runtime::EXAMPLE_WAT.as_bytes()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let st = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, v) = put_mod("PUT", "/v1/admin/runtime/modules/envgate".into()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("TOKEN"), "{v}");
+    let (st, v) = put_mod(
+        "POST",
+        "/v1/admin/runtime/modules/envgate/canary?percent=10".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = put_mod("PUT", "/v1/admin/runtime/modules/envgate?force=true".into()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, d) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/runtime/modules/envgate/env",
+        "defaultkey",
+        Some(json!({ "values": { "TOKEN": "t0k" } })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let (st, v) = put_mod("PUT", "/v1/admin/runtime/modules/envgate".into()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Unbind: one key → back to missing; unknown key → 404; clear all.
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/example/env/API_KEY",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/example/env/API_KEY",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, d) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["missing"], json!(["API_KEY"]));
+    let (_, v) = host(json!({"op": "env.get", "key": "API_KEY"})).await;
+    assert!(v["error"].is_string(), "{v}");
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/example/env",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], 3);
+
+    let _ = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/envgate",
+        "defaultkey",
+        None,
+    )
+    .await;
+    let _ = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/runtime/modules/envgate/env",
+        "defaultkey",
+        None,
+    )
+    .await;
+    let _ = call_server(&app, "DELETE", "/v1/admin/idl", "defaultkey", None).await;
+}

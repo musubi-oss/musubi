@@ -469,6 +469,7 @@ impl ServerHost {
                 };
                 Ok(json!({ "values": values, "max": max }))
             }
+            "env.get" | "env.all" => crate::module_env::host_op(s, &req).await,
             "secrets.get" => {
                 let name = str_field(&req, "name")?;
                 let raw = s

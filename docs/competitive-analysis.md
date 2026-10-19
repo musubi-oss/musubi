@@ -3757,7 +3757,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **What the reports found weaker/missing (merged rows):**
   - 🟡 Hiro/Satori: *Enterprise SSO (SAML) + SCIM directory sync groups → teams* — musubi operator SSO/OIDC (parity.md) without SCIM
   - 🟡 Nakama: *Enterprise SSO (SAML via WorkOS, domain-based routing, multiple domains) + SCIM directory sync mapping IdP groups → tea…* — operator SSO via OIDC exists; no SAML (parity.md "SAML missing"), no SCIM (rg -i scim → none)
-  - 🟡 UGS LiveOps: *Secret Manager (org/project/env hierarchy, inheritance, override; 50 secrets per level; value ≤50,000 chars; roles)* — `[runtime.secrets]` from env/files; no hierarchy, rotation UI or roles
+  - 🟡 UGS LiveOps: *Secret Manager (org/project/env hierarchy, inheritance, override; 50 secrets per level; value ≤50,000 chars; roles)* — `[runtime.secrets]` from env/files plus typed per-module env/secrets declared in the IDL (`[env."module/KEY"]`, required/default/secret, sealed at rest, redacted in the API, publish gate on unbound required keys — P1-63); no org/project hierarchy
 
 #### P1-31. Reward tables, drop tables, loot rolls, reward modifiers, grant limits  
 *area:* economy/IAP · *musubi:* 🟡 partial (2h/3p/0m over 5 rows)
