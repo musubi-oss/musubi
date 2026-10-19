@@ -26594,7 +26594,8 @@ async fn crash_reports_grouping_triage_and_player_timeline() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(v["reports"].as_i64().unwrap() >= 7, "{v}");
+    // r1 (r2 folded into it), r3, shop, dump, 1.0.5, 1.1.0
+    assert!(v["reports"].as_i64().unwrap() >= 6, "{v}");
     assert!(v["groups"].as_i64().unwrap() >= 2);
     assert!(v["active_users"].as_i64().unwrap() >= 2);
     assert!(v["crash_free_users_pct"].is_number());

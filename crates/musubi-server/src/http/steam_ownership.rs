@@ -72,9 +72,14 @@ pub async fn gate(s: &AppState, steam_id: &str) -> Result<Option<Value>> {
                 .as_i64()
                 .is_some_and(|t| now - t < c.ownership_cache_secs as i64)
     });
-    let o: crate::logins::SteamOwnership = match fresh {
-        Some(m) => serde_json::from_value(m.clone()).unwrap_or_default(),
-        None => s.logins.steam_ownership(steam_id).await?,
+    // Steam is asked only when an answer is needed to admit the player (ownership or family
+    // sharing rules); ban propagation alone works from whatever answer is already stored.
+    let needs_api = c.require_ownership || c.family_sharing != "allow";
+    let o: crate::logins::SteamOwnership = match (fresh, cached.as_ref()) {
+        (Some(m), _) => serde_json::from_value(m.clone()).unwrap_or_default(),
+        (None, _) if needs_api => s.logins.steam_ownership(steam_id).await?,
+        (None, Some(m)) => serde_json::from_value(m.clone()).unwrap_or_default(),
+        (None, None) => return Ok(None),
     };
     if c.require_ownership && !o.owns_app {
         return Err(Error::PermissionDenied(
