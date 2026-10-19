@@ -2,7 +2,9 @@
 
 use crate::app::AppState;
 use crate::http::{ApiError, Bearer};
-use crate::lobby::{CreateLobby, JoinLobby, ListQuery, Lobby, LobbyPage, UpdateLobby};
+use crate::lobby::{
+    CreateLobby, JoinLobby, ListQuery, Lobby, LobbyPage, SearchLobbies, UpdateLobby,
+};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -14,6 +16,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/lobbies", get(list).post(create))
         .route("/v1/lobbies/join", post(join))
+        .route("/v1/lobbies/search", post(search))
+        .route("/v1/lobbies/{id}/me", axum::routing::put(member_data))
         .route("/v1/lobbies/mine", get(mine))
         .route("/v1/lobbies/{id}", get(get_one).patch(update).delete(close))
         .route("/v1/lobbies/{id}/leave", post(leave))
@@ -223,4 +227,30 @@ async fn start(
         )
         .await;
     Ok(Json(lobby))
+}
+
+async fn search(
+    Bearer(_me): Bearer,
+    State(s): State<AppState>,
+    Json(req): Json<SearchLobbies>,
+) -> Result<Json<LobbyPage>, ApiError> {
+    Ok(Json(s.lobbies.search(&req).await?))
+}
+
+#[derive(Deserialize)]
+struct MemberDataReq {
+    data: Value,
+}
+
+async fn member_data(
+    Bearer(me): Bearer,
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(r): Json<MemberDataReq>,
+) -> Result<Json<Lobby>, ApiError> {
+    Ok(Json(
+        s.lobbies
+            .set_member_data(me.account_id, &id, r.data)
+            .await?,
+    ))
 }

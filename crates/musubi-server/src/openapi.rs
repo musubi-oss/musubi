@@ -318,6 +318,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/lobbies", "lobbies"),
     ("POST", "/v1/lobbies", "lobbies"),
     ("POST", "/v1/lobbies/join", "lobbies"),
+    ("POST", "/v1/lobbies/search", "lobbies"),
+    ("PUT", "/v1/lobbies/{id}/me", "lobbies"),
     ("GET", "/v1/lobbies/mine", "lobbies"),
     ("GET", "/v1/lobbies/{id}", "lobbies"),
     ("PATCH", "/v1/lobbies/{id}", "lobbies"),

@@ -53,7 +53,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Перевод сообщений | ✅ вебхук `chat.translate_url`: языки присутствующих, `content.translations` | ❌ | ❌ | ❌ | ❌ |
 | Голос | ✅ через Aurix (токены, позиционный канал мира, модерация) | ❌ | ❌ | ✅ | ❌ |
 | Присутствие / статус | ✅ hub + шина (`online_remote`) | ✅ | ✅ | ❌ | ✅ |
-| Пати (label/hidden, кластерный листинг), лобби, ready, команды | ✅ parties (home-node) + `party_list`/`GET /v1/parties` + `/v1/lobbies` | ✅ | ✅ | ✅ | ✅ |
+| Пати (label/hidden, кластерный листинг), лобби, ready, команды | ✅ parties (home-node) + `party_list`/`GET /v1/parties` + `/v1/lobbies` | ✅ | ✅ | ✅ | ✅ | Атрибуты и поиск лобби (P0-44): типизированные публичные `attributes` (string/number/bool, поиск), `private_attributes` (видны только участникам), данные участника `PUT /v1/lobbies/{id}/me`, `POST /v1/lobbies/search {filters[{key,op,value}], sort[{key,dir,near}]}` с eq/ne/gt/gte/lt/lte/contains/in/exists по атрибутам и встроенным полям (member_count, free_slots, created_at…), сортировка по близости к числу.
 | Уведомления in-app | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Push FCM / APNs / Huawei, тихие пуши, deep links | ✅ `push.rs` (`fcm`/`apns`/`hms`, `data.silent`, `data.link`) | ❌ | ❌ | ✅ | ❌ |
 | WebPush | ✅ `push.rs`: RFC 8030/8291 aes128gcm + VAPID, `platform: webpush` в `/v1/account/push_tokens` | ❌ | ❌ | ❌ | ❌ |

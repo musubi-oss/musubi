@@ -251,6 +251,14 @@ id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.
 | `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
 | QUIC `quic.listen` (UDP) | access JWT in the first frame `{token, format, status}` | same envelopes/encodings as WebSocket over one bidirectional quinn stream (`type:u8 \| len:u32be \| payload`); an unvalidated source is answered with a Retry token before any handshake state exists (`quic.retry`, default on — spoofed addresses cost nothing and amplification stays 1×), handshakes in flight are capped by `quic.max_pending_handshakes` (default 1024, refused above), 8 bidirectional / 0 unidirectional streams per connection, ALPN `musubi-rt/1`, PEM cert or self-signed dev cert; `match_data` with `reliable=false` travels as QUIC datagrams (clients may send datagrams too) |
 
+Lobbies carry typed attributes: `attributes {key: string|number|bool}` (public, searchable, ≤ 32
+keys) and `private_attributes` (members only) on create/PATCH, plus per-member `data`
+(`PUT /v1/lobbies/{id}/me {data}` — loadout, colour, platform; everyone in the lobby gets `updated`).
+`POST /v1/lobbies/search {filters: [{key, op, value}], sort: [{key, dir, near?}], region?, has_slots,
+limit, offset}` searches public waiting lobbies — ops `eq ne gt gte lt lte contains in exists` on
+attributes or built-ins (`name`, `region`, `host_id`, `member_count`, `free_slots`, `max_members`,
+`team_count`, `team_size`, `created_at`); `near` sorts by distance to a number (closest skill first).
+
 Sanctions sit on top of bans as the moderation workflow: `POST /v1/admin/accounts/{id}/sanctions
 {action, reason_code?, duration_secs?, message?, pending?, escalate?, source?, note}` with actions
 `warn` (notification only), `mute` (chat + voice), `restrict_matchmaking`, `restrict_social`

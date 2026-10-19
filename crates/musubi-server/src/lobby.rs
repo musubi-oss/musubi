@@ -31,6 +31,8 @@ pub struct Member {
     pub team: i32,
     pub ready: bool,
     pub joined_at: i64,
+    /// Per-member data (`PUT /v1/lobbies/{id}/me`): loadout, colour, platform …
+    pub data: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +51,11 @@ pub struct Lobby {
     pub team_size: i32,
     pub region: Option<String>,
     pub metadata: Value,
+    /// Typed public attributes (string / number / bool), searchable with `POST /v1/lobbies/search`.
+    pub attributes: Value,
+    /// Attributes only members see (host sets them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_attributes: Option<Value>,
     pub state: String,
     /// Connect info once started (`start` payload: allocation / match / custom).
     pub started: Option<Value>,
@@ -71,6 +78,8 @@ pub struct CreateLobby {
     pub team_size: i32,
     pub region: Option<String>,
     pub metadata: Value,
+    pub attributes: Value,
+    pub private_attributes: Value,
     /// Team the host sits on.
     pub team: i32,
 }
@@ -87,6 +96,8 @@ pub struct UpdateLobby {
     pub team_size: Option<i32>,
     pub region: Option<String>,
     pub metadata: Option<Value>,
+    pub attributes: Option<Value>,
+    pub private_attributes: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -136,9 +147,10 @@ type LobbyRow = (
     OffsetDateTime,
     i64,
 );
-const LOBBY_COLS: &str = "l.id, l.name, l.host_id, l.visibility, l.code, l.password_hash, l.max_members, l.team_count, l.team_size, l.region, l.metadata, l.state, l.started, l.created_at, l.updated_at, (select count(*) from musubi.lobby_members m where m.lobby_id = l.id)";
+const LOBBY_COLS: &str = "l.id, l.name, l.host_id, l.visibility, l.code, l.password_hash, l.max_members, l.team_count, l.team_size, l.region, jsonb_build_object('m', l.metadata, 'a', l.attributes, 'p', l.private_attributes), l.state, l.started, l.created_at, l.updated_at, (select count(*) from musubi.lobby_members m where m.lobby_id = l.id)";
 
 fn to_lobby(r: LobbyRow, member: bool) -> Lobby {
+    let packed = r.10;
     Lobby {
         id: r.0.to_string(),
         name: r.1,
@@ -150,7 +162,9 @@ fn to_lobby(r: LobbyRow, member: bool) -> Lobby {
         team_count: r.7,
         team_size: r.8,
         region: r.9,
-        metadata: r.10,
+        metadata: packed["m"].clone(),
+        attributes: packed["a"].clone(),
+        private_attributes: member.then_some(packed["p"].clone()),
         state: r.11,
         started: r.12,
         member_count: r.15,
@@ -160,7 +174,7 @@ fn to_lobby(r: LobbyRow, member: bool) -> Lobby {
     }
 }
 
-type MemberRow = (Uuid, String, i32, bool, OffsetDateTime);
+type MemberRow = (Uuid, String, i32, bool, OffsetDateTime, Value);
 
 fn to_member(r: MemberRow) -> Member {
     Member {
@@ -169,6 +183,7 @@ fn to_member(r: MemberRow) -> Member {
         team: r.2,
         ready: r.3,
         joined_at: r.4.unix_timestamp(),
+        data: r.5,
     }
 }
 
@@ -270,7 +285,7 @@ impl LobbyService {
 
     async fn members_tx(tx: &mut Transaction<'_, Postgres>, id: Uuid) -> Result<Vec<Member>> {
         let rows: Vec<MemberRow> = sqlx::query_as(
-            "select account_id, username, team, ready, joined_at from musubi.lobby_members where lobby_id = $1 order by joined_at, account_id",
+            "select account_id, username, team, ready, joined_at, data from musubi.lobby_members where lobby_id = $1 order by joined_at, account_id",
         )
         .bind(id)
         .fetch_all(&mut **tx)
@@ -392,6 +407,8 @@ impl LobbyService {
     }
 
     pub async fn create(&self, me: AccountId, username: &str, req: CreateLobby) -> Result<Lobby> {
+        let attributes = validate_attrs(&req.attributes, "attributes")?;
+        let private_attributes = validate_attrs(&req.private_attributes, "private_attributes")?;
         validate_name(&req.name)?;
         let visibility = req.visibility.clone().unwrap_or_else(|| "public".into());
         validate_visibility(&visibility)?;
@@ -444,8 +461,8 @@ impl LobbyService {
             }
         }
         sqlx::query(
-            "insert into musubi.lobbies (id, name, host_id, visibility, code, password_hash, max_members, team_count, team_size, region, metadata)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "insert into musubi.lobbies (id, name, host_id, visibility, code, password_hash, max_members, team_count, team_size, region, metadata, attributes, private_attributes)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(id)
         .bind(req.name.trim())
@@ -458,6 +475,8 @@ impl LobbyService {
         .bind(req.team_size)
         .bind(req.region.as_deref())
         .bind(&metadata)
+        .bind(&attributes)
+        .bind(&private_attributes)
         .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
@@ -750,7 +769,7 @@ impl LobbyService {
                 "a member sits on a team that would disappear".into(),
             ));
         }
-        let metadata = req.metadata.clone().unwrap_or(row.10.clone());
+        let metadata = req.metadata.clone().unwrap_or(row.10["m"].clone());
         validate_metadata(&metadata)?;
         let password_hash = match req.password.as_deref() {
             None => row.5.clone(),
@@ -763,9 +782,18 @@ impl LobbyService {
             (_, c) => c.clone(),
         };
         let region = req.region.clone().or(row.9.clone());
+        let attributes = match &req.attributes {
+            Some(a) => validate_attrs(a, "attributes")?,
+            None => row.10["a"].clone(),
+        };
+        let private_attributes = match &req.private_attributes {
+            Some(a) => validate_attrs(a, "private_attributes")?,
+            None => row.10["p"].clone(),
+        };
         sqlx::query(
             "update musubi.lobbies set name = $2, visibility = $3, code = $4, password_hash = $5, max_members = $6,
-                team_count = $7, team_size = $8, region = $9, metadata = $10, updated_at = now(), heartbeat_at = now()
+                team_count = $7, team_size = $8, region = $9, metadata = $10, attributes = $11,
+                private_attributes = $12, updated_at = now(), heartbeat_at = now()
              where id = $1",
         )
         .bind(id)
@@ -778,6 +806,8 @@ impl LobbyService {
         .bind(team_size)
         .bind(region.as_deref())
         .bind(&metadata)
+        .bind(&attributes)
+        .bind(&private_attributes)
         .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
@@ -927,5 +957,302 @@ impl LobbyService {
             .await;
         }
         Ok(n)
+    }
+}
+
+/// Attributes are a flat object of up to 32 string / number / bool values (keys `[A-Za-z0-9_.-]`).
+pub fn validate_attrs(v: &Value, what: &str) -> Result<Value> {
+    if v.is_null() {
+        return Ok(json!({}));
+    }
+    let obj = v
+        .as_object()
+        .ok_or_else(|| Error::InvalidArgument(format!("{what} must be an object")))?;
+    if obj.len() > 32 {
+        return Err(Error::InvalidArgument(format!("{what}: at most 32 keys")));
+    }
+    for (k, val) in obj {
+        if !valid_key(k) {
+            return Err(Error::InvalidArgument(format!(
+                "{what}: key {k:?} must be 1..64 chars of [A-Za-z0-9_.-]"
+            )));
+        }
+        match val {
+            Value::String(s) if s.len() <= 512 => {}
+            Value::Number(_) | Value::Bool(_) => {}
+            Value::String(_) => {
+                return Err(Error::InvalidArgument(format!(
+                    "{what}.{k}: string too long (512)"
+                )))
+            }
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "{what}.{k}: values must be string, number or bool"
+                )))
+            }
+        }
+    }
+    Ok(v.clone())
+}
+
+fn valid_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 64
+        && k.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
+/// One search predicate on a public attribute or a built-in field.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Filter {
+    /// Attribute key, or built-in `name`, `region`, `member_count`, `max_members`, `free_slots`,
+    /// `team_count`, `team_size`, `created_at`, `host_id`.
+    pub key: String,
+    /// `eq` | `ne` | `gt` | `gte` | `lt` | `lte` | `contains` | `in` | `exists`
+    pub op: String,
+    #[serde(default)]
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Sort {
+    pub key: String,
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Order by distance from this number (closest first) instead of the raw value.
+    #[serde(default)]
+    pub near: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SearchLobbies {
+    pub filters: Vec<Filter>,
+    pub sort: Vec<Sort>,
+    pub region: Option<String>,
+    pub has_slots: Option<bool>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+enum Bind {
+    Num(f64),
+    Str(String),
+    Strs(Vec<String>),
+}
+
+const MEMBERS: &str = "(select count(*) from musubi.lobby_members m where m.lobby_id = l.id)";
+
+/// (text expression, numeric expression) for a key.
+fn key_exprs(key: &str) -> Result<(String, String)> {
+    let builtin: Option<(String, bool)> = match key {
+        "name" => Some(("l.name".into(), false)),
+        "region" => Some(("l.region".into(), false)),
+        "host_id" => Some(("l.host_id::text".into(), false)),
+        "member_count" => Some((MEMBERS.into(), true)),
+        "free_slots" => Some((format!("(l.max_members - {MEMBERS})"), true)),
+        "max_members" => Some(("l.max_members".into(), true)),
+        "team_count" => Some(("l.team_count".into(), true)),
+        "team_size" => Some(("l.team_size".into(), true)),
+        "created_at" => Some(("extract(epoch from l.created_at)".into(), true)),
+        _ => None,
+    };
+    if let Some((col, numeric)) = builtin {
+        return Ok(if numeric {
+            (format!("({col})::text"), format!("({col})::numeric"))
+        } else {
+            (
+                col.clone(),
+                format!("case when {col} ~ '^-?[0-9]+(\\.[0-9]+)?$' then ({col})::numeric end"),
+            )
+        });
+    }
+    if !valid_key(key) {
+        return Err(Error::InvalidArgument(format!("bad attribute key {key:?}")));
+    }
+    Ok((
+        format!("(l.attributes->>'{key}')"),
+        format!("case when jsonb_typeof(l.attributes->'{key}') = 'number' then (l.attributes->>'{key}')::numeric end"),
+    ))
+}
+
+fn scalar_text(v: &Value) -> Result<String> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        _ => Err(Error::InvalidArgument(
+            "filter value must be a scalar".into(),
+        )),
+    }
+}
+
+impl LobbyService {
+    /// Attribute search over public waiting lobbies: typed predicates, sorting (optionally by
+    /// distance to a number), offset paging.
+    pub async fn search(&self, req: &SearchLobbies) -> Result<LobbyPage> {
+        if req.filters.len() > 16 || req.sort.len() > 4 {
+            return Err(Error::InvalidArgument(
+                "at most 16 filters and 4 sort keys".into(),
+            ));
+        }
+        let limit = req.limit.unwrap_or(50).clamp(1, 100);
+        let offset = req.offset.unwrap_or(0).max(0);
+        let mut sql = format!(
+            "select {LOBBY_COLS} from musubi.lobbies l where l.visibility = 'public' and l.state = 'waiting'"
+        );
+        let mut binds: Vec<Bind> = Vec::new();
+        fn arg(binds: &mut Vec<Bind>, b: Bind) -> String {
+            binds.push(b);
+            format!("${}", binds.len())
+        }
+        if let Some(r) = &req.region {
+            let a = arg(&mut binds, Bind::Str(r.clone()));
+            sql.push_str(&format!(" and l.region = {a}"));
+        }
+        if req.has_slots.unwrap_or(true) {
+            sql.push_str(&format!(" and {MEMBERS} < l.max_members"));
+        }
+        for f in &req.filters {
+            let (t, n) = key_exprs(&f.key)?;
+            let clause = match f.op.as_str() {
+                "exists" => format!("({t} is not null)"),
+                "in" => {
+                    let vals: Vec<String> = f
+                        .value
+                        .as_array()
+                        .ok_or_else(|| {
+                            Error::InvalidArgument(format!("{}: in needs an array", f.key))
+                        })?
+                        .iter()
+                        .map(scalar_text)
+                        .collect::<Result<_>>()?;
+                    let a = arg(&mut binds, Bind::Strs(vals));
+                    format!("({t} = any({a}::text[]))")
+                }
+                "contains" => {
+                    let a = arg(
+                        &mut binds,
+                        Bind::Str(scalar_text(&f.value)?.replace(['%', '_'], "")),
+                    );
+                    format!("({t} ilike '%' || {a} || '%')")
+                }
+                op @ ("eq" | "ne" | "gt" | "gte" | "lt" | "lte") => {
+                    let sym = match op {
+                        "eq" => "=",
+                        "ne" => "<>",
+                        "gt" => ">",
+                        "gte" => ">=",
+                        "lt" => "<",
+                        _ => "<=",
+                    };
+                    match &f.value {
+                        Value::Number(x) => {
+                            let a = arg(&mut binds, Bind::Num(x.as_f64().unwrap_or(0.0)));
+                            format!("({n} {sym} {a}::numeric)")
+                        }
+                        v if op == "eq" || op == "ne" => {
+                            let a = arg(&mut binds, Bind::Str(scalar_text(v)?));
+                            if op == "ne" {
+                                format!("({t} is null or {t} <> {a})")
+                            } else {
+                                format!("({t} = {a})")
+                            }
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgument(format!(
+                                "{}: {op} needs a number",
+                                f.key
+                            )))
+                        }
+                    }
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "{}: unknown op {other:?}",
+                        f.key
+                    )))
+                }
+            };
+            sql.push_str(" and ");
+            sql.push_str(&clause);
+        }
+        let mut order: Vec<String> = Vec::new();
+        for s in &req.sort {
+            let (t, n) = key_exprs(&s.key)?;
+            let dir = match s.dir.as_deref().unwrap_or("asc") {
+                "asc" => "asc",
+                "desc" => "desc",
+                d => return Err(Error::InvalidArgument(format!("sort dir {d:?}"))),
+            };
+            if let Some(x) = s.near {
+                let a = arg(&mut binds, Bind::Num(x));
+                order.push(format!("abs({n} - {a}::numeric) {dir} nulls last"));
+            } else {
+                order.push(format!("{n} {dir} nulls last, {t} {dir} nulls last"));
+            }
+        }
+        order.push("l.id desc".into());
+        let lim = arg(&mut binds, Bind::Num(limit as f64));
+        let off = arg(&mut binds, Bind::Num(offset as f64));
+        sql.push_str(&format!(
+            " order by {} limit {lim}::numeric::int offset {off}::numeric::int",
+            order.join(", ")
+        ));
+        let mut q = sqlx::query_as::<_, LobbyRow>(&sql);
+        for b in &binds {
+            q = match b {
+                Bind::Num(x) => q.bind(*x),
+                Bind::Str(s) => q.bind(s.clone()),
+                Bind::Strs(v) => q.bind(v.clone()),
+            };
+        }
+        let rows = q.fetch_all(&self.db).await.map_err(|e| {
+            tracing::debug!(error = %e, sql, "lobby search failed");
+            Error::InvalidArgument(format!("search failed: {e}"))
+        })?;
+        let next_cursor = (rows.len() as i64 == limit).then(|| (offset + limit).to_string());
+        Ok(LobbyPage {
+            lobbies: rows.into_iter().map(|r| to_lobby(r, false)).collect(),
+            next_cursor,
+        })
+    }
+
+    /// A member's own data blob (≤ 8 KiB object); other members get an `updated` event.
+    pub async fn set_member_data(&self, me: AccountId, id: &str, data: Value) -> Result<Lobby> {
+        if !data.is_object() || data.to_string().len() > 8192 {
+            return Err(Error::InvalidArgument(
+                "data must be an object up to 8 KiB".into(),
+            ));
+        }
+        let lid = parse_id(id)?;
+        let n = sqlx::query(
+            "update musubi.lobby_members set data = $3 where lobby_id = $1 and account_id = $2",
+        )
+        .bind(lid)
+        .bind(me.0)
+        .bind(&data)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::NotFound("not a member of this lobby".into()));
+        }
+        let lobby = self.get(id, Some(me)).await?;
+        let to: Vec<AccountId> = lobby
+            .members
+            .iter()
+            .map(|m| m.account_id)
+            .filter(|a| *a != me)
+            .collect();
+        self.emit(
+            &to,
+            Some(me),
+            "updated",
+            json!({ "lobby_id": lid, "member": me.0 }),
+        )
+        .await;
+        Ok(lobby)
     }
 }

@@ -19432,3 +19432,195 @@ async fn sanctions_escalation_pending_appeals_and_sync() {
     .await;
     assert_eq!(v["sanctions"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn lobby_attributes_search_private_attrs_and_member_data() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let login = |dev: String| {
+        let app = app.clone();
+        async move {
+            let (st, sess) = call(
+                &app,
+                "POST",
+                "/v1/auth/device",
+                None,
+                Some(json!({"id": dev})),
+            )
+            .await;
+            assert_eq!(st, 200, "{sess}");
+            sess["access_token"].as_str().unwrap().to_string()
+        }
+    };
+    let ta = login(unique("lobby-attr-a-")).await;
+    let tb = login(unique("lobby-attr-b-")).await;
+    let region = unique("reg-");
+    let mk = |name: &str, attrs: Value, private: Value| {
+        let app = app.clone();
+        let ta = ta.clone();
+        let region = region.clone();
+        let name = name.to_string();
+        async move {
+            let (st, l) = call(
+                &app,
+                "POST",
+                "/v1/lobbies",
+                Some(&ta),
+                Some(json!({"name": name, "max_members": 4, "region": region,
+                    "attributes": attrs, "private_attributes": private})),
+            )
+            .await;
+            assert_eq!(st, 200, "{l}");
+            l
+        }
+    };
+    let l1 = mk(
+        "ranked eu",
+        json!({"mode": "ranked", "map": "dust", "skill": 1500, "crossplay": true}),
+        json!({"server_pw": "hunter2"}),
+    )
+    .await;
+    let l2 = mk(
+        "casual",
+        json!({"mode": "casual", "map": "nuke", "skill": 900}),
+        json!({}),
+    )
+    .await;
+    let l3 = mk(
+        "ranked pro",
+        json!({"mode": "ranked", "map": "dust2", "skill": 2100}),
+        json!({}),
+    )
+    .await;
+    assert_eq!(l1["attributes"]["skill"], 1500);
+    assert_eq!(l1["private_attributes"]["server_pw"], "hunter2");
+    let id1 = l1["id"].as_str().unwrap().to_string();
+    // non-member does not see private attributes
+    let (st, v) = call(&app, "GET", &format!("/v1/lobbies/{id1}"), Some(&tb), None).await;
+    assert_eq!(st, 200);
+    assert!(v.get("private_attributes").is_none(), "{v}");
+    assert_eq!(v["attributes"]["crossplay"], true);
+
+    let search = |body: Value| {
+        let app = app.clone();
+        let tb = tb.clone();
+        let region = region.clone();
+        async move {
+            let mut body = body;
+            body["region"] = json!(region);
+            let (st, v) = call(&app, "POST", "/v1/lobbies/search", Some(&tb), Some(body)).await;
+            (st, v)
+        }
+    };
+    let ids = |v: &Value| -> Vec<String> {
+        v["lobbies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (st, v) =
+        search(json!({"filters": [{"key": "mode", "op": "eq", "value": "ranked"}]})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(ids(&v).len(), 2);
+    let (_, v) = search(json!({"filters": [
+        {"key": "skill", "op": "gte", "value": 1000},
+        {"key": "map", "op": "contains", "value": "dus"}]}))
+    .await;
+    assert_eq!(ids(&v).len(), 2, "{v}");
+    let (_, v) = search(json!({"filters": [{"key": "skill", "op": "lt", "value": 1000}]})).await;
+    assert_eq!(ids(&v), vec![l2["id"].as_str().unwrap().to_string()]);
+    let (_, v) = search(json!({"sort": [{"key": "skill", "near": 1400}]})).await;
+    assert_eq!(ids(&v)[0], id1, "{v}");
+    let (_, v) = search(json!({"sort": [{"key": "skill", "dir": "desc"}]})).await;
+    assert_eq!(ids(&v)[0], l3["id"].as_str().unwrap(), "{v}");
+    let (_, v) =
+        search(json!({"filters": [{"key": "mode", "op": "in", "value": ["casual", "coop"]}]}))
+            .await;
+    assert_eq!(ids(&v).len(), 1);
+    let (_, v) = search(
+        json!({"filters": [{"key": "free_slots", "op": "gte", "value": 3},
+        {"key": "crossplay", "op": "eq", "value": true}]}),
+    )
+    .await;
+    assert_eq!(ids(&v), vec![id1.clone()], "{v}");
+    let (_, v) = search(
+        json!({"filters": [{"key": "name", "op": "contains", "value": "ranked"}],
+        "sort": [{"key": "created_at", "dir": "asc"}]}),
+    )
+    .await;
+    assert_eq!(ids(&v).len(), 2);
+    let (_, v) = search(json!({"filters": [{"key": "mode", "op": "exists"}], "limit": 2})).await;
+    assert_eq!(ids(&v).len(), 2);
+    assert_eq!(v["next_cursor"], "2");
+    let (_, v) =
+        search(json!({"filters": [{"key": "mode", "op": "exists"}], "limit": 2, "offset": 2}))
+            .await;
+    assert_eq!(ids(&v).len(), 1);
+    let (st, _) = search(json!({"filters": [{"key": "mode", "op": "like", "value": "x"}]})).await;
+    assert_eq!(st, 400);
+    let (st, _) = search(json!({"filters": [{"key": "bad key!", "op": "eq", "value": "x"}]})).await;
+    assert_eq!(st, 400);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies",
+        Some(&ta),
+        Some(json!({"name": "bad", "max_members": 2, "attributes": {"tags": ["a", "b"]}})),
+    )
+    .await;
+    assert_eq!(st, 400, "{v}");
+
+    // B joins L1: sees private attributes, sets own member data
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/lobbies/join",
+        Some(&tb),
+        Some(json!({"id": id1})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["private_attributes"]["server_pw"], "hunter2");
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("/v1/lobbies/{id1}/me"),
+        Some(&tb),
+        Some(json!({"data": {"loadout": "ak", "colour": "red"}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let members = v["members"].as_array().unwrap();
+    assert!(members.iter().any(|m| m["data"]["loadout"] == "ak"), "{v}");
+    assert!(members.iter().any(|m| m["data"] == json!({})));
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("/v1/lobbies/{}/me", l2["id"].as_str().unwrap()),
+        Some(&tb),
+        Some(json!({"data": {"x": 1}})),
+    )
+    .await;
+    assert_eq!(st, 404);
+
+    // host changes attributes → search follows; one member now, still has slots
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/lobbies/{id1}"),
+        Some(&ta),
+        Some(json!({"attributes": {"mode": "casual", "skill": 1500}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["attributes"]["mode"], "casual");
+    assert!(v["attributes"].get("map").is_none());
+    let (_, v) = search(json!({"filters": [{"key": "mode", "op": "eq", "value": "ranked"}]})).await;
+    assert_eq!(ids(&v), vec![l3["id"].as_str().unwrap().to_string()]);
+    let (_, v) =
+        search(json!({"filters": [{"key": "member_count", "op": "eq", "value": 2}]})).await;
+    assert_eq!(ids(&v), vec![id1.clone()]);
+}
