@@ -33892,3 +33892,401 @@ async fn turn_based_matches_flow() {
     assert_eq!(q["state"], "cancelled");
     assert_eq!(q["result"]["reason"], "expired");
 }
+
+#[tokio::test]
+async fn device_code_login_handoff() {
+    let Some((app, state)) = app_and_state_with(|_| {}).await else {
+        return;
+    };
+    let k = "defaultkey";
+    let (st, phone) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dc-phone")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{phone}");
+    let phone_tok = phone["access_token"].as_str().unwrap().to_string();
+    let phone_id = phone["account_id"].as_str().unwrap().to_string();
+
+    // validation
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code",
+        None,
+        Some(json!({"client": "x".repeat(65)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code",
+        None,
+        Some(json!({"device_id": ""})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // the TV starts a request
+    let (st, dc) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code",
+        None,
+        Some(json!({"client": "tv-app", "device_id": unique("tv"), "vars": {"k": "v"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{dc}");
+    let device_code = dc["device_code"].as_str().unwrap().to_string();
+    let user_code = dc["user_code"].as_str().unwrap().to_string();
+    assert_eq!(device_code.len(), 64);
+    assert_eq!(user_code.len(), 9);
+    assert_eq!(&user_code[4..5], "-");
+    assert!(
+        user_code
+            .chars()
+            .filter(|c| *c != '-')
+            .all(|c| "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(c)),
+        "{user_code}"
+    );
+    assert_eq!(dc["expires_in"], 600);
+    assert_eq!(dc["interval"], 5);
+
+    // polling: pending, then slow_down when eager
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{p}");
+    assert_eq!(p["error"], "authorization_pending");
+    assert_eq!(p["status"], "pending");
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{p}");
+    assert_eq!(p["error"], "slow_down");
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{p}");
+    assert_eq!(p["error"], "invalid_grant");
+    async fn backdate_poll(state: &AppState, user_code: &str) {
+        sqlx::query("update musubi.device_codes set last_poll_at = now() - interval '10 seconds' where user_code = $1")
+            .bind(user_code)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    backdate_poll(&state, &user_code).await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+
+    // consent screen: lookup tolerates case / missing dash / O-vs-0 confusion
+    let (st, _) = call(
+        &app,
+        "GET",
+        "/v1/auth/device_code/ZZZZ-ZZZZ",
+        Some(&phone_tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "GET",
+        "/v1/auth/device_code/ABC",
+        Some(&phone_tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/auth/device_code/{user_code}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let sloppy = user_code.replace('-', "").to_ascii_lowercase();
+    let (st, i) = call(
+        &app,
+        "GET",
+        &format!("/v1/auth/device_code/{sloppy}"),
+        Some(&phone_tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert_eq!(i["client"], "tv-app");
+    assert_eq!(i["status"], "pending");
+    assert_eq!(i["user_code"], user_code);
+    assert!(i.get("device_code").is_none() && i.get("vars").is_none());
+
+    // approve from the phone (wrong code → 404; second approval → 404)
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/approve",
+        Some(&phone_tok),
+        Some(json!({"user_code": "ZZZZ-ZZZZ"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/approve",
+        Some(&phone_tok),
+        Some(json!({"user_code": sloppy})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["status"], "approved");
+    assert_eq!(a["client"], "tv-app");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/approve",
+        Some(&phone_tok),
+        Some(json!({"user_code": user_code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, i) = call(
+        &app,
+        "GET",
+        &format!("/v1/auth/device_code/{user_code}"),
+        Some(&phone_tok),
+        None,
+    )
+    .await;
+    assert_eq!(i["status"], "approved");
+
+    // the TV's next poll gets a session for the phone's account, exactly once
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    assert_eq!(sess["account_id"], phone_id);
+    assert_eq!(sess["created"], false);
+    let tv_tok = sess["access_token"].as_str().unwrap();
+    assert!(sess["refresh_token"].is_string());
+    let (st, me) = call(&app, "GET", "/v1/account/me", Some(tv_tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    assert_eq!(me["id"], phone_id);
+    assert_eq!(me["vars"]["k"], "v");
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{p}");
+    assert_eq!(p["error"], "already_used");
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/auth/device_code/{user_code}"),
+        Some(&phone_tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "consumed codes are not shown");
+
+    // denied
+    let (_, dc2) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code",
+        None,
+        Some(json!({"client": "console"})),
+    )
+    .await;
+    let (st, d) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/deny",
+        Some(&phone_tok),
+        Some(json!({"user_code": dc2["user_code"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["status"], "denied");
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": dc2["device_code"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{p}");
+    assert_eq!(p["error"], "access_denied");
+
+    // expired (lazily marked on poll)
+    let (_, dc3) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code",
+        None,
+        Some(json!({"client": "kiosk"})),
+    )
+    .await;
+    sqlx::query("update musubi.device_codes set expires_at = now() - interval '1 second' where user_code = $1")
+        .bind(dc3["user_code"].as_str().unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!(
+            "/v1/auth/device_code/{}",
+            dc3["user_code"].as_str().unwrap()
+        ),
+        Some(&phone_tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/approve",
+        Some(&phone_tok),
+        Some(json!({"user_code": dc3["user_code"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": dc3["device_code"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::GONE, "{p}");
+    assert_eq!(p["error"], "expired_token");
+
+    // server view: list by status / account, revoke
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/device_codes?account_id={phone_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let codes = l["codes"].as_array().unwrap();
+    assert_eq!(codes.len(), 2, "{l}");
+    assert!(codes.iter().any(|c| c["status"] == "consumed"
+        && c["client"] == "tv-app"
+        && c["poll_count"].as_i64().unwrap() >= 3));
+    assert!(codes.iter().any(|c| c["status"] == "denied"));
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        "/v1/server/device_codes?status=expired",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        l["codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["client"] == "kiosk"),
+        "{l}"
+    );
+    let (st, _) = call_server(&app, "GET", "/v1/server/device_codes?status=weird", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, dc4) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code",
+        None,
+        Some(json!({"client": "revoked"})),
+    )
+    .await;
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        "/v1/server/device_codes?status=pending",
+        k,
+        None,
+    )
+    .await;
+    let row = l["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["client"] == "revoked")
+        .unwrap();
+    let hint = row["ip_hint"].as_str().unwrap();
+    assert!(hint.ends_with("x.x") || hint.ends_with("::x"), "{row}");
+    let rid = row["id"].as_str().unwrap();
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/device_codes/{rid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/device_codes/{rid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, p) = call(
+        &app,
+        "POST",
+        "/v1/auth/device_code/token",
+        None,
+        Some(json!({"device_code": dc4["device_code"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{p}");
+}

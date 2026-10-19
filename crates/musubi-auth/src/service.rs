@@ -1171,6 +1171,35 @@ impl AuthService {
         .await
     }
 
+    /// Fresh session for an account that proved itself out of band (device-code approval by an
+    /// already signed-in client, …). Deleted / unknown accounts are refused.
+    pub async fn session_for(
+        &self,
+        account_id: AccountId,
+        vars: serde_json::Map<String, serde_json::Value>,
+        device_id: Option<&str>,
+    ) -> Result<Session> {
+        let exists: Option<(Uuid,)> =
+            sqlx::query_as("select id from musubi.accounts where id = $1 and deleted_at is null")
+                .bind(account_id.0)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        if exists.is_none() {
+            return Err(Error::NotFound("account".into()));
+        }
+        self.open_session(
+            account_id,
+            false,
+            vars,
+            Device {
+                device_id,
+                user_agent: None,
+            },
+        )
+        .await
+    }
+
     /// Trusted identity minted by the game server (its own id / token already verified there).
     pub async fn authenticate_custom(&self, subject: &str, opts: AuthOptions) -> Result<Session> {
         self.authenticate_external(provider::CUSTOM, subject, opts)

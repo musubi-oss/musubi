@@ -18,6 +18,7 @@ pub mod configs;
 pub mod content;
 pub mod crashes;
 mod dev;
+mod device_codes;
 pub mod economy;
 pub mod economy_changesets;
 pub mod entitlements;
@@ -230,6 +231,7 @@ pub fn router(state: AppState) -> Router {
         .merge(chat::routes())
         .merge(leaderboards::routes())
         .merge(lobbies::routes())
+        .merge(device_codes::routes())
         .merge(turns::routes())
         .merge(tournaments::routes())
         .merge(rpc::routes())

@@ -140,7 +140,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Advanced auth with extraJson |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — metadata settable after login via `PATCH /v1/account {metadata}`; no registration-time pa… |
 | Anonymous (device) auth |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Attach / Detach / Merge identities (per provider) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
-| Handoff / Set-top handoff codes |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no device-code / handoff login flow in `musubi-auth` (grep `handoff` none) |
+| Handoff / Set-top handoff codes |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `POST /v1/auth/device_code` + `…/token` poll (RFC 8628 shape: pending/slow_down/denied/expired, single-use), approve/deny from a signed-in client, server list/revoke |
 | Identity listing & expiry |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `GET /v1/account` lists identities; no token-expiry tracking / refresh of provider tokens |
 | Peer apps (shared services between apps) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no peer-app model |
 | Player state / profile fields |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `PATCH /v1/account {username, display_name, avatar_url, lang, timezone, location}`; no `i… |
