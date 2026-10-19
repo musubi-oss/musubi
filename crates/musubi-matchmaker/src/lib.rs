@@ -811,6 +811,8 @@ impl Matchmaker {
         }
         let t = pool.tickets.remove(idx);
         unindex(&mut pool, &t);
+        drop(pool);
+        self.trace_dropped(std::slice::from_ref(&t), "cancelled");
         Ok(())
     }
 

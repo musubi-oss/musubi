@@ -19640,7 +19640,14 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
         },
     )
     .await;
-    let _ = recv(&mut c).await;
-    let (_, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_c}/trace")).await;
+    let mut v = Value::Null;
+    for _ in 0..40 {
+        let (_, got) = get(format!("/v1/server/matchmaker/tickets/{ticket_c}/trace")).await;
+        v = got;
+        if v["trace"]["outcome"] == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert_eq!(v["trace"]["outcome"], "cancelled", "{v}");
 }
