@@ -35,6 +35,7 @@ mod rtc;
 mod sso;
 pub mod stats;
 mod storage;
+pub(crate) mod subscriptions;
 pub mod timers;
 pub mod tournaments;
 mod tx;
@@ -224,6 +225,7 @@ pub fn router(state: AppState) -> Router {
         )
         .merge(bans::routes())
         .merge(parties::routes())
+        .merge(subscriptions::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::hooks::before_after,

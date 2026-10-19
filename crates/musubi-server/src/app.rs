@@ -978,6 +978,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "subscription sweep failed"),
                     }
+                    match crate::http::subscriptions::sweep(&st).await {
+                        Ok(k) if k > 0 => {
+                            tracing::info!(subscriptions = k, "plan subscription sweep")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "plan subscription sweep failed"),
+                    }
                 }
                 // expired bans: every minute, same leader as the market sweep
                 if n % 12 == 0 {

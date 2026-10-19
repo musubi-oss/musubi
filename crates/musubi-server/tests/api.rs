@@ -17470,3 +17470,302 @@ async fn game_server_logs_capture_filters_and_sdk_push() {
     let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// Plan subscriptions (competitive P0-12): wallet-paid plan with trial, grace on an empty wallet,
+/// renewal once funded, cancel-at-period-end, server grant and feature entitlement.
+#[tokio::test]
+async fn plan_subscriptions_trial_renewal_grace_and_entitlement() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let cur = unique("vipc")
+        .replace('-', "")
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let (st, c) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": cur, "name": "VIP coin"})),
+    )
+    .await;
+    assert!(st == StatusCode::OK || st == StatusCode::CREATED, "{c}");
+    let plan = unique("vip");
+    let (st, p) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/subscription_plans/{plan}"),
+        k,
+        Some(json!({
+            "name": "VIP", "period_secs": 3600, "grace_secs": 600, "trial_secs": 120,
+            "price": {"currency": cur, "amount": 50}, "features": ["vip", "double_xp"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    assert_eq!(p["features"], json!(["vip", "double_xp"]));
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/subscription_plans/{plan}-bad"),
+        k,
+        Some(json!({"name": "x", "period_secs": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(&app, "PUT", &format!("/v1/server/subscription_plans/{plan}-bad"), k, Some(json!({"name": "x", "period_secs": 3600, "price": {"currency": "nope-cur", "amount": 1}}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("sub-dev")})),
+    )
+    .await;
+    let t = a["access_token"].as_str().unwrap().to_string();
+    let acc = a["account_id"].as_str().unwrap().to_string();
+    let (st, e) = call(
+        &app,
+        "GET",
+        "/v1/subscriptions/entitled?feature=vip",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(e["entitled"], false);
+
+    // first time → trial without payment
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/subscriptions/subscribe",
+        Some(&t),
+        Some(json!({"plan_id": plan})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    assert_eq!(s1["status"], "trial");
+    assert_eq!(s1["active"], true);
+    let sid = s1["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/subscriptions/subscribe",
+        Some(&t),
+        Some(json!({"plan_id": plan})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "one live subscription per plan");
+    let (_, e) = call(
+        &app,
+        "GET",
+        "/v1/subscriptions/entitled?feature=vip",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(e["entitled"], true);
+    let (_, e) = call(
+        &app,
+        "GET",
+        "/v1/subscriptions/entitled?feature=other",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(e["entitled"], false);
+
+    // trial ends, wallet empty → grace; still entitled inside grace
+    sqlx::query("update musubi.subscriptions set current_period_end = $2 where id = $1::uuid")
+        .bind(&sid)
+        .bind(time::OffsetDateTime::now_utc().unix_timestamp() - 5)
+        .execute(&db)
+        .await
+        .unwrap();
+    let (st, sw) = call_server(&app, "POST", "/v1/server/subscriptions/sweep", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{sw}");
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/subscriptions?account_id={acc}"),
+        k,
+        None,
+    )
+    .await;
+    let me = &l["subscriptions"][0];
+    assert_eq!(me["status"], "grace", "{l}");
+    assert_eq!(me["active"], true);
+    let (_, e) = call(
+        &app,
+        "GET",
+        "/v1/subscriptions/entitled?feature=vip",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(e["entitled"], true);
+
+    // fund the wallet, grace expires → renewal charges 50 and extends the period
+    let (st, w) = call_server(&app, "POST", "/v1/server/wallet/adjust", k, Some(json!({"account_id": acc, "currency": cur, "delta": 120, "reason": "test", "reference": unique("sub-fund")}))).await;
+    assert!(st.is_success(), "wallet credit route: {st} {w}");
+    sqlx::query("update musubi.subscriptions set grace_until = $2 where id = $1::uuid")
+        .bind(&sid)
+        .bind(time::OffsetDateTime::now_utc().unix_timestamp() - 1)
+        .execute(&db)
+        .await
+        .unwrap();
+    let (_, sw) = call_server(&app, "POST", "/v1/server/subscriptions/sweep", k, None).await;
+    assert!(sw["changed"].as_i64().unwrap() >= 1, "{sw}");
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/subscriptions?account_id={acc}"),
+        k,
+        None,
+    )
+    .await;
+    let me = &l["subscriptions"][0];
+    assert_eq!(me["status"], "active", "{l}");
+    assert!(
+        me["current_period_end"].as_i64().unwrap()
+            > time::OffsetDateTime::now_utc().unix_timestamp() + 3000,
+        "{me}"
+    );
+    let (_, wl) = call(&app, "GET", "/v1/wallet", Some(&t), None).await;
+    let bal = wl["balances"]
+        .as_array()
+        .or(wl.as_array())
+        .and_then(|a| a.iter().find(|b| b["currency"] == json!(cur)))
+        .map(|b| b["balance"].as_i64().unwrap());
+    assert_eq!(bal, Some(70), "{wl}");
+
+    // cancel at period end → no renewal, period runs out → cancelled, no longer entitled
+    let (st, c1) = call(
+        &app,
+        "POST",
+        &format!("/v1/subscriptions/{sid}/cancel"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c1}");
+    assert_eq!(c1["cancel_at_period_end"], true);
+    sqlx::query("update musubi.subscriptions set current_period_end = $2 where id = $1::uuid")
+        .bind(&sid)
+        .bind(time::OffsetDateTime::now_utc().unix_timestamp() - 1)
+        .execute(&db)
+        .await
+        .unwrap();
+    let _ = call_server(&app, "POST", "/v1/server/subscriptions/sweep", k, None).await;
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/subscriptions?account_id={acc}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(l["subscriptions"][0]["status"], "cancelled", "{l}");
+    let (_, e) = call(
+        &app,
+        "GET",
+        "/v1/subscriptions/entitled?feature=vip",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(e["entitled"], false);
+
+    // server grant of two prepaid periods: no payment, renews once from prepaid then expires (no grace for prepaid? → grace since plan has grace)
+    let (st, g) = call_server(
+        &app,
+        "POST",
+        "/v1/server/subscriptions",
+        k,
+        Some(json!({"account_id": acc, "plan_id": plan, "periods": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["source"], "server");
+    assert_eq!(g["periods_left"], 1);
+    let gid = g["id"].as_str().unwrap().to_string();
+    let (_, e) = call(
+        &app,
+        "GET",
+        "/v1/subscriptions/entitled?feature=double_xp",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(e["entitled"], true);
+    sqlx::query("update musubi.subscriptions set current_period_end = $2 where id = $1::uuid")
+        .bind(&gid)
+        .bind(time::OffsetDateTime::now_utc().unix_timestamp() - 1)
+        .execute(&db)
+        .await
+        .unwrap();
+    let _ = call_server(&app, "POST", "/v1/server/subscriptions/sweep", k, None).await;
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/subscriptions?account_id={acc}"),
+        k,
+        None,
+    )
+    .await;
+    let g2 = l["subscriptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == json!(gid))
+        .unwrap()
+        .clone();
+    assert_eq!(g2["status"], "active", "{g2}");
+    assert_eq!(g2["periods_left"], 0);
+    assert_eq!(g2["periods"], 3);
+    // pause / resume / revoke
+    let (st, pz) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/subscriptions/{gid}/pause"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{pz}");
+    assert_eq!(pz["status"], "paused");
+    assert_eq!(pz["active"], false);
+    let (_, rs) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/subscriptions/{gid}/resume"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(rs["status"], "active");
+    let (_, rv) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/subscriptions/{gid}/revoke"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(rv["status"], "revoked");
+    let (_, mine) = call(&app, "GET", "/v1/subscriptions", Some(&t), None).await;
+    assert_eq!(mine["plans"].as_array().unwrap().len(), 2, "{mine}");
+    assert!(mine["store"].is_array());
+    let (_, pl) = call(&app, "GET", "/v1/subscription_plans", Some(&t), None).await;
+    assert!(pl["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == json!(plan)));
+}
