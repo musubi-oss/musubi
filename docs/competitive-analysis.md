@@ -2561,7 +2561,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **Implementation sketch (musubi terms):** Exists: `GET /v1/regions` + UDP echo + `country_map`. Gap: global beacon network, geo-coordinate radius fallback, packet-loss dimension, client QoS SDK.
 - **What the reports found weaker/missing (merged rows):**
   - ❌ Edgegap: *`require_cached_locations` placement flag* — No notion of image locality in placement
-  - ❌ Edgegap: *Placement by geo coordinates* — Only region names / client pings; no lat/long placement
+  - ✅ Edgegap: *Placement by geo coordinates* — `POST /v1/server/allocate {pool, regions[], pings: {region: ms}, max_ping_ms, client: {lat, lon}, region}`: explicit preference → lowest ping (ceiling drops regions) → nearest region by `[fleet.regions.<name>] lat, lon` → hint; allocation carries `route {region, reason, ping_ms, distance_km, rank, tried}`
   - ❌ GameLift: *Placement object* — synchronous allocate only
   - 🟡 Colyseus: *`selectProcessIdToCreateRoom(roomName, options)` — custom placement, default = process with fewest rooms (alt: fewest C…* — matches homed on leader / node regions; worlds have placement strategies (adjacency/points_of_interest/player_density/custom picker); no per-room-type custom placement callback for matches
   - 🟡 Edgegap: *Placement by player IPs ("Server Score": latency + fairness via telemetry)* — Georouting picks the fleet region with lowest worst client ping from client-measured `ping_<region>` ticket props (README `GET /v1/regions`); no server-side IP→latency telemetry or fairness model

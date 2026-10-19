@@ -905,6 +905,17 @@ pub struct FleetConfig {
     /// Node-level autoscaling for the `ssh` host pool (P1-11): capacity pools that order and
     /// release machines on demand.
     pub capacity: CapacityConfig,
+    /// `[fleet.regions.<name>] lat, lon` — where each region lives, for distance-based routing of
+    /// `POST /v1/server/allocate` when the client sends coordinates instead of pings.
+    pub regions: std::collections::HashMap<String, RegionCoords>,
+}
+
+/// Coordinates of a fleet region (decimal degrees).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RegionCoords {
+    pub lat: f64,
+    pub lon: f64,
 }
 
 /// `[fleet.capacity]` — host pools behind the `ssh` provider.

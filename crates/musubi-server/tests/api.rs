@@ -32268,3 +32268,118 @@ async fn title_news_feed_locales_and_reads() {
     )
     .await;
 }
+
+/// Routed allocation picks the region by the client's pings / explicit preference and explains it.
+#[tokio::test]
+async fn routed_allocation_by_pings_and_preference() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let pool = unique("geo-pool");
+    let mut ids = Vec::new();
+    for (region, ps) in [("eu-west", 44000), ("us-east", 44020)] {
+        let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+            "name": unique(&format!("geo-{region}")), "provider": "local", "region": region, "pool": pool,
+            "buffer": 1, "max_servers": 1, "port_start": ps, "port_end": ps + 10, "spec": {"command": ["sleep", "60"]}
+        }))).await;
+        assert_eq!(st, StatusCode::OK, "{f}");
+        let fid = f["id"].as_str().unwrap().to_string();
+        let (st, r) = call_server(
+            &app,
+            "POST",
+            &format!("/v1/server/fleets/{fid}/reconcile"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        ids.push(fid);
+    }
+    let (eu, us) = (ids[0].clone(), ids[1].clone());
+    // the game servers report ready through the SDK surface
+    for fid in [&eu, &us] {
+        let (_, l) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/fleets/{fid}/servers"),
+            k,
+            None,
+        )
+        .await;
+        let sid = l["servers"][0]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{l}"))
+            .to_string();
+        let req = Request::post("/v1/gameserver/ready")
+            .header("x-musubi-server-key", k)
+            .header("x-musubi-server-id", &sid)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+    for bad in [
+        json!({"pool": pool, "pings": {"eu-west": -1}}),
+        json!({"pool": pool, "max_ping_ms": 0}),
+        json!({"pool": pool, "client": {"lat": 95, "lon": 0}}),
+    ] {
+        let (st, r) = call_server(&app, "POST", "/v1/server/allocate", k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    }
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/allocate",
+        k,
+        Some(json!({
+            "pool": pool, "pings": {"eu-west": 120, "us-east": 300}, "max_ping_ms": 50
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{r}");
+    let (st, a) = call_server(
+        &app,
+        "POST",
+        "/v1/server/allocate",
+        k,
+        Some(json!({
+            "pool": pool, "pings": {"eu-west": 120, "us-east": 30}, "region": "eu-west"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(
+        a["fleet_id"],
+        json!(us),
+        "lowest ping wins over the region hint: {a}"
+    );
+    assert_eq!(a["route"]["reason"], "ping");
+    assert_eq!(a["route"]["ping_ms"], 30.0);
+    assert_eq!(a["route"]["region"], "us-east");
+    assert_eq!(a["route"]["tried"], 1);
+    let (st, a) = call_server(
+        &app,
+        "POST",
+        "/v1/server/allocate",
+        k,
+        Some(json!({
+            "pool": pool, "pings": {"eu-west": 120, "us-east": 30}, "regions": ["eu-west"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["fleet_id"], json!(eu), "{a}");
+    assert_eq!(a["route"]["reason"], "preferred");
+    assert_eq!(a["route"]["ping_ms"], 120.0);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/allocate",
+        k,
+        Some(json!({"pool": pool})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "both taken: {r}");
+    for fid in [&eu, &us] {
+        let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    }
+}

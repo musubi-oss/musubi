@@ -1933,6 +1933,149 @@ pub struct Allocation {
     /// Extra named host ports of the server `{name: port}` (P0-7).
     #[serde(default)]
     pub ports: serde_json::Value,
+    /// Why this fleet/region was chosen by a routed allocation (`region`, `reason:
+    /// preferred|ping|distance|hint|fallback`, `ping_ms`, `distance_km`, `rank`, `tried`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<serde_json::Value>,
+}
+
+/// Where the player is, for distance-based region choice.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct GeoPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// Great-circle distance in kilometres.
+pub fn haversine_km(a: GeoPoint, b: GeoPoint) -> f64 {
+    let (la1, la2) = (a.lat.to_radians(), b.lat.to_radians());
+    let dlat = la2 - la1;
+    let dlon = (b.lon - a.lon).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * 6371.0 * h.sqrt().asin()
+}
+
+/// How a routed allocation should pick among the fleets of a pool: an explicit ordered region
+/// preference, the client's measured pings per region, a ping ceiling, the client's position,
+/// and a plain region hint (e.g. the matchmaker's best region).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RouteHint {
+    pub region: Option<String>,
+    pub regions: Vec<String>,
+    pub pings: HashMap<String, f64>,
+    pub max_ping_ms: Option<f64>,
+    pub client: Option<GeoPoint>,
+}
+
+impl RouteHint {
+    pub fn region(region: Option<&str>) -> Self {
+        Self {
+            region: region.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.pings.len() > 256 || self.regions.len() > 64 {
+            return Err(Error::InvalidArgument(
+                "pings: at most 256 regions, regions: at most 64".into(),
+            ));
+        }
+        if self.pings.values().any(|p| !p.is_finite() || *p < 0.0) {
+            return Err(Error::InvalidArgument(
+                "pings must be non-negative milliseconds".into(),
+            ));
+        }
+        if self.max_ping_ms.is_some_and(|m| !m.is_finite() || m <= 0.0) {
+            return Err(Error::InvalidArgument("max_ping_ms must be > 0".into()));
+        }
+        if let Some(c) = self.client {
+            if !(-90.0..=90.0).contains(&c.lat) || !(-180.0..=180.0).contains(&c.lon) {
+                return Err(Error::InvalidArgument(
+                    "client.lat in -90..90, client.lon in -180..180".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Order the fleets of a pool for a routed allocation and explain each choice. Tiers: explicit
+/// `regions` order → lowest ping → nearest by coordinates → the `region` hint → the rest (stable
+/// by name). Fleets whose region pings above `max_ping_ms` are dropped.
+/// (tier, preference index, ping or distance, fleet name) — sort key of `rank_fleets`.
+type RouteKey = (u8, usize, f64, String);
+
+pub fn rank_fleets(
+    fleets: Vec<Fleet>,
+    hint: &RouteHint,
+    coords: &HashMap<String, GeoPoint>,
+) -> Vec<(Fleet, serde_json::Value)> {
+    let mut scored: Vec<(RouteKey, Fleet, serde_json::Value)> = Vec::new();
+    for f in fleets {
+        let ping = hint.pings.get(&f.region).copied();
+        if let (Some(p), Some(max)) = (ping, hint.max_ping_ms) {
+            if p > max {
+                continue;
+            }
+        }
+        let dist = match (hint.client, coords.get(&f.region)) {
+            (Some(c), Some(r)) => Some(haversine_km(c, *r)),
+            _ => None,
+        };
+        let (key, mut why) = if let Some(i) = hint.regions.iter().position(|r| *r == f.region) {
+            (
+                (0u8, i, 0.0, f.name.clone()),
+                serde_json::json!({ "reason": "preferred" }),
+            )
+        } else if let Some(p) = ping {
+            (
+                (1, 0, p, f.name.clone()),
+                serde_json::json!({ "reason": "ping", "ping_ms": p }),
+            )
+        } else if let Some(d) = dist {
+            (
+                (2, 0, d, f.name.clone()),
+                serde_json::json!({ "reason": "distance", "distance_km": d.round() }),
+            )
+        } else if hint.region.as_deref() == Some(f.region.as_str()) {
+            (
+                (3, 0, 0.0, f.name.clone()),
+                serde_json::json!({ "reason": "hint" }),
+            )
+        } else {
+            (
+                (4, 0, 0.0, f.name.clone()),
+                serde_json::json!({ "reason": "fallback" }),
+            )
+        };
+        why["region"] = serde_json::json!(f.region);
+        why["fleet"] = serde_json::json!(f.name);
+        if let Some(p) = ping {
+            why["ping_ms"] = serde_json::json!(p);
+        }
+        if let Some(d) = dist {
+            why["distance_km"] = serde_json::json!(d.round());
+        }
+        scored.push((key, f, why));
+    }
+    scored.sort_by(|a, b| {
+        a.0 .0
+            .cmp(&b.0 .0)
+            .then(a.0 .1.cmp(&b.0 .1))
+            .then(a.0 .2.total_cmp(&b.0 .2))
+            .then(a.0 .3.cmp(&b.0 .3))
+    });
+    scored
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, f, mut why))| {
+            why["rank"] = serde_json::json!(i);
+            (f, why)
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2093,6 +2236,7 @@ type RuleState = HashMap<(Uuid, String), (Option<i64>, Option<i64>)>;
 
 #[derive(Clone)]
 pub struct FleetService {
+    region_coords: Arc<HashMap<String, GeoPoint>>,
     db: PgPool,
     node_id: Uuid,
     providers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn Provider>>>>,
@@ -2212,6 +2356,7 @@ impl FleetService {
         providers.insert("local".into(), Arc::new(local));
         providers.insert("docker".into(), Arc::new(docker::DockerProvider));
         Self {
+            region_coords: Arc::new(HashMap::new()),
             db,
             node_id,
             providers: Arc::new(std::sync::RwLock::new(providers)),
@@ -2377,6 +2522,12 @@ impl FleetService {
     /// Allocate from a pool (or a fleet name): fleets in the hinted `region` first, then the
     /// rest; with `wait` > 0 and nothing ready anywhere, a server is started in the best fleet
     /// that has room and the call waits for it (scale-to-zero cold start).
+    /// `[fleet.regions]` coordinates for distance-based routing.
+    pub fn with_region_coords(mut self, coords: HashMap<String, GeoPoint>) -> Self {
+        self.region_coords = Arc::new(coords);
+        self
+    }
+
     pub async fn allocate_routed(
         &self,
         target: &str,
@@ -2387,7 +2538,7 @@ impl FleetService {
     ) -> Result<Allocation> {
         self.allocate_routed_with(
             target,
-            region,
+            &RouteHint::region(region),
             AllocateRequest {
                 payload,
                 backfill,
@@ -2402,25 +2553,35 @@ impl FleetService {
     pub async fn allocate_routed_with(
         &self,
         target: &str,
-        region: Option<&str>,
+        hint: &RouteHint,
         req: AllocateRequest,
         wait: std::time::Duration,
     ) -> Result<Allocation> {
-        let mut fleets: Vec<Fleet> = self
+        hint.validate()?;
+        let all: Vec<Fleet> = self
             .list()
             .await?
             .into_iter()
             .filter(|f| f.name == target || (!f.pool.is_empty() && f.pool == target))
             .collect();
-        if fleets.is_empty() {
+        if all.is_empty() {
             return Err(Error::NotFound(format!("no fleet or pool {target}")));
         }
-        if let Some(r) = region {
-            fleets.sort_by_key(|f| if f.region == r { 0 } else { 1 });
+        let ranked = rank_fleets(all, hint, &self.region_coords);
+        if ranked.is_empty() {
+            return Err(Error::ResourceExhausted(format!(
+                "no region of {target} within max_ping_ms"
+            )));
         }
-        for f in &fleets {
+        let fleets: Vec<Fleet> = ranked.iter().map(|(f, _)| f.clone()).collect();
+        for (i, (f, why)) in ranked.iter().enumerate() {
             match self.allocate_with(f.id, req.clone()).await {
-                Ok(a) => return Ok(a),
+                Ok(mut a) => {
+                    let mut why = why.clone();
+                    why["tried"] = serde_json::json!(i + 1);
+                    a.route = Some(why);
+                    return Ok(a);
+                }
                 Err(Error::ResourceExhausted(_)) => continue,
                 Err(e) => return Err(e),
             }
@@ -2881,6 +3042,7 @@ impl FleetService {
                     None => (address, port),
                 };
                 Some(Allocation {
+                    route: None,
                     server_id: id,
                     fleet_id,
                     address,
@@ -2951,6 +3113,7 @@ impl FleetService {
             None => (gs.address, gs.port),
         };
         Ok(Some(Allocation {
+            route: None,
             server_id: gs.id,
             fleet_id,
             address,
@@ -3148,6 +3311,7 @@ impl FleetService {
             None => (gs.address, gs.port),
         };
         Ok(Allocation {
+            route: None,
             server_id: gs.id,
             fleet_id,
             address,

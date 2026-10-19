@@ -259,10 +259,19 @@ struct RoutedAllocateReq {
     priorities: Vec<musubi_fleet::Priority>,
     /// `packed` (default) | `distributed`.
     scheduling: musubi_fleet::Scheduling,
+    /// Ordered region preference — tried first, in this order.
+    regions: Vec<String>,
+    /// Client-measured `{region: ms}`; lowest first, `max_ping_ms` drops regions above it.
+    pings: std::collections::HashMap<String, f64>,
+    max_ping_ms: Option<f64>,
+    /// `{lat, lon}` — nearest region by `[fleet.regions]` coordinates when no pings are known.
+    client: Option<musubi_fleet::GeoPoint>,
 }
 
-/// Allocate across a pool of fleets: the hinted region first, then any; `wait_secs` cold-starts a
-/// server when every fleet is empty.
+/// Allocate across a pool of fleets, ordered by explicit `regions`, then the client's `pings`
+/// (under `max_ping_ms`), then distance from `client` to `[fleet.regions]`, then the `region`
+/// hint; `wait_secs` cold-starts a server when every fleet is empty. The allocation carries
+/// `route` explaining the pick.
 async fn allocate_routed(
     State(s): State<AppState>,
     ServerKey: ServerKey,
@@ -275,7 +284,13 @@ async fn allocate_routed(
         s.fleets
             .allocate_routed_with(
                 &r.pool,
-                r.region.as_deref(),
+                &musubi_fleet::RouteHint {
+                    region: r.region,
+                    regions: r.regions,
+                    pings: r.pings,
+                    max_ping_ms: r.max_ping_ms,
+                    client: r.client,
+                },
                 musubi_fleet::AllocateRequest {
                     payload: r.payload,
                     backfill: r.backfill,
@@ -303,7 +318,7 @@ async fn allocate(
         s.fleets
             .allocate_routed_with(
                 &fleet.name,
-                None,
+                &musubi_fleet::RouteHint::default(),
                 musubi_fleet::AllocateRequest {
                     payload: r.payload,
                     backfill: r.backfill,

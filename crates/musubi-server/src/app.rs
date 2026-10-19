@@ -226,7 +226,22 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         &format!("http://{}", cfg.http.listen),
         &cfg.http.server_key,
     )
-    .with_edge(cfg.edge.public_addr.or(cfg.edge.listen));
+    .with_edge(cfg.edge.public_addr.or(cfg.edge.listen))
+    .with_region_coords(
+        cfg.fleet
+            .regions
+            .iter()
+            .map(|(k, c)| {
+                (
+                    k.clone(),
+                    musubi_fleet::GeoPoint {
+                        lat: c.lat,
+                        lon: c.lon,
+                    },
+                )
+            })
+            .collect(),
+    );
     if let Some(bin) = &cfg.fleet.firecracker.binary {
         match firecracker_settings(bin, &cfg.fleet.firecracker)
             .and_then(musubi_fleet::firecracker::FirecrackerProvider::new)
