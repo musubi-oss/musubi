@@ -30069,3 +30069,417 @@ async fn fleet_host_pool_and_capacity_pools() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn economy_changesets_review_publish_and_strings() {
+    let Some(app) = app_with(|cfg| {
+        cfg.economy.require_review = true;
+        cfg.economy.required_locales = vec!["en".into()];
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let gold = unique("gold");
+    let sword = unique("sword");
+    let offer = unique("offer");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // draft with broken references
+    let (st, cs) = call_server(
+        &app,
+        "POST",
+        "/v1/server/economy/changesets",
+        k,
+        Some(json!({"name": "spring sale", "note": "new sword"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{cs}");
+    assert_eq!(cs["state"], "draft");
+    assert_eq!(cs["author"], "config");
+    let cid = cs["id"].as_str().unwrap().to_string();
+    let base = format!("/v1/server/economy/changesets/{cid}");
+    let (st, v) = call_server(&app, "PUT", &format!("{base}/changes"), k, Some(json!({"changes": [
+        {"table": "items", "row": {"id": sword, "name": "Sword", "category": "weapon", "status": "published", "images": {"icon": "http://insecure/x.png"}}},
+        {"table": "store_items", "row": {"id": offer, "item_id": "nope", "prices": {"silver": 10}}},
+    ]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counts"]["items"]["upserts"], 1);
+    for body in [
+        json!({"changes": [{"table": "accounts", "row": {"id": "x"}}]}),
+        json!({"changes": [{"table": "items", "row": {"name": "no pk"}}]}),
+        json!({"changes": [{"table": "items", "row": {"id": "x", "bogus": 1}}]}),
+        json!({"changes": [{"table": "items", "op": "replace", "row": {"id": "x"}}]}),
+    ] {
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            &format!("{base}/changes"),
+            k,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body} → {v}");
+    }
+    let (st, v) = call_server(&app, "GET", &format!("{base}/validate"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"], false);
+    let problems: Vec<String> = v["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["problem"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        problems.iter().any(|p| p.contains("images")),
+        "{problems:?}"
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("unknown item")),
+        "{problems:?}"
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("unknown currency")),
+        "{problems:?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("missing strings for locale en")),
+        "{problems:?}"
+    );
+    let (st, _) = call_server(&app, "POST", &format!("{base}/submit"), k, None).await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "invalid changesets cannot be submitted"
+    );
+
+    // fix it up: partial rows merge, strings staged alongside
+    let (st, v) = call_server(&app, "PUT", &format!("{base}/changes"), k, Some(json!({"changes": [
+        {"table": "items", "row": {"id": sword, "images": {"icon": "https://cdn.example/sword.png"}}},
+        {"table": "store_items", "row": {"id": offer, "item_id": sword, "prices": {gold.clone(): 50}, "quantity": 1}},
+        {"table": "economy_strings", "row": {"kind": "item", "id": sword, "locale": "en", "name": "Sword", "description": "Sharp"}},
+        {"table": "economy_strings", "row": {"kind": "item", "id": sword, "locale": "de", "name": "Schwert"}},
+        {"table": "economy_strings", "row": {"kind": "store_item", "id": offer, "locale": "en", "name": "Sword offer"}},
+        {"table": "economy_strings", "row": {"kind": "store_item", "id": offer, "locale": "de", "name": "Schwert-Angebot"}},
+    ]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counts"]["economy_strings"]["upserts"], 4);
+    let (_, v) = call_server(&app, "GET", &format!("{base}/validate"), k, None).await;
+    assert_eq!(v["ok"], true, "{v}");
+    let (st, v) = call_server(&app, "GET", &format!("{base}/diff"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["diff"]["items"]["added"], 1, "{v}");
+    assert_eq!(v["diff"]["store_items"]["added"], 1, "{v}");
+    assert_eq!(v["diff"]["economy_strings"]["added"], 4, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/preview?table=store_items&locale=de"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let row = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == offer)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["name"], "Schwert-Angebot", "{row}");
+    // the live store does not know the offer yet
+    let (_, items) = call_server(&app, "GET", &format!("/v1/server/store/{offer}"), k, None).await;
+    assert!(items.get("id").is_none() || items["id"] != offer);
+
+    // four-eyes
+    let (st, v) = call_server(&app, "POST", &format!("{base}/publish"), k, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call_server(&app, "POST", &format!("{base}/submit"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "in_review");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("{base}/approve"),
+        k,
+        Some(json!({"note": "lgtm"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "author cannot approve: {v}");
+    let (st, key) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/keys",
+        k,
+        Some(json!({"name": unique("reviewer-"), "role": "admin"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{key}");
+    let rev = key["secret"].as_str().unwrap().to_string();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("{base}/approve"),
+        &rev,
+        Some(json!({"note": "lgtm"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "approved");
+    assert_eq!(v["reviewer"], key["name"]);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("{base}/changes"),
+        k,
+        Some(json!({"changes": [{"table": "items", "row": {"id": sword, "name": "x"}}]})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "approved changesets are frozen: {v}"
+    );
+    let (st, v) = call_server(&app, "POST", &format!("{base}/publish"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["changeset"]["state"], "published");
+    let version = v["version"].as_i64().expect("content version");
+    let (st, ver) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/content/versions/{version}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ver}");
+    let (st, v) = call_server(&app, "DELETE", &base, k, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "published changesets stay: {v}");
+
+    // live now: localized store for a player
+    let (st, s1) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dev-econ")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    let at = s1["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call(&app, "GET", "/v1/store?locale=de", Some(&at), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let row = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == offer)
+        .cloned()
+        .expect("published offer");
+    assert_eq!(row["name"], "Schwert-Angebot", "{row}");
+    assert_eq!(row["strings"]["locale"], "de");
+    let (_, v) = call(&app, "GET", "/v1/store?locale=fr", Some(&at), None).await;
+    let row = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == offer)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        row["name"], "Sword offer",
+        "falls back to the default locale: {row}"
+    );
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/economy/strings?kind=item&ids={sword}&locale=de"),
+        Some(&at),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["strings"][0]["name"], "Schwert");
+    assert_eq!(
+        v["strings"][0]["description"], "Sharp",
+        "description falls back per field"
+    );
+    let (st, _) = call(
+        &app,
+        "GET",
+        "/v1/economy/strings?kind=item",
+        Some(&at),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // strings API + csv round trip
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/economy/strings/item/{sword}"),
+        k,
+        Some(json!({"locales": {"es": {"name": "Espada"}, "BAD": {"name": "x"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/economy/strings/item/{sword}"),
+        k,
+        Some(json!({"locales": {"es": {"name": "Espada", "extra": {"flavor": "afilada"}}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let csv = format!("kind,id,locale,name,description\nitem,{sword},fr,Épée,\"Tranchante, oui\"\nitem,,fr,broken,\n");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/server/economy/strings/csv")
+        .header("x-musubi-server-key", k)
+        .header(header::CONTENT_TYPE, "text/csv")
+        .body(Body::from(csv))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["imported"], 1, "{v}");
+    assert_eq!(v["errors"].as_array().unwrap().len(), 1);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/server/economy/strings/csv?kind=item&locale=fr")
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains(&format!("item,{sword},fr,Épée,\"Tranchante, oui\"")),
+        "{text}"
+    );
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/economy/strings?kind=item&id={sword}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["strings"].as_array().unwrap().len(), 4, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/economy/strings/item/{sword}/fr"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/economy/strings/item/{sword}/fr"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // scheduled publish, cancel, delete rules; dropping a staged row
+    let (_, cs2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/economy/changesets",
+        k,
+        Some(json!({"name": "rename", "changes": [
+            {"table": "items", "row": {"id": sword, "name": "Sword II"}},
+            {"table": "items", "row": {"id": "scratch-item", "name": "tmp"}},
+        ]})),
+    )
+    .await;
+    let cid2 = cs2["id"].as_str().unwrap().to_string();
+    let base2 = format!("/v1/server/economy/changesets/{cid2}");
+    assert_eq!(cs2["counts"]["items"]["upserts"], 2, "{cs2}");
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("{base2}/changes/items/scratch-item"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counts"]["items"]["upserts"], 1);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("{base2}/changes/items/scratch-item"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call_server(&app, "GET", &format!("{base2}/diff"), k, None).await;
+    assert_eq!(v["diff"]["items"]["changed"], 1, "{v}");
+    call_server(&app, "POST", &format!("{base2}/submit"), k, None).await;
+    let (st, v) = call_server(&app, "POST", &format!("{base2}/approve"), &rev, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let later = time::OffsetDateTime::now_utc().unix_timestamp() + 3600;
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("{base2}/publish"),
+        k,
+        Some(json!({"schedule_at": later})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "scheduled");
+    assert_eq!(v["schedule_at"], later);
+    let (st, v) = call_server(&app, "POST", &format!("{base2}/cancel"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "cancelled");
+    let (st, _) = call_server(&app, "DELETE", &base2, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "GET", &base2, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/economy/changesets?state=published",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        v["changesets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == cid),
+        "{v}"
+    );
+}

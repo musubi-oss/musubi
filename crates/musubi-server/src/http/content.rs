@@ -28,6 +28,7 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
             "quests",
             "store_items",
             "store_coupons",
+            "economy_strings",
             "rating_queues",
             "achievements",
             "crafting_recipes",
@@ -57,7 +58,7 @@ fn all_tables() -> Vec<&'static str> {
         .collect()
 }
 
-fn section_of(table: &str) -> Option<&'static str> {
+pub(crate) fn section_of(table: &str) -> Option<&'static str> {
     SECTIONS
         .iter()
         .find(|(_, t)| t.contains(&table))
@@ -133,7 +134,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/content/versions/{id}/rollback", post(rollback))
 }
 
-type Tx<'a> = Transaction<'a, Postgres>;
+pub(crate) type Tx<'a> = Transaction<'a, Postgres>;
 
 /// Whole-catalog bundles (promotion between environments) are far bigger than ordinary
 /// request bodies.
@@ -143,16 +144,16 @@ type VersionRow = (i64, String, String, String, Value, String, Vec<String>);
 /// created_at, source, note, counts, bundle, environment, sections
 type VersionFull = (String, String, String, Value, Value, String, Vec<String>);
 
-struct Shape {
-    cols: Vec<String>,
-    pk: Vec<String>,
+pub(crate) struct Shape {
+    pub(crate) cols: Vec<String>,
+    pub(crate) pk: Vec<String>,
 }
 
 fn q(c: &str) -> String {
     format!("\"{}\"", c.replace('"', "\"\""))
 }
 
-async fn shape(tx: &mut Tx<'_>, table: &str) -> Result<Shape, Error> {
+pub(crate) async fn shape(tx: &mut Tx<'_>, table: &str) -> Result<Shape, Error> {
     let cols: Vec<(String,)> = sqlx::query_as(
         "select column_name::text from information_schema.columns
          where table_schema = 'musubi' and table_name = $1 order by ordinal_position",
@@ -186,7 +187,7 @@ async fn shape(tx: &mut Tx<'_>, table: &str) -> Result<Shape, Error> {
     })
 }
 
-async fn rows(tx: &mut Tx<'_>, table: &str, sh: &Shape) -> Result<Vec<Value>, Error> {
+pub(crate) async fn rows(tx: &mut Tx<'_>, table: &str, sh: &Shape) -> Result<Vec<Value>, Error> {
     let order = sh.pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
     let sql = format!(
         "select to_jsonb(t) - 'created_at' - 'updated_at' from musubi.{} t order by {order}",
@@ -219,7 +220,7 @@ pub(crate) async fn export_bundle(
     }))
 }
 
-fn key_of(row: &Value, pk: &[String]) -> String {
+pub(crate) fn key_of(row: &Value, pk: &[String]) -> String {
     pk.iter()
         .map(|c| row.get(c).map(|v| v.to_string()).unwrap_or_default())
         .collect::<Vec<_>>()
@@ -227,15 +228,15 @@ fn key_of(row: &Value, pk: &[String]) -> String {
 }
 
 #[derive(Default, Serialize)]
-struct TableDiff {
-    added: Vec<Value>,
-    changed: Vec<Value>,
-    removed: Vec<Value>,
+pub(crate) struct TableDiff {
+    pub(crate) added: Vec<Value>,
+    pub(crate) changed: Vec<Value>,
+    pub(crate) removed: Vec<Value>,
 }
 
 /// A wanted row may omit columns (defaults apply, existing values stay): only the keys it carries
 /// are compared.
-fn diff(current: &[Value], wanted: &[Value], pk: &[String]) -> TableDiff {
+pub(crate) fn diff(current: &[Value], wanted: &[Value], pk: &[String]) -> TableDiff {
     let cur: BTreeMap<String, &Value> = current.iter().map(|r| (key_of(r, pk), r)).collect();
     let mut d = TableDiff::default();
     let mut seen = BTreeMap::new();
@@ -399,7 +400,7 @@ fn counts(bundle: &Value) -> Value {
     Value::Object(m)
 }
 
-async fn run_import(
+pub(crate) async fn run_import(
     s: &AppState,
     bundle: &Value,
     dry_run: bool,

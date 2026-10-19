@@ -840,6 +840,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                 if let Err(e) = crate::http::fleets::dispatch_fleet_events(&st).await {
                     tracing::warn!(error = %e, "fleet event dispatch failed");
                 }
+                if let Err(e) = crate::http::economy_changesets::run_due(&st).await {
+                    tracing::warn!(error = %e, "scheduled economy changesets failed");
+                }
             }
         });
     }

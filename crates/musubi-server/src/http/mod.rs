@@ -19,6 +19,7 @@ pub mod content;
 pub mod crashes;
 mod dev;
 pub mod economy;
+pub mod economy_changesets;
 pub mod entitlements;
 mod environments;
 pub(crate) mod error;
@@ -239,6 +240,7 @@ pub fn router(state: AppState) -> Router {
         .merge(dev::routes())
         .merge(match_results::routes())
         .merge(content::routes())
+        .merge(economy_changesets::routes())
         .merge(fleets::routes())
         .merge(workflows::routes())
         .merge(worlds::routes())

@@ -53,6 +53,8 @@ pub struct Config {
     #[serde(skip)]
     pub resolved_refs: Vec<String>,
     pub market: MarketConfig,
+    /// Catalog workflow (P1-48): review requirement for changesets, locales for catalog strings.
+    pub economy: EconomyConfig,
     pub fleet: FleetConfig,
     pub limits: LimitsConfig,
     pub metrics: MetricsConfig,
@@ -2392,6 +2394,29 @@ impl Default for FraudConfig {
             max_spend: Default::default(),
             max_iap: 0,
             action: "flag".into(),
+        }
+    }
+}
+
+/// `[economy]` — catalog change workflow and localisation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EconomyConfig {
+    /// Changesets must be approved by a different operator key before they can be published.
+    pub require_review: bool,
+    /// Locale clients get when they ask for none / the string is missing in theirs.
+    pub default_locale: String,
+    /// Locales every touched item / store entry must have strings for before a changeset
+    /// validates (empty = no requirement).
+    pub required_locales: Vec<String>,
+}
+
+impl Default for EconomyConfig {
+    fn default() -> Self {
+        Self {
+            require_review: false,
+            default_locale: "en".into(),
+            required_locales: Vec::new(),
         }
     }
 }

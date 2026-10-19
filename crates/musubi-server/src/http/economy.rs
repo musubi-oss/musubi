@@ -260,6 +260,9 @@ struct StoreQuery {
     /// The caller's platform; listings limited to other platforms are left out.
     #[serde(default)]
     platform: Option<String>,
+    /// Catalog strings locale (P1-48); falls back to `[economy] default_locale`.
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 async fn store(
@@ -269,9 +272,17 @@ async fn store(
 ) -> Result<Json<Value>, ApiError> {
     let platform = q.platform.as_deref().map(str::to_ascii_lowercase);
     let aud = s.audiences.of(&s.db, &s.economy, me.account_id).await?;
-    Ok(Json(json!({
-        "items": s.economy.store_for(Some(me.account_id), false, platform.as_deref(), &aud).await?
-    })))
+    let mut items = serde_json::to_value(
+        s.economy
+            .store_for(Some(me.account_id), false, platform.as_deref(), &aud)
+            .await?,
+    )
+    .map_err(musubi_core::Error::internal)?;
+    if let Some(arr) = items.as_array_mut() {
+        crate::http::economy_changesets::localize(&s, "store_item", "id", q.locale.as_deref(), arr)
+            .await?;
+    }
+    Ok(Json(json!({ "items": items })))
 }
 
 #[derive(Deserialize, serde::Serialize)]
