@@ -178,6 +178,7 @@ async fn build_state_cfg_with(
         groups: musubi_social::GroupService::new(db.clone()),
         game_sessions: musubi_server::game_sessions::GameSessionService::new(db.clone()),
         async_mm: musubi_server::async_mm::AsyncMatchService::new(db.clone()),
+        auth_providers: musubi_server::auth_providers::AuthProviderService::new(db.clone()),
         lobbies: musubi_server::lobby::LobbyService::new(
             db.clone(),
             musubi_server::notify::Notifier::new(

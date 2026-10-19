@@ -382,6 +382,22 @@ open/incoming with `revenge_available`, daily budget), `PUT …/opt_out`, `POST 
 wallet (ledger reason `async_shield`; refused with an open attack), shields never reach past `shield_max_secs`;
 server: `POST|DELETE /v1/server/matchmaker/async/{q}/shields[/{account_id}]`, `GET …/attacks?account_id&role&state`.
 
+Login provider catalog (any OAuth2 / OIDC IdP at runtime, no code): `PUT /v1/admin/auth/providers/{name} {kind: oidc|oauth2,
+display_name, issuer (discovery) | authorize_url + token_url (+ userinfo_url, jwks_url), client_id, client_secret
+(omit to keep), auth_style: body|basic, scopes, pkce, claims: {subject, email, email_verified, display_name, avatar_url,
+username} (dotted JSON paths), allow_signup, redirect_urls (callbacks registered at the IdP), return_urls (where the browser
+may be sent back), enabled}`, `GET|DELETE`, `POST …/test` (runs discovery, fetches JWKS, shows an example authorize URL).
+Players: `GET /v1/auth/providers` (login buttons), `POST /v1/auth/providers/{name}/start {return_url?, callback_url?,
+create?, username?, vars?}` → `{url, state}` — the server keeps the PKCE verifier + nonce for 10 min; the IdP returns to
+`GET …/callback?code&state` (JSON session, or `return_url#access_token=…&refresh_token=…&created=` when a return_url was
+given) or the native app posts the code to `POST …/exchange {code, state}`; `GET …/login?return_url=` is the browser
+shortcut (302 to the IdP). `POST …/token {id_token | access_token, create, username, vars}` logs in with a token the
+client already holds (oidc: JWKS-verified id_token; oauth2: access token checked at userinfo). Identities are
+`oidc:<name>` (same namespace as `[social.oidc]`); new accounts get display_name/avatar from the mapped claims, the IdP
+email/name are kept on the identity for support. Linking: `POST /v1/account/link/providers/{name}/start|token`
+(409 when the identity belongs to another account), unlink via `DELETE /v1/account/unlink/oidc/{name}`. Events
+`auth.provider_login`, `account.linked`, `auth.provider_updated`.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

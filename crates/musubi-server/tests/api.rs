@@ -94,6 +94,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         groups: musubi_social::GroupService::new(db.clone()),
         game_sessions: musubi_server::game_sessions::GameSessionService::new(db.clone()),
         async_mm: musubi_server::async_mm::AsyncMatchService::new(db.clone()),
+        auth_providers: musubi_server::auth_providers::AuthProviderService::new(db.clone()),
         lobbies: musubi_server::lobby::LobbyService::new(
             db.clone(),
             musubi_server::notify::Notifier::new(
@@ -23725,6 +23726,562 @@ async fn async_matchmaking_opponents_attacks_shields_revenge() {
         &format!("/v1/matchmaker/async/{q}/opponents"),
         Some(&ta),
         None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// Runtime OAuth2/OIDC provider catalog: admin CRUD, server-side authorization-code flow with
+/// PKCE + nonce against a stub IdP (discovery, token, userinfo), token login, linking, claims
+/// mapping onto the profile, replay/nonce/secret failures.
+#[tokio::test]
+async fn auth_provider_catalog_code_flow_pkce_link_and_claims() {
+    use axum::routing::{get as ax_get, post as ax_post};
+    use base64::Engine;
+    use sha2::Digest;
+    #[derive(Default)]
+    struct Shared {
+        nonce: String,
+        challenge: String,
+        sub: String,
+        verifier_seen: bool,
+    }
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared::default()));
+    let jwks: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/google_test_jwks.json")).unwrap();
+    let key =
+        jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!("fixtures/google_test_rsa.pem"))
+            .unwrap();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("t1".into());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (iss, k2, h2, sh2) = (base.clone(), key.clone(), header.clone(), shared.clone());
+    let iss2 = base.clone();
+    let mock = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            ax_get(move || {
+                let iss = iss2.clone();
+                async move {
+                    axum::Json(json!({"issuer": iss, "authorization_endpoint": format!("{iss}/authorize"),
+                        "token_endpoint": format!("{iss}/token"), "userinfo_endpoint": format!("{iss}/userinfo"),
+                        "jwks_uri": format!("{iss}/jwks")}))
+                }
+            }),
+        )
+        .route(
+            "/jwks",
+            ax_get(move || {
+                let j = jwks.clone();
+                async move { axum::Json(j) }
+            }),
+        )
+        .route(
+            "/token",
+            ax_post(move |axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| {
+                let (iss, key, header, sh) = (iss.clone(), k2.clone(), h2.clone(), sh2.clone());
+                async move {
+                    let bad = |e: &str| (StatusCode::BAD_REQUEST, axum::Json(json!({"error": e})));
+                    if f.get("grant_type").map(String::as_str) != Some("authorization_code")
+                        || f.get("client_id").map(String::as_str) != Some("cid")
+                        || !f.get("redirect_uri").is_some_and(|r| r.ends_with("/cb"))
+                    {
+                        return bad("invalid_request");
+                    }
+                    let code = f.get("code").cloned().unwrap_or_default();
+                    let (nonce, challenge, sub) = {
+                        let g = sh.lock().unwrap();
+                        (g.nonce.clone(), g.challenge.clone(), g.sub.clone())
+                    };
+                    match code.as_str() {
+                        "good-oidc" => {
+                            if f.get("client_secret").map(String::as_str) != Some("sec") {
+                                return bad("invalid_client");
+                            }
+                            let v = f.get("code_verifier").cloned().unwrap_or_default();
+                            let got = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .encode(sha2::Sha256::digest(v.as_bytes()));
+                            if got != challenge {
+                                return bad("invalid_grant");
+                            }
+                            sh.lock().unwrap().verifier_seen = true;
+                            let exp = time::OffsetDateTime::now_utc().unix_timestamp() + 600;
+                            let tok = jsonwebtoken::encode(
+                                &header,
+                                &json!({"iss": iss, "aud": "cid", "sub": sub, "exp": exp, "nonce": nonce,
+                                    "email": "P@Example.test", "email_verified": true, "name": "Pat"}),
+                                &key,
+                            )
+                            .unwrap();
+                            (StatusCode::OK, axum::Json(json!({"access_token": "at-oidc", "id_token": tok, "token_type": "Bearer"})))
+                        }
+                        "good-oauth" => {
+                            if f.contains_key("code_verifier") {
+                                return bad("pkce_unexpected");
+                            }
+                            (StatusCode::OK, axum::Json(json!({"access_token": "at-gh", "token_type": "bearer"})))
+                        }
+                        _ => bad("invalid_grant"),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/userinfo",
+            ax_get(move |headers: axum::http::HeaderMap| async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+                if auth != "Bearer at-gh" {
+                    return (StatusCode::UNAUTHORIZED, axum::Json(json!({"error": "bad token"})));
+                }
+                (StatusCode::OK, axum::Json(json!({"id": 424242, "login": "gamer", "avatar": {"url": "https://cdn.example/g.png"}})))
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let tag = &uuid::Uuid::now_v7().simple().to_string()[20..];
+    let (kc, gh) = (format!("kc{tag}"), format!("gh{tag}"));
+    let params = |url: &str| -> std::collections::HashMap<String, String> {
+        url.split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or("")
+            .split('&')
+            .filter_map(|p| p.split_once('='))
+            .map(|(a, b)| {
+                (
+                    a.to_string(),
+                    b.replace("%3A", ":")
+                        .replace("%2F", "/")
+                        .replace("%20", " "),
+                )
+            })
+            .collect()
+    };
+
+    // admin: validation, create, secrets never leave
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/auth/providers/{kc}"),
+        k,
+        Some(json!({"kind": "oidc", "issuer": base, "client_id": "cid"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "no redirect_urls: {v}");
+    let (st, v) = call_server(&app, "PUT", "/v1/admin/auth/providers/Bad_Name", k,
+        Some(json!({"kind": "oidc", "issuer": base, "client_id": "cid", "redirect_urls": [format!("{base}/cb")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{kc}"), k,
+        Some(json!({"kind": "oidc", "display_name": "Keycloak", "issuer": base, "client_id": "cid", "client_secret": "sec",
+            "scopes": ["email", "openid"], "redirect_urls": [format!("{base}/cb")], "return_urls": ["https://game.example/"]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["has_client_secret"], true);
+    assert!(v.get("client_secret").is_none(), "{v}");
+    let (st, v) = call(&app, "GET", "/v1/auth/providers", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let mine = v["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == kc)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["display_name"], "Keycloak");
+    assert!(
+        mine.get("client_id").is_none() && mine.get("client_secret").is_none(),
+        "{mine}"
+    );
+
+    // start: PKCE S256 + nonce + openid scope once; discovery resolved the authorize endpoint
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/start"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let url = v["url"].as_str().unwrap().to_string();
+    assert!(url.starts_with(&format!("{base}/authorize?")), "{url}");
+    let q = params(&url);
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["scope"], "openid email");
+    assert_eq!(q["client_id"], "cid");
+    assert_eq!(q["state"], v["state"]);
+    let state1 = v["state"].as_str().unwrap().to_string();
+    let sub1 = format!("sub-{tag}");
+    {
+        let mut g = shared.lock().unwrap();
+        g.nonce = q["nonce"].clone();
+        g.challenge = q["code_challenge"].clone();
+        g.sub = sub1.clone();
+    }
+    // callback without return_url → JSON session; email mapped + lowercased
+    let (st, s1) = call(
+        &app,
+        "GET",
+        &format!("/v1/auth/providers/{kc}/callback?code=good-oidc&state={state1}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    assert_eq!(s1["created"], true);
+    assert_eq!(s1["provider"], format!("oidc:{kc}"));
+    assert_eq!(s1["email"], "p@example.test");
+    assert!(shared.lock().unwrap().verifier_seen);
+    let t1 = s1["access_token"].as_str().unwrap().to_string();
+    let (_, acc1) = call(&app, "GET", "/v1/account", Some(&t1), None).await;
+    assert_eq!(acc1["display_name"], "Pat", "{acc1}");
+    // state is single use
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/auth/providers/{kc}/callback?code=good-oidc&state={state1}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // bad code → provider refuses → 401; wrong nonce → 401
+    let (_, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/start"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/exchange"),
+        None,
+        Some(json!({"code": "nope", "state": v["state"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (_, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/start"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    let q = params(v["url"].as_str().unwrap());
+    {
+        let mut g = shared.lock().unwrap();
+        g.nonce = "stale".into();
+        g.challenge = q["code_challenge"].clone();
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/exchange"),
+        None,
+        Some(json!({"code": "good-oidc", "state": v["state"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("nonce"), "{v}");
+    // return_url must be allow-listed; allowed one makes the callback a redirect
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/start"),
+        None,
+        Some(json!({"return_url": "https://evil.example/"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/auth/providers/{kc}/login?return_url=https://game.example/done"),
+        None,
+        None,
+    )
+    .await;
+    assert!(st.is_redirection(), "{st} {v}");
+    // native exchange: same player comes back (not created)
+    let (_, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/start"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    let q = params(v["url"].as_str().unwrap());
+    {
+        let mut g = shared.lock().unwrap();
+        g.nonce = q["nonce"].clone();
+        g.challenge = q["code_challenge"].clone();
+    }
+    let (st, s2) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/exchange"),
+        None,
+        Some(json!({"code": "good-oidc", "state": v["state"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    assert_eq!(s2["created"], false);
+    assert_eq!(s2["account_id"], s1["account_id"]);
+
+    // token login with an id_token the client already holds (no nonce check)
+    let exp = time::OffsetDateTime::now_utc().unix_timestamp() + 600;
+    let sign = |sub: &str| {
+        jsonwebtoken::encode(
+            &header,
+            &json!({"iss": base, "aud": "cid", "sub": sub, "exp": exp}),
+            &key,
+        )
+        .unwrap()
+    };
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/token"),
+        None,
+        Some(json!({"id_token": sign(&sub1)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["account_id"], s1["account_id"]);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/token"),
+        None,
+        Some(json!({"access_token": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "oidc needs id_token: {v}");
+
+    // linking: taken identity → 409, fresh one → ok (via token and via code flow)
+    let (_, d) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("apdev")})),
+    )
+    .await;
+    let t2 = d["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/link/providers/{kc}/token"),
+        Some(&t2),
+        Some(json!({"id_token": sign(&sub1)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/link/providers/{kc}/token"),
+        Some(&t2),
+        Some(json!({"id_token": sign(&format!("sub2-{tag}"))})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, d3) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("apdev")})),
+    )
+    .await;
+    let t3 = d3["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/link/providers/{kc}/start"),
+        Some(&t3),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let q = params(v["url"].as_str().unwrap());
+    {
+        let mut g = shared.lock().unwrap();
+        g.nonce = q["nonce"].clone();
+        g.challenge = q["code_challenge"].clone();
+        g.sub = format!("sub3-{tag}");
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/exchange"),
+        None,
+        Some(json!({"code": "good-oidc", "state": v["state"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["linked"], format!("oidc:{kc}"));
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/token"),
+        None,
+        Some(json!({"id_token": sign(&format!("sub3-{tag}"))})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        v["account_id"], d3["account_id"],
+        "linked identity logs into the linker"
+    );
+
+    // allow_signup=false (secret kept when omitted): unknown identity cannot create an account
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/auth/providers/{kc}"),
+        k,
+        Some(
+            json!({"kind": "oidc", "issuer": base, "client_id": "cid", "allow_signup": false,
+            "redirect_urls": [format!("{base}/cb")]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["has_client_secret"], true);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/token"),
+        None,
+        Some(json!({"id_token": sign(&format!("nobody-{tag}"))})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/token"),
+        None,
+        Some(json!({"id_token": sign(&sub1)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "existing players still log in");
+
+    // plain oauth2 provider (GitHub-like): no PKCE, userinfo, numeric subject + nested claims → profile
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{gh}"), k,
+        Some(json!({"kind": "oauth2", "authorize_url": format!("{base}/authorize"), "token_url": format!("{base}/token"),
+            "userinfo_url": format!("{base}/userinfo"), "client_id": "cid", "pkce": false, "scopes": ["read:user"],
+            "claims": {"subject": "id", "display_name": "login", "avatar_url": "avatar.url"},
+            "redirect_urls": [format!("{base}/cb")]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{gh}/start"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    let q = params(v["url"].as_str().unwrap());
+    assert!(
+        !q.contains_key("code_challenge") && !q.contains_key("nonce"),
+        "{q:?}"
+    );
+    assert_eq!(q["scope"], "read:user");
+    let (st, g1) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{gh}/exchange"),
+        None,
+        Some(json!({"code": "good-oauth", "state": v["state"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g1}");
+    let tg = g1["access_token"].as_str().unwrap().to_string();
+    let (_, acc) = call(&app, "GET", "/v1/account", Some(&tg), None).await;
+    assert_eq!(acc["display_name"], "gamer", "{acc}");
+    assert_eq!(acc["avatar_url"], "https://cdn.example/g.png");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{gh}/token"),
+        None,
+        Some(json!({"access_token": "at-gh"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["account_id"], g1["account_id"]);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{gh}/token"),
+        None,
+        Some(json!({"access_token": "forged"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+
+    // admin test + disable + delete
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/auth/providers/{kc}/test"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["endpoints"]["token_url"], format!("{base}/token"));
+    assert_eq!(v["jwks_keys"], 1);
+    let (_, v) = call_server(&app, "GET", "/v1/admin/auth/providers", k, None).await;
+    assert!(
+        v["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == gh),
+        "{v}"
+    );
+    let (st, _) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{gh}"), k,
+        Some(json!({"kind": "oauth2", "enabled": false, "authorize_url": format!("{base}/authorize"), "token_url": format!("{base}/token"),
+            "userinfo_url": format!("{base}/userinfo"), "client_id": "cid", "redirect_urls": [format!("{base}/cb")]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{gh}/start"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call(&app, "GET", "/v1/auth/providers", None, None).await;
+    assert!(v["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["name"] != gh));
+    let (_, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/auth/providers/{kc}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["deleted"], true);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{kc}/start"),
+        None,
+        Some(json!({})),
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);

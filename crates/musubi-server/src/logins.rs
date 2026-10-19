@@ -87,6 +87,10 @@ impl Social {
         }
     }
 
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// Steam: `ISteamUserAuth/AuthenticateUserTicket` → steamid64; VAC/publisher-banned users are refused.
     pub async fn steam(&self, ticket: &str) -> Result<String> {
         let c = &self.cfg.steam;

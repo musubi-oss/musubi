@@ -6,6 +6,7 @@ mod anticheat;
 pub mod async_mm;
 pub mod audiences;
 mod auth;
+pub mod auth_providers;
 mod bans;
 pub mod challenges;
 mod chat;
@@ -246,6 +247,7 @@ pub fn router(state: AppState) -> Router {
         .merge(items_lifecycle::routes())
         .merge(game_sessions::routes())
         .merge(async_mm::routes())
+        .merge(auth_providers::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())
