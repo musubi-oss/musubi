@@ -213,7 +213,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Login from a game client (how-to) |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
 | Partner (game-server) tokens |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
 | Published scale results |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | 🟡 · P2 — README "Measured (not promised)" publishes benchmarks at smaller scale (single node / sma… |
-| Session baggage |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ❌ · P1 — sessions carry fixed fields (device, platform, metadata on account) — no arbitrary per-se… |
+| Session baggage |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ per-session vars seeded at login, `GET/PATCH /v1/session/vars {set, unset}` (fresh access token carries the bag; refresh re-reads it), server `GET/PATCH /v1/server/accounts/{id}/sessions/{sid}/vars`, ≤64 keys / 8 KiB per patch, `session.vars_updated` |
 | Session types: Player / Operator / Partner |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
 | Twitch identity provider |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
 | Unsafe identity provider (dev) |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  | ✅ |
@@ -418,7 +418,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Environments |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  | 🟡 · P2 — `node.environment` label + separate `[[projects]]` per deployment (12 source files mentio… |
 | JSON settings with schema templates (validation in Editor) |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  | ✅ |
 | Live Content / Live Releases (config+asset files backed by schemas, release snapshots, release pointers, tags… |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  | 🟡 · P2 — Content bundles (`/v1/admin/content`, `/versions`, `/rollback`, import, diff) ≈ releases;… |
-| Override priority |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  | ❌ · P1 — No layered config resolution in core (one document per config name) — sketch: `configs.<n… |
+| Override priority |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  | ✅ `remote_config` variants: RFC 7386 merge patches layered on the base document by selector (environment, platform, client version range, country, rollout %), ordered by priority, `GET /v1/server/configs/{name}/preview` shows the resolved result (row was stale) |
 
 ### 2.4 social (13 normalized features, 45 single-competitor features)
 

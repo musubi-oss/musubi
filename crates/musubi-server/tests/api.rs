@@ -35497,3 +35497,134 @@ async fn timed_status_effects_and_server_time() {
     let (_, v) = call(&app, "GET", "/v1/effects", Some(&tok), None).await;
     assert_eq!(v["effects"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn session_baggage_vars() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("bag"), "vars": {"platform": "pc"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let refresh = u["refresh_token"].as_str().unwrap().to_string();
+
+    let (st, _) = call(&app, "GET", "/v1/session/vars", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, v) = call(&app, "GET", "/v1/session/vars", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["vars"]["platform"], "pc", "login vars seed the bag: {v}");
+    let sid = v["session_id"].as_str().unwrap().to_string();
+
+    let big = "x".repeat(9 * 1024);
+    let many: serde_json::Map<String, serde_json::Value> =
+        (0..65).map(|i| (format!("k{i}"), json!(i))).collect();
+    for body in [
+        json!({}),
+        json!({"set": {"bad key": 1}}),
+        json!({"set": {"mfa": "pending"}}),
+        json!({"unset": ["queue"]}),
+        json!({"set": {"blob": big}}),
+        json!({"set": many}),
+    ] {
+        let (st, v) = call(&app, "PATCH", "/v1/session/vars", Some(&tok), Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        "/v1/session/vars",
+        Some(&tok),
+        Some(json!({"set": {"party": "p-1", "region": "eu"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["vars"]["party"], "p-1");
+    assert_eq!(v["vars"]["platform"], "pc", "merge keeps login vars: {v}");
+    let tok2 = v["access_token"].as_str().unwrap().to_string();
+    assert_ne!(tok2, tok);
+    let (_, m) = call(&app, "GET", "/v1/account/me", Some(&tok2), None).await;
+    assert_eq!(m["vars"]["party"], "p-1", "new token carries the bag: {m}");
+    let (_, m) = call(&app, "GET", "/v1/account/me", Some(&tok), None).await;
+    assert!(
+        m["vars"]["party"].is_null(),
+        "old token keeps old claims: {m}"
+    );
+    let (_, v) = call(&app, "GET", "/v1/session/vars", Some(&tok), None).await;
+    assert_eq!(v["vars"]["party"], "p-1", "but the live bag is shared: {v}");
+
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        "/v1/session/vars",
+        Some(&tok2),
+        Some(json!({"unset": ["party", "nope"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["vars"]["party"].is_null() && v["vars"]["region"] == "eu",
+        "{v}"
+    );
+
+    let path = format!("/v1/server/accounts/{me}/sessions/{sid}/vars");
+    let (st, v) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["vars"]["region"], "eu");
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &path,
+        k,
+        Some(json!({"set": {"shard": "eu-3"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v.get("access_token").is_none(),
+        "server patch mints no token: {v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/accounts/{me}/sessions/{}/vars",
+            uuid::Uuid::nil()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/nope/sessions/{sid}/vars"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let tok3 = r["access_token"].as_str().unwrap().to_string();
+    let (_, m) = call(&app, "GET", "/v1/account/me", Some(&tok3), None).await;
+    assert_eq!(m["vars"]["shard"], "eu-3", "refresh re-reads the bag: {m}");
+    assert_eq!(m["vars"]["region"], "eu");
+    assert!(m["vars"]["party"].is_null());
+}

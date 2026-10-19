@@ -1598,6 +1598,69 @@ fn generate_username() -> String {
     )
 }
 
+/// Session baggage: free-form per-session vars (`party`, `region`, `shard`, UI state) that the
+/// client or the server attach after login. They live in `sessions.vars`, ride in every access
+/// token minted for the session (`PATCH` returns a fresh one; `refresh` re-reads them) and die
+/// with the session.
+impl AuthService {
+    pub async fn session_vars(
+        &self,
+        account: AccountId,
+        session: SessionId,
+    ) -> Result<serde_json::Map<String, serde_json::Value>> {
+        let v: Option<serde_json::Value> = sqlx::query_scalar(
+            "select vars from musubi.sessions where id = $1 and account_id = $2 and revoked_at is null and expires_at > now()",
+        )
+        .bind(session.0)
+        .bind(account.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        v.map(|v| v.as_object().cloned().unwrap_or_default())
+            .ok_or_else(|| Error::NotFound("session".into()))
+    }
+
+    /// Merge `set` into the session vars, drop `unset`, and mint an access token carrying the
+    /// result (same session, same expiry policy). Returns `(vars, access_token)`.
+    pub async fn set_session_vars(
+        &self,
+        account: AccountId,
+        session: SessionId,
+        set: serde_json::Map<String, serde_json::Value>,
+        unset: &[String],
+    ) -> Result<(serde_json::Map<String, serde_json::Value>, String)> {
+        let row: Option<(serde_json::Value, String)> = sqlx::query_as(
+            "update musubi.sessions s set vars = (s.vars || $3::jsonb) - $4::text[]
+             from musubi.accounts a
+             where s.id = $1 and s.account_id = $2 and s.revoked_at is null and s.expires_at > now()
+               and a.id = s.account_id and a.deleted_at is null
+             returning s.vars, a.username",
+        )
+        .bind(session.0)
+        .bind(account.0)
+        .bind(serde_json::Value::Object(set))
+        .bind(unset)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some((vars, username)) = row else {
+            return Err(Error::NotFound("session".into()));
+        };
+        let vars = vars.as_object().cloned().unwrap_or_default();
+        let now = OffsetDateTime::now_utc();
+        let claims = Claims {
+            sub: account,
+            sid: session,
+            iat: now.unix_timestamp(),
+            exp: now.unix_timestamp() + self.signer.access_ttl_secs as i64,
+            vars: vars.clone(),
+            name: Some(username),
+            scopes: Vec::new(),
+        };
+        Ok((vars, self.signer.sign(&claims)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

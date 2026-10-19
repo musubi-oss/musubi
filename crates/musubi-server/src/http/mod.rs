@@ -64,6 +64,7 @@ mod rtc;
 pub mod sanctions;
 pub mod secrets;
 mod server_browser;
+mod session_vars;
 mod sso;
 pub mod stats;
 pub mod steam_ownership;
@@ -215,6 +216,7 @@ pub fn router(state: AppState) -> Router {
         .merge(audiences::router())
         .merge(news::router())
         .merge(effects::router())
+        .merge(session_vars::router())
         .route("/v1/time", axum::routing::get(effects::server_time))
         .merge(placements::router())
         .merge(sso::routes())
