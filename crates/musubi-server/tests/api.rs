@@ -17769,3 +17769,221 @@ async fn plan_subscriptions_trial_renewal_grace_and_entitlement() {
         .iter()
         .any(|p| p["id"] == json!(plan)));
 }
+
+/// Audience depth (competitive P0-19): rule algebra, include/exclude, tracked membership with
+/// enter/exit actions.
+#[tokio::test]
+async fn audiences_algebra_tracking_and_actions() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("aud-a")})),
+    )
+    .await;
+    let (_, b) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("aud-b")})),
+    )
+    .await;
+    let (ta, aid) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        a["account_id"].as_str().unwrap().to_string(),
+    );
+    let bid = b["account_id"].as_str().unwrap().to_string();
+    let name = unique("vip").replace('-', "_");
+    let ev = format!("vip.joined.{}", name);
+
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/audiences/{name}"), k, Some(json!({
+        "rules": {"include": [aid]}, "tracked": true,
+        "actions": {"on_enter": [{"type": "metadata", "set": {"seg_vip": true}}, {"type": "event", "name": ev}],
+                    "on_exit": [{"type": "metadata", "set": {"seg_vip": false}}]}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["count"], 1, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{name}_bad"),
+        k,
+        Some(json!({"rules": {"bucket_min": 5, "bucket_max": 2}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{name}_bad"),
+        k,
+        Some(
+            json!({"rules": {}, "actions": {"on_enter": [{"type": "event", "name": "bad name!"}]}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, rf) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/audiences/{name}/refresh"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rf}");
+    assert_eq!(rf["entered"], 1, "{rf}");
+    assert_eq!(rf["members"], 1);
+    let (_, m) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/{name}/members"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(m["total"], 1, "{m}");
+    assert_eq!(m["members"][0]["account_id"], json!(aid));
+    let (_, me) = call(&app, "GET", "/v1/audiences/me", Some(&ta), None).await;
+    assert!(
+        me["audiences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(name)),
+        "{me}"
+    );
+    let flag: Option<String> =
+        sqlx::query_scalar("select metadata->>'seg_vip' from musubi.accounts where id = $1::uuid")
+            .bind(&aid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(flag.as_deref(), Some("true"));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let n: i64 = sqlx::query_scalar(
+        "select count(*) from musubi.events where kind = $1 and account_id = $2::uuid",
+    )
+    .bind(&ev)
+    .bind(&aid)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+    // second refresh: nothing changes
+    let (_, rf2) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/audiences/{name}/refresh"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(rf2["entered"], 0);
+    assert_eq!(rf2["exited"], 0);
+
+    // exclude wins over include → exit action runs
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{name}"),
+        k,
+        Some(json!({
+            "rules": {"include": [aid], "exclude": [aid]}, "tracked": true,
+            "actions": {"on_exit": [{"type": "metadata", "set": {"seg_vip": false}}]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, rf3) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/audiences/{name}/refresh"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(rf3["exited"], 1, "{rf3}");
+    assert_eq!(rf3["members"], 0);
+    let flag: Option<String> =
+        sqlx::query_scalar("select metadata->>'seg_vip' from musubi.accounts where id = $1::uuid")
+            .bind(&aid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(flag.as_deref(), Some("false"));
+
+    // algebra: any / not
+    let alg = format!("{name}_alg");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{alg}"),
+        k,
+        Some(json!({
+            "rules": {"any": [{"include": [aid]}, {"include": [bid]}], "not": {"include": [bid]}}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["count"], 1, "{r}");
+    let (_, oa) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        oa["audiences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(alg)),
+        "{oa}"
+    );
+    let (_, ob) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{bid}"),
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        !ob["audiences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(alg)),
+        "{ob}"
+    );
+    // bucket split covers everyone exactly once
+    let lo = format!("{name}_lo");
+    let hi = format!("{name}_hi");
+    let (_, l) = call_server(&app, "PUT", &format!("/v1/server/audiences/{lo}"), k, Some(json!({"rules": {"include": [], "bucket_min": 0, "bucket_max": 49, "all": [{"any": [{"include": [aid]}, {"include": [bid]}]}]}}))).await;
+    let (_, h) = call_server(&app, "PUT", &format!("/v1/server/audiences/{hi}"), k, Some(json!({"rules": {"bucket_min": 50, "bucket_max": 99, "all": [{"any": [{"include": [aid]}, {"include": [bid]}]}]}}))).await;
+    assert_eq!(
+        l["count"].as_i64().unwrap() + h["count"].as_i64().unwrap(),
+        2,
+        "{l} {h}"
+    );
+    for n in [name, alg, lo, hi] {
+        let _ = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/audiences/{n}"),
+            k,
+            None,
+        )
+        .await;
+    }
+}

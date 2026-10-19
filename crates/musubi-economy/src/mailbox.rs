@@ -48,6 +48,21 @@ pub struct Audience {
     pub active_within_days: Option<i64>,
     pub inactive_days: Option<i64>,
     pub metadata: Option<Value>,
+    /// Account age in days (relative to `now`).
+    pub min_account_age_days: Option<i64>,
+    pub max_account_age_days: Option<i64>,
+    /// Deterministic percentage bucket 0..=99 of the account id (optionally salted) — cohorts,
+    /// rollouts, A/B splits.
+    pub bucket_min: Option<i32>,
+    pub bucket_max: Option<i32>,
+    pub bucket_salt: Option<String>,
+    /// Always in / never in, regardless of the other rules.
+    pub include: Vec<Uuid>,
+    pub exclude: Vec<Uuid>,
+    /// Algebra: at least one of `any` holds, every one of `all` holds, `not` does not hold.
+    pub any: Vec<Audience>,
+    pub all: Vec<Audience>,
+    pub not: Option<Box<Audience>>,
 }
 
 impl Audience {
@@ -74,11 +89,80 @@ impl Audience {
     }
 
     pub fn validate_rules(&self) -> Result<()> {
-        self.validate()
+        self.validate()?;
+        if self.bucket_min.is_some_and(|b| !(0..=99).contains(&b))
+            || self.bucket_max.is_some_and(|b| !(0..=99).contains(&b))
+            || matches!((self.bucket_min, self.bucket_max), (Some(a), Some(b)) if a > b)
+        {
+            return Err(Error::InvalidArgument(
+                "bucket_min/bucket_max must be 0..=99 with min <= max".into(),
+            ));
+        }
+        if self.min_account_age_days.is_some_and(|d| d < 0)
+            || self.max_account_age_days.is_some_and(|d| d < 0)
+        {
+            return Err(Error::InvalidArgument(
+                "account age days must be ≥ 0".into(),
+            ));
+        }
+        if self.any.len() + self.all.len() > 32 {
+            return Err(Error::InvalidArgument("at most 32 nested rule sets".into()));
+        }
+        for c in self.any.iter().chain(self.all.iter()) {
+            c.validate_rules()?;
+        }
+        if let Some(n) = &self.not {
+            n.validate_rules()?;
+        }
+        Ok(())
     }
 
     fn push_where(&self, qb: &mut QueryBuilder<'_, Postgres>, now: OffsetDateTime) {
         qb.push(" where a.deleted_at is null and a.disabled_at is null");
+        if !self.include.is_empty() {
+            // included accounts bypass the rules (a bare list is just that list); excluded never match
+            qb.push(" and (a.id = any(")
+                .push_bind(self.include.clone())
+                .push(")");
+            if self.has_conditions() {
+                qb.push(" or (true");
+                self.push_conditions(qb, now);
+                qb.push(")");
+            }
+            qb.push(")");
+        } else {
+            self.push_conditions(qb, now);
+        }
+        if !self.exclude.is_empty() {
+            qb.push(" and a.id <> all(")
+                .push_bind(self.exclude.clone())
+                .push(")");
+        }
+    }
+
+    /// Any rule besides the include / exclude lists?
+    fn has_conditions(&self) -> bool {
+        !(self.lang.is_empty()
+            && self.location.is_empty()
+            && self.platform.is_empty()
+            && self.age_bracket.is_empty()
+            && self.created_after.is_none()
+            && self.created_before.is_none()
+            && self.track.is_none()
+            && self.active_within_days.is_none()
+            && self.inactive_days.is_none()
+            && self.metadata.is_none()
+            && self.min_account_age_days.is_none()
+            && self.max_account_age_days.is_none()
+            && self.bucket_min.is_none()
+            && self.bucket_max.is_none()
+            && self.any.is_empty()
+            && self.all.is_empty()
+            && self.not.is_none())
+    }
+
+    /// ` and <cond>` fragments for every rule (no `include`/`exclude`, those wrap the whole set).
+    fn push_conditions(&self, qb: &mut QueryBuilder<'_, Postgres>, now: OffsetDateTime) {
         for (col, vals) in [
             ("a.lang", &self.lang),
             ("a.location", &self.location),
@@ -130,6 +214,67 @@ impl Audience {
         }
         if let Some(m) = &self.metadata {
             qb.push(" and a.metadata @> ").push_bind(m.clone());
+        }
+        if let Some(d) = self.min_account_age_days {
+            qb.push(" and a.created_at <= ")
+                .push_bind(now - Duration::days(d));
+        }
+        if let Some(d) = self.max_account_age_days {
+            qb.push(" and a.created_at > ")
+                .push_bind(now - Duration::days(d));
+        }
+        if self.bucket_min.is_some() || self.bucket_max.is_some() {
+            let salt = self.bucket_salt.clone().unwrap_or_default();
+            qb.push(" and (abs(hashtext(a.id::text || ")
+                .push_bind(salt)
+                .push(")) % 100) between ")
+                .push_bind(self.bucket_min.unwrap_or(0))
+                .push(" and ")
+                .push_bind(self.bucket_max.unwrap_or(99));
+        }
+        if !self.any.is_empty() {
+            qb.push(" and (");
+            for (i, c) in self.any.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" or ");
+                }
+                qb.push("(true");
+                c.push_sub(qb, now);
+                qb.push(")");
+            }
+            qb.push(")");
+        }
+        for c in &self.all {
+            qb.push(" and (true");
+            c.push_sub(qb, now);
+            qb.push(")");
+        }
+        if let Some(n) = &self.not {
+            qb.push(" and not (true");
+            n.push_sub(qb, now);
+            qb.push(")");
+        }
+    }
+
+    /// A nested rule set: its own conditions plus its include / exclude lists.
+    fn push_sub(&self, qb: &mut QueryBuilder<'_, Postgres>, now: OffsetDateTime) {
+        if !self.include.is_empty() {
+            qb.push(" and (a.id = any(")
+                .push_bind(self.include.clone())
+                .push(")");
+            if self.has_conditions() {
+                qb.push(" or (true");
+                self.push_conditions(qb, now);
+                qb.push(")");
+            }
+            qb.push(")");
+        } else {
+            self.push_conditions(qb, now);
+        }
+        if !self.exclude.is_empty() {
+            qb.push(" and a.id <> all(")
+                .push_bind(self.exclude.clone())
+                .push(")");
         }
     }
 }
@@ -372,6 +517,25 @@ impl EconomyService {
             }
         }
         Ok(out)
+    }
+
+    /// Accounts matching an audience right now (membership tracking), oldest first.
+    pub async fn audience_accounts(
+        &self,
+        aud: &Audience,
+        now: OffsetDateTime,
+        limit: i64,
+    ) -> Result<Vec<AccountId>> {
+        aud.validate_rules()?;
+        let mut qb = QueryBuilder::new("select a.id from musubi.accounts a");
+        aud.push_where(&mut qb, now);
+        qb.push(" order by a.created_at limit ").push_bind(limit);
+        let rows: Vec<(Uuid,)> = qb
+            .build_query_as()
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(|(id,)| AccountId(id)).collect())
     }
 
     pub async fn count_audience(&self, aud: &Audience, now: OffsetDateTime) -> Result<i64> {
