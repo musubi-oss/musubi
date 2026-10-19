@@ -87,9 +87,17 @@ pub fn check_server_key(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> musubi_core::Result<crate::keys::Caller> {
+    // OAuth2 client-credentials tokens (P1-23) are server keys and may travel as a bearer token
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| t.starts_with("msk_"));
     let given = headers
         .get("x-musubi-server-key")
         .and_then(|v| v.to_str().ok())
+        .or(bearer)
         .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Key".into()))?;
     let expected = state.cfg.http.server_key.as_bytes();
     let ok = given.len() == expected.len()

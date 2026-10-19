@@ -28079,3 +28079,436 @@ async fn limited_access_mode_allowlist_windows_and_maintenance() {
     let (st, _) = login(c).await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// P1-23: OAuth2 clients — client credentials grant, scoped tokens, rotation, introspection.
+#[tokio::test]
+async fn oauth_clients_client_credentials_rotation_and_introspection() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let oauth = |path: &str, basic: Option<(String, String)>, form: String| {
+        let app = app.clone();
+        let path = path.to_string();
+        async move {
+            let mut req = Request::post(path)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if let Some((id, sec)) = basic {
+                use base64::Engine;
+                let creds = base64::engine::general_purpose::STANDARD.encode(format!("{id}:{sec}"));
+                req = req.header(header::AUTHORIZATION, format!("Basic {creds}"));
+            }
+            let res = app
+                .oneshot(req.body(Body::from(form)).unwrap())
+                .await
+                .unwrap();
+            let st = res.status();
+            let www = res
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (st, v, www)
+        }
+    };
+    for bad in [
+        json!({"name": unique("t"), "redirect_uris": ["http://tool.example/cb"]}),
+        json!({"name": unique("t"), "scopes": ["bad scope"]}),
+        json!({"name": unique("t"), "role": "god"}),
+        json!({"name": unique("t"), "kind": "secretive"}),
+        json!({"name": unique("t"), "allowed_ips": ["10.0.0.0/8"]}),
+    ] {
+        let (st, v) = call_server(&app, "POST", "/v1/admin/oauth/clients", k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let name = unique("ci-tool");
+    let (st, c) = call_server(&app, "POST", "/v1/admin/oauth/clients", k, Some(json!({
+        "name": name, "scopes": ["fleets", "gameservers:read"], "redirect_uris": ["https://tool.example/cb", "mygame://cb"],
+        "token_ttl_secs": 600, "owner": "build-team", "secret_label": "initial"
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let cid = c["client_id"].as_str().unwrap().to_string();
+    assert!(cid.starts_with("mc_"), "{cid}");
+    let s1 = c["client_secret"].as_str().unwrap().to_string();
+    assert!(s1.starts_with("mcs_"));
+    assert_eq!(c["secrets"].as_array().unwrap().len(), 1);
+    assert!(
+        c["secrets"][0].get("hash").is_none(),
+        "hashes never leave the server"
+    );
+    assert_eq!(c["secrets"][0]["label"], "initial");
+    // grant with body credentials and a narrowed scope
+    let (st, t, _) = oauth(
+        "/v1/oauth/token",
+        None,
+        format!(
+            "grant_type=client_credentials&client_id={cid}&client_secret={s1}&scope=fleets%3Aread"
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let tok = t["access_token"].as_str().unwrap().to_string();
+    assert!(tok.starts_with("msk_"));
+    assert_eq!(t["token_type"], "Bearer");
+    assert_eq!(t["scope"], "fleets:read");
+    assert!(t["expires_in"].as_i64().unwrap() <= 600);
+    // errors per RFC 6749
+    let (st, v, www) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), "mcs_wrong".into())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(v["error"], "invalid_client");
+    assert!(www.unwrap().starts_with("Basic"));
+    let (st, v, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s1.clone())),
+        "grant_type=password".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], "unsupported_grant_type");
+    let (st, v, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s1.clone())),
+        "grant_type=client_credentials&scope=wallet".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"], "invalid_scope");
+    let (st, v, _) = oauth(
+        "/v1/oauth/token",
+        Some(("mc_nope".into(), s1.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    // the token is a scoped server key: header or bearer
+    let (st, v) = call_server(&app, "GET", "/v1/server/fleets", &tok, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(&app, "GET", "/v1/server/fleets", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "bearer form: {v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        &tok,
+        Some(
+            json!({"name": unique("f"), "provider": "local", "spec": {"command": ["sleep", "1"]}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "read-only scope: {v}");
+    let (st, v) = call_server(&app, "GET", "/v1/server/gameservers", &tok, None).await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "area outside the token scope: {v}"
+    );
+    let (st, v) = call_server(&app, "GET", "/v1/admin/keys", &tok, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "server role: {v}");
+    // basic auth + json body, full client scope
+    let (st, t2, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s1.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t2}");
+    let tok2 = t2["access_token"].as_str().unwrap().to_string();
+    assert_eq!(t2["scope"], "fleets gameservers:read");
+    let (st, _) = call_server(&app, "GET", "/v1/server/gameservers", &tok2, None).await;
+    assert_eq!(st, StatusCode::OK);
+    // introspection by the client itself and by a server key
+    let (st, v, _) = oauth(
+        "/v1/oauth/introspect",
+        Some((cid.clone(), s1.clone())),
+        format!("token={tok}"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["active"], true);
+    assert_eq!(v["client_id"], cid);
+    assert_eq!(v["scope"], "fleets:read");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/oauth/introspect",
+        k,
+        Some(json!({"token": "msk_nothing"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["active"], false);
+    // rotation with a grace period, then retiring the old secret
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/oauth/clients/{cid}/secrets"),
+        k,
+        Some(json!({"label": "2026", "expire_old_in_secs": 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let s2 = r["client_secret"].as_str().unwrap().to_string();
+    assert_ne!(s2, s1);
+    let (st, _, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s1.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "old secret still valid during grace");
+    let (st, _, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s2.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, g) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/oauth/clients/{cid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["secrets"].as_array().unwrap().len(), 2);
+    assert!(g["secrets"][0]["expires_at"].is_i64(), "{g}");
+    assert!(g["live_tokens"].as_i64().unwrap() >= 4, "{g}");
+    assert!(g["tokens_issued"].as_i64().unwrap() >= 4);
+    assert!(g["failures"].as_i64().unwrap() >= 2);
+    let old_sid = g["secrets"][0]["id"].as_str().unwrap().to_string();
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/oauth/clients/{cid}/secrets/{old_sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s1.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/oauth/clients/{cid}/secrets/{old_sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // revocation (RFC 7009) kills the key immediately
+    let (st, v, _) = oauth(
+        "/v1/oauth/revoke",
+        Some((cid.clone(), s2.clone())),
+        format!("token={tok}"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "GET", "/v1/server/fleets", &tok, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, v, _) = oauth(
+        "/v1/oauth/introspect",
+        Some((cid.clone(), s2.clone())),
+        format!("token={tok}"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["active"], false, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/oauth/clients/{cid}/tokens"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["active"] == true && t["key_id"] != t["revoked_at"]),
+        "{v}"
+    );
+    let (_, va) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/oauth/clients/{cid}/tokens?all=true"),
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        va["total"].as_i64().unwrap() > v["total"].as_i64().unwrap(),
+        "{va}"
+    );
+    // narrowing the client's scopes revokes tokens that exceed them; disabling revokes all
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/admin/oauth/clients/{cid}"),
+        k,
+        Some(json!({"scopes": ["fleets:read"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "GET", "/v1/server/gameservers", &tok2, None).await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "token wider than the client was revoked"
+    );
+    let (st, t3, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s2.clone())),
+        "grant_type=client_credentials&ttl_secs=5".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t3}");
+    assert_eq!(t3["expires_in"], 5);
+    let tok3 = t3["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/admin/oauth/clients/{cid}"),
+        k,
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "GET", "/v1/server/fleets", &tok3, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, v, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s2.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/admin/oauth/clients/{cid}"),
+        k,
+        Some(json!({"enabled": true, "allowed_ips": ["10.9.9.9"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s2.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "ip allow-list: {v}");
+    let (st, _) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/admin/oauth/clients/{cid}"),
+        k,
+        Some(json!({"allowed_ips": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, t4, _) = oauth(
+        "/v1/oauth/token",
+        Some((cid.clone(), s2.clone())),
+        "grant_type=client_credentials".into(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t4}");
+    let tok4 = t4["access_token"].as_str().unwrap().to_string();
+    // public clients cannot use client_credentials
+    let (st, p) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/oauth/clients",
+        k,
+        Some(
+            json!({"name": unique("launcher"), "kind": "public", "redirect_uris": ["mygame://cb"]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    assert!(p.get("client_secret").is_none());
+    let (st, v, _) = oauth(
+        "/v1/oauth/token",
+        None,
+        format!(
+            "grant_type=client_credentials&client_id={}",
+            p["client_id"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "unauthorized_client");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!(
+            "/v1/admin/oauth/clients/{}/secrets",
+            p["client_id"].as_str().unwrap()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // list and delete (delete revokes the remaining tokens)
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/oauth/clients?q={name}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["total"], 1, "{l}");
+    assert!(l["clients"][0]["live_tokens"].as_i64().unwrap() >= 1);
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/oauth/clients/{cid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["tokens_revoked"].as_i64().unwrap() >= 1, "{v}");
+    let (st, _) = call_server(&app, "GET", "/v1/server/fleets", &tok4, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/oauth/clients/{cid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!(
+            "/v1/admin/oauth/clients/{}",
+            p["client_id"].as_str().unwrap()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}

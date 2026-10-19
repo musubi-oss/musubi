@@ -42,6 +42,7 @@ mod matches;
 pub(crate) mod matchmaker;
 mod module_routes;
 mod notifications;
+pub mod oauth;
 mod offers;
 mod parties;
 mod passkeys;
@@ -273,6 +274,7 @@ pub fn router(state: AppState) -> Router {
         .merge(steam_ownership::routes())
         .merge(ads::routes())
         .merge(access::routes())
+        .merge(oauth::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
