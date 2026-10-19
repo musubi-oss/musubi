@@ -82,6 +82,7 @@ pub struct AppStateInner {
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
+    pub legal: Arc<crate::legal::Legal>,
     pub ban_rules: Arc<crate::bans::BanRules>,
     pub age: Arc<crate::compliance::AgeGate>,
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
@@ -682,6 +683,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             Arc::new(e)
         },
         banned: Arc::new(crate::bans::Bans::default()),
+        legal: Arc::new(crate::legal::Legal::default()),
         ban_rules: Arc::new(crate::bans::BanRules::default()),
         age: Arc::new(crate::compliance::AgeGate::new(compliance_cfg)),
         anticheat: Arc::new(crate::anticheat::AntiCheat::new()),
@@ -780,8 +782,14 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         Ok(n) => tracing::info!(accounts = n, "age gate cache loaded"),
         Err(e) => tracing::warn!(error = %e, "age gate cache load failed"),
     }
+    match state.legal.load(&state.db).await {
+        Ok(n) if n > 0 => tracing::info!(documents = n, "legal gate active"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "legal documents load failed"),
+    }
     if let Some(c) = &state.cluster {
         state.banned.start(c);
+        state.legal.start(c, state.db.clone());
         state.ban_rules.start(c);
         state.age.start(c);
         crate::runtime_host::start_liveops_sync(&state, c);

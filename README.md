@@ -474,6 +474,20 @@ tells the client what is closed. `POST /v1/account/parental/request {parent_emai
 only `consented_child_restrictions` (`purchases` by default) remain. The view lives in memory on
 every node like bans, so a change bites on the next request.
 
+Legal agreements are versioned documents: `PUT /v1/admin/legal/{key}/{version} {locale, title, url,
+body, mandatory, countries, grace_secs, published}` (ToS, privacy, EULA, marketing …; one row per
+locale, `countries` empty = everywhere), `…/retire`, `GET /v1/admin/legal` with acceptance counts and
+`GET /v1/admin/legal/{key}/consents` / `GET /v1/admin/accounts/{id}/consents` as the audit trail
+(version, locale, country, IP, user agent, time). Players read `GET /v1/legal?locale&country` (no
+token; locale falls back to `en`) and `GET /v1/legal/{key}` for the text, see what applies to them in
+`GET /v1/account/consents` (`pending` with `enforced` / `seconds_left`, `optional` with their choice,
+`history`), answer with `POST /v1/account/consents {accept: [{key, version}], decline: […], country,
+locale}` and withdraw optional ones with `DELETE /v1/account/consents/{key}`. Once a mandatory
+document's latest version is past `grace_secs`, every bearer call from an account that has not
+accepted it fails with `403 consent_required: tos v3` — except reading/accepting documents, auth,
+export and account deletion — so a new ToS can be rolled out with a week of grace and then enforced.
+Events `legal.published`, `legal.consented`, `legal.withdrawn`.
+
 ### Storage: JSON Patch, aggregates, full-text
 
 `POST /v1/storage/patch` takes either a merge patch (`patch`, RFC 7386) or RFC 6902 operations

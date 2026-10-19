@@ -209,6 +209,7 @@ async fn build_state_cfg_with(
         blobs: None,
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        legal: Arc::new(musubi_server::legal::Legal::default()),
         ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),

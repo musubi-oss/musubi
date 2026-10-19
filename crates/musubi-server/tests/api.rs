@@ -137,6 +137,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
             Arc::new(e)
         },
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        legal: Arc::new(musubi_server::legal::Legal::default()),
         ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
@@ -19623,4 +19624,320 @@ async fn lobby_attributes_search_private_attrs_and_member_data() {
     let (_, v) =
         search(json!({"filters": [{"key": "member_count", "op": "eq", "value": 2}]})).await;
     assert_eq!(ids(&v), vec![id1.clone()]);
+}
+
+#[tokio::test]
+async fn legal_documents_versions_consent_gate_and_withdrawal() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let srv = |method: &str, path: String, body: Value| {
+        let app = app.clone();
+        let method = method.to_string();
+        async move {
+            let req = Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (status, v)
+        }
+    };
+    let u = unique("").to_lowercase().replace(['.', ':'], "-");
+    let tos = format!("tos-{u}");
+    let privacy = format!("privacy-{u}");
+    let mkt = format!("mkt-{u}");
+    // documents only for country ZZ so other tests in the shared DB are untouched
+    let doc = |mandatory: bool, grace: i64, locale: &str| {
+        json!({"title": "Terms", "body": "Be nice.", "url": "https://example.test/tos",
+            "mandatory": mandatory, "countries": ["zz"], "grace_secs": grace, "published": true,
+            "locale": locale})
+    };
+    let (st, v) = srv(
+        "PUT",
+        format!("/v1/admin/legal/{tos}/1"),
+        doc(true, 0, "en"),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["countries"][0], "ZZ");
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/admin/legal/{privacy}/1"),
+        doc(true, 0, "en"),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/admin/legal/{mkt}/1"),
+        json!({"title": "Marketing", "mandatory": false, "countries": ["ZZ"], "published": true}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = srv(
+        "PUT",
+        "/v1/admin/legal/Bad Key/1".to_string(),
+        doc(true, 0, "en"),
+    )
+    .await;
+    assert_eq!(st, 400);
+
+    // public listing by country/locale, with fallback to en
+    let (st, v) = call(&app, "GET", "/v1/legal?country=ZZ", None, None).await;
+    assert_eq!(st, 200, "{v}");
+    let keys = |v: &Value| -> Vec<String> {
+        v["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["key"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(keys(&v).contains(&tos) && keys(&v).contains(&mkt));
+    let (_, v) = call(&app, "GET", "/v1/legal?country=US", None, None).await;
+    assert!(!keys(&v).contains(&tos), "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/legal/{tos}?locale=fr"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(v["locale"], "en");
+    assert_eq!(v["body"], "Be nice.");
+
+    // a new player from ZZ is gated until both mandatory documents are accepted
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("legal-dev-")})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let probe = || {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let (st, v) = call(
+                &app,
+                "GET",
+                "/v1/storage?collection=probe",
+                Some(&tok),
+                None,
+            )
+            .await;
+            (st, v)
+        }
+    };
+    let (st, v) = call(&app, "GET", "/v1/account/consents", Some(&tok), None).await;
+    assert_eq!(st, 200, "{v}");
+    assert!(
+        v["pending"].as_array().unwrap().is_empty(),
+        "no country yet: {v}"
+    );
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/consents",
+        Some(&tok),
+        Some(json!({"country": "zz", "locale": "en"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["pending"].as_array().unwrap().len(), 2, "{v}");
+    let (st, v) = probe().await;
+    assert_eq!(st, 403, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("consent_required"),
+        "{v}"
+    );
+    let (st, v) = call(&app, "GET", "/v1/account/consents", Some(&tok), None).await;
+    assert_eq!(st, 200, "exempt while gated: {v}");
+    assert_eq!(v["pending"].as_array().unwrap().len(), 2);
+    assert_eq!(v["pending"][0]["enforced"], true);
+    assert_eq!(v["optional"][0]["key"], mkt);
+    assert!(v["optional"][0]["accepted"].is_null());
+
+    // accept one → still gated; declining a mandatory one is refused
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/consents",
+        Some(&tok),
+        Some(json!({"accept": [{"key": tos, "version": 1}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(probe().await.0, 403);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/consents",
+        Some(&tok),
+        Some(json!({"decline": [{"key": privacy, "version": 1}]})),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/consents",
+        Some(&tok),
+        Some(json!({"accept": [{"key": privacy, "version": 1}], "decline": [{"key": mkt, "version": 1}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert!(v["pending"].as_array().unwrap().is_empty());
+    let (st, v) = probe().await;
+    assert_ne!(st, 403, "{v}");
+    let (_, v) = call(&app, "GET", "/v1/account/consents", Some(&tok), None).await;
+    assert_eq!(v["optional"][0]["accepted"], false);
+
+    // new ToS version with a grace period: visible as pending, not enforced yet
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/admin/legal/{tos}/2"),
+        doc(true, 3600, "en"),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, v) = call(&app, "GET", "/v1/account/consents", Some(&tok), None).await;
+    assert_eq!(v["pending"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["pending"][0]["version"], 2);
+    assert_eq!(v["pending"][0]["enforced"], false);
+    assert!(v["pending"][0]["seconds_left"].as_i64().unwrap() > 3000);
+    assert_ne!(probe().await.0, 403);
+    // v3 without grace, in two locales → gated again until accepted
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/admin/legal/{tos}/3"),
+        doc(true, 0, "en"),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/admin/legal/{tos}/3"),
+        doc(true, 0, "de"),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(probe().await.0, 403);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/legal/{tos}?locale=de&country=ZZ"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["locale"], "de");
+    assert_eq!(v["version"], 3);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/consents",
+        Some(&tok),
+        Some(json!({"accept": [{"key": tos, "version": 3}], "locale": "de"})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_ne!(probe().await.0, 403);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/consents",
+        Some(&tok),
+        Some(json!({"accept": [{"key": tos, "version": 9}]})),
+    )
+    .await;
+    assert_eq!(st, 404);
+
+    // withdrawal: optional yes, mandatory no
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/consents",
+        Some(&tok),
+        Some(json!({"accept": [{"key": mkt, "version": 1}]})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, v) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/account/consents/{mkt}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["withdrawn"], 1);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/account/consents/{tos}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, 409);
+
+    // admin views
+    let (st, v) = srv("GET", format!("/v1/admin/legal?key={tos}"), json!({})).await;
+    assert_eq!(st, 200, "{v}");
+    let docs = v["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 4, "{v}");
+    assert!(docs
+        .iter()
+        .any(|d| d["version"] == 3 && d["accepted_count"] == 1));
+    let (_, v) = srv(
+        "GET",
+        format!("/v1/admin/legal/{tos}/consents?version=3"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["consents"].as_array().unwrap().len(), 1);
+    assert_eq!(v["consents"][0]["locale"], "de");
+    let (_, v) = srv(
+        "GET",
+        format!("/v1/admin/accounts/{acc}/consents"),
+        json!({}),
+    )
+    .await;
+    assert!(v["consents"].as_array().unwrap().len() >= 4, "{v}");
+    assert!(v["pending"].as_array().unwrap().is_empty());
+
+    // retiring the current version falls back to the previous one (v2, still in grace)
+    let (st, _) = srv("POST", format!("/v1/admin/legal/{tos}/3/retire"), json!({})).await;
+    assert_eq!(st, 200);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/legal/{tos}?country=ZZ"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["version"], 2);
+    assert_ne!(probe().await.0, 403);
+    let (st, _) = srv("POST", format!("/v1/admin/legal/{tos}/3/retire"), json!({})).await;
+    assert_eq!(st, 404);
 }

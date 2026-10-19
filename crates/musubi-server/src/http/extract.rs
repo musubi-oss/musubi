@@ -36,6 +36,9 @@ impl FromRequestParts<AppState> for Bearer {
             .into());
         }
         state.banned.check(auth.account_id)?;
+        if !crate::legal::exempt(parts.uri.path()) {
+            state.legal.check(&state.db, auth.account_id).await?;
+        }
         state.limits.account(auth.account_id)?;
         Ok(Bearer(auth))
     }

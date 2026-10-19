@@ -22,6 +22,7 @@ pub mod idempotency;
 pub mod idl;
 pub mod jwt;
 pub mod keys;
+pub mod legal;
 pub mod limits;
 pub mod liveops;
 pub mod lobby;

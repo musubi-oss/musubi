@@ -59,7 +59,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | WebPush | ✅ `push.rs`: RFC 8030/8291 aes128gcm + VAPID, `platform: webpush` в `/v1/account/push_tokens` | ❌ | ❌ | ❌ | ❌ |
 | UGC (моды, карты, скины) | ✅ `/v1/ugc`: реестр с версиями, blob ≤ 16 MiB или URL, теги/поиск/сортировка, рейтинг, подписки, модерация draft→pending→approved/rejected/hidden | ❌ | ❌ | ✅ | ✅ |
 | GDPR export / delete с retention | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Возраст / родительский контроль / COPPA, приватность профиля | ✅ брекеты по дате рождения/платформе, списки закрытых фич, согласие родителя по токену, урезанный публичный профиль | ✅ | ❌ | 🟡 | ✅ |
+| Возраст / родительский контроль / COPPA, приватность профиля | ✅ брекеты по дате рождения/платформе, списки закрытых фич, согласие родителя по токену, урезанный публичный профиль | ✅ | ❌ | 🟡 | ✅ | Юридические соглашения (P0-49): версии ToS/privacy/EULA/marketing по локалям и странам (`PUT /v1/admin/legal/{key}/{version}`, retire, счётчики принятий, аудит согласий с IP/UA), `GET /v1/legal`, `GET /v1/account/consents` (pending/optional/history), `POST /v1/account/consents {accept, decline, country, locale}`, отзыв необязательных; гейт `403 consent_required` для обязательных документов после grace-периода.
 
 ## 3. Соревновательные и мета-системы
 

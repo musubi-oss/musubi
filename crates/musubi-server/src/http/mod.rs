@@ -21,6 +21,7 @@ pub mod group_challenges;
 mod groups;
 mod integrations;
 mod leaderboards;
+mod legal;
 mod liveops;
 mod lobbies;
 pub mod match_results;
@@ -230,6 +231,7 @@ pub fn router(state: AppState) -> Router {
             )),
         )
         .merge(bans::routes())
+        .merge(legal::routes())
         .merge(parties::routes())
         .merge(subscriptions::routes())
         .merge(liveops::routes())
