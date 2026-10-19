@@ -35968,3 +35968,219 @@ async fn fleet_policy_chain_parallelism_and_overflow_labels() {
         "{ev}"
     );
 }
+
+#[tokio::test]
+async fn countries_overrides_groups_and_config_selectors() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, v) = call(&app, "GET", "/v1/countries", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 249);
+    let de = v["countries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code"] == "DE")
+        .unwrap()
+        .clone();
+    assert_eq!(de["alpha3"], "DEU");
+    assert_eq!(de["numeric"], "276");
+    assert_eq!(de["name"], "Germany");
+    assert_eq!(de["blocked"], false);
+    for code in ["de", "DEU", "276"] {
+        let (st, v) = call(&app, "GET", &format!("/v1/countries/{code}"), None, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["code"], "DE");
+    }
+    let (st, _) = call(&app, "GET", "/v1/countries/ZZ", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(&app, "GET", "/v1/countries?q=germ", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+
+    let grp = format!("eu_{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+    let path = format!("/v1/server/country_groups/{grp}");
+    for bad in [
+        json!({"countries": []}),
+        json!({"countries": ["DE", "XX"]}),
+        json!({"countries": ["DE"], "description": "d".repeat(201)}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/country_groups/Bad%20Name",
+        k,
+        Some(json!({"countries": ["DE"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, g) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"countries": ["de", "FRA", "380", "DE"], "description": "EU core"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["countries"], json!(["DE", "FR", "IT"]));
+    assert_eq!(g["count"], 3);
+    let (st, v) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["description"], "EU core");
+    let (_, v) = call_server(&app, "GET", "/v1/server/country_groups", k, None).await;
+    assert!(
+        v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["name"] == grp),
+        "{v}"
+    );
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/countries?group={grp}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 3);
+    let (st, _) = call(&app, "GET", "/v1/countries?group=nope", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call(&app, "GET", "/v1/countries/DE", None, None).await;
+    assert!(
+        v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(grp)),
+        "{v}"
+    );
+
+    let ov = "/v1/server/countries/DE";
+    for bad in [
+        json!({}),
+        json!({"age_restriction": 30}),
+        json!({"metadata": "x"}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", ov, k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/countries/ZZ",
+        k,
+        Some(json!({"blocked": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        ov,
+        k,
+        Some(json!({"age_restriction": 16, "metadata": {"vat": 19}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["age_restriction"], 16);
+    assert_eq!(v["metadata"]["vat"], 19);
+    assert_eq!(v["blocked"], false);
+    let (st, v) = call_server(&app, "PUT", ov, k, Some(json!({"blocked": true}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["age_restriction"], 16, "absent fields are kept: {v}");
+    assert_eq!(v["blocked"], true);
+    let (_, v) = call(&app, "GET", "/v1/countries?blocked=true", None, None).await;
+    assert!(
+        v["countries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["code"] == "DE"),
+        "{v}"
+    );
+    let (_, v) = call(&app, "GET", "/v1/countries/deu", None, None).await;
+    assert_eq!(v["age_restriction"], 16);
+    assert_eq!(v["blocked"], true);
+
+    // remote-config selector by country group
+    let name = unique("cfg-geo").to_lowercase();
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}"),
+        k,
+        Some(json!({"value": {"price": 10}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/server/configs/{name}/variants/eu"), k,
+        Some(json!({"selector": {"countries": [format!("group:{grp}")]}, "patch": {"price": 12}, "priority": 1}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("geo")})),
+    )
+    .await;
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let price = |c: &Value| c["value"]["price"].as_i64().or(c["price"].as_i64());
+    let (st, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}?country=FR"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(price(&c), Some(12), "FR is in the group: {c}");
+    let (_, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}?country=US"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(price(&c), Some(10), "US is not: {c}");
+    let (_, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(price(&c), Some(10), "no country: {c}");
+
+    let (st, v) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}?country=FR"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(price(&c), Some(10), "group gone: {c}");
+    let (st, v) = call_server(&app, "DELETE", ov, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], true);
+    let (_, v) = call_server(&app, "DELETE", ov, k, None).await;
+    assert_eq!(v["removed"], false);
+    let (_, v) = call(&app, "GET", "/v1/countries/DE", None, None).await;
+    assert_eq!(v["blocked"], false);
+    assert!(v["age_restriction"].is_null());
+}

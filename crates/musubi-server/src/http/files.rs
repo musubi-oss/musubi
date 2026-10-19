@@ -312,7 +312,7 @@ async fn manifest(
 ) -> Result<Response, ApiError> {
     let authed = maybe_account(&s, &headers)?;
     let prefix = q.prefix.clone().unwrap_or_default();
-    let ctx = ctx_from(q, &headers);
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let rows: Vec<FileRow> = sqlx::query_as(&format!(
         "select {FILE_COLS} from musubi.files where path like $1 || '%' and (public or $2) order by path"
     ))

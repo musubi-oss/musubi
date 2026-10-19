@@ -50,6 +50,9 @@ pub struct Ctx {
     /// Server-side preview only: resolve rollouts as this account would see them.
     pub account_id: Option<AccountId>,
     pub prefix: Option<String>,
+    /// Country groups of `country` (filled by `enrich`); selectors may list `group:<name>`.
+    #[serde(skip)]
+    pub country_groups: Vec<String>,
 }
 
 pub fn ctx_from(mut q: Ctx, headers: &HeaderMap) -> Ctx {
@@ -64,6 +67,14 @@ pub fn ctx_from(mut q: Ctx, headers: &HeaderMap) -> Ctx {
     q.version = q.version.or_else(|| h("x-musubi-client-version"));
     q.country = q.country.or_else(|| h("x-musubi-country"));
     q
+}
+
+/// Resolve the country's groups so `countries: ["group:eu"]` selectors can match.
+pub async fn enrich(s: &AppState, mut ctx: Ctx) -> Ctx {
+    if ctx.country.is_some() {
+        ctx.country_groups = crate::http::countries::groups_for(s, ctx.country.as_deref()).await;
+    }
+    ctx
 }
 
 /// Compare dotted versions segment by segment: numeric where both are numbers, lexical
@@ -148,7 +159,12 @@ pub fn selector_matches(sel: &Value, env: &str, ctx: &Ctx, bucket: Option<u32>) 
         let want = str_list(c);
         if !want.is_empty() {
             match &ctx.country {
-                Some(cc) if want.contains(&cc.to_ascii_lowercase()) => {}
+                Some(cc)
+                    if want.contains(&cc.to_ascii_lowercase())
+                        || ctx
+                            .country_groups
+                            .iter()
+                            .any(|g| want.contains(&format!("group:{g}"))) => {}
                 _ => return false,
             }
         }
@@ -539,7 +555,7 @@ async fn manifest(
     headers: HeaderMap,
     Query(q): Query<Ctx>,
 ) -> Result<Response, ApiError> {
-    let ctx = ctx_from(q, &headers);
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let all = resolve(&s, None, &ctx, Some(me.account_id)).await?;
     let items: Vec<(String, String)> = all
         .iter()
@@ -569,7 +585,7 @@ async fn preview(
     headers: HeaderMap,
     Query(q): Query<Ctx>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = ctx_from(q, &headers);
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let mut v = resolve(&s, Some(&name), &ctx, None).await?;
     match v.pop() {
         Some(c) => Ok(Json(c)),
@@ -1072,7 +1088,7 @@ async fn client_version(
     headers: HeaderMap,
     Query(q): Query<Ctx>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = ctx_from(q, &headers);
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let (Some(platform), Some(version)) = (ctx.platform, ctx.version) else {
         return Err(Error::InvalidArgument("platform and version required".into()).into());
     };

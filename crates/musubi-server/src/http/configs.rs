@@ -49,7 +49,7 @@ async fn list(
     headers: HeaderMap,
     Query(q): Query<Ctx>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = ctx_from(q, &headers);
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let configs = resolve(&s, None, &ctx, Some(me.account_id)).await?;
     Ok(Json(json!({ "configs": configs })))
 }
@@ -60,7 +60,7 @@ async fn list_server(
     headers: HeaderMap,
     Query(q): Query<Ctx>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = ctx_from(q, &headers);
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let configs = resolve(&s, None, &ctx, None).await?;
     Ok(Json(json!({ "configs": configs })))
 }
@@ -72,7 +72,7 @@ async fn get_one(
     headers: HeaderMap,
     Query(q): Query<Ctx>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = ctx_from(q, &headers);
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let mut configs = resolve(&s, Some(&name), &ctx, Some(me.account_id)).await?;
     match configs.pop() {
         Some(c) => Ok(Json(c)),

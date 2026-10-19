@@ -16,6 +16,8 @@ mod cluster;
 mod codes;
 pub mod configs;
 pub mod content;
+pub mod countries;
+pub mod countries_iso;
 pub mod crashes;
 mod dev;
 mod device_codes;
@@ -219,6 +221,7 @@ pub fn router(state: AppState) -> Router {
         .merge(effects::router())
         .merge(session_vars::router())
         .merge(qa_clock::router())
+        .merge(countries::router())
         .merge(placements::router())
         .merge(sso::routes())
         .merge(stats::routes())
