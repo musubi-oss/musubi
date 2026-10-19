@@ -230,6 +230,162 @@ pub struct ScalePolicy {
     pub idle_ttl_secs: Option<u64>,
     /// … or has been allocated / in game this long (runaway or zombie matches).
     pub allocated_max_secs: Option<u64>,
+    /// How a promoted build reaches servers that are already running.
+    pub rollout: RolloutPolicy,
+}
+
+/// Build rollout strategy (plan P1-29): `manual` only affects new servers; `rolling` replaces
+/// `ready` servers of other builds while keeping at most `max_surge` extra servers and taking
+/// away at most `max_unavailable` ready servers beyond those already replaced; `recreate`
+/// replaces every ready server at once. `allocated` servers are never touched unless
+/// `drain_allocated_after_secs` says a long-running allocation may be ended.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RolloutPolicy {
+    pub strategy: String,
+    pub max_surge: i32,
+    pub max_unavailable: i32,
+    /// Re-promote the previous build after `failure_threshold` servers of the new one failed to
+    /// start or died within two minutes of becoming ready.
+    pub auto_rollback: bool,
+    pub failure_threshold: i32,
+    pub drain_allocated_after_secs: u64,
+}
+
+impl Default for RolloutPolicy {
+    fn default() -> Self {
+        Self {
+            strategy: "rolling".into(),
+            max_surge: 1,
+            max_unavailable: 1,
+            auto_rollback: true,
+            failure_threshold: 3,
+            drain_allocated_after_secs: 0,
+        }
+    }
+}
+
+impl RolloutPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if !["manual", "rolling", "recreate"].contains(&self.strategy.as_str()) {
+            return Err(Error::InvalidArgument(
+                "rollout.strategy must be manual|rolling|recreate".into(),
+            ));
+        }
+        if self.max_surge < 0 || self.max_unavailable < 0 || self.failure_threshold < 1 {
+            return Err(Error::InvalidArgument(
+                "rollout: max_surge/max_unavailable >= 0, failure_threshold >= 1".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One build rollout of a fleet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rollout {
+    pub id: Uuid,
+    pub fleet_id: Uuid,
+    pub from_version: Option<String>,
+    pub to_version: String,
+    pub strategy: String,
+    pub max_surge: i32,
+    pub max_unavailable: i32,
+    pub state: String,
+    pub replaced: i32,
+    pub failed_starts: i32,
+    pub note: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub finished_at: Option<OffsetDateTime>,
+}
+
+type RolloutRow = (
+    Uuid,
+    Uuid,
+    Option<String>,
+    String,
+    String,
+    i32,
+    i32,
+    String,
+    i32,
+    i32,
+    String,
+    OffsetDateTime,
+    OffsetDateTime,
+    Option<OffsetDateTime>,
+);
+
+const ROLLOUT_COLS: &str = "id, fleet_id, from_version, to_version, strategy, max_surge, max_unavailable, state, replaced, failed_starts, note, started_at, updated_at, finished_at";
+
+fn row_to_rollout(r: RolloutRow) -> Rollout {
+    Rollout {
+        id: r.0,
+        fleet_id: r.1,
+        from_version: r.2,
+        to_version: r.3,
+        strategy: r.4,
+        max_surge: r.5,
+        max_unavailable: r.6,
+        state: r.7,
+        replaced: r.8,
+        failed_starts: r.9,
+        note: r.10,
+        started_at: r.11,
+        updated_at: r.12,
+        finished_at: r.13,
+    }
+}
+
+/// Lifecycle event of a fleet (`server.starting|ready|allocated|shutdown|terminated|error`,
+/// `build.added|promoted`, `rollout.started|paused|resumed|finished|rolled_back|failure`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetEvent {
+    pub id: i64,
+    pub fleet_id: Uuid,
+    pub server_id: Option<Uuid>,
+    pub code: String,
+    pub message: String,
+    pub data: serde_json::Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+type EventRow = (
+    i64,
+    Uuid,
+    Option<Uuid>,
+    String,
+    String,
+    serde_json::Value,
+    OffsetDateTime,
+);
+
+fn row_to_event(r: EventRow) -> FleetEvent {
+    FleetEvent {
+        id: r.0,
+        fleet_id: r.1,
+        server_id: r.2,
+        code: r.3,
+        message: r.4,
+        data: r.5,
+        at: r.6,
+    }
+}
+
+/// `GET …/events` filters.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct EventQuery {
+    pub code: Option<String>,
+    pub server_id: Option<Uuid>,
+    /// Only events with id > `after`.
+    pub after: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 impl Default for ScalePolicy {
@@ -246,6 +402,7 @@ impl Default for ScalePolicy {
             max_duration_secs: None,
             idle_ttl_secs: None,
             allocated_max_secs: None,
+            rollout: RolloutPolicy::default(),
         }
     }
 }
@@ -360,6 +517,7 @@ impl ScalePolicy {
     }
 
     fn validate(&self, max_servers: i32) -> Result<()> {
+        self.rollout.validate()?;
         if let Some(u) = self.target_utilization {
             if !(u > 0.0 && u < 1.0) {
                 return Err(Error::InvalidArgument(
@@ -1283,8 +1441,21 @@ impl FleetService {
     // ----- SDK surface (called by the game server itself) -----
 
     pub async fn sdk_ready(&self, id: Uuid) -> Result<GameServer> {
-        self.set_state(id, &["scheduled", "starting", "ready"], "ready")
-            .await
+        let was = self.server(id).await?.state;
+        let s = self
+            .set_state(id, &["scheduled", "starting", "ready"], "ready")
+            .await?;
+        if was != "ready" {
+            self.record_event(
+                s.fleet_id,
+                Some(id),
+                "server.ready",
+                "server ready",
+                serde_json::json!({ "build_version": s.build_version, "startup_secs": (OffsetDateTime::now_utc() - s.created_at).whole_seconds(), "address": s.address, "port": s.port }),
+            )
+            .await;
+        }
+        Ok(s)
     }
 
     pub async fn sdk_health(&self, id: Uuid) -> Result<()> {
@@ -1298,8 +1469,21 @@ impl FleetService {
 
     /// Self-allocation (the server decided it is in use, e.g. a player connected directly).
     pub async fn sdk_allocate(&self, id: Uuid) -> Result<GameServer> {
-        self.set_state(id, &["ready", "allocated"], "allocated")
-            .await
+        let was = self.server(id).await?.state;
+        let s = self
+            .set_state(id, &["ready", "allocated"], "allocated")
+            .await?;
+        if was != "allocated" {
+            self.record_event(
+                s.fleet_id,
+                Some(id),
+                "server.allocated",
+                "server allocated itself",
+                serde_json::json!({ "self": true, "build_version": s.build_version }),
+            )
+            .await;
+        }
+        Ok(s)
     }
 
     pub async fn sdk_labels(&self, id: Uuid, labels: serde_json::Value) -> Result<GameServer> {
@@ -1379,7 +1563,15 @@ impl FleetService {
     pub async fn sdk_shutdown(&self, id: Uuid) -> Result<()> {
         let s = self.server(id).await?;
         let f = self.get(s.fleet_id).await?;
-        self.terminate(&f, id).await;
+        self.record_event(
+            f.id,
+            Some(id),
+            "server.shutdown",
+            "server asked to shut down",
+            serde_json::json!({ "state": s.state, "players": s.players }),
+        )
+        .await;
+        self.terminate_reason(&f, id, "shutdown").await;
         Ok(())
     }
 
@@ -1440,6 +1632,14 @@ impl FleetService {
         .await
         .map_err(Error::internal)?
         .ok_or_else(|| Error::ResourceExhausted("no ready server in fleet".into()))?;
+        self.record_event(
+            fleet_id,
+            Some(r.0),
+            "server.allocated",
+            "server allocated",
+            serde_json::json!({ "self": false }),
+        )
+        .await;
         if let Err(e) = self
             .record_demand(fleet_id, OffsetDateTime::now_utc())
             .await
@@ -1521,15 +1721,419 @@ impl FleetService {
     }
 
     pub async fn terminate(&self, fleet: &Fleet, id: Uuid) {
+        self.terminate_reason(fleet, id, "manual").await;
+    }
+
+    /// Stop a server and record why (`labels.exit_reason`, `server.terminated` event). Early
+    /// failures of a build under rollout count towards its auto-rollback.
+    pub async fn terminate_reason(&self, fleet: &Fleet, id: Uuid, reason: &str) {
+        let prev = self.server(id).await.ok();
         if let Some(p) = self.provider_of(&fleet.provider) {
             p.stop(id).await;
         }
         let _ = sqlx::query(
-            "update musubi.game_servers set state = 'terminated', terminated_at = coalesce(terminated_at, now()), updated_at = now() where id = $1",
+            "update musubi.game_servers set state = 'terminated', terminated_at = coalesce(terminated_at, now()), updated_at = now(),
+                 labels = labels || jsonb_build_object('exit_reason', $2::text) where id = $1 and state <> 'terminated'",
         )
         .bind(id)
+        .bind(reason)
         .execute(&self.db)
         .await;
+        let Some(prev) = prev else { return };
+        if prev.state == "terminated" {
+            return;
+        }
+        let now = OffsetDateTime::now_utc();
+        self.record_event(
+            fleet.id,
+            Some(id),
+            "server.terminated",
+            format!("{} server terminated: {reason}", prev.state),
+            serde_json::json!({
+                "reason": reason, "prev_state": prev.state, "build_version": prev.build_version,
+                "uptime_secs": (now - prev.created_at).whole_seconds(), "players": prev.players,
+            }),
+        )
+        .await;
+        let early = prev.state == "starting"
+            || prev.state == "scheduled"
+            || (prev.state == "ready"
+                && prev
+                    .ready_at
+                    .is_some_and(|r| now - r < Duration::from_secs(120)));
+        if early && ["dead_process", "unhealthy", "stuck_starting"].contains(&reason) {
+            self.note_rollout_failure(fleet, prev.build_version.as_deref(), reason)
+                .await;
+        }
+    }
+
+    /// Append to the fleet's lifecycle log (best effort; the server crate forwards undispatched
+    /// rows to the event bus / webhooks).
+    pub async fn record_event(
+        &self,
+        fleet_id: Uuid,
+        server_id: Option<Uuid>,
+        code: &str,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) {
+        let message: String = message.into();
+        if let Err(e) = sqlx::query(
+            "insert into musubi.fleet_events (fleet_id, server_id, code, message, data) values ($1, $2, $3, $4, $5)",
+        )
+        .bind(fleet_id)
+        .bind(server_id)
+        .bind(code)
+        .bind(&message)
+        .bind(data)
+        .execute(&self.db)
+        .await
+        {
+            tracing::warn!(error = %e, code, "fleet event not recorded");
+        }
+    }
+
+    pub async fn events(&self, fleet_id: Uuid, q: &EventQuery) -> Result<Vec<FleetEvent>> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "select id, fleet_id, server_id, code, message, data, at from musubi.fleet_events
+             where fleet_id = $1 and ($2::text is null or code = $2 or code like $2 || '.%')
+               and ($3::uuid is null or server_id = $3) and ($4::bigint is null or id > $4)
+             order by id desc limit $5",
+        )
+        .bind(fleet_id)
+        .bind(&q.code)
+        .bind(q.server_id)
+        .bind(q.after)
+        .bind(q.limit.unwrap_or(100).clamp(1, 1000))
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(row_to_event).collect())
+    }
+
+    /// Oldest events not yet forwarded to the event bus.
+    pub async fn undispatched_events(&self, limit: i64) -> Result<Vec<FleetEvent>> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "select id, fleet_id, server_id, code, message, data, at from musubi.fleet_events
+             where not dispatched order by id limit $1",
+        )
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(row_to_event).collect())
+    }
+
+    pub async fn mark_dispatched(&self, ids: &[i64]) -> Result<()> {
+        sqlx::query("update musubi.fleet_events set dispatched = true where id = any($1)")
+            .bind(ids)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    // ----- build rollouts -----
+
+    /// Latest rollout of the fleet (any state).
+    pub async fn rollout(&self, fleet_id: Uuid) -> Result<Option<Rollout>> {
+        let r: Option<RolloutRow> = sqlx::query_as(&format!(
+            "select {ROLLOUT_COLS} from musubi.fleet_rollouts where fleet_id = $1 order by started_at desc, id desc limit 1"
+        ))
+        .bind(fleet_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(r.map(row_to_rollout))
+    }
+
+    pub async fn rollouts(&self, fleet_id: Uuid, limit: i64) -> Result<Vec<Rollout>> {
+        let rows: Vec<RolloutRow> = sqlx::query_as(&format!(
+            "select {ROLLOUT_COLS} from musubi.fleet_rollouts where fleet_id = $1 order by started_at desc, id desc limit $2"
+        ))
+        .bind(fleet_id)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(row_to_rollout).collect())
+    }
+
+    /// Rollout card: the latest rollout plus live servers per build/state and how far it got.
+    pub async fn rollout_status(&self, fleet_id: Uuid) -> Result<serde_json::Value> {
+        let f = self.get(fleet_id).await?;
+        let r = self.rollout(fleet_id).await?;
+        let rows: Vec<(Option<String>, String, i64)> = sqlx::query_as(
+            "select build_version, state, count(*) from musubi.game_servers
+             where fleet_id = $1 and state <> 'terminated' group by 1, 2 order by 1, 2",
+        )
+        .bind(fleet_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let builds: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(b, st, n)| serde_json::json!({ "build_version": b, "state": st, "servers": n }))
+            .collect();
+        let live: i64 = rows.iter().map(|r| r.2).sum();
+        let (updated, outdated) = match &r {
+            Some(r) => rows.iter().fold((0i64, 0i64), |(u, o), (b, _, n)| {
+                if b.as_deref() == Some(r.to_version.as_str()) {
+                    (u + n, o)
+                } else {
+                    (u, o + n)
+                }
+            }),
+            None => (live, 0),
+        };
+        Ok(serde_json::json!({
+            "fleet_id": fleet_id,
+            "policy": f.policy.rollout,
+            "rollout": r,
+            "servers": builds,
+            "live": live,
+            "updated": updated,
+            "outdated": outdated,
+            "progress_pct": if live > 0 { updated * 100 / live } else { 100 },
+        }))
+    }
+
+    async fn start_rollout(
+        &self,
+        f: &Fleet,
+        from: Option<&str>,
+        to: &str,
+        note: &str,
+    ) -> Result<Option<Rollout>> {
+        let pol = &f.policy.rollout;
+        if pol.strategy == "manual" || from == Some(to) {
+            return Ok(None);
+        }
+        sqlx::query(
+            "update musubi.fleet_rollouts set state = 'superseded', finished_at = now(), updated_at = now()
+             where fleet_id = $1 and state in ('running', 'paused')",
+        )
+        .bind(f.id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let row: RolloutRow = sqlx::query_as(&format!(
+            "insert into musubi.fleet_rollouts (id, fleet_id, from_version, to_version, strategy, max_surge, max_unavailable, note)
+             values ($1, $2, $3, $4, $5, $6, $7, $8) returning {ROLLOUT_COLS}"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(f.id)
+        .bind(from)
+        .bind(to)
+        .bind(&pol.strategy)
+        .bind(pol.max_surge)
+        .bind(pol.max_unavailable)
+        .bind(note)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let r = row_to_rollout(row);
+        self.record_event(
+            f.id,
+            None,
+            "rollout.started",
+            format!("rollout {} -> {to} ({})", from.unwrap_or("fleet spec"), pol.strategy),
+            serde_json::json!({ "rollout_id": r.id, "from_version": from, "to_version": to, "strategy": pol.strategy, "note": note }),
+        )
+        .await;
+        Ok(Some(r))
+    }
+
+    async fn set_rollout_state(
+        &self,
+        fleet_id: Uuid,
+        from: &[&str],
+        to: &str,
+        code: &str,
+        note: Option<&str>,
+    ) -> Result<Rollout> {
+        let Some(r) = self.rollout(fleet_id).await? else {
+            return Err(Error::NotFound("no rollout".into()));
+        };
+        if !from.contains(&r.state.as_str()) {
+            return Err(Error::Conflict(format!("rollout is {}", r.state)));
+        }
+        let finished = matches!(to, "done" | "rolled_back" | "superseded");
+        let row: RolloutRow = sqlx::query_as(&format!(
+            "update musubi.fleet_rollouts set state = $2, updated_at = now(), note = coalesce($3, note),
+                 finished_at = case when $4 then now() else finished_at end
+             where id = $1 returning {ROLLOUT_COLS}"
+        ))
+        .bind(r.id)
+        .bind(to)
+        .bind(note)
+        .bind(finished)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let r = row_to_rollout(row);
+        self.record_event(
+            fleet_id,
+            None,
+            code,
+            format!("rollout {} -> {} {to}", r.from_version.clone().unwrap_or_default(), r.to_version),
+            serde_json::json!({ "rollout_id": r.id, "to_version": r.to_version, "from_version": r.from_version, "replaced": r.replaced, "failed_starts": r.failed_starts, "note": r.note }),
+        )
+        .await;
+        Ok(r)
+    }
+
+    pub async fn pause_rollout(&self, fleet_id: Uuid) -> Result<Rollout> {
+        self.set_rollout_state(fleet_id, &["running"], "paused", "rollout.paused", None)
+            .await
+    }
+
+    pub async fn resume_rollout(&self, fleet_id: Uuid) -> Result<Rollout> {
+        self.set_rollout_state(fleet_id, &["paused"], "running", "rollout.resumed", None)
+            .await
+    }
+
+    /// Abort the current rollout and promote the build it replaced (which starts a rollout back).
+    pub async fn rollback_rollout(&self, fleet_id: Uuid, reason: &str) -> Result<Rollout> {
+        let Some(r) = self.rollout(fleet_id).await? else {
+            return Err(Error::NotFound("no rollout".into()));
+        };
+        if !["running", "paused"].contains(&r.state.as_str()) {
+            return Err(Error::Conflict(format!("rollout is {}", r.state)));
+        }
+        let Some(from) = r.from_version.clone() else {
+            return Err(Error::Conflict(
+                "rollout has no previous build to roll back to".into(),
+            ));
+        };
+        self.set_rollout_state(
+            fleet_id,
+            &["running", "paused"],
+            "rolled_back",
+            "rollout.rolled_back",
+            Some(reason),
+        )
+        .await?;
+        self.promote_build_noted(fleet_id, &from, &format!("rollback: {reason}"))
+            .await?;
+        self.rollout(fleet_id)
+            .await?
+            .ok_or_else(|| Error::NotFound("no rollout".into()))
+    }
+
+    /// A server of the build under rollout failed early: count it, roll back past the threshold.
+    async fn note_rollout_failure(&self, f: &Fleet, build: Option<&str>, reason: &str) {
+        let Ok(Some(r)) = self.rollout(f.id).await else {
+            return;
+        };
+        if r.state != "running" || build != Some(r.to_version.as_str()) {
+            return;
+        }
+        let failed = r.failed_starts + 1;
+        let _ = sqlx::query(
+            "update musubi.fleet_rollouts set failed_starts = $2, updated_at = now() where id = $1",
+        )
+        .bind(r.id)
+        .bind(failed)
+        .execute(&self.db)
+        .await;
+        self.record_event(
+            f.id,
+            None,
+            "rollout.failure",
+            format!("server of {} failed: {reason} ({failed}/{})", r.to_version, f.policy.rollout.failure_threshold),
+            serde_json::json!({ "rollout_id": r.id, "to_version": r.to_version, "reason": reason, "failed_starts": failed, "threshold": f.policy.rollout.failure_threshold }),
+        )
+        .await;
+        if f.policy.rollout.auto_rollback
+            && failed >= f.policy.rollout.failure_threshold
+            && r.from_version.is_some()
+        {
+            tracing::warn!(fleet = %f.name, build = %r.to_version, failed, "rollout auto-rollback");
+            if let Err(e) = self
+                .rollback_rollout(f.id, &format!("auto: {failed} failed starts"))
+                .await
+            {
+                tracing::warn!(fleet = %f.name, error = %e, "auto-rollback failed");
+            }
+        }
+    }
+
+    /// One rollout step for a fleet: replace ready servers of other builds within the policy and
+    /// return how many extra servers the scaler may run meanwhile (surge).
+    async fn advance_rollout(&self, f: &Fleet, servers: &[GameServer]) -> Result<i32> {
+        let Some(r) = self.rollout(f.id).await? else {
+            return Ok(0);
+        };
+        if r.state != "running" {
+            return Ok(0);
+        }
+        let live: Vec<&GameServer> = servers.iter().filter(|s| s.state != "terminated").collect();
+        let outdated: Vec<&GameServer> = live
+            .iter()
+            .copied()
+            .filter(|s| s.build_version.as_deref() != Some(r.to_version.as_str()))
+            .collect();
+        if outdated.is_empty() {
+            self.set_rollout_state(f.id, &["running"], "done", "rollout.finished", None)
+                .await?;
+            return Ok(0);
+        }
+        let new_ready = live
+            .iter()
+            .filter(|s| {
+                s.state == "ready" && s.build_version.as_deref() == Some(r.to_version.as_str())
+            })
+            .count() as i32;
+        let mut victims: Vec<&GameServer> = outdated
+            .iter()
+            .copied()
+            .filter(|s| s.state == "ready")
+            .collect();
+        victims.sort_by_key(|s| s.created_at);
+        let allowed = if r.strategy == "recreate" {
+            victims.len()
+        } else {
+            (r.max_unavailable + new_ready).max(0) as usize
+        };
+        let now = OffsetDateTime::now_utc();
+        let drain = f.policy.rollout.drain_allocated_after_secs;
+        let mut drained: Vec<&GameServer> = Vec::new();
+        if drain > 0 {
+            drained = outdated
+                .iter()
+                .copied()
+                .filter(|s| {
+                    s.state == "allocated"
+                        && s.allocation
+                            .as_ref()
+                            .and_then(|a| a["at"].as_i64())
+                            .is_some_and(|at| now.unix_timestamp() - at > drain as i64)
+                })
+                .collect();
+        }
+        let mut replaced = 0;
+        for s in victims.into_iter().take(allowed).chain(drained) {
+            tracing::info!(server = %s.id, fleet = %f.name, build = ?s.build_version, to = %r.to_version, "rollout: replacing server");
+            self.terminate_reason(f, s.id, "rollout").await;
+            replaced += 1;
+        }
+        if replaced > 0 {
+            let _ = sqlx::query(
+                "update musubi.fleet_rollouts set replaced = replaced + $2, updated_at = now() where id = $1",
+            )
+            .bind(r.id)
+            .bind(replaced)
+            .execute(&self.db)
+            .await;
+        }
+        let remaining = outdated.len() as i32 - replaced;
+        let surge = if r.strategy == "recreate" {
+            remaining
+        } else {
+            r.max_surge
+        };
+        Ok(surge.min(remaining).max(0))
     }
 
     async fn free_port(&self, f: &Fleet) -> Result<i32> {
@@ -1570,6 +2174,14 @@ impl FleetService {
             .execute(&self.db)
             .await
             .map_err(Error::internal)?;
+        self.record_event(
+            f.id,
+            Some(id),
+            "server.starting",
+            "server starting",
+            serde_json::json!({ "port": port, "build_version": build.as_ref().map(|b| b.version.clone()), "node_id": self.node_id }),
+        )
+        .await;
         match provider
             .start(StartRequest {
                 fleet: f,
@@ -1597,6 +2209,20 @@ impl FleetService {
                     .bind(e.to_string())
                     .execute(&self.db)
                     .await;
+                self.record_event(
+                    f.id,
+                    Some(id),
+                    "server.error",
+                    format!("server failed to start: {e}"),
+                    serde_json::json!({ "error": e.to_string(), "build_version": build.as_ref().map(|b| b.version.clone()) }),
+                )
+                .await;
+                self.note_rollout_failure(
+                    f,
+                    build.as_ref().map(|b| b.version.as_str()),
+                    "start_failed",
+                )
+                .await;
                 Err(e)
             }
         }
@@ -1651,6 +2277,13 @@ impl FleetService {
             ));
         }
         self.get(fleet_id).await?;
+        let prev_active: Option<String> = sqlx::query_scalar(
+            "select version from musubi.fleet_builds where fleet_id = $1 and state = 'active'",
+        )
+        .bind(fleet_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let state = if c.canary_percent > 0 {
             "canary"
@@ -1685,12 +2318,49 @@ impl FleetService {
             Err(e) => return Err(Error::internal(e)),
         };
         tx.commit().await.map_err(Error::internal)?;
-        Ok(row_to_build(row))
+        let b = row_to_build(row);
+        self.record_event(
+            fleet_id,
+            None,
+            "build.added",
+            format!("build {} added ({state})", b.version),
+            serde_json::json!({ "version": b.version, "state": state, "canary_percent": b.canary_percent }),
+        )
+        .await;
+        if state == "active" {
+            let f = self.get(fleet_id).await?;
+            self.start_rollout(
+                &f,
+                prev_active.as_deref(),
+                &b.version,
+                "build added as active",
+            )
+            .await?;
+        }
+        Ok(b)
     }
 
     /// Make `version` the active build (promote a canary, or roll back to a retired build);
     /// every other build is retired. Running servers are not touched.
     pub async fn promote_build(&self, fleet_id: Uuid, version: &str) -> Result<FleetBuild> {
+        self.promote_build_noted(fleet_id, version, "promoted")
+            .await
+    }
+
+    async fn promote_build_noted(
+        &self,
+        fleet_id: Uuid,
+        version: &str,
+        note: &str,
+    ) -> Result<FleetBuild> {
+        let f = self.get(fleet_id).await?;
+        let prev_active: Option<String> = sqlx::query_scalar(
+            "select version from musubi.fleet_builds where fleet_id = $1 and state = 'active'",
+        )
+        .bind(fleet_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let row: Option<BuildRow> = sqlx::query_as(&format!(
             "update musubi.fleet_builds set state = 'active', canary_percent = 0, updated_at = now()
@@ -1711,7 +2381,18 @@ impl FleetService {
             .await
             .map_err(Error::internal)?;
         tx.commit().await.map_err(Error::internal)?;
-        Ok(row_to_build(row))
+        let b = row_to_build(row);
+        self.record_event(
+            fleet_id,
+            None,
+            "build.promoted",
+            format!("build {} promoted ({note})", b.version),
+            serde_json::json!({ "version": b.version, "previous": prev_active, "note": note }),
+        )
+        .await;
+        self.start_rollout(&f, prev_active.as_deref(), &b.version, note)
+            .await?;
+        Ok(b)
     }
 
     /// Retire a canary or an old build; the active build cannot be retired (promote another first).
@@ -1812,16 +2493,31 @@ impl FleetService {
                     s.state == "starting" && now - s.created_at > Duration::from_secs(120);
                 if let Some(why) = lifecycle_expired(&f, s, now, live_min_guard(&servers, &f)) {
                     tracing::info!(server = %s.id, fleet = %f.name, state = %s.state, why, "server lifecycle limit reached");
-                    self.terminate(&f, s.id).await;
+                    self.terminate_reason(&f, s.id, why).await;
                     reaped += 1;
                     continue;
                 }
                 if dead_process || stale || stuck_starting {
                     tracing::warn!(server = %s.id, fleet = %f.name, state = %s.state, dead_process, stale, "reaping game server");
-                    self.terminate(&f, s.id).await;
+                    let reason = if dead_process {
+                        "dead_process"
+                    } else if stale {
+                        "unhealthy"
+                    } else {
+                        "stuck_starting"
+                    };
+                    self.terminate_reason(&f, s.id, reason).await;
                     reaped += 1;
                 }
             }
+            let servers = self.servers(f.id, None).await?;
+            let surge = match self.advance_rollout(&f, &servers).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(fleet = %f.name, error = %e, "rollout step failed");
+                    0
+                }
+            };
             let servers = self.servers(f.id, None).await?;
             let live = servers.iter().filter(|s| s.state != "terminated").count() as i32;
             let available = servers
@@ -1836,7 +2532,8 @@ impl FleetService {
                 0.0
             };
             let target = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour)
-                .max(utilization_target(&f.policy, allocated));
+                .max(utilization_target(&f.policy, allocated))
+                + surge;
             let plan = plan_scale(
                 target,
                 f.min_servers,
@@ -1876,7 +2573,7 @@ impl FleetService {
                 idle.sort_by_key(|s| s.created_at);
                 for s in idle.into_iter().take(stop as usize) {
                     tracing::info!(server = %s.id, fleet = %f.name, target, "scaling down idle game server");
-                    self.terminate(&f, s.id).await;
+                    self.terminate_reason(&f, s.id, "scale_down").await;
                     reaped += 1;
                 }
             }

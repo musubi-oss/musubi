@@ -828,6 +828,22 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     if let Some(c) = state.cluster.clone() {
         let st = state.clone();
+        let lease = c.lease("fleet_events", musubi_cluster::DEAD_AFTER);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
+                if let Err(e) = crate::http::fleets::dispatch_fleet_events(&st).await {
+                    tracing::warn!(error = %e, "fleet event dispatch failed");
+                }
+            }
+        });
+    }
+    if let Some(c) = state.cluster.clone() {
+        let st = state.clone();
         let lease = c.lease("fleet_metrics", musubi_cluster::DEAD_AFTER);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));

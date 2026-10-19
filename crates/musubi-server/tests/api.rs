@@ -1541,7 +1541,10 @@ async fn fleet_lifecycle_with_local_process_provider() {
     let _ = node;
     let svc =
         musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
-    let (started, _) = svc.reconcile().await.unwrap();
+    let (started, _) = svc
+        .reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
     let _ = started; // another test binary's reconciler may have filled the buffer
     let (_, list) = call_server(
         &app,
@@ -1684,7 +1687,7 @@ async fn fleet_autoscale_scales_down_idle_and_forecasts_demand() {
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let svc =
         musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
-    svc.reconcile().await.unwrap();
+    svc.reconcile_one(fuid).await.unwrap();
     let live = |s: &Value| s["state"] != "terminated";
     let all = svc.servers(fuid, None).await.unwrap();
     assert!(
@@ -1706,7 +1709,7 @@ async fn fleet_autoscale_scales_down_idle_and_forecasts_demand() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{f}");
-    let (_, reaped) = svc.reconcile().await.unwrap();
+    let (_, reaped) = svc.reconcile_one(fuid).await.unwrap();
     assert!(reaped >= 2, "{reaped}");
     assert!(svc.servers(fuid, Some("ready")).await.unwrap().is_empty());
     let (_, l) = call_server(
@@ -1740,14 +1743,14 @@ async fn fleet_autoscale_scales_down_idle_and_forecasts_demand() {
     assert_eq!(st, StatusCode::OK);
     // reconcile is cluster-wide: other tests' fleets may start servers in the same pass, so
     // count only this fleet's
-    let (started, _) = svc.reconcile().await.unwrap();
+    let (started, _) = svc.reconcile_one(fuid).await.unwrap();
     assert!(started >= 1, "{started}");
     let starting = svc.servers(fuid, Some("starting")).await.unwrap();
     assert_eq!(starting.len(), 1);
     for s in starting {
         svc.sdk_ready(s.id).await.unwrap();
     }
-    svc.reconcile().await.unwrap();
+    svc.reconcile_one(fuid).await.unwrap();
     assert_eq!(
         svc.servers(fuid, Some("ready")).await.unwrap().len(),
         1,
@@ -1780,7 +1783,7 @@ async fn fleet_autoscale_scales_down_idle_and_forecasts_demand() {
     assert_eq!(d["per_hour"], 12.0, "{d}");
     assert_eq!(d["target_ready"], 2, "{d}");
     assert_eq!(d["slots"].as_array().unwrap().len(), 1);
-    let (started, _) = svc.reconcile().await.unwrap();
+    let (started, _) = svc.reconcile_one(fuid).await.unwrap();
     assert_eq!(started, 1); // 1 ready already
                             // a week later the same slot folds the last count into its EWMA (0.3 × 12 = 3.6/h → 1 ready)
     let next_week = now + time::Duration::days(7);
@@ -1841,7 +1844,7 @@ async fn fleet_docker_provider_runs_a_container() {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let svc = musubi_fleet::FleetService::new(db, uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
-    let (started, _) = svc.reconcile().await.unwrap();
+    let (started, _) = svc.reconcile_one(fid).await.unwrap();
     let all = svc.servers(fid, None).await.unwrap();
     let _ = (started, all); // another test binary's reconciler may have filled the buffer
     let servers = svc.servers(fid, Some("starting")).await.unwrap();
@@ -6871,7 +6874,7 @@ async fn edge_proxy_routes_allocations_by_connect_token() {
     let edge = proxy.local_addr();
     let svc = plain.clone().with_edge(Some(edge));
     assert_eq!(svc.edge(), Some(edge));
-    svc.reconcile().await.unwrap();
+    svc.reconcile_one(fuid).await.unwrap();
     for s in svc.servers(fuid, Some("starting")).await.unwrap() {
         svc.sdk_ready(s.id).await.unwrap();
     }
@@ -9367,7 +9370,10 @@ async fn fleet_builds_canary_promote_and_usage() {
     // fleet's server shows up
     let mut list = json!({});
     for _ in 0..10 {
-        let _ = svc.reconcile().await.unwrap();
+        let _ = svc
+            .reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+            .await
+            .unwrap();
         list = call_server(
             &app,
             "GET",
@@ -9489,7 +9495,7 @@ async fn fleet_builds_canary_promote_and_usage() {
         Some(json!({"buffer": 0, "min_servers": 0})),
     )
     .await;
-    let _ = svc.reconcile().await;
+    let _ = svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap()).await;
 }
 
 /// Any OIDC issuer from `[social.oidc.<name>]`: JWKS found through discovery, tokens become
@@ -10245,7 +10251,10 @@ async fn gameserver_watch_and_backfill() {
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let svc =
         musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
-    let _ = svc.reconcile().await.unwrap();
+    let _ = svc
+        .reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
     let (_, list) = call_server(
         &app,
         "GET",
@@ -22758,7 +22767,10 @@ async fn game_sessions_crud_idempotency_codes_seats_and_templates() {
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let svc =
         musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
-    let _ = svc.reconcile().await.unwrap();
+    let _ = svc
+        .reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
     let (_, list) = call_server(
         &app,
         "GET",
@@ -24303,7 +24315,9 @@ async fn fleet_metrics_history_summary_and_alerts() {
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let svc =
         musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
-    svc.reconcile().await.unwrap();
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
     let (_, list) = call_server(
         &app,
         "GET",
@@ -24638,5 +24652,378 @@ async fn fleet_metrics_history_summary_and_alerts() {
         app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+}
+
+/// Build rollouts: promoting (or adding an active) build starts a rolling replacement of ready
+/// servers under max_surge/max_unavailable, finishes when no outdated server is live, lifecycle
+/// events are logged with codes/exit reasons, early failures of the new build auto-roll back,
+/// pause/resume/rollback controls.
+#[tokio::test]
+async fn fleet_rollouts_rolling_update_events_and_auto_rollback() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("rfleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "buffer": 1, "max_servers": 3, "spec": {"command": ["sleep", "60"]},
+            "policy": {"rollout": {"strategy": "rolling", "max_surge": 1, "max_unavailable": 0, "auto_rollback": true, "failure_threshold": 1}}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    assert_eq!(f["policy"]["rollout"]["max_unavailable"], 0, "{f}");
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    let servers = |state: Option<&str>| {
+        let app = app.clone();
+        let fid = fid.clone();
+        let state = state.map(str::to_string);
+        async move {
+            let (_, v) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/server/fleets/{fid}/servers"),
+                k,
+                None,
+            )
+            .await;
+            v["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| state.as_deref().is_none_or(|st| s["state"] == st))
+                .cloned()
+                .collect::<Vec<Value>>()
+        }
+    };
+    let ready = |sid: String| {
+        let app = app.clone();
+        async move {
+            let req = Request::post("/v1/gameserver/ready")
+                .header("x-musubi-server-key", k)
+                .header("x-musubi-server-id", &sid)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        }
+    };
+    // first server from the fleet spec (no build)
+    svc.reconcile_one(fuid).await.unwrap();
+    let s0 = servers(Some("starting")).await;
+    assert_eq!(s0.len(), 1, "{s0:?}");
+    let sid0 = s0[0]["id"].as_str().unwrap().to_string();
+    assert!(s0[0]["build_version"].is_null());
+    ready(sid0.clone()).await;
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/rollout"),
+        k,
+        None,
+    )
+    .await;
+    assert!(v["rollout"].is_null(), "{v}");
+    assert_eq!(v["progress_pct"], 100);
+
+    // an active build starts a rollout: surge-start a v1 server, keep the old one until v1 is ready
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        Some(json!({"version": "v1", "spec": {"command": ["sleep", "60"]}})),
+    )
+    .await;
+    assert!(st.is_success(), "{st} {v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/rollout"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["rollout"]["state"], "running", "{v}");
+    assert_eq!(v["rollout"]["to_version"], "v1");
+    assert!(v["rollout"]["from_version"].is_null());
+    assert_eq!(v["outdated"], 1);
+    svc.reconcile_one(fuid).await.unwrap();
+    let live = servers(None)
+        .await
+        .into_iter()
+        .filter(|s| s["state"] != "terminated")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        live.len(),
+        2,
+        "surge started a replacement, old one kept: {live:?}"
+    );
+    let new = live
+        .iter()
+        .find(|s| s["build_version"] == "v1")
+        .expect("v1 server");
+    assert_eq!(new["state"], "starting");
+    assert!(live
+        .iter()
+        .any(|s| s["id"] == sid0 && s["state"] == "ready"));
+    let sid1 = new["id"].as_str().unwrap().to_string();
+    // not ready yet → another pass must not kill the old server
+    svc.reconcile_one(fuid).await.unwrap();
+    assert!(servers(Some("ready")).await.iter().any(|s| s["id"] == sid0));
+    ready(sid1.clone()).await;
+    svc.reconcile_one(fuid).await.unwrap();
+    let old = servers(None)
+        .await
+        .into_iter()
+        .find(|s| s["id"] == sid0)
+        .unwrap();
+    assert_eq!(old["state"], "terminated", "{old}");
+    assert_eq!(old["labels"]["exit_reason"], "rollout");
+    svc.reconcile_one(fuid).await.unwrap();
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/rollout"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["rollout"]["state"], "done", "{v}");
+    assert_eq!(v["rollout"]["replaced"], 1);
+    assert_eq!(v["outdated"], 0);
+    assert_eq!(v["progress_pct"], 100);
+    // lifecycle log
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?limit=100"),
+        k,
+        None,
+    )
+    .await;
+    let codes: Vec<&str> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap())
+        .collect();
+    for c in [
+        "server.starting",
+        "server.ready",
+        "server.terminated",
+        "build.added",
+        "rollout.started",
+        "rollout.finished",
+    ] {
+        assert!(codes.contains(&c), "{c} missing in {codes:?}");
+    }
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?code=server.terminated"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(ev["events"].as_array().unwrap().len(), 1, "{ev}");
+    assert_eq!(ev["events"][0]["data"]["reason"], "rollout");
+    assert_eq!(ev["events"][0]["server_id"], sid0);
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?code=server&server_id={sid1}"),
+        k,
+        None,
+    )
+    .await;
+    let c1: Vec<&str> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(c1, vec!["server.ready", "server.starting"], "{ev}");
+    assert_eq!(ev["events"][0]["data"]["build_version"], "v1");
+    // pause / resume / 409s
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/rollout/pause"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "done rollout cannot pause");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/rollout/rollback"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+
+    // v2 crashes on start → dead process → failure threshold 1 → auto rollback to v1
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        Some(json!({"version": "v2", "spec": {"command": ["false"]}})),
+    )
+    .await;
+    assert!(st.is_success(), "{st} {v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/rollout"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["rollout"]["from_version"], "v1", "{v}");
+    assert_eq!(v["rollout"]["to_version"], "v2");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/rollout/pause"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "paused");
+    svc.reconcile_one(fuid).await.unwrap();
+    assert!(
+        servers(None)
+            .await
+            .iter()
+            .all(|s| s["build_version"] != "v2"),
+        "paused rollout starts nothing"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/rollout/resume"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    svc.reconcile_one(fuid).await.unwrap();
+    assert!(
+        servers(None)
+            .await
+            .iter()
+            .any(|s| s["build_version"] == "v2"),
+        "v2 surge server started"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut rolled = false;
+    for _ in 0..5 {
+        svc.reconcile_one(fuid).await.unwrap();
+        let (_, v) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/fleets/{fid}/rollouts"),
+            k,
+            None,
+        )
+        .await;
+        if v["rollouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["state"] == "rolled_back")
+        {
+            rolled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(rolled, "auto rollback after the v2 server died");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/rollouts"),
+        k,
+        None,
+    )
+    .await;
+    let rs = v["rollouts"].as_array().unwrap();
+    assert_eq!(
+        rs[0]["to_version"], "v1",
+        "rollback rollout towards v1: {v}"
+    );
+    assert_eq!(rs[0]["from_version"], "v2");
+    assert!(
+        rs[0]["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("rollback: auto"),
+        "{v}"
+    );
+    assert_eq!(rs[1]["state"], "rolled_back");
+    assert_eq!(rs[1]["failed_starts"], 1);
+    let (_, b) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/builds"),
+        k,
+        None,
+    )
+    .await;
+    let active: Vec<&str> = b["builds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["state"] == "active")
+        .map(|x| x["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(active, vec!["v1"], "{b}");
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?code=rollout"),
+        k,
+        None,
+    )
+    .await;
+    let rc: Vec<&str> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap())
+        .collect();
+    for c in [
+        "rollout.paused",
+        "rollout.resumed",
+        "rollout.failure",
+        "rollout.rolled_back",
+    ] {
+        assert!(rc.contains(&c), "{c} missing in {rc:?}");
+    }
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?code=server.terminated"),
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["data"]["reason"] == "dead_process" && e["data"]["build_version"] == "v2"),
+        "{ev}"
+    );
+    // policy validation
+    let (st, v) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": unique("bad"), "provider": "local", "spec": {"command": ["sleep", "1"]}, "policy": {"rollout": {"strategy": "yolo"}}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }

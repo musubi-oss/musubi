@@ -37,6 +37,13 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     let age = |col: &str| format!("{col} < now() - make_interval(days => $1::int)");
     let events = purge(db, "musubi.events", &age("created_at"), cfg.events_days).await?;
     let server_logs = purge(db, "musubi.server_logs", &age("at"), cfg.server_logs_days).await?;
+    let fleet_events = purge(
+        db,
+        "musubi.fleet_events",
+        &format!("dispatched and {}", age("at")),
+        cfg.server_logs_days,
+    )
+    .await?;
     let mm_log = purge(
         db,
         "musubi.matchmaker_ticket_log",
@@ -150,7 +157,7 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     .map_err(Error::internal)?
     .rows_affected();
     Ok(json!({
-        "events": events, "server_logs": server_logs, "matchmaker_log": mm_log, "analytics_events": analytics_events, "webhook_deliveries": deliveries, "audit_log": audit, "game_sessions": game_sessions,
+        "events": events, "server_logs": server_logs, "fleet_events": fleet_events, "matchmaker_log": mm_log, "analytics_events": analytics_events, "webhook_deliveries": deliveries, "audit_log": audit, "game_sessions": game_sessions,
         "notifications": notifications, "chat_messages": chat, "sessions": sessions, "idempotency": idempotency, "storage_objects": storage, "resumable_sessions": resumable,
         "match_journal": match_journal, "world_journal": world_journal, "world_history": world_history, "replays": replays,
     }))

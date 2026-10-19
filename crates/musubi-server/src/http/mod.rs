@@ -22,7 +22,7 @@ pub(crate) mod error;
 pub(crate) mod extract;
 mod files;
 pub mod fleet_metrics;
-mod fleets;
+pub mod fleets;
 mod friends;
 pub mod game_sessions;
 pub mod group_challenges;

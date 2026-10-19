@@ -677,6 +677,12 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
         "/v1/server/fleets/{id}/alerts/rules/{name}",
         "fleets",
     ),
+    ("GET", "/v1/server/fleets/{id}/rollout", "fleets"),
+    ("GET", "/v1/server/fleets/{id}/rollouts", "fleets"),
+    ("POST", "/v1/server/fleets/{id}/rollout/pause", "fleets"),
+    ("POST", "/v1/server/fleets/{id}/rollout/resume", "fleets"),
+    ("POST", "/v1/server/fleets/{id}/rollout/rollback", "fleets"),
+    ("GET", "/v1/server/fleets/{id}/events", "fleets"),
     ("GET", "/v1/rating/{queue}", "leaderboards"),
     ("GET", "/v1/leaderboards/{id}/tier", "leaderboards"),
     (

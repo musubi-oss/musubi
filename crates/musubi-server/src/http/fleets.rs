@@ -41,6 +41,18 @@ pub fn routes() -> Router<AppState> {
             post(promote_build),
         )
         .route("/v1/server/fleets/{id}/usage", get(usage))
+        .route("/v1/server/fleets/{id}/rollout", get(rollout_get))
+        .route("/v1/server/fleets/{id}/rollouts", get(rollouts))
+        .route("/v1/server/fleets/{id}/rollout/pause", post(rollout_pause))
+        .route(
+            "/v1/server/fleets/{id}/rollout/resume",
+            post(rollout_resume),
+        )
+        .route(
+            "/v1/server/fleets/{id}/rollout/rollback",
+            post(rollout_rollback),
+        )
+        .route("/v1/server/fleets/{id}/events", get(fleet_events))
         .route(
             "/v1/server/gameservers/{id}",
             get(server_get).delete(server_delete),
@@ -387,13 +399,6 @@ async fn add_build(
 ) -> Result<Json<musubi_fleet::FleetBuild>, ApiError> {
     let id = parse(&id)?;
     let b = s.fleets.add_build(id, c).await?;
-    s.events
-        .emit(
-            "fleet.build_added",
-            None,
-            json!({ "fleet_id": id, "version": b.version, "state": b.state }),
-        )
-        .await;
     Ok(Json(b))
 }
 
@@ -404,13 +409,6 @@ async fn promote_build(
 ) -> Result<Json<musubi_fleet::FleetBuild>, ApiError> {
     let id = parse(&id)?;
     let b = s.fleets.promote_build(id, &version).await?;
-    s.events
-        .emit(
-            "fleet.build_promoted",
-            None,
-            json!({ "fleet_id": id, "version": b.version }),
-        )
-        .await;
     Ok(Json(b))
 }
 
@@ -553,4 +551,102 @@ async fn sdk_logs(
         });
     }
     Ok(Json(json!({ "accepted": n })))
+}
+
+/// `GET /v1/server/fleets/{id}/rollout` — latest rollout with live servers per build and progress.
+async fn rollout_get(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.fleets.rollout_status(parse(&id)?).await?))
+}
+
+async fn rollouts(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "rollouts": s.fleets.rollouts(parse(&id)?, 50).await? }),
+    ))
+}
+
+async fn rollout_pause(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<musubi_fleet::Rollout>, ApiError> {
+    Ok(Json(s.fleets.pause_rollout(parse(&id)?).await?))
+}
+
+async fn rollout_resume(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<musubi_fleet::Rollout>, ApiError> {
+    Ok(Json(s.fleets.resume_rollout(parse(&id)?).await?))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RollbackReq {
+    reason: String,
+}
+
+/// `POST /v1/server/fleets/{id}/rollout/rollback {reason?}` — abort and promote the previous build.
+async fn rollout_rollback(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    body: Option<Json<RollbackReq>>,
+) -> Result<Json<musubi_fleet::Rollout>, ApiError> {
+    let reason = body.map(|b| b.0.reason).unwrap_or_default();
+    let reason = if reason.is_empty() {
+        "operator"
+    } else {
+        reason.as_str()
+    };
+    Ok(Json(s.fleets.rollback_rollout(parse(&id)?, reason).await?))
+}
+
+/// `GET /v1/server/fleets/{id}/events?code=server.terminated&server_id&after&limit` — lifecycle log.
+async fn fleet_events(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Query(q): Query<musubi_fleet::EventQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "events": s.fleets.events(parse(&id)?, &q).await? }),
+    ))
+}
+
+/// Event-bus kind of a fleet log code: `server.*` → `gameserver.*`, else `fleet.<a>_<b>`.
+pub fn event_kind(code: &str) -> String {
+    match code.strip_prefix("server.") {
+        Some(rest) => format!("gameserver.{rest}"),
+        None => format!("fleet.{}", code.replace('.', "_")),
+    }
+}
+
+/// Forward undispatched fleet log rows to the event bus (webhooks); the lease holder runs it.
+pub async fn dispatch_fleet_events(s: &AppState) -> musubi_core::Result<usize> {
+    let evs = s.fleets.undispatched_events(200).await?;
+    if evs.is_empty() {
+        return Ok(0);
+    }
+    for e in &evs {
+        let mut payload = e.data.clone();
+        if let Value::Object(m) = &mut payload {
+            m.insert("fleet_id".into(), json!(e.fleet_id));
+            m.insert("server_id".into(), json!(e.server_id));
+            m.insert("message".into(), json!(e.message));
+            m.insert("code".into(), json!(e.code));
+        }
+        s.events.emit(&event_kind(&e.code), None, payload).await;
+    }
+    let ids: Vec<i64> = evs.iter().map(|e| e.id).collect();
+    s.fleets.mark_dispatched(&ids).await?;
+    Ok(ids.len())
 }

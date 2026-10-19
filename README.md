@@ -410,6 +410,19 @@ pending alert, after `for_secs` it fires (`fleet.alert_fired` event → webhooks
 `GET /v1/server/fleets/{id}/alerts?state=firing|pending|resolved|all&server_id`. Samples/resolved alerts kept
 `[retention] server_metrics_days` (7).
 
+Build rollouts and the fleet lifecycle log: `policy.rollout {strategy: manual|rolling|recreate, max_surge, max_unavailable,
+auto_rollback, failure_threshold, drain_allocated_after_secs}` — promoting a build (or adding one as active) starts a rollout:
+the reconciler surge-starts up to `max_surge` servers of the new build above the target and replaces `ready` servers of
+other builds only as replacements become ready (plus `max_unavailable` at a time); `allocated` servers are never touched
+(unless their allocation is older than `drain_allocated_after_secs`); `recreate` replaces every ready server at once.
+Servers of the new build that fail to start or die within two minutes count as failures — at `failure_threshold` the
+previous build is re-promoted (a rollout back). `GET /v1/server/fleets/{id}/rollout` (state, live servers per build,
+`outdated`, `progress_pct`), `…/rollouts`, `POST …/rollout/pause|resume|rollback {reason}`. Every state change is logged
+with a code: `GET /v1/server/fleets/{id}/events?code=server.terminated&server_id&after&limit` — `server.starting|ready|
+allocated|shutdown|terminated|error` (with `exit_reason`: shutdown, dead_process, unhealthy, stuck_starting, max_duration,
+idle_ttl, scale_down, rollout, manual…), `build.added|promoted`, `rollout.*`; the lease holder forwards them to the event
+bus as `gameserver.*` / `fleet.*` (webhooks).
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`
