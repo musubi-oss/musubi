@@ -208,6 +208,11 @@ impl Controller {
                 let centre = Pos {
                     x: (lo.x + hi.x) / 2.0,
                     y: (lo.y + hi.y) / 2.0,
+                    z: if world.config().three_d {
+                        (lo.z + hi.z) / 2.0
+                    } else {
+                        0.0
+                    },
                 };
                 // nearest point of interest within reach whose own cell has an owner with room
                 let mut near: Vec<&Pos> = points
@@ -517,7 +522,7 @@ impl Controller {
         let parents = world.split_cells();
         cold.retain(|c, _| parents.contains(c));
         for p in parents {
-            let kids = p.children();
+            let kids = p.split_into(world.config().three_d);
             if world.is_pinned_split(p) || kids.iter().any(|k| world.is_split(*k)) {
                 cold.remove(&p);
                 continue;
@@ -533,7 +538,7 @@ impl Controller {
                 continue;
             }
             let mut owners: BTreeMap<SimId, usize> = BTreeMap::new();
-            for k in kids {
+            for k in kids.iter().copied() {
                 if let Some(o) = world.owner(k) {
                     *owners.entry(o).or_insert(0) += 1;
                 }
@@ -747,6 +752,7 @@ mod tests {
                 Pos {
                     x: 10.0 + i as f64,
                     y: 10.0,
+                    z: 0.0,
                 },
                 1.0,
             );
@@ -758,7 +764,11 @@ mod tests {
         assert_eq!(mk(Strategy::PlayerDensity).pick(&w, next, None), Some(s2));
         // points of interest: a POI at (550, 550) (s2's cell) pulls every cell within 700
         let poi = mk(Strategy::PointsOfInterest {
-            points: vec![Pos { x: 550.0, y: 550.0 }],
+            points: vec![Pos {
+                x: 550.0,
+                y: 550.0,
+                z: 0.0,
+            }],
             radius: 700.0,
         });
         assert_eq!(poi.pick(&w, next, None), Some(s2));
@@ -830,6 +840,7 @@ mod tests {
                 Pos {
                     x: 10.0 + 20.0 * i as f64,
                     y: 10.0,
+                    z: 0.0,
                 },
                 std::collections::BTreeMap::new(),
                 false,
@@ -852,7 +863,8 @@ mod tests {
             world.entities_in(CellId {
                 x: 0,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }),
             2
         );
@@ -860,7 +872,8 @@ mod tests {
             world.entities_in(CellId {
                 x: 1,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }),
             2
         );
@@ -872,12 +885,14 @@ mod tests {
             x: 1,
             y: 1,
             level: 1,
+            z: 0,
         });
         world.grant_lease(
             CellId {
                 x: 1,
                 y: 1,
                 level: 1,
+                z: 0,
             },
             s2,
         );
@@ -911,12 +926,36 @@ mod tests {
             soft_cap: 2,
             ..WorldConfig::default()
         });
-        let c = w.cell_of(Pos { x: 10.0, y: 10.0 });
+        let c = w.cell_of(Pos {
+            x: 10.0,
+            y: 10.0,
+            z: 0.0,
+        });
         assert!(w.cell_has_room(c));
-        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
-        w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
+        w.spawn(
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
+        w.spawn(
+            Pos {
+                x: 20.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
         assert!(!w.cell_has_room(c), "two of two slots taken");
-        let other = w.cell_of(Pos { x: 150.0, y: 10.0 });
+        let other = w.cell_of(Pos {
+            x: 150.0,
+            y: 10.0,
+            z: 0.0,
+        });
         assert!(w.cell_has_room(other));
         let mut unlimited = World::new(WorldConfig {
             cell_size: 100.0,
@@ -928,6 +967,7 @@ mod tests {
                 Pos {
                     x: i as f64,
                     y: 1.0,
+                    z: 0.0,
                 },
                 Default::default(),
                 false,
@@ -955,17 +995,35 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             CellId {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
         );
         w.grant_lease(a, slow);
         w.grant_lease(b, slow);
-        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
-        w.spawn(Pos { x: 110.0, y: 10.0 }, Default::default(), false);
+        w.spawn(
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
+        w.spawn(
+            Pos {
+                x: 110.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
         w.tick = 100;
         w.renew_leases(slow);
         w.renew_leases(fast);
@@ -1020,10 +1078,27 @@ mod tests {
             x: 0,
             y: 0,
             level: 0,
+            z: 0,
         };
         w.grant_lease(c, sim);
-        let keep = w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), true);
-        let litter = w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
+        let keep = w.spawn(
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            true,
+        );
+        let litter = w.spawn(
+            Pos {
+                x: 20.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
         // the idle clock starts at the first unwatched check (tick 1) and fires at 1 + 5
         for _ in 0..5 {
             w.advance();
@@ -1044,7 +1119,15 @@ mod tests {
         assert!(w.orphaned_cells().is_empty());
         assert!(ctl.reconcile(&mut w).is_empty());
         // a client arrives: the cell is leased again with its persistent entity in place
-        w.subscribe(Uuid::now_v7(), Pos { x: 15.0, y: 15.0 }, 10.0);
+        w.subscribe(
+            Uuid::now_v7(),
+            Pos {
+                x: 15.0,
+                y: 15.0,
+                z: 0.0,
+            },
+            10.0,
+        );
         let out = ctl.reconcile(&mut w);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].reason, "interest");
@@ -1072,10 +1155,27 @@ mod tests {
             x: 0,
             y: 0,
             level: 0,
+            z: 0,
         };
         w.grant_lease(c, sim);
-        let litter = w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), true);
-        let forever = w.spawn(Pos { x: 20.0, y: 10.0 }, Default::default(), false);
+        let litter = w.spawn(
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            true,
+        );
+        let forever = w.spawn(
+            Pos {
+                x: 20.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
         assert!(w.set_decay(litter, Some(3)));
         for _ in 0..2 {
             w.advance();
@@ -1085,7 +1185,11 @@ mod tests {
         w.apply(
             sim,
             litter,
-            Some(Pos { x: 11.0, y: 10.0 }),
+            Some(Pos {
+                x: 11.0,
+                y: 10.0,
+                z: 0.0,
+            }),
             Default::default(),
         )
         .unwrap();
@@ -1119,17 +1223,35 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             CellId {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
         );
         w.grant_lease(a, s1);
         w.grant_lease(b, s1);
-        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
-        w.spawn(Pos { x: 110.0, y: 10.0 }, Default::default(), false);
+        w.spawn(
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
+        w.spawn(
+            Pos {
+                x: 110.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
         assert!(ctl.reconcile(&mut w).is_empty(), "2 entities are no load");
         // ten clients crowd cell b: 10 × 5 = 50 > split_cost
         for i in 0..10 {
@@ -1138,6 +1260,7 @@ mod tests {
                 Pos {
                     x: 150.0 + i as f64,
                     y: 50.0,
+                    z: 0.0,
                 },
                 10.0,
             );
@@ -1177,17 +1300,35 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             CellId {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
         );
         w.grant_lease(a, s1);
         w.grant_lease(b, s2);
-        w.spawn(Pos { x: 10.0, y: 10.0 }, Default::default(), false);
-        w.spawn(Pos { x: 110.0, y: 10.0 }, Default::default(), false);
+        w.spawn(
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
+        w.spawn(
+            Pos {
+                x: 110.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Default::default(),
+            false,
+        );
         for round in 0..2 {
             assert!(
                 ctl.reconcile(&mut w).is_empty(),
@@ -1222,6 +1363,7 @@ mod tests {
                 Pos {
                     x: 10.0 + i as f64,
                     y: 10.0,
+                    z: 0.0,
                 },
                 5.0,
             );
@@ -1252,6 +1394,7 @@ mod tests {
             x: 0,
             y: 0,
             level: 0,
+            z: 0,
         };
         w.grant_lease(c, sim);
         // never reported: no dilation
@@ -1268,8 +1411,28 @@ mod tests {
         let ch = ctl.dilate(&mut w);
         assert_eq!(ch, vec![(c, 0.25)]);
         assert_eq!(w.time_scale(c), 0.25);
-        assert_eq!(w.min_scale_near(Pos { x: 50.0, y: 50.0 }, 10.0), 0.25);
-        assert_eq!(w.min_scale_near(Pos { x: 500.0, y: 50.0 }, 10.0), 1.0);
+        assert_eq!(
+            w.min_scale_near(
+                Pos {
+                    x: 50.0,
+                    y: 50.0,
+                    z: 0.0
+                },
+                10.0
+            ),
+            0.25
+        );
+        assert_eq!(
+            w.min_scale_near(
+                Pos {
+                    x: 500.0,
+                    y: 50.0,
+                    z: 0.0
+                },
+                10.0
+            ),
+            1.0
+        );
         // floor
         w.tick = 1000;
         w.renew_leases(sim);
@@ -1305,6 +1468,7 @@ mod tests {
                     x: 0,
                     y: 0,
                     level: 0,
+                    z: 0,
                 },
                 Some(s1),
                 "spawn",
@@ -1318,7 +1482,8 @@ mod tests {
                 CellId {
                     x: 1,
                     y: 0,
-                    level: 0
+                    level: 0,
+                    z: 0,
                 },
                 None
             ),
@@ -1330,6 +1495,7 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             None,
             "x",
@@ -1341,7 +1507,8 @@ mod tests {
                 CellId {
                     x: 2,
                     y: 0,
-                    level: 0
+                    level: 0,
+                    z: 0,
                 },
                 None
             ),
@@ -1353,6 +1520,7 @@ mod tests {
                 x: 2,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             None,
             "x",
@@ -1363,6 +1531,7 @@ mod tests {
                 x: 3,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             None,
             "x",
@@ -1373,7 +1542,8 @@ mod tests {
                 CellId {
                     x: 9,
                     y: 9,
-                    level: 0
+                    level: 0,
+                    z: 0,
                 },
                 None
             ),
@@ -1398,6 +1568,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
@@ -1406,11 +1577,12 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
         for x in [10.0, 20.0, 110.0, 120.0] {
-            w.spawn(Pos { x, y: 10.0 }, BTreeMap::new(), false);
+            w.spawn(Pos { x, y: 10.0, z: 0.0 }, BTreeMap::new(), false);
         }
         // s1 carries 4 > split_cost 2 → one cell migrates to s2
         let out = c.reconcile(&mut w);

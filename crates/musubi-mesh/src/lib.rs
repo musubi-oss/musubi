@@ -5,7 +5,8 @@
 //! hysteresis) triggers a handover that completes within a few ticks or is rolled back. Clients
 //! never talk to simulators: they subscribe to an interest radius and receive versioned deltas.
 //!
-//! Space is 2D here (x, y); 3D/octree and non-spatial partition keys plug into `CellId` later.
+//! Space is 2-D (x, y) by default; `WorldConfig::three_d` turns cells into octree voxels with a
+//! `z` index (P1-57). Non-spatial partition keys plug into `CellId` later.
 
 pub mod controller;
 pub mod ghost;
@@ -24,8 +25,12 @@ pub type ClientId = Uuid;
 pub struct CellId {
     pub x: i32,
     pub y: i32,
-    /// Quadtree depth: 0 = a cell of the base grid (`cell_size`), each level halves the side.
-    /// Omitted on the wire for base-grid cells, so frames and stored rows stay as they were.
+    /// Vertical index (P1-57): always 0 for 2-D worlds and omitted on the wire, so existing
+    /// frames and stored rows are unchanged; in `three_d` worlds cells are octree voxels.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub z: i32,
+    /// Quadtree/octree depth: 0 = a cell of the base grid (`cell_size`), each level halves the
+    /// side. Omitted on the wire for base-grid cells, so frames and stored rows stay as they were.
     #[serde(default, skip_serializing_if = "is_zero_level")]
     pub level: u8,
 }
@@ -34,38 +39,108 @@ fn is_zero_level(l: &u8) -> bool {
     *l == 0
 }
 
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
 impl CellId {
     pub const fn root(x: i32, y: i32) -> Self {
-        Self { x, y, level: 0 }
+        Self {
+            x,
+            y,
+            z: 0,
+            level: 0,
+        }
+    }
+
+    pub const fn root3(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z, level: 0 }
     }
 
     pub fn parent(&self) -> Option<CellId> {
         (self.level > 0).then(|| CellId {
             x: self.x.div_euclid(2),
             y: self.y.div_euclid(2),
+            z: self.z.div_euclid(2),
             level: self.level - 1,
         })
+    }
+
+    /// The eight voxels this one splits into (octree, `three_d` worlds).
+    pub fn children3(&self) -> Vec<CellId> {
+        let (x, y, z, l) = (self.x * 2, self.y * 2, self.z * 2, self.level + 1);
+        let mut out = Vec::with_capacity(8);
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    out.push(CellId {
+                        x: x + dx,
+                        y: y + dy,
+                        z: z + dz,
+                        level: l,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Children for a world of the given dimensionality (4 or 8).
+    pub fn split_into(&self, three_d: bool) -> Vec<CellId> {
+        if three_d {
+            self.children3()
+        } else {
+            self.children().to_vec()
+        }
+    }
+
+    /// Morton (Z-order) code of the cell at its own level — interleaved x/y(/z) bits, so cells
+    /// that are close in space are close in the code; used to order cells, pack intervals of
+    /// space onto one simulator and answer range queries without touching every cell.
+    pub fn morton(&self) -> u64 {
+        fn spread(v: i32) -> u64 {
+            // offset so negative coordinates sort before positive ones, 21 bits per axis
+            let v = (i64::from(v) + (1i64 << 20)).clamp(0, (1i64 << 21) - 1) as u64;
+            let mut r = 0u64;
+            for b in 0..21 {
+                r |= ((v >> b) & 1) << (3 * b);
+            }
+            r
+        }
+        spread(self.x) | (spread(self.y) << 1) | (spread(self.z) << 2)
     }
 
     /// The four cells this one splits into.
     pub fn children(&self) -> [CellId; 4] {
         let (x, y, l) = (self.x * 2, self.y * 2, self.level + 1);
         [
-            CellId { x, y, level: l },
+            CellId {
+                x,
+                y,
+                level: l,
+                z: 0,
+            },
             CellId {
                 x: x + 1,
                 y,
                 level: l,
+                z: 0,
             },
             CellId {
                 x,
                 y: y + 1,
                 level: l,
+                z: 0,
             },
             CellId {
                 x: x + 1,
                 y: y + 1,
                 level: l,
+                z: 0,
             },
         ]
     }
@@ -80,11 +155,22 @@ impl CellId {
 pub struct Pos {
     pub x: f64,
     pub y: f64,
+    /// Height (P1-57); 0 and omitted on the wire for 2-D worlds.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub z: f64,
 }
 
 impl Pos {
+    pub const fn new(x: f64, y: f64) -> Self {
+        Self { x, y, z: 0.0 }
+    }
+
+    pub const fn new3(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
     pub fn dist(&self, o: &Pos) -> f64 {
-        ((self.x - o.x).powi(2) + (self.y - o.y).powi(2)).sqrt()
+        ((self.x - o.x).powi(2) + (self.y - o.y).powi(2) + (self.z - o.z).powi(2)).sqrt()
     }
 }
 
@@ -189,6 +275,10 @@ pub struct WorldConfig {
     /// Quadtree depth a hot cell may split down to (plan 4.3); 0 = fixed grid. A cell at depth
     /// `d` has side `cell_size / 2^d`.
     pub max_depth: u8,
+    /// Partition space in three dimensions (P1-57): base cells are `cell_size` cubes, a split
+    /// yields eight octree voxels, interest is a sphere and ghosting/handover look at `z` too.
+    #[serde(default)]
+    pub three_d: bool,
     /// Entities this close to a border are ghosted to the neighbour.
     pub ghost_margin: f64,
     /// Extra distance past the border before a handover starts (prevents flapping).
@@ -250,6 +340,7 @@ impl Default for WorldConfig {
         Self {
             cell_size: 256.0,
             max_depth: 0,
+            three_d: false,
             ghost_margin: 48.0,
             hysteresis: 24.0,
             lease_ttl_ticks: 60,
@@ -665,7 +756,7 @@ impl World {
 
     /// The leaf cell holding `p`: the base-grid cell, descended while cells are split.
     pub fn cell_of(&self, p: Pos) -> CellId {
-        leaf_of(self.cfg.cell_size, &self.split, p)
+        leaf_of(self.cfg.cell_size, self.cfg.three_d, &self.split, p)
     }
 
     pub fn cell_bounds(&self, c: CellId) -> (Pos, Pos) {
@@ -674,12 +765,12 @@ impl World {
 
     /// Distance from `p` to the nearest border of cell `c` (negative = outside by that much).
     pub fn border_distance(&self, c: CellId, p: Pos) -> f64 {
-        grid_border_distance(self.cfg.cell_size, c, p)
+        grid_border_distance(self.cfg.cell_size, self.cfg.three_d, c, p)
     }
 
     /// Leaf cells a circle of interest touches (bounding box).
     pub fn cells_in_radius(&self, p: Pos, radius: f64) -> Vec<CellId> {
-        grid_cells_in_radius(self.cfg.cell_size, &self.split, p, radius)
+        grid_cells_in_radius(self.cfg.cell_size, self.cfg.three_d, &self.split, p, radius)
     }
 
     /// Leaf cells sharing a border or corner with `c` — coarser, equal or finer than `c`.
@@ -687,11 +778,13 @@ impl World {
         let (lo, hi) = self.cell_bounds(c);
         let eps = self.cfg.cell_size * 1e-9;
         let mut out = Vec::new();
-        for n in Self::grid_neighbours(c) {
+        let three_d = self.cfg.three_d;
+        for n in Self::grid_neighbours(c, three_d) {
             let (nlo, nhi) = self.cell_bounds(n);
             let centre = Pos {
                 x: (nlo.x + nhi.x) / 2.0,
                 y: (nlo.y + nhi.y) / 2.0,
+                z: if three_d { (nlo.z + nhi.z) / 2.0 } else { 0.0 },
             };
             let leaf = self.cell_of(centre);
             if leaf.level <= n.level {
@@ -703,14 +796,15 @@ impl World {
             let mut stack = vec![n];
             while let Some(k) = stack.pop() {
                 if self.split.contains(&k) {
-                    stack.extend(k.children());
+                    stack.extend(k.split_into(three_d));
                     continue;
                 }
                 let (klo, khi) = self.cell_bounds(k);
                 let touches = khi.x >= lo.x - eps
                     && klo.x <= hi.x + eps
                     && khi.y >= lo.y - eps
-                    && klo.y <= hi.y + eps;
+                    && klo.y <= hi.y + eps
+                    && (!three_d || (khi.z >= lo.z - eps && klo.z <= hi.z + eps));
                 if touches {
                     out.push(k);
                 }
@@ -776,7 +870,7 @@ impl World {
     /// owner and time scale carry over to every child, so the owning simulator keeps
     /// simulating and nothing is handed over. Refused above `max_depth`, for a split,
     /// hibernated or unloaded cell, or while an entity of the cell is in handover.
-    pub fn split_cell(&mut self, c: CellId) -> std::result::Result<[CellId; 4], String> {
+    pub fn split_cell(&mut self, c: CellId) -> std::result::Result<Vec<CellId>, String> {
         if c.level >= self.cfg.max_depth {
             return Err(format!(
                 "cell {c:?} is already at max_depth {}",
@@ -792,22 +886,22 @@ impl World {
         if self.transit_in(c) {
             return Err(format!("cell {c:?} has an entity in handover"));
         }
-        let kids = c.children();
+        let kids = c.split_into(self.cfg.three_d);
         self.split.insert(c);
         self.rehome(c, |w, p| w.cell_of(p));
         if let Some(lease) = self.leases.remove(&c) {
-            for k in kids {
-                self.leases.insert(k, lease.clone());
+            for k in &kids {
+                self.leases.insert(*k, lease.clone());
             }
         }
         if let Some(owner) = self.last_owners.remove(&c) {
-            for k in kids {
-                self.last_owners.insert(k, owner);
+            for k in &kids {
+                self.last_owners.insert(*k, owner);
             }
         }
         if let Some(scale) = self.cell_scale.remove(&c) {
-            for k in kids {
-                self.cell_scale.insert(k, scale);
+            for k in &kids {
+                self.cell_scale.insert(*k, scale);
             }
         }
         Ok(kids)
@@ -822,7 +916,7 @@ impl World {
         if self.pinned_splits.contains(&parent) {
             return Err(format!("split of {parent:?} is pinned"));
         }
-        let kids = parent.children();
+        let kids = parent.split_into(self.cfg.three_d);
         if kids.iter().any(|k| self.split.contains(k)) {
             return Err(format!("a child of {parent:?} is split itself"));
         }
@@ -840,8 +934,8 @@ impl World {
         }
         let owner = owners.into_iter().next();
         self.split.remove(&parent);
-        for k in kids {
-            self.rehome(k, |_, _| parent);
+        for k in &kids {
+            self.rehome(*k, |_, _| parent);
         }
         let mut expires = 0u64;
         let mut last = None;
@@ -1296,13 +1390,18 @@ impl World {
     // ----- ghosts & views -----
 
     /// The eight cells around `c` at its own level (whether or not they are leaves).
-    pub fn grid_neighbours(c: CellId) -> impl Iterator<Item = CellId> {
-        (-1..=1).flat_map(move |dx| {
-            (-1..=1).filter_map(move |dy| {
-                (dx != 0 || dy != 0).then_some(CellId {
-                    x: c.x + dx,
-                    y: c.y + dy,
-                    level: c.level,
+    /// Same-level cells sharing a border, edge or corner with `c`: 8 in 2-D, 26 in 3-D.
+    pub fn grid_neighbours(c: CellId, three_d: bool) -> impl Iterator<Item = CellId> {
+        let zr = if three_d { -1..=1 } else { 0..=0 };
+        zr.flat_map(move |dz| {
+            (-1..=1).flat_map(move |dx| {
+                (-1..=1).filter_map(move |dy| {
+                    (dx != 0 || dy != 0 || dz != 0).then_some(CellId {
+                        x: c.x + dx,
+                        y: c.y + dy,
+                        z: c.z + dz,
+                        level: c.level,
+                    })
                 })
             })
         })
@@ -1312,7 +1411,8 @@ impl World {
     fn within_margin(&self, cell: CellId, pos: Pos) -> bool {
         let (lo, hi) = self.cell_bounds(cell);
         let m = self.cfg.ghost_margin;
-        pos.x >= lo.x - m && pos.x <= hi.x + m && pos.y >= lo.y - m && pos.y <= hi.y + m
+        let flat = pos.x >= lo.x - m && pos.x <= hi.x + m && pos.y >= lo.y - m && pos.y <= hi.y + m;
+        flat && (!self.cfg.three_d || (pos.z >= lo.z - m && pos.z <= hi.z + m))
     }
 
     /// Entities in cells adjacent to `cell` that lie within `ghost_margin` of its border.
@@ -1902,6 +2002,7 @@ fn quantize(p: Pos, q: f64) -> Pos {
     Pos {
         x: (p.x / q).round() * q,
         y: (p.y / q).round() * q,
+        z: (p.z / q).round() * q,
     }
 }
 
@@ -1925,7 +2026,120 @@ mod tests {
     }
 
     fn at(x: f64, y: f64) -> Pos {
-        Pos { x, y }
+        Pos { x, y, z: 0.0 }
+    }
+
+    fn oct_world() -> World {
+        World::new(WorldConfig {
+            cell_size: 100.0,
+            max_depth: 2,
+            three_d: true,
+            ghost_margin: 5.0,
+            hysteresis: 2.0,
+            ..WorldConfig::default()
+        })
+    }
+
+    fn at3(x: f64, y: f64, z: f64) -> Pos {
+        Pos { x, y, z }
+    }
+
+    #[test]
+    fn three_d_cells_are_voxels_and_split_into_eight() {
+        let mut w = oct_world();
+        let root = CellId::root3(0, 0, 1);
+        assert_eq!(w.cell_of(at3(10.0, 10.0, 150.0)), root);
+        assert_ne!(
+            w.cell_of(at3(10.0, 10.0, 50.0)),
+            root,
+            "height picks the voxel"
+        );
+        let low = w.spawn(at3(10.0, 10.0, 110.0), BTreeMap::new(), false);
+        let high = w.spawn(at3(10.0, 10.0, 190.0), BTreeMap::new(), false);
+        let kids = w.split_cell(root).unwrap();
+        assert_eq!(kids.len(), 8);
+        assert!(kids
+            .iter()
+            .all(|k| k.level == 1 && k.parent() == Some(root)));
+        assert!(kids.iter().all(|k| w.is_leaf(*k)));
+        assert_eq!(
+            w.get(low).unwrap().cell,
+            CellId {
+                x: 0,
+                y: 0,
+                z: 2,
+                level: 1
+            }
+        );
+        assert_eq!(
+            w.get(high).unwrap().cell,
+            CellId {
+                x: 0,
+                y: 0,
+                z: 3,
+                level: 1
+            }
+        );
+        let (lo, hi) = w.cell_bounds(CellId {
+            x: 0,
+            y: 0,
+            z: 3,
+            level: 1,
+        });
+        assert_eq!((lo.z, hi.z), (150.0, 200.0));
+        assert_eq!(
+            w.border_distance(root, at3(50.0, 50.0, 101.0)),
+            1.0,
+            "z border counts"
+        );
+        assert_eq!(w.merge_cell(root).unwrap(), None);
+        assert_eq!(w.get(low).unwrap().cell, root);
+    }
+
+    #[test]
+    fn three_d_neighbours_and_interest_cover_the_vertical_axis() {
+        let w = oct_world();
+        let c = CellId::root3(0, 0, 0);
+        assert_eq!(World::grid_neighbours(c, true).count(), 26);
+        assert_eq!(World::grid_neighbours(c, false).count(), 8);
+        let n = w.neighbours(c);
+        assert_eq!(n.len(), 26);
+        assert!(n.contains(&CellId::root3(0, 0, 1)) && n.contains(&CellId::root3(0, 0, -1)));
+        // a sphere of interest at the top of a voxel reaches the voxel above but not two up
+        let cells = w.cells_in_radius(at3(50.0, 50.0, 95.0), 10.0);
+        assert!(cells.contains(&CellId::root3(0, 0, 0)) && cells.contains(&CellId::root3(0, 0, 1)));
+        assert!(!cells.contains(&CellId::root3(0, 0, 2)));
+        // the 2-D world ignores height entirely
+        let flat = quad_world();
+        assert_eq!(flat.cell_of(at3(10.0, 10.0, 900.0)), CellId::root(0, 0));
+        assert_eq!(
+            flat.cells_in_radius(at3(50.0, 50.0, 95.0), 10.0),
+            vec![CellId::root(0, 0)]
+        );
+    }
+
+    #[test]
+    fn morton_codes_keep_locality_and_wire_format_stays_flat_for_2d() {
+        let a = CellId::root3(4, 4, 4);
+        let near = CellId::root3(5, 4, 4);
+        let far = CellId::root3(40, 4, 4);
+        assert!(a.morton().abs_diff(near.morton()) < a.morton().abs_diff(far.morton()));
+        assert!(CellId::root3(-1, 0, 0).morton() < CellId::root3(0, 0, 0).morton());
+        let mut cells = vec![far, near, a];
+        cells.sort_by_key(|c| c.morton());
+        assert_eq!(cells, vec![a, near, far]);
+        assert_eq!(
+            serde_json::to_string(&CellId::root(3, 4)).unwrap(),
+            r#"{"x":3,"y":4}"#,
+            "2-D cells serialise exactly as before"
+        );
+        assert_eq!(
+            serde_json::to_string(&CellId::root3(3, 4, 5)).unwrap(),
+            r#"{"x":3,"y":4,"z":5}"#
+        );
+        let p: Pos = serde_json::from_str(r#"{"x":1.0,"y":2.0}"#).unwrap();
+        assert_eq!(p.z, 0.0);
+        assert_eq!(serde_json::to_string(&p).unwrap(), r#"{"x":1.0,"y":2.0}"#);
     }
 
     #[test]
@@ -1945,7 +2159,8 @@ mod tests {
             CellId {
                 x: 0,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }
         );
         assert!(w.is_split(root) && !w.is_leaf(root));
@@ -1955,7 +2170,8 @@ mod tests {
             CellId {
                 x: 0,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }
         );
         assert_eq!(
@@ -1963,7 +2179,8 @@ mod tests {
             CellId {
                 x: 1,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }
         );
         assert_eq!(
@@ -1971,7 +2188,8 @@ mod tests {
             CellId {
                 x: 0,
                 y: 1,
-                level: 1
+                level: 1,
+                z: 0,
             }
         );
         assert_eq!(w.get(far).unwrap().cell, CellId::root(1, 0));
@@ -1980,7 +2198,8 @@ mod tests {
             CellId {
                 x: 1,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }
         );
         for k in kids {
@@ -1991,7 +2210,8 @@ mod tests {
             w.entities_in(CellId {
                 x: 1,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }),
             1
         );
@@ -2000,6 +2220,7 @@ mod tests {
             x: 1,
             y: 0,
             level: 1,
+            z: 0,
         });
         assert_eq!((lo.x, hi.x, hi.y), (50.0, 100.0, 50.0));
         let deeper = w
@@ -2007,6 +2228,7 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 1,
+                z: 0,
             })
             .unwrap();
         assert!(w.split_cell(deeper[0]).is_err(), "max_depth 2 reached");
@@ -2018,7 +2240,8 @@ mod tests {
             cells.contains(&CellId {
                 x: 3,
                 y: 0,
-                level: 2
+                level: 2,
+                z: 0,
             }),
             "{cells:?}"
         );
@@ -2027,7 +2250,8 @@ mod tests {
                 && !cells.contains(&CellId {
                     x: 1,
                     y: 0,
-                    level: 1
+                    level: 1,
+                    z: 0,
                 }),
             "{cells:?}"
         );
@@ -2036,13 +2260,15 @@ mod tests {
             x: 3,
             y: 0,
             level: 2,
+            z: 0,
         });
         assert!(
             n.contains(&CellId::root(1, 0))
                 && n.contains(&CellId {
                     x: 2,
                     y: 0,
-                    level: 2
+                    level: 2,
+                    z: 0,
                 }),
             "{n:?}"
         );
@@ -2050,14 +2276,16 @@ mod tests {
             n.contains(&CellId {
                 x: 3,
                 y: 1,
-                level: 2
+                level: 2,
+                z: 0,
             }),
             "{n:?}"
         );
         assert!(!n.contains(&CellId {
             x: 3,
             y: 0,
-            level: 2
+            level: 2,
+            z: 0,
         }));
         // and the coarse root (1,0) sees the fine leaves on its western edge, not the split parent
         let n = w.neighbours(CellId::root(1, 0));
@@ -2065,11 +2293,13 @@ mod tests {
             n.contains(&CellId {
                 x: 3,
                 y: 0,
-                level: 2
+                level: 2,
+                z: 0,
             }) && n.contains(&CellId {
                 x: 3,
                 y: 1,
-                level: 2
+                level: 2,
+                z: 0,
             }),
             "{n:?}"
         );
@@ -2077,7 +2307,8 @@ mod tests {
             !n.contains(&CellId {
                 x: 1,
                 y: 0,
-                level: 1
+                level: 1,
+                z: 0,
             }) && !n.contains(&root),
             "{n:?}"
         );
@@ -2106,11 +2337,13 @@ mod tests {
             x: 3,
             y: 3,
             level: 2,
+            z: 0,
         };
         w.pin_split(CellId {
             x: 1,
             y: 1,
             level: 1,
+            z: 0,
         })
         .unwrap();
         assert!(
@@ -2118,7 +2351,8 @@ mod tests {
                 && w.is_split(CellId {
                     x: 1,
                     y: 1,
-                    level: 1
+                    level: 1,
+                    z: 0,
                 })
         );
         assert!(w.is_leaf(deep));
@@ -2126,7 +2360,8 @@ mod tests {
             w.merge_cell(CellId {
                 x: 1,
                 y: 1,
-                level: 1
+                level: 1,
+                z: 0,
             })
             .is_err(),
             "pinned"
@@ -2134,13 +2369,15 @@ mod tests {
         assert!(w.unpin_split(CellId {
             x: 1,
             y: 1,
-            level: 1
+            level: 1,
+            z: 0,
         }));
         assert_eq!(
             w.merge_cell(CellId {
                 x: 1,
                 y: 1,
-                level: 1
+                level: 1,
+                z: 0,
             })
             .unwrap(),
             Some(s1)
@@ -2182,6 +2419,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
@@ -2190,16 +2428,25 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s2,
         );
         let a = w.spawn(
-            Pos { x: 95.0, y: 50.0 },
+            Pos {
+                x: 95.0,
+                y: 50.0,
+                z: 0.0,
+            },
             comps(serde_json::json!({"hp": 100})),
             false,
         );
         let b = w.spawn(
-            Pos { x: 50.0, y: 50.0 },
+            Pos {
+                x: 50.0,
+                y: 50.0,
+                z: 0.0,
+            },
             comps(serde_json::json!({"hp": 100})),
             false,
         );
@@ -2208,7 +2455,8 @@ mod tests {
             CellId {
                 x: 0,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
         );
         // a is within 10 of the border → ghost for cell (1,0); b is not
@@ -2217,6 +2465,7 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             })
             .iter()
             .map(|e| e.id)
@@ -2226,6 +2475,7 @@ mod tests {
             x: 0,
             y: 0,
             level: 0,
+            z: 0,
         });
         assert_eq!(v.owned.len(), 2);
         assert!(v.ghosts.is_empty());
@@ -2256,6 +2506,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
@@ -2264,16 +2515,43 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s2,
         );
-        let a = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
+        let a = w.spawn(
+            Pos {
+                x: 90.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
         // crossing by less than hysteresis: nothing happens
-        w.apply(s1, a, Some(Pos { x: 103.0, y: 50.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s1,
+            a,
+            Some(Pos {
+                x: 103.0,
+                y: 50.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         assert!(w.detect_handovers().is_empty());
-        w.apply(s1, a, Some(Pos { x: 108.0, y: 50.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s1,
+            a,
+            Some(Pos {
+                x: 108.0,
+                y: 50.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         let out = w.detect_handovers();
         assert_eq!(
             out,
@@ -2299,14 +2577,24 @@ mod tests {
             CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
         );
         assert_eq!(w.route_input(a, serde_json::json!({})).unwrap(), Some(s2));
         assert!(w.apply(s1, a, None, BTreeMap::new()).is_err());
         // timeout path: move back towards s1, never ack → cancelled after 3 ticks, authority stays with s2
-        w.apply(s2, a, Some(Pos { x: 80.0, y: 50.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s2,
+            a,
+            Some(Pos {
+                x: 80.0,
+                y: 50.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         assert!(matches!(
             w.detect_handovers()[0],
             HandoverOutcome::Started { .. }
@@ -2332,6 +2620,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
@@ -2340,19 +2629,38 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
-        let a = w.spawn(Pos { x: 50.0, y: 50.0 }, BTreeMap::new(), true);
-        w.apply(s1, a, Some(Pos { x: 150.0, y: 50.0 }), BTreeMap::new())
-            .unwrap();
+        let a = w.spawn(
+            Pos {
+                x: 50.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            true,
+        );
+        w.apply(
+            s1,
+            a,
+            Some(Pos {
+                x: 150.0,
+                y: 50.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         assert!(w.detect_handovers().is_empty());
         assert_eq!(
             w.get(a).unwrap().cell,
             CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
         );
         w.advance();
@@ -2361,7 +2669,8 @@ mod tests {
             w.owner(CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }),
             None
         );
@@ -2370,7 +2679,8 @@ mod tests {
             vec![CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }]
         );
         let snap = w.snapshot_persistent();
@@ -2385,7 +2695,8 @@ mod tests {
             CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
         );
     }
@@ -2402,17 +2713,38 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
         let c = Uuid::now_v7();
-        w.subscribe(c, Pos { x: 0.0, y: 0.0 }, 60.0);
+        w.subscribe(
+            c,
+            Pos {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            60.0,
+        );
         let near = w.spawn(
-            Pos { x: 10.0, y: 10.0 },
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
             comps(serde_json::json!({"hp": 5})),
             false,
         );
-        let far = w.spawn(Pos { x: 90.0, y: 90.0 }, BTreeMap::new(), false);
+        let far = w.spawn(
+            Pos {
+                x: 90.0,
+                y: 90.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
         let d = w.delta_for(c).unwrap();
         assert_eq!(
             d.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
@@ -2424,8 +2756,17 @@ mod tests {
         let d = w.delta_for(c).unwrap();
         assert_eq!(d.updated.len(), 1);
         assert_eq!(d.updated[0].component("hp").unwrap().version, 2);
-        w.apply(s1, near, Some(Pos { x: 90.0, y: 0.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s1,
+            near,
+            Some(Pos {
+                x: 90.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         let d = w.delta_for(c).unwrap();
         assert_eq!(d.despawned, vec![near]);
         let _ = far;
@@ -2443,6 +2784,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
@@ -2450,15 +2792,43 @@ mod tests {
         // budget of one byte: exactly one entity per tick, nearest first
         w.subscribe_with(
             c,
-            Pos { x: 0.0, y: 0.0 },
+            Pos {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             500.0,
             Some(1),
             BTreeMap::new(),
             1,
         );
-        let far = w.spawn(Pos { x: 300.0, y: 0.0 }, BTreeMap::new(), false);
-        let mid = w.spawn(Pos { x: 100.0, y: 0.0 }, BTreeMap::new(), false);
-        let near = w.spawn(Pos { x: 10.0, y: 0.0 }, BTreeMap::new(), false);
+        let far = w.spawn(
+            Pos {
+                x: 300.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
+        let mid = w.spawn(
+            Pos {
+                x: 100.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
+        let near = w.spawn(
+            Pos {
+                x: 10.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
         let ids = |d: &Delta| d.spawned.iter().map(|e| e.id).collect::<Vec<_>>();
         assert_eq!(ids(&w.delta_for(c).unwrap()), vec![near]);
         w.advance();
@@ -2468,10 +2838,28 @@ mod tests {
         w.advance();
         assert_eq!(w.delta_for(c).unwrap(), Delta::default());
         // a stale far entity outranks a fresh near one once it has waited long enough
-        w.apply(s1, far, Some(Pos { x: 301.0, y: 0.0 }), BTreeMap::new())
-            .unwrap();
-        w.apply(s1, near, Some(Pos { x: 11.0, y: 0.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s1,
+            far,
+            Some(Pos {
+                x: 301.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        w.apply(
+            s1,
+            near,
+            Some(Pos {
+                x: 11.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         for _ in 0..10 {
             w.advance();
         }
@@ -2503,6 +2891,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
@@ -2511,20 +2900,54 @@ mod tests {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s2,
         );
-        let v = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
-        let p = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
-        let q = w.spawn(Pos { x: 90.0, y: 50.0 }, BTreeMap::new(), false);
+        let v = w.spawn(
+            Pos {
+                x: 90.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
+        let p = w.spawn(
+            Pos {
+                x: 90.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
+        let q = w.spawn(
+            Pos {
+                x: 90.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
         w.attach(p, v).unwrap();
         w.attach(q, p).unwrap();
         assert!(w.attach(v, q).is_err(), "cycle refused");
         assert!(w.attach(v, v).is_err());
         assert_eq!(w.attached(v), vec![p, q]);
         // only the root crosses; passengers ride along in one transaction
-        w.apply(s1, v, Some(Pos { x: 108.0, y: 50.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s1,
+            v,
+            Some(Pos {
+                x: 108.0,
+                y: 50.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         let out = w.detect_handovers();
         assert_eq!(
             out,
@@ -2547,15 +2970,25 @@ mod tests {
                 CellId {
                     x: 1,
                     y: 0,
-                    level: 0
+                    level: 0,
+                    z: 0,
                 }
             );
             assert!(e.transit.is_none());
         }
         assert_eq!(w.route_input(q, serde_json::json!({})).unwrap(), Some(s2));
         // timeout: the whole group rolls back and is not offered again until the backoff passes
-        w.apply(s2, v, Some(Pos { x: 80.0, y: 50.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s2,
+            v,
+            Some(Pos {
+                x: 80.0,
+                y: 50.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         assert!(matches!(
             w.detect_handovers()[0],
             HandoverOutcome::Started { .. }
@@ -2596,20 +3029,40 @@ mod tests {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
             s1,
         );
         let c = Uuid::now_v7();
         let mut filter = BTreeMap::new();
         filter.insert("team".to_string(), serde_json::json!("red"));
-        w.subscribe_with(c, Pos { x: 0.0, y: 0.0 }, 500.0, None, filter, 1);
+        w.subscribe_with(
+            c,
+            Pos {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            500.0,
+            None,
+            filter,
+            1,
+        );
         let red = w.spawn(
-            Pos { x: 10.0, y: 0.0 },
+            Pos {
+                x: 10.0,
+                y: 0.0,
+                z: 0.0,
+            },
             comps(serde_json::json!({"team": "red"})),
             false,
         );
         let _blue = w.spawn(
-            Pos { x: 10.0, y: 5.0 },
+            Pos {
+                x: 10.0,
+                y: 5.0,
+                z: 0.0,
+            },
             comps(serde_json::json!({"team": "blue"})),
             false,
         );
@@ -2619,11 +3072,29 @@ mod tests {
             vec![red]
         );
         // a move below the quantum is not an update; above it is, and arrives quantized
-        w.apply(s1, red, Some(Pos { x: 10.04, y: 0.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s1,
+            red,
+            Some(Pos {
+                x: 10.04,
+                y: 0.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(w.delta_for(c).unwrap(), Delta::default());
-        w.apply(s1, red, Some(Pos { x: 10.26, y: 0.0 }), BTreeMap::new())
-            .unwrap();
+        w.apply(
+            s1,
+            red,
+            Some(Pos {
+                x: 10.26,
+                y: 0.0,
+                z: 0.0,
+            }),
+            BTreeMap::new(),
+        )
+        .unwrap();
         let d = w.delta_for(c).unwrap();
         assert_eq!(d.updated.len(), 1);
         assert!(
@@ -2653,7 +3124,15 @@ mod perf {
         let lease_all = |w: &mut World| {
             for x in 0..3 {
                 for y in 0..3 {
-                    w.grant_lease(CellId { x, y, level: 0 }, s1);
+                    w.grant_lease(
+                        CellId {
+                            x,
+                            y,
+                            level: 0,
+                            z: 0,
+                        },
+                        s1,
+                    );
                 }
             }
         };
@@ -2663,6 +3142,7 @@ mod perf {
             Pos {
                 x: (h >> 11) as f64 / (1u64 << 53) as f64 * side,
                 y: (h.rotate_left(29) >> 11) as f64 / (1u64 << 53) as f64 * side,
+                z: 0.0,
             }
         };
         let ids: Vec<EntityId> = (0..500u64)
@@ -2693,6 +3173,7 @@ mod perf {
                     let np = Pos {
                         x: (base.x + (h.x / side - 0.5) * side * 0.1).rem_euclid(side),
                         y: (base.y + (h.y / side - 0.5) * side * 0.1).rem_euclid(side),
+                        z: 0.0,
                     };
                     w.subscribe_with(*c, np, radius, None, BTreeMap::new(), 1);
                 }
@@ -2728,20 +3209,21 @@ fn size_at(base: f64, level: u8) -> f64 {
     base / f64::from(1u32 << level)
 }
 
-fn cell_at(base: f64, level: u8, p: Pos) -> CellId {
+fn cell_at(base: f64, three_d: bool, level: u8, p: Pos) -> CellId {
     let s = size_at(base, level);
     CellId {
         x: (p.x / s).floor() as i32,
         y: (p.y / s).floor() as i32,
+        z: if three_d { (p.z / s).floor() as i32 } else { 0 },
         level,
     }
 }
 
 /// Deepest cell holding `p`: descend from the base grid while cells are split.
-fn leaf_of(base: f64, split: &HashSet<CellId>, p: Pos) -> CellId {
-    let mut c = cell_at(base, 0, p);
+fn leaf_of(base: f64, three_d: bool, split: &HashSet<CellId>, p: Pos) -> CellId {
+    let mut c = cell_at(base, three_d, 0, p);
     while split.contains(&c) {
-        c = cell_at(base, c.level + 1, p);
+        c = cell_at(base, three_d, c.level + 1, p);
     }
     c
 }
@@ -2752,49 +3234,67 @@ fn grid_bounds(base: f64, c: CellId) -> (Pos, Pos) {
         Pos {
             x: c.x as f64 * s,
             y: c.y as f64 * s,
+            z: c.z as f64 * s,
         },
         Pos {
             x: (c.x + 1) as f64 * s,
             y: (c.y + 1) as f64 * s,
+            z: (c.z + 1) as f64 * s,
         },
     )
 }
 
-fn grid_border_distance(base: f64, c: CellId, p: Pos) -> f64 {
+fn grid_border_distance(base: f64, three_d: bool, c: CellId, p: Pos) -> f64 {
     let (lo, hi) = grid_bounds(base, c);
     let dx = (p.x - lo.x).min(hi.x - p.x);
     let dy = (p.y - lo.y).min(hi.y - p.y);
-    dx.min(dy)
+    let d = dx.min(dy);
+    if three_d {
+        d.min((p.z - lo.z).min(hi.z - p.z))
+    } else {
+        d
+    }
 }
 
-/// Leaf cells whose bounds intersect the square around `p` of half-side `radius`.
-fn grid_cells_in_radius(base: f64, split: &HashSet<CellId>, p: Pos, radius: f64) -> Vec<CellId> {
+/// Leaf cells whose bounds intersect the square (cube in 3-D) around `p` of half-side `radius`.
+fn grid_cells_in_radius(
+    base: f64,
+    three_d: bool,
+    split: &HashSet<CellId>,
+    p: Pos,
+    radius: f64,
+) -> Vec<CellId> {
     let (qlo, qhi) = (
         Pos {
             x: p.x - radius,
             y: p.y - radius,
+            z: if three_d { p.z - radius } else { 0.0 },
         },
         Pos {
             x: p.x + radius,
             y: p.y + radius,
+            z: if three_d { p.z + radius } else { 0.0 },
         },
     );
-    let lo = cell_at(base, 0, qlo);
-    let hi = cell_at(base, 0, qhi);
+    let lo = cell_at(base, three_d, 0, qlo);
+    let hi = cell_at(base, three_d, 0, qhi);
     let mut v = Vec::new();
     let mut stack = Vec::new();
     for x in lo.x..=hi.x {
         for y in lo.y..=hi.y {
-            stack.push(CellId::root(x, y));
-            while let Some(c) = stack.pop() {
-                if !split.contains(&c) {
-                    v.push(c);
-                    continue;
-                }
-                for k in c.children() {
-                    let (klo, khi) = grid_bounds(base, k);
-                    if khi.x > qlo.x && klo.x < qhi.x && khi.y > qlo.y && klo.y < qhi.y {
-                        stack.push(k);
+            for z in lo.z..=hi.z {
+                stack.push(CellId::root3(x, y, z));
+                while let Some(c) = stack.pop() {
+                    if !split.contains(&c) {
+                        v.push(c);
+                        continue;
+                    }
+                    for k in c.split_into(three_d) {
+                        let (klo, khi) = grid_bounds(base, k);
+                        let hit = khi.x > qlo.x && klo.x < qhi.x && khi.y > qlo.y && klo.y < qhi.y;
+                        if hit && (!three_d || (khi.z > qlo.z && klo.z < qhi.z)) {
+                            stack.push(k);
+                        }
                     }
                 }
             }
@@ -2819,7 +3319,7 @@ pub struct WorldView {
 
 impl WorldView {
     pub fn cells_in_radius(&self, p: Pos, radius: f64) -> Vec<CellId> {
-        grid_cells_in_radius(self.cfg.cell_size, &self.split, p, radius)
+        grid_cells_in_radius(self.cfg.cell_size, self.cfg.three_d, &self.split, p, radius)
     }
 
     /// Slowest time scale around a client's interest (1.0 when undilated).
@@ -2832,7 +3332,8 @@ impl WorldView {
         self.cell_scale
             .iter()
             .filter(|(c, _)| {
-                grid_border_distance(self.cfg.cell_size, **c, interest.pos) > -interest.radius
+                grid_border_distance(self.cfg.cell_size, self.cfg.three_d, **c, interest.pos)
+                    > -interest.radius
             })
             .map(|(_, s)| *s)
             .fold(1.0, f64::min)

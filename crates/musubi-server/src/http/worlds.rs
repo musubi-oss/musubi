@@ -254,7 +254,7 @@ struct InteractReq {
 impl InteractReq {
     fn spec(self) -> (Uuid, String, InteractSpec) {
         let at = match (self.x, self.y) {
-            (Some(x), Some(y)) => Some(Pos { x, y }),
+            (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
             _ => None,
         };
         (
@@ -452,7 +452,14 @@ async fn spawn(
     Path(w): Path<String>,
     Json(r): Json<SpawnReq>,
 ) -> Result<Response, Response> {
-    match s.worlds.cell_of(&w, Pos { x: r.x, y: r.y }) {
+    match s.worlds.cell_of(
+        &w,
+        Pos {
+            x: r.x,
+            y: r.y,
+            z: 0.0,
+        },
+    ) {
         Ok(c) => ensure_cell_home(&s, &w, c, &uri).await?,
         Err(_) => ensure_home(&s, &w, &uri).await?,
     }
@@ -461,7 +468,11 @@ async fn spawn(
             &w,
             r.sim,
             SpawnSpec {
-                pos: Pos { x: r.x, y: r.y },
+                pos: Pos {
+                    x: r.x,
+                    y: r.y,
+                    z: 0.0,
+                },
                 components: r.components,
                 persistent: r.persistent,
                 decay_ticks: r.decay_ticks,
@@ -552,7 +563,7 @@ async fn apply(
     ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
         let pos = match (r.x, r.y) {
-            (Some(x), Some(y)) => Some(Pos { x, y }),
+            (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
             (None, None) => None,
             _ => return Err(Error::InvalidArgument("x and y go together".into()).into()),
         };
@@ -574,6 +585,7 @@ async fn view(
         x,
         y,
         level: q.level,
+        z: q.z,
     };
     ensure_cell_home(&s, &w, cell, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async { Ok(Json(s.worlds.view(&w, cell)?)) }.await;
@@ -655,7 +667,7 @@ async fn rewind(
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let at = match (r.x, r.y) {
-        (Some(x), Some(y)) => Some(Pos { x, y }),
+        (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
         _ => None,
     };
     let r: Result<Json<Value>, ApiError> = async {
@@ -786,7 +798,11 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             }
             "spawn" => {
                 let r: SpawnReq = serde_json::from_value(cmd).map_err(bad)?;
-                let pos = Pos { x: r.x, y: r.y };
+                let pos = Pos {
+                    x: r.x,
+                    y: r.y,
+                    z: 0.0,
+                };
                 let at_home = match s.worlds.cell_of(w, pos) {
                     Ok(c) => ensure_cell_home(s, w, c, uri).await,
                     Err(_) => ensure_home(s, w, uri).await,
@@ -839,7 +855,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             "apply" => {
                 let r: ApplyReq = serde_json::from_value(cmd).map_err(bad)?;
                 let pos = match (r.x, r.y) {
-                    (Some(x), Some(y)) => Some(Pos { x, y }),
+                    (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
                     (None, None) => None,
                     _ => return Err(Error::InvalidArgument("x and y go together".into())),
                 };
@@ -863,7 +879,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             "rewind" => {
                 let r: RewindReq = serde_json::from_value(cmd).map_err(bad)?;
                 let at = match (r.x, r.y) {
-                    (Some(x), Some(y)) => Some(Pos { x, y }),
+                    (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
                     _ => None,
                 };
                 reply["result"] =

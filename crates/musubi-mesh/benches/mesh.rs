@@ -18,6 +18,7 @@ fn populated(n: usize, cells: i64) -> (World, Uuid, Vec<musubi_mesh::EntityId>) 
             let p = Pos {
                 x: x as f64 * size + 1.0,
                 y: y as f64 * size + 1.0,
+                z: 0.0,
             };
             w.grant_lease(w.cell_of(p), sim);
         }
@@ -28,6 +29,7 @@ fn populated(n: usize, cells: i64) -> (World, Uuid, Vec<musubi_mesh::EntityId>) 
         let p = Pos {
             x: (t * 2.0 - 1.0) * cells as f64 * size * 0.9,
             y: ((i * 7919) % 1000) as f64 / 1000.0 * size * 0.9,
+            z: 0.0,
         };
         ids.push(w.spawn(p, BTreeMap::new(), false));
     }
@@ -49,6 +51,7 @@ fn bench(c: &mut Criterion) {
                             Some(Pos {
                                 x: p.x + SIZE,
                                 y: p.y,
+                                z: 0.0,
                             }),
                             BTreeMap::new(),
                         );

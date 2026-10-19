@@ -315,7 +315,7 @@ mod tests {
             .collect()
     }
     fn p(x: f64, y: f64) -> Pos {
-        Pos { x, y }
+        Pos { x, y, z: 0.0 }
     }
 
     #[test]

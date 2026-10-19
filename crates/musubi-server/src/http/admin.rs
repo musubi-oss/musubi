@@ -1226,6 +1226,9 @@ async fn world_snapshot(
 pub struct CellLevelQuery {
     #[serde(default)]
     pub level: u8,
+    /// Vertical index for `three_d` worlds (P1-57); 0 for flat worlds.
+    #[serde(default)]
+    pub z: i32,
 }
 
 async fn world_cell_host(
@@ -1239,6 +1242,7 @@ async fn world_cell_host(
         x,
         y,
         level: q.level,
+        z: q.z,
     };
     if s.worlds.home_of(&w).await?.is_none() {
         return Err(Error::NotFound(format!("world {w}")).into());

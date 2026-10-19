@@ -2761,6 +2761,7 @@ async fn sim_sdk_two_simulators_hand_an_entity_over() {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             }],
         )
         .await
@@ -2772,6 +2773,7 @@ async fn sim_sdk_two_simulators_hand_an_entity_over() {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             }],
         )
         .await
@@ -2811,6 +2813,7 @@ async fn sim_sdk_two_simulators_hand_an_entity_over() {
                 x: 1,
                 y: 0,
                 level: 0,
+                z: 0,
             })
             .await
             .unwrap();
@@ -4340,7 +4343,11 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
         .spawn(
             &name,
             sim,
-            musubi_mesh::Pos { x: 1.0, y: 1.0 },
+            musubi_mesh::Pos {
+                x: 1.0,
+                y: 1.0,
+                z: 0.0,
+            },
             json!({"hp": 10}),
             true,
         )
@@ -4348,7 +4355,11 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
     r1.spawn(
         &name,
         sim,
-        musubi_mesh::Pos { x: 2.0, y: 2.0 },
+        musubi_mesh::Pos {
+            x: 2.0,
+            y: 2.0,
+            z: 0.0,
+        },
         json!({}),
         false,
     )
@@ -4369,6 +4380,7 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
         x: 0,
         y: 0,
         level: 0,
+        z: 0,
     };
     let view = r2.view(&name, cell).unwrap();
     let s = view.to_string();
@@ -4701,7 +4713,11 @@ async fn world_journal_is_replayed_on_rehome() {
         .spawn(
             &name,
             sim,
-            musubi_mesh::Pos { x: 1.0, y: 1.0 },
+            musubi_mesh::Pos {
+                x: 1.0,
+                y: 1.0,
+                z: 0.0,
+            },
             json!({"hp": 10}),
             true,
         )
@@ -4714,7 +4730,11 @@ async fn world_journal_is_replayed_on_rehome() {
         .spawn(
             &name,
             sim,
-            musubi_mesh::Pos { x: 1.5, y: 1.5 },
+            musubi_mesh::Pos {
+                x: 1.5,
+                y: 1.5,
+                z: 0.0,
+            },
             json!({"kind": "chest"}),
             true,
         )
@@ -4723,7 +4743,11 @@ async fn world_journal_is_replayed_on_rehome() {
         .spawn(
             &name,
             sim,
-            musubi_mesh::Pos { x: 1.2, y: 1.2 },
+            musubi_mesh::Pos {
+                x: 1.2,
+                y: 1.2,
+                z: 0.0,
+            },
             json!({}),
             true,
         )
@@ -4748,6 +4772,7 @@ async fn world_journal_is_replayed_on_rehome() {
                 x: 0,
                 y: 0,
                 level: 0,
+                z: 0,
             },
         )
         .unwrap()
@@ -6786,7 +6811,8 @@ async fn world_cell_host_failover() {
             musubi_mesh::CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
         )]
     );
@@ -9998,7 +10024,11 @@ async fn world_fenced_host_cannot_persist() {
     r1.spawn(
         &name,
         sim,
-        musubi_mesh::Pos { x: 1.0, y: 1.0 },
+        musubi_mesh::Pos {
+            x: 1.0,
+            y: 1.0,
+            z: 0.0,
+        },
         json!({"hp": 10}),
         true,
     )
@@ -10025,7 +10055,11 @@ async fn world_fenced_host_cannot_persist() {
     r1.spawn(
         &name,
         sim,
-        musubi_mesh::Pos { x: 3.0, y: 3.0 },
+        musubi_mesh::Pos {
+            x: 3.0,
+            y: 3.0,
+            z: 0.0,
+        },
         json!({"stale": true}),
         true,
     )
@@ -13925,6 +13959,7 @@ async fn world_replica_takes_over_without_snapshot() {
                     x: 1,
                     y: 0,
                     level: 0,
+                    z: 0,
                 }
                 && x.node == node1
                 && x.tick >= applied_tick
@@ -13941,7 +13976,8 @@ async fn world_replica_takes_over_without_snapshot() {
             == musubi_mesh::CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
             && m.node == node2),
         "home mirrors the cell hosted on node 2: {:?}",
@@ -13961,6 +13997,7 @@ async fn world_replica_takes_over_without_snapshot() {
                         x: 1,
                         y: 0,
                         level: 0,
+                        z: 0,
                     }
             })
             .map(|m| (m.node, m.tick))
@@ -13971,6 +14008,7 @@ async fn world_replica_takes_over_without_snapshot() {
             x: 1,
             y: 0,
             level: 0,
+            z: 0,
         },
         tick: before.1 + 1000,
         keyframe,
@@ -14027,7 +14065,8 @@ async fn world_replica_takes_over_without_snapshot() {
             musubi_mesh::CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
         )]
     );
@@ -15477,7 +15516,11 @@ async fn world_history_and_verify() {
         .spawn(
             &name,
             sim,
-            musubi_mesh::Pos { x: 1.0, y: 1.0 },
+            musubi_mesh::Pos {
+                x: 1.0,
+                y: 1.0,
+                z: 0.0,
+            },
             json!({"hp": 10}),
             true,
         )
@@ -15489,7 +15532,11 @@ async fn world_history_and_verify() {
         .spawn(
             &name,
             sim,
-            musubi_mesh::Pos { x: 1.2, y: 1.2 },
+            musubi_mesh::Pos {
+                x: 1.2,
+                y: 1.2,
+                z: 0.0,
+            },
             json!({}),
             true,
         )
@@ -16340,7 +16387,8 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
             musubi_mesh::CellId {
                 x: 1,
                 y: 0,
-                level: 0
+                level: 0,
+                z: 0,
             }
         )]
     );

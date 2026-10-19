@@ -925,7 +925,7 @@ impl WorldRegistry {
             if v["node_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) != Some(self.node_id) {
                 continue;
             }
-            let cell = CellId { x, y, level };
+            let cell = CellId { x, y, level, z: 0 };
             let home = match self.home_of(name).await {
                 Ok(Some(h)) => h,
                 _ => continue,
@@ -1492,6 +1492,7 @@ impl WorldRegistry {
                 x,
                 y,
                 level: level as u8,
+                z: 0,
             });
         }
         let rows: Vec<(Option<Uuid>, Value)> = sqlx::query_as(if only {
@@ -1980,7 +1981,7 @@ impl WorldRegistry {
             } => self.subscribe(
                 &env.world,
                 env.session_id,
-                Pos { x, y },
+                Pos { x, y, z: 0.0 },
                 radius,
                 budget_bytes.map(|b| b as usize),
                 filter,

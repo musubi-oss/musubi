@@ -4018,14 +4018,14 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **Already covered rows (1):** Hathora: Short codes / join codes
 
 #### P1-57. Spatial partitioning (grid/quadtree/octree, 3-D cells, split/merge by load)  
-*area:* meshing/world · *musubi:* 🟡 partial (1h/4p/1m over 6 rows)
+*area:* meshing/world · *musubi:* ✅ covered (3-D/octree + Morton shipped; 2 rows remain partial)
 - **Competitors with it (2):** Meshing vendors, Pragma
 - **Why it matters:** Single-shard open worlds.
-- **Implementation sketch (musubi terms):** Exists: 2-D grid + quadtree with cost-based split/merge. Gap: 3-D/octree partitioning for vertical worlds.
+- **Implementation sketch (musubi terms):** 2-D grid + quadtree with cost-based split/merge, and `three_d: true` worlds: `cell_size` cubes, octree split into 8 / merge of 8, `z` in `Pos`/`CellId` (omitted on the wire when 0), sphere interest, 26 neighbours, vertical ghost/handover borders, `CellId::morton()` Z-order codes.
 - **What the reports found weaker/missing (merged rows):**
-  - ❌ Meshing vendors: *3-D octree partitioning* — `musubi-mesh/src/lib.rs:8` "3D/octree ... later"
-  - 🟡 Meshing vendors: *Space→process mapping* — musubi grid/quadtree cells leased to simulators, but 2-D only and cells are coarser than per-process Morton intervals
-  - 🟡 Meshing vendors: *Morton-region spatial library* — quadtree `CellId` only; no Morton/space-filling-curve index
+  - ✅ Meshing vendors: *3-D octree partitioning* — `WorldConfig::three_d` (README "3-D worlds")
+  - 🟡 Meshing vendors: *Space→process mapping* — cells (quadtree/octree leaves) leased to simulators; Morton codes exist for ordering/packing but the controller still assigns whole cells, not arbitrary Morton intervals
+  - ✅ Meshing vendors: *Morton-region spatial library* — `CellId::morton()` (21 bits per axis, negative coordinates offset) used by the inspector ordering and available to embedders
   - 🟡 Meshing vendors: *Zone System* — attach/detach keeps passengers with transport, but no nested moving coordinate frames
   - 🟡 Pragma: *Multi-database sharding of services* — single Postgres (read replicas via connection string); table partitioning for ledgers/events but no per-service DB routing.
 - **Already covered rows (1):** Meshing vendors: Spatial partitioning / load balancing across simulators
