@@ -60,6 +60,7 @@ fn challenge(
         exp: now + CHALLENGE_SECS,
         vars,
         name: None,
+        scopes: Vec::new(),
     })?;
     Ok((b64, token))
 }

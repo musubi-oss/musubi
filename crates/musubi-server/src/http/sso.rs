@@ -216,7 +216,7 @@ async fn callback(
         + time::Duration::hours(c.session_hours.clamp(1, 24 * 30) as i64);
     let (caller, secret) = s
         .keys
-        .issue_with(&s.db, &name, role, Some(expires_at), Some(&claims.sub))
+        .issue_with(&s.db, &name, role, Some(expires_at), Some(&claims.sub), &[])
         .await?;
     if let Some(cl) = &s.cluster {
         let _ = cl.publish(crate::keys::KEYS_TOPIC, &caller.id).await;

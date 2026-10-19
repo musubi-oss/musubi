@@ -165,6 +165,8 @@ pub struct Caller {
     pub role: Role,
     /// Per-key rate limit override (see `KeyLimit`).
     pub limit: Option<KeyLimit>,
+    /// Resource scopes (`crate::scopes`); empty = whatever the role allows.
+    pub scopes: Vec<String>,
 }
 
 impl Caller {
@@ -174,6 +176,7 @@ impl Caller {
             name: "config".into(),
             role: Role::Admin,
             limit: None,
+            scopes: Vec::new(),
         }
     }
 }
@@ -201,8 +204,9 @@ impl ServerKeys {
             Option<i32>,
             Option<i32>,
             Option<i64>,
+        Vec<String>,
         )> = sqlx::query_as(
-            "select id, name, role, hash, expires_at, per_second, burst, daily from musubi.server_keys
+            "select id, name, role, hash, expires_at, per_second, burst, daily, scopes from musubi.server_keys
              where revoked_at is null and (expires_at is null or expires_at > now())",
         )
         .fetch_all(db)
@@ -210,7 +214,7 @@ impl ServerKeys {
         .map_err(Error::internal)?;
         self.by_hash.clear();
         self.expires.clear();
-        for (id, name, role, h, exp, p, b, d) in &rows {
+        for (id, name, role, h, exp, p, b, d, sc) in &rows {
             if let Some(role) = Role::parse(role) {
                 self.by_hash.insert(
                     h.clone(),
@@ -219,6 +223,7 @@ impl ServerKeys {
                         name: name.clone(),
                         role,
                         limit: KeyLimit::from_row(*p, *b, *d),
+                        scopes: sc.clone(),
                     },
                 );
                 if let Some(exp) = exp {
@@ -265,7 +270,7 @@ impl ServerKeys {
 
     /// Create a key; the secret is returned exactly once.
     pub async fn issue(&self, db: &PgPool, name: &str, role: Role) -> Result<(Caller, String)> {
-        self.issue_with(db, name, role, None, None).await
+        self.issue_with(db, name, role, None, None, &[]).await
     }
 
     /// A key that stops working at `expires_at` (operator SSO sessions) and remembers the
@@ -277,7 +282,9 @@ impl ServerKeys {
         role: Role,
         expires_at: Option<time::OffsetDateTime>,
         subject: Option<&str>,
+        scopes: &[String],
     ) -> Result<(Caller, String)> {
+        crate::scopes::validate(scopes)?;
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidArgument("name 1..=64 chars".into()));
         }
@@ -291,7 +298,7 @@ impl ServerKeys {
         let secret = format!("msk_{}", hash(&seed));
         let id = Uuid::now_v7();
         sqlx::query(
-            "insert into musubi.server_keys (id, name, role, hash, expires_at, subject) values ($1, $2, $3, $4, $5, $6)",
+            "insert into musubi.server_keys (id, name, role, hash, expires_at, subject, scopes) values ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(id)
         .bind(name)
@@ -299,6 +306,7 @@ impl ServerKeys {
         .bind(hash(&secret))
         .bind(expires_at)
         .bind(subject)
+        .bind(scopes)
         .execute(db)
         .await
         .map_err(Error::internal)?;
@@ -307,6 +315,7 @@ impl ServerKeys {
             name: name.to_string(),
             role,
             limit: None,
+            scopes: scopes.to_vec(),
         };
         if let Some(exp) = expires_at {
             self.expires.insert(id, exp);

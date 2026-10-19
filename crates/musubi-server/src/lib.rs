@@ -40,6 +40,7 @@ pub mod regions;
 pub mod retention;
 pub mod runtime_host;
 pub mod schedules;
+pub mod scopes;
 pub mod security;
 pub mod telemetry;
 pub mod translate;

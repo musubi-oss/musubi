@@ -71,6 +71,10 @@ pub struct Authenticated {
     pub account_id: AccountId,
     pub session_id: SessionId,
     pub vars: serde_json::Map<String, serde_json::Value>,
+    /// Resource scopes of a down-scoped token (empty = full session).
+    pub scopes: Vec<String>,
+    /// Token expiry, unix seconds.
+    pub exp: i64,
     /// From the token when it carries one; older tokens fall back to an account read.
     pub username: Option<String>,
 }
@@ -265,6 +269,7 @@ impl AuthService {
             exp,
             vars: pending,
             name: None,
+            scopes: Vec::new(),
         })?;
         Ok(self.queued(q, ticket, position, exp))
     }
@@ -598,7 +603,33 @@ impl AuthService {
             session_id: c.sid,
             vars: c.vars,
             username: c.name,
+            scopes: c.scopes,
+            exp: c.exp,
         })
+    }
+
+    /// A down-scoped access token for an existing session: only `scopes`, no refresh token,
+    /// at most `ttl_secs` long. Returns the token and its expiry.
+    pub fn sign_scoped(
+        &self,
+        account_id: AccountId,
+        session_id: SessionId,
+        username: Option<String>,
+        scopes: Vec<String>,
+        ttl_secs: i64,
+    ) -> Result<(String, i64)> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ttl = ttl_secs.clamp(1, self.signer.access_ttl_secs as i64 * 24);
+        let claims = Claims {
+            sub: account_id,
+            sid: session_id,
+            iat: now,
+            exp: now + ttl,
+            vars: Default::default(),
+            name: username,
+            scopes,
+        };
+        Ok((self.signer.sign(&claims)?, now + ttl))
     }
 
     /// Rotate a refresh token. Reusing an already-rotated token revokes the entire family.
@@ -740,6 +771,7 @@ impl AuthService {
             exp: now + MFA_TOKEN_SECS,
             vars: pending,
             name: None,
+            scopes: Vec::new(),
         })?;
         Ok(Login::MfaRequired {
             account_id,
@@ -1478,6 +1510,7 @@ impl AuthService {
             exp: now.unix_timestamp() + self.signer.access_ttl_secs as i64,
             vars,
             name: Some(username),
+            scopes: Vec::new(),
         };
         Ok(Session {
             account_id,

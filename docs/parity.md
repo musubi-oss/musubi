@@ -80,6 +80,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Планы подписок вне сторов (VIP/сезон-пасс из кошелька или prepaid сервером: trial, grace, pause, cancel-at-period-end, награды за период, feature-entitlement) | ✅ `http/subscriptions.rs` | 🟡 только сторы | 🟡 | 🟡 | ❌ |
 | Offers / placements (приоритет, лимиты на игрока, cooldown, цепочки-предшественники, force-enable, статистика показов/покупок) | ✅ `http/offers.rs` | ❌ | 🟡 Metaplay-класс | ❌ | ❌ |
 | Продуктовая аналитика: инжест клиентских событий (схемы, семплинг, pre-login ключ), DAU/MAU, retention-когорты, воронки, revenue, экспорт/sinks (JSONL, ClickHouse, webhook) | ✅ `analytics.rs` (без UI-дэшбордов) | 🟡 Satori | ✅ | ✅ | ❌ |
+| Scoped-токены / publishable-ключи (down-scoped сессии игрока, ресурсные скоупы серверных ключей, проверка по маршрутам и на сокете) | ✅ `scopes.rs` | ❌ | 🟡 | 🟡 UGS restricted tokens | ❌ |
 | IAP: PSN / Xbox / Nintendo / Epic | ✅ `POST /v1/iap/{platform}`: s2s entitlement lookup + consume, `[iap.<platform>]` с переопределяемыми путями | ✅ | ❌ | ✅ | ✅ |
 | Подписки с продлением / grace | ✅ `iap_products.kind = subscription` + `grace_secs`, продление по чеку и Apple V2 / Google RTDN, `GET /v1/iap/subscriptions` | 🟡 | ✅ | ✅ | ✅ |
 | Entitlements: платформенные покупки / DLC → предметы | ✅ `/v1/entitlements` (+`/sync` по Steam-ownership), серверный каталог/grant/revoke | ✅ | ❌ | ✅ | ✅ |

@@ -1,7 +1,8 @@
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_auth::{AuthOptions, Session};
+use musubi_core::Error;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -16,6 +17,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/mfa", post(mfa))
         .route("/v1/auth/mfa/email/send", post(mfa_email_send))
         .route("/v1/auth/refresh", post(refresh))
+        .route("/v1/auth/token/scope", post(token_scope))
+        .route("/v1/server/accounts/{id}/token", post(server_token))
         .route("/v1/auth/queue", post(queue))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/steam", post(steam))
@@ -863,4 +866,86 @@ async fn mfa_email_send(
         )
         .await;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScopeBody {
+    pub scopes: Vec<String>,
+    /// Lifetime in seconds (default: the rest of the current token).
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+}
+
+/// `POST /v1/auth/token/scope {scopes, ttl_secs?}` — a down-scoped access token for the
+/// caller's own session (hand it to a companion app, overlay or third-party service). No
+/// refresh token; scopes must be within the caller's own.
+async fn token_scope(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<ScopeBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::scopes::validate(&b.scopes)?;
+    if b.scopes.is_empty() {
+        return Err(Error::InvalidArgument("scopes required".into()).into());
+    }
+    if !crate::scopes::within(&b.scopes, &me.scopes) {
+        return Err(
+            Error::PermissionDenied("requested scopes exceed the token's own".into()).into(),
+        );
+    }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let remaining = (me.exp - now).max(1);
+    let ttl = b.ttl_secs.unwrap_or(remaining).clamp(1, remaining);
+    let (token, exp) = s.auth.sign_scoped(
+        me.account_id,
+        me.session_id,
+        me.username.clone(),
+        b.scopes.clone(),
+        ttl,
+    )?;
+    Ok(Json(serde_json::json!({
+        "access_token": token, "expires_at": exp, "scopes": b.scopes, "account_id": me.account_id,
+    })))
+}
+
+/// `POST /v1/server/accounts/{id}/token {scopes, ttl_secs}` — the game mints a scoped token for a
+/// player (bots, spectator overlays, partner integrations) without their credentials.
+async fn server_token(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<uuid::Uuid>,
+    Json(b): Json<ScopeBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::scopes::validate(&b.scopes)?;
+    if b.scopes.is_empty() {
+        return Err(Error::InvalidArgument("scopes required".into()).into());
+    }
+    let exists: Option<(Option<String>,)> =
+        sqlx::query_as("select username from musubi.accounts where id = $1 and deleted_at is null")
+            .bind(id)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(Error::internal)?;
+    let Some((username,)) = exists else {
+        return Err(Error::NotFound("account".into()).into());
+    };
+    let ttl = b.ttl_secs.unwrap_or(3600).clamp(1, 30 * 86_400);
+    let account = musubi_core::AccountId(id);
+    let (token, exp) = s.auth.sign_scoped(
+        account,
+        musubi_core::SessionId(uuid::Uuid::now_v7()),
+        username,
+        b.scopes.clone(),
+        ttl,
+    )?;
+    s.events
+        .emit(
+            "account.scoped_token",
+            Some(account),
+            serde_json::json!({ "scopes": b.scopes, "expires_at": exp }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "access_token": token, "expires_at": exp, "scopes": b.scopes, "account_id": account,
+    })))
 }

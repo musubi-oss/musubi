@@ -841,6 +841,9 @@ pub fn start_drain_listener(s: AppState) {
 struct IssueKey {
     name: String,
     role: crate::keys::Role,
+    /// Resource scopes (`<area>`, `<area>:read`, `<area>:write`); empty = whole role.
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 async fn keys_list(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -855,7 +858,10 @@ async fn keys_issue(
     State(s): State<AppState>,
     Json(b): Json<IssueKey>,
 ) -> Result<Json<Value>, ApiError> {
-    let (caller, secret) = s.keys.issue(&s.db, &b.name, b.role).await?;
+    let (caller, secret) = s
+        .keys
+        .issue_with(&s.db, &b.name, b.role, None, None, &b.scopes)
+        .await?;
     if let Some(c) = &s.cluster {
         let _ = c.publish(crate::keys::KEYS_TOPIC, &caller.id).await;
     }

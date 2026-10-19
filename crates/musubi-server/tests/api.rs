@@ -19042,3 +19042,158 @@ async fn environments_registry_and_content_promotion() {
         assert_eq!(d["removed"], true);
     }
 }
+
+/// Scoped credentials (competitive P0-55): down-scoped player tokens, server-minted scoped tokens
+/// and server keys with resource scopes.
+#[tokio::test]
+async fn scoped_tokens_and_scoped_server_keys() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("sc-a")})),
+    )
+    .await;
+    let (ta, aid) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        a["account_id"].as_str().unwrap().to_string(),
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/token/scope",
+        Some(&ta),
+        Some(json!({"scopes": ["chat:delete"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/token/scope",
+        Some(&ta),
+        Some(json!({"scopes": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, t) = call(
+        &app,
+        "POST",
+        "/v1/auth/token/scope",
+        Some(&ta),
+        Some(json!({"scopes": ["account:read", "storage"], "ttl_secs": 600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["scopes"], json!(["account:read", "storage"]));
+    let scoped = t["access_token"].as_str().unwrap().to_string();
+    // reads in scope work, writes outside do not
+    let (st, me) = call(&app, "GET", "/v1/account", Some(&scoped), None).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    let (st, w) = call(&app, "GET", "/v1/wallet", Some(&scoped), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{w}");
+    assert!(
+        w["message"].as_str().unwrap().contains("account:read"),
+        "{w}"
+    );
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("/v1/storage/{}/k1", unique("col")),
+        Some(&scoped),
+        Some(json!({"value": {"a": 1}})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::FORBIDDEN, "storage scope covers writes");
+    let (st, _) = call(&app, "POST", "/v1/account/mfa/email", Some(&scoped), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "account:read is read-only");
+    // cannot widen: a scoped token only narrows further
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/token/scope",
+        Some(&scoped),
+        Some(json!({"scopes": ["wallet"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, t2) = call(
+        &app,
+        "POST",
+        "/v1/auth/token/scope",
+        Some(&scoped),
+        Some(json!({"scopes": ["storage:read"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t2}");
+    assert!(
+        t2["expires_at"].as_i64().unwrap() <= t["expires_at"].as_i64().unwrap(),
+        "never longer than the parent"
+    );
+
+    // server-minted scoped token for a player
+    let (st, st1) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/accounts/{aid}/token"),
+        k,
+        Some(json!({"scopes": ["leaderboards:read"], "ttl_secs": 300})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{st1}");
+    let lb = st1["access_token"].as_str().unwrap().to_string();
+    let (st, _) = call(&app, "GET", "/v1/leaderboards", Some(&lb), None).await;
+    assert_ne!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&lb), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/accounts/{}/token", uuid::Uuid::now_v7()),
+        k,
+        Some(json!({"scopes": ["storage"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // a server key restricted to leaderboards:read
+    let (st, key) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/keys",
+        k,
+        Some(json!({"name": unique("pub"), "role": "server", "scopes": ["leaderboards:read"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{key}");
+    let secret = key["secret"]
+        .as_str()
+        .or(key["key"].as_str())
+        .unwrap_or_else(|| panic!("{key}"))
+        .to_string();
+    let (st, _) = call_server(&app, "GET", "/v1/server/leaderboards", &secret, None).await;
+    assert_ne!(st, StatusCode::FORBIDDEN);
+    let (st, d) = call_server(&app, "GET", "/v1/server/currencies", &secret, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{d}");
+    let (st, d) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        &secret,
+        Some(json!({"id": unique("lb")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{d}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/keys",
+        k,
+        Some(json!({"name": unique("bad"), "role": "server", "scopes": ["nope:maybe"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}

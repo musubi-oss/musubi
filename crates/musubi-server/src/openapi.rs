@@ -264,6 +264,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("PUT", "/v1/server/accounts/{id}/age", "account"),
     ("POST", "/v1/server/auth/custom", "auth"),
     ("POST", "/v1/auth/refresh", "auth"),
+    ("POST", "/v1/auth/token/scope", "auth"),
+    ("POST", "/v1/server/accounts/{id}/token", "auth"),
     ("POST", "/v1/auth/queue", "auth"),
     ("GET", "/v1/channel/{id}/messages", "chat"),
     ("POST", "/v1/channel/{id}/report", "chat"),

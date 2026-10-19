@@ -263,6 +263,7 @@ pub async fn replay(s: &AppState, rec: &Recording) -> Result<Value> {
             exp: now + 300,
             vars: Default::default(),
             name: None,
+            scopes: Vec::new(),
         })?;
         req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }

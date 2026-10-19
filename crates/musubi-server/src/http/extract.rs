@@ -26,6 +26,15 @@ impl FromRequestParts<AppState> for Bearer {
             .or_else(|| header.strip_prefix("bearer "))
             .ok_or_else(|| Error::Unauthenticated("malformed authorization header".into()))?;
         let auth = state.auth.verify_access(token)?;
+        if !crate::scopes::allows(&auth.scopes, parts.method.as_str(), parts.uri.path()) {
+            return Err(Error::PermissionDenied(format!(
+                "token scopes [{}] do not cover {} {}",
+                auth.scopes.join(", "),
+                parts.method,
+                parts.uri.path()
+            ))
+            .into());
+        }
         state.banned.check(auth.account_id)?;
         state.limits.account(auth.account_id)?;
         Ok(Bearer(auth))
@@ -49,6 +58,16 @@ impl FromRequestParts<AppState> for ServerKey {
                 "key '{}' has role {}: {} {} is outside its scope",
                 caller.name,
                 caller.role.as_str(),
+                parts.method,
+                parts.uri.path()
+            ))
+            .into());
+        }
+        if !crate::scopes::allows(&caller.scopes, parts.method.as_str(), parts.uri.path()) {
+            return Err(Error::PermissionDenied(format!(
+                "key '{}' scopes [{}] do not cover {} {}",
+                caller.name,
+                caller.scopes.join(", "),
                 parts.method,
                 parts.uri.path()
             ))

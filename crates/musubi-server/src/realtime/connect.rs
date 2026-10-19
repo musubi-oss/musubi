@@ -66,6 +66,12 @@ async fn username_of(s: &AppState, account: uuid::Uuid) -> Result<String> {
 
 pub async fn authorize(s: &AppState, hello: &Hello) -> Result<(UserPresence, Encoding)> {
     let me = s.auth.verify_access(&hello.token)?;
+    if !crate::scopes::allows(&me.scopes, "GET", "/ws") {
+        // down-scoped token without the realtime scope
+        return Err(Error::PermissionDenied(
+            "token lacks the realtime scope".into(),
+        ));
+    }
     let encoding = encoding_of(hello)?;
     let username = match me.username {
         Some(name) => name,
