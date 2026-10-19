@@ -289,6 +289,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         );
     }
     let fleets = Arc::new(fleets);
+    fleets.spawn_log_writer();
     fleets
         .clone()
         .spawn_reconciler(std::time::Duration::from_secs(5), {

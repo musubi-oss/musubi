@@ -101,7 +101,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Dedicated-серверы: провайдеры | ✅ local, docker, kubernetes (Agones-совместимый манифест), firecracker (snapshot-restore + warm pool микроVM, identity через MMDS)  ; `ssh` — bare-metal хосты без агента (`[fleet.ssh] hosts`, старт/стоп/probe по ssh, выбор хоста по свободной ёмкости) | 🟡 внешние | 🟡 FleetManager API | ✅ | ✅ AMS |
 | Внешние оркестраторы как провайдеры (Edgegap, GameLift) | ✅ `provider = edgegap` (deploy/status/stop) и `gamelift` (CreateGameSession/Describe/Terminate, SigV4) рядом с local/docker/firecracker/k8s/agones | — | ✅ | — | — |
 | Автоскейл: буфер + прогноз по истории | ✅ `demand`/`scale` | ❌ | ❌ | ✅ | ✅ |
-| Scale-to-zero флота | ✅ политики автоскейла (`target_utilization`, шаги, cooldown up/down), resource spec серверов (cpu/memory/disk/gpu → k8s requests/limits, docker, firecracker), min 0 + холодный старт при аллокации (ожидание готовности), прогноз по истории | ❌ | ❌ | ✅ | ✅ |
+| Scale-to-zero флота | ✅ логи серверов (stdout/stderr local, ssh-файл, docker/k8s tail, SDK push; фильтры, retention), политики автоскейла (`target_utilization`, шаги, cooldown up/down), resource spec серверов (cpu/memory/disk/gpu → k8s requests/limits, docker, firecracker), min 0 + холодный старт при аллокации (ожидание готовности), прогноз по истории | ❌ | ❌ | ✅ | ✅ |
 | Build pipeline: canary / promote / rollback, vCPU-часы | ✅ | ❌ | ❌ | 🟡 | ✅ |
 | SDK сервера: ready/health/labels/players/watch/shutdown | ✅ `/v1/gameserver/*` | ✅ | 🟡 | ✅ | ✅ |
 

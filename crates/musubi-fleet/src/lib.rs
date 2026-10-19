@@ -28,6 +28,85 @@ pub mod webhook;
 
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One captured game server log line (competitive P0-9).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogLine {
+    pub server_id: Uuid,
+    pub fleet_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    /// `stdout` | `stderr` | `sdk`
+    pub source: String,
+    /// `debug` | `info` | `warn` | `error`
+    pub level: String,
+    pub message: String,
+}
+
+pub type LogSink = tokio::sync::mpsc::UnboundedSender<LogLine>;
+
+pub const LOG_LINE_MAX: usize = 8 * 1024;
+
+/// Level guessed from a raw stdout/stderr line (`[ERROR]`, `WARN:`, `level=debug`, …).
+pub fn level_of(line: &str, source: &str) -> &'static str {
+    let l = line.get(..96).unwrap_or(line).to_ascii_lowercase();
+    for (needle, lvl) in [
+        ("error", "error"),
+        ("fatal", "error"),
+        ("panic", "error"),
+        ("warn", "warn"),
+        ("debug", "debug"),
+        ("trace", "debug"),
+    ] {
+        if l.contains(needle) {
+            return lvl;
+        }
+    }
+    if source == "stderr" {
+        "warn"
+    } else {
+        "info"
+    }
+}
+
+/// Read a child's stream line by line into the sink until EOF.
+pub fn pump_lines<R>(
+    reader: R,
+    sink: LogSink,
+    server_id: Uuid,
+    fleet_id: Uuid,
+    source: &'static str,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncBufReadExt;
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        while let Ok(Some(mut line)) = lines.next_line().await {
+            if line.len() > LOG_LINE_MAX {
+                let mut cut = LOG_LINE_MAX;
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                line.truncate(cut);
+            }
+            let level = level_of(&line, source).to_string();
+            if sink
+                .send(LogLine {
+                    server_id,
+                    fleet_id,
+                    at: OffsetDateTime::now_utc(),
+                    source: source.to_string(),
+                    level,
+                    message: line,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FleetSpec {
@@ -160,6 +239,48 @@ impl Default for ScalePolicy {
             cooldown_down_secs: 0,
         }
     }
+}
+
+/// `GET …/servers/{id}/logs` filters.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct LogQuery {
+    pub level: Option<String>,
+    pub source: Option<String>,
+    /// Case-insensitive substring.
+    pub q: Option<String>,
+    /// Unix seconds, exclusive bounds.
+    pub before: Option<i64>,
+    pub after: Option<i64>,
+    pub limit: u32,
+}
+
+async fn write_logs(db: &PgPool, lines: &[LogLine]) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = lines.iter().map(|_| Uuid::now_v7()).collect();
+    let servers: Vec<Uuid> = lines.iter().map(|l| l.server_id).collect();
+    let fleets: Vec<Uuid> = lines.iter().map(|l| l.fleet_id).collect();
+    let ats: Vec<OffsetDateTime> = lines.iter().map(|l| l.at).collect();
+    let sources: Vec<&str> = lines.iter().map(|l| l.source.as_str()).collect();
+    let levels: Vec<&str> = lines.iter().map(|l| l.level.as_str()).collect();
+    let msgs: Vec<&str> = lines.iter().map(|l| l.message.as_str()).collect();
+    sqlx::query(
+        "insert into musubi.server_logs (id, server_id, fleet_id, at, source, level, message)
+         select * from unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::timestamptz[], $5::text[], $6::text[], $7::text[])",
+    )
+    .bind(&ids)
+    .bind(&servers)
+    .bind(&fleets)
+    .bind(&ats)
+    .bind(&sources)
+    .bind(&levels)
+    .bind(&msgs)
+    .execute(db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
 }
 
 /// Ready servers a utilization target asks for given `allocated` busy servers.
@@ -515,6 +636,17 @@ pub trait Provider: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
     /// `Some(false)` when the provider knows the process/container is gone.
     fn alive(&self, server_id: Uuid) -> Option<bool>;
+
+    /// Last `tail` lines straight from the provider (container / VM / remote file), for providers
+    /// that keep the process output themselves. `None` = not supported.
+    fn logs<'a>(
+        &'a self,
+        _server_id: Uuid,
+        _tail: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(None) })
+    }
     /// One-off preparation that makes later starts faster (firecracker: boot once, snapshot,
     /// fill the warm pool). Providers without such a step reject.
     fn prepare<'a>(
@@ -534,6 +666,14 @@ pub trait Provider: Send + Sync {
 pub struct LocalProcessProvider {
     children: DashMap<Uuid, Arc<tokio::sync::Mutex<tokio::process::Child>>>,
     exited: DashMap<Uuid, i32>,
+    sink: std::sync::RwLock<Option<LogSink>>,
+}
+
+impl LocalProcessProvider {
+    /// Capture stdout/stderr of every server started from now on into `sink`.
+    pub fn set_log_sink(&self, sink: LogSink) {
+        *self.sink.write().unwrap() = Some(sink);
+    }
 }
 
 impl Provider for LocalProcessProvider {
@@ -559,12 +699,25 @@ impl Provider for LocalProcessProvider {
                 .env("MUSUBI_SERVER_KEY", req.server_key)
                 .kill_on_drop(true)
                 .stdin(std::process::Stdio::null());
+            let sink = self.sink.read().unwrap().clone();
+            if sink.is_some() {
+                cmd.stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+            }
             if let Some(d) = &req.fleet.spec.working_dir {
                 cmd.current_dir(d);
             }
-            let child = cmd
+            let mut child = cmd
                 .spawn()
                 .map_err(|e| Error::Internal(format!("spawn {bin}: {e}")))?;
+            if let Some(sink) = sink {
+                if let Some(out) = child.stdout.take() {
+                    pump_lines(out, sink.clone(), req.server_id, req.fleet.id, "stdout");
+                }
+                if let Some(err) = child.stderr.take() {
+                    pump_lines(err, sink, req.server_id, req.fleet.id, "stderr");
+                }
+            }
             let pid = child.id().map(|p| p as i64);
             let child = Arc::new(tokio::sync::Mutex::new(child));
             self.children.insert(req.server_id, child.clone());
@@ -615,6 +768,8 @@ pub struct FleetService {
     edge: Option<SocketAddr>,
     /// Per fleet: unix seconds of the last scale-up and of the last scale action (cooldowns).
     last_scale: Arc<std::sync::Mutex<HashMap<Uuid, (i64, i64)>>>,
+    log_tx: LogSink,
+    log_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<LogLine>>>>,
 }
 
 type FleetRow = (
@@ -696,8 +851,11 @@ const SERVER_COLS: &str =
 
 impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
+        let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        providers.insert("local".into(), Arc::new(LocalProcessProvider::default()));
+        let local = LocalProcessProvider::default();
+        local.set_log_sink(log_tx.clone());
+        providers.insert("local".into(), Arc::new(local));
         providers.insert("docker".into(), Arc::new(docker::DockerProvider));
         Self {
             db,
@@ -707,6 +865,97 @@ impl FleetService {
             server_key: server_key.to_string(),
             edge: None,
             last_scale: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            log_tx,
+            log_rx: Arc::new(std::sync::Mutex::new(Some(log_rx))),
+        }
+    }
+
+    /// Where captured / SDK-pushed log lines go (batched into `musubi.server_logs` by
+    /// `spawn_log_writer`).
+    pub fn log_sink(&self) -> LogSink {
+        self.log_tx.clone()
+    }
+
+    /// Start the batching writer (idempotent; also called before the first server start).
+    pub fn spawn_log_writer(&self) {
+        let Some(mut rx) = self.log_rx.lock().unwrap().take() else {
+            return;
+        };
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(512);
+            loop {
+                let n = rx.recv_many(&mut buf, 512).await;
+                if n == 0 {
+                    break;
+                }
+                if let Err(e) = write_logs(&db, &buf).await {
+                    tracing::warn!(error = %e, lines = buf.len(), "server log write failed");
+                }
+                buf.clear();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+    }
+
+    /// Stored log lines of one server, newest first.
+    pub async fn logs(
+        &self,
+        fleet_id: Uuid,
+        server_id: Uuid,
+        q: &LogQuery,
+    ) -> Result<Vec<LogLine>> {
+        type Row = (Uuid, OffsetDateTime, String, String, String);
+        let rows: Vec<Row> = sqlx::query_as(
+            "select server_id, at, source, level, message from musubi.server_logs
+             where fleet_id = $1 and server_id = $2
+               and ($3::text is null or level = $3)
+               and ($4::text is null or source = $4)
+               and ($5::text is null or message ilike '%' || $5 || '%')
+               and ($6::timestamptz is null or at < $6)
+               and ($7::timestamptz is null or at > $7)
+             order by at desc limit $8",
+        )
+        .bind(fleet_id)
+        .bind(server_id)
+        .bind(q.level.as_deref())
+        .bind(q.source.as_deref())
+        .bind(q.q.as_deref())
+        .bind(
+            q.before
+                .and_then(|b| OffsetDateTime::from_unix_timestamp(b).ok()),
+        )
+        .bind(
+            q.after
+                .and_then(|a| OffsetDateTime::from_unix_timestamp(a).ok()),
+        )
+        .bind(q.limit.clamp(1, 1000) as i64)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(server_id, at, source, level, message)| LogLine {
+                server_id,
+                fleet_id,
+                at,
+                source,
+                level,
+                message,
+            })
+            .collect())
+    }
+
+    /// Raw tail straight from the provider (docker / kubernetes / ssh), if it keeps one.
+    pub async fn provider_logs(
+        &self,
+        fleet: &Fleet,
+        server_id: Uuid,
+        tail: u32,
+    ) -> Result<Option<String>> {
+        match self.provider_of(&fleet.provider) {
+            Some(p) => p.logs(server_id, tail).await,
+            None => Ok(None),
         }
     }
 
@@ -1287,6 +1536,7 @@ impl FleetService {
 
     /// Start one server of the fleet on this node.
     pub async fn start_one(&self, f: &Fleet) -> Result<GameServer> {
+        self.spawn_log_writer();
         let provider = self
             .provider_of(&f.provider)
             .ok_or_else(|| Error::InvalidArgument(format!("unknown provider {}", f.provider)))?;
@@ -1523,9 +1773,20 @@ impl FleetService {
     /// the target (`buffer`, schedule, forecast; floor `min_servers`, cap `max_servers`): start what is
     /// missing or stop idle ready servers above it, oldest first. Returns (started, reaped + stopped).
     pub async fn reconcile(&self) -> Result<(usize, usize)> {
+        let fleets = self.list().await?;
+        self.reconcile_fleets(fleets).await
+    }
+
+    /// One fleet only (tests, `POST …/reconcile`): never touches the other fleets.
+    pub async fn reconcile_one(&self, fleet_id: Uuid) -> Result<(usize, usize)> {
+        let f = self.get(fleet_id).await?;
+        self.reconcile_fleets(vec![f]).await
+    }
+
+    async fn reconcile_fleets(&self, fleets: Vec<Fleet>) -> Result<(usize, usize)> {
         let mut started = 0;
         let mut reaped = 0;
-        for f in self.list().await? {
+        for f in fleets {
             let provider = self.provider_of(&f.provider);
             let servers = self.servers(f.id, None).await?;
             let now = OffsetDateTime::now_utc();
@@ -1767,5 +2028,19 @@ mod policy_tests {
         assert_eq!(r.firecracker(), (Some(1), Some(1024)));
         assert!(Resources::default().kubernetes().is_none());
         assert!(Resources::default().docker_args().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn levels_are_guessed_from_lines() {
+        assert_eq!(level_of("[2025-01-01] ERROR boom", "stdout"), "error");
+        assert_eq!(level_of("warn: slow tick", "stdout"), "warn");
+        assert_eq!(level_of("level=debug x", "stdout"), "debug");
+        assert_eq!(level_of("hello", "stdout"), "info");
+        assert_eq!(level_of("hello", "stderr"), "warn");
     }
 }

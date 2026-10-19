@@ -130,6 +130,7 @@ async fn build_state_cfg_with(
         "http://127.0.0.1:0",
         "defaultkey",
     ));
+    fleets.spawn_log_writer();
     fanout.set_fleets(fleets.clone());
     let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new(
         cluster.as_ref().unwrap().node_id().0,

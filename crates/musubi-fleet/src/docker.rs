@@ -116,6 +116,21 @@ impl Provider for DockerProvider {
     fn alive(&self, _server_id: Uuid) -> Option<bool> {
         None
     }
+
+    fn logs<'a>(
+        &'a self,
+        server_id: Uuid,
+        tail: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let name = name_of(server_id);
+            let tail = tail.clamp(1, 10_000).to_string();
+            docker(&["logs", "--tail", &tail, "--timestamps", &name])
+                .await
+                .map(Some)
+        })
+    }
 }
 
 /// `true` when a Docker daemon answers (used to register the provider and by tests).

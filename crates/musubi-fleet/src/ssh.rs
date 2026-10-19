@@ -1,7 +1,7 @@
 //! Bare-metal fleet provider (plan 6.6 `hybrid`): dedicated servers are started on a pool of
 //! hosts over SSH — no agent to install, the game binary just has to be on the box. A start
 //! picks the host with the most free capacity and runs
-//! `cd <dir> && env K=V … nohup <command> >/dev/null 2>&1 & echo $!`; the pid is kept, `stop`
+//! `cd <dir> && env K=V … nohup <command> >/tmp/musubi-<id>.log 2>&1 & echo $!`; the pid is kept, `stop`
 //! sends TERM then KILL, and `alive` reflects the last `kill -0` probe (`probe` refreshes).
 
 use std::collections::HashMap;
@@ -127,6 +127,11 @@ impl SshProvider {
     }
 }
 
+/// Where a server's stdout/stderr lands on the host (`logs` tails it).
+pub fn log_path(server_id: Uuid) -> String {
+    format!("/tmp/musubi-{}.log", server_id.simple())
+}
+
 impl Provider for SshProvider {
     fn name(&self) -> &'static str {
         "ssh"
@@ -174,7 +179,10 @@ impl Provider for SshProvider {
                 script.push(' ');
                 script.push_str(&sq(a));
             }
-            script.push_str(" >/dev/null 2>&1 </dev/null & echo $!");
+            script.push_str(&format!(
+                " >{log} 2>&1 </dev/null & echo $!",
+                log = log_path(req.server_id)
+            ));
             let out = self.ssh(host, &script).await?;
             let pid: i64 = out
                 .lines()
@@ -227,6 +235,30 @@ impl Provider for SshProvider {
         } else {
             None
         }
+    }
+
+    fn logs<'a>(
+        &'a self,
+        server_id: Uuid,
+        tail: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(host) = self
+                .running
+                .get(&server_id)
+                .and_then(|r| self.cfg.hosts.get(r.0).cloned())
+            else {
+                return Ok(None);
+            };
+            let out = self
+                .ssh(
+                    &host,
+                    &format!("tail -n {} {}", tail.clamp(1, 10_000), log_path(server_id)),
+                )
+                .await?;
+            Ok(Some(out))
+        })
     }
 }
 
@@ -372,7 +404,10 @@ mod tests {
         assert!(script.contains(&format!("MUSUBI_FLEET_ID='{}'", f.id)));
         assert!(script
             .contains("MUSUBI_PORT='7777' MUSUBI_API='http://core:7350' MUSUBI_SERVER_KEY='k'"));
-        assert!(script.contains(r#"nohup '/opt/game/server' '--map' 'it'\''s big' >/dev/null 2>&1 </dev/null & echo $!"#), "{script}");
+        assert!(
+            script.contains(r#"nohup '/opt/game/server' '--map' 'it'\''s big' >/tmp/musubi-"#),
+            "{script}"
+        );
 
         // stop kills by pid, probe notices a dead process
         p.stop(a).await;

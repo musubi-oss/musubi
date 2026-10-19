@@ -1116,6 +1116,8 @@ impl Default for StorageConfig {
 pub struct RetentionConfig {
     pub interval_secs: u64,
     pub events_days: u64,
+    /// Captured game server log lines (`musubi.server_logs`).
+    pub server_logs_days: u64,
     /// Delivered or dead webhook deliveries.
     pub deliveries_days: u64,
     pub audit_days: u64,
@@ -1141,6 +1143,7 @@ impl Default for RetentionConfig {
         Self {
             interval_secs: 600,
             events_days: 30,
+            server_logs_days: 7,
             deliveries_days: 7,
             audit_days: 90,
             notifications_days: 30,

@@ -302,4 +302,32 @@ impl Provider for KubernetesProvider {
     fn alive(&self, _server_id: Uuid) -> Option<bool> {
         None
     }
+
+    fn logs<'a>(
+        &'a self,
+        server_id: Uuid,
+        tail: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if !matches!(self.mode, Mode::Pods) {
+                return Ok(None);
+            }
+            let name = name_of(server_id);
+            let path = format!(
+                "{}/log?tailLines={}&timestamps=true",
+                self.path(Some(&name)),
+                tail.clamp(1, 10_000)
+            );
+            let resp = self
+                .req(reqwest::Method::GET, &path)
+                .send()
+                .await
+                .map_err(Error::internal)?;
+            if !resp.status().is_success() {
+                return Err(Error::Internal(format!("pod log: {}", resp.status())));
+            }
+            Ok(Some(resp.text().await.map_err(Error::internal)?))
+        })
+    }
 }

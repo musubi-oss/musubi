@@ -58,6 +58,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         "http://127.0.0.1:0",
         "defaultkey",
     ));
+    fleets.spawn_log_writer();
     fanout.set_fleets(fleets.clone());
     let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
@@ -17330,4 +17331,142 @@ async fn email_code_second_factor_and_security_timeline() {
     let (st, s3) = call(&app, "POST", "/v1/auth/email", None, Some(creds)).await;
     assert_eq!(st, StatusCode::OK);
     assert!(s3["access_token"].is_string(), "{s3}");
+}
+
+/// Game server log capture (competitive P0-9): stdout/stderr of a local server and SDK-pushed
+/// lines land in the per-server log with levels, filters and the provider tail probe.
+#[tokio::test]
+async fn game_server_logs_capture_filters_and_sdk_push() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let name = unique("logfleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+        "name": name, "provider": "local", "buffer": 1, "max_servers": 1,
+        "port_start": 47300, "port_end": 47310,
+        "spec": {"command": ["sh", "-c", "echo hello-from-stdout; echo oops-stderr >&2; sleep 20"]}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let fid_u = uuid::Uuid::parse_str(&fid).unwrap();
+    svc.reconcile_one(fid_u).await.unwrap();
+    let mut sid = String::new();
+    for _ in 0..20 {
+        let (_, l) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/fleets/{fid}/servers"),
+            k,
+            None,
+        )
+        .await;
+        if let Some(s0) = l["servers"].as_array().and_then(|a| a.first()) {
+            sid = s0["id"].as_str().unwrap().to_string();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(!sid.is_empty(), "server never appeared");
+    let mut lines = Value::Null;
+    for _ in 0..30 {
+        let (st, l) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/fleets/{fid}/servers/{sid}/logs"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{l}");
+        if l["lines"].as_array().is_some_and(|a| a.len() >= 2) {
+            lines = l;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let arr = lines["lines"].as_array().expect("captured lines").clone();
+    let out = arr
+        .iter()
+        .find(|l| l["message"] == "hello-from-stdout")
+        .expect("stdout line");
+    assert_eq!(out["source"], "stdout");
+    assert_eq!(out["level"], "info");
+    let err = arr
+        .iter()
+        .find(|l| l["message"] == "oops-stderr")
+        .expect("stderr line");
+    assert_eq!(err["source"], "stderr");
+    assert_eq!(err["level"], "warn");
+    let (_, w) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers/{sid}/logs?level=warn"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(w["lines"].as_array().unwrap().len(), 1, "{w}");
+    let (_, q) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers/{sid}/logs?q=HELLO"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(q["lines"].as_array().unwrap().len(), 1, "{q}");
+
+    // the server pushes its own structured lines through the SDK route
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/gameserver/logs")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"lines": [{"level": "error", "message": "crash imminent"}, {"message": "round started"}]}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut sdk = Value::Null;
+    for _ in 0..30 {
+        let (_, l) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/fleets/{fid}/servers/{sid}/logs?source=sdk"),
+            k,
+            None,
+        )
+        .await;
+        if l["lines"].as_array().is_some_and(|a| a.len() == 2) {
+            sdk = l;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let sdk = sdk["lines"].as_array().expect("sdk lines").clone();
+    assert!(
+        sdk.iter()
+            .any(|l| l["message"] == "crash imminent" && l["level"] == "error"),
+        "{sdk:?}"
+    );
+    assert!(
+        sdk.iter()
+            .any(|l| l["message"] == "round started" && l["level"] == "info"),
+        "{sdk:?}"
+    );
+    let (st, p) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers/{sid}/logs?source_kind=provider"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    assert_eq!(p["supported"], false, "local keeps nothing of its own: {p}");
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
 }

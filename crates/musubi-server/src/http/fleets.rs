@@ -26,6 +26,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets/{id}/allocate", post(allocate))
         .route("/v1/server/allocate", post(allocate_routed))
         .route("/v1/server/fleets/{id}/servers", get(servers))
+        .route(
+            "/v1/server/fleets/{id}/servers/{sid}/logs",
+            get(server_logs),
+        )
         .route("/v1/server/fleets/{id}/demand", get(demand))
         .route("/v1/server/fleets/{id}/builds", get(builds).post(add_build))
         .route(
@@ -50,6 +54,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/gameserver/players", post(sdk_players))
         .route("/v1/gameserver/watch", get(sdk_watch))
         .route("/v1/gameserver/connect", post(sdk_connect))
+        .route("/v1/gameserver/logs", post(sdk_logs))
 }
 
 fn parse(id: &str) -> Result<Uuid, ApiError> {
@@ -459,4 +464,93 @@ async fn usage(
     Ok(Json(
         json!({ "from": from.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(), "to": to.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(), "rows": rows, "vcpu_hours": total }),
     ))
+}
+
+#[derive(Deserialize)]
+struct LogsQ {
+    #[serde(flatten)]
+    filter: musubi_fleet::LogQuery,
+    /// `provider` = raw tail straight from docker / kubernetes / ssh instead of the stored lines.
+    source_kind: Option<String>,
+}
+
+/// `GET /v1/server/fleets/{id}/servers/{sid}/logs` — captured stdout/stderr + SDK lines of one
+/// game server, newest first (`level`, `source`, `q`, `before`, `after`, `limit`); with
+/// `source_kind=provider` the provider's own tail (`{"raw": "..."}`).
+async fn server_logs(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, sid)): Path<(String, String)>,
+    Query(q): Query<LogsQ>,
+) -> Result<Json<Value>, ApiError> {
+    let (fid, sid) = (parse(&id)?, parse(&sid)?);
+    let mut filter = q.filter;
+    if filter.limit == 0 {
+        filter.limit = 200;
+    }
+    if q.source_kind.as_deref() == Some("provider") {
+        let fleet = s.fleets.get(fid).await?;
+        let raw = s.fleets.provider_logs(&fleet, sid, filter.limit).await?;
+        return Ok(Json(json!({ "raw": raw, "supported": raw.is_some() })));
+    }
+    let lines = s.fleets.logs(fid, sid, &filter).await?;
+    let next = lines.last().map(|l| l.at.unix_timestamp());
+    Ok(Json(json!({ "lines": lines, "next_before": next })))
+}
+
+#[derive(Deserialize)]
+struct SdkLogLine {
+    #[serde(default)]
+    at: Option<i64>,
+    #[serde(default)]
+    level: Option<String>,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct SdkLogsBody {
+    lines: Vec<SdkLogLine>,
+}
+
+/// `POST /v1/gameserver/logs {lines: [{at?, level?, message}]}` — a game server pushes its own
+/// log lines (any provider, including ones musubi does not run the process for).
+async fn sdk_logs(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    Json(b): Json<SdkLogsBody>,
+) -> Result<Json<Value>, ApiError> {
+    let sid = self_id(&headers)?;
+    if b.lines.len() > 1000 {
+        return Err(Error::InvalidArgument("at most 1000 lines per call".into()).into());
+    }
+    let gs = s.fleets.server(sid).await?;
+    let sink = s.fleets.log_sink();
+    let n = b.lines.len();
+    for l in b.lines {
+        let mut message = l.message;
+        if message.len() > musubi_fleet::LOG_LINE_MAX {
+            let mut cut = musubi_fleet::LOG_LINE_MAX;
+            while !message.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            message.truncate(cut);
+        }
+        let level = match l.level.as_deref() {
+            Some(l @ ("debug" | "info" | "warn" | "error")) => l.to_string(),
+            Some(_) | None => musubi_fleet::level_of(&message, "sdk").to_string(),
+        };
+        let at =
+            l.at.and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok())
+                .unwrap_or_else(time::OffsetDateTime::now_utc);
+        let _ = sink.send(musubi_fleet::LogLine {
+            server_id: sid,
+            fleet_id: gs.fleet_id,
+            at,
+            source: "sdk".into(),
+            level,
+            message,
+        });
+    }
+    Ok(Json(json!({ "accepted": n })))
 }
