@@ -1148,6 +1148,16 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/regions", "fleets"),
     ("GET", "/v1/server/fleets/{id}/demand", "fleets"),
     ("GET", "/v1/server/fleets/{id}/builds", "fleets"),
+    ("GET", "/v1/server/builds", "fleets"),
+    ("GET", "/v1/server/builds/{name}/{version}", "fleets"),
+    ("PUT", "/v1/server/builds/{name}/{version}", "fleets"),
+    ("DELETE", "/v1/server/builds/{name}/{version}", "fleets"),
+    (
+        "GET",
+        "/v1/server/builds/{name}/{version}/download",
+        "fleets",
+    ),
+    ("GET", "/v1/server/fleets/{id}/cost", "fleets"),
     ("POST", "/v1/server/fleets/{id}/builds", "fleets"),
     (
         "DELETE",

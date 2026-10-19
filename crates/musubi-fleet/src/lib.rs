@@ -267,9 +267,31 @@ pub fn decode_log_archive(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
         .collect())
 }
 
+/// Hourly cost of one live server (cloud VM share, Anywhere/bare-metal amortisation, licence).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CostSpec {
+    pub hourly_per_server: f64,
+    pub currency: String,
+}
+
+impl Default for CostSpec {
+    fn default() -> Self {
+        Self {
+            hourly_per_server: 0.0,
+            currency: "USD".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FleetSpec {
+    /// Build artifact `name@version` from the artifact store (`PUT /v1/server/builds/{name}/{version}`);
+    /// resolved when the fleet/build is saved into `MUSUBI_ARTIFACT_URL|SHA256|FILENAME|SIZE` env.
+    pub artifact: Option<String>,
+    /// Cost attribute for spend estimates (`GET /v1/server/fleets/{id}/cost`).
+    pub cost: Option<CostSpec>,
     /// Kubernetes node placement / disruption (P0-10); ignored by other providers.
     pub kubernetes: KubePlacement,
     /// Log archival to object storage.
@@ -2595,6 +2617,16 @@ const SERVER_COLS: &str =
     "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports";
 
 impl FleetService {
+    /// Base URL game servers use to reach this API (`MUSUBI_API`).
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    /// Constant-time-irrelevant equality for the shared server key (used by capability routes).
+    pub fn server_key_matches(&self, k: &str) -> bool {
+        !self.server_key.is_empty() && self.server_key == k
+    }
+
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
         let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();

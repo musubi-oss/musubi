@@ -10,6 +10,7 @@ pub mod audiences;
 mod auth;
 pub mod auth_providers;
 mod bans;
+pub mod build_artifacts;
 pub mod challenges;
 mod chat;
 mod cluster;
@@ -230,6 +231,7 @@ pub fn router(state: AppState) -> Router {
         .merge(qa_clock::router())
         .merge(countries::router())
         .merge(config_sources::router())
+        .merge(build_artifacts::router())
         .merge(placements::router())
         .merge(sso::routes())
         .merge(stats::routes())

@@ -1026,12 +1026,12 @@ Rows are normalized features grouped by area. The first block in each area holds
 | S3 Endpoint Storage |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `spec.logs.archive` ships finished-server stdout/stderr/SDK lines as gzip NDJSON to the S3-compatible bucket from `[ugc.s3]` (`server-logs/{fleet}/{server}/…`), list/download/delete API, `server.logs_archived` |
 | Session configuration on version |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `GameServer.capacity/players`, backfill allocation; no socket-accounting session objects… |
 | Stop deployment / bulk stop |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `DELETE /v1/server/gameservers/{id}`, `POST /v1/server/fleets/{id}/scale`; no filter-base… |
-| Anywhere fleet cost attribute |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no cost attribute on fleets |
+| Anywhere fleet cost attribute |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `spec.cost {hourly_per_server, currency}` + `GET /v1/server/fleets/{id}/cost` (hourly/daily/monthly now, idle share, max) |
 | Anywhere fleets (customer hardware) |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `ssh` provider (bare metal), webhook/external providers; no self-registering compute API… |
 | Anywhere roadmap & creation |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — ssh provider automates; no registration flow for externally-started servers except `POST… |
 | Build object & console |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `FleetBuild{version, spec, state, canary_percent, notes, created_at}`; no binary/size/OS |
 | Build packaging guidance |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — |
-| Build resources |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no artifact store: builds are specs referencing an image/command (`FleetBuild.spec`), no… |
+| Build resources |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ artifact store: `PUT /v1/server/builds/{name}/{version}` (raw zip/binary → S3 or Postgres, sha256, rotating capability token), list/get/delete, `…/download?token=`; `spec.artifact = "name@version"` on fleets/builds resolves into `MUSUBI_ARTIFACT_URL|SHA256|FILENAME|SIZE` env for any provider's launcher |
 | Container fleet build walkthrough |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Container remote access |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — — operator owns cluster |
 | Containers starter kit / wrapper |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `FleetSpec.command` runs any binary but it must call `/v1/gameserver/ready` to serve |

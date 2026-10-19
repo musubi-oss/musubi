@@ -36684,3 +36684,331 @@ async fn title_files_tags_and_manifest_queries() {
     .await;
     assert_eq!(t["tags"], json!([{"tag": "legacy", "files": 1}]), "{t}");
 }
+
+#[tokio::test]
+async fn build_artifacts_store_fleet_reference_and_cost() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let raw = |method: &'static str,
+               path: String,
+               headers: Vec<(&'static str, String)>,
+               body: Vec<u8>| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder().method(method).uri(path);
+            for (h, v) in headers {
+                req = req.header(h, v);
+            }
+            let res = app
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let st = res.status();
+            let hs = res.headers().clone();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (st, hs, bytes.to_vec())
+        }
+    };
+    let name = unique("srv").to_lowercase();
+    let hs = || {
+        vec![
+            ("x-musubi-server-key", k.to_string()),
+            ("content-type", "application/zip".to_string()),
+        ]
+    };
+    let payload = b"PK\x03\x04 fake build bytes".to_vec();
+    let (st, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.0"),
+        hs(),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&b)
+    );
+    let (st, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/.hidden"),
+        hs(),
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&b)
+    );
+    let (st, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.0?filename=server.zip&notes=first"),
+        hs(),
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let a: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(a["size"], payload.len());
+    assert_eq!(a["filename"], "server.zip");
+    assert_eq!(a["mime"], "application/zip");
+    assert_eq!(a["storage"], "db");
+    let sha = a["sha256"].as_str().unwrap().to_string();
+    assert_eq!(sha.len(), 64);
+    let token = a["token"].as_str().unwrap().to_string();
+    assert_eq!(token.len(), 48);
+    assert!(
+        a["download_url"].as_str().unwrap().ends_with(&format!(
+            "/v1/server/builds/{name}/1.0.0/download?token={token}"
+        )),
+        "{a}"
+    );
+
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/builds/{name}/1.0.0"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["notes"], "first");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/builds?name={name}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["artifacts"].as_array().unwrap().len(), 1);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/builds/{name}/9.9.9"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // download: token or server key, never anonymous
+    let dl = format!("/v1/server/builds/{name}/1.0.0/download");
+    let (st, _, _) = raw("GET", dl.clone(), vec![], Vec::new()).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _, _) = raw("GET", format!("{dl}?token=nope"), vec![], Vec::new()).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, h, b) = raw("GET", format!("{dl}?token={token}"), vec![], Vec::new()).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, payload);
+    assert_eq!(h["x-artifact-sha256"].to_str().unwrap(), sha);
+    assert!(h["content-disposition"]
+        .to_str()
+        .unwrap()
+        .contains("server.zip"));
+    let (st, _, b) = raw(
+        "GET",
+        dl.clone(),
+        vec![("x-musubi-server-key", k.to_string())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, payload);
+
+    // re-upload rotates the token and keeps notes
+    let (_, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.0"),
+        hs(),
+        b"v2".to_vec(),
+    )
+    .await;
+    let a2: Value = serde_json::from_slice(&b).unwrap();
+    assert_ne!(a2["token"], token);
+    assert_eq!(a2["notes"], "first");
+    assert_eq!(a2["filename"], format!("{name}-1.0.0.bin"));
+    let (st, _, _) = raw("GET", format!("{dl}?token={token}"), vec![], Vec::new()).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "old token is dead");
+    let token2 = a2["token"].as_str().unwrap().to_string();
+
+    // fleet referencing the artifact + cost attribute
+    let fleet = |artifact: Value, cost: Value| {
+        json!({"name": unique("fleet-art"), "provider": "local", "buffer": 0, "max_servers": 3,
+            "port_start": 46300, "port_end": 46400,
+            "spec": {"command": ["sleep", "60"], "artifact": artifact, "cost": cost}})
+    };
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(json!("no-at-sign"), Value::Null)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(json!(format!("{name}@9.9.9")), Value::Null)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(Value::Null, json!({"hourly_per_server": -1}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(
+            Value::Null,
+            json!({"hourly_per_server": 0.5, "currency": "dollars"}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(
+            json!(format!("{name}@1.0.0")),
+            json!({"hourly_per_server": 0.5, "currency": "EUR"}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["spec"]["artifact"], format!("{name}@1.0.0"));
+    assert_eq!(f["spec"]["env"]["MUSUBI_ARTIFACT_SHA256"], a2["sha256"]);
+    assert_eq!(f["spec"]["env"]["MUSUBI_ARTIFACT_SIZE"], "2");
+    assert!(
+        f["spec"]["env"]["MUSUBI_ARTIFACT_URL"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("download?token={token2}")),
+        "{f}"
+    );
+    let fid = f["id"].as_str().unwrap().to_string();
+    let (st, c) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/cost"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["configured"], true);
+    assert_eq!(c["currency"], "EUR");
+    assert_eq!(c["live"], 0);
+    assert_eq!(c["hourly_now"], 0.0);
+    assert_eq!(c["max_hourly"], 1.5);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"buffer": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["started"], 1, "{v}");
+    let (_, c) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/cost"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(c["live"], 1, "{c}");
+    assert_eq!(c["hourly_now"], 0.5);
+    assert_eq!(c["daily_now"], 12.0);
+    // build referencing the artifact
+    let (st, b) = call_server(&app, "POST", &format!("/v1/server/fleets/{fid}/builds"), k,
+        Some(json!({"version": "1.0.1", "spec": {"command": ["sleep", "60"], "artifact": format!("{name}@1.0.0")}}))).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["spec"]["env"]["MUSUBI_ARTIFACT_FILENAME"],
+        format!("{name}-1.0.0.bin")
+    );
+    // a fleet without cost
+    let (_, f2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(Value::Null, Value::Null)),
+    )
+    .await;
+    let (st, c) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{}/cost", f2["id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["configured"], false);
+
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/builds/{name}/1.0.0"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/builds/{name}/1.0.0"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = raw("GET", format!("{dl}?token={token2}"), vec![], Vec::new()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(json!(format!("{name}@1.0.0")), Value::Null)),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "deleted artifact can no longer be referenced: {v}"
+    );
+}

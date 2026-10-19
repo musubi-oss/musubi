@@ -128,8 +128,9 @@ async fn list(State(s): State<AppState>, ServerKey: ServerKey) -> Result<Json<Va
 async fn create(
     State(s): State<AppState>,
     ServerKey: ServerKey,
-    Json(c): Json<CreateFleet>,
+    Json(mut c): Json<CreateFleet>,
 ) -> Result<Json<Fleet>, ApiError> {
+    crate::http::build_artifacts::prepare_spec(&s, &mut c.spec).await?;
     Ok(Json(s.fleets.create(c).await?.redacted()))
 }
 
@@ -556,9 +557,10 @@ async fn add_build(
     State(s): State<AppState>,
     ServerKey: ServerKey,
     Path(id): Path<String>,
-    Json(c): Json<musubi_fleet::CreateBuild>,
+    Json(mut c): Json<musubi_fleet::CreateBuild>,
 ) -> Result<Json<musubi_fleet::FleetBuild>, ApiError> {
     let id = parse(&id)?;
+    crate::http::build_artifacts::prepare_spec(&s, &mut c.spec).await?;
     let b = s.fleets.add_build(id, c).await?.redacted();
     Ok(Json(b))
 }
