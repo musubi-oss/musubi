@@ -730,6 +730,8 @@ nothing. `musubi.workflows` is also plain SQL for your dashboards.
 `PUT /v1/account/age {birthdate | bracket}` puts an account in an age bracket — `child` (under
 `compliance.child_until`, 13), `teen` (under `adult_from`, 18), `adult` — from a birthdate the
 player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does it from a
+| `PUT /v1/server/effects/{account_id}/{key}`, `DELETE /v1/server/effects/{account_id}[/{key}]`, `GET /v1/server/effects?key`, `POST /v1/server/effects/sweep` | Timed status effects (buffs/debuffs/penalties) on the item-effect table: duration or permanent, stacks with cap, JSON `value`, `source`, `mode: replace|extend|stack`; client `GET /v1/effects[/{key}]` with `seconds_left`/`stacks`; expiry swept by the leader → `effect.expired` |
+| `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),
 `purchases` (store + IAP), `ugc` and `public_profile` (lookups show only id/username/avatar);

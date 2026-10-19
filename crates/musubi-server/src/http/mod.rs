@@ -21,6 +21,7 @@ mod dev;
 mod device_codes;
 pub mod economy;
 pub mod economy_changesets;
+pub mod effects;
 pub mod entitlements;
 mod environments;
 pub(crate) mod error;
@@ -213,6 +214,8 @@ pub fn router(state: AppState) -> Router {
         .merge(timers::router())
         .merge(audiences::router())
         .merge(news::router())
+        .merge(effects::router())
+        .route("/v1/time", axum::routing::get(effects::server_time))
         .merge(placements::router())
         .merge(sso::routes())
         .merge(stats::routes())

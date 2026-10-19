@@ -15,6 +15,8 @@ type EffectRow = (
     Option<String>,
     OffsetDateTime,
     Option<OffsetDateTime>,
+    i32,
+    Option<String>,
 );
 
 pub const STATUSES: [&str; 3] = ["draft", "published", "retired"];
@@ -307,7 +309,7 @@ impl EconomyService {
             .map_err(Error::internal)?;
         let rows: Vec<EffectRow> =
             sqlx::query_as(
-                "select key, value, item_id, applied_at, expires_at from musubi.player_effects where account_id = $1 order by key",
+                "select key, value, item_id, applied_at, expires_at, stacks, source from musubi.player_effects where account_id = $1 order by key",
             )
             .bind(account.0)
             .fetch_all(&self.db)
@@ -315,9 +317,9 @@ impl EconomyService {
             .map_err(Error::internal)?;
         Ok(rows
             .into_iter()
-            .map(|(key, value, item_id, applied, expires)| {
+            .map(|(key, value, item_id, applied, expires, stacks, source)| {
                 json!({
-                    "key": key, "value": value, "item_id": item_id,
+                    "key": key, "value": value, "item_id": item_id, "stacks": stacks, "source": source,
                     "applied_at": applied.unix_timestamp(),
                     "expires_at": expires.map(|t| t.unix_timestamp()),
                     "seconds_left": expires.map(|t| (t - now).whole_seconds().max(0)),

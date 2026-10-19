@@ -35289,3 +35289,211 @@ async fn matchmaker_queue_controls_and_session_bulk_stop() {
         );
     }
 }
+
+#[tokio::test]
+async fn timed_status_effects_and_server_time() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, t) = call(&app, "GET", "/v1/time", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let now = t["now"].as_i64().unwrap();
+    assert!(
+        now > 1_700_000_000 && t["now_ms"].as_i64().unwrap() >= now * 1000,
+        "{t}"
+    );
+    assert!(t["iso"].as_str().unwrap().ends_with('Z'));
+
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("fx")})),
+    )
+    .await;
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let base = format!("/v1/server/effects/{me}");
+    for (path, body) in [
+        (format!("{base}/bad%20key"), json!({})),
+        (format!("{base}/xp"), json!({"duration_secs": 0})),
+        (
+            format!("{base}/xp"),
+            json!({"duration_secs": 10, "expires_at": 1}),
+        ),
+        (format!("{base}/xp"), json!({"mode": "weird"})),
+        (format!("{base}/xp"), json!({"stacks": 0})),
+        (format!("{base}/xp"), json!({"expires_at": 5})),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{path} {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/effects/nope/xp",
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("{base}/xp_boost"),
+        k,
+        Some(json!({"duration_secs": 3600, "value": {"mult": 2}, "source": "shop"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stacks"], 1);
+    assert_eq!(v["value"]["mult"], 2);
+    assert_eq!(v["active"], true);
+    assert!(
+        (3590..=3600).contains(&v["seconds_left"].as_i64().unwrap()),
+        "{v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("{base}/xp_boost"),
+        k,
+        Some(json!({"duration_secs": 600, "mode": "extend"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["seconds_left"].as_i64().unwrap() >= 4190,
+        "extend adds: {v}"
+    );
+    assert_eq!(v["value"]["mult"], 2, "value kept");
+    assert_eq!(v["source"], "shop");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("{base}/xp_boost"),
+        k,
+        Some(json!({"stacks": 5, "max_stacks": 3, "mode": "stack", "duration_secs": 60})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stacks"], 3, "capped: {v}");
+    assert!(
+        v["seconds_left"].as_i64().unwrap() <= 60,
+        "stack refreshes duration: {v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("{base}/vip"),
+        k,
+        Some(json!({"value": {"tier": "gold"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["expires_at"].is_null() && v["seconds_left"].is_null(),
+        "permanent: {v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("{base}/slow"),
+        k,
+        Some(json!({"duration_secs": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let (st, v) = call(&app, "GET", "/v1/effects", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let keys: Vec<&str> = v["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["slow", "vip", "xp_boost"], "{v}");
+    assert_eq!(
+        v["effects"][2]["stacks"], 3,
+        "item-effect listing shows stacks: {v}"
+    );
+    let (st, v) = call(&app, "GET", "/v1/effects/vip", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["value"]["tier"], "gold");
+    let (st, _) = call(&app, "GET", "/v1/effects/nope", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", "/v1/effects/vip", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (st, v) = call(&app, "GET", "/v1/effects/slow", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "expired hidden: {v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/effects?key=slow&include_expired=true",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        v["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["account_id"] == me && e["active"] == false),
+        "{v}"
+    );
+    let (st, v) = call_server(&app, "POST", "/v1/server/effects/sweep", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["expired"].as_i64().unwrap() >= 1, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/effects?key=slow&include_expired=true",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        !v["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["account_id"] == me),
+        "{v}"
+    );
+    let (_, v) = call_server(&app, "GET", &base, k, None).await;
+    assert_eq!(v["effects"].as_array().unwrap().len(), 2, "{v}");
+
+    let (st, v) = call_server(&app, "GET", "/v1/server/effects", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/effects?key=vip&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["account_id"] == me),
+        "{v}"
+    );
+
+    let (st, v) = call_server(&app, "DELETE", &format!("{base}/xp_boost"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], true);
+    let (st, v) = call_server(&app, "DELETE", &base, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], 1);
+    let (_, v) = call(&app, "GET", "/v1/effects", Some(&tok), None).await;
+    assert_eq!(v["effects"].as_array().unwrap().len(), 0);
+}

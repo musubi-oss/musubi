@@ -988,6 +988,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "timer sweep failed"),
                 }
+                match crate::http::effects::sweep(&st).await {
+                    Ok(n) if n > 0 => tracing::info!(expired = n, "status effects expired"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "status effect sweep failed"),
+                }
                 match crate::http::group_challenges::settle_due(&st).await {
                     Ok(n) if n > 0 => tracing::info!(settled = n, "group challenges settled"),
                     Ok(_) => {}

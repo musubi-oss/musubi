@@ -147,7 +147,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Session management |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Shared accounts (portal option) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — — console feature |
 | Summary friend data |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
-| Timed status effects |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no timed status/buff primitive (grep `status effect, buff` → only fleet/sim) |
+| Timed status effects |  |  |  | ✅ on the item-effect table: `PUT /v1/server/effects/{account_id}/{key} {duration_secs|expires_at|permanent, stacks, max_stacks, value, source, mode: replace|extend|stack}`, `GET /v1/server/effects/{account_id}`, `DELETE …/{key}` / `DELETE …` (clear), `GET /v1/server/effects?key=`, client `GET /v1/effects[/{key}]` with `seconds_left`/`stacks`, leader sweep → `effect.expired` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `PUT /v1/server/accounts/{id}/effects/{name} {duration_secs|expires_at|permanent, stacks, max_stacks, details, source, mode: replace|extend|stack}`, server list/clear/search-by-name, client `GET /v1/effects[/{name}]` with `remaining_secs`, leader sweep → `effect.expired` |
 | Twitter, Parse, Ultra (blockchain platform) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — — niche/legacy providers; musubi covers via `POST /v1/auth/custom` server-verified auth |
 | User attributes (key/value tags for segmentation) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `metadata` JSON on account; audiences (`[audiences]`) target by fields, but no attribute… |
 | Bring-your-own DB (any ORM/Firebase) from room lifecycle (`onAuth`/`onLeave`) |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — modules reach external systems only via `http.fetch` allowlist (no direct DB drivers in W… |
@@ -337,9 +337,9 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Old vs new Cloud Save services |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — — SDK-side |
 | Stats domains/visibility matrix |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Custom Entity S2S admin (collections/indexes) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
-| Global (app) Statistics |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no app-wide counters (grep `global_stat` none); storage aggregate is query-time only |
+| Global (app) Statistics |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `musubi.global_stats`: `GET /v1/stats/global`, `GET /v1/server/stats/global` (row was stale) |
 | Range/number precision note |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — |
-| Server time |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — no `/v1/time` route (trivial) |
+| Server time |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `GET /v1/time {now, now_ms, iso}` |
 | Cloud saves `db.saves.save(userId, data, {slot, expectedVersion})` / `load` — per-user per-slot, monotonic ve… |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Config: `maxClients` (auto-lock when full), `patchRate` 50 ms, `autoDispose`, `maxMessagesPerSecond` (exceed… |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | GeoIPPlugin (`@colyseus/geoip`) — country from IP at auth via MMDB (BYO file / MaxMind auto-download weekly /… |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — country only from CDN header (`cf-ipcountry`/`x-country` → `[regions] country_map`), no M… |
