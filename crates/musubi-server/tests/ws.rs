@@ -5882,14 +5882,21 @@ async fn resume_rebuilds_session_on_another_node() {
         recv(&mut a).await.msg,
         ServerMessage::Status { .. }
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let rows: i64 =
-        sqlx::query_scalar("select count(*) from musubi.resumable_sessions where session_id = $1")
-            .bind(uuid::Uuid::parse_str(&session_id).unwrap())
-            .fetch_one(&state1.db)
-            .await
-            .unwrap();
+    // the record is written off the socket task; give a slow CI runner up to 5s
+    let mut rows: i64 = 0;
+    for _ in 0..50 {
+        rows = sqlx::query_scalar(
+            "select count(*) from musubi.resumable_sessions where session_id = $1",
+        )
+        .bind(uuid::Uuid::parse_str(&session_id).unwrap())
+        .fetch_one(&state1.db)
+        .await
+        .unwrap();
+        if rows == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert_eq!(rows, 1, "record written");
 
     // transport lost on node 1: the session parks there and its record points at node 1
