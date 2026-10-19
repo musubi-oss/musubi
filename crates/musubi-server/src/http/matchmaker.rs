@@ -374,6 +374,7 @@ async fn ticket_trace(
     if let Some(t) = s.matchmaker.trace(&id) {
         return Ok(Json(json!({ "live": t.outcome == "waiting", "trace": t })));
     }
+    matchmaker_drain(&s.db, &s.matchmaker).await?;
     type R = (
         String,
         Option<String>,
@@ -426,6 +427,7 @@ async fn matches(
     ServerKey: ServerKey,
     axum::extract::Query(q): axum::extract::Query<MatchesQ>,
 ) -> Result<Json<Value>, ApiError> {
+    matchmaker_drain(&s.db, &s.matchmaker).await?;
     let rows: Vec<MatchRow> = sqlx::query_as(
         "select token, queue, region, quality, team_mmr_gap, tickets, accounts, wait_ms, extract(epoch from created_at)::bigint
          from musubi.matchmaker_matches

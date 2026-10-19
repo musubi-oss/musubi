@@ -19267,8 +19267,8 @@ async fn sanctions_escalation_pending_appeals_and_sync() {
     assert_eq!(s1["action"], "warn");
     assert_eq!(s1["status"], "active");
     assert_eq!(s1["reason"], "Toxic chat");
-    let (st, v) = call(&app, "GET", "/v1/storage?collection=x", Some(&tok), None).await;
-    assert!(st == 200 || st == 400, "warn must not block: {st} {v}");
+    let (st, v) = call(&app, "GET", "/v1/account/sanctions", Some(&tok), None).await;
+    assert_eq!(st, 200, "warn must not block: {v}");
 
     // step 2: mute — chat feature-banned, matchmaking still fine
     let (st, s2) = srv(
@@ -19456,10 +19456,15 @@ async fn lobby_attributes_search_private_attrs_and_member_data() {
     };
     let ta = login(unique("lobby-attr-a-")).await;
     let tb = login(unique("lobby-attr-b-")).await;
+    let hosts = [
+        ta.clone(),
+        login(unique("lobby-attr-h2-")).await,
+        login(unique("lobby-attr-h3-")).await,
+    ];
     let region = unique("reg-");
-    let mk = |name: &str, attrs: Value, private: Value| {
+    let mk = |host: usize, name: &str, attrs: Value, private: Value| {
         let app = app.clone();
-        let ta = ta.clone();
+        let ta = hosts[host].clone();
         let region = region.clone();
         let name = name.to_string();
         async move {
@@ -19477,18 +19482,21 @@ async fn lobby_attributes_search_private_attrs_and_member_data() {
         }
     };
     let l1 = mk(
+        0,
         "ranked eu",
         json!({"mode": "ranked", "map": "dust", "skill": 1500, "crossplay": true}),
         json!({"server_pw": "hunter2"}),
     )
     .await;
     let l2 = mk(
+        1,
         "casual",
         json!({"mode": "casual", "map": "nuke", "skill": 900}),
         json!({}),
     )
     .await;
     let l3 = mk(
+        2,
         "ranked pro",
         json!({"mode": "ranked", "map": "dust2", "skill": 2100}),
         json!({}),
@@ -19732,14 +19740,7 @@ async fn legal_documents_versions_consent_gate_and_withdrawal() {
         let app = app.clone();
         let tok = tok.clone();
         async move {
-            let (st, v) = call(
-                &app,
-                "GET",
-                "/v1/storage?collection=probe",
-                Some(&tok),
-                None,
-            )
-            .await;
+            let (st, v) = call(&app, "GET", "/v1/account/sanctions", Some(&tok), None).await;
             (st, v)
         }
     };
