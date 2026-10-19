@@ -140,6 +140,20 @@ pub struct StreakDef {
     pub period_seconds: i64,
     pub grace_seconds: i64,
     pub milestones: Vec<Milestone>,
+    /// Periods are calendar buckets (`period_seconds` long, rolling over at `reset_hour`)
+    /// instead of running from the last claim.
+    pub calendar: bool,
+    pub reset_hour: i32,
+    /// Buckets roll over at `reset_hour` in the player's own timezone.
+    pub local_time: bool,
+    /// Cap on the count (0 = unbounded); further claims keep the count.
+    pub max_count: i32,
+    /// Lose this many per missed period instead of resetting to zero (0 = reset).
+    pub decay: i32,
+    /// Grant `repeat_rewards` every N-th count on top of milestones (0 = off).
+    pub repeat_every: i32,
+    pub repeat_rewards: Option<String>,
+    pub enabled: bool,
 }
 
 impl Default for StreakDef {
@@ -150,8 +164,74 @@ impl Default for StreakDef {
             period_seconds: 86_400,
             grace_seconds: 86_400,
             milestones: Vec::new(),
+            calendar: false,
+            reset_hour: 0,
+            local_time: false,
+            max_count: 0,
+            decay: 0,
+            repeat_every: 0,
+            repeat_rewards: None,
+            enabled: true,
         }
     }
+}
+
+impl StreakDef {
+    fn shift(&self, tz_offset_min: i64) -> i64 {
+        self.reset_hour as i64 * 3600
+            - if self.local_time {
+                tz_offset_min * 60
+            } else {
+                0
+            }
+    }
+
+    /// Calendar bucket index of `t`.
+    pub fn bucket(&self, t: OffsetDateTime, tz_offset_min: i64) -> i64 {
+        (t.unix_timestamp() - self.shift(tz_offset_min)).div_euclid(self.period_seconds)
+    }
+
+    pub fn bucket_start(&self, b: i64, tz_offset_min: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(b * self.period_seconds + self.shift(tz_offset_min))
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+    }
+
+    fn grace_periods(&self) -> i64 {
+        self.grace_seconds / self.period_seconds.max(1)
+    }
+
+    /// When the streak can next be claimed / when it breaks, given the last claim.
+    pub fn window(
+        &self,
+        last: OffsetDateTime,
+        tz_offset_min: i64,
+    ) -> (OffsetDateTime, OffsetDateTime) {
+        if self.calendar {
+            let b = self.bucket(last, tz_offset_min);
+            (
+                self.bucket_start(b + 1, tz_offset_min),
+                self.bucket_start(b + 2 + self.grace_periods(), tz_offset_min),
+            )
+        } else {
+            (
+                last + Duration::seconds(self.period_seconds),
+                last + Duration::seconds(self.period_seconds + self.grace_seconds),
+            )
+        }
+    }
+}
+
+fn rfc(t: OffsetDateTime) -> Value {
+    t.format(&time::format_description::well_known::Rfc3339)
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Advance {
+    pub count: i32,
+    pub missed: i32,
+    pub reset: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,7 +239,10 @@ pub struct StreakClaim {
     pub streak_id: String,
     pub count: i32,
     pub rewards: Vec<RewardEntry>,
+    #[serde(with = "time::serde::rfc3339")]
     pub next_claim_at: OffsetDateTime,
+    pub missed: i32,
+    pub reset: bool,
 }
 
 pub(crate) fn level_for(levels: &[Level], xp: i64) -> i32 {
@@ -222,29 +305,94 @@ fn energy_state(
     }
 }
 
-/// Next streak count for a claim at `now`: Conflict inside the period, reset after period + grace.
-pub fn next_streak(
+/// Next streak count for a claim at `now`: Conflict inside the current period; beyond the grace
+/// the count decays (or resets) by the missed periods, then grows by one up to `max_count`.
+pub fn advance(
+    def: &StreakDef,
     count: i32,
     last_claim: Option<OffsetDateTime>,
-    def: &StreakDef,
     now: OffsetDateTime,
-) -> Result<i32> {
-    let Some(last) = last_claim else { return Ok(1) };
-    let elapsed = (now - last).whole_seconds();
-    if elapsed < def.period_seconds {
-        return Err(Error::Conflict(
-            "streak already claimed for this period".into(),
-        ));
+    tz_offset_min: i64,
+) -> Result<Advance> {
+    let cap = |c: i32| {
+        if def.max_count > 0 {
+            c.min(def.max_count)
+        } else {
+            c
+        }
+    };
+    let Some(last) = last_claim else {
+        return Ok(Advance {
+            count: cap(count.max(0) + 1),
+            missed: 0,
+            reset: false,
+        });
+    };
+    let missed = if def.calendar {
+        let cur = def.bucket(now, tz_offset_min);
+        let prev = def.bucket(last, tz_offset_min);
+        if cur <= prev {
+            return Err(Error::Conflict(
+                "streak already claimed for this period".into(),
+            ));
+        }
+        let gap = cur - prev - 1;
+        if gap <= def.grace_periods() {
+            0
+        } else {
+            gap
+        }
+    } else {
+        let elapsed = (now - last).whole_seconds();
+        if elapsed < def.period_seconds {
+            return Err(Error::Conflict(
+                "streak already claimed for this period".into(),
+            ));
+        }
+        if elapsed <= def.period_seconds + def.grace_seconds {
+            0
+        } else {
+            let beyond = elapsed - def.period_seconds - def.grace_seconds;
+            (beyond + def.period_seconds - 1) / def.period_seconds.max(1)
+        }
+    };
+    let missed = missed.min(i32::MAX as i64) as i32;
+    if missed == 0 {
+        return Ok(Advance {
+            count: cap(count + 1),
+            missed: 0,
+            reset: false,
+        });
     }
-    if elapsed > def.period_seconds + def.grace_seconds {
-        return Ok(1);
-    }
-    Ok(count + 1)
+    let base = if def.decay > 0 {
+        (count - def.decay.saturating_mul(missed)).max(0)
+    } else {
+        0
+    };
+    Ok(Advance {
+        count: cap(base + 1),
+        missed,
+        reset: true,
+    })
 }
 
 type TrackRow = (String, String, Value);
 type EnergyRow = (String, String, i32, i64, i32, i32, i32, Option<String>);
-type StreakRow = (String, String, i64, i64, Value);
+type StreakRow = (
+    String,
+    String,
+    i64,
+    i64,
+    Value,
+    bool,
+    i32,
+    bool,
+    i32,
+    i32,
+    i32,
+    Option<String>,
+    bool,
+);
 type EnergyStateRow = (
     String,
     String,
@@ -257,7 +405,6 @@ type EnergyStateRow = (
     Option<i32>,
     Option<OffsetDateTime>,
 );
-type StreakStateRow = (String, i64, i64, Option<i32>, Option<OffsetDateTime>);
 
 fn track(r: TrackRow) -> Track {
     Track {
@@ -285,8 +432,18 @@ fn streak(r: StreakRow) -> StreakDef {
         period_seconds: r.2,
         grace_seconds: r.3,
         milestones: serde_json::from_value(r.4).unwrap_or_default(),
+        calendar: r.5,
+        reset_hour: r.6,
+        local_time: r.7,
+        max_count: r.8,
+        decay: r.9,
+        repeat_every: r.10,
+        repeat_rewards: r.11,
+        enabled: r.12,
     }
 }
+
+const STREAK_COLS: &str = "id, name, period_seconds, grace_seconds, milestones, calendar, reset_hour, local_time, max_count, decay, repeat_every, repeat_rewards, enabled";
 
 impl EconomyService {
     // ----- XP tracks -----
@@ -712,16 +869,40 @@ impl EconomyService {
                 "period must be positive, grace non-negative, milestone counts positive".into(),
             ));
         }
+        if !(0..24).contains(&d.reset_hour) || d.max_count < 0 || d.decay < 0 || d.repeat_every < 0
+        {
+            return Err(Error::InvalidArgument(
+                "reset_hour 0..23; max_count, decay, repeat_every non-negative".into(),
+            ));
+        }
+        if d.repeat_every > 0 && d.repeat_rewards.is_none() {
+            return Err(Error::InvalidArgument(
+                "repeat_every needs repeat_rewards".into(),
+            ));
+        }
         sqlx::query(
-            "insert into musubi.streaks (id, name, period_seconds, grace_seconds, milestones) values ($1, $2, $3, $4, $5)
+            "insert into musubi.streaks (id, name, period_seconds, grace_seconds, milestones, calendar, reset_hour, local_time,
+                                         max_count, decay, repeat_every, repeat_rewards, enabled)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              on conflict (id) do update set name = excluded.name, period_seconds = excluded.period_seconds,
-             grace_seconds = excluded.grace_seconds, milestones = excluded.milestones",
+             grace_seconds = excluded.grace_seconds, milestones = excluded.milestones, calendar = excluded.calendar,
+             reset_hour = excluded.reset_hour, local_time = excluded.local_time, max_count = excluded.max_count,
+             decay = excluded.decay, repeat_every = excluded.repeat_every, repeat_rewards = excluded.repeat_rewards,
+             enabled = excluded.enabled",
         )
         .bind(&d.id)
         .bind(&d.name)
         .bind(d.period_seconds)
         .bind(d.grace_seconds)
         .bind(serde_json::to_value(&d.milestones)?)
+        .bind(d.calendar)
+        .bind(d.reset_hour)
+        .bind(d.local_time)
+        .bind(d.max_count)
+        .bind(d.decay)
+        .bind(d.repeat_every)
+        .bind(&d.repeat_rewards)
+        .bind(d.enabled)
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -729,42 +910,148 @@ impl EconomyService {
     }
 
     pub async fn streaks(&self) -> Result<Vec<StreakDef>> {
-        let rows: Vec<StreakRow> =
-            sqlx::query_as("select id, name, period_seconds, grace_seconds, milestones from musubi.streaks order by id")
-                .fetch_all(&self.db)
-                .await
-                .map_err(Error::internal)?;
+        let rows: Vec<StreakRow> = sqlx::query_as(&format!(
+            "select {STREAK_COLS} from musubi.streaks order by id"
+        ))
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
         Ok(rows.into_iter().map(streak).collect())
+    }
+
+    async fn streak_def(&self, id: &str) -> Result<StreakDef> {
+        let row: Option<StreakRow> = sqlx::query_as(&format!(
+            "select {STREAK_COLS} from musubi.streaks where id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        row.map(streak)
+            .ok_or_else(|| Error::NotFound(format!("streak {id}")))
+    }
+
+    fn streak_view(
+        def: &StreakDef,
+        st: Option<(i32, Option<OffsetDateTime>, i32, i32, i32)>,
+        now: OffsetDateTime,
+        tz_offset_min: i64,
+    ) -> Value {
+        let (count, last, claims, best, missed) = st.unwrap_or((0, None, 0, 0, 0));
+        let window = last.map(|l| def.window(l, tz_offset_min));
+        let claimable_at = window.map(|w| w.0);
+        let expires_at = window.map(|w| w.1);
+        let claimable = claimable_at.is_none_or(|t| t <= now);
+        let broken = expires_at.is_some_and(|t| t <= now);
+        let in_grace = !broken
+            && claimable_at.is_some_and(|c| {
+                if def.calendar {
+                    def.bucket(now, tz_offset_min) > def.bucket(c, tz_offset_min)
+                } else {
+                    now - c >= Duration::seconds(def.period_seconds)
+                }
+            });
+        let next_milestone = def
+            .milestones
+            .iter()
+            .filter(|m| m.count > count)
+            .map(|m| m.count)
+            .min();
+        json!({
+            "streak_id": def.id,
+            "name": def.name,
+            "count": count,
+            "best": best,
+            "claims": claims,
+            "missed": missed,
+            "last_claim": last.map(rfc).unwrap_or(Value::Null),
+            "claimable": claimable,
+            "claimable_at": claimable_at.map(rfc).unwrap_or(Value::Null),
+            "expires_at": expires_at.map(rfc).unwrap_or(Value::Null),
+            "in_grace": in_grace,
+            "broken": broken,
+            "max_count": def.max_count,
+            "max_count_reached": def.max_count > 0 && count >= def.max_count,
+            "next_milestone": next_milestone,
+            "milestones": def.milestones,
+            "repeat_every": def.repeat_every,
+            "period_seconds": def.period_seconds,
+            "calendar": def.calendar,
+        })
     }
 
     pub async fn streak_states(
         &self,
         account: AccountId,
         now: OffsetDateTime,
+        tz_offset_min: i64,
     ) -> Result<Vec<Value>> {
-        let rows: Vec<StreakStateRow> = sqlx::query_as(
-            "select d.id, d.period_seconds, d.grace_seconds, s.count, s.last_claim from musubi.streaks d
-             left join musubi.streak_state s on s.streak_id = d.id and s.account_id = $1 order by d.id",
+        let defs = self.streaks().await?;
+        let states: Vec<(String, i32, Option<OffsetDateTime>, i32, i32, i32)> = sqlx::query_as(
+            "select streak_id, count, last_claim, claims, best, missed from musubi.streak_state where account_id = $1",
         )
         .bind(account.0)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let claimable_at = r.4.map(|l| l + Duration::seconds(r.1));
-                let expires_at = r.4.map(|l| l + Duration::seconds(r.1 + r.2));
-                json!({
-                    "streak_id": r.0,
-                    "count": r.3.unwrap_or(0),
-                    "last_claim": r.4,
-                    "claimable": claimable_at.is_none_or(|t| t <= now),
-                    "claimable_at": claimable_at,
-                    "expires_at": expires_at,
-                })
+        Ok(defs
+            .iter()
+            .filter(|d| d.enabled)
+            .map(|d| {
+                let st = states
+                    .iter()
+                    .find(|s| s.0 == d.id)
+                    .map(|s| (s.1, s.2, s.3, s.4, s.5));
+                Self::streak_view(d, st, now, tz_offset_min)
             })
             .collect())
+    }
+
+    pub async fn streak_state(
+        &self,
+        account: AccountId,
+        streak_id: &str,
+        now: OffsetDateTime,
+        tz_offset_min: i64,
+    ) -> Result<Value> {
+        let def = self.streak_def(streak_id).await?;
+        let st: Option<(i32, Option<OffsetDateTime>, i32, i32, i32)> = sqlx::query_as(
+            "select count, last_claim, claims, best, missed from musubi.streak_state where account_id = $1 and streak_id = $2",
+        )
+        .bind(account.0)
+        .bind(streak_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(Self::streak_view(&def, st, now, tz_offset_min))
+    }
+
+    /// Operator reset (support, abuse): sets the count (default 0) and makes the streak claimable now.
+    pub async fn reset_streak(
+        &self,
+        account: AccountId,
+        streak_id: &str,
+        count: Option<i32>,
+    ) -> Result<()> {
+        let def = self.streak_def(streak_id).await?;
+        let count = count.unwrap_or(0).max(0);
+        if def.max_count > 0 && count > def.max_count {
+            return Err(Error::InvalidArgument(format!(
+                "count: <= max_count {}",
+                def.max_count
+            )));
+        }
+        sqlx::query(
+            "insert into musubi.streak_state (account_id, streak_id, count, last_claim) values ($1, $2, $3, null)
+             on conflict (account_id, streak_id) do update set count = excluded.count, last_claim = null",
+        )
+        .bind(account.0)
+        .bind(streak_id)
+        .bind(count)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(())
     }
 
     pub async fn claim_streak(
@@ -772,35 +1059,43 @@ impl EconomyService {
         account: AccountId,
         streak_id: &str,
         now: OffsetDateTime,
+        tz_offset_min: i64,
     ) -> Result<StreakClaim> {
-        let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        let row: Option<StreakRow> =
-            sqlx::query_as("select id, name, period_seconds, grace_seconds, milestones from musubi.streaks where id = $1")
-                .bind(streak_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(Error::internal)?;
-        let Some(def) = row.map(streak) else {
+        let def = self.streak_def(streak_id).await?;
+        if !def.enabled {
             return Err(Error::NotFound(format!("streak {streak_id}")));
-        };
+        }
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
         sqlx::query("insert into musubi.streak_state (account_id, streak_id) values ($1, $2) on conflict do nothing")
             .bind(account.0)
             .bind(streak_id)
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?;
-        let (count, last): (i32, Option<OffsetDateTime>) =
-            sqlx::query_as("select count, last_claim from musubi.streak_state where account_id = $1 and streak_id = $2 for update")
+        let (count, last, best): (i32, Option<OffsetDateTime>, i32) =
+            sqlx::query_as("select count, last_claim, best from musubi.streak_state where account_id = $1 and streak_id = $2 for update")
                 .bind(account.0)
                 .bind(streak_id)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(Error::internal)?;
-        let count = next_streak(count, last, &def, now)?;
+        let adv = advance(&def, count, last, now, tz_offset_min)?;
+        let count = adv.count;
         let mut rewards = Vec::new();
-        for m in def.milestones.iter().filter(|m| m.count == count) {
-            let Some(table) = Self::load_table(&mut tx, &m.rewards).await? else {
-                return Err(Error::NotFound(format!("reward table {}", m.rewards)));
+        let mut tables: Vec<String> = def
+            .milestones
+            .iter()
+            .filter(|m| m.count == count)
+            .map(|m| m.rewards.clone())
+            .collect();
+        if def.repeat_every > 0 && count % def.repeat_every == 0 {
+            if let Some(t) = &def.repeat_rewards {
+                tables.push(t.clone());
+            }
+        }
+        for t in tables {
+            let Some(table) = Self::load_table(&mut tx, &t).await? else {
+                return Err(Error::NotFound(format!("reward table {t}")));
             };
             Self::apply_rewards(
                 &mut tx,
@@ -812,20 +1107,27 @@ impl EconomyService {
             .await?;
             rewards.extend(table.entries);
         }
-        sqlx::query("update musubi.streak_state set count = $3, last_claim = $4 where account_id = $1 and streak_id = $2")
-            .bind(account.0)
-            .bind(streak_id)
-            .bind(count)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(Error::internal)?;
+        sqlx::query(
+            "update musubi.streak_state set count = $3, last_claim = $4, claims = claims + 1, best = $5, missed = missed + $6
+             where account_id = $1 and streak_id = $2",
+        )
+        .bind(account.0)
+        .bind(streak_id)
+        .bind(count)
+        .bind(now)
+        .bind(best.max(count))
+        .bind(adv.missed)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
         tx.commit().await.map_err(Error::internal)?;
         Ok(StreakClaim {
             streak_id: streak_id.into(),
             count,
             rewards,
-            next_claim_at: now + Duration::seconds(def.period_seconds),
+            next_claim_at: def.window(now, tz_offset_min).0,
+            missed: adv.missed,
+            reset: adv.reset,
         })
     }
 }
@@ -871,25 +1173,96 @@ mod tests {
     fn streak_period_grace_and_reset() {
         let d = StreakDef::default();
         let t0 = OffsetDateTime::UNIX_EPOCH;
-        assert_eq!(next_streak(0, None, &d, t0).unwrap(), 1);
+        let n = |c, l, now| advance(&d, c, l, now, 0).map(|a| a.count);
+        assert_eq!(n(0, None, t0).unwrap(), 1);
         assert!(matches!(
-            next_streak(1, Some(t0), &d, t0 + Duration::hours(23)),
+            n(1, Some(t0), t0 + Duration::hours(23)),
             Err(Error::Conflict(_))
         ));
+        assert_eq!(n(1, Some(t0), t0 + Duration::hours(30)).unwrap(), 2);
         assert_eq!(
-            next_streak(1, Some(t0), &d, t0 + Duration::hours(30)).unwrap(),
-            2
-        );
-        assert_eq!(
-            next_streak(5, Some(t0), &d, t0 + Duration::hours(47)).unwrap(),
+            n(5, Some(t0), t0 + Duration::hours(47)).unwrap(),
             6,
             "inside grace"
         );
+        let a = advance(&d, 5, Some(t0), t0 + Duration::hours(49), 0).unwrap();
         assert_eq!(
-            next_streak(5, Some(t0), &d, t0 + Duration::hours(49)).unwrap(),
-            1,
+            (a.count, a.missed, a.reset),
+            (1, 1, true),
             "grace exceeded → reset"
         );
+    }
+
+    #[test]
+    fn streak_decay_cap_and_calendar_buckets() {
+        let d = StreakDef {
+            decay: 2,
+            max_count: 7,
+            ..Default::default()
+        };
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        // 3 days missed beyond the grace → lose 2 × 3, then +1
+        let a = advance(&d, 10, Some(t0), t0 + Duration::days(5), 0).unwrap();
+        assert_eq!((a.count, a.missed), (5, 3));
+        assert_eq!(
+            advance(&d, 7, Some(t0), t0 + Duration::days(1), 0)
+                .unwrap()
+                .count,
+            7,
+            "capped"
+        );
+        let c = StreakDef {
+            calendar: true,
+            reset_hour: 4,
+            grace_seconds: 0,
+            ..Default::default()
+        };
+        // claimed 03:00 (yesterday's bucket), again at 05:00 the same day → next bucket, no gap
+        let d0 = OffsetDateTime::from_unix_timestamp(100 * 86_400).unwrap();
+        let last = d0 + Duration::hours(3);
+        assert!(advance(
+            &c,
+            1,
+            Some(last),
+            d0 + Duration::hours(3) + Duration::minutes(30),
+            0
+        )
+        .is_err());
+        assert_eq!(
+            advance(&c, 1, Some(last), d0 + Duration::hours(5), 0)
+                .unwrap()
+                .count,
+            2
+        );
+        let a = advance(
+            &c,
+            1,
+            Some(last),
+            d0 + Duration::days(2) + Duration::hours(5),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            (a.count, a.missed, a.reset),
+            (1, 2, true),
+            "two buckets skipped"
+        );
+        // local time UTC+3: 02:00 UTC = 05:00 local → already today's bucket
+        let l = StreakDef {
+            local_time: true,
+            ..c.clone()
+        };
+        assert_eq!(
+            l.bucket(d0 + Duration::hours(2), 180),
+            l.bucket(d0 + Duration::hours(20), 180)
+        );
+        assert_ne!(
+            l.bucket(d0 + Duration::hours(2), 0),
+            l.bucket(d0 + Duration::hours(20), 0)
+        );
+        let (next, exp) = c.window(last, 0);
+        assert_eq!(next, d0 + Duration::hours(4));
+        assert_eq!(exp, d0 + Duration::days(1) + Duration::hours(4));
     }
 
     #[test]

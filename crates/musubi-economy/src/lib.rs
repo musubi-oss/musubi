@@ -22,8 +22,10 @@ pub use market::{
     Settled, Trade, TradeSide, WantItem,
 };
 pub use orderbook::{Book, Fill, NewOrder, Order, Placed, Side};
+pub mod challenges;
 pub mod group_inventory;
 pub mod progression;
+pub mod quest_pools;
 pub mod quests;
 pub mod seasons;
 pub mod treasury;

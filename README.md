@@ -281,6 +281,29 @@ with the raw body (content-type kept; blobs in `[ugc.s3]` or Postgres, `[files] 
 `GET /v1/files/{path}` with sha256 `ETag`/304, `Cache-Control`, `x-musubi-file-version`; `[files]
 public_base_url` rewrites manifest URLs to a CDN origin.
 
+Quest pools (challenge rotations): `POST /v1/server/quests/pools {id, kind: daily|weekly|custom, period_seconds,
+reset_hour, local_time, pick, goals: [{id, name, description, objectives, rewards, weight}], rerolls_per_period,
+starts_at, ends_at}` hands every player a deterministic weighted pick of `pick` goals per period (seeded by
+account × pool × period × generation — no coordination between nodes), rolling over at `reset_hour` in UTC or
+in the player's timezone (`accounts.metadata.tz_offset_min`); `GET /v1/quests/pools` creates the period's
+assignments on first sight, `POST …/{id}/slots/{slot}/reroll` swaps a slot for a goal not held (limited per
+period), `…/claim` pays the goal's reward table; `POST /v1/server/quests/event` and match results feed pools
+and challenges too (`pools.completed`, `quest_pool.completed` events); `…/{id}/accelerate` bumps the
+generation (fresh set for everyone now), `…/retire` closes the pool, `GET …/{id}/preview/{account_id}?at=`
+shows one player's set at any time. Player challenges from templates: `POST /v1/server/challenge_templates
+{id, objectives, duration_secs, max_participants, rewards_by_rank: {"1": table, "default": table}}`;
+a player runs one — `POST /v1/challenges {template_id, name, open, invite: [ids], starts_in_secs,
+duration_secs, max_participants}` (≤ 5 active per owner; invitees get a `challenge_invite` notification,
+code 31) — friends join by invite, open flag or the 8-char `join_code`; quest events score every running
+challenge the player is in (progress capped per objective), `GET /v1/challenges/{id}` shows live standings
+(code hidden from outsiders), at `ends_at` the ranks freeze (lazily or via `POST /v1/server/challenges/sweep`)
+and `POST …/{id}/claim` pays the rank's table; `GET /v1/challenges` lists the player's own and invited ones.
+Streak depth: `POST /v1/server/streaks {…, calendar, reset_hour, local_time, max_count, decay, repeat_every,
+repeat_rewards, enabled}` — calendar buckets instead of rolling periods (grace in whole periods), caps,
+decay by missed periods instead of a hard reset, a repeating reward every N-th count; state carries `best`,
+`claims`, `missed`, `in_grace`, `broken`, `next_milestone`, `max_count_reached`; operators read
+`GET /v1/server/streaks/{id}/state/{account_id}` and `POST …/{id}/reset {account_id, count?}`.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

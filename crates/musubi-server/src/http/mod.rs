@@ -5,6 +5,7 @@ mod anticheat;
 pub mod audiences;
 mod auth;
 mod bans;
+pub mod challenges;
 mod chat;
 mod cluster;
 mod codes;
@@ -236,6 +237,7 @@ pub fn router(state: AppState) -> Router {
         )
         .merge(bans::routes())
         .merge(group_pools::routes())
+        .merge(challenges::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())

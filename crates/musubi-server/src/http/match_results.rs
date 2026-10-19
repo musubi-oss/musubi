@@ -191,6 +191,8 @@ async fn report(
                     Ok(res) => pj["quests"] = serde_json::to_value(res).unwrap_or(Value::Null),
                     Err(e) => pj["quests_error"] = json!(e.to_string()),
                 }
+                pj["challenges"] =
+                    crate::http::challenges::fan_out_event(&s, acc, &qe.name, qe.delta).await;
             }
             if let Some(pr) = &r.progression {
                 if let Some(xp) = pick(&pr.xp_by_rank.map, rank).and_then(|v| v.as_i64()) {

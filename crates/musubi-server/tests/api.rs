@@ -21161,3 +21161,689 @@ async fn remote_config_variants_history_csv_client_gate_and_title_files() {
     let (st, _, _) = raw("GET", format!("/v1/files/{dir}/secret.bin"), vec![], vec![]).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn quest_pools_player_challenges_and_streak_depth() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let mut users = Vec::new();
+    for i in 0..3 {
+        let (_, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(&format!("qp{i}"))})),
+        )
+        .await;
+        let t = sess["access_token"].as_str().unwrap().to_string();
+        let (_, acc) = call(&app, "GET", "/v1/account", Some(&t), None).await;
+        users.push((t, acc["id"].as_str().unwrap().to_string()));
+    }
+    let (ta, a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let (tc, c) = users[2].clone();
+    let gold = unique("qpg").to_lowercase();
+    let (rt, rt2) = (unique("qprt").to_lowercase(), unique("qprs").to_lowercase());
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for (id, amount) in [(&rt, 10), (&rt2, 1)] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/rewards/tables",
+            k,
+            Some(json!({"id": id, "name": id, "kind": "weighted",
+                "entries": [{"weight": 1, "currency": gold, "amount": amount}]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let balance = |t: String| {
+        let app = app.clone();
+        let gold = gold.clone();
+        async move {
+            let (_, w) = call(&app, "GET", "/v1/wallet", Some(&t), None).await;
+            w["balances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["currency"] == gold || b["code"] == gold)
+                .and_then(|b| b["balance"].as_i64())
+                .unwrap_or(0)
+        }
+    };
+
+    // ----- quest pools -----
+    let pool = unique("pool").to_lowercase();
+    let goals: Vec<Value> = (1..=4)
+        .map(|i| {
+            json!({"id": format!("g{i}"), "name": format!("Goal {i}"),
+                "objectives": [{"event": if i == 4 { "wins" } else { "kills" }, "target": 3}],
+                "rewards": rt, "weight": 1})
+        })
+        .collect();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/quests/pools",
+        k,
+        Some(json!({"id": pool, "name": "Dailies", "kind": "daily", "pick": 9, "goals": goals})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/quests/pools",
+        k,
+        Some(
+            json!({"id": pool, "name": "Dailies", "kind": "daily", "pick": 2,
+            "rerolls_per_period": 1, "goals": goals}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["generation"], 0);
+    let my_pool = |t: String| {
+        let app = app.clone();
+        let pool = pool.clone();
+        async move {
+            let (st, v) = call(&app, "GET", "/v1/quests/pools", Some(&t), None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v["pools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["pool_id"] == pool)
+                .cloned()
+        }
+    };
+    let p1 = my_pool(ta.clone()).await.expect("pool live");
+    assert_eq!(p1["goals"].as_array().unwrap().len(), 2);
+    assert_eq!(p1["rerolls_left"], 1);
+    assert!(p1["period_key"].as_str().unwrap().starts_with("0:"));
+    let p1b = my_pool(ta.clone()).await.unwrap();
+    assert_eq!(p1["goals"], p1b["goals"], "assignments are stable");
+    let held: Vec<String> = p1["goals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["goal_id"].as_str().unwrap().to_string())
+        .collect();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/pools/{pool}/slots/0/reroll"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let new_goal = v["goals"][0]["goal_id"].as_str().unwrap().to_string();
+    assert!(
+        !held.contains(&new_goal),
+        "rerolled into a goal not held: {v}"
+    );
+    assert_eq!(v["goals"][0]["rerolled"], true);
+    assert_eq!(v["rerolls_left"], 0);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/pools/{pool}/slots/1/reroll"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "no rerolls left");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/quests/pools/{pool}/slots/7/claim"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, ev) = call_server(
+        &app,
+        "POST",
+        "/v1/server/quests/event",
+        k,
+        Some(json!({"account_id": a, "event": "kills", "delta": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    let p2 = my_pool(ta.clone()).await.unwrap();
+    let mut claimed = 0;
+    for g in p2["goals"].as_array().unwrap() {
+        let kills = g["objectives"][0]["event"] == "kills";
+        assert_eq!(g["completed"], json!(kills), "{g}");
+        if kills {
+            assert_eq!(g["progress"]["kills"], 3, "clamped to target");
+            assert!(ev["pools"]["completed"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(format!("{pool}/{}", g["slot"]))));
+            let path = format!("/v1/quests/pools/{pool}/slots/{}/claim", g["slot"]);
+            let (st, v) = call(&app, "POST", &path, Some(&ta), None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["rewards"][0]["amount"], 10);
+            let (st, _) = call(&app, "POST", &path, Some(&ta), None).await;
+            assert_eq!(st, StatusCode::CONFLICT, "claimed once");
+            claimed += 1;
+        } else {
+            let path = format!("/v1/quests/pools/{pool}/slots/{}/claim", g["slot"]);
+            let (st, _) = call(&app, "POST", &path, Some(&ta), None).await;
+            assert_eq!(st, StatusCode::CONFLICT, "not completed");
+        }
+    }
+    assert!(
+        claimed >= 1,
+        "at least one kills goal in a pick of 2 from 3×kills + 1×wins"
+    );
+    assert_eq!(balance(ta.clone()).await, 10 * claimed);
+
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/quests/pools/{pool}/accelerate"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["generation"], 1);
+    let p3 = my_pool(ta.clone()).await.unwrap();
+    assert!(p3["period_key"].as_str().unwrap().starts_with("1:"));
+    assert!(p3["goals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|g| g["completed"] == false));
+    assert_eq!(p3["rerolls_left"], 1);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/quests/pools/{pool}/preview/{a}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["goals"], p3["goals"]);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/quests/pools/{pool}/retire"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        my_pool(ta.clone()).await.is_none(),
+        "retired pools disappear"
+    );
+
+    // local-time periods: UTC+3 player at 01:00 UTC is already in "today" (local 04:00) → period
+    // started at local midnight = 21:00 UTC the day before
+    let (st, _) = call(
+        &app,
+        "PATCH",
+        "/v1/account",
+        Some(&ta),
+        Some(json!({"metadata": {"tz_offset_min": 180}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let pool2 = unique("lpool").to_lowercase();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/quests/pools",
+        k,
+        Some(json!({"id": pool2, "kind": "daily", "local_time": true, "pick": 1, "goals": goals})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/quests/pools/{pool2}/preview/{a}?at={}",
+            10 * 86_400 + 3600
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["period_start"], "1970-01-10T21:00:00Z");
+    assert_eq!(v["resets_at"], "1970-01-11T21:00:00Z");
+
+    // ----- player challenges -----
+    let tmpl = unique("race").to_lowercase();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/challenge_templates",
+        k,
+        Some(json!({"id": tmpl, "name": "Kill race", "objectives": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/challenge_templates",
+        k,
+        Some(json!({"id": tmpl, "name": "Kill race", "objectives": [{"event": "kills", "target": 10}],
+            "duration_secs": 3600, "max_participants": 3, "rewards_by_rank": {"1": rt, "default": rt2}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, ch) = call(
+        &app,
+        "POST",
+        "/v1/challenges",
+        Some(&ta),
+        Some(json!({"template_id": tmpl, "name": "Race", "invite": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ch}");
+    let cid = ch["id"].as_str().unwrap().to_string();
+    let code = ch["join_code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 8);
+    assert_eq!(ch["invited"], json!([b]));
+    let (_, n) = call(&app, "GET", "/v1/notifications", Some(&tb), None).await;
+    assert!(n.to_string().contains("challenge_invite"), "{n}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/join"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "private: no invite, no code");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/join"),
+        Some(&tc),
+        Some(json!({"code": code.to_lowercase()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "invited");
+    let (_, l) = call(&app, "GET", "/v1/challenges", Some(&tc), None).await;
+    let mine = l["challenges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == cid)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["role"], "participant");
+    assert_eq!(mine["participants"], 3);
+    for (acc, n) in [(&a, 4), (&b, 12)] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/quests/event",
+            k,
+            Some(json!({"account_id": acc, "event": "kills", "delta": n})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/challenges/{cid}"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["running"], true);
+    assert_eq!(v["join_code"], code, "participants see the code");
+    let order: Vec<&str> = v["standings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["account_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, vec![b.as_str(), a.as_str(), c.as_str()]);
+    assert_eq!(
+        v["standings"][0]["score"], 10,
+        "capped at the objective target"
+    );
+    assert_eq!(v["standings"][1]["score"], 4);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/claim"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "still running");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/leave"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "owner cannot leave");
+    // time runs out
+    let db = sqlx::PgPool::connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "update musubi.challenges set ends_at = now() - interval '1 second' where id = $1::uuid",
+    )
+    .bind(&cid)
+    .execute(&db)
+    .await
+    .unwrap();
+    let before = balance(tb.clone()).await;
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/challenges/{cid}"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["state"], "settled");
+    assert_eq!(v["standings"][0]["rank"], 1);
+    assert_eq!(v["standings"][0]["reward_table"], rt);
+    assert_eq!(v["standings"][2]["reward_table"], rt2);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/claim"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rank"], 1);
+    assert_eq!(balance(tb.clone()).await, before + 10);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/claim"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/claim"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rank"], 3);
+    assert_eq!(v["rewards"][0]["amount"], 1);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{cid}/join"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "over");
+    let (_, l) = call(&app, "GET", "/v1/challenges", Some(&tb), None).await;
+    let mine = l["challenges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == cid)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["my_rank"], 1);
+    assert_eq!(mine["state"], "settled");
+    // invited-only view hides the code
+    let (st, ch2) = call(
+        &app,
+        "POST",
+        "/v1/challenges",
+        Some(&ta),
+        Some(json!({"template_id": tmpl, "open": true, "invite": [c], "duration_secs": 999_999})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "longer than the template allows: {ch2}"
+    );
+    let (st, ch2) = call(
+        &app,
+        "POST",
+        "/v1/challenges",
+        Some(&ta),
+        Some(json!({"template_id": tmpl, "open": true, "invite": [c]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ch2}");
+    let (_, l) = call(&app, "GET", "/v1/challenges", Some(&tc), None).await;
+    let inv = l["challenges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == ch2["id"])
+        .cloned()
+        .unwrap();
+    assert_eq!(inv["role"], "invited");
+    assert!(inv["join_code"].is_null());
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{}/join", ch2["id"].as_str().unwrap()),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "open challenge");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/challenges/{}/leave", ch2["id"].as_str().unwrap()),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // ----- streak depth -----
+    let stk = unique("stk").to_lowercase();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streaks",
+        k,
+        Some(json!({"id": stk, "name": "Login", "repeat_every": 2})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "repeat_every without repeat_rewards"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streaks",
+        k,
+        Some(
+            json!({"id": stk, "name": "Login", "milestones": [{"count": 2, "rewards": rt}],
+            "max_count": 3, "decay": 1, "repeat_every": 3, "repeat_rewards": rt2}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/streaks/{stk}/claim"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["reset"], false);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/streaks/{stk}/claim"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/streaks/{stk}/state/{c}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["claimable"], false);
+    assert_eq!(v["next_milestone"], 2);
+    assert_eq!(v["max_count_reached"], false);
+    assert_eq!(v["in_grace"], false);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/streaks/{stk}/reset"),
+        k,
+        Some(json!({"account_id": c, "count": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "above max_count: {v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/streaks/{stk}/reset"),
+        k,
+        Some(json!({"account_id": c, "count": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["claimable"], true);
+    let before = balance(tc.clone()).await;
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/streaks/{stk}/claim"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 3, "capped by max_count");
+    assert_eq!(
+        v["rewards"][0]["amount"], 1,
+        "every 3rd count grants repeat_rewards"
+    );
+    assert_eq!(balance(tc.clone()).await, before + 1);
+    let (_, l) = call(&app, "GET", "/v1/streaks", Some(&tc), None).await;
+    let mine = l["streaks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["streak_id"] == stk)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["max_count_reached"], true);
+    assert_eq!(mine["best"], 3);
+    assert_eq!(mine["claims"], 2);
+    assert!(mine["next_milestone"].is_null());
+    // calendar streak in the player's local time (a is UTC+3)
+    let stk2 = unique("cal").to_lowercase();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streaks",
+        k,
+        Some(json!({"id": stk2, "calendar": true, "local_time": true, "grace_seconds": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/streaks/{stk2}/claim"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let next = v["next_claim_at"].as_str().unwrap().to_string();
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/streaks/{stk2}/state/{a}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["claimable_at"], next);
+    assert!(
+        v["claimable_at"].as_str().unwrap().contains("T21:00:00"),
+        "local midnight at UTC+3: {v}"
+    );
+    assert!(v["expires_at"].as_str().unwrap() > v["claimable_at"].as_str().unwrap());
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/streaks/{stk2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/streaks/{stk2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

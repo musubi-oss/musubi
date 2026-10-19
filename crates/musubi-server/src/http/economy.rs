@@ -946,7 +946,7 @@ async fn energy_modifier_remove(
 
 async fn streaks(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        json!({ "streaks": s.economy.streak_states(me.account_id, OffsetDateTime::now_utc()).await? }),
+        json!({ "streaks": s.economy.streak_states(me.account_id, OffsetDateTime::now_utc(), crate::http::challenges::tz_offset_min(&s, me.account_id).await).await? }),
     ))
 }
 
@@ -957,7 +957,12 @@ async fn streak_claim(
 ) -> Result<Json<Value>, ApiError> {
     let c = s
         .economy
-        .claim_streak(me.account_id, &id, OffsetDateTime::now_utc())
+        .claim_streak(
+            me.account_id,
+            &id,
+            OffsetDateTime::now_utc(),
+            crate::http::challenges::tz_offset_min(&s, me.account_id).await,
+        )
         .await?;
     Ok(Json(serde_json::to_value(c).map_err(Error::internal)?))
 }
@@ -1647,16 +1652,16 @@ async fn quest_event(
     ServerKey: ServerKey,
     Json(r): Json<QuestEventReq>,
 ) -> Result<Json<Value>, ApiError> {
+    let acc = account(&r.account_id)?;
     let res = s
         .economy
-        .quest_event(
-            account(&r.account_id)?,
-            &r.event,
-            r.delta,
-            OffsetDateTime::now_utc(),
-        )
+        .quest_event(acc, &r.event, r.delta, OffsetDateTime::now_utc())
         .await?;
-    Ok(Json(serde_json::to_value(res).map_err(Error::internal)?))
+    let mut v = serde_json::to_value(res).map_err(Error::internal)?;
+    let extra = crate::http::challenges::fan_out_event(&s, acc, &r.event, r.delta).await;
+    v["pools"] = extra["pools"].clone();
+    v["challenges"] = extra["challenges"].clone();
+    Ok(Json(v))
 }
 
 // ----- seasons / battle pass -----
