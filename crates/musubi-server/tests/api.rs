@@ -18,6 +18,10 @@ async fn app() -> Option<Router> {
 }
 
 async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
+    app_and_state_with(tweak).await.map(|(app, _)| app)
+}
+
+async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, AppState)> {
     let url = std::env::var("MUSUBI_TEST_DATABASE_URL").ok()?;
     let mut cfg = Config::default();
     cfg.database.url = url;
@@ -180,7 +184,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     state.matches.set_idl(state.idl.clone());
     state.anticheat.bind(&state);
     musubi_server::runtime_host::install(&state);
-    Some(musubi_server::http::router(state))
+    Some((musubi_server::http::router(state.clone()), state))
 }
 
 async fn call(
@@ -18455,7 +18459,7 @@ async fn offers_and_placements_lifecycle() {
     let (st, _) = call_server(
         &app,
         "PUT",
-        &format!("/v1/server/placements/{pl}"),
+        &format!("/v1/server/session_placements/{pl}"),
         k,
         Some(json!({"name": "Shop banner", "max_offers": 0})),
     )
@@ -18464,7 +18468,7 @@ async fn offers_and_placements_lifecycle() {
     let (st, r) = call_server(
         &app,
         "PUT",
-        &format!("/v1/server/placements/{pl}"),
+        &format!("/v1/server/session_placements/{pl}"),
         k,
         Some(json!({"name": "Shop banner", "max_offers": 2})),
     )
@@ -18640,7 +18644,7 @@ async fn offers_and_placements_lifecycle() {
     let (st, pv) = call_server(
         &app,
         "GET",
-        &format!("/v1/server/placements/{pl}/offers?account_id={bid}"),
+        &format!("/v1/server/session_placements/{pl}/offers?account_id={bid}"),
         k,
         None,
     )
@@ -18693,7 +18697,7 @@ async fn offers_and_placements_lifecycle() {
     let _ = call_server(
         &app,
         "DELETE",
-        &format!("/v1/server/placements/{pl}"),
+        &format!("/v1/server/session_placements/{pl}"),
         k,
         None,
     )
@@ -33095,5 +33099,285 @@ async fn game_server_log_archives_to_object_storage() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (_, a) = call_server(&app, "GET", &format!("{logs_url}/archives"), k, None).await;
     assert_eq!(a["archives"].as_array().unwrap().len(), 1);
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+}
+
+#[tokio::test]
+async fn placements_queue_until_capacity_or_timeout() {
+    let Some((app, state)) = app_and_state_with(|_| {}).await else {
+        return;
+    };
+    let k = "defaultkey";
+    let pool = unique("placepool");
+
+    // validation / unknown pool
+    for (bad, want) in [
+        (json!({}), StatusCode::BAD_REQUEST),
+        (
+            json!({"pool": pool, "timeout_secs": 0}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"pool": pool, "timeout_secs": 601}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"pool": pool, "metadata": "x"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"pool": pool, "max_ping_ms": -1}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (json!({"pool": "no-such-pool"}), StatusCode::NOT_FOUND),
+    ] {
+        let (st, e) =
+            call_server(&app, "POST", "/v1/server/session_placements", k, Some(bad)).await;
+        assert_eq!(st, want, "{e}");
+    }
+
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("placefleet"), "provider": "local", "pool": pool, "region": "eu-west",
+            "buffer": 0, "max_servers": 1, "port_start": 47500, "port_end": 47510,
+            "spec": {"command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+
+    // empty pool: the synchronous try is exhausted → queued
+    let (st, p1) = call_server(&app, "POST", "/v1/server/session_placements", k, Some(json!({
+        "pool": pool, "timeout_secs": 60, "metadata": {"ticket": "t1"}, "payload": {"mode": "ranked"}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{p1}");
+    assert_eq!(p1["status"], "pending", "{p1}");
+    assert_eq!(p1["attempts"], 1);
+    assert_eq!(p1["queue_position"], 0);
+    assert!(p1["last_error"].as_str().is_some(), "{p1}");
+    let id1 = p1["id"].as_str().unwrap().to_string();
+
+    // the worker cold-starts a server and fulfils it
+    let fid_u = uuid::Uuid::parse_str(&fid).unwrap();
+    let mut done = Value::Null;
+    for _ in 0..60 {
+        let _ = state.fleets.reconcile_one(fid_u).await;
+        // `sleep` never calls the SDK: mark started servers ready like a real game server would
+        for gs in state.fleets.servers(fid_u, None).await.unwrap() {
+            if gs.state == "starting" {
+                let _ = state.fleets.sdk_ready(gs.id).await;
+            }
+        }
+        musubi_server::http::placements::tick(&state).await.unwrap();
+        let (_, g) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/session_placements/{id1}"),
+            k,
+            None,
+        )
+        .await;
+        done = g;
+        if done["status"] == "fulfilled" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(done["status"], "fulfilled", "{done}");
+    assert_eq!(done["allocation"]["fleet_id"], fid, "{done}");
+    assert!(done["allocation"]["connect_token"].as_str().is_some());
+    assert_eq!(done["allocation"]["route"]["region"], "eu-west");
+    assert!(done["fulfilled_at"].as_i64().is_some());
+    assert!(done["queue_position"].is_null());
+    assert_eq!(done["metadata"]["ticket"], "t1");
+    assert_eq!(done["request"]["payload"]["mode"], "ranked");
+
+    // fleet is full (max_servers 1) → the next two wait in order
+    let (st, p2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/session_placements",
+        k,
+        Some(json!({"pool": pool, "timeout_secs": 60})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p2}");
+    assert_eq!(p2["status"], "pending");
+    let id2 = p2["id"].as_str().unwrap().to_string();
+    let (_, p3) = call_server(
+        &app,
+        "POST",
+        "/v1/server/session_placements",
+        k,
+        Some(json!({"pool": pool, "timeout_secs": 60, "try_now": false})),
+    )
+    .await;
+    assert_eq!(p3["status"], "pending");
+    assert_eq!(p3["attempts"], 0);
+    assert_eq!(p3["queue_position"], 1, "{p3}");
+    let id3 = p3["id"].as_str().unwrap().to_string();
+    musubi_server::http::placements::tick(&state).await.unwrap();
+    let (_, g) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/session_placements/{id3}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(g["status"], "pending");
+    assert_eq!(g["queue_position"], 1);
+
+    // cancel the second → third moves up; cancelling again → 409
+    let (st, c) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/session_placements/{id2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["status"], "cancelled");
+    let (st, e) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/session_placements/{id2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{e}");
+    let (st, e) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/session_placements/{id1}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{e}");
+    let (_, g) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/session_placements/{id3}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(g["queue_position"], 0, "{g}");
+
+    // a short deadline expires on the next pass
+    let (_, p4) = call_server(
+        &app,
+        "POST",
+        "/v1/server/session_placements",
+        k,
+        Some(json!({"pool": pool, "timeout_secs": 1})),
+    )
+    .await;
+    let id4 = p4["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    let (_, t) = musubi_server::http::placements::tick(&state).await.unwrap();
+    assert_eq!(t, 1);
+    let (_, g) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/session_placements/{id4}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(g["status"], "timed_out", "{g}");
+    let (_, g) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/session_placements/{id3}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(g["status"], "pending");
+
+    // list / filters / 404
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/session_placements?pool={pool}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert_eq!(l["placements"].as_array().unwrap().len(), 4);
+    assert_eq!(l["placements"][0]["id"], id4, "newest first");
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/session_placements?pool={pool}&status=pending"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(l["placements"].as_array().unwrap().len(), 1);
+    assert_eq!(l["placements"][0]["id"], id3);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/session_placements/{}", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "GET", "/v1/server/session_placements/nope", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // the busy server goes away → the waiting placement gets the replacement
+    let sid = done["allocation"]["server_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fleet = state
+        .fleets
+        .get(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
+    state
+        .fleets
+        .terminate_reason(&fleet, uuid::Uuid::parse_str(&sid).unwrap(), "test")
+        .await;
+    let mut g = Value::Null;
+    for _ in 0..80 {
+        let _ = state.fleets.reconcile_one(fid_u).await;
+        // `sleep` never calls the SDK: mark started servers ready like a real game server would
+        for gs in state.fleets.servers(fid_u, None).await.unwrap() {
+            if gs.state == "starting" {
+                let _ = state.fleets.sdk_ready(gs.id).await;
+            }
+        }
+        musubi_server::http::placements::tick(&state).await.unwrap();
+        let (_, x) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/session_placements/{id3}"),
+            k,
+            None,
+        )
+        .await;
+        g = x;
+        if g["status"] == "fulfilled" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(g["status"], "fulfilled", "{g}");
+    assert_ne!(g["allocation"]["server_id"], sid);
+
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }

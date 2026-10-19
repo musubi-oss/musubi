@@ -49,6 +49,7 @@ pub mod oauth;
 mod offers;
 mod parties;
 mod passkeys;
+pub mod placements;
 pub mod push;
 pub mod rating;
 mod regions;
@@ -207,6 +208,7 @@ pub fn router(state: AppState) -> Router {
         .merge(timers::router())
         .merge(audiences::router())
         .merge(news::router())
+        .merge(placements::router())
         .merge(sso::routes())
         .merge(stats::routes())
         .merge(push::routes())

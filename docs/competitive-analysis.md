@@ -2562,7 +2562,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **What the reports found weaker/missing (merged rows):**
   - ❌ Edgegap: *`require_cached_locations` placement flag* — No notion of image locality in placement
   - ✅ Edgegap: *Placement by geo coordinates* — `POST /v1/server/allocate {pool, regions[], pings: {region: ms}, max_ping_ms, client: {lat, lon}, region}`: explicit preference → lowest ping (ceiling drops regions) → nearest region by `[fleet.regions.<name>] lat, lon` → hint; allocation carries `route {region, reason, ping_ms, distance_km, rank, tried}`
-  - ❌ GameLift: *Placement object* — synchronous allocate only
+  - ✅ GameLift: *Placement object* — `POST /v1/server/session_placements` queues a routed allocation with timeout/metadata, leader worker retries until fulfilled/cancelled/timed_out, `GET/DELETE /v1/server/session_placements/{id}`, `placement.*` events
   - 🟡 Colyseus: *`selectProcessIdToCreateRoom(roomName, options)` — custom placement, default = process with fewest rooms (alt: fewest C…* — matches homed on leader / node regions; worlds have placement strategies (adjacency/points_of_interest/player_density/custom picker); no per-room-type custom placement callback for matches
   - 🟡 Edgegap: *Placement by player IPs ("Server Score": latency + fairness via telemetry)* — Georouting picks the fleet region with lowest worst client ping from client-measured `ping_<region>` ticket props (README `GET /v1/regions`); no server-side IP→latency telemetry or fairness model
   - 🟡 Edgegap: *Placement filters* — Explicit `region` only
@@ -4296,7 +4296,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 *area:* matchmaking · *musubi:* 🟡 partial (0h/2p/0m over 2 rows)
 - **Competitors with it (1):** GameLift
 - **Why it matters:** Scales allocation under load.
-- **Implementation sketch (musubi terms):** Make `POST /v1/server/allocate` async-capable: `202 {placement_id}` + `GET /v1/server/placements/{id}` + webhook/WS event in musubi-fleet.
+- **Implementation sketch (musubi terms):** Make `POST /v1/server/allocate` async-capable: `202 {placement_id}` + `GET /v1/server/session_placements/{id}` + webhook/WS event in musubi-fleet.
 - **What the reports found weaker/missing (merged rows):**
   - 🟡 GameLift: *Game session queues* — pools (fleets grouped by `pool`) + region routing (`allocate_routed`); no timeout/latency policy/priority/filter configuration object
   - 🟡 GameLift: *Game session queue object* — pool is a string attribute on fleets, not a configurable object
