@@ -61,6 +61,11 @@ impl S3Store {
         })
     }
 
+    /// Key prefix inside the bucket (`[ugc.s3] prefix`).
+    pub fn prefix(&self) -> &str {
+        &self.cfg.prefix
+    }
+
     pub fn bucket(&self) -> &str {
         &self.cfg.bucket
     }
@@ -300,6 +305,32 @@ impl S3Store {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Fleet log archives live in the same bucket as UGC blobs (`spec.logs.archive`).
+pub struct FleetLogArchive(pub std::sync::Arc<S3Store>);
+
+impl FleetLogArchive {
+    fn key(&self, key: &str) -> String {
+        format!("{}{key}", self.0.prefix())
+    }
+}
+
+impl musubi_fleet::LogArchive for FleetLogArchive {
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: Vec<u8>,
+        mime: &'a str,
+    ) -> musubi_fleet::BoxFut<'a, Result<()>> {
+        Box::pin(async move { self.0.put(&self.key(key), bytes, mime).await })
+    }
+    fn get<'a>(&'a self, key: &'a str) -> musubi_fleet::BoxFut<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.0.get(&self.key(key)).await })
+    }
+    fn delete<'a>(&'a self, key: &'a str) -> musubi_fleet::BoxFut<'a, Result<()>> {
+        Box::pin(async move { self.0.delete(&self.key(key)).await })
     }
 }
 

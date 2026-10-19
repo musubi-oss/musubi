@@ -55,12 +55,19 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         parties.clone(),
         relayed.clone(),
     );
-    let fleets = Arc::new(musubi_fleet::FleetService::new(
+    let blobs = musubi_server::blobstore::S3Store::new(&cfg.ugc.s3).map(Arc::new);
+    let mut fleets = musubi_fleet::FleetService::new(
         db.clone(),
         cluster.as_ref().unwrap().node_id().0,
         "http://127.0.0.1:0",
         "defaultkey",
-    ));
+    );
+    if let Some(b) = &blobs {
+        fleets = fleets.with_log_archive(Arc::new(musubi_server::blobstore::FleetLogArchive(
+            b.clone(),
+        )));
+    }
+    let fleets = Arc::new(fleets);
     fleets.spawn_log_writer();
     if !cfg.fleet.ssh.hosts.is_empty() || !cfg.fleet.capacity.pools.is_empty() {
         fleets
@@ -92,7 +99,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         dev: Arc::new(musubi_server::dev::DevTools::new()),
         audit: musubi_server::audit::Sink::new(&db),
         cfg: Arc::new(cfg),
-        blobs: None,
+        blobs,
         auth,
         idl: musubi_server::idl::IdlRegistry::new(db.clone(), storage.clone()),
         audiences: Default::default(),
@@ -32762,4 +32769,331 @@ async fn flag_and_experiment_labels() {
         None,
     )
     .await;
+}
+
+/// Minimal S3-compatible object store (PUT/GET/DELETE) for log-archive tests.
+async fn mock_object_store() -> (
+    String,
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+) {
+    use axum::extract::{Path as AxPath, State as AxState};
+    use axum::response::IntoResponse;
+    type Objects = Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>;
+    async fn put(
+        AxState(o): AxState<Objects>,
+        AxPath((_b, key)): AxPath<(String, String)>,
+        body: axum::body::Bytes,
+    ) -> StatusCode {
+        o.lock().unwrap().insert(key, body.to_vec());
+        StatusCode::OK
+    }
+    async fn get(
+        AxState(o): AxState<Objects>,
+        AxPath((_b, key)): AxPath<(String, String)>,
+    ) -> axum::response::Response {
+        match o.lock().unwrap().get(&key) {
+            Some(b) => b.clone().into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+    async fn del(
+        AxState(o): AxState<Objects>,
+        AxPath((_b, key)): AxPath<(String, String)>,
+    ) -> StatusCode {
+        o.lock().unwrap().remove(&key);
+        StatusCode::NO_CONTENT
+    }
+    let objects: Objects = Arc::default();
+    let router = Router::new()
+        .route(
+            "/{bucket}/{*key}",
+            axum::routing::put(put).get(get).delete(del),
+        )
+        .with_state(objects.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (format!("http://{addr}"), objects)
+}
+
+#[tokio::test]
+async fn game_server_log_archives_to_object_storage() {
+    let (endpoint, objects) = mock_object_store().await;
+    let Some(app) = app_with(|cfg| {
+        cfg.ugc.s3 = musubi_core::config::S3Config {
+            endpoint,
+            bucket: "logs-bucket".into(),
+            access_key: "AKIDEXAMPLE".into(),
+            secret_key: "s3cr3t".into(),
+            prefix: "title/".into(),
+            path_style: true,
+            ..Default::default()
+        };
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+
+    // validation
+    for bad in [
+        json!({"delay_secs": 99999}),
+        json!({"prefix": "/abs/"}),
+        json!({"prefix": "noslash"}),
+    ] {
+        let (st, e) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+            "name": unique("badlogs"), "provider": "local", "buffer": 0, "max_servers": 1,
+            "port_start": 47400, "port_end": 47410, "spec": {"command": ["sleep", "1"], "logs": bad}
+        }))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    }
+
+    let name = unique("archfleet");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "local", "buffer": 1, "max_servers": 1,
+            "port_start": 47400, "port_end": 47410,
+            "spec": {"command": ["sh", "-c", "echo line-a; echo line-b >&2; sleep 20"],
+                     "logs": {"archive": true, "delay_secs": 0}}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["spec"]["logs"]["purge_after_archive"], true, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fid_u = uuid::Uuid::parse_str(&fid).unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(fid_u).await.unwrap();
+    let mut sid = String::new();
+    for _ in 0..20 {
+        let (_, l) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/fleets/{fid}/servers"),
+            k,
+            None,
+        )
+        .await;
+        if let Some(s0) = l["servers"].as_array().and_then(|a| a.first()) {
+            sid = s0["id"].as_str().unwrap().to_string();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(!sid.is_empty(), "server never appeared");
+    let logs_url = format!("/v1/server/fleets/{fid}/servers/{sid}/logs");
+    let mut got = false;
+    for _ in 0..40 {
+        let (_, l) = call_server(&app, "GET", &logs_url, k, None).await;
+        if l["lines"].as_array().is_some_and(|a| a.len() >= 2) {
+            got = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(got, "captured lines never stored");
+
+    // nothing archived yet
+    let (st, a) = call_server(&app, "GET", &format!("{logs_url}/archives"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["archives"].as_array().unwrap().len(), 0);
+    assert_eq!(a["storage"], true);
+
+    // manual snapshot of a running server
+    let (st, a1) = call_server(
+        &app,
+        "POST",
+        &format!("{logs_url}/archive"),
+        k,
+        Some(json!({"reason": "bug-1234"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a1}");
+    assert!(a1["lines"].as_i64().unwrap() >= 2, "{a1}");
+    assert!(a1["bytes"].as_i64().unwrap() > 0);
+    assert_eq!(a1["reason"], "bug-1234");
+    let key = a1["key"].as_str().unwrap().to_string();
+    assert!(
+        key.starts_with(&format!("server-logs/{fid}/{sid}/")),
+        "{key}"
+    );
+    assert!(key.ends_with(".ndjson.gz"));
+    {
+        let o = objects.lock().unwrap();
+        assert!(
+            o.contains_key(&format!("title/{key}")),
+            "object not stored; have {:?}",
+            o.keys().collect::<Vec<_>>()
+        );
+    }
+    // purged from Postgres, hint points at the archive
+    let (_, l) = call_server(&app, "GET", &logs_url, k, None).await;
+    assert_eq!(l["lines"].as_array().unwrap().len(), 0, "{l}");
+    assert_eq!(l["archived"], 1);
+    // nothing new → 404
+    let (st, e) = call_server(&app, "POST", &format!("{logs_url}/archive"), k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{e}");
+
+    // download: raw gzip and decoded lines
+    let aid = a1["id"].as_str().unwrap().to_string();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/server/fleets/{fid}/logs/archives/{aid}"))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "application/gzip");
+    assert!(res.headers()[header::CONTENT_DISPOSITION]
+        .to_str()
+        .unwrap()
+        .contains(".ndjson.gz"));
+    let raw = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&raw[..2], &[0x1f, 0x8b], "gzip magic");
+    let (st, d) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/logs/archives/{aid}?format=lines"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let lines = d["lines"].as_array().unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["message"] == "line-a" && l["source"] == "stdout"),
+        "{d}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["message"] == "line-b" && l["source"] == "stderr"),
+        "{d}"
+    );
+    assert!(lines[0]["at"].as_str().is_some());
+    let (st, e) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/logs/archives/{aid}?format=xml"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+
+    // SDK lines after the snapshot, then the server dies → the terminated pass archives the rest
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/gameserver/logs")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"lines": [{"level": "error", "message": "segfault"}, {"message": "bye"}]})
+                .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    for _ in 0..40 {
+        let (_, l) = call_server(&app, "GET", &logs_url, k, None).await;
+        if l["lines"].as_array().is_some_and(|a| a.len() == 2) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let fleet = svc.get(fid_u).await.unwrap();
+    let sid_u = uuid::Uuid::parse_str(&sid).unwrap();
+    svc.terminate_reason(&fleet, sid_u, "test").await;
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (_, a) = call_server(&app, "GET", &format!("{logs_url}/archives"), k, None).await;
+    let arr = a["archives"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "{a}");
+    assert_eq!(arr[0]["reason"], "terminated");
+    assert_eq!(arr[0]["lines"], 2);
+    let (_, d) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/fleets/{fid}/logs/archives/{}?format=lines",
+            arr[0]["id"].as_str().unwrap()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        d["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["message"] == "segfault" && l["level"] == "error"),
+        "{d}"
+    );
+    // a second pass does not archive again
+    let _ = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    let (_, a) = call_server(&app, "GET", &format!("{logs_url}/archives"), k, None).await;
+    assert_eq!(a["archives"].as_array().unwrap().len(), 2);
+    let (_, l) = call_server(&app, "GET", &logs_url, k, None).await;
+    assert_eq!(l["archived"], 2, "{l}");
+
+    // delete
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/{fid}/logs/archives/{aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        !objects
+            .lock()
+            .unwrap()
+            .contains_key(&format!("title/{key}")),
+        "object not deleted"
+    );
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/logs/archives/{aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, a) = call_server(&app, "GET", &format!("{logs_url}/archives"), k, None).await;
+    assert_eq!(a["archives"].as_array().unwrap().len(), 1);
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }

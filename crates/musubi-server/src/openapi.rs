@@ -1085,6 +1085,26 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ),
     ("GET", "/v1/server/fleets/{id}/servers", "fleets"),
     ("GET", "/v1/server/fleets/{id}/servers/{sid}/logs", "fleets"),
+    (
+        "POST",
+        "/v1/server/fleets/{id}/servers/{sid}/logs/archive",
+        "fleets",
+    ),
+    (
+        "GET",
+        "/v1/server/fleets/{id}/servers/{sid}/logs/archives",
+        "fleets",
+    ),
+    (
+        "GET",
+        "/v1/server/fleets/{id}/logs/archives/{aid}",
+        "fleets",
+    ),
+    (
+        "DELETE",
+        "/v1/server/fleets/{id}/logs/archives/{aid}",
+        "fleets",
+    ),
     ("DELETE", "/v1/server/gameservers/{id}", "fleets"),
     ("GET", "/v1/server/gameservers/{id}", "fleets"),
     ("GET", "/v1/server/iap/products", "economy"),

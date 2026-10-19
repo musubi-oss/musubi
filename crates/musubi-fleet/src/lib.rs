@@ -143,11 +143,137 @@ pub struct KubePlacement {
     pub termination_grace_secs: Option<u64>,
 }
 
+/// Shipping of a server's captured / SDK-pushed log lines to object storage (Edgegap endpoint
+/// storage, GameLift server logs): one gzip NDJSON object per snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogSpec {
+    /// Archive every terminated server's lines automatically (needs `[ugc.s3]`).
+    pub archive: bool,
+    /// Drop the archived rows from Postgres once the object is stored (default true).
+    pub purge_after_archive: bool,
+    /// Grace after termination for in-flight lines before the archive is cut (default 30 s).
+    pub delay_secs: u64,
+    /// Key prefix inside the bucket (default `server-logs/`).
+    pub prefix: Option<String>,
+}
+
+impl Default for LogSpec {
+    fn default() -> Self {
+        Self {
+            archive: false,
+            purge_after_archive: true,
+            delay_secs: 30,
+            prefix: None,
+        }
+    }
+}
+
+pub const LOG_ARCHIVE_PREFIX: &str = "server-logs/";
+
+pub fn validate_logs(spec: &FleetSpec) -> Result<()> {
+    let l = &spec.logs;
+    if l.delay_secs > 3600 {
+        return Err(Error::InvalidArgument(
+            "spec.logs.delay_secs must be <= 3600".into(),
+        ));
+    }
+    if let Some(p) = &l.prefix {
+        let ok = !p.is_empty()
+            && p.len() <= 128
+            && !p.starts_with('/')
+            && p.ends_with('/')
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'));
+        if !ok {
+            return Err(Error::InvalidArgument(
+                "spec.logs.prefix: 1..=128 chars of [A-Za-z0-9/_-.], no leading '/', trailing '/'"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Object storage the fleet ships log archives to (implemented over the server's S3 store).
+pub trait LogArchive: Send + Sync {
+    fn put<'a>(&'a self, key: &'a str, bytes: Vec<u8>, mime: &'a str) -> BoxFut<'a, Result<()>>;
+    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Vec<u8>>>;
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<()>>;
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogArchiveEntry {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub fleet_id: Uuid,
+    pub key: String,
+    pub bytes: i64,
+    pub lines: i32,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub from_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub to_at: Option<OffsetDateTime>,
+    pub reason: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+type LogArchiveRow = (
+    Uuid,
+    Uuid,
+    Uuid,
+    String,
+    i64,
+    i32,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+    String,
+    OffsetDateTime,
+);
+
+const LOG_ARCHIVE_COLS: &str =
+    "id, server_id, fleet_id, key, bytes, lines, from_at, to_at, reason, created_at";
+
+fn archive_entry(r: LogArchiveRow) -> LogArchiveEntry {
+    let (id, server_id, fleet_id, key, bytes, lines, from_at, to_at, reason, created_at) = r;
+    LogArchiveEntry {
+        id,
+        server_id,
+        fleet_id,
+        key,
+        bytes,
+        lines,
+        from_at,
+        to_at,
+        reason,
+        created_at,
+    }
+}
+
+/// Decode an archive object back into its lines (`{at, source, level, message}` per entry).
+pub fn decode_log_archive(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_string(&mut text)
+        .map_err(|e| Error::Internal(format!("log archive: {e}")))?;
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FleetSpec {
     /// Kubernetes node placement / disruption (P0-10); ignored by other providers.
     pub kubernetes: KubePlacement,
+    /// Log archival to object storage.
+    pub logs: LogSpec,
     /// Extra named ports besides the primary `MUSUBI_PORT` (P0-7).
     pub ports: Vec<PortSpec>,
     /// Protocol(s) published for the primary port: `udp` | `tcp` | `both` (default).
@@ -2237,6 +2363,7 @@ type RuleState = HashMap<(Uuid, String), (Option<i64>, Option<i64>)>;
 #[derive(Clone)]
 pub struct FleetService {
     region_coords: Arc<HashMap<String, GeoPoint>>,
+    log_archive: Option<Arc<dyn LogArchive>>,
     db: PgPool,
     node_id: Uuid,
     providers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn Provider>>>>,
@@ -2357,6 +2484,7 @@ impl FleetService {
         providers.insert("docker".into(), Arc::new(docker::DockerProvider));
         Self {
             region_coords: Arc::new(HashMap::new()),
+            log_archive: None,
             db,
             node_id,
             providers: Arc::new(std::sync::RwLock::new(providers)),
@@ -2528,6 +2656,204 @@ impl FleetService {
         self
     }
 
+    /// Object storage for log archives (`spec.logs.archive`, `POST …/logs/archive`).
+    pub fn with_log_archive(mut self, store: Arc<dyn LogArchive>) -> Self {
+        self.log_archive = Some(store);
+        self
+    }
+
+    pub fn has_log_archive(&self) -> bool {
+        self.log_archive.is_some()
+    }
+
+    /// Cut an archive of everything stored for `server_id` so far: gzip NDJSON in object storage,
+    /// a row in `musubi.server_log_archives`, rows purged from Postgres when the fleet says so.
+    pub async fn archive_server_logs(
+        &self,
+        fleet: &Fleet,
+        server_id: Uuid,
+        reason: &str,
+    ) -> Result<LogArchiveEntry> {
+        use std::io::Write;
+        let store = self.log_archive.clone().ok_or_else(|| {
+            Error::Unavailable("log archive: no object storage configured ([ugc.s3])".into())
+        })?;
+        type Row = (Uuid, OffsetDateTime, String, String, String);
+        let rows: Vec<Row> = sqlx::query_as(
+            "select id, at, source, level, message from musubi.server_logs
+             where server_id = $1 and fleet_id = $2 order by at, id limit 500000",
+        )
+        .bind(server_id)
+        .bind(fleet.id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        if rows.is_empty() {
+            return Err(Error::NotFound("no stored log lines to archive".into()));
+        }
+        let (from_at, to_at) = (rows[0].1, rows[rows.len() - 1].1);
+        let last_id = rows[rows.len() - 1].0;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        for (_, at, source, level, message) in &rows {
+            let line = serde_json::json!({
+                "at": at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "source": source, "level": level, "message": message,
+            });
+            enc.write_all(line.to_string().as_bytes())
+                .and_then(|_| enc.write_all(b"\n"))
+                .map_err(|e| Error::Internal(format!("gzip: {e}")))?;
+        }
+        let bytes = enc
+            .finish()
+            .map_err(|e| Error::Internal(format!("gzip: {e}")))?;
+        let id = Uuid::now_v7();
+        let prefix = fleet
+            .spec
+            .logs
+            .prefix
+            .clone()
+            .unwrap_or_else(|| LOG_ARCHIVE_PREFIX.to_string());
+        let key = format!(
+            "{prefix}{}/{server_id}/{}-{}.ndjson.gz",
+            fleet.id,
+            to_at.unix_timestamp(),
+            id.simple()
+        );
+        store.put(&key, bytes.clone(), "application/gzip").await?;
+        let row: LogArchiveRow = sqlx::query_as(&format!(
+            "insert into musubi.server_log_archives (id, server_id, fleet_id, key, bytes, lines, from_at, to_at, reason)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) returning {LOG_ARCHIVE_COLS}"
+        ))
+        .bind(id)
+        .bind(server_id)
+        .bind(fleet.id)
+        .bind(&key)
+        .bind(bytes.len() as i64)
+        .bind(rows.len() as i32)
+        .bind(from_at)
+        .bind(to_at)
+        .bind(reason)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut purged = 0u64;
+        if fleet.spec.logs.purge_after_archive {
+            purged = sqlx::query(
+                "delete from musubi.server_logs where server_id = $1 and (at < $2 or (at = $2 and id <= $3))",
+            )
+            .bind(server_id)
+            .bind(to_at)
+            .bind(last_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+        }
+        self.record_event(
+            fleet.id,
+            Some(server_id),
+            "server.logs_archived",
+            format!("{} log lines archived to {key} ({reason})", rows.len()),
+            serde_json::json!({
+                "archive_id": id, "key": key, "bytes": bytes.len(), "lines": rows.len(),
+                "reason": reason, "purged": purged,
+            }),
+        )
+        .await;
+        Ok(archive_entry(row))
+    }
+
+    /// Archive pass for one fleet: terminated servers past `spec.logs.delay_secs` that still have
+    /// stored lines and no archive yet. Returns how many archives were cut.
+    pub async fn archive_terminated_logs(&self, fleet: &Fleet) -> Result<usize> {
+        if self.log_archive.is_none() || !fleet.spec.logs.archive {
+            return Ok(0);
+        }
+        let ids: Vec<(Uuid,)> = sqlx::query_as(
+            "select gs.id from musubi.game_servers gs
+             where gs.fleet_id = $1 and gs.state = 'terminated'
+               and coalesce(gs.terminated_at, gs.updated_at) < now() - make_interval(secs => $2::double precision)
+               and exists (select 1 from musubi.server_logs l where l.server_id = gs.id)
+               and not exists (select 1 from musubi.server_log_archives a
+                               where a.server_id = gs.id and a.created_at >= coalesce(gs.terminated_at, gs.updated_at))
+             order by gs.terminated_at limit 50",
+        )
+        .bind(fleet.id)
+        .bind(fleet.spec.logs.delay_secs as f64)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let mut n = 0;
+        for (sid,) in ids {
+            match self.archive_server_logs(fleet, sid, "terminated").await {
+                Ok(_) => n += 1,
+                Err(e) => tracing::warn!(server = %sid, error = %e, "log archive failed"),
+            }
+        }
+        Ok(n)
+    }
+
+    pub async fn log_archives(
+        &self,
+        fleet_id: Uuid,
+        server_id: Uuid,
+    ) -> Result<Vec<LogArchiveEntry>> {
+        let rows: Vec<LogArchiveRow> = sqlx::query_as(&format!(
+            "select {LOG_ARCHIVE_COLS} from musubi.server_log_archives
+             where fleet_id = $1 and server_id = $2 order by created_at desc"
+        ))
+        .bind(fleet_id)
+        .bind(server_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(archive_entry).collect())
+    }
+
+    pub async fn log_archive(&self, fleet_id: Uuid, id: Uuid) -> Result<LogArchiveEntry> {
+        let row: Option<LogArchiveRow> = sqlx::query_as(&format!(
+            "select {LOG_ARCHIVE_COLS} from musubi.server_log_archives where fleet_id = $1 and id = $2"
+        ))
+        .bind(fleet_id)
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        row.map(archive_entry)
+            .ok_or_else(|| Error::NotFound("log archive not found".into()))
+    }
+
+    /// The archive object itself (gzip NDJSON).
+    pub async fn log_archive_bytes(&self, entry: &LogArchiveEntry) -> Result<Vec<u8>> {
+        let store = self.log_archive.clone().ok_or_else(|| {
+            Error::Unavailable("log archive: no object storage configured ([ugc.s3])".into())
+        })?;
+        store.get(&entry.key).await
+    }
+
+    pub async fn delete_log_archive(&self, fleet_id: Uuid, id: Uuid) -> Result<()> {
+        let entry = self.log_archive(fleet_id, id).await?;
+        if let Some(store) = &self.log_archive {
+            store.delete(&entry.key).await?;
+        }
+        sqlx::query("delete from musubi.server_log_archives where id = $1")
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    pub async fn log_archive_count(&self, server_id: Uuid) -> Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as("select count(*) from musubi.server_log_archives where server_id = $1")
+                .bind(server_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::internal)?;
+        Ok(n)
+    }
+
     pub async fn allocate_routed(
         &self,
         target: &str,
@@ -2655,6 +2981,7 @@ impl FleetService {
         validate_shape(c.min_servers, c.buffer, c.max_servers, &c.policy)?;
         validate_ports(&c.spec)?;
         validate_kubernetes(&c.spec)?;
+        validate_logs(&c.spec)?;
         if c.port_start < 1 || c.port_end < c.port_start || c.port_end > 65535 {
             return Err(Error::InvalidArgument("bad port range".into()));
         }
@@ -4339,10 +4666,17 @@ impl FleetService {
     /// missing or stop idle ready servers above it, oldest first. Returns (started, reaped + stopped).
     pub async fn reconcile(&self) -> Result<(usize, usize)> {
         let fleets = self.list().await?;
-        let r = self.reconcile_fleets(fleets).await;
+        let r = self.reconcile_fleets(fleets.clone()).await;
         if self.capacity().is_some() {
             if let Err(e) = self.capacity_pass().await {
                 tracing::warn!(error = %e, "capacity pass failed");
+            }
+        }
+        if self.log_archive.is_some() {
+            for f in &fleets {
+                if let Err(e) = self.archive_terminated_logs(f).await {
+                    tracing::warn!(fleet = %f.id, error = %e, "log archive pass failed");
+                }
             }
         }
         r
@@ -4351,7 +4685,11 @@ impl FleetService {
     /// One fleet only (tests, `POST …/reconcile`): never touches the other fleets.
     pub async fn reconcile_one(&self, fleet_id: Uuid) -> Result<(usize, usize)> {
         let f = self.get(fleet_id).await?;
-        self.reconcile_fleets(vec![f]).await
+        let r = self.reconcile_fleets(vec![f.clone()]).await;
+        if let Err(e) = self.archive_terminated_logs(&f).await {
+            tracing::warn!(fleet = %f.id, error = %e, "log archive pass failed");
+        }
+        r
     }
 
     async fn reconcile_fleets(&self, fleets: Vec<Fleet>) -> Result<(usize, usize)> {

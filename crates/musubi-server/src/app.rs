@@ -220,6 +220,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             }
         });
     }
+    let blobs = crate::blobstore::S3Store::new(&cfg.ugc.s3).map(Arc::new);
+    if let Some(b) = &blobs {
+        tracing::info!(bucket = b.bucket(), "ugc blobs in object storage");
+    }
     let mut fleets = FleetService::new(
         db.clone(),
         cluster.node_id().0,
@@ -242,6 +246,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             })
             .collect(),
     );
+    if let Some(b) = &blobs {
+        fleets = fleets.with_log_archive(Arc::new(crate::blobstore::FleetLogArchive(b.clone())));
+    }
     if let Some(bin) = &cfg.fleet.firecracker.binary {
         match firecracker_settings(bin, &cfg.fleet.firecracker)
             .and_then(musubi_fleet::firecracker::FirecrackerProvider::new)
@@ -681,10 +688,6 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     };
     let mailer = (!cfg.email.host.is_empty())
         .then(|| Arc::new(musubi_integrations::Mailer::new(cfg.email.clone())));
-    let blobs = crate::blobstore::S3Store::new(&cfg.ugc.s3).map(Arc::new);
-    if let Some(b) = &blobs {
-        tracing::info!(bucket = b.bucket(), "ugc blobs in object storage");
-    }
     let compliance_cfg = cfg.compliance.clone();
     let analytics = crate::analytics::Analytics::new(db.clone(), cfg.analytics.clone());
     analytics.spawn_flusher();

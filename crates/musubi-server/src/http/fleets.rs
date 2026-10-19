@@ -40,6 +40,18 @@ pub fn routes() -> Router<AppState> {
             "/v1/server/fleets/{id}/servers/{sid}/logs",
             get(server_logs),
         )
+        .route(
+            "/v1/server/fleets/{id}/servers/{sid}/logs/archive",
+            post(archive_logs),
+        )
+        .route(
+            "/v1/server/fleets/{id}/servers/{sid}/logs/archives",
+            get(log_archives),
+        )
+        .route(
+            "/v1/server/fleets/{id}/logs/archives/{aid}",
+            get(log_archive).delete(delete_log_archive),
+        )
         .route("/v1/server/fleets/{id}/demand", get(demand))
         .route("/v1/server/fleets/{id}/builds", get(builds).post(add_build))
         .route(
@@ -642,7 +654,111 @@ async fn server_logs(
     }
     let lines = s.fleets.logs(fid, sid, &filter).await?;
     let next = lines.last().map(|l| l.at.unix_timestamp());
-    Ok(Json(json!({ "lines": lines, "next_before": next })))
+    let archived = if lines.is_empty() {
+        s.fleets.log_archive_count(sid).await?
+    } else {
+        0
+    };
+    Ok(Json(
+        json!({ "lines": lines, "next_before": next, "archived": archived }),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ArchiveBody {
+    reason: Option<String>,
+}
+
+/// `POST /v1/server/fleets/{id}/servers/{sid}/logs/archive {reason?}` — cut an archive of the
+/// server's stored lines right now (running or terminated): gzip NDJSON in object storage.
+async fn archive_logs(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, sid)): Path<(String, String)>,
+    body: Option<Json<ArchiveBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let (fid, sid) = (parse(&id)?, parse(&sid)?);
+    let fleet = s.fleets.get(fid).await?;
+    let gs = s.fleets.server(sid).await?;
+    if gs.fleet_id != fid {
+        return Err(Error::NotFound("server not in this fleet".into()).into());
+    }
+    let reason = body
+        .and_then(|b| b.0.reason)
+        .filter(|r| !r.is_empty() && r.len() <= 64)
+        .unwrap_or_else(|| "manual".into());
+    let e = s.fleets.archive_server_logs(&fleet, sid, &reason).await?;
+    Ok(Json(serde_json::to_value(e).map_err(Error::internal)?))
+}
+
+/// `GET /v1/server/fleets/{id}/servers/{sid}/logs/archives` — archives of one server, newest first.
+async fn log_archives(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, sid)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let (fid, sid) = (parse(&id)?, parse(&sid)?);
+    let a = s.fleets.log_archives(fid, sid).await?;
+    Ok(Json(
+        json!({ "archives": a, "storage": s.fleets.has_log_archive() }),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ArchiveQ {
+    /// `gzip` (default, the object as stored) | `lines` (decoded `{lines: [...]}`).
+    format: Option<String>,
+}
+
+/// `GET /v1/server/fleets/{id}/logs/archives/{aid}?format=gzip|lines` — download one archive.
+async fn log_archive(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, aid)): Path<(String, String)>,
+    Query(q): Query<ArchiveQ>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let (fid, aid) = (parse(&id)?, parse(&aid)?);
+    let entry = s.fleets.log_archive(fid, aid).await?;
+    let bytes = s.fleets.log_archive_bytes(&entry).await?;
+    match q.format.as_deref() {
+        Some("lines") => {
+            let lines = musubi_fleet::decode_log_archive(&bytes)?;
+            Ok(Json(json!({ "archive": entry, "lines": lines })).into_response())
+        }
+        None | Some("gzip") => Ok((
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/gzip".to_string(),
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!(
+                        "attachment; filename=\"{}-{}.ndjson.gz\"",
+                        entry.server_id.simple(),
+                        entry.id.simple()
+                    ),
+                ),
+            ],
+            bytes,
+        )
+            .into_response()),
+        Some(_) => Err(Error::InvalidArgument("format: gzip | lines".into()).into()),
+    }
+}
+
+async fn delete_log_archive(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, aid)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    s.fleets
+        .delete_log_archive(parse(&id)?, parse(&aid)?)
+        .await?;
+    Ok(Json(json!({ "deleted": true })))
 }
 
 #[derive(Deserialize)]

@@ -19,6 +19,7 @@ dashmap = "6"
 reqwest.workspace = true
 ring.workspace = true
 hex.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

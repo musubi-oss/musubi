@@ -2467,7 +2467,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **Why it matters:** Debugging live servers without SSH.
 - **Implementation sketch (musubi terms):** Missing. Add log shipper in providers (docker/k8s/ssh) → object store + `GET /v1/server/gameservers/{id}/logs?follow` on musubi-fleet.
 - **What the reports found weaker/missing (merged rows):**
-  - ❌ Edgegap: *Endpoint-storage link per version (log shipping + pull profiles)* — No log capture or S3 integration in fleet (`rg container_log\|s3` → none)
+  - ✅ Edgegap: *Endpoint-storage link per version (log shipping + pull profiles)* — `spec.logs.archive` ships terminated servers' captured/SDK lines to the S3-compatible store as gzip NDJSON (`musubi.server_log_archives`, `GET /v1/server/fleets/{id}/logs/archives/{aid}`); pull profiles n/a (no build artifacts pulled by fleet)
   - ❌ Edgegap: *Container logs (live + after stop)* — No stdout/stderr capture of game servers (`rg container_log` → none)
   - ❌ GameLift: *Game session log URL* — no game-server log capture/upload
   - ❌ Hathora: *Live log tailing & download (Console/API/CLI `hathora log`)* — no game-server log capture in `musubi-fleet`; musubi node logs via `tracing`/journald only
@@ -2489,7 +2489,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
   - ❌ Agones/OM: *KubeStellar Console (multi-cluster dashboard with fleet monitoring), Minikube Agones cluster automation* — Admin console not written (README:status)
   - ❌ Agones/OM: *`agones.allocator.tlsSecret`/`clientCASecret`/`generateTLS`/`generateClientTLS`/`disableMTLS`/`disableTLS`/`disableSecr…* — No built-in TLS/mTLS management
   - ❌ Agones/OM: *`agones.dev/sdk-*` labels set by the game can be matched by allocation selectors (label locking)* — Labels not selectable
-  - ❌ GameLift: *Server logs (EC2)* — no log shipping
+  - ✅ GameLift: *Server logs (EC2)* — stdout/stderr/SDK lines stored, archived to object storage on termination or on demand (`POST …/servers/{sid}/logs/archive`), downloadable raw or decoded
   - ❌ Hathora: *GPU compute* — `rg gpu` → 0 hits
   - 🟡 Agones/OM: *Declarative `GameServer` custom resource managed through the Kubernetes API (`kubectl apply/get/describe`, events, RBAC)* — Game servers are rows in `musubi.game_servers` (mig 0010) driven by `GET/DELETE /v1/server/gameservers/{id}` and the fleet reconciler; no declarative object model, no kubectl/RBAC integration, no per-object event stream…
   - 🟡 Agones/OM: *`agones.dev/last-allocated` RFC3339 annotation set on every allocation* — `allocation` JSON column is overwritten on allocate (fleets.rs) and `version` increments; no explicit last-allocated timestamp field documented
