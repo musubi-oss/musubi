@@ -19567,12 +19567,35 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
     let (st, _) = get("/v1/server/matchmaker/tickets/nope/trace".to_string()).await;
     assert_eq!(st, 404);
 
-    // C was kept apart by the query rule at least once; the table is cumulative
-    let (st, v) = get("/v1/server/matchmaker/rejections".to_string()).await;
-    assert_eq!(st, 200, "{v}");
-    let rej = v["rejections"].as_array().unwrap();
+    // C and D keep rejecting each other on every pass (both demand rank >= 5); the table is cumulative
+    let (td, _) = token(&router).await;
+    let mut d = connect(&addr, &td, f).await;
+    send(&mut d, f, None, add(2.0)).await;
+    assert!(matches!(
+        recv(&mut d).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    let mut v = Value::Null;
+    for _ in 0..40 {
+        let (st, got) = get("/v1/server/matchmaker/rejections".to_string()).await;
+        assert_eq!(st, 200, "{got}");
+        v = got;
+        if v["rejections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["count"].as_u64().unwrap_or(0) > 0)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     assert!(
-        rej.iter().any(|r| r["count"].as_u64().unwrap_or(0) > 0),
+        v["rejections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["count"].as_u64().unwrap_or(0) > 0),
         "{v}"
     );
     let (_, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_c}/trace")).await;
