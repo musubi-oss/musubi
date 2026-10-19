@@ -27787,3 +27787,295 @@ async fn fleet_slots_per_server_packing_and_release() {
     let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     assert!(st.is_success() || st == StatusCode::NOT_FOUND, "{st}");
 }
+
+/// P1-25: limited access mode — allow-list, scheduled windows, maintenance, enforcement.
+#[tokio::test]
+async fn limited_access_mode_allowlist_windows_and_maintenance() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let login = |id: String| {
+        let app = app.clone();
+        async move {
+            call_server(
+                &app,
+                "POST",
+                "/v1/server/auth/custom",
+                "defaultkey",
+                Some(json!({"id": id})),
+            )
+            .await
+        }
+    };
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/access/policy",
+        k,
+        Some(json!({"mode": "closed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+        "mode": "limited", "providers": ["custom"], "message": "closed beta", "retry_after_secs": 600
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["effective"]["mode"], "limited");
+    // policy scoped to custom logins: device logins are untouched
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dev")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let a = unique("acc-a");
+    let (st, v) = login(a.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let msg = v["message"].as_str().unwrap();
+    assert!(
+        msg.contains("signups_closed")
+            && msg.contains("closed beta")
+            && msg.contains("retry after 600s"),
+        "{msg}"
+    );
+    let (st, pubv) = call(&app, "GET", "/v1/access", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(pubv["mode"], "limited");
+    assert_eq!(pubv["message"], "closed beta");
+    // allow-list by identity → in
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/access/allowlist/identity/Custom:{a}"),
+        k,
+        Some(json!({"note": "press"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["key"], format!("identity:custom:{a}"));
+    let (st, sa) = login(a.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{sa}");
+    let a_id = sa["account_id"].as_str().unwrap().to_string();
+    let a_rt = sa["refresh_token"].as_str().unwrap().to_string();
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/access/check?account_id={a_id}&provider=custom"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["decision"]["allowed"], true);
+    assert_eq!(v["decision"]["reason"], "allowlist");
+    assert_eq!(v["decision"]["via"], format!("identity:custom:{a}"));
+    // second account: first attempt creates it but is denied; later it is "existing"
+    let b = unique("acc-b");
+    let (st, v) = login(b.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = login(b.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("not_allowlisted"),
+        "{v}"
+    );
+    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+        "mode": "limited", "providers": ["custom"], "allow_existing_accounts": true, "kick_on_change": false
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, sb) = login(b.clone()).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "soft launch lets existing accounts in: {sb}"
+    );
+    let b_rt = sb["refresh_token"].as_str().unwrap().to_string();
+    let c = unique("acc-c");
+    let (st, v) = login(c.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "new accounts still closed: {v}");
+    // expired entries do not match; import validates per entry
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/access/allowlist/identity/custom:{c}"),
+        k,
+        Some(json!({"expires_at": now - 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/access/policy",
+        k,
+        Some(json!({
+            "mode": "limited", "providers": ["custom"], "kick_on_change": false
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = login(c.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/access/allowlist?kind=identity&include_expired=true&q={c}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/access/allowlist?kind=identity&q={c}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 0, "{v} {st}");
+    let (st, v) = call_server(&app, "GET", "/v1/admin/access/allowlist?kind=nope", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/access/allowlist/import",
+        k,
+        Some(json!({
+            "added_by": "csv", "entries": [
+                {"kind": "email_domain", "value": "@Studio.Example", "note": "staff"},
+                {"kind": "account", "value": "not-a-uuid"},
+                {"kind": "account", "value": a_id}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["imported"], 2);
+    assert_eq!(v["rejected"], 1);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/access/allowlist/email_domain/studio.example",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        "/v1/admin/access/allowlist/email_domain/studio.example",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // denials are recorded for the operator
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/access/denials?since_secs=600",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["total"].as_i64().unwrap() >= 4, "{v}");
+    assert!(
+        v["by_reason"]["signups_closed"].as_i64().unwrap() >= 2,
+        "{v}"
+    );
+    assert!(
+        v["by_reason"]["not_allowlisted"].as_i64().unwrap() >= 2,
+        "{v}"
+    );
+    assert!(v["by_provider"]["custom"].as_i64().unwrap() >= 4, "{v}");
+    // a scheduled open window lets everyone in and is announced publicly
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/access/policy",
+        k,
+        Some(json!({
+            "mode": "limited", "providers": ["custom"], "kick_on_change": false,
+            "windows": [{"name": "playtest", "start": now - 10, "end": now + 600, "mode": "open"},
+                        {"name": "later", "start": now + 1000, "end": now + 2000, "mode": "open"}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["effective"]["mode"], "open");
+    assert_eq!(v["effective"]["window"], "playtest");
+    assert_eq!(v["effective"]["next_change_at"], now + 600);
+    let (_, pubv) = call(&app, "GET", "/v1/access", None, None).await;
+    assert_eq!(pubv["mode"], "open");
+    assert_eq!(pubv["upcoming"].as_array().unwrap().len(), 2, "{pubv}");
+    let (st, _) = login(c.clone()).await;
+    assert_eq!(st, StatusCode::OK, "window open");
+    // maintenance: only bypass gets in, live sessions of everyone else are revoked
+    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+        "mode": "maintenance", "providers": ["custom"], "message": "back at 18:00", "kick_on_change": true
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["enforced"]["kicked"].as_i64().unwrap() >= 2, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": a_rt})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "allow-list does not bypass maintenance: {v}"
+    );
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/refresh",
+        None,
+        Some(json!({"refresh_token": b_rt})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, v) = login(a.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("maintenance: back at 18:00"),
+        "{v}"
+    );
+    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+        "mode": "maintenance", "providers": ["custom"], "bypass_providers": ["custom"], "kick_on_change": false
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = login(a.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "POST", "/v1/admin/access/enforce", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["mode"], "maintenance");
+    // back to open
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/access/policy",
+        k,
+        Some(json!({"mode": "open"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "GET", "/v1/admin/access/policy", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["effective"]["mode"], "open");
+    let (st, _) = login(c).await;
+    assert_eq!(st, StatusCode::OK);
+}

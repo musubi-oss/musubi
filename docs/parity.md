@@ -32,6 +32,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Generic OIDC (Discord, Twitch, Epic, Keycloak…) | ✅ `/v1/auth/oidc/{provider}`, discovery + JWKS | 🟡 | 🟡 | 🟡 | ✅ |
 | Xbox Live (XSTS), PSN, Nintendo | ✅ `POST /v1/auth/{xbox,psn,nintendo}` + link/unlink (XSTS-профиль, id_token через OIDC-проверку) | ✅ | ❌ (custom) | ✅ | ✅ |
 | Проверка владения Steam / Family Sharing при логине | ✅ `[social.steam] require_ownership`, `family_sharing allow|deny`, `ban_propagation` лендер↔заёмщики, `GET /v1/admin/accounts/{id}/steam`  | ❌  | ❌  | 🟡 Pragma/EOS  | ❌  |
+| Limited access / allow-list логинов / расписание плейтестов / maintenance | ✅ `/v1/admin/access/*`: open/limited/maintenance, allow-list (account/identity/email-домен/аудитория, TTL), окна по расписанию, soft-launch для существующих, kick онлайн, публичный `GET /v1/access`  | ❌  | ❌  | ✅ Pragma Limited Access Mode / Photon region allowlist  | ❌  | —  |
 | Passkeys / WebAuthn | ✅ | ❌ | ❌ | ❌ | ❌ |
 | MFA: TOTP + recovery codes + e-mail коды, таймлайн security-событий, MFA операторов через IdP (`require_mfa`) | ✅ | ❌ | ❌ | ❌ | 🟡 |
 | Magic-link вход | ✅ `POST /v1/auth/email/magic/request` → событие `account.magic_link`, `POST /v1/auth/email/magic {token}` | ❌ | ❌ | ✅ | ❌ |

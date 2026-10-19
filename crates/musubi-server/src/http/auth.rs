@@ -81,12 +81,18 @@ async fn device(
     s.limits.auth_ip(&ip.0)?;
     s.ban_rules.check_device(&r.id)?;
     let sess = s.auth.authenticate_device(&r.id, r.opts).await?;
-    authenticated(&s, &sess, musubi_auth::provider::DEVICE, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::DEVICE, &ip.0).await?;
     Ok(Json(sess))
 }
 
 /// Fire the `authenticated` runtime event without delaying the response.
-pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str, ip: &str) {
+pub(super) async fn authenticated(
+    s: &AppState,
+    sess: &Session,
+    provider: &str,
+    ip: &str,
+) -> Result<(), ApiError> {
+    super::access::gate(s, sess, provider, ip).await?;
     let provider = provider.to_string();
     {
         // stamp the IP and flag a login from an address this account was never seen at
@@ -145,7 +151,7 @@ pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str, ip: &s
         });
     }
     if !s.runtime.has_hook("hook_authenticated") {
-        return;
+        return Ok(());
     }
     let rt = s.runtime.clone();
     let ctx = musubi_runtime::CallContext {
@@ -155,6 +161,7 @@ pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str, ip: &s
     };
     let payload = serde_json::json!({ "provider": provider, "created": sess.created });
     tokio::spawn(async move { rt.event("authenticated", ctx, payload).await });
+    Ok(())
 }
 
 /// Plan 5.1 "suspicious login" hook: bus event for webhooks/LiveOps plus the module hook, which
@@ -209,7 +216,7 @@ async fn email(
     };
     match login {
         musubi_auth::Login::Session(sess) => {
-            authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0);
+            authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0).await?;
             Ok(Json(
                 serde_json::to_value(sess).map_err(musubi_core::Error::internal)?,
             ))
@@ -240,7 +247,7 @@ async fn mfa(
 ) -> Result<Json<Session>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
     let sess = s.auth.mfa_complete(&r.mfa_token, &r.code).await?;
-    authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -253,7 +260,7 @@ async fn queue(
 ) -> Result<Json<Session>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
     let sess = s.auth.queue_poll(&r.ticket).await?;
-    authenticated(&s, &sess, "queue", &ip.0);
+    authenticated(&s, &sess, "queue", &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -485,7 +492,7 @@ async fn magic(
         return Err(musubi_core::Error::NotFound("token unknown, used or expired".into()).into());
     };
     let sess = s.auth.authenticate_magic(account, &email, r.opts).await?;
-    authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::EMAIL, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -506,7 +513,7 @@ async fn custom(
     Json(r): Json<CustomReq>,
 ) -> Result<Json<Session>, ApiError> {
     let sess = s.auth.authenticate_custom(&r.id, r.opts).await?;
-    authenticated(&s, &sess, musubi_auth::provider::CUSTOM, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::CUSTOM, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -568,7 +575,7 @@ async fn steam(
     if let Some(o) = ownership {
         super::steam_ownership::store(&s, &steam_id, &o).await?;
     }
-    authenticated(&s, &sess, musubi_auth::provider::STEAM, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::STEAM, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -598,7 +605,7 @@ async fn xbox(
         .auth
         .authenticate_external(musubi_auth::provider::XBOX, &p.xuid, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::XBOX, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::XBOX, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -613,7 +620,7 @@ async fn psn(
         .auth
         .authenticate_external(musubi_auth::provider::PSN, &c.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::PSN, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::PSN, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -628,7 +635,7 @@ async fn nintendo(
         .auth
         .authenticate_external(musubi_auth::provider::NINTENDO, &c.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::NINTENDO, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::NINTENDO, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -643,7 +650,7 @@ async fn google(
         .auth
         .authenticate_external(musubi_auth::provider::GOOGLE, &claims.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::GOOGLE, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::GOOGLE, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -658,7 +665,7 @@ async fn apple(
         .auth
         .authenticate_external(musubi_auth::provider::APPLE, &claims.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::APPLE, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::APPLE, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -683,7 +690,7 @@ async fn facebook(
         .auth
         .authenticate_external(musubi_auth::provider::FACEBOOK, &uid, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::FACEBOOK, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::FACEBOOK, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -709,7 +716,7 @@ async fn gamecenter(
         .auth
         .authenticate_external(musubi_auth::provider::GAMECENTER, &pid, r.opts)
         .await?;
-    authenticated(&s, &sess, musubi_auth::provider::GAMECENTER, &ip.0);
+    authenticated(&s, &sess, musubi_auth::provider::GAMECENTER, &ip.0).await?;
     Ok(Json(sess))
 }
 
@@ -730,7 +737,7 @@ async fn oidc(
         .auth
         .authenticate_external(&p, &claims.sub, r.opts)
         .await?;
-    authenticated(&s, &sess, &p, &ip.0);
+    authenticated(&s, &sess, &p, &ip.0).await?;
     Ok(Json(sess))
 }
 

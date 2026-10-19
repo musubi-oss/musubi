@@ -236,7 +236,9 @@ async fn login(
         }
     }
     let _ = s.auth_providers.note_identity(provider, &ext).await;
-    super::auth::authenticated(s, &sess, provider, ip);
+    super::auth::authenticated(s, &sess, provider, ip)
+        .await
+        .map_err(|e| e.0)?;
     s.events
         .emit(
             "auth.provider_login",

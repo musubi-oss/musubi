@@ -1,3 +1,4 @@
+pub mod access;
 mod account;
 pub mod account_policy;
 pub mod admin;
@@ -271,6 +272,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crashes::routes())
         .merge(steam_ownership::routes())
         .merge(ads::routes())
+        .merge(access::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

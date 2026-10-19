@@ -303,6 +303,6 @@ async fn login(
         .auth
         .authenticate_external(provider::PASSKEY, &subject, opts)
         .await?;
-    super::auth::authenticated(&s, &sess, provider::PASSKEY, &ip.0);
+    super::auth::authenticated(&s, &sess, provider::PASSKEY, &ip.0).await?;
     Ok(Json(sess))
 }
