@@ -1185,6 +1185,8 @@ pub struct RetentionConfig {
     pub chat_days: u64,
     /// Expired or revoked refresh sessions.
     pub sessions_days: u64,
+    /// Terminated game sessions (members, codes) are kept this long for history/support.
+    pub game_sessions_days: u64,
     /// World history snapshots (the time machine's reach).
     pub world_history_days: u64,
     /// Recorded matches (`params.record = true`) and their replay frames.
@@ -1209,6 +1211,7 @@ impl Default for RetentionConfig {
             chat_direct_days: 0,
             chat_days: 0,
             sessions_days: 7,
+            game_sessions_days: 14,
             world_history_days: 7,
             replay_days: 30,
             deleted_account_days: 30,

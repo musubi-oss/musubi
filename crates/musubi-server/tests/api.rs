@@ -91,6 +91,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         accounts: musubi_account::AccountService::new(db.clone()),
         social: musubi_social::SocialService::new(db.clone()),
         groups: musubi_social::GroupService::new(db.clone()),
+        game_sessions: musubi_server::game_sessions::GameSessionService::new(db.clone()),
         lobbies: musubi_server::lobby::LobbyService::new(
             db.clone(),
             musubi_server::notify::Notifier::new(
@@ -22708,4 +22709,471 @@ async fn item_lifecycle_status_cooldown_effects_durability_and_revoke() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn game_sessions_crud_idempotency_codes_seats_and_templates() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let mut users = Vec::new();
+    for tag in ["gsa", "gsb", "gsc", "gsd"] {
+        let (_, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(tag)})),
+        )
+        .await;
+        let t = sess["access_token"].as_str().unwrap().to_string();
+        let (_, acc) = call(&app, "GET", "/v1/account", Some(&t), None).await;
+        users.push((t, acc["id"].as_str().unwrap().to_string()));
+    }
+    let (ta, a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let (tc, c) = users[2].clone();
+    let (td, _d) = users[3].clone();
+
+    // a fleet with one ready local server for the dedicated template
+    let fleet = unique("sessfleet");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({"name": fleet, "provider": "local", "buffer": 1, "max_servers": 1, "region": "eu",
+            "port_start": 48400, "port_end": 48500, "spec": {"command": ["sleep", "60"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let _ = svc.reconcile().await.unwrap();
+    let (_, list) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let sid = list["servers"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{list}"))
+        .to_string();
+    let sdk = |method: &str, path: &str, body: Option<Value>| {
+        let app = app.clone();
+        let sid = sid.clone();
+        let (method, path) = (method.to_string(), path.to_string());
+        async move {
+            let req = Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .header("x-musubi-server-id", sid)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&bytes)
+                .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
+            (status, v)
+        }
+    };
+    let (st, gs) = sdk("POST", "/v1/gameserver/ready", None).await;
+    assert_eq!(st, StatusCode::OK, "{gs}");
+
+    // server-created custom session, idempotent
+    let key = unique("idem");
+    let body = json!({"name": "custom", "connect": {"address": "1.2.3.4", "port": 7777}, "owner_id": a,
+        "properties": {"mode": "ranked", "map": "dust"}, "max_players": 2, "idempotency_key": key});
+    let (st, s1) = call_server(&app, "POST", "/v1/server/sessions", k, Some(body.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    assert_eq!(s1["kind"], "custom");
+    assert_eq!(s1["reused"], false);
+    assert!(
+        s1["join_code"].is_null(),
+        "open sessions have no code: {s1}"
+    );
+    let cid = s1["id"].as_str().unwrap().to_string();
+    let (st, s2) = call_server(&app, "POST", "/v1/server/sessions", k, Some(body)).await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    assert_eq!(s2["id"], cid);
+    assert_eq!(s2["reused"], true);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/sessions",
+        k,
+        Some(json!({"name": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // public browser sees the open session; patch to invite-only hides it and mints a code
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions/search",
+        Some(&tc),
+        Some(json!({"filters": [{"key": "mode", "op": "eq", "value": "ranked"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v.to_string().contains(&cid), "{v}");
+    assert!(
+        v["sessions"][0]["connect"].is_null(),
+        "search hides connect: {v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/sessions/{cid}"),
+        k,
+        Some(json!({"data": {"round": 1}, "join_policy": "invite"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let code = v["join_code"].as_str().expect("code").to_string();
+    assert_eq!(v["data"]["round"], 1);
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions/search",
+        Some(&tc),
+        Some(json!({"filters": [{"key": "mode", "op": "eq", "value": "ranked"}]})),
+    )
+    .await;
+    assert!(
+        !v.to_string().contains(&cid),
+        "invite-only is not browsable: {v}"
+    );
+    let (_, v) = call_server(&app, "POST", "/v1/server/sessions/search", k, Some(json!({"filters": [{"key": "mode", "op": "eq", "value": "ranked"}, {"key": "free_slots", "op": "gte", "value": 2}], "sort": [{"key": "created_at", "dir": "desc"}]}))).await;
+    assert!(v.to_string().contains(&cid), "server search: {v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/sessions/search",
+        k,
+        Some(json!({"filters": [{"key": "mode", "op": "like", "value": "r"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // stranger: public card only; join needs the code; invited friend bypasses it; capacity
+    let (_, v) = call(&app, "GET", &format!("/v1/sessions/{cid}"), Some(&tc), None).await;
+    assert!(
+        v["session"]["connect"].is_null() && v["session"]["join_code"].is_null(),
+        "{v}"
+    );
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/sessions/{cid}/join"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions/join",
+        Some(&tc),
+        Some(json!({"code": code.to_lowercase()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["member"]["state"], "reserved");
+    assert!(v["member"]["token"].is_string());
+    assert_eq!(v["session"]["connect"]["port"], 7777);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/sessions/{cid}/invite"),
+        Some(&ta),
+        Some(json!({"account_id": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "owner invites: {v}");
+    assert_eq!(v["member"]["state"], "invited");
+    let (_, n) = call(&app, "GET", "/v1/notifications", Some(&tb), None).await;
+    assert!(n.to_string().contains("session_invite"), "{n}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/sessions/{cid}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "invited joins without code: {v}");
+    assert_eq!(v["session"]["players"], 2);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions/join",
+        Some(&td),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "full: {v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/sessions/{cid}/leave"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["left"], true);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions/join",
+        Some(&td),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "seat freed: {v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/sessions/{cid}/members"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["members"].as_array().unwrap().len(), 3, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/sessions/{cid}/members"),
+        k,
+        Some(json!({"account_id": c})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::TOO_MANY_REQUESTS,
+        "server reservation still respects capacity: {v}"
+    );
+
+    // template → player-created dedicated session on the ready server; SDK confirms seat tokens
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/session_templates/duel",
+        k,
+        Some(json!({"fleet": fleet, "module": "x", "max_players": 2, "join_policy": "invite"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(&app, "PUT", "/v1/server/session_templates/duel", k, Some(json!({"name": "Duel", "fleet": fleet, "max_players": 2, "join_policy": "invite", "max_active_per_owner": 1}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions",
+        Some(&ta),
+        Some(json!({"template_id": "duel", "name": "a's duel", "properties": {"map": "x"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["session"]["kind"], "dedicated");
+    assert_eq!(v["session"]["server_id"], sid);
+    assert_eq!(v["session"]["region"], "eu");
+    assert_eq!(v["session"]["template_id"], "duel");
+    assert_eq!(v["member"]["state"], "reserved");
+    let did = v["session"]["id"].as_str().unwrap().to_string();
+    let dcode = v["session"]["join_code"].as_str().unwrap().to_string();
+    let atoken = v["member"]["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        v["session"]["connect"]["connect_token"]
+            .as_str()
+            .map(|s| s.is_empty()),
+        Some(false)
+    );
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions",
+        Some(&ta),
+        Some(json!({"template_id": "duel"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::TOO_MANY_REQUESTS,
+        "one active per owner: {v}"
+    );
+    let (st, v) = sdk("GET", "/v1/gameserver/session", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["session"]["id"], did);
+    assert_eq!(v["session"]["properties"]["map"], "x");
+    let (st, v) = sdk(
+        "POST",
+        "/v1/gameserver/session/accept",
+        Some(json!({"token": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, v) = sdk(
+        "POST",
+        "/v1/gameserver/session/accept",
+        Some(json!({"token": atoken})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["account_id"], a);
+    assert_eq!(v["member"]["state"], "joined");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/sessions/join",
+        Some(&tb),
+        Some(json!({"code": dcode})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let btoken = v["member"]["token"].as_str().unwrap().to_string();
+    let (st, _) = sdk(
+        "POST",
+        "/v1/gameserver/session/accept",
+        Some(json!({"token": btoken})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = sdk(
+        "POST",
+        "/v1/gameserver/session/left",
+        Some(json!({"account_id": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["left"], true);
+    let (st, v) = sdk(
+        "POST",
+        "/v1/gameserver/session/accept",
+        Some(json!({"token": btoken})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "left seat token is dead: {v}");
+    let (st, v) = sdk(
+        "PATCH",
+        "/v1/gameserver/session",
+        Some(json!({"data": {"phase": "warmup"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["data"]["phase"], "warmup");
+
+    // owner controls: code rotation, caps, termination; mine/history
+    let (_, v) = call(&app, "GET", "/v1/sessions/mine", Some(&ta), None).await;
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 2, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/sessions/{did}/code"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ncode = v["code"].as_str().unwrap().to_string();
+    assert_ne!(ncode, dcode);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/sessions/join",
+        Some(&tc),
+        Some(json!({"code": dcode})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "old code is gone");
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/sessions/{did}"),
+        Some(&ta),
+        Some(json!({"max_players": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "template cap: {v}");
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/sessions/{did}"),
+        Some(&ta),
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "renamed");
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/sessions/{did}"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/sessions/{did}"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["terminated"], true);
+    let (_, v) = call_server(&app, "GET", &format!("/v1/server/sessions/{did}"), k, None).await;
+    assert_eq!(v["state"], "terminated");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/sessions/join",
+        Some(&tc),
+        Some(json!({"code": ncode})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "terminated sessions have no code"
+    );
+    let (_, v) = call(&app, "GET", "/v1/sessions/history", Some(&tb), None).await;
+    assert!(v["sessions"].as_array().unwrap().len() >= 2, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/sessions/{cid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["terminated"], true);
+    let (_, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/sessions/{cid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["terminated"], false);
+    let (_, v) = call_server(&app, "POST", "/v1/server/sessions/search", k, Some(json!({"include_terminated": true, "filters": [{"key": "state", "op": "eq", "value": "terminated"}, {"key": "name", "op": "contains", "value": "custom"}]}))).await;
+    assert!(v.to_string().contains(&cid), "{v}");
+    let (_, v) = call_server(&app, "DELETE", "/v1/server/session_templates/duel", k, None).await;
+    assert_eq!(v["deleted"], true);
 }

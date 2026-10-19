@@ -21,6 +21,7 @@ pub(crate) mod extract;
 mod files;
 mod fleets;
 mod friends;
+pub mod game_sessions;
 pub mod group_challenges;
 mod group_pools;
 mod groups;
@@ -242,6 +243,7 @@ pub fn router(state: AppState) -> Router {
         .merge(challenges::routes())
         .merge(account_policy::routes())
         .merge(items_lifecycle::routes())
+        .merge(game_sessions::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())

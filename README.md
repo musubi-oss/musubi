@@ -339,6 +339,21 @@ per-player cooldown (409 with `ready_at`), applies the timed status effects (`GE
 of being consumed; `POST /v1/server/inventory/repair {account_id, id, amount?}`). `POST /v1/server/items/{id}/revoke` retires
 the item and pulls every instance from every inventory (`item.revoked` per owner).
 
+Game sessions: one object per running game — `POST /v1/server/sessions {fleet_id|pool+region|module+params|connect, name,
+properties, data, max_players, join_policy: open|invite|closed, idempotency_key, owner_id?}` allocates a dedicated server,
+launches an authoritative match or records custom connect info (same `idempotency_key` → same session, `reused: true`);
+`PATCH` properties/data/caps/policy (invite/closed mint a 6-letter code), `POST …/search {filters, sort}` over typed
+properties and built-ins (`player_count`, `free_slots`, `region`, `kind`, `state`…), `DELETE` terminates and stops the
+match/server, `POST …/{id}/members {account_id}` reserves a seat server-side. Seats are per-player reservations with a token
+the game server confirms (`POST /v1/gameserver/session/accept {token}` → `joined`; unconfirmed seats expire after 120 s;
+`…/left`, `GET|PATCH /v1/gameserver/session`). Players: `POST /v1/sessions/search` (server browser: open sessions with free
+seats), `POST /v1/sessions/join {code}` / `…/{id}/join`, `…/invite {account_id}` (invited friends bypass the policy, get a
+`session_invite` notification), `…/leave`, `GET /v1/sessions/mine|history`, and private/custom matches from operator templates
+(`PUT /v1/server/session_templates/{id} {fleet|module, region, params, max_players, join_policy, max_active_per_owner,
+wait_secs}` → `POST /v1/sessions {template_id, name, properties, join_policy?, max_players?}` returns the session, the
+owner's seat token, connect info and the invite code; owner can `PATCH`, rotate the code (`POST …/{id}/code`) and `DELETE`).
+Terminated sessions stay for `[retention] game_sessions_days` (14).
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`
