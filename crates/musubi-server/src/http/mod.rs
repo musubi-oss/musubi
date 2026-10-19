@@ -25,6 +25,7 @@ pub mod group_challenges;
 mod group_pools;
 mod groups;
 mod integrations;
+pub mod items_lifecycle;
 mod leaderboards;
 mod legal;
 mod liveops;
@@ -240,6 +241,7 @@ pub fn router(state: AppState) -> Router {
         .merge(group_pools::routes())
         .merge(challenges::routes())
         .merge(account_policy::routes())
+        .merge(items_lifecycle::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())

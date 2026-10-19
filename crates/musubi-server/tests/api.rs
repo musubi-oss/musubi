@@ -22462,3 +22462,250 @@ async fn account_policy_edit_cadence_lookup_and_dormancy() {
     let (st, _) = call_server(&app, "PUT", "/v1/admin/accounts/policy", k, Some(json!({}))).await;
     assert_eq!(st, StatusCode::OK, "reset for the other tests");
 }
+
+#[tokio::test]
+async fn item_lifecycle_status_cooldown_effects_durability_and_revoke() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("il0")})),
+    )
+    .await;
+    let ta = sess["access_token"].as_str().unwrap().to_string();
+    let (_, acc) = call(&app, "GET", "/v1/account", Some(&ta), None).await;
+    let a = acc["id"].as_str().unwrap().to_string();
+    let potion = unique("ilp").to_lowercase();
+    let sword = unique("ils").to_lowercase();
+    for body in [
+        json!({"id": potion, "name": "Potion", "stackable": true, "max_stack": 99}),
+        json!({"id": sword, "name": "Sword", "category": "weapon", "stackable": false}),
+    ] {
+        let (st, v) = call_server(&app, "POST", "/v1/server/items", k, Some(body)).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let grant = |item: String, qty: i64| {
+        let app = app.clone();
+        let a = a.clone();
+        async move {
+            call_server(
+                &app,
+                "POST",
+                "/v1/server/inventory/grant",
+                k,
+                Some(json!({"account_id": a, "item_id": item, "quantity": qty})),
+            )
+            .await
+        }
+    };
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/items/{potion}/status"),
+        k,
+        Some(json!({"status": "draft"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = grant(potion.clone(), 1).await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "draft items cannot be granted: {v}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/items/{potion}/status"),
+        k,
+        Some(json!({"status": "bogus"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/items/{potion}/status"),
+        k,
+        Some(json!({"status": "published"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = grant(potion.clone(), 3).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let pid = v["id"].as_str().unwrap().to_string();
+
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/items/{potion}/lifecycle"),
+        k,
+        Some(json!({"durability": {"max": 1, "per_use": 5}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/items/{potion}/lifecycle"),
+        k,
+        Some(json!({"use_cooldown_secs": 3600, "effects": [{"key": "haste", "value": 2, "duration_secs": 600}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/inventory/use",
+        Some(&ta),
+        Some(json!({"id": pid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["remaining"]["quantity"], 2);
+    assert_eq!(v["effects"][0]["key"], "haste");
+    assert!(v["cooldown_ready_at"].is_i64());
+    assert_eq!(v["broken"], false);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/inventory/use",
+        Some(&ta),
+        Some(json!({"id": pid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "cooldown: {v}");
+    assert!(v.to_string().contains("ready_at"));
+    let (_, v) = call(&app, "GET", "/v1/effects", Some(&ta), None).await;
+    assert_eq!(v["effects"][0]["key"], "haste", "{v}");
+    assert_eq!(v["effects"][0]["value"], 2);
+    assert!(v["effects"][0]["seconds_left"].as_i64().unwrap() > 500);
+    let (_, v) = call_server(&app, "GET", &format!("/v1/server/effects/{a}"), k, None).await;
+    assert_eq!(v["effects"].as_array().unwrap().len(), 1);
+    let (_, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/effects/{a}/haste"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["removed"], true);
+    let (_, v) = call(&app, "GET", "/v1/effects", Some(&ta), None).await;
+    assert!(v["effects"].as_array().unwrap().is_empty());
+
+    // durability: durable items wear out instead of being consumed
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/items/{sword}/lifecycle"),
+        k,
+        Some(json!({"durability": {"max": 10, "per_use": 4}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = grant(sword.clone(), 1).await;
+    let sid = v["id"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/inventory/use",
+        Some(&ta),
+        Some(json!({"id": sid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["durability_left"], 6);
+    assert_eq!(v["remaining"]["instance"]["durability"], 6);
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/inventory/use",
+        Some(&ta),
+        Some(json!({"id": sid})),
+    )
+    .await;
+    assert_eq!(v["durability_left"], 2);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/repair",
+        k,
+        Some(json!({"account_id": a, "id": sid, "amount": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["durability"], 5);
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/repair",
+        k,
+        Some(json!({"account_id": a, "id": sid})),
+    )
+    .await;
+    assert_eq!(v["durability"], 10, "full repair");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/repair",
+        k,
+        Some(json!({"account_id": a, "id": pid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "potion has no durability: {v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/inventory/use",
+        Some(&ta),
+        Some(json!({"id": sid, "quantity": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["broken"], true, "{v}");
+    assert!(v["remaining"].is_null());
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&ta), None).await;
+    assert!(
+        !inv.to_string().contains(&sid),
+        "broken sword is gone: {inv}"
+    );
+
+    // revoke: retire + pull from every inventory
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/items/{potion}/revoke"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "retired");
+    assert!(v["accounts"].as_array().unwrap().contains(&json!(a)), "{v}");
+    let (st, _) = grant(potion.clone(), 1).await;
+    assert_eq!(st, StatusCode::CONFLICT, "retired items cannot be granted");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/inventory/use",
+        Some(&ta),
+        Some(json!({"id": pid})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items/no-such-item-xyz/revoke",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

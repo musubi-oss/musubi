@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub mod achievements;
 pub mod iap;
+pub mod items_lifecycle;
 pub mod mailbox;
 pub mod market;
 pub mod orderbook;
@@ -1155,6 +1156,18 @@ impl EconomyService {
     ) -> Result<InventoryEntry> {
         if quantity <= 0 {
             return Err(Error::InvalidArgument("quantity must be positive".into()));
+        }
+        let status: Option<String> =
+            sqlx::query_scalar("select status from musubi.items where id = $1")
+                .bind(item_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(Error::internal)?;
+        if status.as_deref().is_some_and(|st| st != "published") {
+            return Err(Error::Conflict(format!(
+                "item {item_id} is {} and cannot be granted",
+                status.unwrap_or_default()
+            )));
         }
         let item: Option<ItemRulesRow> = sqlx::query_as(
             "select stackable, max_stack, version, instance_schema, migrations, unique_per_account, bind, category from musubi.items where id = $1",

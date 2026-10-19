@@ -331,6 +331,14 @@ notices accounts `notice_days` before the dormancy threshold (`account.dormant_n
 them (`account.dormant_actioned`; activity = last session seen). Support lookup `GET /v1/admin/accounts/lookup?id|username|
 identity=provider:subject|email` returns the player card: account, status, last seen, sessions/devices/IPs, dormancy, edit status.
 
+Item lifecycle: items carry a `status` (`POST /v1/server/items/{id}/status {status: draft|published|retired}` — only
+published items can be granted or bought, retired ones stay usable), `PUT /v1/server/items/{id}/lifecycle {use_cooldown_secs,
+effects: [{key, value, duration_secs}], durability: {max, per_use}}`; `POST /v1/inventory/use {id, quantity}` gates on the
+per-player cooldown (409 with `ready_at`), applies the timed status effects (`GET /v1/effects`, server `GET/DELETE
+/v1/server/effects/{account_id}[/{key}]`), and spends durability on the instance (durable items break — `item.broken` — instead
+of being consumed; `POST /v1/server/inventory/repair {account_id, id, amount?}`). `POST /v1/server/items/{id}/revoke` retires
+the item and pulls every instance from every inventory (`item.revoked` per owner).
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`
