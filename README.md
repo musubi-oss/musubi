@@ -251,6 +251,21 @@ id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.
 | `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
 | QUIC `quic.listen` (UDP) | access JWT in the first frame `{token, format, status}` | same envelopes/encodings as WebSocket over one bidirectional quinn stream (`type:u8 \| len:u32be \| payload`); an unvalidated source is answered with a Retry token before any handshake state exists (`quic.retry`, default on — spoofed addresses cost nothing and amplification stays 1×), handshakes in flight are capped by `quic.max_pending_handshakes` (default 1024, refused above), 8 bidirectional / 0 unidirectional streams per connection, ALPN `musubi-rt/1`, PEM cert or self-signed dev cert; `match_data` with `reliable=false` travels as QUIC datagrams (clients may send datagrams too) |
 
+Sanctions sit on top of bans as the moderation workflow: `POST /v1/admin/accounts/{id}/sanctions
+{action, reason_code?, duration_secs?, message?, pending?, escalate?, source?, note}` with actions
+`warn` (notification only), `mute` (chat + voice), `restrict_matchmaking`, `restrict_social`
+(friends/groups/chat), `restrict_trading` (trading/UGC), `shadow`, `ban`, `custom {features}` — the
+account's effective ban is recomputed from all active sanctions (union of restrictions, full ban wins,
+latest end date), `pending: true` waits for a second moderator (`…/sanctions/{id}/approve|reject`),
+`escalate: true` picks action and duration from the reason's `ladder` (`PUT /v1/admin/bans/reasons/{code}
+{ladder: [{action: "warn"}, {action: "mute", duration_secs: 86400}, {action: "ban"}]}`) by how many
+sanctions with that reason the account already has; `…/revoke`, expiry sweep. Players see their own
+(`GET /v1/account/sanctions`, moderator notes hidden) and appeal once per sanction
+(`POST /v1/account/sanctions/{id}/appeal {text}`); moderators work the queue (`GET /v1/admin/appeals`,
+`POST /v1/admin/appeals/{id}/decide {outcome: upheld|overturned, note}` — overturned revokes). Game
+servers ask `GET /v1/server/accounts/{id}/sanctions` (`banned`, `restricted[]`) or mirror everything via
+`GET /v1/server/sanctions/sync?since` (cursor on `updated_at`). Events `sanction.*`, `appeal.*`.
+
 ## Layout
 
 | crate | role |

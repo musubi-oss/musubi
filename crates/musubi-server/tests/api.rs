@@ -19197,3 +19197,238 @@ async fn scoped_tokens_and_scoped_server_keys() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn sanctions_escalation_pending_appeals_and_sync() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let srv = |method: &str, path: String, body: Option<Value>| {
+        let app = app.clone();
+        let method = method.to_string();
+        async move {
+            let mut req = Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey");
+            let req = match body {
+                Some(b) => req
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(b.to_string()))
+                    .unwrap(),
+                None => {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                    req.body(Body::from("{}")).unwrap()
+                }
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (status, v)
+        }
+    };
+    let device = unique("sanc-dev-");
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": device})),
+    )
+    .await;
+    assert_eq!(st, 200, "{sess}");
+    let tok = sess["access_token"].as_str().unwrap().to_string();
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let code = unique("toxic-");
+
+    // reason with an escalation ladder: warn → mute 1h → ban
+    let (st, _) = srv(
+        "PUT",
+        format!("/v1/admin/bans/reasons/{code}"),
+        Some(
+            json!({"title": "Toxic chat", "message": "Be nice.", "ladder": [
+            {"action": "warn"}, {"action": "mute", "duration_secs": 3600}, {"action": "ban"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, 200);
+
+    // step 1: warn — nothing enforced, player notified
+    let (st, s1) = srv(
+        "POST",
+        format!("/v1/admin/accounts/{acc}/sanctions"),
+        Some(json!({"reason_code": code, "escalate": true, "source": {"report_id": "r1"}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{s1}");
+    assert_eq!(s1["action"], "warn");
+    assert_eq!(s1["status"], "active");
+    assert_eq!(s1["reason"], "Toxic chat");
+    let (st, v) = call(&app, "GET", "/v1/storage?collection=x", Some(&tok), None).await;
+    assert!(st == 200 || st == 400, "warn must not block: {st} {v}");
+
+    // step 2: mute — chat feature-banned, matchmaking still fine
+    let (st, s2) = srv(
+        "POST",
+        format!("/v1/admin/accounts/{acc}/sanctions"),
+        Some(json!({"reason_code": code, "escalate": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{s2}");
+    assert_eq!(s2["action"], "mute");
+    assert!(s2["ends_at"].as_i64().unwrap() > s2["starts_at"].as_i64().unwrap());
+    let (st, v) = srv("GET", format!("/v1/server/accounts/{acc}/sanctions"), None).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["banned"], false);
+    assert!(v["restricted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "chat"));
+    let (st, v) = srv("GET", format!("/v1/admin/accounts/{acc}/ban"), None).await;
+    assert_eq!(st, 200, "{v}");
+    assert!(
+        v["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "chat"),
+        "{v}"
+    );
+
+    // player view: both sanctions, no moderator source/note
+    let (st, mine) = call(&app, "GET", "/v1/account/sanctions", Some(&tok), None).await;
+    assert_eq!(st, 200, "{mine}");
+    assert_eq!(mine["active"], 2);
+    assert!(mine["sanctions"][0].get("source").is_none());
+
+    // appeal the mute once
+    let s2id = s2["id"].as_str().unwrap().to_string();
+    let (st, ap) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/sanctions/{s2id}/appeal"),
+        Some(&tok),
+        Some(json!({"text": "It was a joke between friends."})),
+    )
+    .await;
+    assert_eq!(st, 200, "{ap}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/sanctions/{s2id}/appeal"),
+        Some(&tok),
+        Some(json!({"text": "again"})),
+    )
+    .await;
+    assert_eq!(st, 409);
+    let (st, q) = srv("GET", "/v1/admin/appeals".to_string(), None).await;
+    assert_eq!(st, 200);
+    assert!(q["appeals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["id"] == ap["appeal_id"] && a["action"] == "mute"));
+    // overturned → mute revoked, chat restriction gone
+    let (st, d) = srv(
+        "POST",
+        format!(
+            "/v1/admin/appeals/{}/decide",
+            ap["appeal_id"].as_str().unwrap()
+        ),
+        Some(json!({"outcome": "overturned", "note": "context checked"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{d}");
+    let (_, v) = srv("GET", format!("/v1/admin/sanctions/{s2id}"), None).await;
+    assert_eq!(v["status"], "revoked");
+    assert_eq!(v["appeal"]["status"], "overturned");
+    let (st, v) = srv("GET", format!("/v1/server/accounts/{acc}/sanctions"), None).await;
+    assert_eq!(st, 200);
+    assert!(v["restricted"].as_array().unwrap().is_empty(), "{v}");
+
+    // step 3 (revoked ones don't count → still mute), as pending: not enforced until approved
+    let (st, s3) = srv(
+        "POST",
+        format!("/v1/admin/accounts/{acc}/sanctions"),
+        Some(json!({"reason_code": code, "escalate": true, "pending": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{s3}");
+    assert_eq!(s3["action"], "mute");
+    assert_eq!(s3["status"], "pending");
+    let (_, v) = srv("GET", format!("/v1/server/accounts/{acc}/sanctions"), None).await;
+    assert!(v["restricted"].as_array().unwrap().is_empty());
+    let s3id = s3["id"].as_str().unwrap().to_string();
+    let (st, _) = srv("POST", format!("/v1/admin/sanctions/{s3id}/approve"), None).await;
+    assert_eq!(st, 200);
+    let (_, v) = srv("GET", format!("/v1/server/accounts/{acc}/sanctions"), None).await;
+    assert!(v["restricted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "chat"));
+    let (st, _) = srv("POST", format!("/v1/admin/sanctions/{s3id}/approve"), None).await;
+    assert_eq!(st, 409);
+
+    // full ban wins over restrictions; revoke lifts back to the mute
+    let (st, s4) = srv(
+        "POST",
+        format!("/v1/admin/accounts/{acc}/sanctions"),
+        Some(json!({"action": "ban", "message": "Cheating", "duration_secs": 600})),
+    )
+    .await;
+    assert_eq!(st, 200, "{s4}");
+    let (_, v) = srv("GET", format!("/v1/server/accounts/{acc}/sanctions"), None).await;
+    assert_eq!(v["banned"], true);
+    let (st, v) = call(&app, "GET", "/v1/account/sanctions", Some(&tok), None).await;
+    assert_eq!(st, 403, "{v}");
+    let (st, _) = srv(
+        "POST",
+        format!("/v1/admin/sanctions/{}/revoke", s4["id"].as_str().unwrap()),
+        Some(json!({"note": "false positive"})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, v) = srv("GET", format!("/v1/server/accounts/{acc}/sanctions"), None).await;
+    assert_eq!(v["banned"], false);
+    assert!(v["restricted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "chat"));
+
+    // validation + sync feed
+    let (st, _) = srv(
+        "POST",
+        format!("/v1/admin/accounts/{acc}/sanctions"),
+        Some(json!({"action": "nuke"})),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, v) = srv(
+        "GET",
+        "/v1/server/sanctions/sync?since=0&limit=2000".to_string(),
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let ids: Vec<&str> = v["sanctions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["account_id"] == acc)
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4, "{v}");
+    assert!(v["next"].as_i64().is_some());
+    let (_, v) = srv(
+        "GET",
+        format!("/v1/admin/accounts/{acc}/sanctions?status=revoked"),
+        None,
+    )
+    .await;
+    assert_eq!(v["sanctions"].as_array().unwrap().len(), 2);
+}

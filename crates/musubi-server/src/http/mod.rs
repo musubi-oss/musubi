@@ -36,6 +36,7 @@ mod regions;
 pub mod reports;
 mod rpc;
 mod rtc;
+pub mod sanctions;
 mod sso;
 pub mod stats;
 mod storage;
@@ -208,6 +209,7 @@ pub fn router(state: AppState) -> Router {
         .merge(rating::routes())
         .merge(entitlements::routes())
         .merge(reports::routes())
+        .merge(sanctions::routes())
         .merge(ugc::routes())
         .merge(anticheat::routes())
         .merge(regions::routes())

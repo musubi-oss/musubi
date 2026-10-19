@@ -1009,6 +1009,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                         Err(e) => tracing::warn!(error = %e, "ban expiry sweep failed"),
                     }
                 }
+                if n % 12 == 0 {
+                    match crate::http::sanctions::expire_sanctions(&st).await {
+                        Ok(k) if k > 0 => tracing::info!(sanctions = k, "sanctions expired"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "sanction expiry sweep failed"),
+                    }
+                }
                 // league rollovers: every minute, same leader as the market sweep
                 if n % 12 == 0 {
                     match st.leaderboards.rollover_due().await {

@@ -311,6 +311,10 @@ pub struct ReasonBody {
     pub severity: String,
     #[serde(default)]
     pub features: Vec<String>,
+    /// Escalation ladder for sanctions (`POST /v1/admin/accounts/{id}/sanctions {escalate: true}`):
+    /// `[{action, duration_secs?, message?}, …]`, the n-th prior sanction with this reason picks step n.
+    #[serde(default)]
+    pub ladder: serde_json::Value,
 }
 
 fn default_severity() -> String {
@@ -423,6 +427,16 @@ async fn put_reason(
     .execute(&s.db)
     .await
     .map_err(Error::internal)?;
+    sqlx::query("update musubi.ban_reasons set ladder = $2 where code = $1")
+        .bind(&code)
+        .bind(if b.ladder.is_array() {
+            b.ladder.clone()
+        } else {
+            serde_json::json!([])
+        })
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?;
     s.events
         .emit("ban_reason.updated", None, json!({ "code": code }))
         .await;
