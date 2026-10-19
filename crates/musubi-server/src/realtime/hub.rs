@@ -56,6 +56,10 @@ pub struct Hub {
     channels: DashMap<String, HashMap<SessionId, Member>>,
     /// session → channels joined (for cleanup)
     in_channels: DashMap<SessionId, HashSet<String>>,
+    /// generic module streams: stream id → sessions in it
+    streams: DashMap<String, HashMap<SessionId, UserPresence>>,
+    /// session → streams joined (for cleanup)
+    in_streams: DashMap<SessionId, HashSet<String>>,
     /// Set by `close_all`: sessions ending now keep their resume record (parked) for another node.
     draining: std::sync::atomic::AtomicBool,
 }
@@ -189,7 +193,102 @@ impl Hub {
                 self.leave_channel_inner(&c, &p);
             }
         }
+        if let Some((_, streams)) = self.in_streams.remove(&session_id) {
+            for st in streams {
+                self.streams.remove_if_mut(&st, |_, m| {
+                    m.remove(&session_id);
+                    m.is_empty()
+                });
+            }
+        }
         self.notify_followers(p.account_id, vec![], vec![p]);
+    }
+
+    /// Presence of a live local session.
+    pub fn presence(&self, session_id: SessionId) -> Option<UserPresence> {
+        self.sessions.get(&session_id).map(|h| h.presence.clone())
+    }
+
+    /// Add a session to a generic stream. Returns `false` when the session is not live here,
+    /// `true` otherwise (joining twice is a no-op).
+    pub fn join_stream(&self, stream: &str, session_id: SessionId) -> bool {
+        let Some(p) = self.presence(session_id) else {
+            return false;
+        };
+        self.streams
+            .entry(stream.to_string())
+            .or_default()
+            .insert(session_id, p);
+        self.in_streams
+            .entry(session_id)
+            .or_default()
+            .insert(stream.to_string());
+        true
+    }
+
+    /// Remove a session from a stream; returns whether it was a member.
+    pub fn leave_stream(&self, stream: &str, session_id: SessionId) -> bool {
+        let mut was = false;
+        self.streams.remove_if_mut(stream, |_, m| {
+            was = m.remove(&session_id).is_some();
+            m.is_empty()
+        });
+        if was {
+            self.in_streams.remove_if_mut(&session_id, |_, s| {
+                s.remove(stream);
+                s.is_empty()
+            });
+        }
+        was
+    }
+
+    pub fn in_stream(&self, stream: &str, session_id: SessionId) -> bool {
+        self.streams
+            .get(stream)
+            .is_some_and(|m| m.contains_key(&session_id))
+    }
+
+    pub fn stream_count(&self, stream: &str) -> usize {
+        self.streams.get(stream).map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn stream_members(&self, stream: &str) -> Vec<UserPresence> {
+        self.streams
+            .get(stream)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Streams a session is in (for `stream.mine` / debugging).
+    pub fn streams_of(&self, session_id: SessionId) -> Vec<String> {
+        self.in_streams
+            .get(&session_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Fan a message out to every member of a stream; returns the number of sessions reached.
+    pub fn send_stream(&self, stream: &str, msg: ServerMessage) -> usize {
+        let members: Vec<SessionId> = self
+            .streams
+            .get(stream)
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        let mut n = 0;
+        for sid in members {
+            if self.send_to_session(sid, msg.clone()) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Streams with their member counts (operator inventory).
+    pub fn stream_inventory(&self) -> Vec<(String, usize)> {
+        self.streams
+            .iter()
+            .map(|e| (e.key().clone(), e.value().len()))
+            .collect()
     }
 
     /// Join a chat channel; returns the visible presences already there (excluding the joiner).

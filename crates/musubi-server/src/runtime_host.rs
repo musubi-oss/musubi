@@ -183,6 +183,20 @@ fn owner(req: &Value, ctx: &CallContext) -> Result<Uuid> {
     }
 }
 
+/// Session a stream op applies to: an explicit `session_id` (server context only) or the
+/// calling player's own realtime session.
+fn stream_session(req: &Value, ctx: &CallContext) -> Result<musubi_core::SessionId> {
+    match req.get("session_id").and_then(|v| v.as_str()) {
+        Some(sid) if ctx.server => crate::http::streams::parse_session(sid),
+        Some(_) => Err(Error::PermissionDenied(
+            "only server context may address another session".into(),
+        )),
+        None => ctx
+            .session_id
+            .ok_or_else(|| Error::InvalidArgument("no session_id and no calling session".into())),
+    }
+}
+
 fn to_json<T: serde::Serialize>(v: T) -> Result<Value> {
     serde_json::to_value(v).map_err(Error::internal)
 }
@@ -190,7 +204,8 @@ fn to_json<T: serde::Serialize>(v: T) -> Result<Value> {
 impl ServerHost {
     async fn dispatch(&self, ctx: &CallContext, req: Value) -> Result<Value> {
         let s = &self.state;
-        match str_field(&req, "op")? {
+        let op = str_field(&req, "op")?;
+        match op {
             "anticheat.flag" => {
                 let account = musubi_core::AccountId(owner(&req, ctx)?);
                 s.anticheat
@@ -204,6 +219,76 @@ impl ServerHost {
                         req.get("details").cloned().unwrap_or(Value::Null),
                     )
                     .await
+            }
+            "stream.join" | "stream.leave" => {
+                let stream = str_field(&req, "stream")?;
+                crate::http::streams::check_stream_id(stream)?;
+                let sid = stream_session(&req, ctx)?;
+                let ok = if op == "stream.join" {
+                    if !s.hub.join_stream(stream, sid) {
+                        return Err(Error::NotFound(
+                            "session is not connected to this node".into(),
+                        ));
+                    }
+                    true
+                } else {
+                    s.hub.leave_stream(stream, sid)
+                };
+                Ok(json!({
+                    "stream": stream,
+                    (if op == "stream.join" { "joined" } else { "left" }): ok,
+                    "count": s.hub.stream_count(stream),
+                }))
+            }
+            "stream.send" => {
+                let stream = str_field(&req, "stream")?;
+                crate::http::streams::check_stream_id(stream)?;
+                let data = req.get("data").cloned().unwrap_or(Value::Null);
+                crate::http::streams::check_stream_data(&data)?;
+                let sender = match ctx.session_id {
+                    Some(sid) if !ctx.server => {
+                        if !s.hub.in_stream(stream, sid) {
+                            return Err(Error::PermissionDenied(
+                                "caller is not a member of this stream".into(),
+                            ));
+                        }
+                        s.hub.presence(sid)
+                    }
+                    _ => None,
+                };
+                let hide_sender = req.get("anonymous").and_then(|v| v.as_bool()) == Some(true);
+                let delivered = s.hub.send_stream(
+                    stream,
+                    musubi_proto::ServerMessage::StreamData {
+                        stream: stream.to_string(),
+                        data,
+                        sender: if hide_sender { None } else { sender },
+                    },
+                );
+                Ok(json!({ "stream": stream, "delivered": delivered }))
+            }
+            "stream.count" => {
+                let stream = str_field(&req, "stream")?;
+                crate::http::streams::check_stream_id(stream)?;
+                Ok(json!({ "stream": stream, "count": s.hub.stream_count(stream) }))
+            }
+            "stream.members" => {
+                let stream = str_field(&req, "stream")?;
+                crate::http::streams::check_stream_id(stream)?;
+                if !ctx.server
+                    && !ctx
+                        .session_id
+                        .is_some_and(|sid| s.hub.in_stream(stream, sid))
+                {
+                    return Err(Error::PermissionDenied(
+                        "caller is not a member of this stream".into(),
+                    ));
+                }
+                Ok(crate::http::streams::members_json(s, stream))
+            }
+            "stream.mine" => {
+                let sid = stream_session(&req, ctx)?;
+                Ok(json!({ "session_id": sid, "streams": s.hub.streams_of(sid) }))
             }
             "storage.read" => {
                 let mut objs = s

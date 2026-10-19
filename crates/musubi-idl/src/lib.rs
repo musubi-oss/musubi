@@ -240,6 +240,63 @@ pub struct Idl {
     pub matches: BTreeMap<String, MatchDef>,
     #[serde(default)]
     pub configs: BTreeMap<String, ConfigDef>,
+    /// Module HTTP handlers: key `module/name` → export `http_<name>` of module `module`,
+    /// mounted at `/v1/x/{module}/{name}`.
+    #[serde(default)]
+    pub http: BTreeMap<String, HttpDef>,
+}
+
+/// Who may call a module HTTP handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpAuth {
+    /// Bearer player token or server key (the default, like RPCs).
+    #[default]
+    Any,
+    Player,
+    Server,
+    /// No credentials required (public webhook-style endpoint).
+    None,
+    /// HTTP Basic auth against `basic.users`.
+    Basic,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpBasic {
+    pub realm: Option<String>,
+    /// user → password.
+    pub users: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpCors {
+    /// Allowed origins; `*` allows any. Empty disables CORS handling.
+    pub origins: Vec<String>,
+    /// Allowed methods for preflight (defaults to the handler's `methods`).
+    pub methods: Vec<String>,
+    /// Allowed request headers for preflight.
+    pub headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub credentials: bool,
+    pub max_age_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpDef {
+    /// Allowed HTTP methods (upper-case); empty = any.
+    pub methods: Vec<String>,
+    pub auth: HttpAuth,
+    pub basic: Option<HttpBasic>,
+    pub cors: Option<HttpCors>,
+    /// Per-route body limit (bytes); `None` = runtime default.
+    pub max_body_bytes: Option<usize>,
+    /// Per-route calls per second per caller (ip or account); `None` = unlimited.
+    pub rate_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
 }
 
 // ---- TOML surface -------------------------------------------------------------------------
@@ -289,6 +346,7 @@ struct Doc {
     rpcs: BTreeMap<String, RpcDef>,
     matches: BTreeMap<String, MatchDef>,
     configs: BTreeMap<String, ConfigDef>,
+    http: BTreeMap<String, HttpDef>,
 }
 
 fn toml_to_json(v: toml::Value) -> Value {
@@ -305,6 +363,7 @@ impl Idl {
             rpcs: doc.rpcs,
             matches: doc.matches,
             configs: doc.configs,
+            http: doc.http,
             ..Default::default()
         };
         for (name, spec) in doc.types {
@@ -356,6 +415,35 @@ impl Idl {
     /// Every reference resolves, names are identifiers, enums are non-empty, constraints fit
     /// their types.
     pub fn validate(&self) -> Result<()> {
+        const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+        for (key, h) in &self.http {
+            let Some((module, name)) = key.split_once('/') else {
+                return err(format!("http `{key}`: key must be `module/name`"));
+            };
+            if module.is_empty() || !is_ident(name) {
+                return err(format!("http `{key}`: bad module or handler name"));
+            }
+            for m in &h.methods {
+                if !METHODS.contains(&m.as_str()) {
+                    return err(format!("http `{key}`: unknown method `{m}`"));
+                }
+            }
+            if h.auth == HttpAuth::Basic && h.basic.as_ref().is_none_or(|b| b.users.is_empty()) {
+                return err(format!(
+                    "http `{key}`: auth = \"basic\" needs `basic.users`"
+                ));
+            }
+            if let Some(c) = &h.cors {
+                for m in &c.methods {
+                    if !METHODS.contains(&m.as_str()) {
+                        return err(format!("http `{key}`: unknown cors method `{m}`"));
+                    }
+                }
+            }
+            if h.rate_per_sec.is_some_and(|r| r <= 0.0) {
+                return err(format!("http `{key}`: rate_per_sec must be positive"));
+            }
+        }
         for name in self.types.keys().chain(self.enums.keys()) {
             if !is_ident(name) {
                 return err(format!("`{name}` is not a valid type name"));
@@ -1565,6 +1653,44 @@ auth = "player"
         assert!(rs.contains("pub home: Option<Vec2>,"));
         assert!(rs.contains("pub stats: std::collections::BTreeMap<String, i64>,"));
         assert!(rs.contains("pub extra: Option<serde_json::Value>,"));
+    }
+
+    #[test]
+    fn http_handlers_parse_and_validate() {
+        let idl = Idl::parse(
+            r#"
+[http."shop/checkout"]
+methods = ["POST"]
+auth = "basic"
+basic = { realm = "ops", users = { admin = "pw" } }
+cors = { origins = ["*"], credentials = false, max_age_secs = 60 }
+max_body_bytes = 1024
+rate_per_sec = 5.0
+"#,
+        )
+        .unwrap();
+        let h = &idl.http["shop/checkout"];
+        assert_eq!(h.methods, vec!["POST".to_string()]);
+        assert_eq!(h.auth, HttpAuth::Basic);
+        assert_eq!(h.basic.as_ref().unwrap().users["admin"], "pw");
+        assert_eq!(h.cors.as_ref().unwrap().max_age_secs, Some(60));
+        assert_eq!(h.max_body_bytes, Some(1024));
+        // defaults
+        let d = Idl::parse("[http.\"m/n\"]\n").unwrap();
+        assert_eq!(d.http["m/n"].auth, HttpAuth::Any);
+        assert!(d.http["m/n"].methods.is_empty());
+        for bad in [
+            "[http.\"noslash\"]\n",
+            "[http.\"m/bad name\"]\n",
+            "[http.\"m/n\"]\nmethods = [\"FETCH\"]\n",
+            "[http.\"m/n\"]\nauth = \"basic\"\n",
+            "[http.\"m/n\"]\nauth = \"basic\"\nbasic = { users = {} }\n",
+            "[http.\"m/n\"]\ncors = { origins = [\"*\"], methods = [\"NOPE\"] }\n",
+            "[http.\"m/n\"]\nrate_per_sec = 0\n",
+            "[http.\"m/n\"]\nauth = \"root\"\n",
+        ] {
+            assert!(Idl::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

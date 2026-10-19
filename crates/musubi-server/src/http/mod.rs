@@ -37,6 +37,7 @@ mod lobbies;
 pub mod match_results;
 mod matches;
 pub(crate) mod matchmaker;
+mod module_routes;
 mod notifications;
 mod offers;
 mod parties;
@@ -53,6 +54,7 @@ mod server_browser;
 mod sso;
 pub mod stats;
 mod storage;
+pub mod streams;
 pub(crate) mod subscriptions;
 pub mod timers;
 pub mod tournaments;
@@ -252,6 +254,8 @@ pub fn router(state: AppState) -> Router {
         .merge(auth_providers::routes())
         .merge(fleet_metrics::routes())
         .merge(server_browser::routes())
+        .merge(streams::routes())
+        .merge(module_routes::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())

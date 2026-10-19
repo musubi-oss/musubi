@@ -249,6 +249,7 @@ async fn build_state_cfg_with(
     let state = AppState(Arc::new(inner));
     state.anticheat.bind(&state);
     musubi_server::app::wire_storage_live(&state.storage, &state.fanout);
+    musubi_server::runtime_host::install(&state);
     Some(state)
 }
 
@@ -19852,4 +19853,238 @@ async fn matchmaker_external_match_function_forms_matches_and_falls_back() {
     assert!(st["failures"].as_u64().unwrap() >= 1, "{st}");
     assert_eq!(st["fallback_active"], true, "{st}");
     assert!(st["last_error"].is_string(), "{st}");
+}
+
+/// P1-59: generic streams — module code joins sessions to arbitrary stream ids and fans data
+/// out; leaving/disconnecting drops membership; the server API sees and sends to the same streams.
+#[tokio::test]
+async fn generic_streams_join_send_leave_and_server_fanout() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let (ta, acc_a) = token(&router).await;
+    let (tb, _acc_b) = token(&router).await;
+    let mut a = connect(&addr, &ta, "json").await;
+    let mut b = connect(&addr, &tb, "json").await;
+    let stream = format!("room:{}", uuid::Uuid::now_v7().simple());
+    let host = |payload: Value| ClientMessage::Rpc {
+        id: "host".into(),
+        payload,
+    };
+    let rpc = |r: Envelope<ServerMessage>| match r.msg {
+        ServerMessage::Rpc { payload, .. } => {
+            assert!(payload.get("ok").is_some(), "{payload}");
+            payload["ok"].clone()
+        }
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut a,
+        "json",
+        Some("j1"),
+        host(json!({"op": "stream.join", "stream": stream})),
+    )
+    .await;
+    let v = rpc(recv(&mut a).await);
+    assert_eq!(v["joined"], true);
+    assert_eq!(v["count"], 1);
+    // joining twice is idempotent
+    send(
+        &mut a,
+        "json",
+        Some("j2"),
+        host(json!({"op": "stream.join", "stream": stream})),
+    )
+    .await;
+    assert_eq!(rpc(recv(&mut a).await)["count"], 1);
+    send(
+        &mut b,
+        "json",
+        Some("j3"),
+        host(json!({"op": "stream.join", "stream": stream})),
+    )
+    .await;
+    assert_eq!(rpc(recv(&mut b).await)["count"], 2);
+    // members visible to members
+    send(
+        &mut b,
+        "json",
+        Some("m1"),
+        host(json!({"op": "stream.members", "stream": stream})),
+    )
+    .await;
+    let v = rpc(recv(&mut b).await);
+    assert_eq!(v["count"], 2);
+    assert!(v["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["account_id"] == acc_a));
+    // a sends → both receive with sender = a
+    send(
+        &mut a,
+        "json",
+        Some("s1"),
+        host(json!({"op": "stream.send", "stream": stream, "data": {"hello": "stream"}})),
+    )
+    .await;
+    let mut got_ack = false;
+    let mut got_data = false;
+    for _ in 0..2 {
+        let r = recv(&mut a).await;
+        match r.msg {
+            ServerMessage::Rpc { payload, .. } => {
+                assert_eq!(payload["ok"]["delivered"], 2);
+                got_ack = true;
+            }
+            ServerMessage::StreamData {
+                stream: st,
+                data,
+                sender,
+            } => {
+                assert_eq!(st, stream);
+                assert_eq!(data["hello"], "stream");
+                assert_eq!(sender.unwrap().account_id.to_string(), acc_a);
+                got_data = true;
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    assert!(got_ack && got_data);
+    match recv(&mut b).await.msg {
+        ServerMessage::StreamData { data, sender, .. } => {
+            assert_eq!(data["hello"], "stream");
+            assert!(sender.is_some());
+        }
+        m => panic!("{m:?}"),
+    }
+    // b leaves; a's anonymous send reaches only a
+    send(
+        &mut b,
+        "json",
+        Some("l1"),
+        host(json!({"op": "stream.leave", "stream": stream})),
+    )
+    .await;
+    let v = rpc(recv(&mut b).await);
+    assert_eq!(v["left"], true);
+    assert_eq!(v["count"], 1);
+    send(
+        &mut a,
+        "json",
+        Some("s2"),
+        host(json!({"op": "stream.send", "stream": stream, "data": 7, "anonymous": true})),
+    )
+    .await;
+    for _ in 0..2 {
+        match recv(&mut a).await.msg {
+            ServerMessage::Rpc { payload, .. } => assert_eq!(payload["ok"]["delivered"], 1),
+            ServerMessage::StreamData { data, sender, .. } => {
+                assert_eq!(data, 7);
+                assert!(sender.is_none());
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    // server API: members, send, join b back by session id
+    let server = |method: &str, path: &str, body: Option<Value>| {
+        let router = router.clone();
+        let method = method.to_string();
+        let path = path.to_string();
+        async move {
+            let mut req = axum::http::Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("x-musubi-server-key", "defaultkey");
+            let body = match body {
+                Some(b) => {
+                    req = req.header("content-type", "application/json");
+                    axum::body::Body::from(b.to_string())
+                }
+                None => axum::body::Body::empty(),
+            };
+            let res = router.oneshot(req.body(body).unwrap()).await.unwrap();
+            let status = res.status();
+            let bytes = http_body_util::BodyExt::collect(res.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, v)
+        }
+    };
+    let (st, v) = server("GET", &format!("/v1/server/streams/{stream}"), None).await;
+    assert_eq!(st, axum::http::StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 1);
+    let sid_a = v["members"][0]["session_id"].as_str().unwrap().to_string();
+    send(
+        &mut b,
+        "json",
+        Some("w1"),
+        host(json!({"op": "stream.mine"})),
+    )
+    .await;
+    let mine = rpc(recv(&mut b).await);
+    assert_eq!(mine["streams"], json!([]));
+    let sid_b = mine["session_id"].as_str().unwrap().to_string();
+    let (st, v) = server(
+        "POST",
+        &format!("/v1/server/streams/{stream}/join"),
+        Some(json!({"session_id": sid_b})),
+    )
+    .await;
+    assert_eq!(st, axum::http::StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 2);
+    let (st, v) = server(
+        "POST",
+        &format!("/v1/server/streams/{stream}/send"),
+        Some(json!({"data": {"from": "server"}})),
+    )
+    .await;
+    assert_eq!(st, axum::http::StatusCode::OK, "{v}");
+    assert_eq!(v["delivered"], 2);
+    for ws in [&mut a, &mut b] {
+        match recv(ws).await.msg {
+            ServerMessage::StreamData { data, sender, .. } => {
+                assert_eq!(data["from"], "server");
+                assert!(sender.is_none());
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    let (st, v) = server("GET", "/v1/server/streams", None).await;
+    assert_eq!(st, axum::http::StatusCode::OK, "{v}");
+    assert!(v["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["stream"] == stream && s["count"] == 2));
+    // disconnect a → membership gone
+    drop(a);
+    let mut n = 2;
+    for _ in 0..50 {
+        let (_, v) = server("GET", &format!("/v1/server/streams/{stream}"), None).await;
+        n = v["count"].as_u64().unwrap();
+        if n == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(n, 1);
+    let (st, v) = server(
+        "POST",
+        &format!("/v1/server/streams/{stream}/leave"),
+        Some(json!({"session_id": sid_a})),
+    )
+    .await;
+    assert_eq!(st, axum::http::StatusCode::OK, "{v}");
+    assert_eq!(v["left"], false);
+    let (_, v) = server(
+        "POST",
+        &format!("/v1/server/streams/{stream}/leave"),
+        Some(json!({"session_id": sid_b})),
+    )
+    .await;
+    assert_eq!(v["left"], true);
+    assert_eq!(v["count"], 0);
 }

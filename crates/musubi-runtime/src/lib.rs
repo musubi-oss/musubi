@@ -889,6 +889,47 @@ impl Runtime {
 
     /// Invoke an RPC off the async runtime (wasm execution is blocking). Runs `before_rpc_<id>` /
     /// `after_rpc_<id>` hooks when a module exports them.
+    /// Whether module `module` is loaded and exports `export` (e.g. `http_echo`).
+    pub fn has_export(&self, module: &str, export: &str) -> bool {
+        self.modules
+            .read()
+            .get(module)
+            .is_some_and(|m| m.exports.contains(export))
+    }
+
+    /// Exports of one module (empty when not loaded).
+    pub fn module_exports(&self, module: &str) -> Vec<String> {
+        self.modules
+            .read()
+            .get(module)
+            .map(|m| m.exports.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Invoke an arbitrary export of a module (used for `http_<name>` handlers). Same payload
+    /// limit, context and error handling as RPCs, no before/after hooks.
+    pub async fn call_export(
+        self: &Arc<Self>,
+        module: &str,
+        export: &str,
+        ctx: CallContext,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if payload.len() > self.limits.max_payload_bytes {
+            return Err(Error::InvalidArgument("payload too large".into()));
+        }
+        let loaded = self
+            .modules
+            .read()
+            .get(module)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("module {module}")))?;
+        if !loaded.exports.contains(export) {
+            return Err(Error::NotFound(format!("export {module}/{export}")));
+        }
+        self.invoke(loaded, export, ctx, payload).await
+    }
+
     pub async fn call(
         self: &Arc<Self>,
         id: &str,
@@ -1278,7 +1319,15 @@ pub const EXAMPLE_WAT: &str = r#"
   (func (export "rpc_spin") (param i32 i32 i32 i32) (result i64)
     (loop br 0)
     i64.const 0)
-)
+
+  ;; module HTTP handlers (P1-36): echo returns the request envelope as the body (200);
+  ;; teapot returns a full response envelope
+  (func (export "http_echo") (param i32 i32 i32 i32) (result i64)
+    local.get 2 i64.extend_i32_u i64.const 32 i64.shl
+    local.get 3 i64.extend_i32_u i64.or)
+  (data (i32.const 768) "{\"status\":418,\"headers\":{\"x-tea\":\"1\"},\"body\":{\"ok\":false}}")
+  (func (export "http_teapot") (param i32 i32 i32 i32) (result i64)
+    i64.const 768 i64.const 32 i64.shl i64.const 58 i64.or))
 "#;
 
 #[cfg(test)]

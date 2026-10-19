@@ -18,7 +18,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Server key or bearer token; the module sees which one.
-async fn context(s: &AppState, headers: &HeaderMap) -> Result<CallContext, ApiError> {
+pub(crate) async fn context(s: &AppState, headers: &HeaderMap) -> Result<CallContext, ApiError> {
     if let Some(k) = headers
         .get("x-musubi-server-key")
         .and_then(|v| v.to_str().ok())

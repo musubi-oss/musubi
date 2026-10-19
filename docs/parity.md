@@ -114,6 +114,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Фича | Musubi | Pragma | Nakama | PlayFab | AccelByte |
 |---|---|---|---|---|---|
 | Серверная логика | ✅ WASM-модули (`musubi-runtime`): rpc, before/after, hook_*, match_*, schedule_* | Kotlin-плагины | Go/Lua/JS | CloudScript | ❌ |
+| Generic streams + кастомные HTTP-маршруты модулей | ✅ `stream.join/leave/send/count/members` host-ops поверх realtime-хаба (`StreamData` на сокете, `/v1/server/streams/*`); `http_<name>` экспорты на `/v1/x/{module}/{name}` с IDL-метаданными `[http."module/name"]` (methods, auth any/player/server/none/basic, CORS, лимит тела, rate) | ✅ streams, RPC-only HTTP | ✅ (Nakama-like) | ❌ | — |
 | Hot reload модулей | ✅ `PUT /v1/admin/runtime/modules/{name}` | ❌ | ❌ | ✅ | — |
 | Канареечный rollout модулей | ✅ `/v1/admin/runtime/modules/{name}/canary` (процент/список аккаунтов, promote) | ❌ | ❌ | ❌ | — |
 | Изоляция: fuel, память, дедлайн | ✅ | — | ❌ | ✅ | — |

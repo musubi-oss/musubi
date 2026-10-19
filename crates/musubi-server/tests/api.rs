@@ -25853,3 +25853,360 @@ async fn server_browser_list_join_favorites_history_and_rating() {
     )
     .await;
 }
+
+async fn raw_call(
+    app: &Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut req = Request::builder().method(method).uri(path);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let req = match body {
+        Some(b) => req.body(Body::from(b.to_string())).unwrap(),
+        None => req.body(Body::empty()).unwrap(),
+    };
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let hdrs = res.headers().clone();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v = serde_json::from_slice(&bytes)
+        .unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into()));
+    (status, hdrs, v)
+}
+
+/// P1-36: `http_<name>` module exports are mounted at `/v1/x/{module}/{name}` with IDL-declared
+/// methods, auth mode (bearer/server, none, basic), CORS, body limit and response envelopes.
+#[tokio::test]
+async fn module_http_routes_auth_cors_basic_and_envelopes() {
+    use base64::Engine as _;
+    let _idl_guard = IDL_LOCK.lock().await;
+    let Some(app) = app().await else { return };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("mhttp")})),
+    )
+    .await;
+    let tok = s["access_token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {tok}");
+
+    // undeclared handler: behaves like an RPC (bearer or server key), any method
+    let (st, _, _) = raw_call(&app, "GET", "/v1/x/example/echo", &[], None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, h, v) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/echo?a=1&b=x%20y&c=",
+        &[("authorization", &bearer), ("x-custom", "yes")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(h["content-type"], "application/json");
+    assert_eq!(v["method"], "GET");
+    assert_eq!(v["path"], "/v1/x/example/echo");
+    assert_eq!(v["query"]["a"], "1");
+    assert_eq!(v["query"]["b"], "x y");
+    assert_eq!(v["query"]["c"], "");
+    assert_eq!(v["headers"]["x-custom"], "yes");
+    assert!(v["headers"].get("authorization").is_none());
+    assert_eq!(v["caller"]["account_id"], s["account_id"]);
+    assert_eq!(v["caller"]["server"], false);
+    assert_eq!(v["caller"]["anonymous"], false);
+    assert!(v["body"].is_null());
+    let (st, _, v) = raw_call(
+        &app,
+        "POST",
+        "/v1/x/example/echo",
+        &[
+            ("authorization", &bearer),
+            ("content-type", "application/json"),
+        ],
+        Some(r#"{"hello":"world"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["body"]["hello"], "world");
+    assert_eq!(v["body_text"], r#"{"hello":"world"}"#);
+    let (st, _, v) = raw_call(
+        &app,
+        "PUT",
+        "/v1/x/example/echo",
+        &[("authorization", &bearer)],
+        Some("plain text"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["body"].is_null());
+    assert_eq!(v["body_text"], "plain text");
+    // unknown handler / module
+    let (st, _, _) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/missing",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/nomod/echo",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // response envelope {status, headers, body}
+    let (st, h, v) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/teapot",
+        &[("x-musubi-server-key", "defaultkey")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::IM_A_TEAPOT, "{v}");
+    assert_eq!(h["x-tea"], "1");
+    assert_eq!(h["content-type"], "application/json");
+    assert_eq!(v["ok"], false);
+
+    // invalid declarations
+    for bad in [
+        "[http.\"nodash\"]\nauth = \"none\"\n",
+        "[http.\"example/echo\"]\nmethods = [\"FETCH\"]\n",
+        "[http.\"example/echo\"]\nauth = \"basic\"\n",
+        "[http.\"example/echo\"]\nrate_per_sec = 0\n",
+    ] {
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/admin/idl",
+            "defaultkey",
+            Some(json!({ "source": bad })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let source = r#"
+[http."example/echo"]
+methods = ["GET", "POST"]
+auth = "none"
+max_body_bytes = 16
+cors = { origins = ["https://game.example"], headers = ["x-custom"], max_age_secs = 600, expose_headers = ["x-tea"] }
+
+[http."example/teapot"]
+auth = "basic"
+basic = { realm = "ops", users = { admin = "s3cret" } }
+"#;
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/idl",
+        "defaultkey",
+        Some(json!({ "source": source })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // auth = none → anonymous caller
+    let (st, _, v) = raw_call(&app, "GET", "/v1/x/example/echo", &[], None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["caller"]["anonymous"], true);
+    assert!(v["caller"]["account_id"].is_null());
+    // method allow-list
+    let (st, h, _) = raw_call(&app, "DELETE", "/v1/x/example/echo", &[], None).await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(h["allow"], "GET, POST, OPTIONS");
+    let (st, h, _) = raw_call(&app, "OPTIONS", "/v1/x/example/echo", &[], None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(h["allow"], "GET, POST, OPTIONS");
+    // body limit
+    let (st, _, _) = raw_call(
+        &app,
+        "POST",
+        "/v1/x/example/echo",
+        &[],
+        Some(&"x".repeat(100)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    // CORS preflight + actual request + rejected origin
+    let (st, h, _) = raw_call(
+        &app,
+        "OPTIONS",
+        "/v1/x/example/echo",
+        &[
+            ("origin", "https://game.example"),
+            ("access-control-request-method", "POST"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(h["access-control-allow-origin"], "https://game.example");
+    assert_eq!(h["access-control-allow-methods"], "GET, POST, OPTIONS");
+    assert_eq!(h["access-control-allow-headers"], "x-custom");
+    assert_eq!(h["access-control-max-age"], "600");
+    let (st, h, v) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/echo",
+        &[("origin", "https://game.example")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(h["access-control-allow-origin"], "https://game.example");
+    assert_eq!(h["access-control-expose-headers"], "x-tea");
+    assert_eq!(h["vary"], "Origin");
+    let (st, _, _) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/echo",
+        &[("origin", "https://evil.example")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // basic auth
+    let (st, h, _) = raw_call(&app, "GET", "/v1/x/example/teapot", &[], None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(h["www-authenticate"], "Basic realm=\"ops\"");
+    let wrong = base64::engine::general_purpose::STANDARD.encode("admin:nope");
+    let (st, _, _) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/teapot",
+        &[("authorization", &format!("Basic {wrong}"))],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let good = base64::engine::general_purpose::STANDARD.encode("admin:s3cret");
+    let (st, h, _) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/teapot",
+        &[("authorization", &format!("Basic {good}"))],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::IM_A_TEAPOT);
+    assert_eq!(h["x-tea"], "1");
+    // the server key still can't use a basic-only route
+    let (st, _, _) = raw_call(
+        &app,
+        "GET",
+        "/v1/x/example/teapot",
+        &[("x-musubi-server-key", "defaultkey")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call_server(&app, "DELETE", "/v1/admin/idl", "defaultkey", None).await;
+    assert!(st.is_success(), "{st}");
+}
+
+/// P1-59: stream host ops validate ids, membership and session addressing (fan-out itself is
+/// covered by the ws suite).
+#[tokio::test]
+async fn stream_ops_validate_ids_membership_and_sessions() {
+    let Some(app) = app().await else { return };
+    let (_, s) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("streams")})),
+    )
+    .await;
+    let tok = s["access_token"].as_str().unwrap().to_string();
+    let host = |body: Value| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move { call(&app, "POST", "/v1/rpc/host", Some(&tok), Some(body)).await }
+    };
+    // no live realtime session on this node → cannot join
+    let err = |v: &Value, needle: &str| {
+        let e = v["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected error: {v}"));
+        assert!(e.contains(needle), "{e}");
+    };
+    let (st, v) = host(json!({"op": "stream.join", "stream": "room:1"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    err(&v, "not connected");
+    let (_, v) = host(json!({"op": "stream.join", "stream": "has space"})).await;
+    err(&v, "whitespace");
+    let (_, v) = host(json!({"op": "stream.join", "stream": "x".repeat(200)})).await;
+    err(&v, "1..=128");
+    // players cannot address other sessions
+    let (_, v) = host(json!({
+        "op": "stream.join", "stream": "room:1", "session_id": uuid::Uuid::now_v7()
+    }))
+    .await;
+    err(&v, "only server context");
+    // non-member send / members are denied, count is public
+    let (_, v) = host(json!({"op": "stream.send", "stream": "room:1", "data": {"a": 1}})).await;
+    err(&v, "not a member");
+    let (_, v) = host(json!({"op": "stream.members", "stream": "room:1"})).await;
+    err(&v, "not a member");
+    let (st, v) = host(json!({"op": "stream.count", "stream": "room:1"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"]["count"], 0);
+    let (st, v) = host(json!({"op": "stream.mine"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"]["streams"], json!([]));
+    // server routes
+    let (st, v) = call_server(&app, "GET", "/v1/server/streams/room:1", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 0);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streams/room:1/join",
+        "defaultkey",
+        Some(json!({"session_id": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streams/room:1/join",
+        "defaultkey",
+        Some(json!({"session_id": uuid::Uuid::now_v7()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streams/room:1/send",
+        "defaultkey",
+        Some(json!({"data": "x".repeat(20_000)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/streams/room:1/send",
+        "defaultkey",
+        Some(json!({"data": {"tick": 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["delivered"], 0);
+    let (st, v) = call_server(&app, "GET", "/v1/server/streams", "defaultkey", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["streams"].is_array());
+}

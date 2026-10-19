@@ -142,6 +142,12 @@ impl IdlRegistry {
 
     /// `/v1/rpc/{name}`: enforce the declared `auth` and validate the JSON body against
     /// `input`. RPCs the IDL does not mention pass through untouched.
+    /// Declared metadata of module HTTP handler `module/name` (None = undeclared, defaults apply).
+    pub fn http_def(&self, module: &str, name: &str) -> Option<musubi_idl::HttpDef> {
+        self.get()
+            .and_then(|idl| idl.http.get(&format!("{module}/{name}")).cloned())
+    }
+
     pub fn check_rpc(&self, name: &str, server: bool, body: &[u8]) -> Result<()> {
         let Some(idl) = self.get() else { return Ok(()) };
         let Some(rpc) = idl.rpcs.get(name) else {

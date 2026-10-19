@@ -626,6 +626,16 @@ pub enum ServerMessage {
         party_id: String,
         from: UserPresence,
     },
+    /// Fan-out from a module/server stream (`stream.send` host op or `POST /v1/server/streams/{id}/send`):
+    /// `stream` is the free-form stream id the session joined, `sender` the originating player
+    /// when a player-context module call sent it (absent for server-originated data).
+    StreamData {
+        stream: String,
+        #[serde(with = "crate::json_in_binary")]
+        data: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender: Option<UserPresence>,
+    },
 }
 
 /// Entity as seen by a client: position plus (changed) components with their versions.
