@@ -2720,6 +2720,7 @@ dependencies = [
  "axum",
  "dashmap",
  "flate2",
+ "futures",
  "hex",
  "musubi-core",
  "reqwest 0.12.28",

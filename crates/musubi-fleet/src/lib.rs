@@ -461,6 +461,57 @@ pub struct ScalePolicy {
     /// `rollout.drain_allocated_after_secs`) or `always` (scale-down may also stop the emptiest
     /// allocated servers when the fleet is over target).
     pub eviction: String,
+    /// Servers started concurrently per reconcile batch (1 = one after another; Agones
+    /// `maxCreationParallelism`). `step_up` / `step_down` cap each batch.
+    pub creation_parallelism: u32,
+    /// Ordered policy chain: the first entry whose window matches `now` supplies the buffer,
+    /// utilisation target and/or webhook; a failing webhook falls through to the next matching
+    /// entry, then to the fleet-level `webhook`/`buffer`. Agones `Chain`.
+    pub chain: Vec<ChainEntry>,
+    /// Labels merged onto the emptiest allocated servers that keep the fleet above `max_servers`
+    /// after a scale-down (idle ones are stopped first, allocated ones are never killed); the
+    /// game server sees them via `GET /v1/gameserver/self` and winds down. Agones `allocationOverflow`.
+    pub overflow_labels: HashMap<String, String>,
+}
+
+/// One link of `ScalePolicy::chain`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ChainEntry {
+    pub id: String,
+    /// When this entry applies (UTC weekday/hours, like `ScheduleWindow`); absent = always.
+    pub when: Option<ChainWindow>,
+    pub buffer: Option<i32>,
+    pub target_utilization: Option<f64>,
+    pub webhook: Option<ScaleWebhook>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ChainWindow {
+    pub days: Vec<u8>,
+    pub from_hour: u8,
+    pub to_hour: u8,
+}
+
+impl ChainWindow {
+    pub fn matches(&self, weekday: u8, hour: u8) -> bool {
+        let day_ok = self.days.is_empty() || self.days.contains(&weekday);
+        let hour_ok = if self.from_hour < self.to_hour {
+            hour >= self.from_hour && hour < self.to_hour
+        } else {
+            hour >= self.from_hour || hour < self.to_hour
+        };
+        day_ok && hour_ok
+    }
+}
+
+impl ChainEntry {
+    pub fn applies(&self, now: OffsetDateTime) -> bool {
+        self.when
+            .as_ref()
+            .is_none_or(|w| w.matches(now.weekday().number_days_from_sunday(), now.hour()))
+    }
 }
 
 /// Health-check policy (Agones `health` + eviction semantics). A server that does not report
@@ -706,6 +757,9 @@ impl Default for ScalePolicy {
             browsable: false,
             health: HealthPolicy::default(),
             eviction: "on_upgrade".into(),
+            creation_parallelism: 1,
+            chain: Vec::new(),
+            overflow_labels: HashMap::new(),
         }
     }
 }
@@ -845,6 +899,72 @@ impl ScalePolicy {
         if self.step_up.is_some_and(|v| v <= 0) || self.step_down.is_some_and(|v| v <= 0) {
             return Err(Error::InvalidArgument(
                 "policy.step_up / step_down must be positive".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.creation_parallelism) {
+            return Err(Error::InvalidArgument(
+                "policy.creation_parallelism must be 1..=64".into(),
+            ));
+        }
+        if self.chain.len() > 16 {
+            return Err(Error::InvalidArgument(
+                "policy.chain: at most 16 entries".into(),
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for e in &self.chain {
+            if e.id.is_empty() || e.id.len() > 64 || !ids.insert(e.id.as_str()) {
+                return Err(Error::InvalidArgument(
+                    "policy.chain[].id must be unique and 1..=64 chars".into(),
+                ));
+            }
+            if e.buffer.is_none() && e.target_utilization.is_none() && e.webhook.is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "policy.chain[{}] needs buffer, target_utilization or webhook",
+                    e.id
+                )));
+            }
+            if e.buffer.is_some_and(|b| b < 0) {
+                return Err(Error::InvalidArgument(format!(
+                    "policy.chain[{}].buffer must be >= 0",
+                    e.id
+                )));
+            }
+            if e.target_utilization.is_some_and(|u| !(u > 0.0 && u < 1.0)) {
+                return Err(Error::InvalidArgument(format!(
+                    "policy.chain[{}].target_utilization must be in (0, 1)",
+                    e.id
+                )));
+            }
+            if let Some(w) = &e.when {
+                if w.days.iter().any(|d| *d > 6) || w.from_hour > 23 || w.to_hour > 24 {
+                    return Err(Error::InvalidArgument(format!(
+                        "policy.chain[{}].when: days 0..=6, from_hour 0..=23, to_hour 0..=24",
+                        e.id
+                    )));
+                }
+            }
+            if let Some(w) = &e.webhook {
+                if !(w.url.starts_with("http://") || w.url.starts_with("https://")) {
+                    return Err(Error::InvalidArgument(format!(
+                        "policy.chain[{}].webhook.url must be http(s)",
+                        e.id
+                    )));
+                }
+            }
+        }
+        if self.overflow_labels.len() > 16
+            || self.overflow_labels.iter().any(|(k, v)| {
+                k.is_empty()
+                    || k.len() > 64
+                    || v.len() > 256
+                    || !k
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_.-/".contains(c))
+            })
+        {
+            return Err(Error::InvalidArgument(
+                "policy.overflow_labels: <= 16 labels, keys [A-Za-z0-9_.-/]{1,64}, values <= 256 chars".into(),
             ));
         }
         if self.horizon_min == 0 || self.horizon_min > 24 * 60 {
@@ -4757,8 +4877,18 @@ impl FleetService {
                 .as_ref()
                 .map(|ct| counter_shortfall(ct, &servers))
                 .unwrap_or(0);
-            let base = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour)
-                .max(utilization_target(&f.policy, allocated));
+            let chain: Vec<&ChainEntry> =
+                f.policy.chain.iter().filter(|e| e.applies(now)).collect();
+            let chain_buffer = chain.iter().find_map(|e| e.buffer);
+            let chain_util = chain.iter().find_map(|e| e.target_utilization);
+            let mut eff = f.policy.clone();
+            if chain_util.is_some() {
+                eff.target_utilization = chain_util;
+            }
+            let buffer = chain_buffer.unwrap_or_else(|| f.policy.buffer_at(now, f.buffer));
+            let base =
+                target_ready(&eff, buffer, per_hour).max(utilization_target(&eff, allocated));
+            let chain_note: Vec<&str> = chain.iter().map(|e| e.id.as_str()).collect();
             let gauges = self.gauges(f.id, &servers).await;
             let now_s = now.unix_timestamp();
             let mut rule_delta = 0i32;
@@ -4783,19 +4913,37 @@ impl FleetService {
             }
             let mut target = (base + surge + counter_extra + rule_delta).max(0);
             let mut webhook_note: Option<String> = None;
-            if let Some(w) = &f.policy.webhook {
-                let busy = gauges.allocated + gauges.in_game;
+            let hooks: Vec<(&str, &ScaleWebhook)> = chain
+                .iter()
+                .filter_map(|e| e.webhook.as_ref().map(|w| (e.id.as_str(), w)))
+                .chain(f.policy.webhook.as_ref().map(|w| ("fleet", w)))
+                .collect();
+            let busy = gauges.allocated + gauges.in_game;
+            let mut errors: Vec<String> = Vec::new();
+            for (id, w) in hooks {
+                let tag = if id == "fleet" {
+                    String::new()
+                } else {
+                    format!("{id}: ")
+                };
                 match self.ask_webhook(w, &f, &gauges, target).await {
                     Ok(Some(replicas)) => {
                         target = webhook_target(replicas, busy, f.max_servers);
-                        webhook_note = Some(format!("replicas {replicas}"));
+                        webhook_note = Some(format!("{tag}replicas {replicas}"));
+                        break;
                     }
-                    Ok(None) => webhook_note = Some("no scale".into()),
+                    Ok(None) => {
+                        webhook_note = Some(format!("{tag}no scale"));
+                        break;
+                    }
                     Err(e) => {
-                        tracing::warn!(fleet = %f.name, error = %e, "scale webhook failed");
-                        webhook_note = Some(format!("error: {e}"));
+                        tracing::warn!(fleet = %f.name, hook = id, error = %e, "scale webhook failed");
+                        errors.push(format!("{tag}error: {e}"));
                     }
                 }
+            }
+            if webhook_note.is_none() && !errors.is_empty() {
+                webhook_note = Some(errors.join("; "));
             }
             let plan = plan_scale(
                 target,
@@ -4824,6 +4972,7 @@ impl FleetService {
                     "at": now_s, "suspended": f.policy.suspended, "target": target, "base": base,
                     "surge": surge, "counter_extra": counter_extra, "rule_delta": rule_delta,
                     "rules_fired": &rules_fired, "rules_holding": rules_holding, "webhook": &webhook_note,
+                    "chain": chain_note, "buffer": buffer,
                     "plan": {"start": plan.0, "stop": plan.1}, "applied": {"start": start, "stop": stop},
                     "limited": limited,
                     "able_to_scale": !f.policy.suspended && (live < f.max_servers || live > f.min_servers),
@@ -4849,14 +4998,21 @@ impl FleetService {
                 }
                 e.1 = now_s;
             }
-            for _ in 0..start {
-                match self.start_one(&f).await {
-                    Ok(_) => started += 1,
-                    Err(e) => {
-                        tracing::warn!(fleet = %f.name, error = %e, "could not start game server");
-                        break;
+            let par = f.policy.creation_parallelism.max(1) as usize;
+            let mut remaining = start.max(0) as usize;
+            'starts: while remaining > 0 {
+                let n = remaining.min(par);
+                let results = futures::future::join_all((0..n).map(|_| self.start_one(&f))).await;
+                for r in results {
+                    match r {
+                        Ok(_) => started += 1,
+                        Err(e) => {
+                            tracing::warn!(fleet = %f.name, error = %e, "could not start game server");
+                            break 'starts;
+                        }
                     }
                 }
+                remaining -= n;
             }
             if stop > 0 {
                 let mut idle: Vec<&GameServer> =
@@ -4872,6 +5028,47 @@ impl FleetService {
                     tracing::info!(server = %s.id, fleet = %f.name, target, "scaling down idle game server");
                     self.terminate_reason(&f, s.id, "scale_down").await;
                     reaped += 1;
+                }
+            }
+            let overflow = live - stop - f.max_servers;
+            if overflow > 0 && !f.policy.suspended && !f.policy.overflow_labels.is_empty() {
+                let patch = serde_json::Value::Object(
+                    f.policy
+                        .overflow_labels
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect(),
+                );
+                let is_marked = |s: &GameServer| {
+                    f.policy
+                        .overflow_labels
+                        .iter()
+                        .all(|(k, v)| s.labels.get(k).and_then(|x| x.as_str()) == Some(v.as_str()))
+                };
+                let already = servers
+                    .iter()
+                    .filter(|s| s.state == "allocated" && is_marked(s))
+                    .count() as i32;
+                let mut busy: Vec<&GameServer> = servers
+                    .iter()
+                    .filter(|s| s.state == "allocated" && !is_marked(s))
+                    .collect();
+                busy.sort_by_key(|s| (s.players, s.created_at));
+                let mut marked = Vec::new();
+                for s in busy.into_iter().take((overflow - already).max(0) as usize) {
+                    if self.sdk_labels(s.id, patch.clone()).await.is_ok() {
+                        marked.push(s.id);
+                    }
+                }
+                if !marked.is_empty() {
+                    self.record_event(
+                        f.id,
+                        None,
+                        "autoscale.overflow_marked",
+                        format!("autoscaler: {} allocated server(s) over target labelled", marked.len()),
+                        serde_json::json!({ "servers": marked, "labels": patch, "overflow": overflow, "target": target }),
+                    )
+                    .await;
                 }
             }
         }

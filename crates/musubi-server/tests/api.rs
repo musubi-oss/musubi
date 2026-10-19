@@ -35818,3 +35818,153 @@ async fn qa_clock_future_date_testing() {
     let (st, _) = call_server(&app, "GET", &path, k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn fleet_policy_chain_parallelism_and_overflow_labels() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("fleet-chain"), "provider": "local", "buffer": 1, "max_servers": 4,
+            "port_start": 46100, "port_end": 46200, "spec": {"command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["policy"]["creation_parallelism"], 1);
+    assert_eq!(f["policy"]["chain"], json!([]));
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    let scale = format!("/v1/server/fleets/{fid}/scale");
+    let status = format!("/v1/server/fleets/{fid}/autoscaler");
+    for bad in [
+        json!({"creation_parallelism": 0}),
+        json!({"creation_parallelism": 65}),
+        json!({"chain": [{"id": "x"}]}),
+        json!({"chain": [{"id": "x", "buffer": 1}, {"id": "x", "buffer": 2}]}),
+        json!({"chain": [{"id": "x", "buffer": 1, "when": {"from_hour": 25, "to_hour": 2}}]}),
+        json!({"chain": [{"id": "x", "webhook": {"url": "ftp://scaler"}}]}),
+        json!({"chain": [{"id": "x", "buffer": -1}]}),
+        json!({"overflow_labels": {"bad key": "v"}}),
+    ] {
+        let (st, v) = call_server(&app, "POST", &scale, k, Some(json!({"policy": bad}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad} -> {v}");
+    }
+    let other_day = (time::OffsetDateTime::now_utc()
+        .weekday()
+        .number_days_from_sunday()
+        + 1)
+        % 7;
+    let policy = |buffer: i32| {
+        json!({"creation_parallelism": 2, "overflow_labels": {"musubi/overflow": "true"},
+        "chain": [
+            {"id": "off", "when": {"days": [other_day]}, "buffer": 9},
+            {"id": "peak", "when": {"days": [], "from_hour": 0, "to_hour": 24}, "buffer": buffer},
+            {"id": "hook", "webhook": {"url": "http://127.0.0.1:9/scale", "timeout_ms": 200}}
+        ]})
+    };
+    let (st, v) = call_server(&app, "POST", &scale, k, Some(json!({"policy": policy(2)}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["policy"]["chain"][1]["id"], "peak");
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let reconcile = format!("/v1/server/fleets/{fid}/reconcile");
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["started"], 2,
+        "chain buffer 2 starts two servers in one parallel batch: {v}"
+    );
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["buffer"], 2, "{v}");
+    assert_eq!(v["last"]["base"], 2, "{v}");
+    let chain = v["last"]["chain"].as_array().unwrap();
+    assert!(
+        chain.iter().any(|c| c == "peak") && chain.iter().any(|c| c == "hook"),
+        "{v}"
+    );
+    assert!(
+        !chain.iter().any(|c| c == "off"),
+        "another weekday never matches: {v}"
+    );
+    let note = v["last"]["webhook"].as_str().unwrap_or_default();
+    assert!(
+        note.starts_with("hook: error"),
+        "unreachable chain webhook is reported, not fatal: {v}"
+    );
+    for s in svc.servers(fuid, Some("starting")).await.unwrap() {
+        svc.sdk_ready(s.id).await.unwrap();
+    }
+    assert_eq!(svc.servers(fuid, Some("ready")).await.unwrap().len(), 2);
+    svc.allocate(fuid, json!({}), false).await.unwrap();
+    svc.allocate(fuid, json!({}), false).await.unwrap();
+    assert_eq!(svc.servers(fuid, Some("allocated")).await.unwrap().len(), 2);
+    for s in svc.servers(fuid, Some("allocated")).await.unwrap() {
+        assert!(s.labels.get("musubi/overflow").is_none(), "{:?}", s.labels);
+    }
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &scale,
+        k,
+        Some(json!({"policy": policy(0), "max_servers": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["started"], 0,
+        "allocated servers are not stopped or replaced: {v}"
+    );
+    let allocated = svc.servers(fuid, Some("allocated")).await.unwrap();
+    assert_eq!(allocated.len(), 2, "allocated servers are never killed");
+    let marked: Vec<&musubi_fleet::GameServer> = allocated
+        .iter()
+        .filter(|s| s.labels["musubi/overflow"] == "true")
+        .collect();
+    assert_eq!(
+        marked.len(),
+        1,
+        "exactly the one server above max_servers is labelled: {allocated:?}"
+    );
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let again = svc.servers(fuid, Some("allocated")).await.unwrap();
+    assert_eq!(
+        again
+            .iter()
+            .filter(|s| s.labels["musubi/overflow"] == "true")
+            .count(),
+        1,
+        "idempotent"
+    );
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["target"], 0, "{v}");
+    assert_eq!(v["last"]["buffer"], 0, "{v}");
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?limit=50"),
+        k,
+        None,
+    )
+    .await;
+    let marked = ev
+        .as_array()
+        .or_else(|| ev["events"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        marked
+            .iter()
+            .any(|e| e["code"] == "autoscale.overflow_marked"),
+        "{ev}"
+    );
+}
