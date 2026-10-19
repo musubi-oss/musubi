@@ -179,6 +179,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/stats/{account_id}", "stats"),
     ("GET", "/v1/stats", "stats"),
     ("GET", "/v1/stats/{account_id}", "stats"),
+    ("POST", "/v1/stats", "stats"),
     ("GET", "/v1/stats/global", "stats"),
     ("GET", "/v1/stats/history", "stats"),
     ("GET", "/v1/server/stats/global", "stats"),
