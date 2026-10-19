@@ -423,6 +423,20 @@ allocated|shutdown|terminated|error` (with `exit_reason`: shutdown, dead_process
 idle_ttl, scale_down, rollout, manual…), `build.added|promoted`, `rollout.*`; the lease holder forwards them to the event
 bus as `gameserver.*` / `fleet.*` (webhooks).
 
+Counters, lists and the server inventory: a server reports named counters `POST /v1/gameserver/counters {rooms: {delta|count,
+capacity}}` and lists `POST /v1/gameserver/lists {players: {add, remove, values, capacity}}` (over capacity → 429; operators
+`PATCH /v1/server/gameservers/{id}/counters|lists`). Allocations take a selector: `POST /v1/server/fleets/{id}/allocate` /
+`/v1/server/allocate {selector: {labels, build_version, states: ["ready", "allocated"], counters: {rooms: {min_available,
+min_count, max_count}}, lists: {players: {contains, excludes, min_available}}}, counter_actions: {rooms: {delta}},
+list_actions: {players: {add}}}` — the first matching server is taken and the actions are applied in the same transaction;
+with `"allocated"` in `states` a live server is shared (its connect token is returned, `backfill: true`) — room/sub-match
+hosting. `policy.counter_target {counter, buffer}` makes the autoscaler keep that much aggregate free counter capacity across
+the fleet; `GET /v1/server/fleets/{id}/counters` aggregates counters/lists and the shortfall. Cross-fleet inventory
+`GET /v1/server/gameservers?fleet|fleet_id|pool|region|provider&state=ready,allocated|all&build_version&exit_reason&node_id
+&labels=k=v,k2=v2&min_age_secs&max_age_secs&min_players&free_slots&counter&counter_min_available&list&list_contains
+&order=-created_at|players|last_health&limit&offset` (servers with fleet/region/pool/provider, `exit_reason`, `age_secs`,
+`total`) and `GET /v1/server/gameservers/counts?group=state|region|fleet|pool|provider|build|exit_reason|node&<same filters>`.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

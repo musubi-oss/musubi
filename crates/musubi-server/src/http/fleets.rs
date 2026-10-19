@@ -53,6 +53,19 @@ pub fn routes() -> Router<AppState> {
             post(rollout_rollback),
         )
         .route("/v1/server/fleets/{id}/events", get(fleet_events))
+        .route("/v1/server/fleets/{id}/counters", get(fleet_counters))
+        .route("/v1/server/gameservers", get(inventory))
+        .route("/v1/server/gameservers/counts", get(inventory_counts))
+        .route(
+            "/v1/server/gameservers/{id}/counters",
+            axum::routing::patch(op_counters),
+        )
+        .route(
+            "/v1/server/gameservers/{id}/lists",
+            axum::routing::patch(op_lists),
+        )
+        .route("/v1/gameserver/counters", post(sdk_counters))
+        .route("/v1/gameserver/lists", post(sdk_lists))
         .route(
             "/v1/server/gameservers/{id}",
             get(server_get).delete(server_delete),
@@ -156,6 +169,13 @@ struct AllocateReq {
     backfill: bool,
     /// With nothing ready, start a server and wait up to this long for it (scale-to-zero).
     wait_secs: u64,
+    /// `{labels, build_version, states, counters: {name: {min_available, min_count, max_count}},
+    /// lists: {name: {contains, excludes, min_available}}}` — which servers may be taken.
+    selector: musubi_fleet::AllocSelector,
+    /// `{name: {delta, count, capacity}}` applied atomically with the allocation.
+    counter_actions: std::collections::HashMap<String, musubi_fleet::CounterAction>,
+    /// `{name: {add, remove, values, capacity}}` applied atomically with the allocation.
+    list_actions: std::collections::HashMap<String, musubi_fleet::ListAction>,
 }
 
 #[derive(Deserialize, Default)]
@@ -168,6 +188,9 @@ struct RoutedAllocateReq {
     payload: Value,
     backfill: bool,
     wait_secs: u64,
+    selector: musubi_fleet::AllocSelector,
+    counter_actions: std::collections::HashMap<String, musubi_fleet::CounterAction>,
+    list_actions: std::collections::HashMap<String, musubi_fleet::ListAction>,
 }
 
 /// Allocate across a pool of fleets: the hinted region first, then any; `wait_secs` cold-starts a
@@ -182,11 +205,16 @@ async fn allocate_routed(
     }
     Ok(Json(
         s.fleets
-            .allocate_routed(
+            .allocate_routed_with(
                 &r.pool,
                 r.region.as_deref(),
-                r.payload,
-                r.backfill,
+                musubi_fleet::AllocateRequest {
+                    payload: r.payload,
+                    backfill: r.backfill,
+                    selector: r.selector,
+                    counter_actions: r.counter_actions,
+                    list_actions: r.list_actions,
+                },
                 std::time::Duration::from_secs(r.wait_secs.min(300)),
             )
             .await?,
@@ -202,11 +230,16 @@ async fn allocate(
     let fleet = s.fleets.get(parse(&id)?).await?;
     Ok(Json(
         s.fleets
-            .allocate_routed(
+            .allocate_routed_with(
                 &fleet.name,
                 None,
-                r.payload,
-                r.backfill,
+                musubi_fleet::AllocateRequest {
+                    payload: r.payload,
+                    backfill: r.backfill,
+                    selector: r.selector,
+                    counter_actions: r.counter_actions,
+                    list_actions: r.list_actions,
+                },
                 std::time::Duration::from_secs(r.wait_secs.min(300)),
             )
             .await?,
@@ -649,4 +682,97 @@ pub async fn dispatch_fleet_events(s: &AppState) -> musubi_core::Result<usize> {
     let ids: Vec<i64> = evs.iter().map(|e| e.id).collect();
     s.fleets.mark_dispatched(&ids).await?;
     Ok(ids.len())
+}
+
+type CounterActions = std::collections::HashMap<String, musubi_fleet::CounterAction>;
+type ListActions = std::collections::HashMap<String, musubi_fleet::ListAction>;
+
+/// `POST /v1/gameserver/counters {name: {delta?, count?, capacity?}}` — the server reports its
+/// counters (rooms, bots, …); over capacity → 429, below zero → 400.
+async fn sdk_counters(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    Json(a): Json<CounterActions>,
+) -> Result<Json<GameServer>, ApiError> {
+    Ok(Json(
+        s.fleets.update_counters(self_id(&headers)?, &a).await?,
+    ))
+}
+
+/// `POST /v1/gameserver/lists {name: {add?, remove?, values?, capacity?}}`.
+async fn sdk_lists(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    Json(a): Json<ListActions>,
+) -> Result<Json<GameServer>, ApiError> {
+    Ok(Json(s.fleets.update_lists(self_id(&headers)?, &a).await?))
+}
+
+async fn op_counters(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(a): Json<CounterActions>,
+) -> Result<Json<GameServer>, ApiError> {
+    Ok(Json(s.fleets.update_counters(parse(&id)?, &a).await?))
+}
+
+async fn op_lists(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(a): Json<ListActions>,
+) -> Result<Json<GameServer>, ApiError> {
+    Ok(Json(s.fleets.update_lists(parse(&id)?, &a).await?))
+}
+
+/// `GET /v1/server/fleets/{id}/counters` — aggregate counters/lists over live servers and the
+/// `counter_target` shortfall.
+async fn fleet_counters(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.fleets.fleet_counters(parse(&id)?).await?))
+}
+
+/// `GET /v1/server/gameservers?fleet_id|fleet|pool|region|provider&state=ready,allocated|all&build_version
+/// &exit_reason&node_id&labels=k=v,k2=v2&min_age_secs&max_age_secs&min_players&free_slots&counter
+/// &counter_min_available&list&list_contains&order&limit&offset` — cross-fleet inventory.
+async fn inventory(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<musubi_fleet::ServerSearch>,
+) -> Result<Json<Value>, ApiError> {
+    let (servers, total) = s.fleets.search_servers(&q).await?;
+    Ok(Json(json!({
+        "servers": servers, "total": total,
+        "limit": q.limit.unwrap_or(100).clamp(1, 1000), "offset": q.offset.unwrap_or(0).max(0),
+    })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CountsQuery {
+    group: Option<String>,
+    #[serde(flatten)]
+    search: musubi_fleet::ServerSearch,
+}
+
+/// `GET /v1/server/gameservers/counts?group=state|region|fleet|pool|provider|build|exit_reason|node&<filters>`.
+async fn inventory_counts(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<CountsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let group = q.group.as_deref().unwrap_or("state");
+    let rows = s.fleets.server_counts(&q.search, group).await?;
+    let total: i64 = rows.iter().map(|r| r.1).sum();
+    Ok(Json(json!({
+        "group": group,
+        "counts": rows.iter().map(|(k, n)| json!({ "key": k, "servers": n })).collect::<Vec<_>>(),
+        "total": total,
+    })))
 }

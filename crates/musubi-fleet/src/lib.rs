@@ -232,6 +232,8 @@ pub struct ScalePolicy {
     pub allocated_max_secs: Option<u64>,
     /// How a promoted build reaches servers that are already running.
     pub rollout: RolloutPolicy,
+    /// Keep this much aggregate free counter capacity across the fleet (adds to the ready target).
+    pub counter_target: Option<CounterTarget>,
 }
 
 /// Build rollout strategy (plan P1-29): `manual` only affects new servers; `rolling` replaces
@@ -403,6 +405,7 @@ impl Default for ScalePolicy {
             idle_ttl_secs: None,
             allocated_max_secs: None,
             rollout: RolloutPolicy::default(),
+            counter_target: None,
         }
     }
 }
@@ -518,6 +521,14 @@ impl ScalePolicy {
 
     fn validate(&self, max_servers: i32) -> Result<()> {
         self.rollout.validate()?;
+        if let Some(ct) = &self.counter_target {
+            valid_slot_name(&ct.counter)?;
+            if ct.buffer < 0 {
+                return Err(Error::InvalidArgument(
+                    "policy.counter_target.buffer must be >= 0".into(),
+                ));
+            }
+        }
         if let Some(u) = self.target_utilization {
             if !(u > 0.0 && u < 1.0) {
                 return Err(Error::InvalidArgument(
@@ -697,7 +708,411 @@ pub struct GameServer {
     pub version: i64,
     /// When the server last became `ready` (idle TTL counts from here).
     pub ready_at: Option<OffsetDateTime>,
+    /// Named counters `{name: {count, capacity}}` (rooms, bots, …) the server reports; allocation
+    /// selectors and `policy.counter_target` use them.
+    #[serde(default)]
+    pub counters: serde_json::Value,
+    /// Named lists `{name: {values: [..], capacity}}` (player ids, reserved slots, …).
+    #[serde(default)]
+    pub lists: serde_json::Value,
 }
+
+/// Which servers an allocation may take (all conditions must hold).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AllocSelector {
+    /// Every key must be present with this exact value.
+    pub labels: serde_json::Map<String, serde_json::Value>,
+    pub build_version: Option<String>,
+    /// States a server may be in to be picked; default `["ready"]` — add `"allocated"` to share live
+    /// servers (room/sub-match hosting): the caller then gets the server's existing connect token.
+    pub states: Vec<String>,
+    pub counters: HashMap<String, CounterSel>,
+    pub lists: HashMap<String, ListSel>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CounterSel {
+    pub min_count: Option<i64>,
+    pub max_count: Option<i64>,
+    /// `capacity - count` must be at least this.
+    pub min_available: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ListSel {
+    pub contains: Option<String>,
+    pub excludes: Option<String>,
+    pub min_available: Option<i64>,
+}
+
+/// Change to one counter: set `count` and/or `capacity`, then add `delta` (checked against capacity).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CounterAction {
+    pub delta: Option<i64>,
+    pub count: Option<i64>,
+    pub capacity: Option<i64>,
+}
+
+/// Change to one list: replace `values`, set `capacity`, then `remove` and `add` (unique, checked).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ListAction {
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+    pub values: Option<Vec<String>>,
+    pub capacity: Option<i64>,
+}
+
+/// Full allocation request: who may be taken and what to change on the server atomically.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AllocateRequest {
+    pub payload: serde_json::Value,
+    pub backfill: bool,
+    pub selector: AllocSelector,
+    pub counter_actions: HashMap<String, CounterAction>,
+    pub list_actions: HashMap<String, ListAction>,
+}
+
+fn valid_slot_name(n: &str) -> Result<()> {
+    if n.is_empty()
+        || n.len() > 64
+        || !n
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(Error::InvalidArgument(format!(
+            "bad counter/list name {n:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn counter_parts(v: &serde_json::Value, name: &str) -> (i64, i64) {
+    let c = &v[name];
+    (
+        c["count"].as_i64().unwrap_or(0),
+        c["capacity"].as_i64().unwrap_or(0),
+    )
+}
+
+fn list_parts(v: &serde_json::Value, name: &str) -> (Vec<String>, i64) {
+    let l = &v[name];
+    let values = l["values"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    (values, l["capacity"].as_i64().unwrap_or(0))
+}
+
+/// Apply one counter action; over capacity → `ResourceExhausted`, below zero → `InvalidArgument`.
+pub fn apply_counter(
+    counters: &mut serde_json::Value,
+    name: &str,
+    a: &CounterAction,
+) -> Result<()> {
+    valid_slot_name(name)?;
+    if !counters.is_object() {
+        *counters = serde_json::json!({});
+    }
+    let (mut count, mut cap) = counter_parts(counters, name);
+    if let Some(c) = a.capacity {
+        if c < 0 {
+            return Err(Error::InvalidArgument("capacity must be >= 0".into()));
+        }
+        cap = c;
+    }
+    if let Some(c) = a.count {
+        if c < 0 {
+            return Err(Error::InvalidArgument("count must be >= 0".into()));
+        }
+        count = c;
+    }
+    if let Some(d) = a.delta {
+        count += d;
+        if count < 0 {
+            return Err(Error::InvalidArgument(format!(
+                "counter {name} would go below zero"
+            )));
+        }
+    }
+    if count > cap {
+        return Err(Error::ResourceExhausted(format!(
+            "counter {name}: {count} exceeds capacity {cap}"
+        )));
+    }
+    counters[name] = serde_json::json!({ "count": count, "capacity": cap });
+    Ok(())
+}
+
+/// Apply one list action (values stay unique and ordered); over capacity → `ResourceExhausted`.
+pub fn apply_list(lists: &mut serde_json::Value, name: &str, a: &ListAction) -> Result<()> {
+    valid_slot_name(name)?;
+    if !lists.is_object() {
+        *lists = serde_json::json!({});
+    }
+    let (mut values, mut cap) = list_parts(lists, name);
+    if let Some(c) = a.capacity {
+        if c < 0 {
+            return Err(Error::InvalidArgument("capacity must be >= 0".into()));
+        }
+        cap = c;
+    }
+    if let Some(v) = &a.values {
+        values.clear();
+        for x in v {
+            if !values.contains(x) {
+                values.push(x.clone());
+            }
+        }
+    }
+    values.retain(|v| !a.remove.contains(v));
+    for x in &a.add {
+        if x.len() > 256 {
+            return Err(Error::InvalidArgument("list value too long".into()));
+        }
+        if !values.contains(x) {
+            values.push(x.clone());
+        }
+    }
+    if values.len() as i64 > cap {
+        return Err(Error::ResourceExhausted(format!(
+            "list {name}: {} values exceed capacity {cap}",
+            values.len()
+        )));
+    }
+    lists[name] = serde_json::json!({ "values": values, "capacity": cap });
+    Ok(())
+}
+
+/// Does `s` satisfy the selector (labels subset, build, counters, lists)? States are checked by SQL.
+pub fn selector_matches(s: &GameServer, sel: &AllocSelector) -> bool {
+    if sel.labels.iter().any(|(k, v)| s.labels.get(k) != Some(v)) {
+        return false;
+    }
+    if sel
+        .build_version
+        .as_ref()
+        .is_some_and(|b| s.build_version.as_deref() != Some(b.as_str()))
+    {
+        return false;
+    }
+    for (name, c) in &sel.counters {
+        let (count, cap) = counter_parts(&s.counters, name);
+        if c.min_count.is_some_and(|m| count < m)
+            || c.max_count.is_some_and(|m| count > m)
+            || c.min_available.is_some_and(|m| cap - count < m)
+        {
+            return false;
+        }
+    }
+    for (name, l) in &sel.lists {
+        let (values, cap) = list_parts(&s.lists, name);
+        if l.contains.as_ref().is_some_and(|v| !values.contains(v))
+            || l.excludes.as_ref().is_some_and(|v| values.contains(v))
+            || l.min_available
+                .is_some_and(|m| (cap - values.len() as i64) < m)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Keep at least `buffer` units of `counter` capacity free across the fleet's live servers
+/// (`policy.counter_target`): the autoscaler adds servers until the aggregate is covered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct CounterTarget {
+    pub counter: String,
+    pub buffer: i64,
+}
+
+/// Servers to add so the fleet has `buffer` free units of the counter: free capacity on live
+/// servers plus the per-server capacity (largest seen, else 1) assumed for servers still starting.
+pub fn counter_shortfall(ct: &CounterTarget, servers: &[GameServer]) -> i32 {
+    if ct.counter.is_empty() || ct.buffer <= 0 {
+        return 0;
+    }
+    let mut per_server = 1i64;
+    let mut available = 0i64;
+    let mut starting = 0i64;
+    for s in servers.iter().filter(|s| s.state != "terminated") {
+        if s.state == "starting" || s.state == "scheduled" {
+            starting += 1;
+            continue;
+        }
+        let (count, cap) = counter_parts(&s.counters, &ct.counter);
+        per_server = per_server.max(cap);
+        available += (cap - count).max(0);
+    }
+    available += starting * per_server;
+    if available >= ct.buffer {
+        0
+    } else {
+        ((ct.buffer - available + per_server - 1) / per_server) as i32
+    }
+}
+
+/// Cross-fleet server inventory filters (`GET /v1/server/gameservers`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ServerSearch {
+    pub fleet_id: Option<Uuid>,
+    pub fleet: Option<String>,
+    pub pool: Option<String>,
+    pub region: Option<String>,
+    pub provider: Option<String>,
+    /// Comma-separated states; default = every non-terminated state.
+    pub state: Option<String>,
+    pub build_version: Option<String>,
+    pub exit_reason: Option<String>,
+    pub node_id: Option<Uuid>,
+    /// `key=value,key2=value2` — every pair must match.
+    pub labels: Option<String>,
+    pub min_age_secs: Option<i64>,
+    pub max_age_secs: Option<i64>,
+    pub min_players: Option<i32>,
+    /// Only servers with `players < capacity`.
+    pub free_slots: Option<bool>,
+    pub counter: Option<String>,
+    pub counter_min_available: Option<i64>,
+    pub list: Option<String>,
+    pub list_contains: Option<String>,
+    /// `created_at|last_health|players|age` with optional leading `-` for descending.
+    pub order: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// A server with its fleet's identity for inventory views.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerView {
+    #[serde(flatten)]
+    pub server: GameServer,
+    pub fleet: String,
+    pub region: String,
+    pub pool: String,
+    pub provider: String,
+    pub exit_reason: Option<String>,
+    pub age_secs: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ViewRow {
+    #[sqlx(flatten)]
+    s: ServerRow,
+    fleet: String,
+    region: String,
+    pool: String,
+    provider: String,
+}
+
+fn push_server_filters(
+    qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+    q: &ServerSearch,
+) -> Result<()> {
+    if let Some(id) = q.fleet_id {
+        qb.push(" and g.fleet_id = ").push_bind(id);
+    }
+    if let Some(v) = q.fleet.clone() {
+        qb.push(" and f.name = ").push_bind(v);
+    }
+    if let Some(v) = q.pool.clone() {
+        qb.push(" and f.pool = ").push_bind(v);
+    }
+    if let Some(v) = q.region.clone() {
+        qb.push(" and f.region = ").push_bind(v);
+    }
+    if let Some(v) = q.provider.clone() {
+        qb.push(" and f.provider = ").push_bind(v);
+    }
+    match q.state.as_deref() {
+        Some("all") => {}
+        Some(st) => {
+            let states: Vec<String> = st
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            qb.push(" and g.state = any(").push_bind(states).push(")");
+        }
+        None => {
+            qb.push(" and g.state <> 'terminated'");
+        }
+    }
+    if let Some(v) = q.build_version.clone() {
+        qb.push(" and g.build_version = ").push_bind(v);
+    }
+    if let Some(v) = q.exit_reason.clone() {
+        qb.push(" and g.labels->>'exit_reason' = ").push_bind(v);
+    }
+    if let Some(v) = q.node_id {
+        qb.push(" and g.node_id = ").push_bind(v);
+    }
+    if let Some(l) = &q.labels {
+        let mut m = serde_json::Map::new();
+        for pair in l.split(',').filter(|p| !p.trim().is_empty()) {
+            let (k, v) = pair.split_once('=').ok_or_else(|| {
+                Error::InvalidArgument(format!("labels: expected key=value, got {pair:?}"))
+            })?;
+            m.insert(
+                k.trim().to_string(),
+                serde_json::Value::String(v.trim().to_string()),
+            );
+        }
+        qb.push(" and g.labels @> ")
+            .push_bind(serde_json::Value::Object(m));
+    }
+    if let Some(v) = q.min_age_secs {
+        qb.push(" and g.created_at <= now() - make_interval(secs => ")
+            .push_bind(v as f64)
+            .push(")");
+    }
+    if let Some(v) = q.max_age_secs {
+        qb.push(" and g.created_at >= now() - make_interval(secs => ")
+            .push_bind(v as f64)
+            .push(")");
+    }
+    if let Some(v) = q.min_players {
+        qb.push(" and g.players >= ").push_bind(v);
+    }
+    if q.free_slots == Some(true) {
+        qb.push(" and g.capacity > 0 and g.players < g.capacity");
+    }
+    if let Some(c) = q.counter.clone() {
+        valid_slot_name(&c)?;
+        let min = q.counter_min_available.unwrap_or(1);
+        qb.push(" and coalesce((g.counters->")
+            .push_bind(c.clone())
+            .push("->>'capacity')::bigint, 0) - coalesce((g.counters->")
+            .push_bind(c)
+            .push("->>'count')::bigint, 0) >= ")
+            .push_bind(min);
+    }
+    if let Some(l) = q.list.clone() {
+        valid_slot_name(&l)?;
+        if let Some(v) = q.list_contains.clone() {
+            qb.push(" and g.lists->")
+                .push_bind(l)
+                .push("->'values' @> ")
+                .push_bind(serde_json::json!([v]));
+        } else {
+            qb.push(" and g.lists ? ").push_bind(l);
+        }
+    }
+    Ok(())
+}
+
+const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
 /// `canary_percent` of new servers (optionally only in `canary_regions`), `retired` is kept for rollback.
@@ -975,50 +1390,55 @@ fn row_to_fleet(r: FleetRow) -> Fleet {
     }
 }
 
-type ServerRow = (
-    Uuid,
-    Uuid,
-    String,
-    Option<Uuid>,
-    String,
-    i32,
-    Option<i64>,
-    serde_json::Value,
-    Option<serde_json::Value>,
-    OffsetDateTime,
-    OffsetDateTime,
-    Option<String>,
-    i32,
-    i32,
-    i64,
-    Option<OffsetDateTime>,
-);
+#[derive(sqlx::FromRow)]
+struct ServerRow {
+    id: Uuid,
+    fleet_id: Uuid,
+    state: String,
+    node_id: Option<Uuid>,
+    address: String,
+    port: i32,
+    pid: Option<i64>,
+    labels: serde_json::Value,
+    allocation: Option<serde_json::Value>,
+    last_health: OffsetDateTime,
+    created_at: OffsetDateTime,
+    build_version: Option<String>,
+    players: i32,
+    capacity: i32,
+    version: i64,
+    ready_at: Option<OffsetDateTime>,
+    counters: serde_json::Value,
+    lists: serde_json::Value,
+}
 
 fn row_to_server(r: ServerRow) -> GameServer {
     GameServer {
-        id: r.0,
-        fleet_id: r.1,
-        state: r.2,
-        node_id: r.3,
-        address: r.4,
-        port: r.5,
-        pid: r.6,
-        labels: r.7,
-        allocation: r.8,
-        last_health: r.9,
-        created_at: r.10,
-        build_version: r.11,
-        players: r.12,
-        capacity: r.13,
-        version: r.14,
-        ready_at: r.15,
+        id: r.id,
+        fleet_id: r.fleet_id,
+        state: r.state,
+        node_id: r.node_id,
+        address: r.address,
+        port: r.port,
+        pid: r.pid,
+        labels: r.labels,
+        allocation: r.allocation,
+        last_health: r.last_health,
+        created_at: r.created_at,
+        build_version: r.build_version,
+        players: r.players,
+        capacity: r.capacity,
+        version: r.version,
+        ready_at: r.ready_at,
+        counters: r.counters,
+        lists: r.lists,
     }
 }
 
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists";
 
 impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
@@ -1199,6 +1619,27 @@ impl FleetService {
         backfill: bool,
         wait: std::time::Duration,
     ) -> Result<Allocation> {
+        self.allocate_routed_with(
+            target,
+            region,
+            AllocateRequest {
+                payload,
+                backfill,
+                ..Default::default()
+            },
+            wait,
+        )
+        .await
+    }
+
+    /// `allocate_routed` with a full request (selector + counter/list actions).
+    pub async fn allocate_routed_with(
+        &self,
+        target: &str,
+        region: Option<&str>,
+        req: AllocateRequest,
+        wait: std::time::Duration,
+    ) -> Result<Allocation> {
         let mut fleets: Vec<Fleet> = self
             .list()
             .await?
@@ -1212,7 +1653,7 @@ impl FleetService {
             fleets.sort_by_key(|f| if f.region == r { 0 } else { 1 });
         }
         for f in &fleets {
-            match self.allocate(f.id, payload.clone(), backfill).await {
+            match self.allocate_with(f.id, req.clone()).await {
                 Ok(a) => return Ok(a),
                 Err(Error::ResourceExhausted(_)) => continue,
                 Err(e) => return Err(e),
@@ -1242,7 +1683,7 @@ impl FleetService {
             let deadline = tokio::time::Instant::now() + wait;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                match self.allocate(f.id, payload.clone(), backfill).await {
+                match self.allocate_with(f.id, req.clone()).await {
                     Ok(a) => return Ok(a),
                     Err(Error::ResourceExhausted(_)) => {}
                     Err(e) => return Err(e),
@@ -1586,58 +2027,155 @@ impl FleetService {
         payload: serde_json::Value,
         backfill: bool,
     ) -> Result<Allocation> {
-        if backfill {
-            let r = sqlx::query_as::<_, (Uuid, String, i32, Option<String>)>(
-                "update musubi.game_servers set allocation = allocation || jsonb_build_object('backfill',
-                        coalesce(allocation->'backfill', '[]'::jsonb) || jsonb_build_array($2::jsonb)),
-                     updated_at = now()
-                 where id = (select id from musubi.game_servers
-                             where fleet_id = $1 and state in ('allocated', 'in_game') and capacity > 0
-                               and players < capacity and connect_token is not null
-                             order by (capacity - players) desc, created_at limit 1 for update skip locked)
-                 returning id, address, port, connect_token",
-            )
-            .bind(fleet_id)
-            .bind(serde_json::json!({ "payload": payload, "at": OffsetDateTime::now_utc().unix_timestamp() }))
-            .fetch_optional(&self.db)
-            .await
-            .map_err(Error::internal)?;
-            if let Some((id, address, port, Some(token))) = r {
+        self.allocate_with(
+            fleet_id,
+            AllocateRequest {
+                payload,
+                backfill,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Player-slot backfill: a live server with free player slots takes the newcomers (same token).
+    async fn try_backfill(
+        &self,
+        fleet_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<Option<Allocation>> {
+        let r = sqlx::query_as::<_, (Uuid, String, i32, Option<String>)>(
+            "update musubi.game_servers set allocation = allocation || jsonb_build_object('backfill',
+                    coalesce(allocation->'backfill', '[]'::jsonb) || jsonb_build_array($2::jsonb)),
+                 updated_at = now()
+             where id = (select id from musubi.game_servers
+                         where fleet_id = $1 and state in ('allocated', 'in_game') and capacity > 0
+                           and players < capacity and connect_token is not null
+                         order by (capacity - players) desc, created_at limit 1 for update skip locked)
+             returning id, address, port, connect_token",
+        )
+        .bind(fleet_id)
+        .bind(serde_json::json!({ "payload": payload, "at": OffsetDateTime::now_utc().unix_timestamp() }))
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(match r {
+            Some((id, address, port, Some(token))) => {
                 let (address, port) = match self.edge {
                     Some(e) => (e.ip().to_string(), e.port() as i32),
                     None => (address, port),
                 };
-                return Ok(Allocation {
+                Some(Allocation {
                     server_id: id,
                     fleet_id,
                     address,
                     port,
                     connect_token: token,
                     backfill: true,
-                });
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Hand a server to a caller. Candidates are the fleet's servers in `selector.states`
+    /// (default `ready`), oldest ready first; the first one matching the selector (labels, build,
+    /// counters, lists) is taken, the counter/list actions are applied in the same transaction
+    /// (an action exceeding a capacity fails the allocation), and the server becomes `allocated`
+    /// with a fresh connect token — or, when it was already allocated, keeps its token and the
+    /// payload is appended to its backfill list.
+    pub async fn allocate_with(&self, fleet_id: Uuid, req: AllocateRequest) -> Result<Allocation> {
+        if req.backfill {
+            if let Some(a) = self.try_backfill(fleet_id, &req.payload).await? {
+                return Ok(a);
             }
         }
-        let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
-        let alloc = serde_json::json!({ "payload": payload, "at": OffsetDateTime::now_utc().unix_timestamp() });
-        let r = sqlx::query_as::<_, (Uuid, String, i32)>(
-            "update musubi.game_servers set state = 'allocated', allocation = $2, connect_token = $3, updated_at = now()
-             where id = (select id from musubi.game_servers where fleet_id = $1 and state = 'ready'
-                         order by created_at limit 1 for update skip locked)
-             returning id, address, port",
-        )
+        for n in req.counter_actions.keys().chain(req.list_actions.keys()) {
+            valid_slot_name(n)?;
+        }
+        let states: Vec<String> = if req.selector.states.is_empty() {
+            vec!["ready".into()]
+        } else {
+            req.selector.states.clone()
+        };
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let rows: Vec<ServerRow> = sqlx::query_as(&format!(
+            "select {SERVER_COLS} from musubi.game_servers where fleet_id = $1 and state = any($2)
+             order by (case state when 'ready' then 0 else 1 end), created_at for update skip locked"
+        ))
         .bind(fleet_id)
-        .bind(alloc)
-        .bind(&token)
-        .fetch_optional(&self.db)
+        .bind(&states)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(Error::internal)?
-        .ok_or_else(|| Error::ResourceExhausted("no ready server in fleet".into()))?;
+        .map_err(Error::internal)?;
+        let Some(mut gs) = rows
+            .into_iter()
+            .map(row_to_server)
+            .find(|g| selector_matches(g, &req.selector))
+        else {
+            return Err(Error::ResourceExhausted(
+                "no ready server in fleet matches the selector".into(),
+            ));
+        };
+        for (name, a) in &req.counter_actions {
+            apply_counter(&mut gs.counters, name, a)?;
+        }
+        for (name, a) in &req.list_actions {
+            apply_list(&mut gs.lists, name, a)?;
+        }
+        let entry = serde_json::json!({ "payload": req.payload, "at": OffsetDateTime::now_utc().unix_timestamp() });
+        let shared = gs.state != "ready";
+        let token = if shared {
+            let existing: Option<String> =
+                sqlx::query_scalar("select connect_token from musubi.game_servers where id = $1")
+                    .bind(gs.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(Error::internal)?;
+            let token = existing.unwrap_or_else(|| {
+                format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple())
+            });
+            sqlx::query(
+                "update musubi.game_servers set allocation = coalesce(allocation, '{}'::jsonb) || jsonb_build_object('backfill',
+                        coalesce(allocation->'backfill', '[]'::jsonb) || jsonb_build_array($2::jsonb)),
+                     connect_token = $3, counters = $4, lists = $5, updated_at = now() where id = $1",
+            )
+            .bind(gs.id)
+            .bind(&entry)
+            .bind(&token)
+            .bind(&gs.counters)
+            .bind(&gs.lists)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            token
+        } else {
+            let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
+            sqlx::query(
+                "update musubi.game_servers set state = 'allocated', allocation = $2, connect_token = $3,
+                     counters = $4, lists = $5, updated_at = now() where id = $1",
+            )
+            .bind(gs.id)
+            .bind(&entry)
+            .bind(&token)
+            .bind(&gs.counters)
+            .bind(&gs.lists)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            token
+        };
+        tx.commit().await.map_err(Error::internal)?;
         self.record_event(
             fleet_id,
-            Some(r.0),
+            Some(gs.id),
             "server.allocated",
-            "server allocated",
-            serde_json::json!({ "self": false }),
+            if shared {
+                "server shared with another allocation"
+            } else {
+                "server allocated"
+            },
+            serde_json::json!({ "self": false, "shared": shared, "selector": req.selector }),
         )
         .await;
         if let Err(e) = self
@@ -1648,16 +2186,189 @@ impl FleetService {
         }
         let (address, port) = match self.edge {
             Some(e) => (e.ip().to_string(), e.port() as i32),
-            None => (r.1, r.2),
+            None => (gs.address, gs.port),
         };
         Ok(Allocation {
-            server_id: r.0,
+            server_id: gs.id,
             fleet_id,
             address,
             port,
             connect_token: token,
-            backfill: false,
+            backfill: shared,
         })
+    }
+
+    /// Apply counter actions reported by the server itself (or an operator).
+    pub async fn update_counters(
+        &self,
+        id: Uuid,
+        actions: &HashMap<String, CounterAction>,
+    ) -> Result<GameServer> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let mut counters: serde_json::Value =
+            sqlx::query_scalar("select counters from musubi.game_servers where id = $1 for update")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(Error::internal)?
+                .ok_or_else(|| Error::NotFound("game server".into()))?;
+        for (name, a) in actions {
+            apply_counter(&mut counters, name, a)?;
+        }
+        sqlx::query(
+            "update musubi.game_servers set counters = $2, updated_at = now() where id = $1",
+        )
+        .bind(id)
+        .bind(&counters)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        self.server(id).await
+    }
+
+    pub async fn update_lists(
+        &self,
+        id: Uuid,
+        actions: &HashMap<String, ListAction>,
+    ) -> Result<GameServer> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let mut lists: serde_json::Value =
+            sqlx::query_scalar("select lists from musubi.game_servers where id = $1 for update")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(Error::internal)?
+                .ok_or_else(|| Error::NotFound("game server".into()))?;
+        for (name, a) in actions {
+            apply_list(&mut lists, name, a)?;
+        }
+        sqlx::query("update musubi.game_servers set lists = $2, updated_at = now() where id = $1")
+            .bind(id)
+            .bind(&lists)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        self.server(id).await
+    }
+
+    /// Aggregate counters/lists over the fleet's live servers.
+    pub async fn fleet_counters(&self, fleet_id: Uuid) -> Result<serde_json::Value> {
+        let servers = self.servers(fleet_id, None).await?;
+        let mut counters: std::collections::BTreeMap<String, (i64, i64, i64)> = Default::default();
+        let mut lists: std::collections::BTreeMap<String, (i64, i64, i64)> = Default::default();
+        for s in servers.iter().filter(|s| s.state != "terminated") {
+            if let Some(o) = s.counters.as_object() {
+                for name in o.keys() {
+                    let (count, cap) = counter_parts(&s.counters, name);
+                    let e = counters.entry(name.clone()).or_default();
+                    e.0 += count;
+                    e.1 += cap;
+                    e.2 += 1;
+                }
+            }
+            if let Some(o) = s.lists.as_object() {
+                for name in o.keys() {
+                    let (values, cap) = list_parts(&s.lists, name);
+                    let e = lists.entry(name.clone()).or_default();
+                    e.0 += values.len() as i64;
+                    e.1 += cap;
+                    e.2 += 1;
+                }
+            }
+        }
+        let f = self.get(fleet_id).await?;
+        Ok(serde_json::json!({
+            "fleet_id": fleet_id,
+            "counters": counters.iter().map(|(k, (count, cap, n))| (k.clone(), serde_json::json!({
+                "count": count, "capacity": cap, "available": cap - count, "servers": n }))).collect::<serde_json::Map<_, _>>(),
+            "lists": lists.iter().map(|(k, (len, cap, n))| (k.clone(), serde_json::json!({
+                "count": len, "capacity": cap, "available": cap - len, "servers": n }))).collect::<serde_json::Map<_, _>>(),
+            "counter_target": f.policy.counter_target.as_ref().map(|ct| serde_json::json!({
+                "counter": ct.counter, "buffer": ct.buffer, "shortfall_servers": counter_shortfall(ct, &servers) })),
+        }))
+    }
+
+    /// Cross-fleet inventory: matching servers (page) and the total.
+    pub async fn search_servers(&self, q: &ServerSearch) -> Result<(Vec<ServerView>, i64)> {
+        let mut qb = sqlx::QueryBuilder::new(VIEW_SELECT);
+        push_server_filters(&mut qb, q)?;
+        let (col, dir) = match q.order.as_deref().unwrap_or("-created_at") {
+            "created_at" => ("g.created_at", "asc"),
+            "-created_at" | "age" => ("g.created_at", "desc"),
+            "-age" => ("g.created_at", "asc"),
+            "last_health" => ("g.last_health", "asc"),
+            "-last_health" => ("g.last_health", "desc"),
+            "players" => ("g.players", "asc"),
+            "-players" => ("g.players", "desc"),
+            other => {
+                return Err(Error::InvalidArgument(format!("bad order {other:?}")));
+            }
+        };
+        qb.push(format!(" order by {col} {dir}, g.id"));
+        qb.push(" limit ")
+            .push_bind(q.limit.unwrap_or(100).clamp(1, 1000));
+        qb.push(" offset ").push_bind(q.offset.unwrap_or(0).max(0));
+        let rows: Vec<ViewRow> = qb
+            .build_query_as()
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        let mut cq = sqlx::QueryBuilder::new(
+            "select count(*) from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true",
+        );
+        push_server_filters(&mut cq, q)?;
+        let total: i64 = cq
+            .build_query_scalar()
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        let now = OffsetDateTime::now_utc();
+        let views = rows
+            .into_iter()
+            .map(|r| {
+                let server = row_to_server(r.s);
+                ServerView {
+                    exit_reason: server.labels["exit_reason"].as_str().map(str::to_string),
+                    age_secs: (now - server.created_at).whole_seconds(),
+                    fleet: r.fleet,
+                    region: r.region,
+                    pool: r.pool,
+                    provider: r.provider,
+                    server,
+                }
+            })
+            .collect();
+        Ok((views, total))
+    }
+
+    /// Inventory counts by `group`: state, region, fleet, pool, provider, build, exit_reason, node.
+    pub async fn server_counts(&self, q: &ServerSearch, group: &str) -> Result<Vec<(String, i64)>> {
+        let expr = match group {
+            "state" => "g.state",
+            "region" => "f.region",
+            "fleet" => "f.name",
+            "pool" => "f.pool",
+            "provider" => "f.provider",
+            "build" => "coalesce(g.build_version, '')",
+            "exit_reason" => "coalesce(g.labels->>'exit_reason', '')",
+            "node" => "coalesce(g.node_id::text, '')",
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "group must be state|region|fleet|pool|provider|build|exit_reason|node".into(),
+                ))
+            }
+        };
+        let mut qb = sqlx::QueryBuilder::new(format!(
+            "select {expr} as k, count(*) from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true"
+        ));
+        push_server_filters(&mut qb, q)?;
+        qb.push(" group by 1 order by 2 desc, 1");
+        qb.build_query_as::<(String, i64)>()
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::internal)
     }
 
     /// Count one allocation at `at` into its hour-of-week slot. A slot not touched for 23 h is a
@@ -2531,9 +3242,16 @@ impl FleetService {
             } else {
                 0.0
             };
+            let counter_extra = f
+                .policy
+                .counter_target
+                .as_ref()
+                .map(|ct| counter_shortfall(ct, &servers))
+                .unwrap_or(0);
             let target = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour)
                 .max(utilization_target(&f.policy, allocated))
-                + surge;
+                + surge
+                + counter_extra;
             let plan = plan_scale(
                 target,
                 f.min_servers,
@@ -2842,6 +3560,8 @@ mod lifecycle_tests {
             capacity: 0,
             version: 0,
             ready_at: ready_secs.map(|r| now - Duration::from_secs(r)),
+            counters: serde_json::json!({}),
+            lists: serde_json::json!({}),
         }
     }
 

@@ -9495,7 +9495,9 @@ async fn fleet_builds_canary_promote_and_usage() {
         Some(json!({"buffer": 0, "min_servers": 0})),
     )
     .await;
-    let _ = svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap()).await;
+    let _ = svc
+        .reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await;
 }
 
 /// Any OIDC issuer from `[social.oidc.<name>]`: JWKS found through discovery, tokens become
@@ -25025,5 +25027,388 @@ async fn fleet_rollouts_rolling_update_events_and_auto_rollback() {
     let (st, v) = call_server(&app, "POST", "/v1/server/fleets", k,
         Some(json!({"name": unique("bad"), "provider": "local", "spec": {"command": ["sleep", "1"]}, "policy": {"rollout": {"strategy": "yolo"}}}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+}
+
+/// Counters/lists on game servers (SDK + operator), selector-based allocation with atomic
+/// counter/list actions and shared (allocated) servers, cross-fleet inventory search/counts,
+/// fleet aggregate and the counter-capacity autoscaler target.
+#[tokio::test]
+async fn fleet_counters_lists_selector_allocation_and_inventory() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("cfleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "region": "eu-west", "buffer": 1, "max_servers": 3,
+            "spec": {"command": ["sleep", "60"]}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(fuid).await.unwrap();
+    let sid = svc.servers(fuid, Some("starting")).await.unwrap()[0]
+        .id
+        .to_string();
+    let sdk = |path: &str, body: Value| {
+        let app = app.clone();
+        let sid = sid.clone();
+        let path = path.to_string();
+        async move {
+            let req = Request::post(&path)
+                .header("x-musubi-server-key", k)
+                .header("x-musubi-server-id", &sid)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let st = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                st,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (st, _) = sdk("/v1/gameserver/ready", json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = sdk(
+        "/v1/gameserver/label",
+        json!({"map": "dust", "mode": "ctf"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // counters: set, delta, capacity checks
+    let (st, v) = sdk(
+        "/v1/gameserver/counters",
+        json!({"rooms": {"capacity": 4, "count": 1}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counters"]["rooms"], json!({"count": 1, "capacity": 4}));
+    let (st, v) = sdk("/v1/gameserver/counters", json!({"rooms": {"delta": 4}})).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "over capacity: {v}");
+    let (st, v) = sdk("/v1/gameserver/counters", json!({"rooms": {"delta": -5}})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = sdk(
+        "/v1/gameserver/counters",
+        json!({"bad name!": {"count": 1}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // lists: unique values, remove, capacity
+    let (st, v) = sdk(
+        "/v1/gameserver/lists",
+        json!({"players": {"add": ["a", "b"], "capacity": 3}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["lists"]["players"]["values"], json!(["a", "b"]));
+    let (_, v) = sdk(
+        "/v1/gameserver/lists",
+        json!({"players": {"add": ["b", "c"]}}),
+    )
+    .await;
+    assert_eq!(v["lists"]["players"]["values"], json!(["a", "b", "c"]));
+    let (st, v) = sdk("/v1/gameserver/lists", json!({"players": {"add": ["d"]}})).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    let (_, v) = sdk(
+        "/v1/gameserver/lists",
+        json!({"players": {"remove": ["a"]}}),
+    )
+    .await;
+    assert_eq!(v["lists"]["players"]["values"], json!(["b", "c"]));
+    // operator PATCH raises the capacity; GET shows both
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/gameservers/{sid}/counters"),
+        k,
+        Some(json!({"rooms": {"capacity": 5}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counters"]["rooms"]["capacity"], 5);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["counters"]["rooms"]["count"], 1);
+    assert_eq!(v["lists"]["players"]["capacity"], 3);
+
+    // inventory search + counts
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&state=ready"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+    assert_eq!(v["servers"][0]["id"], sid);
+    assert_eq!(v["servers"][0]["fleet"], name);
+    assert_eq!(v["servers"][0]["region"], "eu-west");
+    assert!(v["servers"][0]["age_secs"].as_i64().unwrap() < 60);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&labels=map=dust,mode=ctf"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 1, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&labels=map=nope"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 0);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&labels=broken"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&counter=rooms&counter_min_available=4"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 1, "5-1 available: {v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&counter=rooms&counter_min_available=5"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 0);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&list=players&list_contains=c"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 1, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/gameservers?region=eu-west&fleet={name}&max_age_secs=600&order=-players"
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 1, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&order=sideways"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/counts?group=state&fleet_id={fid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counts"], json!([{"key": "ready", "servers": 1}]));
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/gameservers/counts?group=colour",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // selector allocation: labels + counter min_available, atomic actions
+    let (st, a1) = call_server(&app, "POST", &format!("/v1/server/fleets/{fid}/allocate"), k,
+        Some(json!({"payload": {"match": 1}, "selector": {"labels": {"map": "dust"}, "counters": {"rooms": {"min_available": 2}}},
+            "counter_actions": {"rooms": {"delta": 1}}, "list_actions": {"players": {"remove": ["b"], "add": ["p1"]}}}))).await;
+    assert_eq!(st, StatusCode::OK, "{a1}");
+    assert_eq!(a1["server_id"], sid);
+    assert_eq!(a1["backfill"], false);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["state"], "allocated");
+    assert_eq!(v["counters"]["rooms"]["count"], 2);
+    assert_eq!(v["lists"]["players"]["values"], json!(["c", "p1"]));
+    // default selector wants ready servers → nothing left
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    // sharing an allocated server by counter capacity: same token, backfill flag, count bumps
+    let (st, a2) = call_server(&app, "POST", &format!("/v1/server/fleets/{fid}/allocate"), k,
+        Some(json!({"payload": {"match": 2}, "selector": {"states": ["ready", "allocated"], "counters": {"rooms": {"min_available": 1}}},
+            "counter_actions": {"rooms": {"delta": 1}}}))).await;
+    assert_eq!(st, StatusCode::OK, "{a2}");
+    assert_eq!(a2["server_id"], sid);
+    assert_eq!(a2["backfill"], true);
+    assert_eq!(a2["connect_token"], a1["connect_token"]);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["counters"]["rooms"]["count"], 3);
+    assert_eq!(v["allocation"]["backfill"].as_array().unwrap().len(), 1);
+    // action exceeding capacity fails the allocation and changes nothing
+    let (st, v) = call_server(&app, "POST", &format!("/v1/server/fleets/{fid}/allocate"), k,
+        Some(json!({"selector": {"states": ["allocated"]}, "counter_actions": {"rooms": {"delta": 3}}}))).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["counters"]["rooms"]["count"], 3);
+    // unmet selector via the routed endpoint
+    let (st, v) = call_server(&app, "POST", "/v1/server/allocate", k,
+        Some(json!({"pool": name, "selector": {"states": ["allocated"], "lists": {"players": {"contains": "zzz"}}}}))).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    // fleet aggregate
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/counters"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["counters"]["rooms"],
+        json!({"count": 3, "capacity": 5, "available": 2, "servers": 1})
+    );
+    assert_eq!(v["lists"]["players"]["count"], 2);
+
+    // exit reasons in the inventory after a shutdown
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/gameservers/{sid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 0, "terminated hidden by default: {v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&state=all&exit_reason=shutdown"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["total"], 1, "{v}");
+    assert_eq!(v["servers"][0]["exit_reason"], "shutdown");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/counts?group=exit_reason&fleet_id={fid}&state=terminated"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(
+        v["counts"],
+        json!([{"key": "shutdown", "servers": 1}]),
+        "{v}"
+    );
+
+    // counter_target: keep 6 free room slots → with nothing live the scaler asks for more servers (cap 3)
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"policy": {"counter_target": {"counter": "bad name!", "buffer": 6}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"policy": {"counter_target": {"counter": "rooms", "buffer": 6}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    svc.reconcile_one(fuid).await.unwrap();
+    assert_eq!(
+        svc.servers(fuid, Some("starting")).await.unwrap().len(),
+        3,
+        "buffer 6 / 1 per unknown server, capped by max_servers"
+    );
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/counters"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["counter_target"]["shortfall_servers"], 3, "{v}");
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }
