@@ -28512,3 +28512,191 @@ async fn oauth_clients_client_credentials_rotation_and_introspection() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// P1-30: stored credentials are sealed under the master key; status and re-encryption.
+#[tokio::test]
+async fn secrets_at_rest_status_and_reencrypt() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let k1 = format!("{:064x}", 0x5151u128);
+    musubi_core::secrets::install(std::slice::from_ref(&k1)).unwrap();
+    let kid1 = musubi_core::secrets::Keyring::parse(std::slice::from_ref(&k1))
+        .unwrap()
+        .current_kid()
+        .unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let (st, v) = call_server(&app, "GET", "/v1/admin/secrets/status", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["configured"], true);
+    assert!(
+        v["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == &json!(kid1)),
+        "{v}"
+    );
+    assert!(v["config_refs"].is_array());
+    // webhook secret is sealed on write and still usable
+    let wname = unique("hook");
+    let (st, v) = call_server(&app, "POST", "/v1/admin/webhooks", k, Some(json!({
+        "name": wname, "url": "https://example.invalid/hook", "secret": "whsec_0123456789abcdef", "kinds": ["secrets.test_never_emitted"]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let stored: String = sqlx::query_scalar("select secret from musubi.webhooks where name = $1")
+        .bind(&wname)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(musubi_core::secrets::is_sealed(&stored), "{stored}");
+    assert_eq!(
+        musubi_core::secrets::open(&stored).unwrap(),
+        "whsec_0123456789abcdef"
+    );
+    assert!(!stored.contains("whsec"));
+    // IdP client secret too; the API never returns it
+    let pname = format!("idp{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{pname}"), k, Some(json!({
+        "kind": "oauth2", "authorize_url": "https://idp.example/authorize", "token_url": "https://idp.example/token",
+        "userinfo_url": "https://idp.example/me", "client_id": "cid", "redirect_urls": ["https://game.example/cb"], "client_secret": "css-very-secret", "enabled": false
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["has_client_secret"], true);
+    assert!(v.get("client_secret").is_none(), "{v}");
+    let stored_p: String =
+        sqlx::query_scalar("select client_secret from musubi.auth_providers where name = $1")
+            .bind(&pname)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(musubi_core::secrets::is_sealed(&stored_p), "{stored_p}");
+    assert_eq!(
+        musubi_core::secrets::open(&stored_p).unwrap(),
+        "css-very-secret"
+    );
+    // "omit = keep" survives sealing
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{pname}"), k, Some(json!({
+        "kind": "oauth2", "authorize_url": "https://idp.example/authorize", "token_url": "https://idp.example/token",
+        "userinfo_url": "https://idp.example/me", "client_id": "cid", "redirect_urls": ["https://game.example/cb"], "enabled": false
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let stored_p2: String =
+        sqlx::query_scalar("select client_secret from musubi.auth_providers where name = $1")
+            .bind(&pname)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        musubi_core::secrets::open(&stored_p2).unwrap(),
+        "css-very-secret"
+    );
+    // a legacy plaintext row is picked up by status and sealed by reencrypt
+    let legacy = unique("legacy");
+    sqlx::query("insert into musubi.webhooks (id, name, url, secret, kinds) values ($1, $2, 'https://example.invalid/l', 'plain-legacy-secret', '{}')")
+        .bind(uuid::Uuid::now_v7()).bind(&legacy).execute(&db).await.unwrap();
+    let (st, v) = call_server(&app, "GET", "/v1/admin/secrets/status", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let wh = v["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["table"] == "webhooks")
+        .unwrap()
+        .clone();
+    assert!(wh["plaintext"].as_i64().unwrap() >= 1, "{v}");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("plaintext")),
+        "{v}"
+    );
+    let (st, v) = call_server(&app, "POST", "/v1/admin/secrets/reencrypt", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let wh = v["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["table"] == "webhooks")
+        .unwrap()
+        .clone();
+    assert!(wh["resealed"].as_i64().unwrap() >= 1, "{v}");
+    let now_sealed: String =
+        sqlx::query_scalar("select secret from musubi.webhooks where name = $1")
+            .bind(&legacy)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(musubi_core::secrets::is_sealed(&now_sealed));
+    assert_eq!(
+        musubi_core::secrets::open(&now_sealed).unwrap(),
+        "plain-legacy-secret"
+    );
+    // rotation: new key first, old still opens; reencrypt moves rows to the new key
+    let k2 = format!("{:064x}", 0x5252u128);
+    musubi_core::secrets::install(&[k2.clone(), k1.clone()]).unwrap();
+    let kid2 = musubi_core::secrets::current_kid().unwrap();
+    assert_ne!(kid2, kid1);
+    assert_eq!(
+        musubi_core::secrets::open(&stored).unwrap(),
+        "whsec_0123456789abcdef",
+        "old key still opens"
+    );
+    let (_, v) = call_server(&app, "GET", "/v1/admin/secrets/status", k, None).await;
+    assert_eq!(v["current_key"], kid2);
+    let wh = v["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["table"] == "webhooks")
+        .unwrap()
+        .clone();
+    assert!(wh["sealed_other_key"].as_i64().unwrap() >= 2, "{v}");
+    let (st, v) = call_server(&app, "POST", "/v1/admin/secrets/reencrypt", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let rotated: String = sqlx::query_scalar("select secret from musubi.webhooks where name = $1")
+        .bind(&wname)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(musubi_core::secrets::sealed_kid(&rotated).unwrap(), kid2);
+    assert_eq!(
+        musubi_core::secrets::open(&rotated).unwrap(),
+        "whsec_0123456789abcdef"
+    );
+    let rotated_p: String =
+        sqlx::query_scalar("select client_secret from musubi.auth_providers where name = $1")
+            .bind(&pname)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(musubi_core::secrets::sealed_kid(&rotated_p).unwrap(), kid2);
+    // config dump never shows master keys
+    let (st, c) = call_server(&app, "GET", "/v1/admin/config", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        c["security"]["master_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x == "***" || x.as_str().unwrap().is_empty()),
+        "{}",
+        c["security"]
+    );
+    sqlx::query("delete from musubi.webhooks where name = any($1)")
+        .bind(vec![wname, legacy])
+        .execute(&db)
+        .await
+        .unwrap();
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/auth/providers/{pname}"),
+        k,
+        None,
+    )
+    .await;
+    assert!(st.is_success(), "{st}");
+}

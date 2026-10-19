@@ -237,6 +237,13 @@ impl Events {
         .map_err(Error::internal)?;
         let (mut ok, mut failed) = (0, 0);
         for (wid, eid, attempts, url, secret, kind, account, payload, created) in rows {
+            let secret = match musubi_core::secrets::open(&secret) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(webhook = %wid, error = %e, "webhook secret cannot be opened; delivery skipped");
+                    continue;
+                }
+            };
             let body = json!({
                 "id": eid,
                 "kind": kind,
@@ -346,7 +353,7 @@ async fn create_webhook(
     .bind(id)
     .bind(&b.name)
     .bind(&b.url)
-    .bind(&b.secret)
+    .bind(musubi_core::secrets::seal(&b.secret))
     .bind(&b.kinds)
     .execute(&s.db)
     .await

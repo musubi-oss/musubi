@@ -378,6 +378,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/gameserver/release", "fleets"),
     ("GET", "/v1/access", "auth"),
     ("POST", "/v1/oauth/token", "auth"),
+    ("GET", "/v1/admin/secrets/status", "admin"),
+    ("POST", "/v1/admin/secrets/reencrypt", "admin"),
     ("POST", "/v1/oauth/introspect", "auth"),
     ("POST", "/v1/oauth/revoke", "auth"),
     ("GET", "/v1/admin/oauth/clients", "admin"),

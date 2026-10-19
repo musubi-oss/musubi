@@ -45,6 +45,11 @@ pub struct Config {
     pub aurix: AurixConfig,
     pub iap: IapConfig,
     pub ads: AdsConfig,
+    /// P1-30: master keys for secrets stored in Postgres (see `musubi_core::secrets`).
+    pub security: SecurityConfig,
+    /// Config paths whose values contained `${env:…}` / `${file:…}` references (filled by `load`).
+    #[serde(skip)]
+    pub resolved_refs: Vec<String>,
     pub market: MarketConfig,
     pub fleet: FleetConfig,
     pub limits: LimitsConfig,
@@ -407,8 +412,24 @@ impl Config {
                 .with_list_parse_key("node.roles")
                 .try_parsing(true),
         );
-        b.build()?.try_deserialize()
+        let mut v: serde_json::Value = b.build()?.try_deserialize()?;
+        let mut refs = Vec::new();
+        crate::secrets::resolve_refs(&mut v, "", &mut refs)
+            .map_err(config::ConfigError::Message)?;
+        let mut c: Config =
+            serde_json::from_value(v).map_err(|e| config::ConfigError::Message(e.to_string()))?;
+        c.resolved_refs = refs;
+        crate::secrets::install(&c.security.master_keys).map_err(config::ConfigError::Message)?;
+        Ok(c)
     }
+}
+
+/// `[security]` — encryption at rest for stored credentials. `master_keys`: 32-byte keys as hex or
+/// base64 (use `${env:…}`/`${file:…}`); the first seals, all open. Empty = store plaintext.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    pub master_keys: Vec<String>,
 }
 
 /// One more project in the same process: `name`, the `Host`s that select it, and any config

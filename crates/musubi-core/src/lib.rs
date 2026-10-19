@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod id;
+pub mod secrets;
 
 pub use error::{Code, Error, Result};
 pub use id::*;

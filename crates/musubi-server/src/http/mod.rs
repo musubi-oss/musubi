@@ -54,6 +54,7 @@ pub mod reports;
 mod rpc;
 mod rtc;
 pub mod sanctions;
+pub mod secrets;
 mod server_browser;
 mod sso;
 pub mod stats;
@@ -275,6 +276,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ads::routes())
         .merge(access::routes())
         .merge(oauth::routes())
+        .merge(secrets::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

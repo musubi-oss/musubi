@@ -166,6 +166,10 @@ struct ProviderRow {
 const PROVIDER_COLS: &str = "name, kind, display_name, enabled, issuer, authorize_url, token_url, userinfo_url, jwks_url, client_id, client_secret, auth_style, scopes, pkce, claims, allow_signup, redirect_urls, return_urls, updated_at";
 
 fn row_to_provider(r: ProviderRow) -> Provider {
+    let client_secret = musubi_core::secrets::open(&r.client_secret).unwrap_or_else(|e| {
+        tracing::error!(provider = %r.name, error = %e, "auth provider client secret cannot be opened");
+        String::new()
+    });
     Provider {
         name: r.name,
         kind: r.kind,
@@ -178,7 +182,7 @@ fn row_to_provider(r: ProviderRow) -> Provider {
         jwks_url: r.jwks_url,
         client_id: r.client_id,
         has_client_secret: !r.client_secret.is_empty(),
-        client_secret: r.client_secret,
+        client_secret,
         auth_style: r.auth_style,
         scopes: r.scopes,
         pkce: r.pkce,
@@ -497,7 +501,7 @@ impl AuthProviderService {
         .bind(&p.userinfo_url)
         .bind(&p.jwks_url)
         .bind(p.client_id.trim())
-        .bind(&secret)
+        .bind(musubi_core::secrets::seal(&secret))
         .bind(&p.auth_style)
         .bind(&p.scopes)
         .bind(p.pkce)
