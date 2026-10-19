@@ -112,6 +112,11 @@ pub struct HttpConfig {
     pub max_body_bytes: usize,
     /// Shared secret for server-to-server calls (`X-Musubi-Server-Key`). Change it outside dev.
     pub server_key: String,
+    /// Browser / WebGL origins allowed to call the API cross-site: exact (`https://play.example.com`),
+    /// wildcard subdomain (`*.example.com`) or `*`. Empty = no CORS headers (same-origin only).
+    pub cors_origins: Vec<String>,
+    /// How long browsers may cache a preflight answer.
+    pub cors_max_age_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +196,8 @@ impl Default for HttpConfig {
             listen: "0.0.0.0:7350".parse().unwrap(),
             max_body_bytes: 1 << 20,
             server_key: "defaultkey".into(),
+            cors_origins: Vec::new(),
+            cors_max_age_secs: 600,
         }
     }
 }

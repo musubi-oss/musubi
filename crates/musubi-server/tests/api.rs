@@ -34973,3 +34973,127 @@ async fn friend_codes_and_request_privacy() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "expired");
 }
+
+#[tokio::test]
+async fn cors_allowlist_for_browser_clients() {
+    use axum::http::header as h;
+    async fn send(
+        app: &Router,
+        method: &str,
+        origin: &str,
+        preflight: bool,
+    ) -> axum::http::Response<Body> {
+        let mut req = Request::builder()
+            .method(method)
+            .uri("/v1/auth/device")
+            .header(h::ORIGIN, origin);
+        if preflight {
+            req = req.header(h::ACCESS_CONTROL_REQUEST_METHOD, "POST").header(
+                h::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, content-type",
+            );
+        }
+        let req = if preflight {
+            req.body(Body::empty()).unwrap()
+        } else {
+            req.header(h::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"id": unique("cors")}).to_string()))
+                .unwrap()
+        };
+        app.clone().oneshot(req).await.unwrap()
+    }
+    fn hdr<'a>(r: &'a axum::http::Response<Body>, name: &str) -> Option<&'a str> {
+        r.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    // default: no CORS at all
+    let Some(plain) = app().await else { return };
+    let r = send(&plain, "OPTIONS", "https://play.example.com", true).await;
+    assert!(
+        hdr(&r, "access-control-allow-origin").is_none(),
+        "{:?}",
+        r.headers()
+    );
+    let r = send(&plain, "POST", "https://play.example.com", false).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(hdr(&r, "access-control-allow-origin").is_none());
+
+    // allowlist with exact + wildcard-subdomain rules
+    let Some(app) = app_with(|c| {
+        c.http.cors_origins = vec![
+            "https://play.example.com/".into(),
+            "*.Games.Example.org".into(),
+        ];
+        c.http.cors_max_age_secs = 120;
+    })
+    .await
+    else {
+        return;
+    };
+    let r = send(&app, "OPTIONS", "https://play.example.com", true).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        hdr(&r, "access-control-allow-origin"),
+        Some("https://play.example.com"),
+        "{:?}",
+        r.headers()
+    );
+    let methods = hdr(&r, "access-control-allow-methods").unwrap_or("");
+    assert!(
+        methods.contains("POST") && methods.contains("DELETE") && methods.contains("PATCH"),
+        "{methods}"
+    );
+    let headers = hdr(&r, "access-control-allow-headers")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(
+        headers.contains("authorization") && headers.contains("x-musubi-server-key"),
+        "{headers}"
+    );
+    assert_eq!(hdr(&r, "access-control-max-age"), Some("120"));
+    assert!(
+        hdr(&r, "access-control-allow-credentials").is_none(),
+        "bearer tokens: never credentials"
+    );
+    let r = send(&app, "POST", "https://play.example.com", false).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        hdr(&r, "access-control-allow-origin"),
+        Some("https://play.example.com")
+    );
+    let expose = hdr(&r, "access-control-expose-headers")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(expose.contains("x-trace-id"), "{expose}");
+    // wildcard subdomain (case-insensitive, with port), apex included
+    for ok in [
+        "https://eu.games.example.org",
+        "https://EU.Games.Example.org:8443",
+        "https://games.example.org",
+    ] {
+        let r = send(&app, "OPTIONS", ok, true).await;
+        assert_eq!(hdr(&r, "access-control-allow-origin"), Some(ok), "{ok}");
+    }
+    // not allowed: other host, lookalike, scheme change, http vs https on the exact rule
+    for bad in [
+        "https://evil.example.com",
+        "https://play.example.com.evil.net",
+        "https://notgames.example.org",
+        "http://play.example.com",
+    ] {
+        let r = send(&app, "OPTIONS", bad, true).await;
+        assert!(
+            hdr(&r, "access-control-allow-origin").is_none(),
+            "{bad} -> {:?}",
+            r.headers()
+        );
+    }
+
+    // `*` allows everyone (still no credentials)
+    let Some(any) = app_with(|c| c.http.cors_origins = vec!["*".into()]).await else {
+        return;
+    };
+    let r = send(&any, "OPTIONS", "https://whatever.example.net", true).await;
+    assert_eq!(hdr(&r, "access-control-allow-origin"), Some("*"));
+    assert!(hdr(&r, "access-control-allow-credentials").is_none());
+}

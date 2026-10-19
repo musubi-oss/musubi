@@ -658,7 +658,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Auto-assigned reservation |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `POST /v1/server/allocate {backfill, wait_secs}` is server-key; players go through matchm… |
 | Automated ping in SDKs |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — No client SDK does this (client must send `ping_<region>` itself) |
 | Bulk reservation confirmation by server |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `POST /v1/gameserver/players` updates counts; no reservation reconciliation |
-| CORS allowlist for WebGL clients |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — `rg -i cors` → none in server/edge |
+| CORS allowlist for WebGL clients |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ `[http] cors_origins = ["https://play.example.com", "*.example.com"]` + `cors_max_age_secs` — exact / wildcard-subdomain / `*` allowlist, preflight for all API methods, Bearer + musubi headers allowed, trace id exposed; empty = no CORS (was: none in server/edge) |
 | Config: semver `version`, `inspect` mode, `max_deployment_retry_count`, `allowed_cors_origins`, `ticket_expir… |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — `QueueConfig` has wait/widening/ready-check/teams/MMR/ping; no ticket expiration/removal… |
 | Deployment selectors (tag-based session routing) |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — Allocation routed by `pool` + `region` only |
 | Federated identity for players |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |

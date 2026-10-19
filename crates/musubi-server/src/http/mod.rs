@@ -197,6 +197,7 @@ impl tower::Service<axum::http::Request<axum::body::Body>> for ProjectDispatch {
 }
 
 pub fn router(state: AppState) -> Router {
+    let cors = cors_layer(&state.cfg.http);
     crate::realtime::netsim::configure(&state.cfg.dev.netsim);
     Router::new()
         .route("/healthz", get(healthz))
@@ -317,7 +318,66 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             crate::dev::record,
         ))
+        .layer(cors)
         .with_state(state)
+}
+
+/// CORS for browser / WebGL clients from `[http] cors_origins` (exact, `*.suffix` or `*`).
+/// Bearer tokens travel in headers, so credentials are never allowed and `*` is safe to echo.
+/// With an empty list the layer stays inert: no `Access-Control-*` headers, preflights get 200
+/// without allowances and the browser blocks the call.
+pub fn cors_layer(cfg: &musubi_core::config::HttpConfig) -> tower_http::cors::CorsLayer {
+    use axum::http::{header, HeaderName, HeaderValue, Method};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+    let rules: Vec<String> = cfg
+        .cors_origins
+        .iter()
+        .map(|o| o.trim().trim_end_matches('/').to_ascii_lowercase())
+        .filter(|o| !o.is_empty())
+        .collect();
+    let origin = if rules.iter().any(|r| r == "*") {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+            let Ok(o) = origin.to_str() else { return false };
+            let o = o.to_ascii_lowercase();
+            let host = o.split("://").nth(1).unwrap_or(&o);
+            rules.iter().any(|r| match r.strip_prefix("*.") {
+                Some(suffix) => {
+                    let h = host.split(':').next().unwrap_or(host);
+                    h.ends_with(&format!(".{suffix}")) || h == suffix
+                }
+                None => *r == o,
+            })
+        })
+    };
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_static("x-musubi-server-key"),
+            HeaderName::from_static("x-musubi-project"),
+            HeaderName::from_static("x-musubi-idempotency-key"),
+            HeaderName::from_static("x-musubi-client-version"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("x-trace-id"),
+            HeaderName::from_static("x-musubi-trace-id"),
+            header::RETRY_AFTER,
+        ])
+        .max_age(std::time::Duration::from_secs(
+            cfg.cors_max_age_secs.min(86_400),
+        ))
 }
 
 async fn healthz() -> &'static str {
