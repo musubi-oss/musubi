@@ -354,6 +354,18 @@ wait_secs}` → `POST /v1/sessions {template_id, name, properties, join_policy?,
 owner's seat token, connect info and the invite code; owner can `PATCH`, rotate the code (`POST …/{id}/code`) and `DELETE`).
 Terminated sessions stay for `[retention] game_sessions_days` (14).
 
+External match functions (Open Match model): a queue with `mmf: {kind: "http", url, headers, timeout_ms, every_ms,
+min_tickets, fallback_after_secs}` is no longer matched in-process — the leader POSTs `{queue, extensions, tickets}` (the
+queue's whole waiting pool as wire tickets) to `url` every `every_ms` and applies the answer `{proposals: [{tickets: [id…],
+teams?: [[id…]…], region?, score?}]}` (or plain `{groups: [[id…]…]}`): every ticket must still be waiting, be used once and
+the size must be one the queue accepts; teams/region/score default to the built-in balancer/ping/grade, a negative score
+vetoes. Rejected proposals count under `bad_proposal`/`vetoed`. When the function has not succeeded for
+`fallback_after_secs` the built-in algorithm takes the queue over until it answers again (0 = never fall back).
+`GET /v1/server/matchmaker/mmf` — per queue calls/failures/latency/last proposals + rejections/`fallback_active`;
+`POST /v1/server/matchmaker/queues/{name}/mmf/test {apply?}` calls it once on the live pool (dry-run by default).
+`mmf: {kind: "wasm", propose, score}` names per-queue WASM exports instead of the global `matchmaker_propose`/
+`matchmaker_score` hooks; `extensions` is an opaque JSON blob handed to either kind with every call.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

@@ -108,6 +108,7 @@ async fn build_state_cfg_with(
     let runtime = test_runtime();
     let cluster = test_cluster_in(&db, group, region).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
+    let mmf = Arc::new(musubi_server::realtime::matchmaking::MmfClient::new());
     let parties = Arc::new(
         musubi_server::realtime::PartyRegistry::new(cluster.as_ref().unwrap().node_id().0)
             .with_directory(db.clone()),
@@ -142,11 +143,17 @@ async fn build_state_cfg_with(
     // production runs matchmaking::spawn_ticker; here a plain loop (no lease) so ready-checks
     // and ticket TTLs expire in tests too
     {
-        let (relayed, mm, fanout) = (relayed.clone(), matchmaker.clone(), fanout.clone());
+        let (relayed, mm, fanout, mmf) = (
+            relayed.clone(),
+            matchmaker.clone(),
+            fanout.clone(),
+            mmf.clone(),
+        );
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 musubi_server::realtime::matchmaking::process_and_deliver(&relayed, &mm, &fanout);
+                musubi_server::realtime::matchmaking::mmf_cycle(&mmf, &relayed, &mm, &fanout).await;
             }
         });
     }
@@ -187,6 +194,7 @@ async fn build_state_cfg_with(
         ratings: musubi_leaderboard::RatingService::new(db.clone()),
         economy: musubi_economy::EconomyService::new(db.clone()),
         matchmaker,
+        mmf: mmf.clone(),
         parties,
         relayed,
         matches: test_matches(&db, &runtime),
@@ -19651,4 +19659,194 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert_eq!(v["trace"]["outcome"], "cancelled", "{v}");
+}
+
+/// Stub external match function: pairs tickets in arrival order with a fixed score.
+async fn start_stub_mmf() -> String {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/mmf",
+        post(|axum::Json(v): axum::Json<serde_json::Value>| async move {
+            let ids: Vec<String> = v["tickets"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(v["extensions"]["mode"], "stub", "{v}");
+            let proposals: Vec<serde_json::Value> = ids
+                .chunks(2)
+                .filter(|c| c.len() == 2)
+                .map(|c| serde_json::json!({"tickets": c, "score": 0.77, "region": "stub-eu"}))
+                .collect();
+            axum::Json(serde_json::json!({"proposals": proposals}))
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    format!("http://{addr}/mmf")
+}
+
+#[tokio::test]
+async fn matchmaker_external_match_function_forms_matches_and_falls_back() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let url = start_stub_mmf().await;
+    let queue = format!("mmf-{}", uuid::Uuid::now_v7().simple());
+    let put = |body: serde_json::Value| {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri("/v1/server/matchmaker/queues")
+            .header("x-musubi-server-key", "defaultkey")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    };
+    let bad = put(serde_json::json!({"name": queue, "mmf": {"kind": "grpc", "url": url}}));
+    assert_eq!(router.clone().oneshot(bad).await.unwrap().status(), 400);
+    let bad = put(serde_json::json!({"name": queue, "mmf": {"kind": "http", "url": "ftp://x"}}));
+    assert_eq!(router.clone().oneshot(bad).await.unwrap().status(), 400);
+    // MMR window so tight the built-in algorithm would never pair these two: the MMF must do it
+    let ok = put(serde_json::json!({
+        "name": queue, "min_count": 2, "max_count": 2,
+        "mmr": {"initial_delta": 1.0, "step": 0.0, "max_delta": 1.0},
+        "mmf": {"kind": "http", "url": url, "every_ms": 300, "fallback_after_secs": 0},
+        "extensions": {"mode": "stub"}
+    }));
+    assert_eq!(router.clone().oneshot(ok).await.unwrap().status(), 200);
+
+    // dry-run on an empty pool
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/v1/server/matchmaker/queues/{queue}/mmf/test"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["outcome"]["tickets"], 0);
+    assert_eq!(v["outcome"]["proposals"].as_array().unwrap().len(), 0);
+
+    let add = |q: &str, mmr: f64| ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: "*".into(),
+        string_properties: [("queue".to_string(), q.to_string())].into(),
+        numeric_properties: [("mmr".to_string(), mmr)].into(),
+        count_multiple: 1,
+    };
+    let mut socks = Vec::new();
+    for _ in 0..2 {
+        let (t, _) = token(&router).await;
+        socks.push(connect(&addr, &t, f).await);
+    }
+    for (i, mmr) in [1000.0, 5000.0].into_iter().enumerate() {
+        send(&mut socks[i], f, None, add(&queue, mmr)).await;
+        assert!(matches!(
+            recv(&mut socks[i]).await.msg,
+            ServerMessage::MatchmakerTicket { .. }
+        ));
+    }
+    let mut tok = None;
+    for s in socks.iter_mut() {
+        match recv(s).await.msg {
+            ServerMessage::MatchmakerMatched { token, users, .. } => {
+                assert_eq!(users.len(), 2);
+                assert!(tok.get_or_insert(token.clone()) == &token);
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/server/matchmaker/mmf")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let st = v["queues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["queue"] == queue)
+        .unwrap_or_else(|| panic!("{v}"));
+    assert!(st["calls"].as_u64().unwrap() >= 1, "{st}");
+    assert_eq!(st["last_applied"], 1, "{st}");
+    assert_eq!(st["fallback_active"], false);
+    assert!(st["last_error"].is_null(), "{st}");
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/server/matchmaker/matches?queue={queue}"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v.to_string().contains("stub-eu"),
+        "region from the MMF is recorded: {v}"
+    );
+
+    // dead MMF with a 1 s fallback: the built-in algorithm takes the queue over
+    let queue2 = format!("mmf2-{}", uuid::Uuid::now_v7().simple());
+    let ok = put(serde_json::json!({
+        "name": queue2, "min_count": 2, "max_count": 2,
+        "mmf": {"kind": "http", "url": "http://127.0.0.1:9/mmf", "every_ms": 300, "timeout_ms": 300, "fallback_after_secs": 1},
+        "extensions": {"mode": "stub"}
+    }));
+    assert_eq!(router.clone().oneshot(ok).await.unwrap().status(), 200);
+    let mut socks = Vec::new();
+    for _ in 0..2 {
+        let (t, _) = token(&router).await;
+        socks.push(connect(&addr, &t, f).await);
+    }
+    for s in socks.iter_mut() {
+        send(s, f, None, add(&queue2, 1000.0)).await;
+        assert!(matches!(
+            recv(s).await.msg,
+            ServerMessage::MatchmakerTicket { .. }
+        ));
+    }
+    for s in socks.iter_mut() {
+        assert!(matches!(
+            recv(s).await.msg,
+            ServerMessage::MatchmakerMatched { .. }
+        ));
+    }
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/server/matchmaker/mmf")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let st = v["queues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["queue"] == queue2)
+        .unwrap_or_else(|| panic!("{v}"));
+    assert!(st["failures"].as_u64().unwrap() >= 1, "{st}");
+    assert_eq!(st["fallback_active"], true, "{st}");
+    assert!(st["last_error"].is_string(), "{st}");
 }

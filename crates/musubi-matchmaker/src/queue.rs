@@ -39,6 +39,55 @@ pub struct QueueConfig {
     pub ready_check_secs: Option<u64>,
     /// Base keep-out for a member who did not confirm (None = the matchmaker's default).
     pub dodge_penalty_secs: Option<u64>,
+    /// External match function (Open Match model): the queue's waiting pool is handed to an HTTP
+    /// service or a WASM export that returns the groups; the built-in algorithm only runs when it
+    /// is down (`fallback_after_secs`) or returns nothing.
+    pub mmf: Option<MmfConfig>,
+    /// Opaque game-specific payload passed to the match function with every call.
+    pub extensions: serde_json::Value,
+}
+
+/// Pluggable match function for one queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MmfConfig {
+    /// `http`: `POST url {queue, extensions, tickets}` → `{proposals: [{tickets: [id…], teams?,
+    /// region?, score?}]}` (or just `{groups: [[id…]]}`), called every `every_ms` by the leader.
+    /// `wasm`: the module exports named by `propose`/`score` run in-process on every pass.
+    pub kind: String,
+    pub url: String,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub timeout_ms: u64,
+    pub every_ms: u64,
+    /// Minimum pool before the function is called (0 = the queue's `min_count`).
+    pub min_tickets: usize,
+    /// Built-in algorithm takes the queue over after this long without a successful call (0 = never).
+    pub fallback_after_secs: u64,
+    /// WASM export names (`kind = wasm`); defaults `matchmaker_propose` / `matchmaker_score`.
+    pub propose: String,
+    pub score: String,
+}
+
+impl Default for MmfConfig {
+    fn default() -> Self {
+        Self {
+            kind: "http".into(),
+            url: String::new(),
+            headers: Default::default(),
+            timeout_ms: 2_000,
+            every_ms: 1_000,
+            min_tickets: 0,
+            fallback_after_secs: 30,
+            propose: "matchmaker_propose".into(),
+            score: "matchmaker_score".into(),
+        }
+    }
+}
+
+impl MmfConfig {
+    pub fn is_http(&self) -> bool {
+        self.kind == "http"
+    }
 }
 
 impl Default for QueueConfig {
@@ -56,6 +105,8 @@ impl Default for QueueConfig {
             priority_after_secs: 0,
             ready_check_secs: None,
             dodge_penalty_secs: None,
+            mmf: None,
+            extensions: serde_json::Value::Null,
         }
     }
 }
@@ -131,6 +182,38 @@ impl QueueConfig {
                 "queue {}: need 2 <= min_count <= max_count",
                 self.name
             )));
+        }
+        if let Some(m) = &self.mmf {
+            match m.kind.as_str() {
+                "http" => {
+                    if !(m.url.starts_with("http://") || m.url.starts_with("https://")) {
+                        return Err(Error::InvalidArgument(format!(
+                            "queue {}: mmf.url must be an http(s) URL",
+                            self.name
+                        )));
+                    }
+                    if m.timeout_ms == 0 || m.every_ms == 0 {
+                        return Err(Error::InvalidArgument(format!(
+                            "queue {}: mmf.timeout_ms and every_ms must be > 0",
+                            self.name
+                        )));
+                    }
+                }
+                "wasm" => {
+                    if m.propose.is_empty() && m.score.is_empty() {
+                        return Err(Error::InvalidArgument(format!(
+                            "queue {}: wasm mmf needs a propose or score export",
+                            self.name
+                        )));
+                    }
+                }
+                other => {
+                    return Err(Error::InvalidArgument(format!(
+                        "queue {}: mmf.kind must be http or wasm, not {other}",
+                        self.name
+                    )))
+                }
+            }
         }
         if let Some(t) = self.teams {
             if t.count < 2 || t.size == 0 {
@@ -542,6 +625,9 @@ pub struct CandidateMatch {
     pub teams: Vec<Vec<String>>,
     pub region: Option<String>,
     pub quality: Quality,
+    /// The queue's match-function config (per-queue WASM export names).
+    #[serde(default)]
+    pub mmf: Option<MmfConfig>,
 }
 
 /// Game-specific override of the queue algorithm (WASM `matchmaker_score` / `matchmaker_propose`

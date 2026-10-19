@@ -596,6 +596,12 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/matchmaker/tickets/{id}/trace", "matches"),
     ("GET", "/v1/server/matchmaker/matches", "matches"),
     ("GET", "/v1/server/matchmaker/rejections", "matches"),
+    ("GET", "/v1/server/matchmaker/mmf", "matchmaker"),
+    (
+        "POST",
+        "/v1/server/matchmaker/queues/{name}/mmf/test",
+        "matchmaker",
+    ),
     ("GET", "/v1/rating/{queue}", "leaderboards"),
     ("GET", "/v1/leaderboards/{id}/tier", "leaderboards"),
     (

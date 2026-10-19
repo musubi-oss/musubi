@@ -38,6 +38,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     )));
     let cluster = test_cluster(&db, &unique("grp")).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
+    let mmf = Arc::new(musubi_server::realtime::matchmaking::MmfClient::new());
     let parties = Arc::new(
         musubi_server::realtime::PartyRegistry::new(cluster.as_ref().unwrap().node_id().0)
             .with_directory(db.clone()),
@@ -111,6 +112,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         ratings: musubi_leaderboard::RatingService::new(db.clone()),
         economy: musubi_economy::EconomyService::new(db.clone()),
         matchmaker,
+        mmf: mmf.clone(),
         parties,
         relayed,
         matches: test_matches(&db, &runtime),

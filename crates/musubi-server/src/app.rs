@@ -57,6 +57,7 @@ pub struct AppStateInner {
     pub ratings: musubi_leaderboard::RatingService,
     pub economy: musubi_economy::EconomyService,
     pub matchmaker: Arc<Matchmaker>,
+    pub mmf: Arc<crate::realtime::matchmaking::MmfClient>,
     pub parties: Arc<PartyRegistry>,
     pub relayed: Arc<RelayedRegistry>,
     pub matches: Arc<MatchRegistry>,
@@ -366,6 +367,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         relayed.clone(),
     );
     fanout.set_social(musubi_social::SocialService::new(db.clone()));
+    let mmf = Arc::new(crate::realtime::matchmaking::MmfClient::new());
     crate::realtime::matchmaking::spawn_ticker(
         relayed.clone(),
         matchmaker.clone(),
@@ -374,6 +376,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         std::time::Duration::from_secs(1),
         hub.clone(),
         parties.clone(),
+        mmf.clone(),
     );
     fanout.set_fleets(fleets.clone());
     if cfg.session.login_queue_capacity > 0 {
@@ -712,6 +715,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         ratings,
         economy,
         matchmaker,
+        mmf: mmf.clone(),
         parties,
         relayed,
         matches,

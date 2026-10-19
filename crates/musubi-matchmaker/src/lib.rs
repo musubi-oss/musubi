@@ -231,6 +231,8 @@ pub struct Matchmaker {
     backfill_ttl: Option<Duration>,
     /// Recent wait times (seconds) per (queue, region) — the operator's p50/p95 without Prometheus.
     waits: Mutex<HashMap<(String, String), std::collections::VecDeque<f32>>>,
+    /// Per `mmf: http` queue: last successful call (or first failure) for fallback timing.
+    mmf_ok: Mutex<HashMap<String, Instant>>,
 }
 
 const WAIT_SAMPLES: usize = 2048;
@@ -289,6 +291,7 @@ impl Matchmaker {
             backfill_ttl: None,
             ttl: DEFAULT_TICKET_TTL,
             waits: Mutex::new(HashMap::new()),
+            mmf_ok: Mutex::new(HashMap::new()),
         }
     }
 
@@ -999,6 +1002,10 @@ impl Matchmaker {
             if members < cfg.min_count {
                 continue;
             }
+            if cfg.mmf.as_ref().is_some_and(|m| m.is_http()) && !self.mmf_fallback_active(cfg, now)
+            {
+                continue;
+            }
             let mut bump = |reason: &'static str| {
                 *rejections.entry((name.clone(), reason)).or_insert(0) += 1;
             };
@@ -1047,55 +1054,19 @@ impl Matchmaker {
                 );
             }
             for g in groups {
-                let mut tickets: Vec<Ticket> = g.iter().map(|&i| pool.tickets[i].clone()).collect();
-                let Some(teams) = assign_teams(cfg, &tickets) else {
-                    bump("roles");
-                    continue;
-                };
-                let refs: Vec<&Ticket> = tickets.iter().collect();
-                let region = cfg.best_region(&refs);
-                let mut q = quality(cfg, &tickets, &teams, region.as_ref(), now);
-                if let Some(sc) = &self.scorer {
-                    let cand = CandidateMatch {
-                        queue: name.clone(),
-                        tickets: tickets.iter().map(TicketWire::from).collect(),
-                        teams: teams
-                            .iter()
-                            .map(|g| g.iter().map(|&k| tickets[k].id.clone()).collect())
-                            .collect(),
-                        region: region.as_ref().map(|r| r.0.clone()),
-                        quality: q,
-                    };
-                    if let Some(s) = sc.score(&cand) {
-                        if s < 0.0 {
-                            bump("vetoed");
-                            continue;
-                        }
-                        q.score = s;
-                    }
+                if let Some(m) = self.form_group(
+                    cfg,
+                    name,
+                    &pool.tickets,
+                    &g,
+                    None,
+                    now,
+                    &mut recent,
+                    &mut bump,
+                ) {
+                    remove.extend(g.iter().copied());
+                    out.push(m);
                 }
-                for (team, g) in teams.iter().enumerate() {
-                    for &k in g {
-                        for m in &mut tickets[k].members {
-                            m.team = Some(team as u32);
-                        }
-                    }
-                }
-                if cfg.no_repeat_secs > 0 {
-                    let accounts: Vec<AccountId> = tickets
-                        .iter()
-                        .flat_map(|t| t.members.iter().map(|m| m.presence.account_id))
-                        .collect();
-                    recent.record(&accounts, now, Duration::from_secs(cfg.no_repeat_secs));
-                }
-                remove.extend(g.iter().copied());
-                out.push(Matched {
-                    token: uuid::Uuid::now_v7().simple().to_string(),
-                    tickets,
-                    queue: Some(name.clone()),
-                    region: region.map(|r| r.0),
-                    quality: Some(q),
-                });
             }
         }
         remove.sort_unstable_by(|a, b| b.cmp(a));
@@ -1106,6 +1077,269 @@ impl Matchmaker {
         let keep = queues.values().map(|q| q.no_repeat_secs).max().unwrap_or(0);
         recent.prune(now, Duration::from_secs(keep));
         out
+    }
+}
+
+/// One proposed group from an external match function.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Proposal {
+    pub tickets: Vec<String>,
+    /// Ticket ids per team; absent = the built-in balancer splits the group.
+    pub teams: Option<Vec<Vec<String>>>,
+    pub region: Option<String>,
+    /// Overrides the computed grade (negative = veto).
+    pub score: Option<f32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RejectedProposal {
+    pub tickets: Vec<String>,
+    pub reason: &'static str,
+}
+
+impl Matchmaker {
+    /// Form one group of pool indices under a queue's rules: teams, region, grade, scorer verdict,
+    /// no-repeat bookkeeping. `None` = rejected (reason bumped).
+    #[allow(clippy::too_many_arguments)]
+    fn form_group(
+        &self,
+        cfg: &QueueConfig,
+        name: &str,
+        all: &[Ticket],
+        g: &[usize],
+        override_: Option<&Proposal>,
+        now: Instant,
+        recent: &mut Recent,
+        bump: &mut dyn FnMut(&'static str),
+    ) -> Option<Matched> {
+        let mut tickets: Vec<Ticket> = g.iter().map(|&i| all[i].clone()).collect();
+        let teams = match override_.and_then(|p| p.teams.as_ref()) {
+            Some(want) => {
+                let mut teams: Vec<Vec<usize>> = Vec::new();
+                let mut seen = HashSet::new();
+                for team in want {
+                    let mut t = Vec::new();
+                    for id in team {
+                        match tickets.iter().position(|x| &x.id == id) {
+                            Some(k) if seen.insert(k) => t.push(k),
+                            _ => {
+                                bump("bad_proposal");
+                                return None;
+                            }
+                        }
+                    }
+                    teams.push(t);
+                }
+                if seen.len() != tickets.len() || cfg.teams.is_some_and(|t| t.count != teams.len())
+                {
+                    bump("bad_proposal");
+                    return None;
+                }
+                if cfg.teams.is_none() {
+                    Vec::new()
+                } else {
+                    teams
+                }
+            }
+            None => match assign_teams(cfg, &tickets) {
+                Some(t) => t,
+                None => {
+                    bump("roles");
+                    return None;
+                }
+            },
+        };
+        let refs: Vec<&Ticket> = tickets.iter().collect();
+        let mut region = cfg.best_region(&refs);
+        if let Some(r) = override_.and_then(|p| p.region.clone()) {
+            region = Some((r, region.map(|x| x.1).unwrap_or(0.0)));
+        }
+        let mut q = quality(cfg, &tickets, &teams, region.as_ref(), now);
+        if let Some(s) = override_.and_then(|p| p.score) {
+            if s < 0.0 {
+                bump("vetoed");
+                return None;
+            }
+            q.score = s;
+        } else if let Some(sc) = &self.scorer {
+            let cand = CandidateMatch {
+                queue: name.to_string(),
+                tickets: tickets.iter().map(TicketWire::from).collect(),
+                teams: teams
+                    .iter()
+                    .map(|g| g.iter().map(|&k| tickets[k].id.clone()).collect())
+                    .collect(),
+                region: region.as_ref().map(|r| r.0.clone()),
+                quality: q,
+                mmf: cfg.mmf.clone(),
+            };
+            if let Some(s) = sc.score(&cand) {
+                if s < 0.0 {
+                    bump("vetoed");
+                    return None;
+                }
+                q.score = s;
+            }
+        }
+        for (team, g) in teams.iter().enumerate() {
+            for &k in g {
+                for m in &mut tickets[k].members {
+                    m.team = Some(team as u32);
+                }
+            }
+        }
+        if cfg.no_repeat_secs > 0 {
+            let accounts: Vec<AccountId> = tickets
+                .iter()
+                .flat_map(|t| t.members.iter().map(|m| m.presence.account_id))
+                .collect();
+            recent.record(&accounts, now, Duration::from_secs(cfg.no_repeat_secs));
+        }
+        Some(Matched {
+            token: uuid::Uuid::now_v7().simple().to_string(),
+            tickets,
+            queue: Some(name.to_string()),
+            region: region.map(|r| r.0),
+            quality: Some(q),
+        })
+    }
+
+    /// The waiting pool of one queue as wire tickets (what an external match function sees).
+    pub fn pool_snapshot(&self, queue: &str) -> Vec<TicketWire> {
+        let pool = self.pool.lock();
+        pool.tickets
+            .iter()
+            .filter(|t| t.queue.as_deref() == Some(queue))
+            .map(TicketWire::from)
+            .collect()
+    }
+
+    /// Apply groups proposed by an external match function: every ticket must still be waiting
+    /// in that queue and be used once, the size must be one the queue accepts; valid groups become
+    /// matches under the usual team/region/grade rules.
+    pub fn apply_proposals(
+        &self,
+        queue: &str,
+        proposals: &[Proposal],
+    ) -> Result<(Vec<Matched>, Vec<RejectedProposal>)> {
+        self.apply_proposals_at(queue, proposals, Instant::now())
+    }
+
+    pub fn apply_proposals_at(
+        &self,
+        queue: &str,
+        proposals: &[Proposal],
+        now: Instant,
+    ) -> Result<(Vec<Matched>, Vec<RejectedProposal>)> {
+        let queues = self.queues.read();
+        let cfg = queues
+            .get(queue)
+            .ok_or_else(|| Error::NotFound(format!("queue {queue} does not exist")))?;
+        let mut pool = self.pool.lock();
+        let mut recent = self.recent.lock();
+        let mut rejections = self.rejections.lock();
+        let mut bump = |reason: &'static str| {
+            *rejections.entry((queue.to_string(), reason)).or_insert(0) += 1;
+        };
+        let by_id: HashMap<&str, usize> = pool
+            .tickets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.queue.as_deref() == Some(queue))
+            .map(|(i, t)| (t.id.as_str(), i))
+            .collect();
+        let mut used: HashSet<usize> = HashSet::new();
+        let mut out = Vec::new();
+        let mut rejected = Vec::new();
+        let mut remove: Vec<usize> = Vec::new();
+        for p in proposals {
+            let mut gi = Vec::new();
+            let mut reason = None;
+            for id in &p.tickets {
+                match by_id.get(id.as_str()) {
+                    Some(&i) if !used.contains(&i) && !gi.contains(&i) => gi.push(i),
+                    Some(_) => {
+                        reason = Some("duplicate_ticket");
+                        break;
+                    }
+                    None => {
+                        reason = Some("unknown_ticket");
+                        break;
+                    }
+                }
+            }
+            let n: usize = gi.iter().map(|&i| pool.tickets[i].members.len()).sum();
+            if reason.is_none() && (gi.is_empty() || !cfg.accepts(n)) {
+                reason = Some("bad_size");
+            }
+            if let Some(r) = reason {
+                bump("bad_proposal");
+                rejected.push(RejectedProposal {
+                    tickets: p.tickets.clone(),
+                    reason: r,
+                });
+                continue;
+            }
+            let mut why: Option<&'static str> = None;
+            let mut bump2 = |r: &'static str| {
+                why = Some(r);
+                bump(r);
+            };
+            match self.form_group(
+                cfg,
+                queue,
+                &pool.tickets,
+                &gi,
+                Some(p),
+                now,
+                &mut recent,
+                &mut bump2,
+            ) {
+                Some(m) => {
+                    used.extend(gi.iter().copied());
+                    remove.extend(gi.iter().copied());
+                    out.push(m);
+                }
+                None => rejected.push(RejectedProposal {
+                    tickets: p.tickets.clone(),
+                    reason: why.unwrap_or("rejected"),
+                }),
+            }
+        }
+        remove.sort_unstable_by(|a, b| b.cmp(a));
+        for k in remove {
+            let t = pool.tickets.remove(k);
+            unindex(&mut pool, &t);
+        }
+        if !out.is_empty() {
+            self.trace_matched(&out, now);
+        }
+        self.mmf_ok.lock().insert(queue.to_string(), now);
+        Ok((out, rejected))
+    }
+
+    /// Record that the queue's external match function could not be reached / answered badly.
+    pub fn mmf_failed(&self, queue: &str, now: Instant) {
+        self.mmf_ok.lock().entry(queue.to_string()).or_insert(now);
+    }
+
+    /// The built-in algorithm handles an `mmf: http` queue when the function has not succeeded
+    /// for `fallback_after_secs` (measured from the first failure or the last success).
+    pub fn mmf_fallback_active(&self, cfg: &QueueConfig, now: Instant) -> bool {
+        let Some(m) = &cfg.mmf else {
+            return true;
+        };
+        if m.fallback_after_secs == 0 {
+            return false;
+        }
+        let ok = self.mmf_ok.lock();
+        match ok.get(&cfg.name) {
+            Some(t) => {
+                now.saturating_duration_since(*t) >= Duration::from_secs(m.fallback_after_secs)
+            }
+            None => false,
+        }
     }
 }
 

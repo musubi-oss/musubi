@@ -27,6 +27,11 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/server/matchmaker/matches", get(matches))
         .route("/v1/server/matchmaker/rejections", get(rejections))
+        .route("/v1/server/matchmaker/mmf", get(mmf_status))
+        .route(
+            "/v1/server/matchmaker/queues/{name}/mmf/test",
+            post(mmf_test),
+        )
 }
 
 async fn list_queues(
@@ -467,4 +472,46 @@ async fn rejections(
         .map(|(q, r, n)| json!({ "queue": q, "reason": r, "count": n }))
         .collect();
     Ok(Json(json!({ "rejections": rejections })))
+}
+
+/// Health of every `mmf: http` queue: calls, failures, latency, last proposals/rejections,
+/// whether the built-in algorithm currently has the queue (fallback).
+async fn mmf_status(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "queues": s.mmf.statuses(&s.matchmaker) })))
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct MmfTestReq {
+    /// Apply what comes back instead of only reporting it.
+    apply: bool,
+}
+
+/// Call the queue's match function once on the current pool and report proposals; `apply: true`
+/// also forms the matches (delivery happens on the leader's next tick).
+async fn mmf_test(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+    body: Option<Json<MmfTestReq>>,
+) -> Result<Json<Value>, ApiError> {
+    let apply = body.map(|Json(b)| b.apply).unwrap_or(false);
+    let cfg = s
+        .matchmaker
+        .queues()
+        .into_iter()
+        .find(|q| q.name == name)
+        .ok_or_else(|| musubi_core::Error::NotFound(format!("queue {name} does not exist")))?;
+    if !cfg.mmf.as_ref().is_some_and(|m| m.is_http()) {
+        return Err(
+            musubi_core::Error::InvalidArgument(format!("queue {name} has no http mmf")).into(),
+        );
+    }
+    match s.mmf.run_queue(&s.matchmaker, &cfg, !apply).await {
+        Ok(out) => Ok(Json(json!({ "ok": true, "outcome": out }))),
+        Err(e) => Ok(Json(json!({ "ok": false, "error": e }))),
+    }
 }
