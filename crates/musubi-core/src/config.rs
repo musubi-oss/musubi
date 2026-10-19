@@ -1923,6 +1923,9 @@ pub struct RegionEntry {
 #[serde(default)]
 pub struct OperatorsConfig {
     pub sso: OperatorSsoConfig,
+    /// Refuse SSO logins whose ID token does not prove a second factor (`amr` / `acr` claims,
+    /// see `sso.mfa_claims`).
+    pub require_mfa: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1948,6 +1951,9 @@ pub struct OperatorSsoConfig {
     pub role_map: std::collections::BTreeMap<String, String>,
     /// Role for operators without a mapped group; empty = refuse them.
     pub default_role: String,
+    /// `amr` values (or substrings of `acr`) that count as a second factor when
+    /// `[operators] require_mfa` is on. Default: `mfa`, `otp`, `hwk`, `mca`, `sms`, `swk`, `fido`.
+    pub mfa_claims: Vec<String>,
     /// Only e-mails of these domains may log in (empty = any).
     pub allowed_domains: Vec<String>,
     /// Lifetime of the minted operator key.
@@ -1957,6 +1963,10 @@ pub struct OperatorSsoConfig {
 impl Default for OperatorSsoConfig {
     fn default() -> Self {
         Self {
+            mfa_claims: ["mfa", "otp", "hwk", "mca", "sms", "swk", "fido"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             issuer: String::new(),
             client_id: String::new(),
             client_secret: String::new(),

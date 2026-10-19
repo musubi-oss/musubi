@@ -14,6 +14,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/device", post(device))
         .route("/v1/auth/email", post(email))
         .route("/v1/auth/mfa", post(mfa))
+        .route("/v1/auth/mfa/email/send", post(mfa_email_send))
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/queue", post(queue))
         .route("/v1/auth/logout", post(logout))
@@ -835,4 +836,31 @@ async fn parental_consent(
         "parental_consent": true,
         "restrictions": s.age.restrictions(account),
     })))
+}
+
+#[derive(Deserialize)]
+struct MfaSendReq {
+    mfa_token: String,
+}
+
+/// E-mail second factor, step 1: mint a code for the pending login and hand it to the game's
+/// mailer through `account.mfa_code` (like `account.magic_link`). Always `{ok: true}`.
+async fn mfa_email_send(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<MfaSendReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let (account, email, code) = s.auth.email_mfa_send(&r.mfa_token).await?;
+    s.events
+        .emit(
+            "account.mfa_code",
+            Some(account),
+            serde_json::json!({
+                "account_id": account, "email": email, "code": code,
+                "expires_in_secs": musubi_auth::EMAIL_CODE_TTL_SECS,
+            }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }

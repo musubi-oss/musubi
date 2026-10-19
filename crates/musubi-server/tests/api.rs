@@ -17188,3 +17188,146 @@ async fn bans_depth_reasons_features_devices_and_ip_rules() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// MFA depth (competitive P0-27): e-mail codes as a second factor, the security timeline.
+#[tokio::test]
+async fn email_code_second_factor_and_security_timeline() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let email = format!("{}@example.com", unique("mfa"));
+    let creds = json!({"email": email, "password": "Str0ng-passw0rd!", "create": true});
+    let (st, a) = call(&app, "POST", "/v1/auth/email", None, Some(creds.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let t = a["access_token"].as_str().unwrap().to_string();
+    let acc = a["account_id"].as_str().unwrap().to_string();
+
+    // needs a verified address
+    let (st, _) = call(&app, "POST", "/v1/account/mfa/email", Some(&t), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "unverified e-mail");
+    sqlx::query(
+        "update musubi.identities set verified = true where provider = 'email' and subject = $1",
+    )
+    .bind(&email)
+    .execute(&db)
+    .await
+    .unwrap();
+    let (st, r) = call(&app, "POST", "/v1/account/mfa/email", Some(&t), None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["email"], json!(email));
+    let (_, m) = call(&app, "GET", "/v1/account/mfa", Some(&t), None).await;
+    assert_eq!(m["email_code"], true);
+    assert_eq!(m["totp"], false);
+
+    // login is now a challenge; the code travels through the event bus to the mailer
+    let (st, c) = call(&app, "POST", "/v1/auth/email", None, Some(creds.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["mfa_required"], true, "{c}");
+    let mfa_token = c["mfa_token"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": "000000"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "no code minted yet");
+    let (st, r) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa/email/send",
+        None,
+        Some(json!({"mfa_token": mfa_token})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let code: String = sqlx::query_scalar(
+        "select payload->>'code' from musubi.events where kind = 'account.mfa_code' and account_id = $1::uuid order by created_at desc limit 1",
+    )
+    .bind(&acc).fetch_one(&db).await.unwrap();
+    assert_eq!(code.len(), 6);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": "999999"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    assert!(s2["access_token"].is_string());
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/mfa",
+        None,
+        Some(json!({"mfa_token": mfa_token, "code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "a code is single use");
+
+    // security timeline: MFA change and the code event are there, the code itself is not
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (st, tl) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{acc}/security_events?limit=50"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{tl}");
+    let ev = tl["events"].as_array().unwrap();
+    assert!(
+        ev.iter().any(|e| e["kind"] == "account.mfa_enabled"),
+        "{tl}"
+    );
+    let code_ev = ev
+        .iter()
+        .find(|e| e["kind"] == "account.mfa_code")
+        .expect("code event");
+    assert!(
+        code_ev["payload"].get("code").is_none(),
+        "secret stripped: {code_ev}"
+    );
+    assert!(
+        ev.iter().any(|e| e["kind"] == "account.authenticated"),
+        "{tl}"
+    );
+    let (st, mine) = call(
+        &app,
+        "GET",
+        "/v1/account/security_events?kinds=account.mfa_enabled",
+        Some(s2["access_token"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(mine["events"].as_array().unwrap().len(), 1, "{mine}");
+
+    // off again: password login opens a session directly
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        "/v1/account/mfa/email",
+        Some(s2["access_token"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, s3) = call(&app, "POST", "/v1/auth/email", None, Some(creds)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(s3["access_token"].is_string(), "{s3}");
+}

@@ -179,6 +179,12 @@ async fn callback(
     if claims.extra.get("nonce").and_then(Value::as_str) != Some(nonce.as_str()) {
         return Err(Error::Unauthenticated("id token nonce mismatch".into()).into());
     }
+    if s.cfg.operators.require_mfa && !proves_mfa(&claims.extra, &c.mfa_claims) {
+        return Err(Error::PermissionDenied(
+            "operator login requires a second factor at the identity provider ([operators] require_mfa)".into(),
+        )
+        .into());
+    }
     let email = claims.email.clone().unwrap_or_default();
     if !c.allowed_domains.is_empty() {
         let domain = email.rsplit('@').next().unwrap_or("");
@@ -390,5 +396,54 @@ mod tests {
         assert!(role_of(&c, &claims(json!(["nobody"]))).is_err());
         c.default_role = "liveops".into();
         assert_eq!(role_of(&c, &claims(json!([]))).unwrap(), Role::Liveops);
+    }
+}
+
+/// `amr` (array or string) intersects `accepted`, or `acr` mentions one of them.
+pub fn proves_mfa(extra: &serde_json::Map<String, Value>, accepted: &[String]) -> bool {
+    let hit = |v: &str| accepted.iter().any(|a| v.eq_ignore_ascii_case(a));
+    match extra.get("amr") {
+        Some(Value::Array(a)) if a.iter().filter_map(Value::as_str).any(hit) => return true,
+        Some(Value::String(s)) if s.split([' ', ',']).any(hit) => return true,
+        _ => {}
+    }
+    extra.get("acr").and_then(Value::as_str).is_some_and(|acr| {
+        let l = acr.to_ascii_lowercase();
+        accepted.iter().any(|a| l.contains(&a.to_ascii_lowercase()))
+    })
+}
+
+#[cfg(test)]
+mod mfa_claim_tests {
+    use super::*;
+
+    #[test]
+    fn amr_and_acr_detection() {
+        let acc: Vec<String> = ["mfa", "otp", "hwk"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut e = serde_json::Map::new();
+        assert!(!proves_mfa(&e, &acc));
+        e.insert("amr".into(), serde_json::json!(["pwd"]));
+        assert!(!proves_mfa(&e, &acc));
+        e.insert("amr".into(), serde_json::json!(["pwd", "OTP"]));
+        assert!(proves_mfa(&e, &acc));
+        e.clear();
+        e.insert("amr".into(), serde_json::json!("pwd mfa"));
+        assert!(proves_mfa(&e, &acc));
+        e.clear();
+        e.insert("acr".into(), serde_json::json!("urn:okta:loa:2fa:any"));
+        assert!(!proves_mfa(&e, &acc));
+        e.insert(
+            "acr".into(),
+            serde_json::json!("http://schemas.openid.net/pape/policies/2007/06/multi-factor"),
+        );
+        assert!(
+            !proves_mfa(&e, &acc),
+            "multi-factor is not in the accepted list"
+        );
+        e.insert("acr".into(), serde_json::json!("urn:mace:incommon:iap:mfa"));
+        assert!(proves_mfa(&e, &acc));
     }
 }

@@ -8,6 +8,7 @@
 pub mod passkey;
 pub mod password;
 mod service;
+pub use service::{EMAIL_CODE_ATTEMPTS, EMAIL_CODE_TTL_SECS};
 pub mod token;
 pub mod totp;
 

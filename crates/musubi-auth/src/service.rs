@@ -49,6 +49,8 @@ pub enum Login {
 /// How long a pending second-factor token stays valid.
 pub const MFA_TOKEN_SECS: i64 = 300;
 pub const RECOVERY_CODES: usize = 8;
+pub const EMAIL_CODE_TTL_SECS: u64 = 600;
+pub const EMAIL_CODE_ATTEMPTS: i32 = 5;
 
 /// One login/device of an account as seen in `GET /v1/account/sessions`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -712,7 +714,7 @@ impl AuthService {
         created: bool,
         vars: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Login> {
-        if !self.totp_required(account_id).await? {
+        if !self.mfa_required(account_id).await? {
             return Ok(Login::Session(
                 self.open_session(
                     account_id,
@@ -743,6 +745,151 @@ impl AuthService {
             account_id,
             mfa_token,
         })
+    }
+
+    /// Is any second factor (authenticator app or e-mail code) enabled?
+    pub async fn mfa_required(&self, account_id: AccountId) -> Result<bool> {
+        sqlx::query_scalar(
+            "select exists(select 1 from musubi.identities where account_id = $1 and provider in ('totp', 'email_code') and verified)",
+        )
+        .bind(account_id.0)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
+    /// Is the e-mail code factor enabled?
+    pub async fn email_mfa_enabled(&self, account_id: AccountId) -> Result<bool> {
+        sqlx::query_scalar(
+            "select exists(select 1 from musubi.identities where account_id = $1 and provider = 'email_code' and verified)",
+        )
+        .bind(account_id.0)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)
+    }
+
+    /// Enable e-mail codes as a second factor; needs a verified e-mail identity. Returns the
+    /// address codes go to.
+    pub async fn email_mfa_enable(&self, account_id: AccountId) -> Result<String> {
+        let email: Option<String> = sqlx::query_scalar(
+            "select subject from musubi.identities where account_id = $1 and provider = 'email' and verified limit 1",
+        )
+        .bind(account_id.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some(email) = email else {
+            return Err(Error::Conflict(
+                "a verified e-mail is required for e-mail codes".into(),
+            ));
+        };
+        if self.email_mfa_enabled(account_id).await? {
+            return Err(Error::AlreadyExists("e-mail codes already enabled".into()));
+        }
+        sqlx::query(
+            "insert into musubi.identities (id, account_id, provider, subject, verified) values ($1, $2, 'email_code', $3, true)
+             on conflict (provider, subject) do update set verified = true, account_id = excluded.account_id",
+        )
+        .bind(IdentityId::new().0)
+        .bind(account_id.0)
+        .bind(&email)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(email)
+    }
+
+    pub async fn email_mfa_disable(&self, account_id: AccountId) -> Result<()> {
+        let n = sqlx::query(
+            "delete from musubi.identities where account_id = $1 and provider = 'email_code'",
+        )
+        .bind(account_id.0)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::NotFound("e-mail codes not enabled".into()));
+        }
+        Ok(())
+    }
+
+    /// Step 1 of an e-mail second factor: mint a 6-digit code for a pending login (valid
+    /// `EMAIL_CODE_TTL_SECS`). Returns (account, address, code) for the game's mailer.
+    pub async fn email_mfa_send(&self, mfa_token: &str) -> Result<(AccountId, String, String)> {
+        let c = self.signer.verify(mfa_token)?;
+        if c.vars.get("mfa").and_then(|v| v.as_str()) != Some("pending") {
+            return Err(Error::Unauthenticated("not a pending login".into()));
+        }
+        let email: Option<String> = sqlx::query_scalar(
+            "select subject from musubi.identities where account_id = $1 and provider = 'email_code' and verified",
+        )
+        .bind(c.sub.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some(email) = email else {
+            return Err(Error::Conflict("e-mail codes not enabled".into()));
+        };
+        let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
+        let hash = hex::encode(Sha256::digest(code.as_bytes()));
+        sqlx::query(
+            "insert into musubi.mfa_codes (account_id, code_hash, expires_at)
+             values ($1, $2, now() + make_interval(secs => $3))
+             on conflict (account_id) do update set code_hash = excluded.code_hash, attempts = 0,
+                expires_at = excluded.expires_at, created_at = now()",
+        )
+        .bind(c.sub.0)
+        .bind(&hash)
+        .bind(EMAIL_CODE_TTL_SECS as f64)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok((c.sub, email, code))
+    }
+
+    /// Consume an e-mail code; `EMAIL_CODE_ATTEMPTS` wrong guesses burn it.
+    async fn email_code_check(&self, account_id: AccountId, code: &str) -> Result<()> {
+        let want = hex::encode(Sha256::digest(code.trim().as_bytes()));
+        let ok: Option<bool> = sqlx::query_scalar(
+            "with c as (
+                select account_id, code_hash = $2 as ok from musubi.mfa_codes
+                where account_id = $1 and expires_at > now() and attempts < $3
+             ), d as (
+                delete from musubi.mfa_codes using c where mfa_codes.account_id = c.account_id and c.ok
+             ), u as (
+                update musubi.mfa_codes set attempts = attempts + 1
+                from c where mfa_codes.account_id = c.account_id and not c.ok
+             )
+             select ok from c",
+        )
+        .bind(account_id.0)
+        .bind(&want)
+        .bind(EMAIL_CODE_ATTEMPTS)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        match ok {
+            Some(true) => Ok(()),
+            _ => Err(Error::Unauthenticated("bad or expired code".into())),
+        }
+    }
+
+    /// Any enabled second factor accepts `code`: authenticator / recovery code first, then an
+    /// e-mail code.
+    async fn second_factor_check(&self, account_id: AccountId, code: &str) -> Result<()> {
+        let totp = self.totp_required(account_id).await?;
+        if totp && self.totp_check(account_id, code).await.is_ok() {
+            return Ok(());
+        }
+        if self.email_mfa_enabled(account_id).await? {
+            return self.email_code_check(account_id, code).await;
+        }
+        if totp {
+            return Err(Error::Unauthenticated("bad code".into()));
+        }
+        Err(Error::NotFound("no second factor enabled".into()))
     }
 
     /// Does this account have a verified authenticator?
@@ -893,7 +1040,7 @@ impl AuthService {
         if c.vars.get("mfa").and_then(|v| v.as_str()) != Some("pending") {
             return Err(Error::Unauthenticated("not a pending login".into()));
         }
-        self.totp_check(c.sub, code).await?;
+        self.second_factor_check(c.sub, code).await?;
         let created = c
             .vars
             .get("created")

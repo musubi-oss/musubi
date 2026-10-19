@@ -40,6 +40,12 @@ pub fn routes() -> Router<AppState> {
             post(totp_begin).delete(totp_disable),
         )
         .route("/v1/account/mfa/totp/verify", post(totp_verify))
+        .route("/v1/account/mfa", get(mfa_status))
+        .route(
+            "/v1/account/mfa/email",
+            post(email_mfa_enable).delete(email_mfa_disable),
+        )
+        .route("/v1/account/security_events", get(my_security_events))
         .route("/v1/account/delete", post(delete_self))
         .route("/v1/account/age", get(get_age).put(put_age))
         .route(
@@ -608,4 +614,57 @@ async fn server_put_age(
         .set(&s.db, id, info, birthdate, s.cluster.as_ref())
         .await?;
     Ok(Json(age_view(&s, id)))
+}
+
+/// `GET /v1/account/mfa` — which second factors are on.
+async fn mfa_status(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({
+        "totp": s.auth.totp_required(me.account_id).await?,
+        "email_code": s.auth.email_mfa_enabled(me.account_id).await?,
+    })))
+}
+
+/// `POST /v1/account/mfa/email` — e-mail codes as a second factor (needs a verified e-mail).
+async fn email_mfa_enable(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let email = s.auth.email_mfa_enable(me.account_id).await?;
+    s.events
+        .emit(
+            "account.mfa_enabled",
+            Some(me.account_id),
+            serde_json::json!({ "method": "email_code" }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "enabled": true, "email": email })))
+}
+
+async fn email_mfa_disable(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.auth.email_mfa_disable(me.account_id).await?;
+    s.events
+        .emit(
+            "account.mfa_disabled",
+            Some(me.account_id),
+            serde_json::json!({ "method": "email_code" }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "enabled": false })))
+}
+
+/// `GET /v1/account/security_events` — the player's own security timeline.
+async fn my_security_events(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Query(q): axum::extract::Query<crate::security::TimelineQ>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        crate::security::timeline(&s.db, me.account_id.0, &q).await?,
+    ))
 }

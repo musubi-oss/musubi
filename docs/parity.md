@@ -32,7 +32,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Generic OIDC (Discord, Twitch, Epic, Keycloak…) | ✅ `/v1/auth/oidc/{provider}`, discovery + JWKS | 🟡 | 🟡 | 🟡 | ✅ |
 | Xbox Live (XSTS), PSN, Nintendo | ✅ `POST /v1/auth/{xbox,psn,nintendo}` + link/unlink (XSTS-профиль, id_token через OIDC-проверку) | ✅ | ❌ (custom) | ✅ | ✅ |
 | Passkeys / WebAuthn | ✅ | ❌ | ❌ | ❌ | ❌ |
-| TOTP MFA + recovery codes | ✅ | ❌ | ❌ | ❌ | 🟡 |
+| MFA: TOTP + recovery codes + e-mail коды, таймлайн security-событий, MFA операторов через IdP (`require_mfa`) | ✅ | ❌ | ❌ | ❌ | 🟡 |
 | Magic-link вход | ✅ `POST /v1/auth/email/magic/request` → событие `account.magic_link`, `POST /v1/auth/email/magic {token}` | ❌ | ❌ | ✅ | ❌ |
 | Lockout, captcha при брутфорсе, suspicious login | ✅ `[session]`, `hook_auth_captcha`, `account.suspicious_login` | 🟡 | ❌ | 🟡 | 🟡 |
 | Login queue при лимите онлайна | ✅ `POST /v1/auth/queue` (гейт в выдаче сессии) | ✅ | ❌ | ❌ | 🟡 |

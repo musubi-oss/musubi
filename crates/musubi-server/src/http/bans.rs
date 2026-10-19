@@ -29,6 +29,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/accounts/{id}/devices", get(devices))
         .route("/v1/admin/accounts/{id}/ips", get(ips))
         .route("/v1/admin/accounts/{id}/ban/devices", post(ban_devices))
+        .route(
+            "/v1/admin/accounts/{id}/security_events",
+            get(security_events),
+        )
 }
 
 #[derive(Deserialize)]
@@ -590,4 +594,14 @@ async fn ban_devices(
     Ok(Json(
         json!({ "devices_banned": d, "ips_banned": i, "until": until }),
     ))
+}
+
+/// `GET /v1/admin/accounts/{id}/security_events` — logins, suspicious logins, bans, MFA changes…
+async fn security_events(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<Uuid>,
+    Query(q): Query<crate::security::TimelineQ>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    Ok(Json(crate::security::timeline(&s.db, id, &q).await?))
 }
