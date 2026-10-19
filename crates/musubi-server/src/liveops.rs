@@ -472,6 +472,7 @@ pub async fn assignments(
         .map_err(Error::internal)?
         .rows_affected();
         if inserted > 0 {
+            s.events.invalidate_experiments(Some(account));
             s.events
                 .emit(
                     "experiment.exposed",

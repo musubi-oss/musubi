@@ -714,6 +714,11 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/experiments/{id}", "integrations"),
     ("PUT", "/v1/server/experiments/{id}", "integrations"),
     ("DELETE", "/v1/server/experiments/{id}", "integrations"),
+    (
+        "GET",
+        "/v1/server/experiments/of/{account_id}",
+        "integrations",
+    ),
     ("POST", "/v1/server/experiments/{id}/start", "integrations"),
     ("POST", "/v1/server/experiments/{id}/pause", "integrations"),
     ("POST", "/v1/server/experiments/{id}/end", "integrations"),

@@ -31,7 +31,19 @@ pub struct Events {
     /// SMTP sink for `account.email_verification` / `account.password_reset`.
     mailer: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<musubi_integrations::Mailer>>>,
     analytics: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::analytics::Analytics>>>,
+    /// Per-account `{experiment_id: variant}` of running experiments, stamped onto account-bound
+    /// events so analytics can split every metric by variant (cached for 60 s).
+    experiments: ExperimentCtxCache,
 }
+
+const EXPERIMENT_CTX_TTL: Duration = Duration::from_secs(60);
+
+/// account → (cached at, `{experiment_id: variant}`)
+type ExperimentCtxCache = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<AccountId, (std::time::Instant, std::sync::Arc<Value>)>,
+    >,
+>;
 
 /// Which events become mail: (template, to, subject, text).
 fn mail_for(
@@ -101,7 +113,51 @@ impl Events {
             liveops: Default::default(),
             mailer: Default::default(),
             analytics: Default::default(),
+            experiments: Default::default(),
         }
+    }
+
+    /// Forget cached experiment context (assignments or experiment status changed).
+    pub fn invalidate_experiments(&self, account: Option<AccountId>) {
+        let mut g = self.experiments.lock().unwrap_or_else(|e| e.into_inner());
+        match account {
+            Some(a) => {
+                g.remove(&a);
+            }
+            None => g.clear(),
+        }
+    }
+
+    /// `{experiment_id: variant}` for the account's running experiments (empty object when none).
+    pub async fn experiment_context(&self, account: AccountId) -> std::sync::Arc<Value> {
+        if let Some((at, v)) = self
+            .experiments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&account)
+        {
+            if at.elapsed() < EXPERIMENT_CTX_TTL {
+                return v.clone();
+            }
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "select a.experiment_id, a.variant from musubi.experiment_assignments a
+             join musubi.experiments e on e.id = a.experiment_id
+             where a.account_id = $1 and e.status = 'running' order by a.experiment_id",
+        )
+        .bind(account.0)
+        .fetch_all(&self.db)
+        .await
+        .unwrap_or_default();
+        let v: serde_json::Map<String, Value> = rows
+            .into_iter()
+            .map(|(e, v)| (e, Value::String(v)))
+            .collect();
+        let v = std::sync::Arc::new(Value::Object(v));
+        let mut g = self.experiments.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|_, (at, _)| at.elapsed() < EXPERIMENT_CTX_TTL);
+        g.insert(account, (std::time::Instant::now(), v.clone()));
+        v
     }
 
     /// Forward account-bound events to LiveOps as analytics events (`external_id` = account id).
@@ -122,6 +178,18 @@ impl Events {
         account: Option<AccountId>,
         payload: Value,
     ) -> Option<Uuid> {
+        let mut payload = payload;
+        if let Some(a) = account {
+            if kind != "experiment.exposed"
+                && payload.is_object()
+                && payload.get("experiments").is_none()
+            {
+                let ctx = self.experiment_context(a).await;
+                if ctx.as_object().is_some_and(|m| !m.is_empty()) {
+                    payload["experiments"] = (*ctx).clone();
+                }
+            }
+        }
         if let (Some(l), Some(a)) = (self.liveops.get(), account) {
             l.track(&a.to_string(), kind, payload.clone());
         }

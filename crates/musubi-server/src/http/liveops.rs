@@ -29,6 +29,10 @@ pub fn routes() -> Router<AppState> {
                 .put(put_experiment)
                 .delete(delete_experiment),
         )
+        .route(
+            "/v1/server/experiments/of/{account_id}",
+            get(experiments_of),
+        )
         .route("/v1/server/experiments/{id}/start", post(start_experiment))
         .route("/v1/server/experiments/{id}/pause", post(pause_experiment))
         .route("/v1/server/experiments/{id}/end", post(end_experiment))
@@ -79,6 +83,9 @@ fn valid_id(id: &str, what: &str) -> Result<()> {
 }
 
 async fn changed(s: &AppState, what: &str, id: &str) {
+    if what == "experiment" {
+        s.events.invalidate_experiments(None);
+    }
     crate::runtime_host::liveops_changed(s, json!({ "source": "musubi", what: id }), true).await;
 }
 
@@ -1316,5 +1323,36 @@ async fn timeline(
     Ok(Json(json!({
         "from": from, "to": to, "now": now, "kinds": kinds, "total": total, "entries": out,
         "summary": { "by_kind": by_kind, "active_now": active_now, "next_24h": next_24h },
+    })))
+}
+
+/// `GET /v1/server/experiments/of/{account_id}` — the account's experiment history: every
+/// assignment with the experiment's current status (running or ended) — the context stamped as
+/// `experiments: {id: variant}` on the account's events while the experiment runs.
+async fn experiments_of(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(account_id): Path<Uuid>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "select a.experiment_id, e.name, e.status, a.variant, extract(epoch from a.assigned_at)::bigint
+         from musubi.experiment_assignments a join musubi.experiments e on e.id = a.experiment_id
+         where a.account_id = $1 order by a.assigned_at desc",
+    )
+    .bind(account_id)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let current: serde_json::Map<String, Value> = rows
+        .iter()
+        .filter(|r| r.2 == "running")
+        .map(|r| (r.0.clone(), json!(r.3)))
+        .collect();
+    Ok(Json(json!({
+        "account_id": account_id,
+        "current": current,
+        "history": rows.iter().map(|(id, name, status, variant, at)| json!({
+            "experiment_id": id, "name": name, "status": status, "variant": variant, "assigned_at": at,
+        })).collect::<Vec<_>>(),
     })))
 }

@@ -32546,3 +32546,124 @@ async fn liveops_timeline_aggregates_schedules() {
     .await;
     let _ = call_server(&app, "DELETE", &format!("/v1/server/news/{news}"), k, None).await;
 }
+
+/// Experiment context rides on account-bound events; the player keeps an experiment history.
+#[tokio::test]
+async fn experiment_context_on_events_and_history() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let exp = unique("ctx-exp");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/experiments/{exp}"), k, Some(json!({
+        "name": "Context test", "variants": [{"name": "a", "weight": 1}, {"name": "b", "weight": 1}]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/experiments/{exp}/start"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let dev = unique("ctx-dev");
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    let aid = a["account_id"].as_str().unwrap().to_string();
+    // evaluation assigns the account a variant (sticky)
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/liveops/eval?account_id={aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    let variant = ev["experiments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["experiment_id"] == json!(exp))
+        .unwrap_or_else(|| panic!("{ev}"))["variant"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/experiments/of/{aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    assert_eq!(h["current"][&exp], json!(variant));
+    assert_eq!(h["history"][0]["status"], "running");
+    // the next account-bound event carries the context
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut stamped = false;
+    for _ in 0..50 {
+        let (st, evs) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/admin/accounts/{aid}/events?limit=50"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{evs}");
+        let list = evs["events"].as_array().cloned().unwrap_or_default();
+        if list
+            .iter()
+            .any(|e| e["payload"]["experiments"][&exp] == json!(variant))
+        {
+            stamped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(stamped, "no event carried experiments.{exp}");
+    // ending the experiment drops it from the context but keeps the history
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/experiments/{exp}/end"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (_, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/experiments/of/{aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert!(h["current"].as_object().unwrap().get(&exp).is_none(), "{h}");
+    assert_eq!(h["history"][0]["status"], "ended");
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/experiments/{exp}"),
+        k,
+        None,
+    )
+    .await;
+}
