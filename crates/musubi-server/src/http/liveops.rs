@@ -1022,7 +1022,7 @@ struct TimelineQ {
     /// Window (Unix seconds); defaults to now-1d .. now+14d.
     from: Option<i64>,
     to: Option<i64>,
-    /// Comma-separated subset of `live_event,flag,experiment,news,offer,changeset`.
+    /// Comma-separated subset of `live_event,flag,experiment,news,offer,changeset,tournament`.
     kinds: Option<String>,
     /// Keep live events carrying this label / news carrying this tag.
     label: Option<String>,
@@ -1041,6 +1041,8 @@ type OfferTimelineRow = (
     Option<i64>,
     Option<String>,
 );
+/// (id, title, category, start_time, end_time, duration, reset_schedule)
+type TournamentTimelineRow = (String, String, i32, i64, Option<i64>, i32, Option<String>);
 /// (id, title, published_at, expires_at, tags, audience, pinned)
 type NewsTimelineRow = (
     uuid::Uuid,
@@ -1109,6 +1111,7 @@ async fn timeline(
         "news",
         "offer",
         "changeset",
+        "tournament",
     ];
     let kinds: Vec<String> = match q.kinds.as_deref() {
         Some(k) if !k.is_empty() => {
@@ -1119,7 +1122,7 @@ async fn timeline(
                 .collect();
             if let Some(bad) = v.iter().find(|x| !all_kinds.contains(&x.as_str())) {
                 return Err(Error::InvalidArgument(format!(
-                    "unknown kind `{bad}` (live_event|flag|experiment|news|offer|changeset)"
+                    "unknown kind `{bad}` (live_event|flag|experiment|news|offer|changeset|tournament)"
                 ))
                 .into());
             }
@@ -1326,6 +1329,30 @@ async fn timeline(
                     now,
                     json!([]),
                     json!({ "state": state, "publishes_at": at }),
+                ));
+            }
+        }
+    }
+    if want("tournament") && q.label.is_none() {
+        let rows: Vec<TournamentTimelineRow> = sqlx::query_as(
+            "select id, title, category::int4, extract(epoch from start_time)::bigint, extract(epoch from end_time)::bigint, duration::int4, reset_schedule from musubi.leaderboards
+             where is_tournament order by start_time, id",
+        )
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        for (id, title, category, start, end, duration, reset) in rows {
+            let end = end.or((duration > 0).then(|| start + duration as i64));
+            if intersects(start, end, from, to) {
+                out.push(entry(
+                    "tournament",
+                    &id,
+                    &title,
+                    start,
+                    end,
+                    now,
+                    json!([]),
+                    json!({ "category": category, "duration_secs": duration, "reset_schedule": reset }),
                 ));
             }
         }
