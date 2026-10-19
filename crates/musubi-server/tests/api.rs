@@ -18858,3 +18858,179 @@ async fn analytics_ingest_schemas_export_and_kpis() {
         assert_eq!(d["removed"], true);
     }
 }
+
+/// Environments & promotion (competitive P0-40): a second cluster ("stage") served on a local
+/// port, registered here, content promoted to it with dry-run, protection and history.
+#[tokio::test]
+async fn environments_registry_and_content_promotion() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let env_name = format!("st{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+    let target_env = env_name.clone();
+    let Some(target) = app_with(move |c| c.node.environment = target_env).await else {
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, target).await.unwrap();
+    });
+    let url = format!("http://{addr}");
+
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/environments/{env_name}"),
+        k,
+        Some(json!({"url": "ftp://nope", "admin_key": k})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/environments/dev",
+        k,
+        Some(json!({"url": url, "admin_key": k})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "this environment");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/environments/{env_name}"),
+        k,
+        Some(json!({"url": url})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "admin_key required on create");
+    let (st, e) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/environments/{env_name}"),
+        k,
+        Some(json!({"url": format!("{url}/"), "admin_key": k, "description": "staging"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    assert_eq!(e["url"], json!(url), "trailing slash trimmed");
+    assert_eq!(e["admin_key_set"], true);
+    assert!(e.get("admin_key").is_none(), "key never returned: {e}");
+    let (_, l) = call_server(&app, "GET", "/v1/admin/environments", k, None).await;
+    assert_eq!(l["this"]["name"], "dev");
+    assert!(
+        l["environments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["name"] == json!(env_name)),
+        "{l}"
+    );
+
+    let (st, stt) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/environments/{env_name}/status"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{stt}");
+    assert_eq!(stt["health"]["ok"], true, "{stt}");
+
+    // dry run → remote diff, recorded
+    let (st, p1) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/environments/{env_name}/promote"),
+        k,
+        Some(json!({"sections": ["content"], "dry_run": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p1}");
+    assert_eq!(p1["dry_run"], true);
+    assert_eq!(p1["sections"], json!(["content"]));
+    assert!(p1["result"].is_object(), "{p1}");
+    // protect it: a real promotion needs confirm
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/environments/{env_name}"),
+        k,
+        Some(json!({"url": url, "protected": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "update keeps the stored key");
+    let (st, c) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/environments/{env_name}/promote"),
+        k,
+        Some(json!({"sections": ["content"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{c}");
+    let (st, p2) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/environments/{env_name}/promote"),
+        k,
+        Some(json!({"sections": ["content"], "confirm": true, "note": "release 1.0"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p2}");
+    assert_eq!(p2["dry_run"], false);
+    // a bundle for another environment is refused by the target
+    let bad = format!("{env_name}x");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/environments/{bad}"),
+        k,
+        Some(json!({"url": url, "admin_key": k})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/environments/{bad}/promote"),
+        k,
+        Some(json!({"sections": ["content"], "dry_run": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{r}");
+    let (_, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/promotions?to={env_name}"),
+        k,
+        None,
+    )
+    .await;
+    let rows = h["promotions"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{h}");
+    assert_eq!(rows[0]["note"], "release 1.0");
+    assert_eq!(rows[0]["ok"], true);
+    assert_eq!(rows[1]["dry_run"], true);
+    let (_, hb) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/promotions?to={bad}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(hb["promotions"][0]["ok"], false, "{hb}");
+    for n in [env_name, bad] {
+        let (_, d) = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/admin/environments/{n}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(d["removed"], true);
+    }
+}

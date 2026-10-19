@@ -64,6 +64,11 @@ fn section_of(table: &str) -> Option<&'static str> {
         .map(|(n, _)| *n)
 }
 
+/// Every known section name (for "promote everything").
+pub(crate) fn all_sections() -> Vec<String> {
+    SECTIONS.iter().map(|(n, _)| n.to_string()).collect()
+}
+
 fn tables_of(sections: &[String]) -> Result<Vec<&'static str>, Error> {
     for sc in sections {
         if !SECTIONS.iter().any(|(n, _)| n == sc) {
@@ -117,13 +122,22 @@ pub const FORMAT: u64 = 1;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/admin/content", get(export))
-        .route("/v1/admin/content/import", post(import))
+        .route(
+            "/v1/admin/content/import",
+            post(import).layer(axum::extract::DefaultBodyLimit::max(
+                CONTENT_IMPORT_MAX_BYTES,
+            )),
+        )
         .route("/v1/admin/content/versions", get(versions))
         .route("/v1/admin/content/versions/{id}", get(version))
         .route("/v1/admin/content/versions/{id}/rollback", post(rollback))
 }
 
 type Tx<'a> = Transaction<'a, Postgres>;
+
+/// Whole-catalog bundles (promotion between environments) are far bigger than ordinary
+/// request bodies.
+pub(crate) const CONTENT_IMPORT_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// id, created_at, source, note, counts, environment, sections
 type VersionRow = (i64, String, String, String, Value, String, Vec<String>);
 /// created_at, source, note, counts, bundle, environment, sections
@@ -185,7 +199,7 @@ async fn rows(tx: &mut Tx<'_>, table: &str, sh: &Shape) -> Result<Vec<Value>, Er
     Ok(v.into_iter().map(|(r,)| r).collect())
 }
 
-async fn export_bundle(
+pub(crate) async fn export_bundle(
     tx: &mut Tx<'_>,
     sections: &[String],
     environment: &str,

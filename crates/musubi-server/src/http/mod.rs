@@ -12,6 +12,7 @@ pub mod content;
 mod dev;
 pub mod economy;
 pub mod entitlements;
+mod environments;
 pub(crate) mod error;
 pub(crate) mod extract;
 mod fleets;
@@ -232,6 +233,7 @@ pub fn router(state: AppState) -> Router {
         .merge(liveops::routes())
         .merge(offers::routes())
         .merge(analytics::routes())
+        .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::hooks::before_after,

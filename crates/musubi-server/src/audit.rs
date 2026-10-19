@@ -168,7 +168,9 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
             .unwrap_or_default()
     };
     // Binary uploads (WASM modules) are not buffered: only their size is recorded.
-    let binary = path.starts_with("/v1/admin/runtime/modules/");
+    // module binaries and whole-catalog content bundles are logged by size only
+    let binary =
+        path.starts_with("/v1/admin/runtime/modules/") || path == "/v1/admin/content/import";
     let content_length = req
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
