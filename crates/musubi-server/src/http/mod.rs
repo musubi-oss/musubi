@@ -47,6 +47,7 @@ mod module_routes;
 pub mod news;
 mod notifications;
 pub mod oauth;
+mod oauth_authz;
 mod offers;
 mod parties;
 mod passkeys;
@@ -289,6 +290,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ads::routes())
         .merge(access::routes())
         .merge(oauth::routes())
+        .merge(oauth_authz::routes())
         .merge(secrets::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(

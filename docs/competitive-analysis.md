@@ -119,7 +119,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | **Magic link / passwordless email login** |  |  |  | ✅ |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  | ✅ |  | ✅ |  | 🟡 2/2/0 · P1 |
 | **Nintendo (NSA) login** |  |  |  | ✅ |  |  |  |  |  | ✅ |  |  |  |  | ✅ | ✅ |  |  |  |  |  |  | ✅ 4/0/0 |
 | **Facebook / Instant Games login** |  |  | ✅ | ✅ |  |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  | ✅ 3/0/0 |
-| **OAuth2 clients / app registrations (client ids, secrets, redirect URIs)** | ✅ |  |  |  |  |  | ✅ |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 0/2/1 · P1 |
+| **OAuth2 clients / app registrations (client ids, secrets, redirect URIs)** | ✅ |  |  |  |  |  | ✅ |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  | ✅ 0/2/1 · P1 — client registrations + client_credentials (P1-23) and authorization-code + PKCE with refresh rotation, player grants (`/v1/oauth/authorize`, `/v1/account/oauth/grants`) |
 | **Platform ownership / entitlement check at login (Steam app ownership, Family Sharing)** |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  | ✅ |  |  | ✅ |  |  | ❌ 1/1/1 · P1 |
 | **Scoped / down-scoped tokens, publishable keys, per-action client policies** |  |  |  |  | ✅ |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |  | 🟡 0/2/1 · P0 |
 | **Discord / Twitch login & linking** |  |  |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  | ✅ |  |  |  | ✅ 2/0/0 |

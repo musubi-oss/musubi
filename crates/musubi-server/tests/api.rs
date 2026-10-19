@@ -34290,3 +34290,416 @@ async fn device_code_login_handoff() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "{p}");
 }
+
+#[tokio::test]
+async fn oauth_authorization_code_flow() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, player) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("oac")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{player}");
+    let ptok = player["access_token"].as_str().unwrap().to_string();
+    let pid = player["account_id"].as_str().unwrap().to_string();
+
+    // a public (PKCE) companion app and a confidential partner site
+    let (st, pubc) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/oauth/clients",
+        k,
+        Some(json!({"name": unique("companion"), "kind": "public", "scopes": ["account:read", "friends"],
+            "redirect_uris": ["https://companion.example.com/cb", "https://companion.example.com/cb2"], "token_ttl_secs": 600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{pubc}");
+    let pub_id = pubc["client_id"].as_str().unwrap().to_string();
+    let (st, conf) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/oauth/clients",
+        k,
+        Some(
+            json!({"name": unique("partner"), "kind": "confidential", "scopes": ["account:read"],
+            "redirect_uris": ["https://partner.example.com/cb"]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    let conf_id = conf["client_id"].as_str().unwrap().to_string();
+    let conf_secret = conf["client_secret"].as_str().unwrap().to_string();
+
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk_dBjftJeZ4CVP";
+    let challenge = {
+        use base64::Engine;
+        use sha2::Digest;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()))
+    };
+    let cb = "https://companion.example.com/cb";
+
+    // preview / validation
+    let q = format!("/v1/oauth/authorize?client_id={pub_id}&redirect_uri={cb}&scope=account:read%20friends&state=xyz&code_challenge={challenge}&code_challenge_method=S256");
+    let (st, _) = call(&app, "GET", &q, None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, pv) = call(&app, "GET", &q, Some(&ptok), None).await;
+    assert_eq!(st, StatusCode::OK, "{pv}");
+    assert_eq!(pv["client"]["client_id"], pub_id);
+    assert_eq!(pv["scopes"], json!(["account:read", "friends"]));
+    assert_eq!(pv["already_granted"], false);
+    assert_eq!(pv["pkce"], true);
+    for (bad, want) in [
+        (
+            json!({"client_id": "mc_nope", "scope": "account:read", "code_challenge": challenge}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({"client_id": pub_id, "scope": "account:read", "redirect_uri": "https://evil.example.com/", "code_challenge": challenge}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"client_id": pub_id, "scope": "account:read"}),
+            StatusCode::BAD_REQUEST,
+        ), // no redirect_uri (two registered)
+        (
+            json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read"}),
+            StatusCode::BAD_REQUEST,
+        ), // public without PKCE
+        (
+            json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read", "code_challenge": challenge, "code_challenge_method": "plain"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"client_id": pub_id, "redirect_uri": cb, "scope": "wallet", "code_challenge": challenge}),
+            StatusCode::BAD_REQUEST,
+        ), // outside client scopes
+        (
+            json!({"client_id": pub_id, "redirect_uri": cb, "scope": "*", "code_challenge": challenge}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"client_id": pub_id, "redirect_uri": cb, "code_challenge": challenge}),
+            StatusCode::BAD_REQUEST,
+        ), // no scope
+        (
+            json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read", "code_challenge": challenge, "response_type": "token"}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/oauth/authorize",
+            Some(&ptok),
+            Some(bad.clone()),
+        )
+        .await;
+        assert_eq!(st, want, "{bad} -> {v}");
+    }
+
+    // deny
+    let (st, d) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read friends", "state": "xyz", "code_challenge": challenge, "approve": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["error"], "access_denied");
+    assert_eq!(
+        d["redirect_to"],
+        format!("{cb}?error=access_denied&state=xyz")
+    );
+
+    // approve → code
+    let (st, a) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": pub_id, "redirect_uri": cb, "scope": "friends account:read", "state": "xyz", "code_challenge": challenge, "code_challenge_method": "S256"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let code = a["code"].as_str().unwrap().to_string();
+    assert!(code.starts_with("mac_"));
+    assert_eq!(a["redirect_to"], format!("{cb}?code={code}&state=xyz"));
+    let (_, pv) = call(&app, "GET", &q, Some(&ptok), None).await;
+    assert_eq!(pv["already_granted"], true);
+    assert_eq!(pv["granted_scopes"], json!(["account:read", "friends"]));
+
+    // token exchange: wrong verifier burns the code
+    let tok = |body: Value| call(&app, "POST", "/v1/oauth/token", None, Some(body));
+    let (st, e) = tok(json!({"grant_type": "authorization_code", "client_id": pub_id, "code": code, "code_verifier": "wrong-verifier-wrong-verifier-wrong-verifier-wrong"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert_eq!(e["error"], "invalid_grant");
+    let (st, e) = tok(json!({"grant_type": "authorization_code", "client_id": pub_id, "code": code, "code_verifier": verifier})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert!(
+        e["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("already used"),
+        "{e}"
+    );
+    let (st, e) = tok(json!({"grant_type": "authorization_code", "client_id": pub_id, "code": "mac_nope", "code_verifier": verifier})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = tok(json!({"grant_type": "password", "client_id": pub_id})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert_eq!(e["error"], "unsupported_grant_type");
+
+    // fresh code → tokens
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read friends", "code_challenge": challenge})),
+    )
+    .await;
+    let code = a["code"].as_str().unwrap().to_string();
+    let (st, e) = tok(json!({"grant_type": "authorization_code", "client_id": conf_id, "client_secret": conf_secret, "code": code, "code_verifier": verifier})).await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "another client cannot redeem: {e}"
+    );
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read friends", "code_challenge": challenge})),
+    )
+    .await;
+    let code = a["code"].as_str().unwrap().to_string();
+    let (st, t) = tok(json!({"grant_type": "authorization_code", "client_id": pub_id, "code": code, "code_verifier": verifier, "redirect_uri": cb})).await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!(t["token_type"], "Bearer");
+    assert_eq!(t["account_id"], pid);
+    assert_eq!(t["scope"], "account:read friends");
+    assert_eq!(t["expires_in"], 600);
+    let at = t["access_token"].as_str().unwrap().to_string();
+    let rt = t["refresh_token"].as_str().unwrap().to_string();
+    assert!(rt.starts_with("mrt_"));
+    // the app sees the player within its scopes only
+    let (st, me) = call(&app, "GET", "/v1/account/me", Some(&at), None).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    assert_eq!(me["id"], pid);
+    let (st, v) = call(&app, "GET", "/v1/wallet", Some(&at), None).await;
+    assert!(
+        st == StatusCode::FORBIDDEN || st == StatusCode::UNAUTHORIZED,
+        "{st} {v}"
+    );
+    let (st, v) = call(&app, "POST", "/v1/oauth/authorize", Some(&at), Some(json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read", "code_challenge": challenge}))).await;
+    assert!(
+        st == StatusCode::FORBIDDEN || st == StatusCode::UNAUTHORIZED,
+        "scoped token cannot delegate: {st} {v}"
+    );
+
+    // introspection sees player + refresh tokens
+    let (st, i) = call_server(
+        &app,
+        "POST",
+        "/v1/oauth/introspect",
+        k,
+        Some(json!({"token": at})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{i}");
+    assert_eq!(i["active"], true);
+    assert_eq!(i["token_type"], "player");
+    assert_eq!(i["sub"], pid);
+    let (_, i) = call_server(
+        &app,
+        "POST",
+        "/v1/oauth/introspect",
+        k,
+        Some(json!({"token": rt})),
+    )
+    .await;
+    assert_eq!(i["active"], true, "{i}");
+    assert_eq!(i["token_type"], "refresh_token");
+    assert_eq!(i["client_id"], pub_id);
+
+    // refresh rotation + down-scoping + reuse detection
+    let (st, e) = tok(json!({"grant_type": "refresh_token", "client_id": pub_id, "refresh_token": rt, "scope": "account:read wallet"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert_eq!(e["error"], "invalid_scope");
+    let (st, t2) = tok(json!({"grant_type": "refresh_token", "client_id": pub_id, "refresh_token": rt, "scope": "account:read"})).await;
+    assert_eq!(st, StatusCode::OK, "{t2}");
+    assert_eq!(t2["scope"], "account:read");
+    let rt2 = t2["refresh_token"].as_str().unwrap().to_string();
+    assert_ne!(rt2, rt);
+    let (_, i) = call_server(
+        &app,
+        "POST",
+        "/v1/oauth/introspect",
+        k,
+        Some(json!({"token": rt})),
+    )
+    .await;
+    assert_eq!(i["active"], false, "rotated: {i}");
+    let (st, e) =
+        tok(json!({"grant_type": "refresh_token", "client_id": pub_id, "refresh_token": rt})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert!(
+        e["error_description"].as_str().unwrap().contains("family"),
+        "{e}"
+    );
+    let (st, e) =
+        tok(json!({"grant_type": "refresh_token", "client_id": pub_id, "refresh_token": rt2}))
+            .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "family revoked after reuse: {e}"
+    );
+
+    // grants: list, admin view, player disconnect kills refresh tokens
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read", "code_challenge": challenge})),
+    )
+    .await;
+    let (st, t3) = tok(json!({"grant_type": "authorization_code", "client_id": pub_id, "code": a["code"], "code_verifier": verifier})).await;
+    assert_eq!(st, StatusCode::OK, "{t3}");
+    let rt3 = t3["refresh_token"].as_str().unwrap().to_string();
+    let (st, g) = call(&app, "GET", "/v1/account/oauth/grants", Some(&ptok), None).await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let grants = g["grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{g}");
+    assert_eq!(grants[0]["client_id"], pub_id);
+    assert_eq!(grants[0]["scopes"], json!(["account:read", "friends"]));
+    assert_eq!(grants[0]["live_refresh_tokens"], 1);
+    let (st, ag) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/oauth/clients/{pub_id}/grants"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ag}");
+    assert_eq!(ag["active_grants"], 1);
+    assert_eq!(ag["grants"][0]["account_id"], pid);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/oauth/clients/mc_nope/grants",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // RFC 7009 revoke of a refresh token by the server key
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/oauth/revoke",
+        k,
+        Some(json!({"token": rt3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, e) =
+        tok(json!({"grant_type": "refresh_token", "client_id": pub_id, "refresh_token": rt3}))
+            .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    assert!(
+        e["error_description"].as_str().unwrap().contains("revoked"),
+        "{e}"
+    );
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": pub_id, "redirect_uri": cb, "scope": "account:read", "code_challenge": challenge})),
+    )
+    .await;
+    let (_, t4) = tok(json!({"grant_type": "authorization_code", "client_id": pub_id, "code": a["code"], "code_verifier": verifier})).await;
+    let rt4 = t4["refresh_token"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/account/oauth/grants/{pub_id}"),
+        Some(&ptok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/account/oauth/grants/{pub_id}"),
+        Some(&ptok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, e) =
+        tok(json!({"grant_type": "refresh_token", "client_id": pub_id, "refresh_token": rt4}))
+            .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (_, g) = call(&app, "GET", "/v1/account/oauth/grants", Some(&ptok), None).await;
+    assert_eq!(g["grants"].as_array().unwrap().len(), 0);
+    let (_, pv) = call(&app, "GET", &q, Some(&ptok), None).await;
+    assert_eq!(pv["already_granted"], false);
+
+    // confidential client: secret required, no PKCE needed; admin kill-switch
+    let (st, a) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": conf_id, "scope": "account:read", "state": "s1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(
+        a["redirect_to"],
+        format!(
+            "https://partner.example.com/cb?code={}&state=s1",
+            a["code"].as_str().unwrap()
+        )
+    );
+    let (st, e) =
+        tok(json!({"grant_type": "authorization_code", "client_id": conf_id, "code": a["code"]}))
+            .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{e}");
+    assert_eq!(e["error"], "invalid_client");
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/oauth/authorize",
+        Some(&ptok),
+        Some(json!({"client_id": conf_id, "scope": "account:read"})),
+    )
+    .await;
+    let (st, t5) = tok(json!({"grant_type": "authorization_code", "client_id": conf_id, "client_secret": conf_secret, "code": a["code"]})).await;
+    assert_eq!(st, StatusCode::OK, "{t5}");
+    assert_eq!(t5["client_id"], conf_id);
+    let (st, r) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/oauth/clients/{conf_id}/grants"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["revoked"], 1);
+    let (st, e) = tok(json!({"grant_type": "refresh_token", "client_id": conf_id, "client_secret": conf_secret, "refresh_token": t5["refresh_token"]})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+}

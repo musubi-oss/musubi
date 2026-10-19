@@ -29,25 +29,25 @@ const MAX_TTL: i64 = 7 * 86_400;
 const DEFAULT_TTL: i64 = 3600;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct ClientRow {
-    client_id: String,
-    name: String,
-    description: String,
-    kind: String,
-    role: String,
-    scopes: Vec<String>,
-    redirect_uris: Vec<String>,
-    allowed_ips: Vec<String>,
-    token_ttl_secs: i64,
-    enabled: bool,
-    owner: Option<String>,
-    metadata: Value,
-    secrets: Value,
-    tokens_issued: i64,
-    failures: i64,
-    last_token_at: Option<OffsetDateTime>,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
+pub(super) struct ClientRow {
+    pub(super) client_id: String,
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) kind: String,
+    pub(super) role: String,
+    pub(super) scopes: Vec<String>,
+    pub(super) redirect_uris: Vec<String>,
+    pub(super) allowed_ips: Vec<String>,
+    pub(super) token_ttl_secs: i64,
+    pub(super) enabled: bool,
+    pub(super) owner: Option<String>,
+    pub(super) metadata: Value,
+    pub(super) secrets: Value,
+    pub(super) tokens_issued: i64,
+    pub(super) failures: i64,
+    pub(super) last_token_at: Option<OffsetDateTime>,
+    pub(super) created_at: OffsetDateTime,
+    pub(super) updated_at: OffsetDateTime,
 }
 
 const COLS: &str = "client_id, name, description, kind, role, scopes, redirect_uris, allowed_ips, token_ttl_secs, enabled, owner, metadata, secrets, tokens_issued, failures, last_token_at, created_at, updated_at";
@@ -71,7 +71,7 @@ fn client_json(c: &ClientRow) -> Value {
     })
 }
 
-async fn load(db: &PgPool, id: &str) -> Result<Option<ClientRow>> {
+pub(super) async fn load(db: &PgPool, id: &str) -> Result<Option<ClientRow>> {
     sqlx::query_as(&format!(
         "select {COLS} from musubi.oauth_clients where client_id = $1"
     ))
@@ -274,7 +274,7 @@ fn client_auth(
         .map(|id| (id.clone(), p.get("client_secret").cloned()))
 }
 
-fn oauth_error(status: StatusCode, code: &str, desc: &str) -> Response {
+pub(super) fn oauth_error(status: StatusCode, code: &str, desc: &str) -> Response {
     let mut r = (
         status,
         Json(json!({ "error": code, "error_description": desc })),
@@ -293,7 +293,7 @@ fn oauth_error(status: StatusCode, code: &str, desc: &str) -> Response {
     r
 }
 
-async fn note_failure(s: &AppState, client_id: &str, reason: &str, ip: &str) {
+pub(super) async fn note_failure(s: &AppState, client_id: &str, reason: &str, ip: &str) {
     let _ =
         sqlx::query("update musubi.oauth_clients set failures = failures + 1 where client_id = $1")
             .bind(client_id)
@@ -309,7 +309,7 @@ async fn note_failure(s: &AppState, client_id: &str, reason: &str, ip: &str) {
 }
 
 /// Authenticate the calling client (shared by token/introspect/revoke).
-async fn authenticate_client(
+pub(super) async fn authenticate_client(
     s: &AppState,
     headers: &HeaderMap,
     p: &HashMap<String, String>,
@@ -389,12 +389,21 @@ async fn token(
         return ApiError(e).into_response();
     }
     let p = params(&headers, &body);
-    if p.get("grant_type").map(String::as_str) != Some("client_credentials") {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_grant_type",
-            "only client_credentials is supported",
-        );
+    match p.get("grant_type").map(String::as_str) {
+        Some("client_credentials") => {}
+        Some("authorization_code") => {
+            return super::oauth_authz::token_code(&s, &headers, &p, &ip.0).await
+        }
+        Some("refresh_token") => {
+            return super::oauth_authz::token_refresh(&s, &headers, &p, &ip.0).await
+        }
+        _ => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_grant_type",
+                "grant_type must be client_credentials, authorization_code or refresh_token",
+            )
+        }
     }
     let c = match authenticate_client(&s, &headers, &p, &ip.0).await {
         Ok(c) => c,
@@ -546,7 +555,7 @@ async fn introspect(
             let active = k.revoked_at.is_none() && k.expires_at.is_none_or(|e| e > now);
             Json(key_json(&k, active)).into_response()
         }
-        _ => Json(json!({ "active": false })).into_response(),
+        _ => super::oauth_authz::introspect_player(&s, tok, who.as_deref()).await,
     }
 }
 
@@ -575,6 +584,9 @@ async fn revoke(
         Ok(r) => r,
         Err(e) => return ApiError(Error::internal(e)).into_response(),
     };
+    if row.is_none() {
+        super::oauth_authz::revoke_player_token(&s, tok, who.as_deref()).await;
+    }
     if let Some((id, subject)) = row {
         if who.is_none() || who.as_deref() == subject.as_deref() {
             if let Err(e) = s.keys.revoke(&s.db, id).await {
