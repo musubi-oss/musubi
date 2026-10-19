@@ -4,6 +4,7 @@ pub mod achievement_sync;
 pub mod analytics;
 pub mod anticheat;
 pub mod app;
+pub mod async_mm;
 pub mod audit;
 pub mod automod;
 pub mod bans;

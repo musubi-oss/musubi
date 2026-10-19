@@ -93,6 +93,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         social: musubi_social::SocialService::new(db.clone()),
         groups: musubi_social::GroupService::new(db.clone()),
         game_sessions: musubi_server::game_sessions::GameSessionService::new(db.clone()),
+        async_mm: musubi_server::async_mm::AsyncMatchService::new(db.clone()),
         lobbies: musubi_server::lobby::LobbyService::new(
             db.clone(),
             musubi_server::notify::Notifier::new(
@@ -23178,4 +23179,553 @@ async fn game_sessions_crud_idempotency_codes_seats_and_templates() {
     assert!(v.to_string().contains(&cid), "{v}");
     let (_, v) = call_server(&app, "DELETE", "/v1/server/session_templates/duel", k, None).await;
     assert_eq!(v["deleted"], true);
+}
+
+#[tokio::test]
+async fn async_matchmaking_opponents_attacks_shields_revenge() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let mut users = Vec::new();
+    for tag in ["ama", "amb", "amc", "amd"] {
+        let (_, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(tag)})),
+        )
+        .await;
+        let t = sess["access_token"].as_str().unwrap().to_string();
+        let (_, acc) = call(&app, "GET", "/v1/account", Some(&t), None).await;
+        users.push((t, acc["id"].as_str().unwrap().to_string()));
+    }
+    let (ta, a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let (tc, c) = users[2].clone();
+    let (td, d) = users[3].clone();
+    let q = unique("aq");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/rating/queues",
+        k,
+        Some(json!({"id": q, "system": "elo", "params": {"elo_k": 32.0, "placement_games": 0}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    for (w, l) in [(&a, &b), (&c, &d)] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            &format!("/v1/server/rating/queues/{q}/results"),
+            k,
+            Some(json!({"teams": [[w], [l]]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    // rules: rating queue must exist, values validated
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/matchmaker/async/no-such-queue",
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/matchmaker/async/{q}"),
+        k,
+        Some(json!({"spread": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let rules = json!({"spread": 10.0, "max_spread": 500.0, "count": 3, "defender_cooldown_secs": 3600,
+        "attack_ttl_secs": 600, "max_open": 1, "shield_on_loss_secs": 3600, "revenge_ttl_secs": 3600,
+        "attacks_per_day": 3});
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/matchmaker/async/{q}"),
+        k,
+        Some(rules.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["enabled"], true);
+
+    // opponents: within 10 only c (same rating as a) → widened to 500 → b, c, d; never myself
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/opponents"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ops = v["opponents"].as_array().unwrap();
+    assert_eq!(ops.len(), 3, "{v}");
+    assert_eq!(v["spread"], 500.0);
+    assert_eq!(ops[0]["account_id"], c, "nearest first: {v}");
+    assert!(ops.iter().all(|o| o["account_id"] != a));
+    // d opts out → gone from the list
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("/v1/matchmaker/async/{q}/opt_out"),
+        Some(&td),
+        Some(json!({"opted_out": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/opponents?count=10"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(v["opponents"].as_array().unwrap().len(), 2, "{v}");
+
+    // attack: self refused, one open at a time, only the attacker resolves
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&ta),
+        Some(json!({"defender_id": a})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, at1) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&ta),
+        Some(json!({"defender_id": b, "data": {"deck": 7}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{at1}");
+    assert_eq!(at1["state"], "open");
+    let at1_id = at1["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&ta),
+        Some(json!({"defender_id": c})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks/{at1_id}/resolve"),
+        Some(&tc),
+        Some(json!({"result": "win"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks/{at1_id}/resolve"),
+        Some(&ta),
+        Some(json!({"result": "bogus"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks/{at1_id}/resolve"),
+        Some(&ta),
+        Some(json!({"result": "win", "data": {"stars": 3}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["attack"]["state"], "resolved");
+    assert_eq!(v["attack"]["data"]["stars"], 3);
+    assert_eq!(v["rating"]["changes"].as_array().unwrap().len(), 2);
+    assert!(
+        v["rating"]["changes"][0]["after"].as_f64().unwrap() > 1516.0,
+        "{v}"
+    );
+    assert!(
+        v["defender_shield"]["seconds_left"].as_i64().unwrap() > 3500,
+        "{v}"
+    );
+    // resolving twice → 409
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks/{at1_id}/resolve"),
+        Some(&ta),
+        Some(json!({"result": "win"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // b is shielded: nobody can attack, b is not offered; server drops the shield
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&tc),
+        Some(json!({"defender_id": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("shielded"));
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/opponents?count=10"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert!(
+        v["opponents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["account_id"] != b),
+        "{v}"
+    );
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/me"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(v["shield"]["source"], "loss", "{v}");
+    assert_eq!(v["incoming"][0]["revenge_available"], true);
+    assert_eq!(v["attacks_left_today"], 3);
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/matchmaker/async/{q}/shields/{b}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["dropped"], true);
+    let (st, at2) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&tc),
+        Some(json!({"defender_id": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{at2}");
+    let at2_id = at2["id"].as_str().unwrap().to_string();
+    // server-side resolve (authoritative sim): c lost → no shield for b
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matchmaker/async/attacks/{at2_id}/resolve"),
+        k,
+        Some(json!({"result": "loss"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["defender_shield"].is_null());
+    // a → b again: defender cooldown
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&ta),
+        Some(json!({"defender_id": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("cooldown"));
+
+    // revenge: b strikes back at a (ignores cooldown), once
+    let (_, me) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/me"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    let inc = me["incoming"].as_array().unwrap();
+    assert_eq!(inc.len(), 2, "{me}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&tb),
+        Some(json!({"defender_id": c, "revenge_of": at1_id})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "revenge_of must point at that attacker: {v}"
+    );
+    let (st, rv) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&tb),
+        Some(json!({"defender_id": a, "revenge_of": at1_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rv}");
+    assert_eq!(rv["revenge_of"], at1_id);
+    let rv_id = rv["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks/{rv_id}/resolve"),
+        Some(&tb),
+        Some(json!({"result": "win"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&tb),
+        Some(json!({"defender_id": a, "revenge_of": at1_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "revenge used: {v}");
+    let (_, me) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/me"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    let first = me["incoming"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == at1_id)
+        .unwrap();
+    assert_eq!(first["revenge_available"], false, "{me}");
+    // opted-out defender
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&tb),
+        Some(json!({"defender_id": d})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // daily budget: lower to 1 → b (1 attack today) is out
+    let mut r2 = rules.clone();
+    r2["attacks_per_day"] = json!(1);
+    r2["attack_ttl_secs"] = json!(1);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/matchmaker/async/{q}"),
+        k,
+        Some(r2),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&tb),
+        Some(json!({"defender_id": c})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+
+    // b's revenge win shielded a; drop it so c can attack
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/matchmaker/async/{q}/shields/{a}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // expiry: d (opted out as defender, still an attacker) → a with a 1 s TTL is gone before it is resolved
+    let (st, at3) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/attacks"),
+        Some(&td),
+        Some(json!({"defender_id": a})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{at3}");
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!(
+            "/v1/matchmaker/async/{q}/attacks/{}/resolve",
+            at3["id"].as_str().unwrap()
+        ),
+        Some(&td),
+        Some(json!({"result": "win"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("expired"));
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/matchmaker/async/{q}/attacks?state=expired"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["attacks"].as_array().unwrap().len(), 1);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/matchmaker/async/{q}/attacks?account_id={b}&role=attacker"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["attacks"].as_array().unwrap().len(), 1, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/matchmaker/async/{q}/attacks"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["attacks"].as_array().unwrap().len(), 4, "{v}");
+    // buying shield time (async_shield gold): priced per hour, wallet-debited, capped by hours
+    let gold = unique("amgold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": c, "currency": gold, "delta": 25, "reason": "seed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/shield"),
+        Some(&tc),
+        Some(json!({"hours": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "not for sale yet: {v}");
+    let mut r3 = rules.clone();
+    r3["shield_price"] = json!({"currency": gold, "per_hour": 10});
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/matchmaker/async/{q}"),
+        k,
+        Some(r3),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/shield"),
+        Some(&tc),
+        Some(json!({"hours": 999})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/shield"),
+        Some(&tc),
+        Some(json!({"hours": 3})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "25 gold cannot buy 3 h: {v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/matchmaker/async/{q}/shield"),
+        Some(&tc),
+        Some(json!({"hours": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["cost"], 20);
+    assert_eq!(v["shield"]["source"], "bought");
+    assert!(v["shield"]["seconds_left"].as_i64().unwrap() > 7100);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/me"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(v["shield"]["source"], "bought", "{v}");
+    assert_eq!(v["shield_price"]["per_hour"], 10);
+    // server-granted shield is capped by shield_max_secs
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/matchmaker/async/{q}/shields"),
+        k,
+        Some(json!({"account_id": d, "secs": 99_999_999})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["seconds_left"].as_i64().unwrap() <= 7 * 86_400);
+
+    let (_, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/matchmaker/async/{q}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["deleted"], true);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/matchmaker/async/{q}/opponents"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

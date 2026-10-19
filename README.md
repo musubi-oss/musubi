@@ -366,6 +366,22 @@ vetoes. Rejected proposals count under `bad_proposal`/`vetoed`. When the functio
 `mmf: {kind: "wasm", propose, score}` names per-queue WASM exports instead of the global `matchmaker_propose`/
 `matchmaker_score` hooks; `extensions` is an opaque JSON blob handed to either kind with every call.
 
+Asynchronous PvP (offline matchmaking, P1-55): `PUT /v1/server/matchmaker/async/{rating_queue} {spread, max_spread,
+count, max_count, min_games, defender_cooldown_secs, attack_ttl_secs, attacks_per_day, max_open, shield_on_loss_secs,
+shield_max_secs, attack_breaks_shield, shield_price: {currency, per_hour}, revenge_ttl_secs, revenge_ignores_shield}`
+turns a rating queue into an attack ladder. `GET /v1/matchmaker/async/{q}/opponents?count&spread` — attackable players
+nearest to my display rating (within `spread`, widened to `max_spread` when too few; never shielded, opted-out,
+under-played, under my cooldown or already in one of my open attacks; `revenge_of` set when striking back is allowed);
+`POST …/attacks {defender_id, revenge_of?, data}` opens an attack (one per `max_open`, daily budget, cooldown per defender;
+revenge ignores shield and cooldown and can be used once per received attack within `revenge_ttl_secs`; starting an
+attack drops the attacker's own shield), `POST …/attacks/{id}/resolve {result: win|loss|draw, data?}` by the attacker
+or `POST /v1/server/matchmaker/async/attacks/{id}/resolve` by the game server: rating result for both sides, loser's
+shield (`shield_on_loss_secs`), `async_attack` notification to the defender with the revenge window, events
+`async_mm.attack_started|resolved`. Unresolved attacks expire after `attack_ttl_secs`. `GET …/me` (shield, opt-out,
+open/incoming with `revenge_available`, daily budget), `PUT …/opt_out`, `POST …/shield {hours}` buys shield time from the
+wallet (ledger reason `async_shield`; refused with an open attack), shields never reach past `shield_max_secs`;
+server: `POST|DELETE /v1/server/matchmaker/async/{q}/shields[/{account_id}]`, `GET …/attacks?account_id&role&state`.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

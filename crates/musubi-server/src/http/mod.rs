@@ -3,6 +3,7 @@ pub mod account_policy;
 pub mod admin;
 mod analytics;
 mod anticheat;
+pub mod async_mm;
 pub mod audiences;
 mod auth;
 mod bans;
@@ -244,6 +245,7 @@ pub fn router(state: AppState) -> Router {
         .merge(account_policy::routes())
         .merge(items_lifecycle::routes())
         .merge(game_sessions::routes())
+        .merge(async_mm::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())
