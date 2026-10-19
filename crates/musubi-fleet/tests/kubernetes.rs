@@ -119,6 +119,7 @@ fn fleet() -> Fleet {
             vcpu: None,
             slots_per_server: None,
             resources: Default::default(),
+            ..Default::default()
         },
         buffer: 1,
         max_servers: 2,

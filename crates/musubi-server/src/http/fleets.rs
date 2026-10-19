@@ -19,6 +19,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets", get(list).post(create))
         .route("/v1/server/fleets/{id}", get(get_one).delete(delete))
         .route("/v1/server/fleets/{id}/scale", post(scale))
+        .route("/v1/server/fleets/{id}/reconcile", post(reconcile_now))
         .route(
             "/v1/server/fleets/providers/{name}/prepare",
             post(prepare_provider),
@@ -143,6 +144,17 @@ async fn prepare_provider(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(s.fleets.prepare_provider(&name).await?))
+}
+
+/// `POST /v1/server/fleets/{id}/reconcile` — run the autoscaler for one fleet now (starts what
+/// is missing, reaps dead/idle servers); the background reconciler does this every few seconds.
+async fn reconcile_now(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (started, reaped) = s.fleets.reconcile_one(parse(&id)?).await?;
+    Ok(Json(json!({ "started": started, "reaped": reaped })))
 }
 
 async fn scale(

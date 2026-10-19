@@ -1,8 +1,9 @@
 //! HTTP integration tests. Run with `MUSUBI_TEST_DATABASE_URL=postgres://...`; skipped otherwise.
 
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
-use axum::Router;
+use axum::{Json, Router};
 use http_body_util::BodyExt;
 use musubi_auth::AuthService;
 use musubi_core::config::Config;
@@ -61,6 +62,12 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         "defaultkey",
     ));
     fleets.spawn_log_writer();
+    if !cfg.fleet.ssh.hosts.is_empty() || !cfg.fleet.capacity.pools.is_empty() {
+        fleets
+            .enable_ssh(db.clone(), &cfg.fleet.ssh, &cfg.fleet.capacity)
+            .await
+            .unwrap();
+    }
     fanout.set_fleets(fleets.clone());
     let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new(
         cluster.as_ref().unwrap().node_id().0,
@@ -29235,4 +29242,830 @@ async fn dev_loadtest_simulated_players() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// Stand-in `ssh` for the host pool: answers start scripts with a pid, probes with
+/// `musubi-host-ok`, and refuses hosts that have a `down-<addr>` marker in `dir`.
+fn fake_host_ssh(dir: &std::path::Path) -> String {
+    let script = dir.join("fake-ssh.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; case \"$a\" in *@*) target=\"${{a#*@}}\" ;; esac; done\n\
+             if [ -f {dir}/down-\"$target\" ]; then echo unreachable >&2; exit 255; fi\n\
+             case \"$last\" in\n\
+               *'echo $!'*) echo 4242 ;;\n\
+               *'musubi-host-ok'*) echo musubi-host-ok ;;\n\
+               *'kill -0'*) echo up ;;\n\
+             esac\n",
+            dir = dir.display()
+        ),
+    )
+    .unwrap();
+    script.display().to_string()
+}
+
+#[tokio::test]
+async fn fleet_host_pool_and_capacity_pools() {
+    if std::env::var("MUSUBI_TEST_DATABASE_URL").is_err() {
+        return;
+    }
+    // fake cloud: Hetzner-shaped /servers and a webhook provisioner under /wh
+    #[derive(Clone, Default)]
+    struct Cloud(
+        Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        Arc<std::sync::atomic::AtomicU32>,
+    );
+    let cloud = Cloud::default();
+    let oct = (uuid::Uuid::now_v7().as_u128() % 200 + 20) as u8;
+    let cloud_app = Router::new()
+        .route(
+            "/servers",
+            axum::routing::post(move |State(c): State<Cloud>, Json(b): Json<Value>| async move {
+                let n = c.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                c.0.lock().unwrap().push(("POST /servers".into(), b));
+                Json(json!({"server": {"id": 100 + n, "public_net": {"ipv4": {"ip": format!("10.9.{oct}.{n}")}}}}))
+            }),
+        )
+        .route(
+            "/servers/{id}",
+            axum::routing::delete(|State(c): State<Cloud>, axum::extract::Path(id): axum::extract::Path<String>| async move {
+                c.0.lock().unwrap().push((format!("DELETE /servers/{id}"), Value::Null));
+                StatusCode::NO_CONTENT
+            }),
+        )
+        .route(
+            "/wh/provision",
+            axum::routing::post(move |State(c): State<Cloud>, Json(b): Json<Value>| async move {
+                let n = c.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let count = b["count"].as_u64().unwrap_or(1);
+                c.0.lock().unwrap().push(("POST /wh/provision".into(), b));
+                let hosts: Vec<Value> = (0..count)
+                    .map(|i| json!({"external_id": format!("wh-{}", n + i as u32), "addr": format!("10.8.{oct}.{}", n + i as u32), "public_addr": format!("203.0.113.{}", n + i as u32)}))
+                    .collect();
+                Json(json!({"hosts": hosts}))
+            }),
+        )
+        .route(
+            "/wh/deprovision",
+            axum::routing::post(move |State(c): State<Cloud>, Json(b): Json<Value>| async move {
+                c.0.lock().unwrap().push(("POST /wh/deprovision".into(), b));
+                Json(json!({}))
+            }),
+        )
+        .with_state(cloud.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cloud_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, cloud_app).await.unwrap() });
+
+    let dir = std::env::temp_dir().join(format!("musubi-hosts-{}", uuid::Uuid::now_v7().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ssh = fake_host_ssh(&dir);
+    let octet = oct;
+    let static_addr = format!("10.1.{octet}.1");
+    let manual_addr = format!("10.1.{octet}.2");
+    let reg = unique("reg");
+    let reg2 = unique("reg");
+    let (hz, racks, wh) = (unique("hz"), unique("racks"), unique("wh"));
+    let Some(app) = app_with(|cfg| {
+        cfg.fleet.ssh = musubi_core::config::SshFleetConfig {
+            hosts: vec![musubi_core::config::SshHost {
+                addr: static_addr.clone(),
+                capacity: 1,
+                ..Default::default()
+            }],
+            ssh_command: "sh".into(),
+            ssh_args: vec![ssh.clone()],
+            connect_timeout_secs: 3,
+        };
+        let base = musubi_core::config::CapacityPoolConfig {
+            region: reg.clone(),
+            cooldown_secs: 0,
+            scale_down_idle_secs: 0,
+            ..Default::default()
+        };
+        cfg.fleet.capacity.pools = vec![
+            musubi_core::config::CapacityPoolConfig {
+                name: hz.clone(),
+                kind: "hetzner".into(),
+                class: "cx22".into(),
+                capacity_per_host: 2,
+                max_hosts: 2,
+                api_url: format!("http://127.0.0.1:{cloud_port}"),
+                token: "t".into(),
+                server_type: "cx22".into(),
+                image: "ubuntu-24.04".into(),
+                location: "fsn1".into(),
+                cost_per_hour: 0.01,
+                spot: true,
+                ..base.clone()
+            },
+            musubi_core::config::CapacityPoolConfig {
+                name: racks.clone(),
+                kind: "manual".into(),
+                class: "ax41".into(),
+                max_hosts: 2,
+                ..base.clone()
+            },
+            musubi_core::config::CapacityPoolConfig {
+                name: wh.clone(),
+                kind: "webhook".into(),
+                region: reg2.clone(),
+                class: "vps".into(),
+                capacity_per_host: 1,
+                min_hosts: 1,
+                max_hosts: 2,
+                url: format!("http://127.0.0.1:{cloud_port}/wh"),
+                token: "s".into(),
+                ..base
+            },
+        ];
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let nil = "00000000-0000-0000-0000-000000000000";
+
+    // static host seeded; pools visible
+    let (st, v) = call_server(&app, "GET", "/v1/server/fleets/hosts", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let sh = v["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["addr"] == static_addr)
+        .cloned()
+        .expect("static host");
+    assert_eq!(sh["source"], "static");
+    assert_eq!(sh["state"], "ready");
+    assert_eq!(sh["free"], 1);
+    let static_id = sh["id"].as_str().unwrap().to_string();
+    let (st, v) = call_server(&app, "GET", "/v1/server/fleets/capacity", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let names: Vec<&str> = v["pools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&hz.as_str()) && names.contains(&racks.as_str()),
+        "{v}"
+    );
+    let (st, _) = call_server(&app, "GET", "/v1/server/fleets/hosts/classes", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // register a bare-metal box by hand; validation
+    let (st, m) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/hosts",
+        k,
+        Some(json!({"addr": manual_addr, "capacity": 3, "region": reg, "class": "ax41", "labels": {"gpu": "a10"}, "cost_per_hour": 1.5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert_eq!(m["source"], "manual");
+    assert_eq!(m["state"], "ready");
+    let mid = m["id"].as_str().unwrap().to_string();
+    for (body, want) in [
+        (json!({"addr": manual_addr}), StatusCode::CONFLICT),
+        (json!({"addr": "a b"}), StatusCode::BAD_REQUEST),
+        (
+            json!({"addr": "10.1.250.9", "capacity": 0}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"addr": "10.1.250.9", "pool": "nope"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"addr": "10.1.250.9", "labels": {"a": [1]}}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/fleets/hosts",
+            k,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(st, want, "{body} → {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/fleets/hosts/{mid}"),
+        k,
+        Some(json!({"name": "rack-1", "labels": {"gpu": "a10", "rack": 3}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "rack-1");
+    let (st, _) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/fleets/hosts/{mid}"),
+        k,
+        Some(json!({"state": "terminating"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // fleet pinned to the ax41 class lands on the manual host only (static host has no class)
+    let (st, f1) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({"name": unique("bm"), "provider": "ssh", "region": reg, "max_servers": 4, "port_start": 48000, "port_end": 48100,
+            "spec": {"command": ["/opt/game/server"], "host_class": "ax41", "host_labels": {"gpu": "a10"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f1}");
+    let f1 = f1["id"].as_str().unwrap().to_string();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f1}/scale"),
+        k,
+        Some(json!({"min_servers": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f1}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["started"], 3, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts/{mid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["used"], 3, "{v}");
+    assert_eq!(v["free"], 0);
+    assert_eq!(v["servers"].as_array().unwrap().len(), 3);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts/{static_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["used"], 0, "class pin keeps the static host out: {v}");
+    // a 4th server starves → the manual pool asks for hardware
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f1}/scale"),
+        k,
+        Some(json!({"min_servers": 4})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f1}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["started"], 0, "{v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/fleets/capacity", k, None).await;
+    assert!(
+        v["starved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["region"] == reg && s["class"] == "ax41"),
+        "{v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let acts = v["actions"].as_array().unwrap().clone();
+    assert!(
+        acts.iter()
+            .any(|a| a["pool"] == racks && a["action"] == "needed"),
+        "{v}"
+    );
+    // webhook pool holds min_hosts = 1 from the first pass
+    assert!(
+        acts.iter()
+            .any(|a| a["pool"] == wh && a["action"] == "provisioned"),
+        "{v}"
+    );
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{nil}/events?limit=200"),
+        k,
+        None,
+    )
+    .await;
+    let codes: Vec<String> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap().to_string())
+        .collect();
+    assert!(codes.contains(&"capacity.needed".to_string()), "{codes:?}");
+    assert!(codes.contains(&"host.registered".to_string()), "{codes:?}");
+
+    // hetzner pool: starvation orders a machine, the next pass finds it reachable
+    let (st, f2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({"name": unique("cloud"), "provider": "ssh", "region": reg, "max_servers": 2, "port_start": 48200, "port_end": 48300,
+            "spec": {"command": ["/opt/game/server"], "host_class": "cx22"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f2}");
+    let f2 = f2["id"].as_str().unwrap().to_string();
+    call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f2}/scale"),
+        k,
+        Some(json!({"min_servers": 1})),
+    )
+    .await;
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f2}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["started"], 0, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    let acts = v["actions"].as_array().unwrap().clone();
+    assert!(
+        acts.iter()
+            .any(|a| a["pool"] == hz && a["action"] == "provisioned"),
+        "{v}"
+    );
+    assert!(
+        acts.iter().any(|a| a["action"] == "ready"),
+        "webhook host answered: {v}"
+    );
+    {
+        let log = cloud.0.lock().unwrap();
+        let (_, body) = log
+            .iter()
+            .find(|(m, _)| m == "POST /servers")
+            .expect("hetzner create");
+        assert_eq!(body["server_type"], "cx22");
+        assert_eq!(body["image"], "ubuntu-24.04");
+        assert_eq!(body["location"], "fsn1");
+        assert_eq!(body["labels"]["musubi-pool"], hz);
+        let (_, body) = log
+            .iter()
+            .find(|(m, _)| m == "POST /wh/provision")
+            .expect("webhook provision");
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["class"], "vps");
+    }
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts?pool={hz}"),
+        k,
+        None,
+    )
+    .await;
+    let hzh = v["hosts"][0].clone();
+    assert_eq!(v["count"], 1, "{v}");
+    assert_eq!(hzh["state"], "provisioning", "{hzh}");
+    assert_eq!(hzh["source"], "provisioned");
+    let hz_ext = hzh["external_id"].as_str().unwrap().to_string();
+    assert_eq!(hzh["spot"], true);
+    assert_eq!(hzh["capacity"], 2);
+    let hz_id = hzh["id"].as_str().unwrap().to_string();
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts?pool={wh}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["hosts"][0]["state"], "ready", "{v}");
+    assert_eq!(v["hosts"][0]["public_addr"], "203.0.113.1", "{v}");
+    let wh_id = v["hosts"][0]["id"].as_str().unwrap().to_string();
+    let wh_ext = v["hosts"][0]["external_id"].as_str().unwrap().to_string();
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["host"] == hz_id && a["action"] == "ready"),
+        "{v}"
+    );
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f2}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["started"], 1, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts/{hz_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["used"], 1, "{v}");
+    assert_eq!(v["state"], "ready");
+    let (_, v) = call_server(&app, "GET", "/v1/server/fleets/capacity", k, None).await;
+    let pool = v["pools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == hz)
+        .unwrap()
+        .clone();
+    assert_eq!(pool["slots"]["total"], 2, "{pool}");
+    assert_eq!(pool["slots"]["used"], 1);
+    assert_eq!(pool["slots"]["free"], 1);
+    assert_eq!(pool["by_state"]["ready"], 1);
+    assert!(pool["cost_per_hour"].as_f64().unwrap() > 0.0);
+    assert!(
+        pool["last_action"]["what"]
+            .as_str()
+            .unwrap()
+            .starts_with("scaled up"),
+        "{pool}"
+    );
+
+    // spot termination notice: the (starting) server stops now, the host is released next pass
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/hosts/{hz_id}/termination-notice"),
+        k,
+        Some(json!({"deadline_secs": 0, "reason": "spot"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stopped"], 1, "{v}");
+    assert_eq!(v["host"]["state"], "terminating");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{f2}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let srv = v
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| v["servers"].as_array().unwrap().clone());
+    assert!(
+        srv.iter()
+            .any(|s| s["state"] == "terminated" && s["labels"]["exit_reason"] == "host_preempted"),
+        "{v}"
+    );
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["host"] == hz_id && a["action"] == "released"),
+        "{v}"
+    );
+    assert!(cloud
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, _)| *m == format!("DELETE /servers/{hz_ext}")));
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts?pool={hz}&include_gone=true"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["hosts"][0]["state"], "gone", "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts?pool={hz}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["count"], 0, "{v}");
+    // the fleet still wants a server → replacement machine; then idle → scaled down and released
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f2}/reconcile"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["started"], 0);
+    call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/hosts?pool={hz}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["hosts"][0]["state"], "ready", "{v}");
+    let hz2_ext = v["hosts"][0]["external_id"].as_str().unwrap().to_string();
+    let hz2 = v["hosts"][0]["id"].as_str().unwrap().to_string();
+    call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{f2}/scale"),
+        k,
+        Some(json!({"min_servers": 0})),
+    )
+    .await;
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["host"] == hz2 && a["action"] == "draining"),
+        "{v}"
+    );
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/capacity/reconcile",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        v["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["host"] == hz2 && a["action"] == "released"),
+        "{v}"
+    );
+    assert!(cloud
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, _)| *m == format!("DELETE /servers/{hz2_ext}")));
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{nil}/events?limit=500"),
+        k,
+        None,
+    )
+    .await;
+    let codes: Vec<String> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap().to_string())
+        .collect();
+    for c in [
+        "capacity.scaled_up",
+        "capacity.scaled_down",
+        "host.preempted",
+        "host.removed",
+        "host.ready",
+    ] {
+        assert!(codes.contains(&c.to_string()), "{c} missing in {codes:?}");
+    }
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets/hosts/notice",
+        k,
+        Some(json!({"addr": "10.255.255.1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // drain / undrain the manual host
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/hosts/{mid}/drain"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "draining");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/hosts/{mid}/drain"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/hosts/{mid}/undrain"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "ready");
+
+    // probe: reachable → unreachable (failed) → back
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/hosts/{static_id}/probe"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    std::fs::write(dir.join(format!("down-{static_addr}")), b"").unwrap();
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/hosts/{static_id}/probe"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(v["host"]["state"], "failed");
+    assert!(v["error"].as_str().unwrap().contains("unreachable"), "{v}");
+    std::fs::remove_file(dir.join(format!("down-{static_addr}"))).unwrap();
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/hosts/{static_id}/probe"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["host"]["state"], "ready");
+
+    // removing a busy host needs force; servers on it are stopped
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/hosts/{mid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/hosts/{mid}?force=true"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{f1}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let srv = v
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| v["servers"].as_array().unwrap().clone());
+    assert!(
+        srv.iter()
+            .filter(|s| s["labels"]["exit_reason"] == "host_removed")
+            .count()
+            >= 3,
+        "{v}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/hosts/{mid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/hosts/{wh_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["released"], true);
+    assert!(cloud
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, b)| m == "POST /wh/deprovision" && b["external_id"] == wh_ext));
+    call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/hosts/{static_id}"),
+        k,
+        None,
+    )
+    .await;
+    for f in [&f1, &f2] {
+        call_server(&app, "DELETE", &format!("/v1/server/fleets/{f}"), k, None).await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

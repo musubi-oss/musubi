@@ -18,10 +18,12 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod capacity;
 pub mod docker;
 pub mod edgegap;
 pub mod firecracker;
 pub mod gamelift;
+pub mod hosts;
 pub mod kubernetes;
 pub mod ssh;
 pub mod webhook;
@@ -124,6 +126,9 @@ pub struct FleetSpec {
     /// per server. Allocation packs onto the fullest live server with a free slot first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots_per_server: Option<u32>,
+    /// `ssh` provider: only hosts of this hardware class / with these labels take the fleet.
+    pub host_class: Option<String>,
+    pub host_labels: serde_json::Value,
 }
 
 /// Per-server resources (competitive P0-7). Unset fields leave the provider default.
@@ -837,6 +842,8 @@ pub struct GameServer {
     /// Allocations currently hosted (see `FleetSpec::slots_per_server`).
     #[serde(default)]
     pub slots_used: i32,
+    /// `ssh` provider: host-pool entry the server runs on.
+    pub host_id: Option<Uuid>,
 }
 
 /// Which servers an allocation may take (all conditions must hold).
@@ -1236,7 +1243,7 @@ fn push_server_filters(
     Ok(())
 }
 
-const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
+const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
 /// `canary_percent` of new servers (optionally only in `canary_regions`), `retired` is kept for rollback.
@@ -1344,6 +1351,10 @@ pub trait Provider: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
     /// `Some(false)` when the provider knows the process/container is gone.
     fn alive(&self, server_id: Uuid) -> Option<bool>;
+    /// Host-pool id the server runs on (`ssh` provider), for preemption and capacity accounting.
+    fn host_of(&self, _server_id: Uuid) -> Option<Uuid> {
+        None
+    }
 
     /// Last `tail` lines straight from the provider (container / VM / remote file), for providers
     /// that keep the process output themselves. `None` = not supported.
@@ -1478,6 +1489,8 @@ pub struct FleetService {
     last_scale: Arc<std::sync::Mutex<HashMap<Uuid, (i64, i64)>>>,
     log_tx: LogSink,
     log_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<LogLine>>>>,
+    /// Host pool + capacity pools behind the `ssh` provider (`enable_ssh`).
+    capacity: Arc<std::sync::RwLock<Option<Arc<capacity::CapacityState>>>>,
 }
 
 type FleetRow = (
@@ -1535,6 +1548,7 @@ struct ServerRow {
     counters: serde_json::Value,
     lists: serde_json::Value,
     slots_used: i32,
+    host_id: Option<Uuid>,
 }
 
 fn row_to_server(r: ServerRow) -> GameServer {
@@ -1558,13 +1572,14 @@ fn row_to_server(r: ServerRow) -> GameServer {
         counters: r.counters,
         lists: r.lists,
         slots_used: r.slots_used,
+        host_id: r.host_id,
     }
 }
 
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id";
 
 impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
@@ -1584,6 +1599,7 @@ impl FleetService {
             last_scale: Arc::new(std::sync::Mutex::new(HashMap::new())),
             log_tx,
             log_rx: Arc::new(std::sync::Mutex::new(Some(log_rx))),
+            capacity: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -3204,11 +3220,12 @@ impl FleetService {
             .await
         {
             Ok(st) => {
-                sqlx::query("update musubi.game_servers set address = $2, port = $3, pid = $4, updated_at = now() where id = $1")
+                sqlx::query("update musubi.game_servers set address = $2, port = $3, pid = $4, host_id = $5, updated_at = now() where id = $1")
                     .bind(id)
                     .bind(&st.address)
                     .bind(st.port)
                     .bind(st.pid)
+                    .bind(provider.host_of(id))
                     .execute(&self.db)
                     .await
                     .map_err(Error::internal)?;
@@ -3479,7 +3496,13 @@ impl FleetService {
     /// missing or stop idle ready servers above it, oldest first. Returns (started, reaped + stopped).
     pub async fn reconcile(&self) -> Result<(usize, usize)> {
         let fleets = self.list().await?;
-        self.reconcile_fleets(fleets).await
+        let r = self.reconcile_fleets(fleets).await;
+        if self.capacity().is_some() {
+            if let Err(e) = self.capacity_pass().await {
+                tracing::warn!(error = %e, "capacity pass failed");
+            }
+        }
+        r
     }
 
     /// One fleet only (tests, `POST …/reconcile`): never touches the other fleets.
@@ -3874,6 +3897,7 @@ mod lifecycle_tests {
             counters: serde_json::json!({}),
             lists: serde_json::json!({}),
             slots_used: 0,
+            host_id: None,
         }
     }
 

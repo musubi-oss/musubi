@@ -1,24 +1,27 @@
 //! Bare-metal fleet provider (plan 6.6 `hybrid`): dedicated servers are started on a pool of
 //! hosts over SSH — no agent to install, the game binary just has to be on the box. A start
-//! picks the host with the most free capacity and runs
-//! `cd <dir> && env K=V … nohup <command> >/tmp/musubi-<id>.log 2>&1 & echo $!`; the pid is kept, `stop`
-//! sends TERM then KILL, and `alive` reflects the last `kill -0` probe (`probe` refreshes).
+//! picks the eligible host (ready, fleet's region, pinned class/labels) with the most free
+//! capacity and runs `cd <dir> && env K=V … nohup <command> >/tmp/musubi-<id>.log 2>&1 & echo $!`;
+//! the pid is kept, `stop` sends TERM then KILL, and `alive` reflects the last `kill -0` probe
+//! (`probe` refreshes). Hosts come from the [`HostRegistry`] (static config and/or the
+//! `musubi.fleet_hosts` table fed by operators and capacity pools, P1-11).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use musubi_core::config::{SshFleetConfig, SshHost};
+use musubi_core::config::SshFleetConfig;
 use musubi_core::{Error, Result};
 use uuid::Uuid;
 
+use crate::hosts::{Host, HostRegistry};
 use crate::{Provider, StartRequest, Started};
 
 pub struct SshProvider {
-    cfg: SshFleetConfig,
-    /// server → (host index, remote pid)
-    running: DashMap<Uuid, (usize, i64)>,
+    hosts: Arc<HostRegistry>,
+    /// server → (host id, remote pid)
+    running: DashMap<Uuid, (Uuid, i64)>,
     dead: DashMap<Uuid, ()>,
 }
 
@@ -28,19 +31,33 @@ fn sq(s: &str) -> String {
 }
 
 impl SshProvider {
+    /// Static host list from config (no database).
     pub fn new(cfg: SshFleetConfig) -> Self {
+        Self::with_registry(Arc::new(HostRegistry::static_only(&cfg)))
+    }
+
+    pub fn with_registry(hosts: Arc<HostRegistry>) -> Self {
         Self {
-            cfg,
+            hosts,
             running: DashMap::new(),
             dead: DashMap::new(),
         }
     }
 
-    pub fn hosts(&self) -> &[SshHost] {
-        &self.cfg.hosts
+    pub fn registry(&self) -> &Arc<HostRegistry> {
+        &self.hosts
     }
 
-    fn load(&self) -> HashMap<usize, u32> {
+    pub fn hosts(&self) -> Vec<Host> {
+        self.hosts.snapshot()
+    }
+
+    fn cfg(&self) -> &SshFleetConfig {
+        self.hosts.ssh_config()
+    }
+
+    /// Servers this node started per host (what `pick` balances on).
+    pub fn load(&self) -> HashMap<Uuid, u32> {
         let mut m = HashMap::new();
         for r in self.running.iter() {
             *m.entry(r.value().0).or_insert(0) += 1;
@@ -48,30 +65,48 @@ impl SshProvider {
         m
     }
 
-    /// Host with the most free slots, or none when the pool is full.
-    fn pick(&self) -> Option<usize> {
-        let load = self.load();
-        self.cfg
-            .hosts
+    /// Servers this node runs on `host`.
+    pub fn servers_on(&self, host: Uuid) -> Vec<Uuid> {
+        self.running
             .iter()
-            .enumerate()
-            .filter_map(|(i, h)| {
-                let used = load.get(&i).copied().unwrap_or(0);
-                (h.capacity > used).then_some((h.capacity - used, i))
-            })
-            .max_by_key(|(free, i)| (*free, std::cmp::Reverse(*i)))
-            .map(|(_, i)| i)
+            .filter(|r| r.value().0 == host)
+            .map(|r| *r.key())
+            .collect()
     }
 
-    async fn ssh(&self, host: &SshHost, script: &str) -> Result<String> {
-        let mut cmd = tokio::process::Command::new(&self.cfg.ssh_command);
-        cmd.args(&self.cfg.ssh_args)
+    /// Eligible host with the most free slots, or none when every eligible host is full.
+    fn pick(&self, fleet: &crate::Fleet) -> Option<Host> {
+        let load = self.load();
+        let class = fleet.spec.host_class.as_deref();
+        let labels = fleet
+            .spec
+            .host_labels
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        self.hosts
+            .snapshot()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, h)| h.accepts(&fleet.region, class, &labels))
+            .filter_map(|(i, h)| {
+                let used = load.get(&h.id).copied().unwrap_or(0) as i32;
+                (h.capacity > used).then_some((h.capacity - used, std::cmp::Reverse(i), h))
+            })
+            .max_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)))
+            .map(|(_, _, h)| h)
+    }
+
+    pub async fn ssh(&self, host: &Host, script: &str) -> Result<String> {
+        let cfg = self.cfg();
+        let mut cmd = tokio::process::Command::new(&cfg.ssh_command);
+        cmd.args(&cfg.ssh_args)
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg(format!(
                 "ConnectTimeout={}",
-                self.cfg.connect_timeout_secs.max(1)
+                cfg.connect_timeout_secs.max(1)
             ))
             .arg("-p")
             .arg(host.port.to_string());
@@ -83,7 +118,7 @@ impl SshProvider {
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         let out = tokio::time::timeout(
-            Duration::from_secs(self.cfg.connect_timeout_secs.max(1) + 20),
+            Duration::from_secs(cfg.connect_timeout_secs.max(1) + 20),
             cmd.output(),
         )
         .await
@@ -100,20 +135,44 @@ impl SshProvider {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
+    /// Is the host reachable and does the game binary exist? (`echo musubi-host-ok`, plus
+    /// `test -x` on the command when `cmd` is given.)
+    pub async fn probe_host(&self, host: &Host, cmd: Option<&str>) -> Result<()> {
+        let script = match cmd {
+            Some(c) if !c.is_empty() => format!(
+                "test -x {} && echo musubi-host-ok || echo musubi-host-nobinary",
+                sq(c)
+            ),
+            _ => "echo musubi-host-ok".to_string(),
+        };
+        let out = self.ssh(host, &script).await?;
+        match out.lines().last().map(str::trim) {
+            Some("musubi-host-ok") => Ok(()),
+            Some("musubi-host-nobinary") => Err(Error::Unavailable(format!(
+                "host {}: game binary missing",
+                host.addr
+            ))),
+            _ => Err(Error::Unavailable(format!(
+                "host {}: unexpected probe output {out:?}",
+                host.addr
+            ))),
+        }
+    }
+
     /// Re-check every known server with `kill -0`; dead ones flip `alive` to `Some(false)`.
     pub async fn probe(&self) {
-        let known: Vec<(Uuid, usize, i64)> = self
+        let known: Vec<(Uuid, Uuid, i64)> = self
             .running
             .iter()
             .map(|r| (*r.key(), r.value().0, r.value().1))
             .collect();
-        for (id, hi, pid) in known {
-            let Some(host) = self.cfg.hosts.get(hi) else {
+        for (id, hid, pid) in known {
+            let Some(host) = self.hosts.host(hid) else {
                 continue;
             };
             if let Ok(out) = self
                 .ssh(
-                    host,
+                    &host,
                     &format!("kill -0 {pid} 2>/dev/null && echo up || echo down"),
                 )
                 .await
@@ -145,12 +204,15 @@ impl Provider for SshProvider {
             if req.fleet.spec.command.is_empty() {
                 return Err(Error::InvalidArgument("fleet spec.command is empty".into()));
             }
-            let Some(hi) = self.pick() else {
+            let Some(host) = self.pick(req.fleet) else {
+                self.hosts.note_starved(
+                    &req.fleet.region,
+                    req.fleet.spec.host_class.as_deref().unwrap_or(""),
+                );
                 return Err(Error::Unavailable(
                     "ssh fleet: every host is at capacity".into(),
                 ));
             };
-            let host = &self.cfg.hosts[hi];
             let mut env: Vec<(String, String)> = req
                 .fleet
                 .spec
@@ -165,6 +227,7 @@ impl Provider for SshProvider {
                 ("MUSUBI_PORT".to_string(), req.port.to_string()),
                 ("MUSUBI_API".to_string(), req.api_url.to_string()),
                 ("MUSUBI_SERVER_KEY".to_string(), req.server_key.to_string()),
+                ("MUSUBI_HOST_ID".to_string(), host.id.to_string()),
             ]);
             let mut script = String::new();
             if let Some(d) = &req.fleet.spec.working_dir {
@@ -183,7 +246,7 @@ impl Provider for SshProvider {
                 " >{log} 2>&1 </dev/null & echo $!",
                 log = log_path(req.server_id)
             ));
-            let out = self.ssh(host, &script).await?;
+            let out = self.ssh(&host, &script).await?;
             let pid: i64 = out
                 .lines()
                 .last()
@@ -191,13 +254,10 @@ impl Provider for SshProvider {
                 .ok_or_else(|| {
                     Error::Internal(format!("ssh {}: no pid in output {out:?}", host.addr))
                 })?;
-            self.running.insert(req.server_id, (hi, pid));
+            self.running.insert(req.server_id, (host.id, pid));
             self.dead.remove(&req.server_id);
             Ok(Started {
-                address: host
-                    .public_addr
-                    .clone()
-                    .unwrap_or_else(|| host.addr.clone()),
+                address: host.public(),
                 port: req.port,
                 pid: Some(pid),
             })
@@ -209,13 +269,13 @@ impl Provider for SshProvider {
         server_id: Uuid,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            if let Some((_, (hi, pid))) = self.running.remove(&server_id) {
-                if let Some(host) = self.cfg.hosts.get(hi) {
+            if let Some((_, (hid, pid))) = self.running.remove(&server_id) {
+                if let Some(host) = self.hosts.host(hid) {
                     if let Err(e) = self
                         .ssh(
-                            host,
+                            &host,
                             &format!(
-                                "kill {pid} 2>/dev/null; for i in 1 2 3 4 5; do kill -0 {pid} 2>/dev/null || exit 0; sleep 1; done; kill -9 {pid} 2>/dev/null; true"
+                                "kill {pid} 2>/dev/null; for i in 1 2 3 4 5; do kill -0 {pid} 2>/dev/null || exit 0; sleep 1; done; kill -9 {pid} 2>/dev/null; exit 0"
                             ),
                         )
                         .await
@@ -237,6 +297,10 @@ impl Provider for SshProvider {
         }
     }
 
+    fn host_of(&self, server_id: Uuid) -> Option<Uuid> {
+        self.running.get(&server_id).map(|r| r.0)
+    }
+
     fn logs<'a>(
         &'a self,
         server_id: Uuid,
@@ -247,7 +311,7 @@ impl Provider for SshProvider {
             let Some(host) = self
                 .running
                 .get(&server_id)
-                .and_then(|r| self.cfg.hosts.get(r.0).cloned())
+                .and_then(|r| self.hosts.host(r.0))
             else {
                 return Ok(None);
             };
@@ -265,7 +329,7 @@ impl Provider for SshProvider {
 impl std::fmt::Debug for SshProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SshProvider")
-            .field("hosts", &self.cfg.hosts.len())
+            .field("hosts", &self.hosts.snapshot().len())
             .field("running", &self.running.len())
             .finish()
     }
@@ -280,6 +344,7 @@ fn _assert_send(p: Arc<SshProvider>) -> Arc<dyn Provider> {
 mod tests {
     use super::*;
     use crate::{Fleet, FleetSpec};
+    use musubi_core::config::SshHost;
 
     fn fleet() -> Fleet {
         Fleet {

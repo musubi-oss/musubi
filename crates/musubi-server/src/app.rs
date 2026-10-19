@@ -275,16 +275,16 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             )),
         );
     }
-    if !cfg.fleet.ssh.hosts.is_empty() {
+    if !cfg.fleet.ssh.hosts.is_empty() || !cfg.fleet.capacity.pools.is_empty() {
         tracing::info!(
             provider = "ssh",
             hosts = cfg.fleet.ssh.hosts.len(),
+            pools = cfg.fleet.capacity.pools.len(),
             "fleet provider registered"
         );
-        fleets = fleets.with_provider(
-            "ssh",
-            Arc::new(musubi_fleet::ssh::SshProvider::new(cfg.fleet.ssh.clone())),
-        );
+        fleets
+            .enable_ssh(db.clone(), &cfg.fleet.ssh, &cfg.fleet.capacity)
+            .await?;
     }
     if !cfg.fleet.gamelift.access_key.is_empty() {
         tracing::info!(provider = "gamelift", region = %cfg.fleet.gamelift.region, "fleet provider registered");

@@ -24,6 +24,7 @@ mod environments;
 pub(crate) mod error;
 pub(crate) mod extract;
 mod files;
+pub mod fleet_hosts;
 pub mod fleet_metrics;
 pub mod fleets;
 mod friends;
@@ -260,6 +261,7 @@ pub fn router(state: AppState) -> Router {
         .merge(async_mm::routes())
         .merge(auth_providers::routes())
         .merge(fleet_metrics::routes())
+        .merge(fleet_hosts::routes())
         .merge(server_browser::routes())
         .merge(streams::routes())
         .merge(module_routes::routes())

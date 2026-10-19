@@ -900,6 +900,102 @@ pub struct FleetConfig {
     /// Bare-metal / VPS hosts reached over SSH (`hybrid` profile: control plane anywhere,
     /// dedicated servers on Hetzner/OVH boxes).
     pub ssh: SshFleetConfig,
+    /// Node-level autoscaling for the `ssh` host pool (P1-11): capacity pools that order and
+    /// release machines on demand.
+    pub capacity: CapacityConfig,
+}
+
+/// `[fleet.capacity]` — host pools behind the `ssh` provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CapacityConfig {
+    pub pools: Vec<CapacityPoolConfig>,
+    /// Seconds between capacity passes (also runs after every fleet reconcile).
+    pub pass_secs: u64,
+}
+
+impl Default for CapacityConfig {
+    fn default() -> Self {
+        Self {
+            pools: Vec::new(),
+            pass_secs: 15,
+        }
+    }
+}
+
+/// One capacity pool: a hardware class in a region, provisioned by a driver.
+/// `kind = manual` never orders machines — it raises `capacity.needed` so an operator racks a
+/// box (bare-metal first); `webhook` calls `POST {url}/provision|deprovision`; `hetzner` uses the
+/// Hetzner Cloud API (`server_type`, `image`, `location`, `ssh_keys`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CapacityPoolConfig {
+    pub name: String,
+    pub kind: String,
+    pub region: String,
+    pub class: String,
+    /// Servers one provisioned host runs at once.
+    pub capacity_per_host: u32,
+    pub min_hosts: u32,
+    pub max_hosts: u32,
+    /// Keep at least this many free server slots across the pool's ready hosts.
+    pub keep_free_slots: u32,
+    /// Release a provisioned host after it has been empty this long (and the pool keeps its
+    /// free-slot target without it).
+    pub scale_down_idle_secs: u64,
+    pub cooldown_secs: u64,
+    /// Provisioning hosts that do not answer ssh within this time are marked failed and released.
+    pub provision_timeout_secs: u64,
+    /// Order spot / preemptible machines (cost tag + termination-notice handling).
+    pub spot: bool,
+    pub cost_per_hour: f64,
+    pub ssh_user: String,
+    pub ssh_port: u16,
+    pub ssh_key: String,
+    pub labels: std::collections::HashMap<String, String>,
+    /// `webhook`: base url + bearer token.
+    pub url: String,
+    pub token: String,
+    /// `hetzner`: API base (tests point it at a fake), server type, image, location, ssh key
+    /// names/ids, cloud-init user data.
+    pub api_url: String,
+    pub server_type: String,
+    pub image: String,
+    pub location: String,
+    pub ssh_keys: Vec<String>,
+    pub user_data: String,
+}
+
+impl Default for CapacityPoolConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: "manual".into(),
+            region: String::new(),
+            class: String::new(),
+            capacity_per_host: 8,
+            min_hosts: 0,
+            max_hosts: 4,
+            keep_free_slots: 0,
+            scale_down_idle_secs: 600,
+            cooldown_secs: 120,
+            provision_timeout_secs: 600,
+            spot: false,
+            cost_per_hour: 0.0,
+            ssh_user: "musubi".into(),
+            ssh_port: 22,
+            ssh_key: String::new(),
+            labels: Default::default(),
+            url: String::new(),
+            token: String::new(),
+            api_url: "https://api.hetzner.cloud/v1".into(),
+            server_type: String::new(),
+            image: String::new(),
+            location: String::new(),
+            ssh_keys: Vec::new(),
+            user_data: String::new(),
+        }
+    }
 }
 
 /// Firecracker microVM fleet provider; registered when `binary` is set. Needs KVM, a kernel
