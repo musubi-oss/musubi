@@ -602,6 +602,48 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
         "/v1/server/matchmaker/queues/{name}/mmf/test",
         "matchmaker",
     ),
+    ("GET", "/v1/server/matchmaker/async", "matchmaker"),
+    ("GET", "/v1/server/matchmaker/async/{queue}", "matchmaker"),
+    ("PUT", "/v1/server/matchmaker/async/{queue}", "matchmaker"),
+    (
+        "DELETE",
+        "/v1/server/matchmaker/async/{queue}",
+        "matchmaker",
+    ),
+    (
+        "POST",
+        "/v1/server/matchmaker/async/{queue}/shields",
+        "matchmaker",
+    ),
+    (
+        "DELETE",
+        "/v1/server/matchmaker/async/{queue}/shields/{account_id}",
+        "matchmaker",
+    ),
+    (
+        "GET",
+        "/v1/server/matchmaker/async/{queue}/attacks",
+        "matchmaker",
+    ),
+    (
+        "POST",
+        "/v1/server/matchmaker/async/attacks/{id}/resolve",
+        "matchmaker",
+    ),
+    (
+        "GET",
+        "/v1/matchmaker/async/{queue}/opponents",
+        "matchmaker",
+    ),
+    ("POST", "/v1/matchmaker/async/{queue}/attacks", "matchmaker"),
+    (
+        "POST",
+        "/v1/matchmaker/async/{queue}/attacks/{id}/resolve",
+        "matchmaker",
+    ),
+    ("GET", "/v1/matchmaker/async/{queue}/me", "matchmaker"),
+    ("PUT", "/v1/matchmaker/async/{queue}/opt_out", "matchmaker"),
+    ("POST", "/v1/matchmaker/async/{queue}/shield", "matchmaker"),
     ("GET", "/v1/rating/{queue}", "leaderboards"),
     ("GET", "/v1/leaderboards/{id}/tier", "leaderboards"),
     (
