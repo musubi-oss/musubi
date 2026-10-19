@@ -41,6 +41,7 @@ pub fn routes() -> Router<AppState> {
             get(experiment_assignments),
         )
         .route("/v1/server/live_events", get(list_events).post(post_event))
+        .route("/v1/server/liveops/timeline", get(timeline))
         .route(
             "/v1/server/live_events/from_template",
             post(event_from_template),
@@ -981,5 +982,339 @@ async fn eval_for(
         "flags": liveops::merged_flags(&s, acc, &names).await?,
         "live_events": liveops::merged_live_events(&s, acc).await?["live_events"],
         "experiments": exps.iter().map(|(e, v)| json!({ "experiment_id": e.id, "variant": v })).collect::<Vec<_>>(),
+    })))
+}
+
+// ---------------------------------------------------------------- LiveOps timeline
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TimelineQ {
+    /// Window (Unix seconds); defaults to now-1d .. now+14d.
+    from: Option<i64>,
+    to: Option<i64>,
+    /// Comma-separated subset of `live_event,flag,experiment,news,offer,changeset`.
+    kinds: Option<String>,
+    /// Keep live events carrying this label / news carrying this tag.
+    label: Option<String>,
+    limit: Option<usize>,
+}
+
+/// (id, name, status, starts_at, ends_at)
+type ExpTimelineRow = (String, String, String, Option<i64>, Option<i64>);
+/// (id, name, placement_id, enabled, starts_at, ends_at, audience)
+type OfferTimelineRow = (
+    String,
+    String,
+    String,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+/// (id, title, published_at, expires_at, tags, audience, pinned)
+type NewsTimelineRow = (
+    uuid::Uuid,
+    String,
+    i64,
+    Option<i64>,
+    Value,
+    Option<String>,
+    bool,
+);
+
+fn state_of(start: i64, end: Option<i64>, now: i64) -> &'static str {
+    if end.is_some_and(|e| e <= now) {
+        "past"
+    } else if start <= now {
+        "active"
+    } else {
+        "upcoming"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn entry(
+    kind: &str,
+    id: &str,
+    name: &str,
+    start: i64,
+    end: Option<i64>,
+    now: i64,
+    labels: Value,
+    detail: Value,
+) -> Value {
+    json!({
+        "kind": kind, "id": id, "name": name, "starts_at": start, "ends_at": end,
+        "state": state_of(start, end, now), "labels": labels, "detail": detail,
+    })
+}
+
+fn intersects(start: i64, end: Option<i64>, from: i64, to: i64) -> bool {
+    start < to && end.is_none_or(|e| e > from)
+}
+
+/// `GET /v1/server/liveops/timeline?from&to&kinds&label` — one chronological view of everything
+/// scheduled: live-event cycles (recurrence expanded, phases listed), flag rule windows,
+/// experiments, news, store offers and scheduled economy changesets, each with
+/// `past|active|upcoming`, plus a summary (per kind/state, what is active now, what starts in
+/// the next 24 h). Local-time live events are shown at their UTC anchor.
+async fn timeline(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<TimelineQ>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let from = q.from.unwrap_or(now - 86_400);
+    let to = q.to.unwrap_or(now + 14 * 86_400);
+    if to <= from || to - from > 366 * 86_400 {
+        return Err(Error::InvalidArgument(
+            "to must be after from and the window at most 366 days".into(),
+        )
+        .into());
+    }
+    let all_kinds = [
+        "live_event",
+        "flag",
+        "experiment",
+        "news",
+        "offer",
+        "changeset",
+    ];
+    let kinds: Vec<String> = match q.kinds.as_deref() {
+        Some(k) if !k.is_empty() => {
+            let v: Vec<String> = k
+                .split(',')
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect();
+            if let Some(bad) = v.iter().find(|x| !all_kinds.contains(&x.as_str())) {
+                return Err(Error::InvalidArgument(format!(
+                    "unknown kind `{bad}` (live_event|flag|experiment|news|offer|changeset)"
+                ))
+                .into());
+            }
+            v
+        }
+        _ => all_kinds.iter().map(|x| x.to_string()).collect(),
+    };
+    let want = |k: &str| kinds.iter().any(|x| x == k);
+    let mut out: Vec<Value> = Vec::new();
+
+    if want("live_event") {
+        for ev in liveops::load_events(&s).await? {
+            if !ev.enabled {
+                continue;
+            }
+            if q.label.as_ref().is_some_and(|l| !ev.labels.contains(l)) {
+                continue;
+            }
+            let len = liveops::cycle_len(&ev);
+            let detail = |cycle: i64, index: i64| {
+                json!({
+                    "cycle_index": index, "participation": ev.participation, "audience": ev.audience,
+                    "phases": ev.phases.iter().map(|p| json!({
+                        "name": p.name, "starts_at": cycle + p.offset_secs, "ends_at": cycle + p.offset_secs + p.duration_secs,
+                    })).collect::<Vec<_>>(),
+                    "recurrence_secs": ev.recurrence_secs, "local_time": ev.local_time,
+                })
+            };
+            match ev.recurrence_secs.filter(|r| *r > 0) {
+                None => {
+                    let end = Some(ev.ends_at.unwrap_or(ev.starts_at + len));
+                    if intersects(ev.starts_at, end, from, to) {
+                        out.push(entry(
+                            "live_event",
+                            &ev.id,
+                            &ev.name,
+                            ev.starts_at,
+                            end,
+                            now,
+                            json!(ev.labels),
+                            detail(ev.starts_at, 0),
+                        ));
+                    }
+                }
+                Some(r) => {
+                    let first = if from > ev.starts_at {
+                        (from - ev.starts_at - len).max(0) / r
+                    } else {
+                        0
+                    };
+                    let mut k = first;
+                    let mut n = 0;
+                    loop {
+                        let cycle = ev.starts_at + k * r;
+                        if cycle >= to || n >= 200 || ev.ends_at.is_some_and(|e| cycle >= e) {
+                            break;
+                        }
+                        let end = Some((cycle + len).min(ev.ends_at.unwrap_or(i64::MAX)));
+                        if intersects(cycle, end, from, to) {
+                            out.push(entry(
+                                "live_event",
+                                &ev.id,
+                                &ev.name,
+                                cycle,
+                                end,
+                                now,
+                                json!(ev.labels),
+                                detail(cycle, k),
+                            ));
+                            n += 1;
+                        }
+                        k += 1;
+                    }
+                }
+            }
+        }
+    }
+    if want("flag") && q.label.is_none() {
+        let rows: Vec<(String, bool, Value)> =
+            sqlx::query_as("select name, enabled, rules from musubi.flags order by name")
+                .fetch_all(&s.db)
+                .await
+                .map_err(Error::internal)?;
+        for (name, enabled, rules) in rows {
+            let rules: Vec<liveops::FlagRule> = serde_json::from_value(rules).unwrap_or_default();
+            for (i, r) in rules.iter().enumerate() {
+                if r.starts_at.is_none() && r.ends_at.is_none() {
+                    continue;
+                }
+                let start = r.starts_at.unwrap_or(i64::MIN / 2);
+                if intersects(start, r.ends_at, from, to) {
+                    out.push(entry("flag", &name, &name, start.max(from.min(start)), r.ends_at, now, json!([]),
+                        json!({ "rule_index": i, "value": r.value, "audience": r.audience, "rollout_pct": r.rollout_pct, "enabled": enabled })));
+                }
+            }
+        }
+    }
+    if want("experiment") && q.label.is_none() {
+        let rows: Vec<ExpTimelineRow> = sqlx::query_as(
+            "select id, name, status, starts_at, ends_at from musubi.experiments order by starts_at nulls last, id",
+        )
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        for (id, name, status, st, en) in rows {
+            if st.is_none() && en.is_none() {
+                continue;
+            }
+            let start = st.unwrap_or(from);
+            if intersects(start, en, from, to) {
+                out.push(entry(
+                    "experiment",
+                    &id,
+                    &name,
+                    start,
+                    en,
+                    now,
+                    json!([]),
+                    json!({ "status": status }),
+                ));
+            }
+        }
+    }
+    if want("news") {
+        let rows: Vec<NewsTimelineRow> = sqlx::query_as(
+            "select id, title, published_at, expires_at, tags, audience, pinned from musubi.news where enabled order by published_at",
+        )
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        for (id, title, p, e, tags, audience, pinned) in rows {
+            if q.label.as_ref().is_some_and(|l| {
+                !tags
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|t| t.as_str() == Some(l)))
+            }) {
+                continue;
+            }
+            if intersects(p, e, from, to) {
+                out.push(entry(
+                    "news",
+                    &id.to_string(),
+                    &title,
+                    p,
+                    e,
+                    now,
+                    tags,
+                    json!({ "audience": audience, "pinned": pinned }),
+                ));
+            }
+        }
+    }
+    if want("offer") && q.label.is_none() {
+        let rows: Vec<OfferTimelineRow> = sqlx::query_as(
+            "select id, name, placement_id, enabled, starts_at, ends_at, audience from musubi.offers where enabled order by starts_at nulls last, id",
+        )
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        for (id, name, placement, _enabled, st, en, audience) in rows {
+            if st.is_none() && en.is_none() {
+                continue;
+            }
+            let start = st.unwrap_or(from);
+            if intersects(start, en, from, to) {
+                out.push(entry(
+                    "offer",
+                    &id,
+                    &name,
+                    start,
+                    en,
+                    now,
+                    json!([]),
+                    json!({ "placement_id": placement, "audience": audience }),
+                ));
+            }
+        }
+    }
+    if want("changeset") && q.label.is_none() {
+        let rows: Vec<(uuid::Uuid, String, String, Option<i64>)> = sqlx::query_as(
+            "select id, name, state, extract(epoch from schedule_at)::bigint from musubi.economy_changesets
+             where state = 'scheduled' and schedule_at is not null order by schedule_at",
+        )
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        for (id, name, state, at) in rows {
+            let Some(at) = at else { continue };
+            if at >= from && at < to {
+                out.push(entry(
+                    "changeset",
+                    &id.to_string(),
+                    &name,
+                    at,
+                    Some(at),
+                    now,
+                    json!([]),
+                    json!({ "state": state, "publishes_at": at }),
+                ));
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a["starts_at"]
+            .as_i64()
+            .cmp(&b["starts_at"].as_i64())
+            .then(a["kind"].as_str().cmp(&b["kind"].as_str()))
+            .then(a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    let total = out.len();
+    out.truncate(q.limit.unwrap_or(500).clamp(1, 2000));
+    let mut by_kind = serde_json::Map::new();
+    for e in &out {
+        let k = e["kind"].as_str().unwrap_or("").to_string();
+        let st = e["state"].as_str().unwrap_or("").to_string();
+        let slot = by_kind
+            .entry(k)
+            .or_insert_with(|| json!({ "past": 0, "active": 0, "upcoming": 0 }));
+        slot[&st] = json!(slot[&st].as_i64().unwrap_or(0) + 1);
+    }
+    let active_now: Vec<Value> = out.iter().filter(|e| e["state"] == "active").map(|e| json!({ "kind": e["kind"], "id": e["id"], "name": e["name"], "ends_at": e["ends_at"] })).collect();
+    let next_24h: Vec<Value> = out.iter().filter(|e| e["state"] == "upcoming" && e["starts_at"].as_i64().is_some_and(|t| t <= now + 86_400)).map(|e| json!({ "kind": e["kind"], "id": e["id"], "name": e["name"], "starts_at": e["starts_at"] })).collect();
+    Ok(Json(json!({
+        "from": from, "to": to, "now": now, "kinds": kinds, "total": total, "entries": out,
+        "summary": { "by_kind": by_kind, "active_now": active_now, "next_24h": next_24h },
     })))
 }

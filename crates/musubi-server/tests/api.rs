@@ -32383,3 +32383,166 @@ async fn routed_allocation_by_pings_and_preference() {
         let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     }
 }
+
+/// LiveOps timeline: one chronological view across live events (cycles), flags, experiments, news.
+#[tokio::test]
+async fn liveops_timeline_aggregates_schedules() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let ev = unique("tl-ev");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/live_events/{ev}"), k, Some(json!({
+        "name": "Hourly rush", "phases": [{"name": "go", "offset_secs": 0, "duration_secs": 600}],
+        "starts_at": now - 100, "recurrence_secs": 3600, "labels": ["rush"]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let flag = unique("tl-flag");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/flags/{flag}"), k, Some(json!({
+        "default_value": false, "rules": [{"value": true, "starts_at": now + 1800, "ends_at": now + 5400}]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let exp = unique("tl-exp");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/experiments/{exp}"), k, Some(json!({
+        "name": "Timeline test", "variants": [{"name": "a", "weight": 1}, {"name": "b", "weight": 1}], "starts_at": now - 3600, "ends_at": now - 60
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, n) = call_server(&app, "POST", "/v1/server/news", k, Some(json!({
+        "title": "Weekend news", "published_at": now + 600, "expires_at": now + 7200, "tags": ["rush"]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{n}");
+    let news = n["id"].as_str().unwrap().to_string();
+    // validation
+    for q in ["?kinds=bogus", &format!("?from={}&to={}", now, now - 10)] {
+        let (st, r) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/liveops/timeline{q}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    }
+    let (st, t) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/liveops/timeline?from={}&to={}",
+            now - 3600,
+            now + 3 * 3600
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let entries = t["entries"].as_array().unwrap();
+    let cycles: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["kind"] == "live_event" && e["id"] == json!(ev))
+        .collect();
+    assert!(cycles.len() >= 3, "recurrence expanded: {}", cycles.len());
+    assert_eq!(cycles[0]["state"], "active");
+    assert_eq!(cycles[0]["detail"]["phases"][0]["name"], "go");
+    assert_eq!(cycles[1]["starts_at"], json!(now - 100 + 3600));
+    assert_eq!(cycles[1]["state"], "upcoming");
+    let f = entries
+        .iter()
+        .find(|e| e["kind"] == "flag" && e["id"] == json!(flag))
+        .unwrap_or_else(|| panic!("{t}"));
+    assert_eq!(f["state"], "upcoming");
+    assert_eq!(f["detail"]["value"], true);
+    assert_eq!(f["ends_at"], json!(now + 5400));
+    let x = entries
+        .iter()
+        .find(|e| e["kind"] == "experiment" && e["id"] == json!(exp))
+        .unwrap_or_else(|| panic!("{t}"));
+    assert_eq!(x["state"], "past");
+    let nw = entries
+        .iter()
+        .find(|e| e["kind"] == "news" && e["id"] == json!(news))
+        .unwrap_or_else(|| panic!("{t}"));
+    assert_eq!(nw["state"], "upcoming");
+    assert!(t["summary"]["active_now"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["id"] == json!(ev)));
+    assert!(t["summary"]["next_24h"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["id"] == json!(news)));
+    assert!(
+        t["summary"]["by_kind"]["live_event"]["active"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
+    // sorted by start
+    let starts: Vec<i64> = entries
+        .iter()
+        .map(|e| e["starts_at"].as_i64().unwrap())
+        .collect();
+    assert!(starts.windows(2).all(|w| w[0] <= w[1]));
+    // kinds + label filters
+    let (_, t) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/liveops/timeline?from={}&to={}&kinds=news,flag",
+            now - 3600,
+            now + 3 * 3600
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert!(t["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["kind"] == "news" || e["kind"] == "flag"));
+    assert!(t["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["id"] == json!(news)));
+    let (_, t) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/liveops/timeline?from={}&to={}&label=rush",
+            now - 3600,
+            now + 3 * 3600
+        ),
+        k,
+        None,
+    )
+    .await;
+    let es = t["entries"].as_array().unwrap();
+    assert!(
+        es.iter()
+            .all(|e| e["kind"] == "live_event" || e["kind"] == "news"),
+        "{t}"
+    );
+    assert!(es.iter().any(|e| e["id"] == json!(ev)) && es.iter().any(|e| e["id"] == json!(news)));
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/live_events/{ev}"),
+        k,
+        None,
+    )
+    .await;
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/flags/{flag}"), k, None).await;
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/experiments/{exp}"),
+        k,
+        None,
+    )
+    .await;
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/news/{news}"), k, None).await;
+}

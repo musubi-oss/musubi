@@ -549,7 +549,7 @@ pub async fn eval_live_events(s: &AppState, account: AccountId) -> Result<Vec<Va
     eval_live_events_q(s, account, &EventQuery::default()).await
 }
 
-fn cycle_len(ev: &LiveEvent) -> i64 {
+pub fn cycle_len(ev: &LiveEvent) -> i64 {
     ev.phases
         .iter()
         .map(|p| p.offset_secs + p.duration_secs)

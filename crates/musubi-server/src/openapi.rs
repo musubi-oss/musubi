@@ -724,6 +724,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
         "integrations",
     ),
     ("GET", "/v1/server/live_events", "integrations"),
+    ("GET", "/v1/server/liveops/timeline", "integrations"),
     ("POST", "/v1/server/live_events", "integrations"),
     ("GET", "/v1/server/live_events/{id}", "integrations"),
     ("PUT", "/v1/server/live_events/{id}", "integrations"),
