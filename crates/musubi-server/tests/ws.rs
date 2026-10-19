@@ -19510,7 +19510,7 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
         recv(&mut b).await.msg,
         ServerMessage::MatchmakerTicket { .. }
     ));
-    let token = match recv(&mut a).await.msg {
+    let mtoken = match recv(&mut a).await.msg {
         ServerMessage::MatchmakerMatched { token, .. } => token,
         m => panic!("{m:?}"),
     };
@@ -19530,14 +19530,14 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
         .find(|e| e["kind"] == "matched")
         .cloned()
         .unwrap_or_else(|| panic!("{v}"));
-    assert_eq!(matched["detail"]["token"], token);
+    assert_eq!(matched["detail"]["token"], mtoken);
     assert_eq!(matched["detail"]["partners"].as_array().unwrap().len(), 1);
     assert_eq!(v["trace"]["accounts"].as_array().unwrap().len(), 1);
 
     // stored match record appears once the drain ran
     let mut rec = Value::Null;
     for _ in 0..40 {
-        let (st, v) = get(format!("/v1/server/matchmaker/matches?token={token}")).await;
+        let (st, v) = get(format!("/v1/server/matchmaker/matches?token={mtoken}")).await;
         assert_eq!(st, 200, "{v}");
         if let Some(m) = v["matches"].as_array().and_then(|a| a.first()) {
             rec = m.clone();
@@ -19545,7 +19545,7 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    assert_eq!(rec["token"], token, "match not persisted");
+    assert_eq!(rec["token"], mtoken, "match not persisted");
     assert_eq!(rec["tickets"].as_array().unwrap().len(), 2);
     assert_eq!(rec["accounts"].as_array().unwrap().len(), 2);
     assert_eq!(rec["wait_ms"].as_array().unwrap().len(), 2);
@@ -19559,7 +19559,7 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| m["token"] == token));
+        .any(|m| m["token"] == mtoken));
     // persisted trace is still readable after it left memory (same shape)
     let (st, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_a}/trace")).await;
     assert_eq!(st, 200, "{v}");
