@@ -517,7 +517,7 @@ pub async fn eval_flags(s: &AppState, account: AccountId, names: &[String]) -> R
             }
         }
     }
-    let now = now_s();
+    let now = crate::http::qa_clock::now_for(s, account).await;
     let mut out = Vec::new();
     for f in flags {
         if !f.enabled || (!names.is_empty() && !names.contains(&f.name)) {
@@ -607,7 +607,7 @@ pub async fn eval_live_events_q(
         .collect();
     let audiences = s.audiences.of(&s.db, &s.economy, account).await?;
     let tz = tz_offset_min(s, account).await;
-    let now = now_s();
+    let now = crate::http::qa_clock::now_for(s, account).await;
     let mine = if events.iter().any(|e| e.participation == "explicit") {
         participations(s, account).await?
     } else {
@@ -704,7 +704,7 @@ pub async fn join_live_event(s: &AppState, account: AccountId, id: &str) -> Resu
             "account is not eligible for this live event".into(),
         ));
     }
-    let now = now_s();
+    let now = crate::http::qa_clock::now_for(s, account).await;
     let tz = tz_offset_min(s, account).await;
     let Ok((_, _, _, cycle)) = phase_at(&ev, now, tz) else {
         return Err(Error::Conflict("live event is not running".into()));
@@ -760,7 +760,7 @@ pub async fn leave_live_event(s: &AppState, account: AccountId, id: &str) -> Res
     let ev = load_event(s, id)
         .await?
         .ok_or_else(|| Error::NotFound("live event".into()))?;
-    let now = now_s();
+    let now = crate::http::qa_clock::now_for(s, account).await;
     let tz = tz_offset_min(s, account).await;
     let cycle = phase_at(&ev, now, tz).map(|(_, _, _, c)| c).ok();
     let n = sqlx::query(

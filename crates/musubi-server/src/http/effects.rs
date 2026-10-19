@@ -335,13 +335,3 @@ async fn my_effect(
         _ => Err(Error::NotFound(format!("effect {key}")).into()),
     }
 }
-
-/// `GET /v1/time` — authoritative server clock for clients (countdowns, offline-progress checks).
-pub async fn server_time() -> Json<Value> {
-    let now = OffsetDateTime::now_utc();
-    Json(json!({
-        "now": now.unix_timestamp(),
-        "now_ms": (now.unix_timestamp_nanos() / 1_000_000) as i64,
-        "iso": now.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-    }))
-}

@@ -732,6 +732,7 @@ nothing. `musubi.workflows` is also plain SQL for your dashboards.
 player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does it from a
 | `PUT /v1/server/effects/{account_id}/{key}`, `DELETE /v1/server/effects/{account_id}[/{key}]`, `GET /v1/server/effects?key`, `POST /v1/server/effects/sweep` | Timed status effects (buffs/debuffs/penalties) on the item-effect table: duration or permanent, stacks with cap, JSON `value`, `source`, `mode: replace|extend|stack`; client `GET /v1/effects[/{key}]` with `seconds_left`/`stacks`; expiry swept by the leader → `effect.expired` |
 | `GET/PATCH /v1/session/vars`, `GET/PATCH /v1/server/accounts/{id}/sessions/{sid}/vars` | Session baggage: free-form per-session vars (`party`, `region`, `shard`) seeded by login `vars`, patched with `{set, unset}`; the client PATCH returns an access token carrying the new bag and `POST /v1/auth/refresh` re-reads it; server stamps bags too |
+| `PUT/GET/DELETE /v1/server/accounts/{id}/clock`, `GET /v1/server/clocks` | QA clocks: pin a tester to a simulated date (`at`) or shift their clock (`offset_secs`); live events, flag windows, offers, news and `GET /v1/time` evaluate against it, everything else stays real; auto-expires |
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

@@ -411,7 +411,7 @@ async fn stats(
 
 /// Items an account may see right now: enabled, published, not expired, audience matches.
 async fn visible(s: &AppState, account: AccountId) -> Result<Vec<NewsRow>> {
-    let now = now_s();
+    let now = crate::http::qa_clock::now_for(s, account).await;
     let rows: Vec<NewsRow> = sqlx::query_as::<_, NewsRow>(&format!(
         "select {COLS} from musubi.news
          where enabled and published_at <= $1 and (expires_at is null or expires_at > $1)

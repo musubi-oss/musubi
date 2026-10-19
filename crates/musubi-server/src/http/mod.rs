@@ -55,6 +55,7 @@ mod parties;
 mod passkeys;
 pub mod placements;
 pub mod push;
+pub mod qa_clock;
 pub mod rating;
 mod regions;
 pub mod remote_config;
@@ -217,7 +218,7 @@ pub fn router(state: AppState) -> Router {
         .merge(news::router())
         .merge(effects::router())
         .merge(session_vars::router())
-        .route("/v1/time", axum::routing::get(effects::server_time))
+        .merge(qa_clock::router())
         .merge(placements::router())
         .merge(sso::routes())
         .merge(stats::routes())

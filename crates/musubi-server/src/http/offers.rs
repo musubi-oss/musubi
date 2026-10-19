@@ -598,7 +598,7 @@ async fn history(s: &AppState, account: Uuid, offers: &[String]) -> Result<Vec<A
 }
 
 async fn live_activation(s: &AppState, account: Uuid, offer: &str) -> Result<Option<Activation>> {
-    let now = now_s();
+    let now = crate::http::qa_clock::now_for(s, musubi_core::AccountId(account)).await;
     Ok(history(s, account, &[offer.to_string()])
         .await?
         .into_iter()
@@ -618,7 +618,7 @@ async fn evaluate(
     if offers.is_empty() {
         return Ok(Vec::new());
     }
-    let now = now_s();
+    let now = crate::http::qa_clock::now_for(s, account).await;
     let ids: Vec<String> = offers.iter().map(|o| o.id.clone()).collect();
     let mut precursors: Vec<String> = offers.iter().filter_map(|o| o.precursor.clone()).collect();
     precursors.retain(|p| !ids.contains(p));

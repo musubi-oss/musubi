@@ -35628,3 +35628,193 @@ async fn session_baggage_vars() {
     assert_eq!(m["vars"]["region"], "eu");
     assert!(m["vars"]["party"].is_null());
 }
+
+#[tokio::test]
+async fn qa_clock_future_date_testing() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("qa")})),
+    )
+    .await;
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let path = format!("/v1/server/accounts/{me}/clock");
+    let (_, t) = call(&app, "GET", "/v1/time", Some(&tok), None).await;
+    let real = t["now"].as_i64().unwrap();
+    assert!(t.get("simulated").is_none(), "{t}");
+
+    for body in [
+        json!({}),
+        json!({"at": real + 10, "offset_secs": 10}),
+        json!({"offset_secs": 0}),
+        json!({"at": real + 30 * 366 * 86_400}),
+        json!({"offset_secs": 60, "expires_in_secs": 0}),
+        json!({"offset_secs": 60, "reason": "r".repeat(201)}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/accounts/{}/clock", uuid::Uuid::nil()),
+        k,
+        Some(json!({"offset_secs": 60})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+
+    let future = real + 7 * 86_400;
+    let title = unique("tomorrow");
+    let (st, n) = call_server(
+        &app,
+        "POST",
+        "/v1/server/news",
+        k,
+        Some(json!({"title": title, "body": "next week", "published_at": future - 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{n}");
+    let (_, feed) = call(&app, "GET", "/v1/news", Some(&tok), None).await;
+    assert!(
+        !feed["news"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["title"] == title),
+        "future news hidden on the real clock: {feed}"
+    );
+
+    let (st, c) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"at": future, "reason": "test week-2 event"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["mode"], "fixed");
+    assert_eq!(c["now"], future);
+    assert_eq!(c["active"], true);
+    assert!(
+        c["expires_at"].as_i64().unwrap() >= real + 86_400 - 5,
+        "default 24h: {c}"
+    );
+    let (_, t) = call(&app, "GET", "/v1/time", Some(&tok), None).await;
+    assert_eq!(t["simulated"], true, "{t}");
+    assert_eq!(t["now"], future);
+    assert!(t["real_now"].as_i64().unwrap() >= real);
+    let (_, t) = call(&app, "GET", "/v1/time", None, None).await;
+    assert!(
+        t.get("simulated").is_none(),
+        "anonymous time stays real: {t}"
+    );
+    let (_, feed) = call(&app, "GET", "/v1/news", Some(&tok), None).await;
+    assert!(
+        feed["news"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["title"] == title),
+        "future news visible under the QA clock: {feed}"
+    );
+
+    let (st, c) = call_server(&app, "PUT", &path, k, Some(json!({"offset_secs": 3600}))).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["mode"], "offset");
+    assert!(
+        (c["now"].as_i64().unwrap() - (real + 3600)).abs() < 30,
+        "{c}"
+    );
+    let (_, feed) = call(&app, "GET", "/v1/news", Some(&tok), None).await;
+    assert!(
+        !feed["news"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["title"] == title),
+        "+1h is still before the news: {feed}"
+    );
+
+    let (st, l) = call_server(&app, "GET", "/v1/server/clocks", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    assert!(
+        l["clocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["account_id"] == me),
+        "{l}"
+    );
+    let (st, c) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["offset_secs"], 3600);
+
+    let (st, c) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"offset_secs": 86_400 * 8, "expires_in_secs": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let (_, feed) = call(&app, "GET", "/v1/news", Some(&tok), None).await;
+    assert!(
+        feed["news"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["title"] == title),
+        "{feed}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, c) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(c["active"], false, "expired clock: {c}");
+    let (_, t) = call(&app, "GET", "/v1/time", Some(&tok), None).await;
+    assert!(
+        t.get("simulated").is_none(),
+        "expired clock is ignored: {t}"
+    );
+    let (_, l) = call_server(&app, "GET", "/v1/server/clocks", k, None).await;
+    assert!(
+        !l["clocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["account_id"] == me),
+        "expired hidden by default: {l}"
+    );
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        "/v1/server/clocks?include_expired=true",
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        l["clocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["account_id"] == me),
+        "{l}"
+    );
+
+    let (st, v) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], true);
+    let (_, v) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(v["removed"], false);
+    let (st, _) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
