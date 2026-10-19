@@ -1693,32 +1693,35 @@ mod component_tests {
         );
 
         let calls = host.calls.lock();
-        assert_eq!(calls[0], json!({ "op": "time.now" }));
+        assert_eq!(calls[0], json!({ "__module": "m", "op": "time.now" }));
         assert_eq!(
             calls[1],
-            json!({ "op": "rng.random", "seed": "seed", "count": 3, "max": 6 })
+            json!({ "__module": "m", "op": "rng.random", "seed": "seed", "count": 3, "max": 6 })
         );
-        assert_eq!(calls[2], json!({ "op": "secrets.get", "name": "steam" }));
+        assert_eq!(
+            calls[2],
+            json!({ "__module": "m", "op": "secrets.get", "name": "steam" })
+        );
         assert_eq!(
             calls[3],
-            json!({ "op": "metrics.inc", "name": "kills", "value": 1.0, "labels": { "team": "red" } })
+            json!({ "__module": "m", "op": "metrics.inc", "name": "kills", "value": 1.0, "labels": { "team": "red" } })
         );
         assert_eq!(calls[4]["labels"], json!(""));
         assert_eq!(
             calls[5],
-            json!({ "op": "http.fetch", "method": "POST", "url": "https://api.example/ping", "headers": { "x-a": "b" }, "body": "ping" })
+            json!({ "__module": "m", "op": "http.fetch", "method": "POST", "url": "https://api.example/ping", "headers": { "x-a": "b" }, "body": "ping" })
         );
         assert_eq!(
             calls[6],
-            json!({ "op": "timer.schedule", "rpc": "daily_reset", "payload": { "day": 1 }, "in_secs": 60, "key": "reset" })
+            json!({ "__module": "m", "op": "timer.schedule", "rpc": "daily_reset", "payload": { "day": 1 }, "in_secs": 60, "key": "reset" })
         );
         assert_eq!(
             calls[7],
-            json!({ "op": "timer.cancel", "id": null, "key": "reset" })
+            json!({ "__module": "m", "op": "timer.cancel", "id": null, "key": "reset" })
         );
         assert_eq!(
             calls[8],
-            json!({ "op": "audiences.of", "account_id": null })
+            json!({ "__module": "m", "op": "audiences.of", "account_id": null })
         );
     }
 
@@ -1788,7 +1791,7 @@ mod component_tests {
         assert_eq!(out, b"s3cret");
         assert_eq!(
             host.calls.lock()[0],
-            json!({ "op": "secrets.get", "name": "steam" })
+            json!({ "__module": "sec", "op": "secrets.get", "name": "steam" })
         );
         // the host refusing (unknown secret) surfaces as the guest's error
         let strict = Arc::new(CannedHost {
@@ -1821,11 +1824,11 @@ mod component_tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0],
-            json!({ "op": "storage.write", "collection": "c", "key": "k", "value": "hello", "owner_id": null })
+            json!({ "__module": "kv", "op": "storage.write", "collection": "c", "key": "k", "value": "hello", "owner_id": null })
         );
         assert_eq!(
             calls[1],
-            json!({ "op": "storage.read", "collection": "c", "key": "k", "owner_id": null })
+            json!({ "__module": "kv", "op": "storage.read", "collection": "c", "key": "k", "owner_id": null })
         );
     }
 }
