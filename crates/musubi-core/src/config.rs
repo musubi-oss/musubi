@@ -707,6 +707,15 @@ pub struct AnalyticsConfig {
     pub mirror_domain_events: bool,
     pub flush_secs: u64,
     pub sinks: Vec<AnalyticsSink>,
+    /// Crash reports with one fingerprint from the same player/device inside this window fold
+    /// into the earlier report (`duplicates`).
+    pub crash_dedupe_secs: u64,
+    /// Largest decoded minidump accepted with a crash report, bytes; 0 refuses minidumps.
+    pub crash_max_minidump_bytes: usize,
+    /// `crash.spike` fires when one group gathers this many reports within an hour (0 = off).
+    pub crash_spike_per_hour: u64,
+    /// Crash/error reports accepted per player or device per minute.
+    pub crash_per_minute: u32,
 }
 
 impl Default for AnalyticsConfig {
@@ -720,6 +729,10 @@ impl Default for AnalyticsConfig {
             mirror_domain_events: false,
             flush_secs: 10,
             sinks: Vec::new(),
+            crash_dedupe_secs: 60,
+            crash_max_minidump_bytes: 4 * 1024 * 1024,
+            crash_spike_per_hour: 50,
+            crash_per_minute: 30,
         }
     }
 }
@@ -1195,6 +1208,8 @@ pub struct RetentionConfig {
     pub replay_days: u64,
     /// Soft-deleted accounts are purged for good after this many days (0 = never).
     pub deleted_account_days: u64,
+    /// Raw crash/error reports (groups and their counters stay).
+    pub crash_reports_days: u64,
 }
 
 impl Default for RetentionConfig {
@@ -1218,6 +1233,7 @@ impl Default for RetentionConfig {
             world_history_days: 7,
             replay_days: 30,
             deleted_account_days: 30,
+            crash_reports_days: 30,
         }
     }
 }

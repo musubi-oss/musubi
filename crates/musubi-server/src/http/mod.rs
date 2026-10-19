@@ -14,6 +14,7 @@ mod cluster;
 mod codes;
 pub mod configs;
 pub mod content;
+pub mod crashes;
 mod dev;
 pub mod economy;
 pub mod entitlements;
@@ -265,6 +266,7 @@ pub fn router(state: AppState) -> Router {
         .merge(liveops::routes())
         .merge(offers::routes())
         .merge(analytics::routes())
+        .merge(crashes::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

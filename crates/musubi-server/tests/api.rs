@@ -23,6 +23,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
     cfg.database.max_connections = 3;
     cfg.market.anti_snipe_secs = 0;
     tweak(&mut cfg);
+    let analytics_cfg = cfg.analytics.clone();
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
     migrate_once(&db).await;
     let auth = AuthService::new(db.clone(), &cfg.session).unwrap();
@@ -147,7 +148,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
-        analytics: musubi_server::analytics::Analytics::new(db.clone(), Default::default()),
+        analytics: musubi_server::analytics::Analytics::new(db.clone(), analytics_cfg),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -26209,4 +26210,601 @@ async fn stream_ops_validate_ids_membership_and_sessions() {
     let (st, v) = call_server(&app, "GET", "/v1/server/streams", "defaultkey", None).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(v["streams"].is_array());
+}
+
+/// P1-39/40: crash reports group by fingerprint with dedupe, triage and regression detection;
+/// support sees a player's events, notes and a merged timeline.
+#[tokio::test]
+async fn crash_reports_grouping_triage_and_player_timeline() {
+    use base64::Engine as _;
+    let Some(app) = app_with(|c| c.analytics.telemetry_keys = vec!["tk-crash".into()]).await else {
+        return;
+    };
+    let k = "defaultkey";
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("cr-a")})),
+    )
+    .await;
+    let (ta, aid) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        a["account_id"].as_str().unwrap().to_string(),
+    );
+    let (_, b) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("cr-b")})),
+    )
+    .await;
+    let tb = b["access_token"].as_str().unwrap().to_string();
+
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/crash",
+        None,
+        Some(json!({"kind": "crash", "message": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/crash",
+        Some(&ta),
+        Some(json!({"kind": "boom", "message": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/crash",
+        Some(&ta),
+        Some(json!({"kind": "crash", "message": "  "})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // fingerprints are deterministic and the test database persists across runs: salt the stacks
+    let salt: String = unique("fp")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_digit() {
+                (b'a' + (c as u8 - b'0')) as char
+            } else {
+                c
+            }
+        })
+        .collect();
+    let report = |msg: &str, stack: &str, version: &str, platform: &str| {
+        json!({
+            "kind": "crash", "message": msg, "stack": format!("{stack}\nat Salt::{salt}"), "platform": platform,
+            "app_version": version, "build": "b1", "os": "win11", "device": "pc", "locale": "en",
+            "breadcrumbs": [{"t": 1, "msg": "loaded"}], "tags": {"map": "dust"}, "custom": {"fps": 12}
+        })
+    };
+    let (st, r1) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/crash",
+        Some(&ta),
+        Some(report(
+            "thread 12 timed out after 3041ms",
+            "at Game::Tick (0x7ff123) game.cpp:120\nat main 0x400 main.cpp:12",
+            "1.0.0",
+            "windows",
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{r1}");
+    assert_eq!(r1["deduplicated"], false);
+    assert_eq!(r1["new_group"], true);
+    assert_eq!(r1["status"], "open");
+    let fp1 = r1["fingerprint"].as_str().unwrap().to_string();
+    let rid1 = r1["id"].as_str().unwrap().to_string();
+    // same player, same shape, different numbers → folded
+    let (st, r2) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/crash",
+        Some(&ta),
+        Some(report(
+            "thread 7 timed out after 2988ms",
+            "at Game::Tick (0x7ff9ab) game.cpp:131\n  at main 0x401 main.cpp:19",
+            "1.0.0",
+            "windows",
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{r2}");
+    assert_eq!(r2["deduplicated"], true, "r1={r1} r2={r2}");
+    assert_eq!(r2["fingerprint"], fp1);
+    assert_eq!(r2["id"], rid1);
+    // another player, newer version, other platform → same group, new report
+    let (st, r3) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/crash",
+        Some(&tb),
+        Some(report(
+            "thread 3 timed out after 1200ms",
+            "at Game::Tick (0x7ff000) game.cpp:140\nat main 0x402 main.cpp:12",
+            "1.0.1",
+            "android",
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{r3}");
+    assert_eq!(r3["deduplicated"], false, "{r3}");
+    assert_eq!(r3["new_group"], false);
+    assert_eq!(r3["fingerprint"], fp1);
+
+    // anonymous pre-login reports
+    let anon = |body: Value, key: Option<&str>| {
+        let app = app.clone();
+        let key = key.map(str::to_string);
+        async move {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/v1/telemetry/crash/anonymous")
+                .header("content-type", "application/json");
+            if let Some(k) = key {
+                req = req.header("x-telemetry-key", k);
+            }
+            let res = app
+                .oneshot(req.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            let st = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let shop = json!({"kind": "error", "message": "NullReference in Shop", "stack": format!("at Shop::Open\nat Salt::{salt}"), "platform": "ios", "app_version": "1.0.1", "device_id": "dev-1"});
+    let (st, _) = anon(shop.clone(), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let mut no_dev = shop.clone();
+    no_dev["device_id"] = Value::Null;
+    let (st, _) = anon(no_dev, Some("tk-crash")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r4) = anon(shop.clone(), Some("tk-crash")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{r4}");
+    assert_eq!(r4["new_group"], true);
+    let fp2 = r4["fingerprint"].as_str().unwrap().to_string();
+    assert_ne!(fp1, fp2);
+
+    // listing + filters
+    let (st, v) = call_server(&app, "GET", "/v1/server/crashes?limit=100", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let groups = v["groups"].as_array().unwrap();
+    let g1 = groups
+        .iter()
+        .find(|g| g["fingerprint"] == fp1)
+        .expect("fp1 listed");
+    assert_eq!(g1["count"], 3);
+    assert_eq!(g1["users"], 2);
+    assert_eq!(g1["first_version"], "1.0.0");
+    assert_eq!(g1["last_version"], "1.0.1");
+    assert!(groups
+        .iter()
+        .any(|g| g["fingerprint"] == fp2 && g["users"] == 1));
+    let (_, v) = call_server(&app, "GET", "/v1/server/crashes?kind=error&q=Shop", k, None).await;
+    let gs = v["groups"].as_array().unwrap();
+    assert!(gs.iter().any(|g| g["fingerprint"] == fp2), "{v}");
+    assert!(gs.iter().all(|g| g["kind"] == "error") && !gs.iter().any(|g| g["fingerprint"] == fp1));
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/crashes?platform=android&limit=100",
+        k,
+        None,
+    )
+    .await;
+    let gs = v["groups"].as_array().unwrap();
+    assert!(gs.iter().any(|g| g["fingerprint"] == fp1), "{v}");
+    assert!(
+        !gs.iter().any(|g| g["fingerprint"] == fp2),
+        "ios-only group must not match platform=android"
+    );
+    let (st, _) = call_server(&app, "GET", "/v1/server/crashes?sort=bogus", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(&app, "GET", "/v1/server/crashes?status=bogus", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // group detail + reports + full report
+    let (st, v) = call_server(&app, "GET", &format!("/v1/server/crashes/{fp1}"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 3);
+    let versions: Vec<&str> = v["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["value"].as_str().unwrap())
+        .collect();
+    assert!(versions.contains(&"1.0.0") && versions.contains(&"1.0.1"));
+    assert_eq!(v["platforms"].as_array().unwrap().len(), 2);
+    assert_eq!(v["recent"].as_array().unwrap().len(), 2);
+    assert!(!v["hourly"].as_array().unwrap().is_empty());
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/crashes/{fp1}/reports?account_id={aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["reports"].as_array().unwrap().len(), 1);
+    assert_eq!(v["reports"][0]["duplicates"], 1);
+    assert_eq!(v["reports"][0]["has_minidump"], false);
+    assert!(v["reports"][0].get("stack").is_none());
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/crashes/reports/{rid1}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["stack"].as_str().unwrap().contains("Game::Tick"));
+    assert_eq!(v["breadcrumbs"][0]["msg"], "loaded");
+    assert_eq!(v["custom"]["fps"], 12);
+    assert_eq!(v["tags"]["map"], "dust");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/crashes/reports/{rid1}/minidump"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // minidump round-trip
+    let dump = b"MDMP\x00\x01\x02\x03binary";
+    let mut with_dump = shop.clone();
+    with_dump["device_id"] = json!("dev-dump");
+    with_dump["message"] = json!(format!("Access violation at Render {salt}"));
+    with_dump["minidump_b64"] = json!(base64::engine::general_purpose::STANDARD.encode(dump));
+    let (st, r5) = anon(with_dump, Some("tk-crash")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{r5}");
+    let rid5 = r5["id"].as_str().unwrap().to_string();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/server/crashes/reports/{rid5}/minidump"))
+                .header("x-musubi-server-key", k)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "application/octet-stream");
+    assert_eq!(
+        &res.into_body().collect().await.unwrap().to_bytes()[..],
+        &dump[..]
+    );
+    let mut bad_dump = shop.clone();
+    bad_dump["device_id"] = json!("dev-bad");
+    bad_dump["minidump_b64"] = json!("***not-base64***");
+    let (st, _) = anon(bad_dump, Some("tk-crash")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // triage: resolved in 1.1.0 → 1.0.5 stays resolved, 1.1.0 regresses
+    let (st, v) = call_server(&app, "PATCH", &format!("/v1/server/crashes/{fp1}"), k, Some(json!({"status": "resolved", "resolved_in_version": "1.1.0", "assignee": "alice", "notes": "fixed tick guard"}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "resolved");
+    assert_eq!(v["resolved_in_version"], "1.1.0");
+    assert_eq!(v["assignee"], "alice");
+    assert!(v["resolved_at"].is_string());
+    let mut old = report(
+        "thread 9 timed out after 100ms",
+        "at Game::Tick (0x1) game.cpp:1\nat main 0x2 main.cpp:1",
+        "1.0.5",
+        "windows",
+    );
+    old["device_id"] = json!("dev-old");
+    let (st, v) = anon(old, Some("tk-crash")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["fingerprint"], fp1);
+    assert_eq!(v["status"], "resolved");
+    let mut fixed = report(
+        "thread 9 timed out after 100ms",
+        "at Game::Tick (0x1) game.cpp:1\nat main 0x2 main.cpp:1",
+        "1.1.0",
+        "windows",
+    );
+    fixed["device_id"] = json!("dev-new");
+    let (st, v) = anon(fixed, Some("tk-crash")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["status"], "regressed");
+    let (_, v) = call_server(&app, "GET", &format!("/v1/server/crashes/{fp1}"), k, None).await;
+    assert_eq!(v["status"], "regressed");
+    assert_eq!(v["count"], 5);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/crashes?status=regressed&limit=100",
+        k,
+        None,
+    )
+    .await;
+    assert!(v["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g["fingerprint"] == fp1));
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/crashes/{fp1}"),
+        k,
+        Some(json!({"status": "ignored"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "ignored");
+    assert!(v["resolved_in_version"].is_null());
+    let (_, v) = call_server(&app, "GET", "/v1/server/crashes?limit=100", k, None).await;
+    assert!(
+        !v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["fingerprint"] == fp1),
+        "ignored is hidden by default"
+    );
+    let (st, _) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/crashes/{fp1}"),
+        k,
+        Some(json!({"status": "bogus"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PATCH",
+        "/v1/server/crashes/nope",
+        k,
+        Some(json!({"status": "open"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // summary
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/crashes/summary?since_secs=3600",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["reports"].as_i64().unwrap() >= 7, "{v}");
+    assert!(v["groups"].as_i64().unwrap() >= 2);
+    assert!(v["active_users"].as_i64().unwrap() >= 2);
+    assert!(v["crash_free_users_pct"].is_number());
+    let kinds: Vec<&str> = v["by_kind"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["value"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"crash") && kinds.contains(&"error"));
+    assert!(!v["top"].as_array().unwrap().is_empty());
+
+    // player history: crashes, notes, events, timeline
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/crashes"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["reports"].as_array().unwrap().len(), 1);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/notes"),
+        k,
+        Some(json!({"text": "VIP, refunded twice", "tags": ["vip"], "author": "cs-bob"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    let note_id = v["id"].as_str().unwrap().to_string();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/notes"),
+        k,
+        Some(json!({"text": "  "})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{}/notes", uuid::Uuid::now_v7()),
+        k,
+        Some(json!({"text": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/notes"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["notes"].as_array().unwrap().len(), 1);
+    assert_eq!(v["notes"][0]["author"], "cs-bob");
+    assert_eq!(v["notes"][0]["tags"][0], "vip");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/events?kinds=support.note"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["events"].as_array().unwrap().len(), 1);
+    assert_eq!(v["events"][0]["payload"]["text"], "VIP, refunded twice");
+    assert!(v["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x == "support.note"));
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/events?prefix=support.&q=refunded"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["events"].as_array().unwrap().len(), 1);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/events?q=nothing-like-this"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["events"].as_array().unwrap().len(), 0);
+
+    let gold = unique("crgold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/wallet/adjust",
+        k,
+        Some(json!({"account_id": aid, "currency": gold, "delta": 50, "reason": "goodwill"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/timeline"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let items = v["items"].as_array().unwrap();
+    let srcs: std::collections::HashSet<&str> = items
+        .iter()
+        .map(|i| i["source"].as_str().unwrap())
+        .collect();
+    for want in ["notes", "crashes", "sessions", "ledger"] {
+        assert!(srcs.contains(want), "missing {want}: {v}");
+    }
+    let ledger = items.iter().find(|i| i["source"] == "ledger").unwrap();
+    assert_eq!(ledger["kind"], "wallet.credit");
+    assert!(ledger["summary"].as_str().unwrap().starts_with("+50 "));
+    let crash = items.iter().find(|i| i["source"] == "crashes").unwrap();
+    assert_eq!(crash["kind"], "crash.crash");
+    assert!(crash["summary"]
+        .as_str()
+        .unwrap()
+        .contains("[windows 1.0.0]"));
+    let login = items.iter().find(|i| i["source"] == "sessions").unwrap();
+    assert!(login["summary"].as_str().unwrap().starts_with("login from"));
+    // newest first
+    let ats: Vec<&str> = items.iter().map(|i| i["at"].as_str().unwrap()).collect();
+    assert!(ats.windows(2).all(|w| w[0] >= w[1]), "{ats:?}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/timeline?sources=notes,crashes"),
+        k,
+        None,
+    )
+    .await;
+    assert!(v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["source"] == "notes" || i["source"] == "crashes"));
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/timeline?limit=1"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    assert!(v["next_before"].is_number());
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/timeline?sources=bogus"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // cleanup paths
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/accounts/{aid}/notes/{note_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/notes"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["notes"].as_array().unwrap().len(), 0);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/crashes/{fp2}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "GET", &format!("/v1/server/crashes/{fp2}"), k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }
