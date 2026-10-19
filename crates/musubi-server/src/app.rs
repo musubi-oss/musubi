@@ -756,6 +756,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     crate::modules::start_sync(state.clone());
     state.matches.set_events(state.events.clone());
+    state.relayed.set_events(state.events.clone());
     crate::http::admin::start_drain_listener(state.clone());
     state.worlds.set_events(state.events.clone());
     state.worlds.set_runtime(state.runtime.clone());

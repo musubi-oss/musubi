@@ -437,6 +437,12 @@ the fleet; `GET /v1/server/fleets/{id}/counters` aggregates counters/lists and t
 &order=-created_at|players|last_health&limit&offset` (servers with fleet/region/pool/provider, `exit_reason`, `age_secs`,
 `total`) and `GET /v1/server/gameservers/counts?group=state|region|fleet|pool|provider|build|exit_reason|node&<same filters>`.
 
+Match / room lifecycle on the event bus: `match.started|created|joined|left|closed|ended|resumed|results` (authoritative and
+relayed matches, with `match_id`, account/session, node) — `GET /v1/server/matches/{id}/events` is the trail of one match;
+webhook `kinds` accept wildcards (`match.*`, `gameserver.*`, `gameserver.custom.*`). Server-to-server callbacks: a game
+server posts its own events `POST /v1/gameserver/events {kind, data}` → `gameserver.custom.<kind>` on the bus (webhooks,
+LiveOps, `GET /v1/server/events`) and in the fleet log.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

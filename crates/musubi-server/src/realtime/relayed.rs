@@ -2,6 +2,8 @@
 //! nothing more. Authoritative matches live in the actor runtime. Like parties, a relayed match is
 //! homed on one node (`<uuid>.<node>`); members elsewhere reach it over the bus (`RelayedCmd`).
 
+use std::sync::Arc;
+
 use dashmap::DashMap;
 use musubi_core::{Error, MatchId, Result, SessionId};
 use musubi_proto::{ServerMessage, UserPresence};
@@ -80,9 +82,22 @@ pub struct RelayedRegistry {
     by_session: DashMap<SessionId, Vec<String>>,
     /// Matches homed elsewhere that local sessions joined (for RTT fan-out and disconnect leave).
     remote: DashMap<SessionId, Vec<String>>,
+    events: std::sync::OnceLock<Arc<crate::events::Events>>,
 }
 
 impl RelayedRegistry {
+    pub fn set_events(&self, events: Arc<crate::events::Events>) {
+        let _ = self.events.set(events);
+    }
+
+    fn emit(&self, kind: &'static str, payload: serde_json::Value) {
+        if let Some(ev) = self.events.get().cloned() {
+            tokio::spawn(async move {
+                ev.emit(kind, None, payload).await;
+            });
+        }
+    }
+
     pub fn new(node_id: Uuid) -> Self {
         Self {
             node_id,
@@ -90,6 +105,7 @@ impl RelayedRegistry {
             by_token: DashMap::new(),
             by_session: DashMap::new(),
             remote: DashMap::new(),
+            events: std::sync::OnceLock::new(),
         }
     }
 
@@ -145,11 +161,16 @@ impl RelayedRegistry {
             rtt: Default::default(),
         };
         let snap = m.snapshot(me);
+        let label = m.label.clone();
         self.by_session
             .entry(me.session_id)
             .or_default()
             .push(id.clone());
-        self.matches.insert(id, m);
+        self.matches.insert(id.clone(), m);
+        self.emit(
+            "match.created",
+            serde_json::json!({ "match_id": id, "account_id": me.account_id, "relayed": true, "name": label, "node_id": self.node_id }),
+        );
         Ok(snap)
     }
 
@@ -188,6 +209,11 @@ impl RelayedRegistry {
             .entry(me.session_id)
             .or_default()
             .push(id.clone());
+        self.emit(
+            "match.joined",
+            serde_json::json!({ "match_id": id, "account_id": me.account_id, "session_id": me.session_id,
+                "username": me.username, "relayed": true, "size": m.members.len(), "node_id": self.node_id }),
+        );
         let ev = ServerMessage::MatchPresenceEvent {
             match_id: id,
             joins: vec![me.clone()],
@@ -211,6 +237,7 @@ impl RelayedRegistry {
             return Err(Error::NotFound("not in match".into()));
         };
         let gone = m.members.remove(idx);
+        let gone_account = gone.account_id;
         m.rtt.remove(&me);
         if let Some(mut v) = self.by_session.get_mut(&me) {
             v.retain(|id| id != match_id);
@@ -229,10 +256,18 @@ impl RelayedRegistry {
             }
         }
         drop(m);
+        self.emit(
+            "match.left",
+            serde_json::json!({ "match_id": match_id, "account_id": gone_account, "session_id": me, "relayed": true, "reason": "leave" }),
+        );
         // a match the matchmaker formed gets the seat offered to waiting tickets again (or is
         // closed for backfill once nobody is left)
         let formed = self.by_token.iter().any(|e| e.value() == match_id);
         if empty {
+            self.emit(
+                "match.closed",
+                serde_json::json!({ "match_id": match_id, "relayed": true, "reason": "empty" }),
+            );
             self.matches.remove(match_id);
             self.by_token.retain(|_, v| v != match_id);
             if formed {

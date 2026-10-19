@@ -539,6 +539,11 @@ impl MatchRegistry {
             .entry(me.session_id)
             .or_default()
             .push(match_id.to_string());
+        self.emit(
+            "match.joined",
+            serde_json::json!({ "match_id": match_id, "account_id": me.account_id, "session_id": me.session_id,
+                "username": me.username, "spectator": spectator.is_some(), "node_id": self.node_id }),
+        );
         Ok(snap)
     }
 
@@ -550,6 +555,10 @@ impl MatchRegistry {
         if let Some(mut v) = self.by_session.get_mut(&session) {
             v.retain(|m| m != match_id);
         }
+        self.emit(
+            "match.left",
+            serde_json::json!({ "match_id": match_id, "session_id": session, "reason": "leave" }),
+        );
         Ok(())
     }
 
@@ -558,6 +567,10 @@ impl MatchRegistry {
             for id in ids {
                 if let Some(h) = self.get(&id) {
                     h.leave(session);
+                    self.emit(
+                        "match.left",
+                        serde_json::json!({ "match_id": id, "session_id": session, "reason": "disconnect" }),
+                    );
                 }
             }
         }

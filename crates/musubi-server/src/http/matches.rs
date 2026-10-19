@@ -14,6 +14,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/matches", post(create))
         .route("/v1/server/matches/{id}", get(get_one).delete(terminate))
         .route("/v1/server/matches/{id}/backfill", post(backfill))
+        .route("/v1/server/matches/{id}/events", get(match_events))
         .route("/v1/matches/replays", get(replays))
         .route("/v1/matches/{id}/replay", get(replay))
         .route("/v1/matches/{id}/replay/state", get(replay_state))
@@ -387,4 +388,45 @@ async fn delete_replay(
         return Err(musubi_core::Error::NotFound("replay".into()).into());
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct MatchEventsQuery {
+    limit: Option<i64>,
+}
+
+/// `GET /v1/server/matches/{id}/events?limit` — the match's lifecycle trail from the event bus
+/// (`match.started|joined|left|closed|ended|results|resumed`, oldest first).
+async fn match_events(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<MatchEventsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows: Vec<(
+        uuid::Uuid,
+        String,
+        Option<uuid::Uuid>,
+        serde_json::Value,
+        time::OffsetDateTime,
+    )> = sqlx::query_as(
+        "select id, kind, account_id, payload, created_at from musubi.events
+         where kind like 'match.%' and payload->>'match_id' = $1 order by id limit $2",
+    )
+    .bind(&id)
+    .bind(q.limit.unwrap_or(500).clamp(1, 5000))
+    .fetch_all(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(eid, kind, acc, payload, at)| {
+            serde_json::json!({ "id": eid, "kind": kind, "account_id": acc, "payload": payload,
+                "created_at": at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
+        })
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "match_id": id, "events": events }),
+    ))
 }

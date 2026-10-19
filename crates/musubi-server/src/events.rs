@@ -189,7 +189,8 @@ impl Events {
         .map_err(Error::internal)?;
         sqlx::query(
             "insert into musubi.webhook_deliveries (webhook_id, event_id)
-             select id, $1 from musubi.webhooks where enabled and (cardinality(kinds) = 0 or $2 = any(kinds))",
+             select id, $1 from musubi.webhooks where enabled and (cardinality(kinds) = 0 or $2 = any(kinds)
+                 or exists (select 1 from unnest(kinds) k where k like '%*' and $2 like replace(replace(k, '_', '\\_'), '*', '%')))",
         )
         .bind(id)
         .bind(kind)

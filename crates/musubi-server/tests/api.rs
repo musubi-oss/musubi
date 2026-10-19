@@ -25412,3 +25412,120 @@ async fn fleet_counters_lists_selector_allocation_and_inventory() {
     assert_eq!(v["counter_target"]["shortfall_servers"], 3, "{v}");
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }
+
+/// Server-to-server callbacks: a game server's custom event reaches the event bus as
+/// `gameserver.custom.<kind>`, webhooks subscribe with wildcards (`gameserver.*`), the fleet log
+/// keeps it, and the per-match event trail endpoint answers.
+#[tokio::test]
+async fn gameserver_custom_events_and_wildcard_webhooks() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("efleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "buffer": 1, "max_servers": 1, "spec": {"command": ["sleep", "60"]}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(fuid).await.unwrap();
+    let sid = svc.servers(fuid, Some("starting")).await.unwrap()[0]
+        .id
+        .to_string();
+    let tag = unique("k").replace('-', "");
+    let kind = format!("round_end_{}", &tag[tag.len() - 8..]);
+    // wildcard webhook before the event
+    let (st, wh) = call_server(&app, "POST", "/v1/admin/webhooks", k,
+        Some(json!({"name": unique("wh"), "url": "https://hooks.example/x", "secret": "0123456789abcdef0123", "kinds": ["gameserver.custom.*", "match.*"]}))).await;
+    assert!(st.is_success(), "{st} {wh}");
+    let whid = wh["id"].as_str().unwrap().to_string();
+    let post = |body: Value, sid: String| {
+        let app = app.clone();
+        async move {
+            let req = Request::post("/v1/gameserver/events")
+                .header("x-musubi-server-key", k)
+                .header("x-musubi-server-id", &sid)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let st = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                st,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (st, v) = post(json!({"kind": "Bad Kind", "data": {}}), sid.clone()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = post(
+        json!({"kind": kind, "data": {"winner": "red", "score": [3, 1]}}),
+        sid.clone(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["kind"], format!("gameserver.custom.{kind}"));
+    let (st, v) = post(json!({"kind": kind}), uuid::Uuid::now_v7().to_string()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    // on the bus with server/fleet identity
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/events?kinds=gameserver.custom.{kind}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    let evs = ev["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 1, "{ev}");
+    assert_eq!(evs[0]["payload"]["server_id"], sid);
+    assert_eq!(evs[0]["payload"]["fleet_id"], fid);
+    assert_eq!(evs[0]["payload"]["data"]["winner"], "red");
+    // wildcard subscription produced a delivery
+    let (_, d) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/webhooks/{whid}/deliveries"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(d["deliveries"].as_array().unwrap().len(), 1, "{d}");
+    // fleet lifecycle log has it too
+    let (_, fl) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?code=custom.{kind}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(fl["events"].as_array().unwrap().len(), 1, "{fl}");
+    assert_eq!(fl["events"][0]["data"]["winner"], "red");
+    // per-match trail endpoint
+    let (st, m) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/matches/{}/events", unique("m")),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    assert!(m["events"].as_array().unwrap().is_empty());
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/webhooks/{whid}"),
+        k,
+        None,
+    )
+    .await;
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+}

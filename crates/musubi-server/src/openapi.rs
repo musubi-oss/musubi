@@ -690,6 +690,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("PATCH", "/v1/server/gameservers/{id}/lists", "fleets"),
     ("POST", "/v1/gameserver/counters", "fleets"),
     ("POST", "/v1/gameserver/lists", "fleets"),
+    ("POST", "/v1/gameserver/events", "fleets"),
+    ("GET", "/v1/server/matches/{id}/events", "matches"),
     ("GET", "/v1/rating/{queue}", "leaderboards"),
     ("GET", "/v1/leaderboards/{id}/tier", "leaderboards"),
     (

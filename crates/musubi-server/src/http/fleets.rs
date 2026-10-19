@@ -65,6 +65,7 @@ pub fn routes() -> Router<AppState> {
             axum::routing::patch(op_lists),
         )
         .route("/v1/gameserver/counters", post(sdk_counters))
+        .route("/v1/gameserver/events", post(sdk_event))
         .route("/v1/gameserver/lists", post(sdk_lists))
         .route(
             "/v1/server/gameservers/{id}",
@@ -775,4 +776,55 @@ async fn inventory_counts(
         "counts": rows.iter().map(|(k, n)| json!({ "key": k, "servers": n })).collect::<Vec<_>>(),
         "total": total,
     })))
+}
+
+#[derive(Deserialize)]
+struct SdkEvent {
+    kind: String,
+    #[serde(default)]
+    data: Value,
+}
+
+/// `POST /v1/gameserver/events {kind, data}` — a server-to-server callback: the game server's own
+/// event (round ended, boss spawned, …) goes to the event bus as `gameserver.custom.<kind>`
+/// (webhooks filter with `gameserver.custom.*`) and into the fleet's lifecycle log.
+async fn sdk_event(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    Json(e): Json<SdkEvent>,
+) -> Result<Json<Value>, ApiError> {
+    let sid = self_id(&headers)?;
+    if e.kind.is_empty()
+        || e.kind.len() > 64
+        || !e
+            .kind
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+    {
+        return Err(Error::InvalidArgument("kind must be 1..=64 of [a-z0-9_.]".into()).into());
+    }
+    if e.data.to_string().len() > 16 * 1024 {
+        return Err(Error::InvalidArgument("data must be <= 16 KB".into()).into());
+    }
+    let gs = s.fleets.server(sid).await?;
+    let kind = format!("gameserver.custom.{}", e.kind);
+    let id = s
+        .events
+        .emit(
+            &kind,
+            None,
+            json!({ "fleet_id": gs.fleet_id, "server_id": sid, "build_version": gs.build_version, "data": e.data }),
+        )
+        .await;
+    s.fleets
+        .record_event(
+            gs.fleet_id,
+            Some(sid),
+            &format!("custom.{}", e.kind),
+            format!("server event {}", e.kind),
+            e.data,
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "kind": kind, "event_id": id })))
 }
