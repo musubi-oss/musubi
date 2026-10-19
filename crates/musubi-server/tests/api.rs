@@ -36184,3 +36184,257 @@ async fn countries_overrides_groups_and_config_selectors() {
     assert_eq!(v["blocked"], false);
     assert!(v["age_restriction"].is_null());
 }
+
+#[tokio::test]
+async fn config_sources_sync_csv_json_and_errors() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let sheet: std::sync::Arc<std::sync::Mutex<String>> = std::sync::Arc::new(
+        std::sync::Mutex::new("id,price,rarity\nsword,10,common\nshield,20,rare\n".to_string()),
+    );
+    let hits: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (s2, h2) = (sheet.clone(), hits.clone());
+    let h3 = hits.clone();
+    let mock = axum::Router::new()
+        .route(
+            "/sheet",
+            axum::routing::get(move |hs: axum::http::HeaderMap| {
+                let (s2, h2) = (s2.clone(), h2.clone());
+                async move {
+                    h2.lock().unwrap().push(
+                        hs.get("x-api-key")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                    s2.lock().unwrap().clone()
+                }
+            }),
+        )
+        .route(
+            "/data.json",
+            axum::routing::get(move || {
+                let h3 = h3.clone();
+                async move {
+                    h3.lock().unwrap().push("json".into());
+                    axum::Json(json!({"speed": 42, "modes": ["a", "b"]}))
+                }
+            }),
+        )
+        .route(
+            "/boom",
+            axum::routing::get(|| async {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "nope")
+            }),
+        )
+        .route("/notjson", axum::routing::get(|| async { "<html>" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+    let name = unique("items").to_lowercase();
+    let src = format!("/v1/server/configs/{name}/source");
+    for bad in [
+        json!({"url": "ftp://x/y.csv"}),
+        json!({"url": format!("{base}/sheet"), "format": "xml"}),
+        json!({"url": format!("{base}/sheet"), "interval_secs": 5}),
+        json!({"url": format!("{base}/sheet"), "headers": {"bad header": "v"}}),
+        json!({"url": format!("{base}/sheet"), "key": ""}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &src, k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, _) = call_server(&app, "GET", &src, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &src,
+        k,
+        Some(json!({
+            "url": format!("{base}/sheet?format=csv"), "key": "id", "interval_secs": 60,
+            "headers": {"x-api-key": "secret-1"}, "note": "items sheet"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["format"], "csv", "guessed from the url: {v}");
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["header_names"], json!(["x-api-key"]));
+    assert!(
+        v.get("headers").is_none(),
+        "header values are never echoed: {v}"
+    );
+    assert!(v["last_sync_at"].is_null());
+    assert!(v["next_sync_at"].is_number());
+
+    let sync = format!("{src}/sync");
+    let (st, v) = call_server(&app, "POST", &sync, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["changed"], true);
+    assert_eq!(v["syncs"], 1);
+    assert_eq!(
+        hits.lock().unwrap().as_slice(),
+        &["secret-1".to_string()],
+        "auth header sent"
+    );
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("cfgsrc")})),
+    )
+    .await;
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let (st, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let val = if c.get("value").is_some() {
+        c["value"].clone()
+    } else {
+        c.clone()
+    };
+    assert_eq!(val["sword"]["rarity"], "common", "{c}");
+    assert_eq!(
+        val["shield"]["price"].to_string().trim_matches('"'),
+        "20",
+        "{c}"
+    );
+
+    let (_, v) = call_server(&app, "POST", &sync, k, None).await;
+    assert_eq!(
+        v["status"], "unchanged",
+        "same content, no new version: {v}"
+    );
+    assert_eq!(v["changed"], false);
+    assert_eq!(v["syncs"], 2);
+    *sheet.lock().unwrap() = "id,price,rarity\nsword,11,common\n".to_string();
+    let (_, v) = call_server(&app, "POST", &sync, k, None).await;
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["changed"], true);
+    let (_, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    let val = if c.get("value").is_some() {
+        c["value"].clone()
+    } else {
+        c.clone()
+    };
+    assert_eq!(
+        val["sword"]["price"].to_string().trim_matches('"'),
+        "11",
+        "{c}"
+    );
+    assert!(val.get("shield").is_none(), "{c}");
+
+    let (_, v) = call_server(
+        &app,
+        "PUT",
+        &src,
+        k,
+        Some(json!({"url": format!("{base}/boom"), "format": "csv"})),
+    )
+    .await;
+    assert_eq!(v["url"], format!("{base}/boom"));
+    let (st, v) = call_server(&app, "POST", &sync, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "error", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("HTTP 500"), "{v}");
+    assert_eq!(v["last_status"], "error");
+    let (_, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    let val = if c.get("value").is_some() {
+        c["value"].clone()
+    } else {
+        c.clone()
+    };
+    assert_eq!(
+        val["sword"]["price"].to_string().trim_matches('"'),
+        "11",
+        "failed fetch keeps the last good value: {c}"
+    );
+
+    let (_, _) = call_server(
+        &app,
+        "PUT",
+        &src,
+        k,
+        Some(json!({"url": format!("{base}/notjson")})),
+    )
+    .await;
+    let (_, v) = call_server(&app, "POST", &sync, k, None).await;
+    assert_eq!(v["status"], "error", "{v}");
+    assert!(v["error"].as_str().unwrap().starts_with("json:"), "{v}");
+
+    let (_, v) = call_server(
+        &app,
+        "PUT",
+        &src,
+        k,
+        Some(json!({"url": format!("{base}/data.json"), "enabled": false})),
+    )
+    .await;
+    assert_eq!(v["format"], "json");
+    assert_eq!(v["enabled"], false);
+    assert!(
+        v["next_sync_at"].is_null(),
+        "disabled sources are not scheduled: {v}"
+    );
+    let (_, v) = call_server(&app, "POST", &sync, k, None).await;
+    assert_eq!(
+        v["status"], "ok",
+        "manual sync works for disabled sources: {v}"
+    );
+    let (_, c) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    let val = if c.get("value").is_some() {
+        c["value"].clone()
+    } else {
+        c.clone()
+    };
+    assert_eq!(val["speed"], 42, "{c}");
+
+    let (st, v) = call_server(&app, "GET", "/v1/server/config_sources", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["name"] == name),
+        "{v}"
+    );
+    let (st, v) = call_server(&app, "DELETE", &src, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "DELETE", &src, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "POST", &sync, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

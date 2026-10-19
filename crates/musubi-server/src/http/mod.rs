@@ -14,6 +14,7 @@ pub mod challenges;
 mod chat;
 mod cluster;
 mod codes;
+pub mod config_sources;
 pub mod configs;
 pub mod content;
 pub mod countries;
@@ -222,6 +223,7 @@ pub fn router(state: AppState) -> Router {
         .merge(session_vars::router())
         .merge(qa_clock::router())
         .merge(countries::router())
+        .merge(config_sources::router())
         .merge(placements::router())
         .merge(sso::routes())
         .merge(stats::routes())

@@ -735,6 +735,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 | `PUT/GET/DELETE /v1/server/accounts/{id}/clock`, `GET /v1/server/clocks` | QA clocks: pin a tester to a simulated date (`at`) or shift their clock (`offset_secs`); live events, flag windows, offers, news and `GET /v1/time` evaluate against it, everything else stays real; auto-expires |
 | fleet `policy.chain`, `creation_parallelism`, `overflow_labels` | Ordered autoscale policy chain (windowed buffer/utilisation/webhook with fallback), concurrent server starts per batch, labels for allocated servers still above `max_servers` after a scale-down |
 | `GET /v1/countries[/{code}]`, `PUT/DELETE /v1/server/countries/{code}`, `GET/PUT/DELETE /v1/server/country_groups[/{name}]` | Country API: ISO 3166-1 list with age restriction / blocked / metadata overrides and named country groups; remote-config selectors accept `countries: ["group:eu"]` |
+| `GET/PUT/DELETE /v1/server/configs/{name}/source`, `POST …/source/sync`, `GET /v1/server/config_sources` | Config sources: keep a config in sync with a published Google Sheet / CSV / JSON URL — polled on an interval (ETag + hash, new version only on change), manual sync, status/errors inline |
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

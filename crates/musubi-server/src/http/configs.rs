@@ -30,7 +30,7 @@ fn doc((name, value, version, updated_at): Row) -> Value {
     json!({ "name": name, "value": value, "version": version, "updated_at": updated_at })
 }
 
-fn check_name(name: &str) -> Result<(), ApiError> {
+pub fn check_name(name: &str) -> Result<(), ApiError> {
     let ok = !name.is_empty()
         && name.len() <= 64
         && name

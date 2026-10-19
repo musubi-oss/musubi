@@ -701,6 +701,11 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/country_groups/{name}", "system"),
     ("PUT", "/v1/server/country_groups/{name}", "system"),
     ("DELETE", "/v1/server/country_groups/{name}", "system"),
+    ("GET", "/v1/server/config_sources", "system"),
+    ("GET", "/v1/server/configs/{name}/source", "system"),
+    ("PUT", "/v1/server/configs/{name}/source", "system"),
+    ("DELETE", "/v1/server/configs/{name}/source", "system"),
+    ("POST", "/v1/server/configs/{name}/source/sync", "system"),
     ("GET", "/v1/session/vars", "auth"),
     ("PATCH", "/v1/session/vars", "auth"),
     (
