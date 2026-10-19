@@ -63,6 +63,7 @@ impl Provider for DockerProvider {
                 "--label".into(),
                 format!("musubi.fleet={}", req.fleet.id),
             ];
+            args.extend(req.fleet.spec.resources.docker_args());
             let envs = [
                 ("MUSUBI_SERVER_ID", req.server_id.to_string()),
                 ("MUSUBI_FLEET_ID", req.fleet.id.to_string()),

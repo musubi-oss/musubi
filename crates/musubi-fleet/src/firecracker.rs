@@ -368,8 +368,11 @@ impl Inner {
         }
     }
 
-    fn vm_config(&self, boot_args: &str, tap: Option<&str>) -> Value {
+    fn vm_config(&self, boot_args: &str, tap: Option<&str>, res: &crate::Resources) -> Value {
         let st = &self.settings;
+        let (vcpus, mem) = res.firecracker();
+        let vcpus = vcpus.unwrap_or(st.vcpus).max(1);
+        let mem = mem.unwrap_or(st.mem_mib).max(128);
         let ifaces: Vec<Value> = tap
             .map(|t| vec![json!({ "iface_id": "eth0", "host_dev_name": t })])
             .unwrap_or_default();
@@ -381,7 +384,7 @@ impl Inner {
                 "is_root_device": true,
                 "is_read_only": true
             }],
-            "machine-config": { "vcpu_count": st.vcpus.max(1), "mem_size_mib": st.mem_mib.max(128) },
+            "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mem },
             "network-interfaces": ifaces,
             "mmds-config": { "version": "V1", "network_interfaces": tap.map(|_| vec!["eth0"]).unwrap_or_default() }
         })
@@ -393,11 +396,12 @@ impl Inner {
         dir: &Path,
         boot_args: &str,
         tap: Option<&str>,
+        res: &crate::Resources,
     ) -> Result<tokio::process::Child> {
         let cfg_path = dir.join("vm.json");
         tokio::fs::write(
             &cfg_path,
-            serde_json::to_vec_pretty(&self.vm_config(boot_args, tap)).unwrap_or_default(),
+            serde_json::to_vec_pretty(&self.vm_config(boot_args, tap, res)).unwrap_or_default(),
         )
         .await
         .map_err(|e| Error::Internal(format!("firecracker config: {e}")))?;
@@ -639,7 +643,10 @@ impl Provider for FirecrackerProvider {
                 ));
                 address = ip.to_string();
             }
-            let child = match inner.cold_boot(&dir, &boot_args, tap.as_deref()).await {
+            let child = match inner
+                .cold_boot(&dir, &boot_args, tap.as_deref(), &req.fleet.spec.resources)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     Inner::net_down(tap.as_deref()).await;
@@ -718,7 +725,14 @@ impl Provider for FirecrackerProvider {
             );
             let started = std::time::Instant::now();
             let res = async {
-                let mut child = inner.cold_boot(&dir, &boot_args, tap.as_deref()).await?;
+                let mut child = inner
+                    .cold_boot(
+                        &dir,
+                        &boot_args,
+                        tap.as_deref(),
+                        &crate::Resources::default(),
+                    )
+                    .await?;
                 let sock = dir.join("api.sock");
                 let work = async {
                     Inner::wait_sock(&sock).await?;

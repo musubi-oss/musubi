@@ -38,6 +38,90 @@ pub struct FleetSpec {
     pub working_dir: Option<String>,
     /// vCPUs one server uses, for usage accounting (default 1).
     pub vcpu: Option<f64>,
+    /// Per-server resource specification handed to the provider (Kubernetes requests/limits,
+    /// Docker `--cpus`/`--memory`, Firecracker machine config).
+    pub resources: Resources,
+}
+
+/// Per-server resources (competitive P0-7). Unset fields leave the provider default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct Resources {
+    /// CPU request in millicores (1000 = one core).
+    pub cpu_millis: Option<u32>,
+    /// CPU limit in millicores; defaults to the request.
+    pub cpu_limit_millis: Option<u32>,
+    /// Memory request in MiB.
+    pub memory_mb: Option<u32>,
+    /// Memory limit in MiB; defaults to the request.
+    pub memory_limit_mb: Option<u32>,
+    /// Ephemeral disk in MiB (Kubernetes `ephemeral-storage`, Firecracker rootfs size hint).
+    pub disk_mb: Option<u32>,
+    /// GPUs (`nvidia.com/gpu` on Kubernetes, `--gpus` on Docker).
+    pub gpu: Option<u32>,
+}
+
+impl Resources {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Kubernetes `resources: {requests, limits}`; `None` when nothing is set.
+    pub fn kubernetes(&self) -> Option<serde_json::Value> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut req = serde_json::Map::new();
+        let mut lim = serde_json::Map::new();
+        if let Some(c) = self.cpu_millis {
+            req.insert("cpu".into(), format!("{c}m").into());
+        }
+        if let Some(c) = self.cpu_limit_millis.or(self.cpu_millis) {
+            lim.insert("cpu".into(), format!("{c}m").into());
+        }
+        if let Some(m) = self.memory_mb {
+            req.insert("memory".into(), format!("{m}Mi").into());
+        }
+        if let Some(m) = self.memory_limit_mb.or(self.memory_mb) {
+            lim.insert("memory".into(), format!("{m}Mi").into());
+        }
+        if let Some(d) = self.disk_mb {
+            req.insert("ephemeral-storage".into(), format!("{d}Mi").into());
+            lim.insert("ephemeral-storage".into(), format!("{d}Mi").into());
+        }
+        if let Some(g) = self.gpu.filter(|g| *g > 0) {
+            lim.insert("nvidia.com/gpu".into(), g.to_string().into());
+        }
+        Some(serde_json::json!({ "requests": req, "limits": lim }))
+    }
+
+    /// Extra `docker run` flags.
+    pub fn docker_args(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(c) = self.cpu_limit_millis.or(self.cpu_millis) {
+            out.push("--cpus".into());
+            out.push(format!("{:.3}", c as f64 / 1000.0));
+        }
+        if let Some(m) = self.memory_limit_mb.or(self.memory_mb) {
+            out.push("--memory".into());
+            out.push(format!("{m}m"));
+        }
+        if let Some(g) = self.gpu.filter(|g| *g > 0) {
+            out.push("--gpus".into());
+            out.push(g.to_string());
+        }
+        out
+    }
+
+    /// Firecracker machine config: (vcpus, MiB) when either is set.
+    pub fn firecracker(&self) -> (Option<u32>, Option<u32>) {
+        (
+            self.cpu_limit_millis
+                .or(self.cpu_millis)
+                .map(|c| c.div_ceil(1000).max(1)),
+            self.memory_limit_mb.or(self.memory_mb),
+        )
+    }
 }
 
 /// Autoscale policy (plan 05): buffer overrides by schedule plus an optional demand forecast.
@@ -50,6 +134,17 @@ pub struct ScalePolicy {
     pub horizon_min: u32,
     /// Buffer overrides by weekday/hour (UTC); the first matching window wins over `buffer`.
     pub schedule: Vec<ScheduleWindow>,
+    /// Keep `allocated / (allocated + ready)` near this fraction (0 < u < 1): the ready pool is
+    /// sized to `allocated × (1 − u) / u`, never below the buffer/forecast target.
+    pub target_utilization: Option<f64>,
+    /// Most servers started per reconcile pass (default: whatever the target needs).
+    pub step_up: Option<i32>,
+    /// Most idle servers stopped per reconcile pass.
+    pub step_down: Option<i32>,
+    /// Seconds after a scale-up before the next scale-up (0 = none).
+    pub cooldown_up_secs: u64,
+    /// Seconds after any scale action before a scale-down (0 = none).
+    pub cooldown_down_secs: u64,
 }
 
 impl Default for ScalePolicy {
@@ -58,8 +153,46 @@ impl Default for ScalePolicy {
             forecast: false,
             horizon_min: 10,
             schedule: Vec::new(),
+            target_utilization: None,
+            step_up: None,
+            step_down: None,
+            cooldown_up_secs: 0,
+            cooldown_down_secs: 0,
         }
     }
+}
+
+/// Ready servers a utilization target asks for given `allocated` busy servers.
+pub fn utilization_target(policy: &ScalePolicy, allocated: i32) -> i32 {
+    match policy.target_utilization {
+        Some(u) if allocated > 0 => ((allocated as f64) * (1.0 - u) / u).ceil() as i32,
+        _ => 0,
+    }
+}
+
+/// Clamp a `plan_scale` result by the policy's step sizes and cooldowns. `since_up` / `since_any`
+/// are seconds since the last scale-up / last scale action (`None` = never).
+pub fn apply_policy(
+    policy: &ScalePolicy,
+    (start, stop): (i32, i32),
+    since_up: Option<u64>,
+    since_any: Option<u64>,
+) -> (i32, i32) {
+    let mut start = start;
+    let mut stop = stop;
+    if start > 0 && since_up.is_some_and(|s| s < policy.cooldown_up_secs) {
+        start = 0;
+    }
+    if stop > 0 && since_any.is_some_and(|s| s < policy.cooldown_down_secs) {
+        stop = 0;
+    }
+    if let Some(step) = policy.step_up {
+        start = start.min(step);
+    }
+    if let Some(step) = policy.step_down {
+        stop = stop.min(step);
+    }
+    (start, stop)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -97,6 +230,18 @@ impl ScalePolicy {
     }
 
     fn validate(&self, max_servers: i32) -> Result<()> {
+        if let Some(u) = self.target_utilization {
+            if !(u > 0.0 && u < 1.0) {
+                return Err(Error::InvalidArgument(
+                    "policy.target_utilization must be in (0, 1)".into(),
+                ));
+            }
+        }
+        if self.step_up.is_some_and(|v| v <= 0) || self.step_down.is_some_and(|v| v <= 0) {
+            return Err(Error::InvalidArgument(
+                "policy.step_up / step_down must be positive".into(),
+            ));
+        }
         if self.horizon_min == 0 || self.horizon_min > 24 * 60 {
             return Err(Error::InvalidArgument(
                 "policy.horizon_min in 1..=1440".into(),
@@ -468,6 +613,8 @@ pub struct FleetService {
     /// Public address of the UDP edge proxy; when set, allocations hand clients this address
     /// instead of the game server's own (the proxy routes by connect token).
     edge: Option<SocketAddr>,
+    /// Per fleet: unix seconds of the last scale-up and of the last scale action (cooldowns).
+    last_scale: Arc<std::sync::Mutex<HashMap<Uuid, (i64, i64)>>>,
 }
 
 type FleetRow = (
@@ -559,6 +706,7 @@ impl FleetService {
             api_url: api_url.to_string(),
             server_key: server_key.to_string(),
             edge: None,
+            last_scale: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1401,13 +1549,15 @@ impl FleetService {
                 .filter(|s| s.state == "ready" || s.state == "starting" || s.state == "scheduled")
                 .count() as i32;
             let idle_ready = servers.iter().filter(|s| s.state == "ready").count() as i32;
+            let allocated = servers.iter().filter(|s| s.state == "allocated").count() as i32;
             let per_hour = if f.policy.forecast {
                 self.forecast_per_hour(f.id, now).await.unwrap_or(0.0)
             } else {
                 0.0
             };
-            let target = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour);
-            let (start, stop) = plan_scale(
+            let target = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour)
+                .max(utilization_target(&f.policy, allocated));
+            let plan = plan_scale(
                 target,
                 f.min_servers,
                 f.max_servers,
@@ -1415,6 +1565,22 @@ impl FleetService {
                 available,
                 idle_ready,
             );
+            let now_s = now.unix_timestamp();
+            let last = self.last_scale.lock().unwrap().get(&f.id).copied();
+            let (start, stop) = apply_policy(
+                &f.policy,
+                plan,
+                last.map(|(up, _)| (now_s - up).max(0) as u64),
+                last.map(|(_, any)| (now_s - any).max(0) as u64),
+            );
+            if start > 0 || stop > 0 {
+                let mut g = self.last_scale.lock().unwrap();
+                let e = g.entry(f.id).or_insert((i64::MIN / 2, i64::MIN / 2));
+                if start > 0 {
+                    e.0 = now_s;
+                }
+                e.1 = now_s;
+            }
             for _ in 0..start {
                 match self.start_one(&f).await {
                     Ok(_) => started += 1,
@@ -1515,5 +1681,91 @@ mod scale_tests {
         assert_eq!(plan_scale(0, 0, 5, 4, 0, 0), (0, 0));
         assert_eq!(plan_scale(1, 0, 5, 3, 3, 1), (0, 1));
         assert_eq!(plan_scale(2, 0, 5, 2, 2, 2), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn pol() -> ScalePolicy {
+        ScalePolicy {
+            target_utilization: Some(0.8),
+            step_up: Some(2),
+            step_down: Some(1),
+            cooldown_up_secs: 60,
+            cooldown_down_secs: 300,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn utilization_sizes_the_ready_pool() {
+        // 8 busy at 80 % → 2 ready
+        assert_eq!(utilization_target(&pol(), 8), 2);
+        assert_eq!(utilization_target(&pol(), 0), 0);
+        assert_eq!(utilization_target(&ScalePolicy::default(), 8), 0);
+        // 7 busy → 1.75 → 2
+        assert_eq!(utilization_target(&pol(), 7), 2);
+    }
+
+    #[test]
+    fn steps_and_cooldowns_clamp_the_plan() {
+        let p = pol();
+        assert_eq!(apply_policy(&p, (5, 0), None, None), (2, 0));
+        assert_eq!(apply_policy(&p, (0, 3), None, None), (0, 1));
+        // scale-up inside the up cooldown waits
+        assert_eq!(apply_policy(&p, (5, 0), Some(30), Some(30)), (0, 0));
+        assert_eq!(apply_policy(&p, (5, 0), Some(61), Some(61)), (2, 0));
+        // scale-down waits for the long cooldown after any action
+        assert_eq!(apply_policy(&p, (0, 3), Some(200), Some(200)), (0, 0));
+        assert_eq!(apply_policy(&p, (0, 3), Some(400), Some(400)), (0, 1));
+        assert_eq!(
+            apply_policy(&ScalePolicy::default(), (5, 3), Some(0), Some(0)),
+            (5, 3)
+        );
+    }
+
+    #[test]
+    fn policy_validation() {
+        assert!(pol().validate(10).is_ok());
+        assert!(ScalePolicy {
+            target_utilization: Some(1.0),
+            ..Default::default()
+        }
+        .validate(10)
+        .is_err());
+        assert!(ScalePolicy {
+            step_up: Some(0),
+            ..Default::default()
+        }
+        .validate(10)
+        .is_err());
+    }
+
+    #[test]
+    fn resources_map_to_providers() {
+        let r = Resources {
+            cpu_millis: Some(500),
+            memory_mb: Some(512),
+            memory_limit_mb: Some(1024),
+            disk_mb: Some(2048),
+            gpu: Some(1),
+            ..Default::default()
+        };
+        let k = r.kubernetes().unwrap();
+        assert_eq!(k["requests"]["cpu"], "500m");
+        assert_eq!(k["limits"]["cpu"], "500m");
+        assert_eq!(k["requests"]["memory"], "512Mi");
+        assert_eq!(k["limits"]["memory"], "1024Mi");
+        assert_eq!(k["limits"]["ephemeral-storage"], "2048Mi");
+        assert_eq!(k["limits"]["nvidia.com/gpu"], "1");
+        assert_eq!(
+            r.docker_args(),
+            vec!["--cpus", "0.500", "--memory", "1024m", "--gpus", "1"]
+        );
+        assert_eq!(r.firecracker(), (Some(1), Some(1024)));
+        assert!(Resources::default().kubernetes().is_none());
+        assert!(Resources::default().docker_args().is_empty());
     }
 }

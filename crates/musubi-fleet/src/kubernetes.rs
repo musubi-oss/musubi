@@ -144,6 +144,9 @@ impl KubernetesProvider {
             "args": req.fleet.spec.command,
             "env": env,
         });
+        if let Some(res) = req.fleet.spec.resources.kubernetes() {
+            container["resources"] = res;
+        }
         Ok(match self.mode {
             Mode::Pods => {
                 container["ports"] = json!([
