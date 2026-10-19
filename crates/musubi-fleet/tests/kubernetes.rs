@@ -117,6 +117,7 @@ fn fleet() -> Fleet {
                 .collect(),
             working_dir: None,
             vcpu: None,
+            slots_per_server: None,
             resources: Default::default(),
         },
         buffer: 1,

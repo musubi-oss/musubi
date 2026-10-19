@@ -27614,3 +27614,176 @@ async fn rewarded_ad_placements_callbacks_and_caps() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// P1-46: several allocations per server process — packing onto the fullest live server, per-slot
+/// connect tokens, release back to ready.
+#[tokio::test]
+async fn fleet_slots_per_server_packing_and_release() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("slots-bad"), "provider": "local", "max_servers": 1,
+            "spec": {"command": ["sleep", "1"], "slots_per_server": 0}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("slots"), "provider": "local", "buffer": 1, "max_servers": 1,
+            "port_start": 47600, "port_end": 47700,
+            "spec": {"command": ["sleep", "60"], "slots_per_server": 3}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["spec"]["slots_per_server"], 3);
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
+    let (_, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    let sid = h["servers"][0]["id"].as_str().unwrap().to_string();
+    let sdk = |path: &str, body: Value| {
+        let app = app.clone();
+        let sid = sid.clone();
+        let path = path.to_string();
+        async move {
+            let req = Request::post(path)
+                .header("x-musubi-server-key", k)
+                .header("x-musubi-server-id", &sid)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let st = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                st,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    assert_eq!(
+        sdk("/v1/gameserver/ready", json!({})).await.0,
+        StatusCode::OK
+    );
+    let slots = |sid: &str| {
+        let db = db.clone();
+        let sid = uuid::Uuid::parse_str(sid).unwrap();
+        async move {
+            let (n, state): (i32, String) =
+                sqlx::query_as("select slots_used, state from musubi.game_servers where id = $1")
+                    .bind(sid)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            (n, state)
+        }
+    };
+    let alloc = |n: i32| {
+        let app = app.clone();
+        let fid = fid.clone();
+        async move {
+            call_server(
+                &app,
+                "POST",
+                &format!("/v1/server/fleets/{fid}/allocate"),
+                k,
+                Some(json!({"payload": {"match": n}})),
+            )
+            .await
+        }
+    };
+    let (st, a1) = alloc(1).await;
+    assert_eq!(st, StatusCode::OK, "{a1}");
+    assert_eq!(a1["server_id"], sid);
+    assert_eq!(a1["backfill"], false);
+    assert_eq!(slots(&sid).await, (1, "allocated".to_string()));
+    let (st, a2) = alloc(2).await;
+    assert_eq!(st, StatusCode::OK, "{a2}");
+    assert_eq!(a2["server_id"], sid, "packed onto the same server");
+    assert_eq!(a2["backfill"], true);
+    assert_ne!(a2["connect_token"], a1["connect_token"]);
+    let (st, a3) = alloc(3).await;
+    assert_eq!(st, StatusCode::OK, "{a3}");
+    assert_eq!(slots(&sid).await.0, 3);
+    let (st, v) = alloc(4).await;
+    assert_eq!(
+        st,
+        StatusCode::TOO_MANY_REQUESTS,
+        "all slots taken and max_servers 1: {v}"
+    );
+    // every slot token connects
+    let t2 = a2["connect_token"].as_str().unwrap().to_string();
+    let (st, c) = sdk("/v1/gameserver/connect", json!({"token": t2})).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["slots"].as_array().unwrap().len(), 2, "{c}");
+    assert_eq!(slots(&sid).await.1, "in_game");
+    let (st, _) = sdk("/v1/gameserver/connect", json!({"token": "nope"})).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // release one slot → room for another allocation on the same server
+    let (st, v) = sdk("/v1/gameserver/release", json!({"token": "nope"})).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = sdk("/v1/gameserver/release", json!({"token": t2})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["slots_used"], 2);
+    let (st, _) = sdk("/v1/gameserver/release", json!({"token": t2})).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "a slot is released once");
+    let (st, a4) = alloc(4).await;
+    assert_eq!(st, StatusCode::OK, "{a4}");
+    assert_eq!(a4["server_id"], sid);
+    assert_eq!(slots(&sid).await.0, 3);
+    // releasing the last slot returns the server to ready
+    for t in [
+        &a1["connect_token"],
+        &a3["connect_token"],
+        &a4["connect_token"],
+    ] {
+        let (st, _) = sdk("/v1/gameserver/release", json!({"token": t})).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    assert_eq!(slots(&sid).await, (0, "ready".to_string()));
+    let (st, v) = alloc(5).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["backfill"], false);
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?code=server.released"),
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        ev["events"]
+            .as_array()
+            .map(|a| a.len() >= 4)
+            .unwrap_or(false),
+        "{ev}"
+    );
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert!(st.is_success() || st == StatusCode::NOT_FOUND, "{st}");
+}

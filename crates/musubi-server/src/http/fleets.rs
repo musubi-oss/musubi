@@ -81,6 +81,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/gameserver/players", post(sdk_players))
         .route("/v1/gameserver/watch", get(sdk_watch))
         .route("/v1/gameserver/connect", post(sdk_connect))
+        .route("/v1/gameserver/release", post(sdk_release))
         .route("/v1/gameserver/logs", post(sdk_logs))
 }
 
@@ -422,6 +423,17 @@ async fn sdk_connect(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         s.fleets.sdk_connect(self_id(&headers)?, &r.token).await?,
+    ))
+}
+
+async fn sdk_release(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    Json(r): Json<ConnectReq>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        s.fleets.sdk_release(self_id(&headers)?, &r.token).await?,
     ))
 }
 
