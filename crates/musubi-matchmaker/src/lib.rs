@@ -1461,6 +1461,18 @@ fn greedy_queue(
                     continue;
                 }
             }
+            {
+                let members: Vec<&Ticket> = group
+                    .iter()
+                    .chain(std::iter::once(&c))
+                    .map(|&k| &tickets[k])
+                    .collect();
+                let waited = now.saturating_duration_since(seed.created);
+                if !cfg.group_ok(&members, waited) {
+                    bump("rule:stddev");
+                    continue;
+                }
+            }
             group.push(c);
             size += t.members.len();
             if size == cfg.max_count {
@@ -1693,6 +1705,103 @@ mod tests {
         };
         assert_eq!(mm.remove_session(s2), vec![id2]);
         assert_eq!(mm.ticket_count(), 0);
+    }
+
+    #[test]
+    fn attribute_rules_difference_match_set_intersection_stddev_and_widening() {
+        use crate::queue::AttributeRule;
+        let rule = |kind: &str, property: &str, max: f64| AttributeRule {
+            kind: kind.into(),
+            property: property.into(),
+            max,
+            ..Default::default()
+        };
+        assert!(Matchmaker::new(Duration::ZERO)
+            .with_queues(vec![QueueConfig {
+                name: "bad".into(),
+                min_count: 2,
+                max_count: 2,
+                rules: vec![rule("foo", "x", 1.0)],
+                ..Default::default()
+            }])
+            .is_err());
+        let mm = Matchmaker::new(Duration::ZERO)
+            .with_queues(vec![
+                QueueConfig {
+                    name: "duo".into(),
+                    min_count: 2,
+                    max_count: 2,
+                    rules: vec![
+                        AttributeRule {
+                            step: 10.0,
+                            every_secs: 1,
+                            max_limit: 30.0,
+                            ..rule("difference", "level", 5.0)
+                        },
+                        rule("match", "mode", 0.0),
+                        rule("set_intersection", "maps", 0.0),
+                    ],
+                    ..Default::default()
+                },
+                QueueConfig {
+                    name: "trio".into(),
+                    min_count: 3,
+                    max_count: 3,
+                    rules: vec![rule("stddev", "level", 5.0)],
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+        let t0 = Instant::now();
+        let mk = |queue: &str, level: f64, mode: &str, maps: &str| {
+            let mut c = cand("eu", 1000.0);
+            c.string_properties.insert("queue".into(), queue.into());
+            c.string_properties.insert("mode".into(), mode.into());
+            c.string_properties.insert("maps".into(), maps.into());
+            c.numeric_properties.insert("level".into(), level);
+            ticket(vec![c], "", 2, 3)
+        };
+        mm.add_at(mk("duo", 10.0, "ranked", "a,b"), t0).unwrap();
+        mm.add_at(mk("duo", 20.0, "ranked", "a,b"), t0).unwrap();
+        assert!(mm.process_at(t0).is_empty(), "difference 10 > 5");
+        mm.add_at(mk("duo", 12.0, "casual", "a,b"), t0).unwrap();
+        assert!(mm.process_at(t0).is_empty(), "mode mismatch");
+        mm.add_at(mk("duo", 12.0, "ranked", "c"), t0).unwrap();
+        assert!(mm.process_at(t0).is_empty(), "no shared map");
+        mm.add_at(mk("duo", 12.0, "ranked", "B , c"), t0).unwrap();
+        let m = mm.process_at(t0);
+        assert_eq!(m.len(), 1, "level 10 + 12, ranked, shared map b");
+        let levels: Vec<f64> = m[0]
+            .tickets
+            .iter()
+            .map(|t| t.props.numbers["level"])
+            .collect();
+        assert!(
+            levels.contains(&10.0) && levels.contains(&12.0),
+            "{levels:?}"
+        );
+        // widening: after 2 s the difference limit is 25, so level 20 pairs with the casual 12? no —
+        // mode still differs; with another ranked 12 it does not pair either (maps). Add a ranked
+        // 40 sharing maps: |40-20| = 20 ≤ 25 → match.
+        mm.add_at(mk("duo", 40.0, "ranked", "a"), t0).unwrap();
+        assert!(mm.process_at(t0).is_empty(), "20 vs 40 before widening");
+        let m = mm.process_at(t0 + Duration::from_secs(2));
+        assert_eq!(m.len(), 1, "widened to 25: 20 + 40 pair");
+        // stddev over the group
+        for l in [10.0, 12.0, 40.0] {
+            mm.add_at(mk("trio", l, "x", "x"), t0).unwrap();
+        }
+        assert!(mm.process_at(t0).is_empty(), "stddev of 10,12,40 > 5");
+        mm.add_at(mk("trio", 14.0, "x", "x"), t0).unwrap();
+        let m = mm.process_at(t0);
+        assert_eq!(m.len(), 1);
+        let mut levels: Vec<f64> = m[0]
+            .tickets
+            .iter()
+            .map(|t| t.props.numbers["level"])
+            .collect();
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(levels, vec![10.0, 12.0, 14.0]);
     }
 
     #[test]

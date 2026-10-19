@@ -688,7 +688,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Party aggregation in rules |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — party tickets kept together; MMR averaged? (`Teams` balancing by MMR) – no custom aggrega… |
 | Player attributes |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — ticket `props` (string/number) used by query and `MmrRule.property`; no list/map typed at… |
 | Player object in requests |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — ticket `props` flat map; team assigned on match |
-| Property expression language |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — `rg -i 'stddev' or 'set_intersection' crates/musubi-matchmaker` → none |
+| Property expression language |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ per-queue attribute `rules: [{kind: difference|match|set_intersection|stddev, property, max, step/every_secs/max_limit (widening), min, missing: skip|reject}]` — pairwise difference/match/set-intersection in `incompatible()`, group-level stddev in seed-and-fill (`rule:*` rejection counters) |
 | Queue notifications |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — global webhooks/event bus, not per-queue targets |
 | Queue scope & examples |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
 | Regions |  |  |  |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — |

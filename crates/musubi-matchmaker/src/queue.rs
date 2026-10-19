@@ -24,6 +24,8 @@ pub struct QueueConfig {
     /// accepted size) and every party stays on one team.
     pub teams: Option<Teams>,
     pub mmr: Option<MmrRule>,
+    /// Attribute rules (PlayFab-style): pairwise `difference|match|set_intersection`, group `stddev`.
+    pub rules: Vec<AttributeRule>,
     pub ping: Option<PingRule>,
     /// Per-team (or per-match without teams) maximum per `role`.
     pub roles: BTreeMap<String, usize>,
@@ -106,6 +108,7 @@ impl Default for QueueConfig {
             max_count: 2,
             teams: None,
             mmr: None,
+            rules: Vec::new(),
             ping: None,
             roles: BTreeMap::new(),
             no_repeat_secs: 0,
@@ -127,6 +130,41 @@ impl Default for QueueConfig {
 pub struct Teams {
     pub count: usize,
     pub size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AttributeRule {
+    /// `difference` (|a-b| ≤ max on a number, widening), `match` (equal strings),
+    /// `set_intersection` (≥ min shared values of a `,`-separated string), `stddev` (group-level:
+    /// standard deviation of a number ≤ max).
+    pub kind: String,
+    pub property: String,
+    pub max: f64,
+    /// Widening for `difference` / `stddev`: `max` grows by `step` every `every_secs`, capped at
+    /// `max_limit` (0 = no widening).
+    pub step: f64,
+    pub every_secs: u64,
+    pub max_limit: f64,
+    /// `set_intersection`: minimum shared values (default 1).
+    pub min: usize,
+    /// Tickets missing the property: `skip` (rule ignored, default) or `reject`.
+    pub missing: String,
+}
+
+impl Default for AttributeRule {
+    fn default() -> Self {
+        Self {
+            kind: "difference".into(),
+            property: String::new(),
+            max: 0.0,
+            step: 0.0,
+            every_secs: 0,
+            max_limit: 0.0,
+            min: 1,
+            missing: "skip".into(),
+        }
+    }
 }
 
 /// Allowed MMR distance between any two tickets: `initial_delta`, plus `step` every `every_secs`
@@ -186,6 +224,42 @@ fn widen(initial: f64, step: f64, every_secs: u64, max: f64, waited: Duration) -
 
 impl QueueConfig {
     pub fn validate(&self) -> Result<()> {
+        for r in &self.rules {
+            if !["difference", "match", "set_intersection", "stddev"].contains(&r.kind.as_str()) {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: rule kind must be difference|match|set_intersection|stddev",
+                    self.name
+                )));
+            }
+            if r.property.is_empty() || r.property.len() > 64 {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: rule property must be 1..=64 chars",
+                    self.name
+                )));
+            }
+            if (r.kind == "difference" || r.kind == "stddev")
+                && ((r.max.is_nan() || r.max < 0.0)
+                    || r.step < 0.0
+                    || (r.step > 0.0 && (r.every_secs == 0 || r.max_limit < r.max)))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: rule {} needs max >= 0 and, when widening, step > 0, every_secs > 0, max_limit >= max",
+                    self.name, r.property
+                )));
+            }
+            if r.kind == "set_intersection" && r.min == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: set_intersection min must be >= 1",
+                    self.name
+                )));
+            }
+            if r.missing != "skip" && r.missing != "reject" {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: rule missing must be skip|reject",
+                    self.name
+                )));
+            }
+        }
         if self.name.is_empty() {
             return Err(Error::InvalidArgument("queue needs a name".into()));
         }
@@ -346,6 +420,9 @@ impl QueueConfig {
                 return Some("ping");
             }
         }
+        if let Some(reason) = self.attribute_conflict(a, b, waited) {
+            return Some(reason);
+        }
         if !self.crossplay_ok(a, b) {
             return Some("crossplay");
         }
@@ -359,6 +436,96 @@ impl QueueConfig {
             }
         }
         None
+    }
+
+    fn rule_limit(r: &AttributeRule, waited: Duration) -> f64 {
+        if r.step > 0.0 && r.every_secs > 0 {
+            widen(r.max, r.step, r.every_secs, r.max_limit, waited)
+        } else {
+            r.max
+        }
+    }
+
+    fn set_of(t: &Ticket, key: &str) -> Option<std::collections::HashSet<String>> {
+        t.props.strings.get(key).map(|v| {
+            v.split([',', '|'])
+                .map(|x| x.trim().to_ascii_lowercase())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+    }
+
+    /// Pairwise attribute rules; `Some(reason)` when a rule rejects the pair.
+    pub fn attribute_conflict(
+        &self,
+        a: &Ticket,
+        b: &Ticket,
+        waited: Duration,
+    ) -> Option<&'static str> {
+        for r in &self.rules {
+            let reject_missing = r.missing == "reject";
+            match r.kind.as_str() {
+                "difference" => match (
+                    a.props.numbers.get(&r.property),
+                    b.props.numbers.get(&r.property),
+                ) {
+                    (Some(x), Some(y)) => {
+                        if (x - y).abs() > Self::rule_limit(r, waited) {
+                            return Some("rule:difference");
+                        }
+                    }
+                    _ if reject_missing => return Some("rule:missing"),
+                    _ => {}
+                },
+                "match" => match (
+                    a.props.strings.get(&r.property),
+                    b.props.strings.get(&r.property),
+                ) {
+                    (Some(x), Some(y)) => {
+                        if !x.eq_ignore_ascii_case(y) {
+                            return Some("rule:match");
+                        }
+                    }
+                    _ if reject_missing => return Some("rule:missing"),
+                    _ => {}
+                },
+                "set_intersection" => {
+                    match (Self::set_of(a, &r.property), Self::set_of(b, &r.property)) {
+                        (Some(x), Some(y)) => {
+                            if x.intersection(&y).count() < r.min {
+                                return Some("rule:set_intersection");
+                            }
+                        }
+                        _ if reject_missing => return Some("rule:missing"),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Group-level attribute rules (`stddev`) over every member ticket of a prospective match.
+    pub fn group_ok(&self, tickets: &[&Ticket], waited: Duration) -> bool {
+        for r in self.rules.iter().filter(|r| r.kind == "stddev") {
+            let vals: Vec<f64> = tickets
+                .iter()
+                .filter_map(|t| t.props.numbers.get(&r.property).copied())
+                .collect();
+            if vals.len() < tickets.len() && r.missing == "reject" {
+                return false;
+            }
+            if vals.len() < 2 {
+                continue;
+            }
+            let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+            let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
+            if var.sqrt() > Self::rule_limit(r, waited) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Role quota check for one team (or the whole match without teams).

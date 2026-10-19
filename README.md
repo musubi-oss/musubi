@@ -739,6 +739,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 | title files `?tags=`, manifest `?tags&any_tags&omit_tags`, `GET /v1/files/tags` | Content tags on title files: tag-based manifest queries (all-of / any-of), tag index with counts, optional tag-less manifest |
 | `PUT/GET/DELETE /v1/server/builds/{name}/{version}`, `…/download?token=`, `spec.artifact`, `spec.cost`, `GET /v1/server/fleets/{id}/cost` | Build artifact store (versioned binaries with sha256 and capability download URLs, resolved into `MUSUBI_ARTIFACT_*` env for fleets/builds) and fleet cost attribute with live spend estimates |
 | entitlement `license` / `trial_secs`, grant `license, expires_at | duration_secs, source`, `POST /v1/server/entitlements/sweep` | Timed trials / free weekends / demos / subscriptions on entitlements: expiring grants with in-place upgrade to full, client sees license and remaining time, sweeper emits `entitlement.expired` |
+| matchmaker queue `rules: [{kind, property, max, step, every_secs, max_limit, min, missing}]` | Attribute rules on queues: numeric difference (widening), string match, set intersection, group standard deviation — rejections visible in matchmaker stats |
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),
