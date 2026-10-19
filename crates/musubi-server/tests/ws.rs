@@ -19567,12 +19567,41 @@ async fn matchmaker_observability_trace_matches_and_rejections() {
     let (st, _) = get("/v1/server/matchmaker/tickets/nope/trace".to_string()).await;
     assert_eq!(st, 404);
 
-    // C and D keep rejecting each other on every pass (both demand rank >= 5); the table is cumulative
+    // rejection reasons are counted per configured queue: D and E sit in one and keep rejecting
+    // each other on every pass (both demand rank >= 5); the table is cumulative
+    let queue = format!("q{region}");
+    let req = Request::put("/v1/server/matchmaker/queues")
+        .header("x-musubi-server-key", "defaultkey")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"name": queue, "min_count": 2, "max_count": 2}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 200);
+    let addq = |rank: f64| ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: format!("+region:{region} +rank:>=5"),
+        string_properties: [
+            ("region".to_string(), region.clone()),
+            ("queue".to_string(), queue.clone()),
+        ]
+        .into(),
+        numeric_properties: [("rank".to_string(), rank)].into(),
+        count_multiple: 1,
+    };
     let (td, _) = token(&router).await;
+    let (te, _) = token(&router).await;
     let mut d = connect(&addr, &td, f).await;
-    send(&mut d, f, None, add(2.0)).await;
+    let mut e = connect(&addr, &te, f).await;
+    send(&mut d, f, None, addq(2.0)).await;
     assert!(matches!(
         recv(&mut d).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    send(&mut e, f, None, addq(3.0)).await;
+    assert!(matches!(
+        recv(&mut e).await.msg,
         ServerMessage::MatchmakerTicket { .. }
     ));
     let mut v = Value::Null;
