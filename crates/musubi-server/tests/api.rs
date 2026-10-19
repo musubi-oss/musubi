@@ -32048,3 +32048,223 @@ async fn fleet_secret_env_sealed_and_redacted() {
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     let _ = std::fs::remove_file(&marker);
 }
+
+/// Title news: scheduling/expiry/audience gating, pinned order, locale fallback, read tracking.
+#[tokio::test]
+async fn title_news_feed_locales_and_reads() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("news")})),
+    )
+    .await;
+    let ta = a["access_token"].as_str().unwrap().to_string();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let steam = format!("news_steam_{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{steam}"),
+        k,
+        Some(json!({"rules": {"platform": ["steam"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // the feed may contain items from other runs — track only ours
+    for bad in [
+        json!({"body": "no title"}),
+        json!({"title": "x", "tags": ["Bad Tag"]}),
+        json!({"title": "x", "published_at": now, "expires_at": now - 1}),
+        json!({"title": "x", "locales": {"d": {"title": "y"}}}),
+    ] {
+        let (st, r) = call_server(&app, "POST", "/v1/server/news", k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    }
+    let mk = |body: Value| {
+        let app = app.clone();
+        async move {
+            let (st, r) = call_server(&app, "POST", "/v1/server/news", k, Some(body)).await;
+            assert_eq!(st, StatusCode::OK, "{r}");
+            r["id"].as_str().unwrap().to_string()
+        }
+    };
+    let n1 = mk(json!({"title": "Patch 1.2", "body": "Notes", "tags": ["patch"], "published_at": now - 100,
+        "locales": {"de": {"title": "Patch 1.2 (DE)", "body": "Hinweise"}}, "link": "https://example.com/patch"})).await;
+    let future = mk(json!({"title": "Soon", "published_at": now + 3600})).await;
+    let expired =
+        mk(json!({"title": "Gone", "published_at": now - 100, "expires_at": now - 10})).await;
+    let gated = mk(json!({"title": "Steam only", "audience": steam})).await;
+    let pinned = mk(json!({"title": "Welcome", "pinned": true, "published_at": now - 5000})).await;
+    let disabled = mk(json!({"title": "Draft", "enabled": false})).await;
+    let ours = [&n1, &future, &expired, &gated, &pinned, &disabled];
+    let feed = |q: &str| {
+        let app = app.clone();
+        let ta = ta.clone();
+        let q = q.to_string();
+        async move {
+            let (st, v) = call(&app, "GET", &format!("/v1/news{q}"), Some(&ta), None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v
+        }
+    };
+    let v = feed("?count=100").await;
+    let items: Vec<&Value> = v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| ours.iter().any(|o| x["id"] == json!(o)))
+        .collect();
+    let ids: Vec<&str> = items.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![pinned.as_str(), n1.as_str()], "{v}");
+    assert_eq!(items[0]["pinned"], true);
+    assert_eq!(items[1]["read"], false);
+    assert_eq!(items[1]["title"], "Patch 1.2");
+    assert!(items[1]["locale"].is_null());
+    assert!(v["unread"].as_u64().unwrap() >= 2);
+    let v = feed("?count=100&locale=de-AT").await;
+    let it = v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == json!(n1))
+        .unwrap();
+    assert_eq!(it["title"], "Patch 1.2 (DE)");
+    assert_eq!(it["locale"], "de");
+    let it = v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == json!(pinned))
+        .unwrap();
+    assert_eq!(it["title"], "Welcome");
+    let v = feed("?count=100&tag=patch").await;
+    assert!(v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|x| x["tags"].as_array().unwrap().contains(&json!("patch"))));
+    assert!(v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["id"] == json!(n1)));
+    let v = feed(&format!("?count=100&since={}", now - 50)).await;
+    assert!(v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|x| x["id"] != json!(n1) && x["id"] != json!(pinned)));
+    // reads
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/news/{n1}/read"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["read"], true);
+    let before = r["unread"].as_u64().unwrap();
+    let v = feed("?count=100&unread_only=true").await;
+    assert!(v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|x| x["id"] != json!(n1)));
+    assert!(v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["id"] == json!(pinned)));
+    let v = feed("?count=100").await;
+    let it = v["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == json!(n1))
+        .unwrap();
+    assert_eq!(it["read"], true);
+    assert_eq!(v["unread"].as_u64().unwrap(), before);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/news/{}/read", uuid::Uuid::now_v7()),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, r) = call(&app, "POST", "/v1/news/read_all", Some(&ta), None).await;
+    assert_eq!(r["unread"], 0);
+    assert_eq!(feed("?count=100").await["unread"], 0);
+    let (_, st) = call_server(&app, "GET", &format!("/v1/server/news/{n1}/stats"), k, None).await;
+    assert_eq!(st["reads"], 1);
+    // server side: list, update replaces locales, locale put/delete, delete → 404
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        "/v1/server/news?include_disabled=true&limit=500",
+        k,
+        None,
+    )
+    .await;
+    let listed: Vec<&str> = l["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap())
+        .collect();
+    for o in ours {
+        assert!(listed.contains(&o.as_str()), "{o} missing");
+    }
+    let (_, l) = call_server(&app, "GET", "/v1/server/news?limit=500", k, None).await;
+    assert!(l["news"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|x| x["id"] != json!(disabled)));
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/news/{n1}"), k, Some(json!({"title": "Patch 1.2.1", "tags": ["patch", "hotfix"], "locales": {"fr": {"title": "Correctif", "body": ""}}}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["title"], "Patch 1.2.1");
+    assert!(r["locales"]["de"].is_null() && r["locales"]["fr"]["title"] == "Correctif");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/news/{n1}/locales/ja"),
+        k,
+        Some(json!({"title": "パッチ", "body": "..."})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["locales"]["ja"]["title"], "パッチ");
+    let (_, r) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/news/{n1}/locales/ja"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(r["removed"], true);
+    let (_, g) = call_server(&app, "GET", &format!("/v1/server/news/{n1}"), k, None).await;
+    assert!(g["locales"]["ja"].is_null());
+    for o in ours {
+        let (_, r) = call_server(&app, "DELETE", &format!("/v1/server/news/{o}"), k, None).await;
+        assert_eq!(r["removed"], true);
+    }
+    let (st, _) = call_server(&app, "GET", &format!("/v1/server/news/{n1}"), k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/audiences/{steam}"),
+        k,
+        None,
+    )
+    .await;
+}

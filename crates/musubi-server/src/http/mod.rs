@@ -43,6 +43,7 @@ pub mod match_results;
 mod matches;
 pub(crate) mod matchmaker;
 mod module_routes;
+pub mod news;
 mod notifications;
 pub mod oauth;
 mod offers;
@@ -205,6 +206,7 @@ pub fn router(state: AppState) -> Router {
         .merge(configs::router())
         .merge(timers::router())
         .merge(audiences::router())
+        .merge(news::router())
         .merge(sso::routes())
         .merge(stats::routes())
         .merge(push::routes())
