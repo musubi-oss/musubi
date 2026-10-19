@@ -50,11 +50,12 @@ impl Audiences {
                 return Ok(d.clone());
             }
         }
-        let rows: Vec<(String, Value)> =
-            sqlx::query_as("select name, rules from musubi.audiences order by name")
-                .fetch_all(db)
-                .await
-                .map_err(Error::internal)?;
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "select name, rules from musubi.audiences where kind = 'rule' order by name",
+        )
+        .fetch_all(db)
+        .await
+        .map_err(Error::internal)?;
         let defs: Vec<(String, Audience)> = rows
             .into_iter()
             .filter_map(|(n, r)| serde_json::from_value(r).ok().map(|a| (n, a)))
@@ -91,12 +92,53 @@ impl Audiences {
                 .audiences_of(account, &defs, time::OffsetDateTime::now_utc())
                 .await?
         };
-        let names = Arc::new(names);
+        let names = Arc::new(apply_overrides(db, account, names).await?);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.members.retain(|_, (at, _)| at.elapsed() < TTL);
         g.members.insert(account, (Instant::now(), names.clone()));
         Ok(names)
     }
+}
+
+/// Managed (imported) memberships, then identity overrides (P0-19): `include` forces the
+/// account in regardless of rules, `exclude` forces it out; expired overrides are ignored.
+async fn apply_overrides(
+    db: &PgPool,
+    account: AccountId,
+    mut names: Vec<String>,
+) -> Result<Vec<String>> {
+    let managed: Vec<(String,)> = sqlx::query_as(
+        "select m.audience from musubi.audience_managed_members m
+         join musubi.audiences a on a.name = m.audience
+         where m.account_id = $1 and a.kind = 'managed' order by m.audience",
+    )
+    .bind(account.0)
+    .fetch_all(db)
+    .await
+    .map_err(Error::internal)?;
+    for (n,) in managed {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    let overrides: Vec<(String, String)> = sqlx::query_as(
+        "select audience, mode from musubi.audience_overrides
+         where account_id = $1 and (expires_at is null or expires_at > now()) order by audience",
+    )
+    .bind(account.0)
+    .fetch_all(db)
+    .await
+    .map_err(Error::internal)?;
+    for (n, mode) in overrides {
+        if mode == "include" {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        } else {
+            names.retain(|x| x != &n);
+        }
+    }
+    Ok(names)
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -123,33 +165,84 @@ pub fn router() -> Router<AppState> {
         )
         .route("/v1/server/audiences/of/{account_id}", get(of_account))
         .route("/v1/server/audiences/refresh", post(refresh_all))
-        .route("/v1/server/audiences/{name}/members", get(members))
+        .route(
+            "/v1/server/audiences/{name}/members",
+            get(members).put(put_members),
+        )
+        .route(
+            "/v1/server/audiences/{name}/members/csv",
+            post(put_members_csv),
+        )
+        .route(
+            "/v1/server/audiences/{name}/overrides",
+            get(list_overrides)
+                .put(put_overrides)
+                .delete(clear_overrides),
+        )
+        .route(
+            "/v1/server/audiences/{name}/overrides/{account_id}",
+            axum::routing::delete(delete_override),
+        )
         .route("/v1/server/audiences/{name}/refresh", post(refresh_one))
         .route("/v1/audiences/me", get(me))
 }
 
-type Row = (String, Value, String, i64);
+type Row = (String, Value, String, i64, String, Option<String>);
 
-fn doc((name, rules, description, updated_at): Row) -> Value {
-    json!({ "name": name, "rules": rules, "description": description, "updated_at": updated_at })
+fn doc((name, rules, description, updated_at, kind, source): Row) -> Value {
+    json!({
+        "name": name, "rules": rules, "description": description, "updated_at": updated_at,
+        "kind": kind, "source": source,
+    })
 }
 
+type ListRow = (
+    String,
+    Value,
+    String,
+    i64,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+);
+
 async fn list(State(s): State<AppState>, _k: ServerKey) -> Result<Json<Value>, ApiError> {
-    let rows: Vec<Row> = sqlx::query_as(
-        "select name, rules, description, extract(epoch from updated_at)::bigint
-         from musubi.audiences order by name",
+    let rows: Vec<ListRow> = sqlx::query_as(
+        "select a.name, a.rules, a.description, extract(epoch from a.updated_at)::bigint, a.kind, a.source,
+            (select count(*) from musubi.audience_overrides o where o.audience = a.name and o.mode = 'include' and (o.expires_at is null or o.expires_at > now())),
+            (select count(*) from musubi.audience_overrides o where o.audience = a.name and o.mode = 'exclude' and (o.expires_at is null or o.expires_at > now())),
+            (select count(*) from musubi.audience_managed_members m where m.audience = a.name)
+         from musubi.audiences a order by a.name",
     )
     .fetch_all(&s.db)
     .await
     .map_err(Error::internal)?;
-    Ok(Json(
-        json!({ "audiences": rows.into_iter().map(doc).collect::<Vec<_>>() }),
-    ))
+    Ok(Json(json!({
+        "audiences": rows.into_iter().map(|(n, r, d, u, k, src, inc, exc, mem)| {
+            let mut v = doc((n, r, d, u, k, src));
+            v["overrides"] = json!({ "include": inc, "exclude": exc });
+            v["managed_members"] = json!(mem);
+            v
+        }).collect::<Vec<_>>(),
+    })))
+}
+
+fn rule_kind() -> String {
+    "rule".into()
 }
 
 #[derive(Deserialize)]
 struct PutBody {
+    #[serde(default)]
     rules: Audience,
+    /// `rule` (membership from `rules`) | `managed` (membership imported via
+    /// `PUT …/members` / `POST …/members/csv`, e.g. a segment exported from analytics).
+    #[serde(default = "rule_kind")]
+    kind: String,
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     description: String,
     /// Keep a member table and run `actions` on every change (leader sweep, every 5 min, or
@@ -239,22 +332,51 @@ async fn put(
     if b.description.len() > 500 {
         return Err(Error::InvalidArgument("description: at most 500 chars".into()).into());
     }
-    let count = s
-        .economy
-        .count_audience(&b.rules, time::OffsetDateTime::now_utc())
-        .await?;
+    if !matches!(b.kind.as_str(), "rule" | "managed") {
+        return Err(Error::InvalidArgument("kind: rule|managed".into()).into());
+    }
+    if b.source
+        .as_ref()
+        .is_some_and(|x| x.is_empty() || x.len() > 64)
+    {
+        return Err(Error::InvalidArgument("source: 1..64 chars".into()).into());
+    }
+    let rules = serde_json::to_value(&b.rules).map_err(Error::internal)?;
+    if b.kind == "managed"
+        && rules != serde_json::to_value(Audience::default()).map_err(Error::internal)?
+    {
+        return Err(Error::InvalidArgument(
+            "managed audiences have no rules — import members via PUT …/members".into(),
+        )
+        .into());
+    }
+    let count = if b.kind == "managed" {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from musubi.audience_managed_members where audience = $1",
+        )
+        .bind(&name)
+        .fetch_one(&s.db)
+        .await
+        .map_err(Error::internal)?
+    } else {
+        s.economy
+            .count_audience(&b.rules, time::OffsetDateTime::now_utc())
+            .await?
+    };
     let row: Row = sqlx::query_as(
-        "insert into musubi.audiences (name, rules, description, tracked, actions) values ($1, $2, $3, $4, $5)
+        "insert into musubi.audiences (name, rules, description, tracked, actions, kind, source) values ($1, $2, $3, $4, $5, $6, $7)
          on conflict (name) do update set rules = excluded.rules,
              description = excluded.description, tracked = excluded.tracked,
-             actions = excluded.actions, updated_at = now()
-         returning name, rules, description, extract(epoch from updated_at)::bigint",
+             actions = excluded.actions, kind = excluded.kind, source = excluded.source, updated_at = now()
+         returning name, rules, description, extract(epoch from updated_at)::bigint, kind, source",
     )
     .bind(&name)
-    .bind(serde_json::to_value(&b.rules).map_err(Error::internal)?)
+    .bind(rules)
     .bind(&b.description)
     .bind(b.tracked)
     .bind(serde_json::to_value(&b.actions).map_err(Error::internal)?)
+    .bind(&b.kind)
+    .bind(&b.source)
     .fetch_one(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -318,33 +440,39 @@ async fn members(
     Path(name): Path<String>,
     Query(q): Query<PageQ>,
 ) -> Result<Json<Value>, ApiError> {
-    let tracked: Option<bool> =
-        sqlx::query_scalar("select tracked from musubi.audiences where name = $1")
+    let row: Option<(bool, String)> =
+        sqlx::query_as("select tracked, kind from musubi.audiences where name = $1")
             .bind(&name)
             .fetch_optional(&s.db)
             .await
             .map_err(Error::internal)?;
-    let Some(tracked) = tracked else {
+    let Some((tracked, kind)) = row else {
         return Err(Error::NotFound("audience".into()).into());
     };
-    let rows: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
-        "select account_id, extract(epoch from entered_at)::bigint from musubi.audience_members
-         where audience = $1 order by entered_at desc limit $2 offset $3",
-    )
+    let (table, at) = if kind == "managed" {
+        ("audience_managed_members", "imported_at")
+    } else {
+        ("audience_members", "entered_at")
+    };
+    let rows: Vec<(uuid::Uuid, i64)> = sqlx::query_as(&format!(
+        "select account_id, extract(epoch from {at})::bigint from musubi.{table}
+         where audience = $1 order by {at} desc limit $2 offset $3"
+    ))
     .bind(&name)
     .bind(q.limit.clamp(1, 1000))
     .bind(q.offset.max(0))
     .fetch_all(&s.db)
     .await
     .map_err(Error::internal)?;
-    let total: i64 =
-        sqlx::query_scalar("select count(*) from musubi.audience_members where audience = $1")
-            .bind(&name)
-            .fetch_one(&s.db)
-            .await
-            .map_err(Error::internal)?;
+    let total: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from musubi.{table} where audience = $1"
+    ))
+    .bind(&name)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
     Ok(Json(json!({
-        "audience": name, "tracked": tracked, "total": total,
+        "audience": name, "tracked": tracked, "kind": kind, "total": total,
         "members": rows.iter().map(|(id, at)| json!({ "account_id": id, "entered_at": at })).collect::<Vec<_>>(),
     })))
 }
@@ -396,11 +524,32 @@ const ACTION_LIMIT: usize = 5_000;
 
 /// Diff the live rule result against the member table, run enter/exit actions, emit events.
 async fn track(s: &AppState, name: &str, rules: &Value, actions: &Value) -> Result<Value> {
-    let aud: Audience = serde_json::from_value(rules.clone()).map_err(Error::internal)?;
     let actions: Actions = serde_json::from_value(actions.clone()).unwrap_or_default();
     let now = time::OffsetDateTime::now_utc();
-    let current = s.economy.audience_accounts(&aud, now, TRACK_LIMIT).await?;
-    let current: std::collections::HashSet<uuid::Uuid> = current.into_iter().map(|a| a.0).collect();
+    let kind: Option<String> =
+        sqlx::query_scalar("select kind from musubi.audiences where name = $1")
+            .bind(name)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(Error::internal)?;
+    let current: Vec<uuid::Uuid> = if kind.as_deref() == Some("managed") {
+        sqlx::query_scalar(
+            "select account_id from musubi.audience_managed_members where audience = $1",
+        )
+        .bind(name)
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?
+    } else {
+        let aud: Audience = serde_json::from_value(rules.clone()).map_err(Error::internal)?;
+        s.economy
+            .audience_accounts(&aud, now, TRACK_LIMIT)
+            .await?
+            .into_iter()
+            .map(|a| a.0)
+            .collect()
+    };
+    let current: std::collections::HashSet<uuid::Uuid> = current.into_iter().collect();
     let prev: Vec<(uuid::Uuid,)> =
         sqlx::query_as("select account_id from musubi.audience_members where audience = $1")
             .bind(name)
@@ -501,4 +650,304 @@ async fn run_actions(s: &AppState, name: &str, dir: &str, id: uuid::Uuid, action
             tracing::warn!(audience = %name, account = %id, error = %e, "audience action failed");
         }
     }
+}
+
+// ---------------------------------------------------------------- overrides & managed members (P0-19)
+
+async fn audience_kind(s: &AppState, name: &str) -> Result<(String, bool, Value, Value)> {
+    let row: Option<(String, bool, Value, Value)> = sqlx::query_as(
+        "select kind, tracked, rules, actions from musubi.audiences where name = $1",
+    )
+    .bind(name)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    row.ok_or_else(|| Error::NotFound("audience".into()))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OverridesBody {
+    include: Vec<uuid::Uuid>,
+    exclude: Vec<uuid::Uuid>,
+    note: String,
+    expires_in_secs: Option<i64>,
+}
+
+async fn overrides_doc(s: &AppState, name: &str) -> Result<Value> {
+    sqlx::query(
+        "delete from musubi.audience_overrides where audience = $1 and expires_at <= now()",
+    )
+    .bind(name)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let rows: Vec<(uuid::Uuid, String, String, Option<i64>, i64)> = sqlx::query_as(
+        "select account_id, mode, note, extract(epoch from expires_at)::bigint, extract(epoch from created_at)::bigint
+         from musubi.audience_overrides where audience = $1 order by created_at desc, account_id limit 10000",
+    )
+    .bind(name)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let pick = |m: &str| -> Vec<Value> {
+        rows.iter()
+            .filter(|r| r.1 == m)
+            .map(|(a, _, n, e, c)| json!({ "account_id": a, "note": n, "expires_at": e, "created_at": c }))
+            .collect()
+    };
+    Ok(json!({ "audience": name, "include": pick("include"), "exclude": pick("exclude") }))
+}
+
+/// `GET /v1/server/audiences/{name}/overrides` — identity include/exclude lists.
+async fn list_overrides(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    audience_kind(&s, &name).await?;
+    Ok(Json(overrides_doc(&s, &name).await?))
+}
+
+/// `PUT /v1/server/audiences/{name}/overrides {include: [ids], exclude: [ids], note, expires_in_secs}`
+/// — force accounts in/out regardless of rules or imports (QA, VIPs, support cases).
+async fn put_overrides(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(name): Path<String>,
+    Json(b): Json<OverridesBody>,
+) -> Result<Json<Value>, ApiError> {
+    audience_kind(&s, &name).await?;
+    if b.include.is_empty() && b.exclude.is_empty() {
+        return Err(Error::InvalidArgument("include or exclude required".into()).into());
+    }
+    if b.include.len() + b.exclude.len() > 1000 {
+        return Err(Error::InvalidArgument("at most 1000 ids per call".into()).into());
+    }
+    if b.include.iter().any(|i| b.exclude.contains(i)) {
+        return Err(
+            Error::InvalidArgument("an id cannot be both included and excluded".into()).into(),
+        );
+    }
+    if b.expires_in_secs.is_some_and(|e| e <= 0) || b.note.len() > 500 {
+        return Err(Error::InvalidArgument("expires_in_secs > 0; note <= 500 chars".into()).into());
+    }
+    for (mode, ids) in [("include", &b.include), ("exclude", &b.exclude)] {
+        if ids.is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "insert into musubi.audience_overrides (audience, account_id, mode, note, expires_at)
+             select $1, unnest($2::uuid[]), $3, $4,
+                    case when $5::bigint is null then null else now() + ($5::bigint * interval '1 second') end
+             on conflict (audience, account_id) do update set mode = excluded.mode, note = excluded.note,
+                expires_at = excluded.expires_at, created_at = now()",
+        )
+        .bind(&name)
+        .bind(ids)
+        .bind(mode)
+        .bind(&b.note)
+        .bind(b.expires_in_secs)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?;
+    }
+    s.audiences.invalidate();
+    s.events
+        .emit(
+            "audience.overrides_updated",
+            None,
+            json!({ "audience": name, "include": b.include.len(), "exclude": b.exclude.len() }),
+        )
+        .await;
+    Ok(Json(overrides_doc(&s, &name).await?))
+}
+
+async fn delete_override(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path((name, account_id)): Path<(String, uuid::Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let n = sqlx::query(
+        "delete from musubi.audience_overrides where audience = $1 and account_id = $2",
+    )
+    .bind(&name)
+    .bind(account_id)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    s.audiences.invalidate();
+    Ok(Json(json!({ "removed": n > 0 })))
+}
+
+async fn clear_overrides(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let n = sqlx::query("delete from musubi.audience_overrides where audience = $1")
+        .bind(&name)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    s.audiences.invalidate();
+    Ok(Json(json!({ "removed": n })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct MembersBody {
+    account_ids: Vec<uuid::Uuid>,
+    mode: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ModeQ {
+    mode: Option<String>,
+}
+
+const IMPORT_LIMIT: usize = 10_000;
+
+/// Apply an import to a managed audience: `replace` (default) | `add` | `remove`.
+async fn import_members(
+    s: &AppState,
+    name: &str,
+    ids: &[uuid::Uuid],
+    mode: &str,
+    invalid: usize,
+) -> Result<Value> {
+    let (kind, tracked, rules, actions) = audience_kind(s, name).await?;
+    if kind != "managed" {
+        return Err(Error::Conflict(
+            "audience is rule-based — change kind to managed to import members".into(),
+        ));
+    }
+    if !matches!(mode, "replace" | "add" | "remove") {
+        return Err(Error::InvalidArgument("mode: replace|add|remove".into()));
+    }
+    if ids.len() > IMPORT_LIMIT {
+        return Err(Error::InvalidArgument(format!(
+            "at most {IMPORT_LIMIT} ids per call"
+        )));
+    }
+    let unknown: i64 = sqlx::query_scalar(
+        "select count(*) from unnest($1::uuid[]) x where not exists (select 1 from musubi.accounts a where a.id = x)",
+    )
+    .bind(ids)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    let mut removed = 0u64;
+    if mode == "replace" {
+        removed = sqlx::query(
+            "delete from musubi.audience_managed_members where audience = $1 and not (account_id = any($2))",
+        )
+        .bind(name)
+        .bind(ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    }
+    let added = if mode == "remove" {
+        removed = sqlx::query(
+            "delete from musubi.audience_managed_members where audience = $1 and account_id = any($2)",
+        )
+        .bind(name)
+        .bind(ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        0
+    } else {
+        sqlx::query(
+            "insert into musubi.audience_managed_members (audience, account_id)
+             select $1, x from unnest($2::uuid[]) x where exists (select 1 from musubi.accounts a where a.id = x)
+             on conflict do nothing",
+        )
+        .bind(name)
+        .bind(ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected()
+    };
+    tx.commit().await.map_err(Error::internal)?;
+    let total: i64 = sqlx::query_scalar(
+        "select count(*) from musubi.audience_managed_members where audience = $1",
+    )
+    .bind(name)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    s.audiences.invalidate();
+    let mut tracking = Value::Null;
+    if tracked {
+        tracking = track(s, name, &rules, &actions).await?;
+    }
+    s.events
+        .emit(
+            "audience.imported",
+            None,
+            json!({ "audience": name, "mode": mode, "added": added, "removed": removed, "total": total }),
+        )
+        .await;
+    Ok(json!({
+        "audience": name, "mode": mode, "total": total, "added": added, "removed": removed,
+        "unknown": unknown, "invalid": invalid, "tracking": tracking,
+    }))
+}
+
+/// `PUT /v1/server/audiences/{name}/members {account_ids, mode}` — import a managed audience.
+async fn put_members(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(name): Path<String>,
+    Json(b): Json<MembersBody>,
+) -> Result<Json<Value>, ApiError> {
+    let mode = b.mode.unwrap_or_else(|| "replace".into());
+    Ok(Json(
+        import_members(&s, &name, &b.account_ids, &mode, 0).await?,
+    ))
+}
+
+/// `POST /v1/server/audiences/{name}/members/csv?mode=` — one account id per line (header
+/// `account_id`/`id` and extra columns ignored); malformed lines are counted as `invalid`.
+async fn put_members_csv(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(name): Path<String>,
+    Query(q): Query<ModeQ>,
+    body: String,
+) -> Result<Json<Value>, ApiError> {
+    let mut ids = Vec::new();
+    let mut invalid = 0usize;
+    for line in body.lines() {
+        let cell = line
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        if cell.is_empty()
+            || cell.eq_ignore_ascii_case("account_id")
+            || cell.eq_ignore_ascii_case("id")
+        {
+            continue;
+        }
+        match cell.parse::<uuid::Uuid>() {
+            Ok(u) => ids.push(u),
+            Err(_) => invalid += 1,
+        }
+    }
+    if ids.is_empty() && invalid > 0 {
+        return Err(Error::InvalidArgument("no valid account ids in CSV".into()).into());
+    }
+    let mode = q.mode.unwrap_or_else(|| "replace".into());
+    Ok(Json(import_members(&s, &name, &ids, &mode, invalid).await?))
 }

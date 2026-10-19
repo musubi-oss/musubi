@@ -983,6 +983,33 @@ async fn migrate_once(db: &sqlx::PgPool) {
         .await;
 }
 
+async fn call_raw(
+    app: &Router,
+    method: &str,
+    path: &str,
+    key: &str,
+    body: String,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-musubi-server-key", key)
+        .header(header::CONTENT_TYPE, "text/csv");
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
 async fn call_server(
     app: &Router,
     method: &str,
@@ -31571,6 +31598,346 @@ async fn live_events_participation_labels_peek_and_templates() {
             &app,
             "DELETE",
             &format!("/v1/server/live_events/{id}"),
+            k,
+            None,
+        )
+        .await;
+    }
+}
+
+/// P0-19: identity include/exclude overrides and managed (imported) audiences.
+#[tokio::test]
+async fn audiences_overrides_and_managed_imports() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut ids = Vec::new();
+    for who in ["ova", "ovb"] {
+        let (_, a) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(who)})),
+        )
+        .await;
+        ids.push(a["account_id"].as_str().unwrap().to_string());
+    }
+    let (a, b) = (ids[0].clone(), ids[1].clone());
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let steam = format!("ov_steam_{sfx}");
+    let all = format!("ov_all_{sfx}");
+    let managed = format!("ov_mng_{sfx}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{steam}"),
+        k,
+        Some(json!({"rules": {"platform": ["steam"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{all}"),
+        k,
+        Some(json!({"rules": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let of = |id: String| {
+        let app = app.clone();
+        async move {
+            let (st, v) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/server/audiences/of/{id}"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v["audiences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    let mine = of(a.clone()).await;
+    assert!(mine.contains(&all) && !mine.contains(&steam), "{mine:?}");
+    // validation
+    for bad in [
+        json!({}),
+        json!({"include": [a], "exclude": [a]}),
+        json!({"include": [a], "expires_in_secs": 0}),
+    ] {
+        let (st, r) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/server/audiences/{steam}/overrides"),
+            k,
+            Some(bad),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    }
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/audiences/nope_ov/overrides",
+        k,
+        Some(json!({"include": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // include forces in, exclude forces out
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{steam}/overrides"),
+        k,
+        Some(json!({"include": [a], "note": "qa"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["include"][0]["account_id"], json!(a));
+    assert_eq!(r["include"][0]["note"], "qa");
+    let mine = of(a.clone()).await;
+    assert!(mine.contains(&steam), "{mine:?}");
+    assert!(!of(b.clone()).await.contains(&steam));
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{all}/overrides"),
+        k,
+        Some(json!({"exclude": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mine = of(a.clone()).await;
+    assert!(!mine.contains(&all) && mine.contains(&steam), "{mine:?}");
+    assert!(of(b.clone()).await.contains(&all));
+    let (_, l) = call_server(&app, "GET", "/v1/server/audiences", k, None).await;
+    let doc = l["audiences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == json!(all))
+        .unwrap();
+    assert_eq!(doc["kind"], "rule");
+    assert_eq!(doc["overrides"]["exclude"], 1);
+    let (_, r) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/audiences/{all}/overrides/{a}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(r["removed"], true);
+    assert!(of(a.clone()).await.contains(&all));
+    // expiring include: a is in until it lapses; the next edit drops the expired row
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{steam}/overrides"),
+        k,
+        Some(json!({"include": [a], "expires_in_secs": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(of(a.clone()).await.contains(&steam));
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    let (_, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{steam}/overrides"),
+        k,
+        Some(json!({"include": [b]})),
+    )
+    .await;
+    assert_eq!(r["include"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["include"][0]["account_id"], json!(b));
+    assert!(!of(a.clone()).await.contains(&steam));
+    assert!(of(b.clone()).await.contains(&steam));
+    let (_, r) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/audiences/{steam}/overrides"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(r["removed"], 1);
+    assert!(!of(b.clone()).await.contains(&steam));
+
+    // managed audience
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}"),
+        k,
+        Some(json!({"kind": "managed", "rules": {"platform": ["steam"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}"),
+        k,
+        Some(json!({"kind": "weird"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}"),
+        k,
+        Some(json!({"kind": "managed", "source": "amplitude", "description": "churn risk"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["kind"], "managed");
+    assert_eq!(r["source"], "amplitude");
+    assert_eq!(r["count"], 0);
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{steam}/members"),
+        k,
+        Some(json!({"account_ids": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "rule-based: {r}");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}/members"),
+        k,
+        Some(json!({"account_ids": [a], "mode": "weird"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let ghost = uuid::Uuid::now_v7();
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}/members"),
+        k,
+        Some(json!({"account_ids": [a, ghost], "mode": "add"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["added"], 1);
+    assert_eq!(r["unknown"], 1);
+    assert_eq!(r["total"], 1);
+    assert!(of(a.clone()).await.contains(&managed));
+    assert!(!of(b.clone()).await.contains(&managed));
+    let csv = format!("account_id,score\n{b},0.9\nnot-a-uuid,0.1\n\"{a}\",0.5\n");
+    let (st, r) = call_raw(
+        &app,
+        "POST",
+        &format!("/v1/server/audiences/{managed}/members/csv?mode=add"),
+        k,
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["added"], 1);
+    assert_eq!(r["invalid"], 1);
+    assert_eq!(r["total"], 2);
+    let (st, r) = call_raw(
+        &app,
+        "POST",
+        &format!("/v1/server/audiences/{managed}/members/csv"),
+        k,
+        "id\nzzz\n".to_string(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (_, m) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/{managed}/members"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(m["kind"], "managed");
+    assert_eq!(m["total"], 2);
+    let (_, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}/members"),
+        k,
+        Some(json!({"account_ids": [a], "mode": "remove"})),
+    )
+    .await;
+    assert_eq!(r["removed"], 1);
+    assert_eq!(r["total"], 1);
+    assert!(!of(a.clone()).await.contains(&managed));
+    let (_, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}/members"),
+        k,
+        Some(json!({"account_ids": [a]})),
+    )
+    .await;
+    assert_eq!(r["mode"], "replace");
+    assert_eq!(r["removed"], 1);
+    assert_eq!(r["added"], 1);
+    assert_eq!(r["total"], 1);
+    assert!(of(a.clone()).await.contains(&managed));
+    assert!(!of(b.clone()).await.contains(&managed));
+    // exclude override beats an import
+    let (_, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}/overrides"),
+        k,
+        Some(json!({"exclude": [a]})),
+    )
+    .await;
+    assert!(!of(a.clone()).await.contains(&managed));
+    let (_, l) = call_server(&app, "GET", "/v1/server/audiences", k, None).await;
+    let doc = l["audiences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == json!(managed))
+        .unwrap();
+    assert_eq!(doc["managed_members"], 1);
+    assert_eq!(doc["overrides"]["exclude"], 1);
+    // tracked managed audience: refresh walks the imported set
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{managed}"),
+        k,
+        Some(json!({"kind": "managed", "tracked": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/audiences/{managed}/refresh"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["members"], 1);
+    for n in [&steam, &all, &managed] {
+        let _ = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/audiences/{n}"),
             k,
             None,
         )
