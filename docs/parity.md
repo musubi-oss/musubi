@@ -31,6 +31,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Device / email+пароль / Steam / Google / Apple | ✅ `musubi-auth`, `http/auth.rs` | ✅ | ✅ | ✅ | ✅ |
 | Generic OIDC (Discord, Twitch, Epic, Keycloak…) | ✅ `/v1/auth/oidc/{provider}`, discovery + JWKS | 🟡 | 🟡 | 🟡 | ✅ |
 | Xbox Live (XSTS), PSN, Nintendo | ✅ `POST /v1/auth/{xbox,psn,nintendo}` + link/unlink (XSTS-профиль, id_token через OIDC-проверку) | ✅ | ❌ (custom) | ✅ | ✅ |
+| Проверка владения Steam / Family Sharing при логине | ✅ `[social.steam] require_ownership`, `family_sharing allow|deny`, `ban_propagation` лендер↔заёмщики, `GET /v1/admin/accounts/{id}/steam`  | ❌  | ❌  | 🟡 Pragma/EOS  | ❌  |
 | Passkeys / WebAuthn | ✅ | ❌ | ❌ | ❌ | ❌ |
 | MFA: TOTP + recovery codes + e-mail коды, таймлайн security-событий, MFA операторов через IdP (`require_mfa`) | ✅ | ❌ | ❌ | ❌ | 🟡 |
 | Magic-link вход | ✅ `POST /v1/auth/email/magic/request` → событие `account.magic_link`, `POST /v1/auth/email/magic {token}` | ❌ | ❌ | ✅ | ❌ |
@@ -107,6 +108,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Внешние оркестраторы как провайдеры (Edgegap, GameLift) | ✅ `provider = edgegap` (deploy/status/stop) и `gamelift` (CreateGameSession/Describe/Terminate, SigV4) рядом с local/docker/firecracker/k8s/agones | — | ✅ | — | — |
 | Автоскейл: буфер + прогноз по истории | ✅ `demand`/`scale` | ❌ | ❌ | ✅ | ✅ |
 | Scale-to-zero флота | ✅ браузер серверов для игроков (`GET /v1/servers` с фильтрами/сортировкой, join через shared-аллокацию, избранное по address:port, история, рейтинг), lifecycle-события матчей (`match.created|joined|left|closed`), custom server-to-server события `POST /v1/gameserver/events`, wildcard-подписки вебхуков; counters/lists на серверах с селекторной аллокацией и атомарными actions (шаринг allocated-серверов), `counter_target` в автоскейле, кросс-флотовый инвентарь `GET /v1/server/gameservers` + `/counts` (регион/состояние/билд/лейблы/exit_reason/возраст); rolling/recreate rollout билдов (`max_surge`/`max_unavailable`, allocated не трогаем, auto-rollback по провалам старта, pause/resume/rollback), журнал lifecycle-событий флота с кодами и `exit_reason` → вебхуки `gameserver.*`/`fleet.*`; per-server метрики (CPU/mem/net/tick/players с агента, история и бакеты, сводка флота, правила алертов `for_secs`/`silence_secs` → события `fleet.alert_fired|resolved`), логи серверов (stdout/stderr local, ssh-файл, docker/k8s tail, SDK push; фильтры, retention), политики автоскейла (`target_utilization`, шаги, cooldown up/down), resource spec серверов (cpu/memory/disk/gpu → k8s requests/limits, docker, firecracker), min 0 + холодный старт при аллокации (ожидание готовности), прогноз по истории | ❌ | ❌ | ✅ | ✅ |
+| Health-политика серверов и eviction | ✅ `policy.health {initial_delay, period, failure_threshold, disabled}`, `GET /v1/server/fleets/{id}/health`, `policy.eviction never|on_upgrade|always`  | ❌  | ❌  | ✅ Agones  | ❌  |
 | Build pipeline: canary / promote / rollback, vCPU-часы | ✅ | ❌ | ❌ | 🟡 | ✅ |
 | SDK сервера: ready/health/labels/players/watch/shutdown | ✅ `/v1/gameserver/*` | ✅ | 🟡 | ✅ | ✅ |
 

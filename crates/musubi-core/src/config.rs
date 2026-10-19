@@ -1349,6 +1349,17 @@ pub struct SteamLoginConfig {
     /// Steamworks Web API key; empty = Steam login disabled.
     pub web_api_key: String,
     pub app_id: u32,
+    /// Check `ISteamUser/CheckAppOwnership` at login and refuse accounts that do not own `app_id`
+    /// (pirated or refunded copies). Family-shared and free-weekend copies count as owned.
+    pub require_ownership: bool,
+    /// Steam Family Sharing borrowers: `allow` (default) or `deny` (owner's copy only).
+    pub family_sharing: String,
+    /// Ban propagation through Family Sharing: `none`, `owner_to_borrower` (a borrower cannot log
+    /// in while the lending account is banned — default) or `both` (the lender is also refused
+    /// while any of their borrowers is banned).
+    pub ban_propagation: String,
+    /// Reuse a stored ownership answer this long before asking Steam again (0 = every login).
+    pub ownership_cache_secs: u64,
 }
 
 /// Xbox Live profile service used to validate XSTS tokens (`Authorization: XBL3.0 x=<uhs>;<token>`).
@@ -1376,6 +1387,10 @@ impl Default for SteamLoginConfig {
             url: "https://partner.steam-api.com".into(),
             web_api_key: String::new(),
             app_id: 0,
+            require_ownership: false,
+            family_sharing: "allow".into(),
+            ban_propagation: "owner_to_borrower".into(),
+            ownership_cache_secs: 3600,
         }
     }
 }

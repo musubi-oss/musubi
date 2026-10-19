@@ -560,10 +560,14 @@ async fn steam(
 ) -> Result<Json<Session>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
     let steam_id = s.logins.steam(&r.ticket).await?;
+    let ownership = super::steam_ownership::gate(&s, &steam_id).await?;
     let sess = s
         .auth
         .authenticate_external(musubi_auth::provider::STEAM, &steam_id, r.opts)
         .await?;
+    if let Some(o) = ownership {
+        super::steam_ownership::store(&s, &steam_id, &o).await?;
+    }
     authenticated(&s, &sess, musubi_auth::provider::STEAM, &ip.0);
     Ok(Json(sess))
 }

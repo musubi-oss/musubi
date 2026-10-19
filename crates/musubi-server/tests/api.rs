@@ -26808,3 +26808,379 @@ async fn crash_reports_grouping_triage_and_player_timeline() {
     let (st, _) = call_server(&app, "GET", &format!("/v1/server/crashes/{fp2}"), k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// P1-24: Steam ownership and Family Sharing at login — unowned copies are refused, borrowers
+/// are tied to their lender, and bans propagate between lender and borrowers.
+#[tokio::test]
+async fn steam_ownership_and_family_sharing_gate_logins() {
+    use axum::extract::Query as AxQuery;
+    use axum::routing::get as ax_get;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        % 1_000_000_000;
+    let (s1, s2, s3) = (
+        format!("76561195{nonce:09}"),
+        format!("76561194{nonce:09}"),
+        format!("76561193{nonce:09}"),
+    );
+    let (t1, t2, t3) = (s1.clone(), s2.clone(), s3.clone());
+    let (o1, o2, o3) = (s1.clone(), s2.clone(), s3.clone());
+    let mock = Router::new()
+        .route(
+            "/ISteamUserAuth/AuthenticateUserTicket/v1/",
+            ax_get(move |AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| {
+                let (t1, t2, t3) = (t1.clone(), t2.clone(), t3.clone());
+                async move {
+                    let id = match q.get("ticket").map(String::as_str) {
+                        Some("aa01") => t1,
+                        Some("bb02") => t2,
+                        Some("cc03") => t3,
+                        _ => return axum::Json(json!({"response": {"error": {"errorcode": 101, "errordesc": "Invalid ticket"}}})),
+                    };
+                    axum::Json(json!({"response": {"params": {"result": "OK", "steamid": id, "ownersteamid": id, "vacbanned": false, "publisherbanned": false}}}))
+                }
+            }),
+        )
+        .route(
+            "/ISteamUser/CheckAppOwnership/v4/",
+            ax_get(move |AxQuery(q): AxQuery<std::collections::HashMap<String, String>>| {
+                let (o1, o2, o3) = (o1.clone(), o2.clone(), o3.clone());
+                async move {
+                    let sid = q.get("steamid").cloned().unwrap_or_default();
+                    let body = if sid == o1 {
+                        json!({"ownsapp": true, "permanent": true, "ownersteamid": o1, "sitelicense": false, "timedtrial": false, "result": "OK"})
+                    } else if sid == o2 {
+                        json!({"ownsapp": true, "permanent": false, "ownersteamid": o1, "sitelicense": false, "timedtrial": false, "result": "OK"})
+                    } else {
+                        json!({"ownsapp": false, "permanent": false, "ownersteamid": o3, "sitelicense": false, "timedtrial": false, "result": "OK"})
+                    };
+                    axum::Json(json!({"appownership": body}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let steam_cfg = |c: &mut Config, base: &str| {
+        c.social.steam.url = base.to_string();
+        c.social.steam.web_api_key = "k".into();
+        c.social.steam.app_id = 480;
+        c.social.steam.ownership_cache_secs = 0;
+    };
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        steam_cfg(c, &b);
+        c.social.steam.require_ownership = true;
+        c.social.steam.ban_propagation = "both".into();
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let login = |app: &Router, ticket: &str| {
+        let app = app.clone();
+        let ticket = ticket.to_string();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/v1/auth/steam",
+                None,
+                Some(json!({"ticket": ticket})),
+            )
+            .await
+        }
+    };
+    // not owned → refused before any account exists
+    let (st, v) = login(&app, "cc03").await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("does not own"),
+        "{v}"
+    );
+    // borrower and owner log in
+    let (st, vb) = login(&app, "bb02").await;
+    assert_eq!(st, StatusCode::OK, "{vb}");
+    let acc_b = vb["account_id"].as_str().unwrap().to_string();
+    let (st, va) = login(&app, "aa01").await;
+    assert_eq!(st, StatusCode::OK, "{va}");
+    let acc_a = va["account_id"].as_str().unwrap().to_string();
+    // support card: lender ↔ borrowers
+    let (st, card) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{acc_b}/steam"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{card}");
+    assert_eq!(card["policy"]["require_ownership"], true);
+    let idb = &card["identities"][0];
+    assert_eq!(idb["steam_id"], s2);
+    assert_eq!(idb["ownership"]["family_shared"], true);
+    assert_eq!(idb["ownership"]["owner_steamid"], s1);
+    assert_eq!(idb["ownership"]["permanent"], false);
+    assert_eq!(idb["lender"]["account_id"], acc_a);
+    assert_eq!(idb["lender"]["banned"], false);
+    let (_, card) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{acc_a}/steam"),
+        k,
+        None,
+    )
+    .await;
+    let ida = &card["identities"][0];
+    assert_eq!(ida["ownership"]["family_shared"], false);
+    assert_eq!(ida["ownership"]["permanent"], true);
+    assert!(ida["lender"].is_null());
+    assert!(
+        ida["borrowers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["account_id"] == acc_a || b["account_id"] == acc_b),
+        "{card}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{}/steam", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // lender banned → borrower refused
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{acc_a}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = login(&app, "bb02").await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("lending"), "{v}");
+    let (_, card) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{acc_b}/steam"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(card["identities"][0]["lender"]["banned"], true);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{acc_a}/unban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = login(&app, "bb02").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // borrower banned → lender refused (`both`)
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{acc_b}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = login(&app, "aa01").await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("borrowing"), "{v}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{acc_b}/unban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = login(&app, "aa01").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // a deployment that refuses family sharing
+    let b = base.clone();
+    let Some(deny) = app_with(move |c| {
+        steam_cfg(c, &b);
+        c.social.steam.family_sharing = "deny".into();
+    })
+    .await
+    else {
+        return;
+    };
+    let (st, v) = login(&deny, "bb02").await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("family sharing"),
+        "{v}"
+    );
+    let (st, v) = login(&deny, "aa01").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // ownership not required → unowned copies may play
+    let b = base.clone();
+    let Some(lax) = app_with(move |c| steam_cfg(c, &b)).await else {
+        return;
+    };
+    let (st, v) = login(&lax, "cc03").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+/// P1-28: fleet health policy — validation, per-server health report, missed checks reap the
+/// server as `unhealthy`.
+#[tokio::test]
+async fn fleet_health_policy_report_and_reaping() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    for bad in [
+        json!({"health": {"period_secs": 0}}),
+        json!({"health": {"failure_threshold": 0}}),
+        json!({"eviction": "sometimes"}),
+    ] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/fleets",
+            k,
+            Some(json!({"name": unique("hp"), "provider": "local", "max_servers": 1, "spec": {"command": ["sleep", "1"]}, "policy": bad})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let name = unique("health");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "local", "buffer": 1, "max_servers": 1,
+            "port_start": 47400, "port_end": 47500,
+            "spec": {"command": ["sleep", "60"]},
+            "policy": {"health": {"period_secs": 1, "failure_threshold": 2, "initial_delay_secs": 60}, "eviction": "never"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["policy"]["health"]["period_secs"], 1);
+    assert_eq!(f["policy"]["eviction"], "never");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
+    let (st, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    assert_eq!(h["timeout_secs"], 2);
+    assert_eq!(h["eviction"], "never");
+    assert_eq!(h["counts"]["starting"], 1, "{h}");
+    let srv = &h["servers"][0];
+    assert_eq!(srv["status"], "starting");
+    assert!(srv["reap_in_secs"].as_i64().unwrap() <= 60);
+    let sid = srv["id"].as_str().unwrap().to_string();
+    let sdk = |path: &str| {
+        let app = app.clone();
+        let sid = sid.clone();
+        let path = path.to_string();
+        async move {
+            let req = Request::post(path)
+                .header("x-musubi-server-key", k)
+                .header("x-musubi-server-id", &sid)
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(sdk("/v1/gameserver/ready").await, StatusCode::OK);
+    assert_eq!(sdk("/v1/gameserver/health").await, StatusCode::OK);
+    let (_, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    let srv = h["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == sid)
+        .unwrap();
+    assert_eq!(srv["status"], "healthy", "{h}");
+    assert_eq!(srv["missed_checks"], 0);
+    assert!(srv["reap_in_secs"].as_i64().unwrap() <= 2);
+    // silence for longer than period × threshold → unhealthy → reaped on the next pass
+    tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+    let (_, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    let srv = h["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == sid)
+        .unwrap();
+    assert_eq!(srv["status"], "unhealthy", "{h}");
+    assert!(srv["missed_checks"].as_i64().unwrap() >= 2);
+    assert!(srv["reap_in_secs"].is_null());
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet_id={fid}&state=all&exit_reason=unhealthy"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == sid),
+        "{v}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{}/health", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert!(st.is_success() || st == StatusCode::NOT_FOUND, "{st}");
+}

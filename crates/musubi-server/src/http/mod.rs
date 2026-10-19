@@ -54,6 +54,7 @@ pub mod sanctions;
 mod server_browser;
 mod sso;
 pub mod stats;
+pub mod steam_ownership;
 mod storage;
 pub mod streams;
 pub(crate) mod subscriptions;
@@ -267,6 +268,7 @@ pub fn router(state: AppState) -> Router {
         .merge(offers::routes())
         .merge(analytics::routes())
         .merge(crashes::routes())
+        .merge(steam_ownership::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

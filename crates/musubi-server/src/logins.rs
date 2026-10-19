@@ -11,7 +11,7 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use musubi_core::config::{oidc_preset, OidcLoginConfig, SocialConfig};
 use musubi_core::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const JWKS_TTL: Duration = Duration::from_secs(3600);
 
@@ -65,6 +65,18 @@ pub struct GameCenterSig {
     /// base64
     pub signature: String,
     pub public_key_url: String,
+}
+
+/// Answer of `ISteamUser/CheckAppOwnership` for the configured app.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SteamOwnership {
+    pub owns_app: bool,
+    pub permanent: bool,
+    pub timed_trial: bool,
+    pub site_license: bool,
+    /// `ownersteamid` is another account: the player borrows the game through Family Sharing.
+    pub family_shared: bool,
+    pub owner_steamid: String,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +168,56 @@ impl Social {
             return Err(Error::PermissionDenied("steam account banned".into()));
         }
         Ok(p.steamid)
+    }
+
+    /// Steam: `ISteamUser/CheckAppOwnership` for `app_id` — ownership, Family Sharing lender
+    /// (`ownersteamid` differs from the player), permanence and timed trials.
+    pub async fn steam_ownership(&self, steam_id: &str) -> Result<SteamOwnership> {
+        let c = &self.cfg.steam;
+        if c.web_api_key.is_empty() || c.app_id == 0 {
+            return Err(Error::InvalidArgument(
+                "steam login is not configured".into(),
+            ));
+        }
+        let url = format!(
+            "{}/ISteamUser/CheckAppOwnership/v4/",
+            c.url.trim_end_matches('/')
+        );
+        let v: serde_json::Value = self
+            .http
+            .get(url)
+            .query(&[
+                ("key", c.web_api_key.as_str()),
+                ("steamid", steam_id),
+                ("appid", &c.app_id.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .error_for_status()
+            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::Internal(format!("steam api: {e}")))?;
+        let a = &v["appownership"];
+        if a.is_null() {
+            return Err(Error::Internal(format!("steam api: unexpected answer {v}")));
+        }
+        let owner = a["ownersteamid"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| a["ownersteamid"].as_u64().map(|n| n.to_string()))
+            .unwrap_or_default();
+        Ok(SteamOwnership {
+            owns_app: a["ownsapp"].as_bool().unwrap_or(false),
+            permanent: a["permanent"].as_bool().unwrap_or(false),
+            timed_trial: a["timedtrial"].as_bool().unwrap_or(false),
+            site_license: a["sitelicense"].as_bool().unwrap_or(false),
+            family_shared: a["ownsapp"].as_bool().unwrap_or(false)
+                && !owner.is_empty()
+                && owner != steam_id,
+            owner_steamid: owner,
+        })
     }
 
     /// Xbox Live: the XSTS token the client got for the `http://xboxlive.com` relying party is

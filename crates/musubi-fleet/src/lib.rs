@@ -236,6 +236,81 @@ pub struct ScalePolicy {
     pub counter_target: Option<CounterTarget>,
     /// List this fleet's servers in the player server browser (`GET /v1/servers`).
     pub browsable: bool,
+    /// Health-check policy (P1-28): how long a server may take to become ready and how many
+    /// missed `POST /v1/gameserver/health` periods make it unhealthy.
+    pub health: HealthPolicy,
+    /// Which `allocated` (in-game) servers the fleet may stop: `never` (only lifecycle limits
+    /// end them), `on_upgrade` (default: rollouts may drain long allocations per
+    /// `rollout.drain_allocated_after_secs`) or `always` (scale-down may also stop the emptiest
+    /// allocated servers when the fleet is over target).
+    pub eviction: String,
+}
+
+/// Health-check policy (Agones `health` + eviction semantics). A server that does not report
+/// `ready` within `initial_delay_secs` is `stuck_starting`; after ready, missing health reports
+/// for `period_secs × failure_threshold` makes it `unhealthy` and the reconciler reaps it.
+/// `disabled` keeps servers alive regardless of reports (debuggers, pause-on-breakpoint).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HealthPolicy {
+    pub disabled: bool,
+    pub initial_delay_secs: u64,
+    pub period_secs: u64,
+    pub failure_threshold: u32,
+}
+
+impl Default for HealthPolicy {
+    fn default() -> Self {
+        Self {
+            disabled: false,
+            initial_delay_secs: 120,
+            period_secs: 10,
+            failure_threshold: 3,
+        }
+    }
+}
+
+pub const EVICTIONS: [&str; 3] = ["never", "on_upgrade", "always"];
+
+impl HealthPolicy {
+    /// Silence that makes a ready/allocated server unhealthy.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.period_secs.max(1) * self.failure_threshold.max(1) as u64)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.period_secs < 1 || self.failure_threshold < 1 || self.initial_delay_secs < 1 {
+            return Err(Error::InvalidArgument(
+                "policy.health: period_secs, failure_threshold and initial_delay_secs must be >= 1"
+                    .into(),
+            ));
+        }
+        if self.period_secs > 3600 || self.initial_delay_secs > 86_400 {
+            return Err(Error::InvalidArgument(
+                "policy.health: period_secs <= 3600, initial_delay_secs <= 86400".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Status of one server given its state, seconds since its last health report and seconds
+    /// since it was created.
+    pub fn status(&self, state: &str, since_health: i64, since_created: i64) -> &'static str {
+        match state {
+            "terminated" => "terminated",
+            "scheduled" | "starting" => {
+                if since_created > self.initial_delay_secs as i64 {
+                    "stuck_starting"
+                } else {
+                    "starting"
+                }
+            }
+            _ if self.disabled => "unchecked",
+            _ if since_health > self.timeout().as_secs() as i64 => "unhealthy",
+            _ if since_health > self.period_secs as i64 => "suspect",
+            _ => "healthy",
+        }
+    }
 }
 
 /// Build rollout strategy (plan P1-29): `manual` only affects new servers; `rolling` replaces
@@ -409,6 +484,8 @@ impl Default for ScalePolicy {
             rollout: RolloutPolicy::default(),
             counter_target: None,
             browsable: false,
+            health: HealthPolicy::default(),
+            eviction: "on_upgrade".into(),
         }
     }
 }
@@ -524,6 +601,12 @@ impl ScalePolicy {
 
     fn validate(&self, max_servers: i32) -> Result<()> {
         self.rollout.validate()?;
+        self.health.validate()?;
+        if !EVICTIONS.contains(&self.eviction.as_str()) {
+            return Err(Error::InvalidArgument(
+                "policy.eviction must be never|on_upgrade|always".into(),
+            ));
+        }
         if let Some(ct) = &self.counter_target {
             valid_slot_name(&ct.counter)?;
             if ct.buffer < 0 {
@@ -1904,6 +1987,48 @@ impl FleetService {
         Ok(s)
     }
 
+    /// `GET /v1/server/fleets/{id}/health`: every live server classified under the fleet's
+    /// health policy, with counts per status.
+    pub async fn health_report(&self, fleet_id: Uuid) -> Result<serde_json::Value> {
+        let f = self.get(fleet_id).await?;
+        let servers = self.servers(fleet_id, None).await?;
+        let h = &f.policy.health;
+        let now = OffsetDateTime::now_utc();
+        let mut counts: std::collections::BTreeMap<&'static str, i64> = Default::default();
+        let mut out = Vec::new();
+        for s in servers.iter().filter(|s| s.state != "terminated") {
+            // ceil so the report agrees with the reconciler's `>` on sub-second remainders
+            let since_health_f = (now - s.last_health).as_seconds_f64().max(0.0);
+            let since_health = since_health_f.ceil() as i64;
+            let since_created = (now - s.created_at).as_seconds_f64().ceil().max(0.0) as i64;
+            let status = h.status(&s.state, since_health, since_created);
+            *counts.entry(status).or_default() += 1;
+            let missed = if matches!(status, "starting" | "stuck_starting" | "unchecked") {
+                0
+            } else {
+                (since_health_f / h.period_secs.max(1) as f64).floor() as i64
+            };
+            out.push(serde_json::json!({
+                "id": s.id, "state": s.state, "status": status,
+                "last_health_secs_ago": since_health, "missed_checks": missed,
+                "age_secs": since_created, "players": s.players, "build_version": s.build_version,
+                "reap_in_secs": match status {
+                    "healthy" | "suspect" => Some((h.timeout().as_secs() as i64 - since_health).max(0)),
+                    "starting" => Some((h.initial_delay_secs as i64 - since_created).max(0)),
+                    _ => None,
+                },
+            }));
+        }
+        Ok(serde_json::json!({
+            "fleet_id": fleet_id,
+            "policy": h,
+            "eviction": f.policy.eviction,
+            "timeout_secs": h.timeout().as_secs(),
+            "counts": counts,
+            "servers": out,
+        }))
+    }
+
     pub async fn sdk_health(&self, id: Uuid) -> Result<()> {
         sqlx::query("update musubi.game_servers set last_health = now() where id = $1 and state not in ('terminated')")
             .bind(id)
@@ -2815,7 +2940,11 @@ impl FleetService {
             (r.max_unavailable + new_ready).max(0) as usize
         };
         let now = OffsetDateTime::now_utc();
-        let drain = f.policy.rollout.drain_allocated_after_secs;
+        let drain = if f.policy.eviction == "never" {
+            0
+        } else {
+            f.policy.rollout.drain_allocated_after_secs
+        };
         let mut drained: Vec<&GameServer> = Vec::new();
         if drain > 0 {
             drained = outdated
@@ -3206,9 +3335,13 @@ impl FleetService {
                 let mine = s.node_id == Some(self.node_id);
                 let dead_process =
                     mine && provider.as_ref().and_then(|p| p.alive(s.id)) == Some(false);
-                let stale = now - s.last_health > HEALTH_TIMEOUT && s.state != "starting";
-                let stuck_starting =
-                    s.state == "starting" && now - s.created_at > Duration::from_secs(120);
+                let h = &f.policy.health;
+                let stale = !h.disabled
+                    && s.state != "starting"
+                    && s.state != "scheduled"
+                    && now - s.last_health > h.timeout();
+                let stuck_starting = s.state == "starting"
+                    && now - s.created_at > Duration::from_secs(h.initial_delay_secs);
                 if let Some(why) = lifecycle_expired(&f, s, now, live_min_guard(&servers, &f)) {
                     tracing::info!(server = %s.id, fleet = %f.name, state = %s.state, why, "server lifecycle limit reached");
                     self.terminate_reason(&f, s.id, why).await;
@@ -3296,6 +3429,12 @@ impl FleetService {
                 let mut idle: Vec<&GameServer> =
                     servers.iter().filter(|s| s.state == "ready").collect();
                 idle.sort_by_key(|s| s.created_at);
+                if f.policy.eviction == "always" && idle.len() < stop as usize {
+                    let mut busy: Vec<&GameServer> =
+                        servers.iter().filter(|s| s.state == "allocated").collect();
+                    busy.sort_by_key(|s| (s.players, s.created_at));
+                    idle.extend(busy);
+                }
                 for s in idle.into_iter().take(stop as usize) {
                     tracing::info!(server = %s.id, fleet = %f.name, target, "scaling down idle game server");
                     self.terminate_reason(&f, s.id, "scale_down").await;
@@ -3611,5 +3750,42 @@ mod lifecycle_tests {
             lifecycle_expired(&none, &server("ready", 99999, Some(99999), None), now, 5),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn health_policy_timeout_and_status() {
+        let h = HealthPolicy::default();
+        assert_eq!(h.timeout(), Duration::from_secs(30));
+        assert_eq!(h.status("ready", 3, 500), "healthy");
+        assert_eq!(h.status("allocated", 15, 500), "suspect");
+        assert_eq!(h.status("ready", 31, 500), "unhealthy");
+        assert_eq!(h.status("starting", 0, 10), "starting");
+        assert_eq!(h.status("starting", 0, 121), "stuck_starting");
+        let off = HealthPolicy {
+            disabled: true,
+            ..HealthPolicy::default()
+        };
+        assert_eq!(off.status("ready", 10_000, 10_000), "unchecked");
+        assert!(HealthPolicy {
+            period_secs: 0,
+            ..HealthPolicy::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HealthPolicy {
+            failure_threshold: 0,
+            ..HealthPolicy::default()
+        }
+        .validate()
+        .is_err());
+        let mut p = ScalePolicy::default();
+        assert!(p.validate(10).is_ok());
+        p.eviction = "sometimes".into();
+        assert!(p.validate(10).is_err());
     }
 }

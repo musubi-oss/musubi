@@ -42,6 +42,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/server/fleets/{id}/usage", get(usage))
         .route("/v1/server/fleets/{id}/rollout", get(rollout_get))
+        .route("/v1/server/fleets/{id}/health", get(health_report))
         .route("/v1/server/fleets/{id}/rollouts", get(rollouts))
         .route("/v1/server/fleets/{id}/rollout/pause", post(rollout_pause))
         .route(
@@ -316,6 +317,16 @@ async fn sdk_ready(
     headers: HeaderMap,
 ) -> Result<Json<GameServer>, ApiError> {
     Ok(Json(s.fleets.sdk_ready(self_id(&headers)?).await?))
+}
+
+/// `GET /v1/server/fleets/{id}/health` — per-server health status under the fleet's health
+/// policy: healthy / suspect (missed checks) / unhealthy (about to be reaped) / starting / stuck.
+async fn health_report(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.fleets.health_report(id).await?))
 }
 
 async fn sdk_health(
