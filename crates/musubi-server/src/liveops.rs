@@ -116,6 +116,35 @@ pub struct LiveEvent {
     pub audience: Option<String>,
     #[serde(default)]
     pub metadata: Value,
+    /// Category labels (filter in lists, group in tooling).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// `implicit` — every eligible account is in while a phase runs; `explicit` — the account
+    /// joins, and its own window runs `participation_secs` from joining (capped by the cycle).
+    #[serde(default = "implicit")]
+    pub participation: String,
+    #[serde(default)]
+    pub participation_secs: Option<i64>,
+    #[serde(default)]
+    pub max_participants: Option<i64>,
+    #[serde(default)]
+    pub template: Option<String>,
+}
+
+fn implicit() -> String {
+    "implicit".into()
+}
+
+/// Client-side view options for live events (P0-53).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct EventQuery {
+    /// Include events / own participations that ended within 30 days.
+    pub include_past: bool,
+    /// Include events starting later than the default 7-day horizon.
+    pub include_future: bool,
+    /// Comma-separated labels — keep events carrying any of them.
+    pub labels: Option<String>,
 }
 
 /// Deterministic 0..10_000 bucket of (key, account) — stable across nodes and restarts.
@@ -301,7 +330,7 @@ pub async fn load_experiment(s: &AppState, id: &str) -> Result<Option<Experiment
     Ok(row.map(exp_of))
 }
 
-const EV_SELECT: &str = "select id, name, description, enabled, phases, starts_at, ends_at, recurrence_secs, local_time, audience, metadata from musubi.live_events";
+const EV_SELECT: &str = "select id, name, description, enabled, phases, starts_at, ends_at, recurrence_secs, local_time, audience, metadata, labels, participation, participation_secs, max_participants, template from musubi.live_events";
 type EvRow = (
     String,
     String,
@@ -314,6 +343,11 @@ type EvRow = (
     bool,
     Option<String>,
     Value,
+    Value,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
 );
 
 fn ev_of(r: EvRow) -> LiveEvent {
@@ -329,6 +363,11 @@ fn ev_of(r: EvRow) -> LiveEvent {
         local_time,
         audience,
         metadata,
+        labels,
+        participation,
+        participation_secs,
+        max_participants,
+        template,
     ) = r;
     LiveEvent {
         id,
@@ -342,6 +381,11 @@ fn ev_of(r: EvRow) -> LiveEvent {
         local_time,
         audience,
         metadata,
+        labels: serde_json::from_value(labels).unwrap_or_default(),
+        participation,
+        participation_secs,
+        max_participants,
+        template,
     }
 }
 
@@ -502,36 +546,224 @@ async fn tz_offset_min(s: &AppState, account: AccountId) -> i64 {
 /// Native live events for an account: active ones with their phase, plus upcoming ones
 /// (next start within 7 days).
 pub async fn eval_live_events(s: &AppState, account: AccountId) -> Result<Vec<Value>> {
+    eval_live_events_q(s, account, &EventQuery::default()).await
+}
+
+fn cycle_len(ev: &LiveEvent) -> i64 {
+    ev.phases
+        .iter()
+        .map(|p| p.offset_secs + p.duration_secs)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Rows of `live_event_participants` for one account: (event, cycle) → (joined_at, ends_at).
+async fn participations(
+    s: &AppState,
+    account: AccountId,
+) -> Result<HashMap<(String, i64), (i64, i64)>> {
+    let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "select event_id, cycle_started_at, joined_at, ends_at from musubi.live_event_participants where account_id = $1",
+    )
+    .bind(account.0)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(rows
+        .into_iter()
+        .map(|(e, c, j, x)| ((e, c), (j, x)))
+        .collect())
+}
+
+/// Live events as one account sees them (P0-53): running phases (with the account's own
+/// participation window for `explicit` events), upcoming starts, and — on request — recently
+/// ended events / participations and starts beyond the 7-day horizon, filtered by labels.
+pub async fn eval_live_events_q(
+    s: &AppState,
+    account: AccountId,
+    q: &EventQuery,
+) -> Result<Vec<Value>> {
     let events = load_events(s).await?;
     if events.is_empty() {
         return Ok(Vec::new());
     }
+    let want: Vec<String> = q
+        .labels
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
     let audiences = s.audiences.of(&s.db, &s.economy, account).await?;
     let tz = tz_offset_min(s, account).await;
     let now = now_s();
+    let mine = if events.iter().any(|e| e.participation == "explicit") {
+        participations(s, account).await?
+    } else {
+        HashMap::new()
+    };
     let mut out = Vec::new();
     for ev in events {
         if !ev.enabled || ev.audience.as_ref().is_some_and(|a| !audiences.contains(a)) {
             continue;
         }
+        if !want.is_empty() && !ev.labels.iter().any(|l| want.contains(l)) {
+            continue;
+        }
+        let base = json!({
+            "id": ev.id, "name": ev.name, "description": ev.description, "labels": ev.labels,
+            "participation": ev.participation, "metadata": ev.metadata,
+        });
+        let mut v = base;
         match phase_at(&ev, now, tz) {
             Ok((i, ps, pe, cycle)) => {
                 let next = ev.phases.get(i + 1).map(|p| p.name.clone());
-                out.push(json!({
-                    "id": ev.id, "name": ev.name, "description": ev.description, "active": true,
-                    "phase": ev.phases[i].name, "phase_index": i, "phase_started_at": ps,
-                    "phase_ends_at": pe, "cycle_started_at": cycle, "next_phase": next,
-                    "metadata": ev.metadata,
-                }));
+                v["active"] = json!(true);
+                v["phase"] = json!(ev.phases[i].name);
+                v["phase_index"] = json!(i);
+                v["phase_started_at"] = json!(ps);
+                v["phase_ends_at"] = json!(pe);
+                v["cycle_started_at"] = json!(cycle);
+                v["cycle_ends_at"] = json!(cycle + cycle_len(&ev));
+                v["next_phase"] = json!(next);
+                if ev.participation == "explicit" {
+                    match mine.get(&(ev.id.clone(), cycle)) {
+                        Some((j, x)) if *x > now => {
+                            v["joined"] = json!(true);
+                            v["joined_at"] = json!(j);
+                            v["participation_ends_at"] = json!(x);
+                        }
+                        Some((j, x)) => {
+                            if !q.include_past {
+                                continue;
+                            }
+                            v["active"] = json!(false);
+                            v["joined"] = json!(true);
+                            v["joined_at"] = json!(j);
+                            v["ended"] = json!(true);
+                            v["ended_at"] = json!(x);
+                        }
+                        None => {
+                            v["joined"] = json!(false);
+                            v["can_join"] = json!(true);
+                            v["participation_secs"] = json!(ev.participation_secs);
+                        }
+                    }
+                }
+                out.push(v);
             }
-            Err(Some(next)) if next - now <= 7 * 86_400 => out.push(json!({
-                "id": ev.id, "name": ev.name, "description": ev.description, "active": false,
-                "starts_at": next, "metadata": ev.metadata,
-            })),
-            Err(_) => {}
+            Err(Some(next)) if q.include_future || next - now <= 7 * 86_400 => {
+                v["active"] = json!(false);
+                v["starts_at"] = json!(next);
+                out.push(v);
+            }
+            Err(Some(_)) => {}
+            Err(None) if q.include_past => {
+                let ended_at = ev
+                    .ends_at
+                    .unwrap_or(ev.starts_at + cycle_len(&ev))
+                    .min(ev.ends_at.unwrap_or(i64::MAX));
+                if now - ended_at <= 30 * 86_400 {
+                    v["active"] = json!(false);
+                    v["ended"] = json!(true);
+                    v["ended_at"] = json!(ended_at);
+                    out.push(v);
+                }
+            }
+            Err(None) => {}
         }
     }
     Ok(out)
+}
+
+/// `explicit` participation: the account opts into the running cycle; its own window ends at
+/// `joined_at + participation_secs` or the cycle end, whichever is first.
+pub async fn join_live_event(s: &AppState, account: AccountId, id: &str) -> Result<Value> {
+    let ev = load_event(s, id)
+        .await?
+        .ok_or_else(|| Error::NotFound("live event".into()))?;
+    if ev.participation != "explicit" {
+        return Err(Error::InvalidArgument(
+            "live event has implicit participation — every eligible account is already in".into(),
+        ));
+    }
+    let audiences = s.audiences.of(&s.db, &s.economy, account).await?;
+    if !ev.enabled || ev.audience.as_ref().is_some_and(|a| !audiences.contains(a)) {
+        return Err(Error::PermissionDenied(
+            "account is not eligible for this live event".into(),
+        ));
+    }
+    let now = now_s();
+    let tz = tz_offset_min(s, account).await;
+    let Ok((_, _, _, cycle)) = phase_at(&ev, now, tz) else {
+        return Err(Error::Conflict("live event is not running".into()));
+    };
+    let cycle_end = cycle + cycle_len(&ev);
+    let ends_at = ev
+        .participation_secs
+        .map_or(cycle_end, |p| (now + p).min(cycle_end));
+    if let Some(max) = ev.max_participants {
+        let n: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.live_event_participants where event_id = $1 and cycle_started_at = $2",
+        )
+        .bind(id)
+        .bind(cycle)
+        .fetch_one(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        let already: bool = sqlx::query_scalar(
+            "select exists(select 1 from musubi.live_event_participants where event_id = $1 and cycle_started_at = $2 and account_id = $3)",
+        )
+        .bind(id)
+        .bind(cycle)
+        .bind(account.0)
+        .fetch_one(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        if n >= max && !already {
+            return Err(Error::Conflict("live event is full".into()));
+        }
+    }
+    let (joined_at, ends_at, inserted): (i64, i64, bool) = sqlx::query_as(
+        "insert into musubi.live_event_participants (event_id, account_id, cycle_started_at, joined_at, ends_at)
+         values ($1, $2, $3, $4, $5)
+         on conflict (event_id, account_id, cycle_started_at) do update set joined_at = musubi.live_event_participants.joined_at
+         returning joined_at, ends_at, (xmax = 0)",
+    )
+    .bind(id)
+    .bind(account.0)
+    .bind(cycle)
+    .bind(now)
+    .bind(ends_at)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(json!({
+        "id": id, "joined": true, "already": !inserted, "cycle_started_at": cycle,
+        "joined_at": joined_at, "participation_ends_at": ends_at,
+    }))
+}
+
+/// Leave the current cycle of an `explicit` event (re-joining starts a fresh window).
+pub async fn leave_live_event(s: &AppState, account: AccountId, id: &str) -> Result<Value> {
+    let ev = load_event(s, id)
+        .await?
+        .ok_or_else(|| Error::NotFound("live event".into()))?;
+    let now = now_s();
+    let tz = tz_offset_min(s, account).await;
+    let cycle = phase_at(&ev, now, tz).map(|(_, _, _, c)| c).ok();
+    let n = sqlx::query(
+        "delete from musubi.live_event_participants where event_id = $1 and account_id = $2 and ($3::bigint is null or cycle_started_at = $3)",
+    )
+    .bind(id)
+    .bind(account.0)
+    .bind(cycle)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    Ok(json!({ "id": id, "left": n > 0 }))
 }
 
 fn merge_by_name(mut native: Vec<Value>, extra: Vec<Value>) -> Vec<Value> {
@@ -565,7 +797,15 @@ pub async fn merged_flags(s: &AppState, account: AccountId, names: &[String]) ->
 
 /// Live events as clients see them (`{live_events: [...]}`), native + Zanshin overlay.
 pub async fn merged_live_events(s: &AppState, account: AccountId) -> Result<Value> {
-    let native = eval_live_events(s, account).await?;
+    merged_live_events_q(s, account, &EventQuery::default()).await
+}
+
+pub async fn merged_live_events_q(
+    s: &AppState,
+    account: AccountId,
+    q: &EventQuery,
+) -> Result<Value> {
+    let native = eval_live_events_q(s, account, q).await?;
     let extra = match &s.liveops {
         Some(l) => {
             let v = l.live_events(&account.to_string()).await?;
@@ -738,6 +978,11 @@ mod tests {
             local_time: false,
             audience: None,
             metadata: Value::Null,
+            labels: vec![],
+            participation: "implicit".into(),
+            participation_secs: None,
+            max_participants: None,
+            template: None,
         };
         assert_eq!(phase_at(&ev, 500, 0), Err(Some(1000)));
         assert_eq!(phase_at(&ev, 1050, 0).unwrap().0, 0);

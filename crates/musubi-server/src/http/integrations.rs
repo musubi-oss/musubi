@@ -16,6 +16,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/liveops/flags", get(flags))
         .route("/v1/liveops/live-events", get(live_events))
+        .route("/v1/liveops/live-events/{id}/join", post(join_live_event))
+        .route("/v1/liveops/live-events/{id}/leave", post(leave_live_event))
         .route(
             "/v1/server/liveops/changed",
             axum::routing::post(liveops_changed),
@@ -72,13 +74,44 @@ fn remember(s: &AppState, key: String, v: Value) {
 async fn live_events(
     State(s): State<AppState>,
     Bearer(me): Bearer,
+    Query(q): Query<crate::liveops::EventQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let key = format!("liveops.live_events|{}|", me.account_id);
+    let key = format!(
+        "liveops.live_events|{}|{}|{}|{}",
+        me.account_id,
+        q.include_past,
+        q.include_future,
+        q.labels.as_deref().unwrap_or("")
+    );
     if let Some(v) = cached(&s, &key) {
         return Ok(Json(v));
     }
-    let v = crate::liveops::merged_live_events(&s, me.account_id).await?;
+    let v = crate::liveops::merged_live_events_q(&s, me.account_id, &q).await?;
     remember(&s, key, v.clone());
+    Ok(Json(v))
+}
+
+/// `POST /v1/liveops/live-events/{id}/join` — opt into an `explicit` live event (P0-53).
+async fn join_live_event(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let v = crate::liveops::join_live_event(&s, me.account_id, &id).await?;
+    crate::runtime_host::liveops_changed(&s, json!({ "source": "musubi", "live_event": id }), true)
+        .await;
+    Ok(Json(v))
+}
+
+/// `POST /v1/liveops/live-events/{id}/leave` — drop out of the current cycle.
+async fn leave_live_event(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let v = crate::liveops::leave_live_event(&s, me.account_id, &id).await?;
+    crate::runtime_host::liveops_changed(&s, json!({ "source": "musubi", "live_event": id }), true)
+        .await;
     Ok(Json(v))
 }
 

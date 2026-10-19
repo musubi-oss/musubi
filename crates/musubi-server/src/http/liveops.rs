@@ -42,6 +42,19 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/server/live_events", get(list_events).post(post_event))
         .route(
+            "/v1/server/live_events/from_template",
+            post(event_from_template),
+        )
+        .route(
+            "/v1/server/live_events/{id}/participants",
+            get(event_participants),
+        )
+        .route("/v1/server/live_event_templates", get(list_templates))
+        .route(
+            "/v1/server/live_event_templates/{id}",
+            get(get_template).put(put_template).delete(delete_template),
+        )
+        .route(
             "/v1/server/live_events/{id}",
             get(get_event).put(put_event).delete(delete_event),
         )
@@ -532,6 +545,39 @@ struct EventBody {
     audience: Option<String>,
     #[serde(default)]
     metadata: Value,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default = "implicit")]
+    participation: String,
+    #[serde(default)]
+    participation_secs: Option<i64>,
+    #[serde(default)]
+    max_participants: Option<i64>,
+    #[serde(default)]
+    template: Option<String>,
+}
+
+fn implicit() -> String {
+    "implicit".into()
+}
+
+fn valid_labels(labels: &[String]) -> Result<()> {
+    if labels.len() > 16 {
+        return Err(Error::InvalidArgument("labels: at most 16".into()));
+    }
+    for l in labels {
+        if l.is_empty()
+            || l.len() > 32
+            || !l
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(Error::InvalidArgument(
+                "labels: [a-z0-9_-]{1,32} each".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -541,8 +587,7 @@ struct EventBodyWithId {
     body: EventBody,
 }
 
-async fn save_event(s: &AppState, id: &str, b: EventBody) -> Result<LiveEvent> {
-    valid_id(id, "live event id")?;
+fn validate_event(b: &EventBody) -> Result<()> {
     if b.name.trim().is_empty() || b.name.len() > 128 {
         return Err(Error::InvalidArgument("name: 1..128 chars".into()));
     }
@@ -568,14 +613,40 @@ async fn save_event(s: &AppState, id: &str, b: EventBody) -> Result<LiveEvent> {
             "ends_at must be after starts_at".into(),
         ));
     }
+    valid_labels(&b.labels)?;
+    if !matches!(b.participation.as_str(), "implicit" | "explicit") {
+        return Err(Error::InvalidArgument(
+            "participation: implicit|explicit".into(),
+        ));
+    }
+    if b.participation_secs.is_some_and(|p| p <= 0) || b.max_participants.is_some_and(|m| m <= 0) {
+        return Err(Error::InvalidArgument(
+            "participation_secs / max_participants must be positive".into(),
+        ));
+    }
+    if b.participation == "implicit"
+        && (b.participation_secs.is_some() || b.max_participants.is_some())
+    {
+        return Err(Error::InvalidArgument(
+            "participation_secs / max_participants need participation = explicit".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn save_event(s: &AppState, id: &str, b: EventBody) -> Result<LiveEvent> {
+    valid_id(id, "live event id")?;
+    validate_event(&b)?;
     sqlx::query(
-        "insert into musubi.live_events (id, name, description, enabled, phases, starts_at, ends_at, recurrence_secs, local_time, audience, metadata)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "insert into musubi.live_events (id, name, description, enabled, phases, starts_at, ends_at, recurrence_secs, local_time, audience, metadata, labels, participation, participation_secs, max_participants, template)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          on conflict (id) do update set name = excluded.name, description = excluded.description,
             enabled = excluded.enabled, phases = excluded.phases, starts_at = excluded.starts_at,
             ends_at = excluded.ends_at, recurrence_secs = excluded.recurrence_secs,
             local_time = excluded.local_time, audience = excluded.audience,
-            metadata = excluded.metadata, updated_at = now()",
+            metadata = excluded.metadata, labels = excluded.labels, participation = excluded.participation,
+            participation_secs = excluded.participation_secs, max_participants = excluded.max_participants,
+            template = excluded.template, updated_at = now()",
     )
     .bind(id)
     .bind(b.name.trim())
@@ -588,6 +659,11 @@ async fn save_event(s: &AppState, id: &str, b: EventBody) -> Result<LiveEvent> {
     .bind(b.local_time)
     .bind(&b.audience)
     .bind(if b.metadata.is_null() { json!({}) } else { b.metadata })
+    .bind(json!(b.labels))
+    .bind(&b.participation)
+    .bind(b.participation_secs)
+    .bind(b.max_participants)
+    .bind(&b.template)
     .execute(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -597,13 +673,238 @@ async fn save_event(s: &AppState, id: &str, b: EventBody) -> Result<LiveEvent> {
         .ok_or_else(|| Error::NotFound("live event".into()))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct EventListQ {
+    label: Option<String>,
+    participation: Option<String>,
+    template: Option<String>,
+}
+
 async fn list_events(
     State(s): State<AppState>,
     ServerKey: ServerKey,
+    Query(q): Query<EventListQ>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({ "live_events": liveops::load_events(&s).await? }),
-    ))
+    let mut evs = liveops::load_events(&s).await?;
+    evs.retain(|e| {
+        q.label.as_ref().is_none_or(|l| e.labels.contains(l))
+            && q.participation
+                .as_ref()
+                .is_none_or(|p| &e.participation == p)
+            && q.template
+                .as_ref()
+                .is_none_or(|t| e.template.as_ref() == Some(t))
+    });
+    Ok(Json(json!({ "live_events": evs })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ParticipantsQ {
+    limit: Option<i64>,
+    cycle_started_at: Option<i64>,
+}
+
+/// `GET /v1/server/live_events/{id}/participants` — who joined (explicit events), per cycle.
+async fn event_participants(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Query(q): Query<ParticipantsQ>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    liveops::load_event(&s, &id)
+        .await?
+        .ok_or_else(|| Error::NotFound("live event".into()))?;
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let rows: Vec<(Uuid, i64, i64, i64)> = sqlx::query_as(
+        "select account_id, cycle_started_at, joined_at, ends_at from musubi.live_event_participants
+         where event_id = $1 and ($2::bigint is null or cycle_started_at = $2)
+         order by joined_at desc limit $3",
+    )
+    .bind(&id)
+    .bind(q.cycle_started_at)
+    .bind(limit)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from musubi.live_event_participants where event_id = $1 and ($2::bigint is null or cycle_started_at = $2)",
+    )
+    .bind(&id)
+    .bind(q.cycle_started_at)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(json!({
+        "id": id, "count": count,
+        "participants": rows.iter().map(|(a, c, j, e)| json!({
+            "account_id": a, "cycle_started_at": c, "joined_at": j, "ends_at": e,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+// ---------------------------------------------------------------- live-event templates
+
+/// A template is a stored partial event body (phases, labels, metadata, participation…);
+/// `POST /v1/server/live_events/from_template` overlays `starts_at`/name/… and saves an event.
+#[derive(Deserialize)]
+struct TemplateBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
+}
+
+const TEMPLATE_KEYS: &[&str] = &[
+    "phases",
+    "recurrence_secs",
+    "local_time",
+    "audience",
+    "metadata",
+    "labels",
+    "participation",
+    "participation_secs",
+    "max_participants",
+    "ends_at",
+    "enabled",
+];
+
+fn template_json(id: &str, name: &str, body: &Value, updated_at: Option<i64>) -> Value {
+    let mut v = body.clone();
+    v["id"] = json!(id);
+    v["name"] = json!(name);
+    if let Some(u) = updated_at {
+        v["updated_at"] = json!(u);
+    }
+    v
+}
+
+const TPL_SELECT: &str = "select id, name, body, extract(epoch from updated_at)::bigint from musubi.live_event_templates";
+type TplRow = (String, String, Value, i64);
+
+async fn list_templates(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let rows: Vec<TplRow> = sqlx::query_as(&format!("{TPL_SELECT} order by id"))
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?;
+    Ok(Json(json!({
+        "templates": rows.iter().map(|(i, n, b, u)| template_json(i, n, b, Some(*u))).collect::<Vec<_>>(),
+    })))
+}
+
+async fn load_template(s: &AppState, id: &str) -> Result<TplRow> {
+    let row: Option<TplRow> = sqlx::query_as(&format!("{TPL_SELECT} where id = $1"))
+        .bind(id)
+        .fetch_optional(&s.db)
+        .await
+        .map_err(Error::internal)?;
+    row.ok_or_else(|| Error::NotFound("live event template".into()))
+}
+
+async fn get_template(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let (i, n, b, u) = load_template(&s, &id).await?;
+    Ok(Json(template_json(&i, &n, &b, Some(u))))
+}
+
+async fn put_template(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(b): Json<TemplateBody>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    valid_id(&id, "template id")?;
+    if b.name.trim().is_empty() || b.name.len() > 128 {
+        return Err(Error::InvalidArgument("name: 1..128 chars".into()).into());
+    }
+    if let Some(k) = b.rest.keys().find(|k| !TEMPLATE_KEYS.contains(&k.as_str())) {
+        return Err(Error::InvalidArgument(format!(
+            "unknown template field `{k}` (allowed: {})",
+            TEMPLATE_KEYS.join(", ")
+        ))
+        .into());
+    }
+    // Dry-run the template as an event body to validate phases/labels/participation.
+    let mut probe = Value::Object(b.rest.clone());
+    probe["name"] = json!(b.name.trim());
+    probe["starts_at"] = json!(0);
+    probe["ends_at"] = Value::Null;
+    let eb: EventBody = serde_json::from_value(probe)
+        .map_err(|e| Error::InvalidArgument(format!("template body: {e}")))?;
+    validate_event(&eb)?;
+    let mut body = Value::Object(b.rest);
+    body["description"] = json!(b.description);
+    let (i, n, bo, u): TplRow = sqlx::query_as(
+        "insert into musubi.live_event_templates (id, name, body) values ($1, $2, $3)
+         on conflict (id) do update set name = excluded.name, body = excluded.body, updated_at = now()
+         returning id, name, body, extract(epoch from updated_at)::bigint",
+    )
+    .bind(&id)
+    .bind(b.name.trim())
+    .bind(&body)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(template_json(&i, &n, &bo, Some(u))))
+}
+
+async fn delete_template(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let n = sqlx::query("delete from musubi.live_event_templates where id = $1")
+        .bind(&id)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    Ok(Json(json!({ "removed": n > 0 })))
+}
+
+#[derive(Deserialize)]
+struct FromTemplateBody {
+    template: String,
+    id: String,
+    starts_at: i64,
+    #[serde(flatten)]
+    overrides: serde_json::Map<String, Value>,
+}
+
+/// `POST /v1/server/live_events/from_template {template, id, starts_at, …overrides}` — an event
+/// from a template: template fields, then overrides (`metadata` is merged key-wise).
+async fn event_from_template(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(b): Json<FromTemplateBody>,
+) -> std::result::Result<Json<LiveEvent>, ApiError> {
+    let (tid, tname, tbody, _) = load_template(&s, &b.template).await?;
+    let mut merged = tbody;
+    merged["name"] = json!(tname);
+    for (k, v) in b.overrides {
+        if k == "metadata" {
+            if let (Some(dst), Some(src)) = (merged["metadata"].as_object_mut(), v.as_object()) {
+                for (mk, mv) in src {
+                    dst.insert(mk.clone(), mv.clone());
+                }
+                continue;
+            }
+        }
+        merged[k] = v;
+    }
+    merged["starts_at"] = json!(b.starts_at);
+    merged["template"] = json!(tid);
+    let eb: EventBody = serde_json::from_value(merged)
+        .map_err(|e| Error::InvalidArgument(format!("event body: {e}")))?;
+    Ok(Json(save_event(&s, &b.id, eb).await?))
 }
 
 async fn get_event(

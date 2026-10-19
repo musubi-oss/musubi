@@ -31203,3 +31203,377 @@ async fn fleet_named_ports_and_protocols() {
     let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     assert!(st.is_success() || st == StatusCode::NO_CONTENT);
 }
+
+/// P0-53: live-event labels, explicit participation windows, peek past/future, templates.
+#[tokio::test]
+async fn live_events_participation_labels_peek_and_templates() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut toks = Vec::new();
+    for who in ["lea", "leb"] {
+        let (_, a) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(who)})),
+        )
+        .await;
+        toks.push((
+            a["access_token"].as_str().unwrap().to_string(),
+            a["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, aid) = toks[0].clone();
+    let (tb, bid) = toks[1].clone();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let ex = unique("le-ex");
+    let im = unique("le-im");
+    let fut = unique("le-fut");
+    let past = unique("le-past");
+    let one = json!([{"name": "go", "offset_secs": 0, "duration_secs": 3600}]);
+    // validation
+    for bad in [
+        json!({"name": "x", "phases": one, "starts_at": now, "participation": "weird"}),
+        json!({"name": "x", "phases": one, "starts_at": now, "participation_secs": 10}),
+        json!({"name": "x", "phases": one, "starts_at": now, "labels": ["Bad Label"]}),
+        json!({"name": "x", "phases": one, "starts_at": now, "participation": "explicit", "max_participants": 0}),
+    ] {
+        let (st, r) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/server/live_events/{ex}"),
+            k,
+            Some(bad),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    }
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/live_events/{ex}"),
+        k,
+        Some(json!({
+            "name": "Boss rush", "phases": one, "starts_at": now - 100, "participation": "explicit",
+            "participation_secs": 600, "max_participants": 1, "labels": ["xp", "weekend"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["participation"], "explicit");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/live_events/{im}"),
+        k,
+        Some(json!({
+            "name": "Double XP", "phases": one, "starts_at": now - 10, "labels": ["xp"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/live_events/{fut}"),
+        k,
+        Some(json!({
+            "name": "Later", "phases": one, "starts_at": now + 20 * 86_400, "labels": ["later"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "PUT", &format!("/v1/server/live_events/{past}"), k, Some(json!({
+        "name": "Old", "phases": [{"name": "a", "offset_secs": 0, "duration_secs": 1000}], "starts_at": now - 5000, "labels": ["old"]
+    }))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let find = |v: &Value, id: &str| -> Option<Value> {
+        v["live_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == json!(id))
+            .cloned()
+    };
+    let (st, le) = call(&app, "GET", "/v1/liveops/live-events", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{le}");
+    let e = find(&le, &ex).unwrap_or_else(|| panic!("{le}"));
+    assert_eq!(e["active"], true);
+    assert_eq!(e["participation"], "explicit");
+    assert_eq!(e["joined"], false);
+    assert_eq!(e["can_join"], true);
+    assert_eq!(e["participation_secs"], 600);
+    assert_eq!(e["labels"], json!(["xp", "weekend"]));
+    let i = find(&le, &im).unwrap();
+    assert_eq!(i["participation"], "implicit");
+    assert!(i.get("joined").is_none());
+    assert!(
+        find(&le, &fut).is_none(),
+        "beyond 7-day horizon hidden by default"
+    );
+    assert!(find(&le, &past).is_none(), "ended events hidden by default");
+    // peek
+    let (_, le) = call(
+        &app,
+        "GET",
+        "/v1/liveops/live-events?include_future=true",
+        Some(&ta),
+        None,
+    )
+    .await;
+    let f = find(&le, &fut).unwrap_or_else(|| panic!("{le}"));
+    assert_eq!(f["active"], false);
+    assert_eq!(f["starts_at"], json!(now + 20 * 86_400));
+    let (_, le) = call(
+        &app,
+        "GET",
+        "/v1/liveops/live-events?include_past=true",
+        Some(&ta),
+        None,
+    )
+    .await;
+    let p = find(&le, &past).unwrap_or_else(|| panic!("{le}"));
+    assert_eq!(p["ended"], true);
+    assert_eq!(p["ended_at"], json!(now - 4000));
+    let (_, le) = call(
+        &app,
+        "GET",
+        "/v1/liveops/live-events?labels=weekend",
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert!(find(&le, &ex).is_some() && find(&le, &im).is_none(), "{le}");
+
+    // explicit participation
+    let (st, j) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/live-events/{ex}/join"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert_eq!(j["joined"], true);
+    assert_eq!(j["already"], false);
+    let ja = j["joined_at"].as_i64().unwrap();
+    assert_eq!(j["participation_ends_at"], json!(ja + 600));
+    let (st, j) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/live-events/{ex}/join"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(j["already"], true);
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/live-events/{ex}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "full: {r}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/live-events/{im}/join"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "implicit events are not joinable"
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/liveops/live-events/nope-le/join",
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, le) = call(&app, "GET", "/v1/liveops/live-events", Some(&ta), None).await;
+    let e = find(&le, &ex).unwrap();
+    assert_eq!(e["joined"], true);
+    assert_eq!(e["participation_ends_at"], json!(ja + 600));
+    let (st, ps) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/live_events/{ex}/participants"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ps}");
+    assert_eq!(ps["count"], 1);
+    assert_eq!(ps["participants"][0]["account_id"], json!(aid));
+    let (st, l) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/live-events/{ex}/leave"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(l["left"], true);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/live-events/{ex}/join"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "seat freed");
+    let (_, ps) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/live_events/{ex}/participants"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(ps["count"], 1);
+    assert_eq!(ps["participants"][0]["account_id"], json!(bid));
+    let (_, l) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/live-events/{ex}/leave"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(l["left"], false);
+
+    // templates
+    let t = unique("le-tpl");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/live_event_templates/{t}"),
+        k,
+        Some(json!({
+            "name": "Weekend boss", "phases": one, "labels": ["xp"], "participation": "explicit",
+            "participation_secs": 300, "metadata": {"xp": 2}, "foo": 1
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "unknown field: {r}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/live_event_templates/{t}"),
+        k,
+        Some(json!({
+            "name": "Weekend boss", "phases": one, "participation": "weird"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/live_event_templates/{t}"),
+        k,
+        Some(json!({
+            "name": "Weekend boss", "phases": one, "labels": ["xp"], "participation": "explicit",
+            "participation_secs": 300, "metadata": {"xp": 2}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["id"], json!(t));
+    assert_eq!(r["participation_secs"], 300);
+    let (_, ts) = call_server(&app, "GET", "/v1/server/live_event_templates", k, None).await;
+    assert!(ts["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["id"] == json!(t)));
+    let ev3 = unique("le-from");
+    let (st, r) = call_server(&app, "POST", "/v1/server/live_events/from_template", k, Some(json!({
+        "template": t, "id": ev3, "starts_at": now - 10, "metadata": {"bonus": 1}, "name": "Boss #3"
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["template"], json!(t));
+    assert_eq!(r["name"], "Boss #3");
+    assert_eq!(r["participation"], "explicit");
+    assert_eq!(r["participation_secs"], 300);
+    assert_eq!(r["labels"], json!(["xp"]));
+    assert_eq!(r["metadata"], json!({"xp": 2, "bonus": 1}));
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/server/live_events/from_template",
+        k,
+        Some(json!({
+            "template": "nope-tpl", "id": unique("le-x"), "starts_at": now
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{r}");
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/live_events?template={t}"),
+        k,
+        None,
+    )
+    .await;
+    let ids: Vec<&str> = l["live_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![ev3.as_str()]);
+    let (_, l) = call_server(&app, "GET", "/v1/server/live_events?label=xp", k, None).await;
+    let ids: Vec<&str> = l["live_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&ex.as_str()) && ids.contains(&im.as_str()) && !ids.contains(&fut.as_str())
+    );
+    let (_, r) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/live_event_templates/{t}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(r["removed"], true);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/live_event_templates/{t}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    for id in [&ex, &im, &fut, &past, &ev3] {
+        let _ = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/live_events/{id}"),
+            k,
+            None,
+        )
+        .await;
+    }
+}
