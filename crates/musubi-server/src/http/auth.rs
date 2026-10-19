@@ -75,6 +75,7 @@ async fn device(
     Json(r): Json<DeviceReq>,
 ) -> Result<Json<Session>, ApiError> {
     s.limits.auth_ip(&ip.0)?;
+    s.ban_rules.check_device(&r.id)?;
     let sess = s.auth.authenticate_device(&r.id, r.opts).await?;
     authenticated(&s, &sess, musubi_auth::provider::DEVICE, &ip.0);
     Ok(Json(sess))
@@ -97,6 +98,33 @@ pub(super) fn authenticated(s: &AppState, sess: &Session, provider: &str, ip: &s
                 Ok(true) => suspicious_login(&st, acc, sid, &provider, &ip).await,
                 Ok(false) => {}
                 Err(e) => tracing::warn!(error = %e, "note_login failed"),
+            }
+            if let Err(e) = crate::bans::note_login(&st.db, sid.0, acc, &ip).await {
+                tracing::warn!(error = %e, "device registry update failed");
+            }
+            // a banned device that logged in through another provider is cut off right away
+            let dev: Option<String> =
+                sqlx::query_scalar("select device_id from musubi.sessions where id = $1")
+                    .bind(sid.0)
+                    .fetch_optional(&st.db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
+            if let Some(d) = dev {
+                if let Err(e) = st.ban_rules.check_device(&d) {
+                    if let Err(e) = st.auth.logout(sid, false).await {
+                        tracing::warn!(error = %e, "revoking banned-device session failed");
+                    }
+                    crate::http::admin::kick_everywhere(&st, acc).await;
+                    st.events
+                        .emit(
+                            "account.banned_device_login",
+                            Some(acc),
+                            serde_json::json!({ "device_id": d, "message": e.to_string() }),
+                        )
+                        .await;
+                }
             }
         });
     }

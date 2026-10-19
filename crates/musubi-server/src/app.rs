@@ -82,6 +82,7 @@ pub struct AppStateInner {
     pub limits: Arc<crate::limits::RateLimiter>,
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
+    pub ban_rules: Arc<crate::bans::BanRules>,
     pub age: Arc<crate::compliance::AgeGate>,
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
     pub dev: Arc<crate::dev::DevTools>,
@@ -665,6 +666,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             Arc::new(e)
         },
         banned: Arc::new(crate::bans::Bans::default()),
+        ban_rules: Arc::new(crate::bans::BanRules::default()),
         age: Arc::new(crate::compliance::AgeGate::new(compliance_cfg)),
         anticheat: Arc::new(crate::anticheat::AntiCheat::new()),
         dev: Arc::new(crate::dev::DevTools::new()),
@@ -749,6 +751,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         state.limits.start(c, state.db.clone());
     }
     state.anticheat.bind(&state);
+    match state.ban_rules.load(&state.db).await {
+        Ok(n) => tracing::info!(rules = n, "ban rules loaded"),
+        Err(e) => tracing::warn!(error = %e, "ban rules load failed"),
+    }
     match state.banned.load(&state.db).await {
         Ok(n) => tracing::info!(banned = n, "ban cache loaded"),
         Err(e) => tracing::warn!(error = %e, "ban cache load failed"),
@@ -759,6 +765,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     if let Some(c) = &state.cluster {
         state.banned.start(c);
+        state.ban_rules.start(c);
         state.age.start(c);
         crate::runtime_host::start_liveops_sync(&state, c);
     }

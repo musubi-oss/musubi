@@ -212,6 +212,7 @@ async fn write(
     Path(id): Path<String>,
     Json(w): Json<WriteRecord>,
 ) -> Result<Json<Record>, ApiError> {
+    s.banned.check_feature(me.account_id, "leaderboards")?;
     let username = s
         .accounts
         .get_users(&[me.account_id], &[])

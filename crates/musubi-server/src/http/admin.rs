@@ -221,6 +221,19 @@ pub struct BanBody {
     pub until_secs: Option<i64>,
     /// Keep the account working but make chat and matchmaking silently ignore it.
     pub shadow: bool,
+    /// Feature ban: the account keeps working except for these features
+    /// (`chat`, `matchmaking`, `groups`, `ugc`, `trading`, `leaderboards`, `voice`, `friends`).
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Code from the reason catalog (`PUT /v1/admin/bans/reasons/{code}`): fills in reason,
+    /// message, duration and features that the body leaves out.
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    /// Also ban every device / address in the account's login registry.
+    #[serde(default)]
+    pub ban_devices: bool,
+    #[serde(default)]
+    pub ban_ips: bool,
 }
 
 /// `POST /v1/admin/accounts/{id}/ban` — body optional (legacy: permanent hard ban).
@@ -237,6 +250,31 @@ async fn ban(
 /// Apply (or replace) a ban: the row, the account flag, kicks, voice and the cluster-wide cache.
 /// Shared with player-report decisions.
 pub(crate) async fn apply_ban(s: &AppState, id: AccountId, b: BanBody) -> Result<Value, ApiError> {
+    let mut b = b;
+    if let Some(code) = b.reason_code.as_deref() {
+        let (code, title, message, dur, _sev, features, _) = super::bans::load_reason(s, code)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("ban reason {code}")))?;
+        if b.reason.is_none() {
+            b.reason = Some(title);
+        }
+        if b.message.is_none() && !message.is_empty() {
+            b.message = Some(message);
+        }
+        if b.until_secs.is_none() {
+            b.until_secs = dur;
+        }
+        if b.features.is_empty() {
+            b.features = features;
+        }
+        b.reason_code = Some(code);
+    }
+    super::bans::validate_features(&b.features)?;
+    if b.shadow && !b.features.is_empty() {
+        return Err(
+            Error::InvalidArgument("a ban is either shadow or feature-scoped".into()).into(),
+        );
+    }
     if b.until_secs.is_some_and(|u| u <= 0) {
         return Err(Error::InvalidArgument("until_secs must be positive".into()).into());
     }
@@ -251,19 +289,23 @@ pub(crate) async fn apply_ban(s: &AppState, id: AccountId, b: BanBody) -> Result
         message: b.message.clone(),
         until,
         shadow: b.shadow,
+        features: b.features.clone(),
     };
     sqlx::query(
-        "insert into musubi.account_bans (account_id, reason, message, until, shadow, actor)
-         values ($1, $2, $3, to_timestamp($4), $5, 'server')
+        "insert into musubi.account_bans (account_id, reason, message, until, shadow, actor, features, reason_code)
+         values ($1, $2, $3, to_timestamp($4), $5, 'server', $6, $7)
          on conflict (account_id) do update set reason = excluded.reason,
             message = excluded.message, until = excluded.until, shadow = excluded.shadow,
-            actor = excluded.actor, created_at = now()",
+            actor = excluded.actor, features = excluded.features,
+            reason_code = excluded.reason_code, created_at = now()",
     )
     .bind(id.0)
     .bind(&b.reason)
     .bind(&b.message)
     .bind(until.map(|u| u as f64))
     .bind(b.shadow)
+    .bind(&b.features)
+    .bind(&b.reason_code)
     .execute(&s.db)
     .await
     .map_err(|e| match e {
@@ -277,21 +319,44 @@ pub(crate) async fn apply_ban(s: &AppState, id: AccountId, b: BanBody) -> Result
         // a previous hard ban on the same account becomes a shadow one
         s.accounts.set_disabled(id, false).await?;
         voice_ban(s, id, false);
+    } else if !b.features.is_empty() {
+        // feature ban: the account stays usable, only the listed features deny
+        s.accounts.set_disabled(id, false).await?;
+        voice_ban(s, id, b.features.iter().any(|f| f == "voice"));
     } else {
         s.accounts.set_disabled(id, true).await?;
         kicked = kick_everywhere(s, id).await;
         voice_ban(s, id, true);
     }
     s.banned.set(id, Some(info), s.cluster.as_ref()).await;
+    let (devices_banned, ips_banned) = if b.ban_devices || b.ban_ips {
+        super::bans::ban_registry(
+            s,
+            id.0,
+            b.ban_devices,
+            b.ban_ips,
+            b.reason.as_deref(),
+            b.message.as_deref(),
+            until,
+        )
+        .await?
+    } else {
+        (0, 0)
+    };
     s.events
         .emit(
             "account.banned",
             Some(id),
-            json!({ "reason": b.reason, "until": until, "shadow": b.shadow }),
+            json!({
+                "reason": b.reason, "reason_code": b.reason_code, "until": until,
+                "shadow": b.shadow, "features": b.features,
+            }),
         )
         .await;
     Ok(json!({
-        "banned": true, "shadow": b.shadow, "until": until, "kicked_local": kicked
+        "banned": true, "shadow": b.shadow, "features": b.features, "reason_code": b.reason_code,
+        "until": until, "kicked_local": kicked,
+        "devices_banned": devices_banned, "ips_banned": ips_banned,
     }))
 }
 
@@ -326,22 +391,31 @@ async fn get_ban(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    type Row = (Option<String>, Option<String>, Option<i64>, bool, String);
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        bool,
+        String,
+        Vec<String>,
+        Option<String>,
+    );
     let row: Option<Row> = sqlx::query_as(
         "select reason, message, (extract(epoch from until))::bigint, shadow,
-                to_char(created_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                to_char(created_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                features, reason_code
          from musubi.account_bans where account_id = $1",
     )
     .bind(id)
     .fetch_optional(&s.db)
     .await
     .map_err(Error::internal)?;
-    let Some((reason, message, until, shadow, created_at)) = row else {
+    let Some((reason, message, until, shadow, created_at, features, reason_code)) = row else {
         return Err(Error::NotFound("ban".into()).into());
     };
     Ok(Json(json!({
-        "account_id": id, "reason": reason, "message": message, "until": until,
-        "shadow": shadow, "created_at": created_at,
+        "account_id": id, "reason": reason, "reason_code": reason_code, "message": message,
+        "until": until, "shadow": shadow, "features": features, "created_at": created_at,
         "active": until.is_none_or(|u| u > time::OffsetDateTime::now_utc().unix_timestamp()),
     })))
 }

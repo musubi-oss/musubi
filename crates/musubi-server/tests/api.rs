@@ -135,6 +135,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
             Arc::new(e)
         },
         banned: Arc::new(musubi_server::bans::Bans::default()),
+        ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
@@ -16910,4 +16911,279 @@ async fn group_challenges_score_standings_and_settle() {
     )
     .await;
     assert_eq!(d["removed"], true);
+}
+
+/// Bans depth (competitive P0-8): reason catalog, feature bans, device/IP registry, device and
+/// CIDR rules enforced before authentication, the paged banned feed.
+#[tokio::test]
+async fn bans_depth_reasons_features_devices_and_ip_rules() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let dev = unique("bd-dev-");
+    let (st, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let at = a["access_token"].as_str().unwrap().to_string();
+    let aid = a["account_id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await; // registry upkeep is async
+
+    // reason catalog
+    let code = unique("toxic-");
+    let (st, _) = call_server(&app, "PUT", &format!("/v1/admin/bans/reasons/{code}"), k,
+        Some(json!({"title": "Toxic chat", "message": "be nice", "default_duration_secs": 3600, "severity": "high", "features": ["chat", "groups"]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/bans/reasons/{code}"),
+        k,
+        Some(json!({"title": "x", "features": ["flying"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "unknown feature");
+    let (st, l) = call_server(&app, "GET", "/v1/admin/bans/reasons", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(l["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["code"] == json!(code)));
+
+    // feature ban from the catalog: account works, chat/groups do not
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        Some(json!({"reason_code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["features"], json!(["chat", "groups"]));
+    assert!(r["until"].is_i64());
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&at), None).await;
+    assert_eq!(st, StatusCode::OK, "feature ban keeps the account usable");
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(&at),
+        Some(json!({"name": unique("bg"), "open": true, "max_count": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert!(
+        e["message"]
+            .as_str()
+            .unwrap()
+            .contains("groups banned: be nice"),
+        "{e}"
+    );
+    let (_, g) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(g["reason_code"], json!(code));
+    assert_eq!(g["features"], json!(["chat", "groups"]));
+    let (_, feed) = call_server(&app, "GET", "/v1/admin/bans?kind=feature", k, None).await;
+    assert!(
+        feed["bans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["account_id"] == json!(aid)),
+        "{feed}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        Some(json!({"shadow": true, "features": ["chat"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "shadow xor features");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban"),
+        k,
+        Some(json!({"reason_code": unique("nope")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // registry: the device and address of the login are known
+    let (st, d) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{aid}/devices"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        d["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["device_id"] == json!(dev) && x["banned"] == false),
+        "{d}"
+    );
+
+    // ban the hardware behind the account: device login refused, probe says so
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/ban/devices"),
+        k,
+        Some(json!({"message": "hardware ban"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["devices_banned"], 1);
+    let (st, e) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+    assert!(
+        e["message"]
+            .as_str()
+            .unwrap()
+            .contains("device banned: hardware ban"),
+        "{e}"
+    );
+    let (_, p) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/bans/check?device={dev}&ip=10.0.0.1"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(p["device_banned"], true);
+    assert_eq!(p["ip_banned"], false);
+    let (_, rules) = call_server(&app, "GET", "/v1/admin/bans/rules?kind=device", k, None).await;
+    let rule = rules["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["value"] == json!(dev))
+        .cloned()
+        .unwrap();
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/bans/rules/{}", rule["id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": dev})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "rule lifted");
+
+    // CIDR rule gates /v1/auth/* by client address
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/bans/rules",
+        k,
+        Some(json!({"kind": "cidr", "value": "203.0.113.5"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "cidr needs a prefix");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/bans/rules",
+        k,
+        Some(json!({"kind": "hwid", "value": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, cidr) = call_server(&app, "POST", "/v1/admin/bans/rules", k,
+        Some(json!({"kind": "cidr", "value": "203.0.113.0/24", "message": "vpn range", "until_secs": 600}))).await;
+    assert_eq!(st, StatusCode::OK, "{cidr}");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/device")
+        .header("x-forwarded-for", "203.0.113.77")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"id": unique("bd-other-")}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "banned address never reaches the handler"
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/device")
+        .header("x-forwarded-for", "203.0.114.1")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"id": unique("bd-other-")}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "neighbouring range is fine");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/bans/rules/{}", cidr["id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/bans/rules/{}", cidr["id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/bans/reasons/{code}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{aid}/unban"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
 }

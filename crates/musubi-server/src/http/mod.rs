@@ -3,6 +3,7 @@ pub mod admin;
 mod anticheat;
 pub mod audiences;
 mod auth;
+mod bans;
 mod chat;
 mod cluster;
 pub mod configs;
@@ -177,7 +178,12 @@ pub fn router(state: AppState) -> Router {
         .merge(stats::routes())
         .merge(push::routes())
         .merge(crate::events::routes())
-        .merge(auth::routes())
+        .merge(
+            auth::routes().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::bans::ip_gate,
+            )),
+        )
         .merge(tx::routes())
         .merge(account::routes())
         .merge(passkeys::routes())
@@ -209,7 +215,13 @@ pub fn router(state: AppState) -> Router {
         .merge(rtc::routes())
         .merge(economy::routes())
         .merge(storage::routes())
-        .merge(ws::routes())
+        .merge(
+            ws::routes().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::bans::ip_gate,
+            )),
+        )
+        .merge(bans::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::hooks::before_after,

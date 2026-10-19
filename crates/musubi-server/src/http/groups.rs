@@ -118,6 +118,7 @@ async fn create(
     Bearer(me): Bearer,
     Json(c): Json<CreateGroup>,
 ) -> Result<Json<Group>, ApiError> {
+    s.banned.check_feature(me.account_id, "groups")?;
     let g = groups(&s).create(me.account_id, c).await?;
     s.events
         .emit(

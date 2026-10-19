@@ -2068,6 +2068,7 @@ async fn market_list(
     Bearer(me): Bearer,
     Json(n): Json<NewListing>,
 ) -> Result<Json<Value>, ApiError> {
+    s.banned.check_feature(me.account_id, "trading")?;
     let l = s
         .economy
         .list_item(me.account_id, n, &market_rules(&s.cfg))
@@ -2403,6 +2404,7 @@ async fn trade_propose(
     Bearer(me): Bearer,
     Json(n): Json<NewTrade>,
 ) -> Result<Json<Value>, ApiError> {
+    s.banned.check_feature(me.account_id, "trading")?;
     let t = s
         .economy
         .propose_trade(me.account_id, n, &market_rules(&s.cfg))

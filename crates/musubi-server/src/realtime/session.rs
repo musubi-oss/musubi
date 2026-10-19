@@ -704,6 +704,12 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                     }
                 }
             }
+            if let Err(e) = ctx
+                .banned
+                .check_feature(ctx.presence.account_id, "matchmaking")
+            {
+                return Some(ServerMessage::error(&e));
+            }
             if ctx.banned.is_shadow(ctx.presence.account_id) {
                 // shadow-banned: looks like a ticket, never matches
                 return Some(ServerMessage::MatchmakerTicket {
@@ -802,6 +808,12 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             numeric_properties,
             count_multiple,
         } => {
+            if let Err(e) = ctx
+                .banned
+                .check_feature(ctx.presence.account_id, "matchmaking")
+            {
+                return Some(ServerMessage::error(&e));
+            }
             if ctx.banned.is_shadow(ctx.presence.account_id) {
                 return Some(ServerMessage::MatchmakerTicket {
                     ticket: uuid::Uuid::now_v7().to_string(),
@@ -1235,6 +1247,7 @@ async fn channel_send(
     let channel = joined_channel(ctx, channel_id)?;
     let me = ctx.presence.account_id;
     // an account-level shadow ban behaves like a shadow restriction on every channel
+    ctx.banned.check_feature(me, "chat")?;
     let restriction = if ctx.banned.is_shadow(me) {
         Some("shadow".to_string())
     } else {

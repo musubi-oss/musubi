@@ -82,7 +82,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Entitlements: платформенные покупки / DLC → предметы | ✅ `/v1/entitlements` (+`/sync` по Steam-ownership), серверный каталог/grant/revoke | ✅ | ❌ | ✅ | ✅ |
 | Limited grants (лимит серверных грантов на игрока в окно) | ✅ `/v1/server/grant_limits`, `GET /v1/admin/accounts/{id}/grants` | ✅ | ❌ | ❌ | ❌ |
 | Жалобы на игроков общего вида + ревью | ✅ `POST /v1/reports` на игрока/матч/UGC, очередь и решение `GET/POST /v1/admin/reports/{id}`, история по аккаунту | ✅ | ❌ | ✅ | ✅ |
-| Баны (timed, shadow), kick, purge | ✅ | ✅ | 🟡 | ✅ | ✅ |
+| Баны (timed, shadow, feature-баны, правила device/IP/CIDR, реестр устройств и адресов, каталог причин, paged-список) , kick, purge | ✅ `bans.rs`, `http/bans.rs` | ✅ | 🟡 | ✅ | ✅ |
 | Античит: серверная валидация, EAC/BattlEye-интеграция | ✅ размер/частота ввода в authoritative-матчах → отказ + сигнал; `POST /v1/server/anticheat/flag` от серверов и `anticheat.flag` из модулей; очки за окно, авто-кик по порогу, очередь `GET /v1/admin/anticheat`; `POST /v1/server/anticheat/verify` → EAC/BattlEye endpoint | 🟡 | ❌ | 🟡 | 🟡 |
 
 ## 4. Realtime, матчмейкинг, серверы
