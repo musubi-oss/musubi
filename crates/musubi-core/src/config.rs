@@ -1170,6 +1170,8 @@ pub struct RetentionConfig {
     pub analytics_events_days: u64,
     /// Captured game server log lines (`musubi.server_logs`).
     pub server_logs_days: u64,
+    /// Matchmaker ticket traces and formed-match records (`musubi.matchmaker_ticket_log` / `matchmaker_matches`).
+    pub matchmaker_log_days: u64,
     /// Delivered or dead webhook deliveries.
     pub deliveries_days: u64,
     pub audit_days: u64,
@@ -1197,6 +1199,7 @@ impl Default for RetentionConfig {
             events_days: 30,
             analytics_events_days: 90,
             server_logs_days: 7,
+            matchmaker_log_days: 14,
             deliveries_days: 7,
             audit_days: 90,
             notifications_days: 30,

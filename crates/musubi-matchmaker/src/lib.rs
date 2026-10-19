@@ -213,6 +213,10 @@ pub struct Matchmaker {
     scorer: Option<Arc<dyn Scorer>>,
     /// Why queue candidates were kept apart, per (queue, reason) — the operator's expansion view.
     rejections: Mutex<HashMap<(String, &'static str), u64>>,
+    /// Cumulative (queue, reason) rejection counts since start (`rejection_totals`).
+    rejection_totals: Mutex<HashMap<(String, &'static str), u64>>,
+    /// Per-ticket decision traces (`trace`), bounded; finished ones queue for persistence.
+    traces: Mutex<Traces>,
     /// Formed groups waiting for every member to confirm (leader only).
     pending: Mutex<Vec<Pending>>,
     penalties: Mutex<ready::Penalties>,
@@ -275,6 +279,8 @@ impl Matchmaker {
             recent: Mutex::new(Recent::default()),
             scorer: None,
             rejections: Mutex::new(HashMap::new()),
+            rejection_totals: Mutex::new(HashMap::new()),
+            traces: Mutex::new(Traces::default()),
             pending: Mutex::new(Vec::new()),
             penalties: Mutex::new(ready::Penalties::default()),
             ready_check: Duration::ZERO,
@@ -514,10 +520,12 @@ impl Matchmaker {
 
     /// Counts of (queue, reason) a pair of tickets was kept apart since the last call.
     pub fn take_rejections(&self) -> Vec<(String, &'static str, u64)> {
-        std::mem::take(&mut *self.rejections.lock())
-            .into_iter()
-            .map(|((q, r), n)| (q, r, n))
-            .collect()
+        let taken = std::mem::take(&mut *self.rejections.lock());
+        let mut totals = self.rejection_totals.lock();
+        for (k, n) in &taken {
+            *totals.entry(k.clone()).or_insert(0) += n;
+        }
+        taken.into_iter().map(|((q, r), n)| (q, r, n)).collect()
     }
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
@@ -544,6 +552,8 @@ impl Matchmaker {
                 i += 1;
             }
         }
+        drop(pool);
+        self.trace_dropped(&out, "expired");
         out
     }
 
@@ -752,6 +762,11 @@ impl Matchmaker {
             count_multiple,
             created: now,
         });
+        if let Some(t) = pool.tickets.last() {
+            let t = t.clone();
+            drop(pool);
+            self.trace_start(&t, now);
+        }
         Ok(id)
     }
 
@@ -807,6 +822,8 @@ impl Matchmaker {
         };
         let t = pool.tickets.remove(idx);
         unindex(&mut pool, &t);
+        drop(pool);
+        self.trace_dropped(std::slice::from_ref(&t), "cancelled");
         true
     }
 
@@ -906,6 +923,8 @@ impl Matchmaker {
             // the pool shifted; restart scanning from the beginning of what remains
             i = 0;
         }
+        drop(pool);
+        self.trace_matched(&out, now);
         out
     }
 }
@@ -1397,5 +1416,204 @@ mod tests {
         };
         assert_eq!(mm.remove_session(s2), vec![id2]);
         assert_eq!(mm.ticket_count(), 0);
+    }
+}
+
+/// One step in a ticket's life inside the matchmaker (observability, P0-58).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TraceEvent {
+    /// Milliseconds since the ticket was enqueued.
+    pub at_ms: u64,
+    pub kind: String,
+    pub detail: serde_json::Value,
+}
+
+/// Decision trace of one ticket.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TicketTrace {
+    pub ticket: String,
+    pub queue: Option<String>,
+    pub accounts: Vec<AccountId>,
+    pub events: Vec<TraceEvent>,
+    /// `waiting` | `matched` | `expired` | `cancelled`
+    pub outcome: String,
+    pub wait_ms: u64,
+}
+
+/// A formed match as kept for `matches` / persistence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MatchRecord {
+    pub token: String,
+    pub queue: Option<String>,
+    pub region: Option<String>,
+    pub quality: Option<f32>,
+    pub team_mmr_gap: Option<f64>,
+    pub tickets: Vec<String>,
+    pub accounts: Vec<AccountId>,
+    pub wait_ms: Vec<u64>,
+}
+
+#[derive(Default)]
+struct Traces {
+    live: HashMap<String, (Instant, TicketTrace)>,
+    order: std::collections::VecDeque<String>,
+    finished: Vec<TicketTrace>,
+    matches: Vec<MatchRecord>,
+}
+
+const TRACE_CAP: usize = 20_000;
+const FINISHED_CAP: usize = 50_000;
+
+impl Matchmaker {
+    fn trace_start(&self, t: &Ticket, now: Instant) {
+        let mut tr = self.traces.lock();
+        let trace = TicketTrace {
+            ticket: t.id.clone(),
+            queue: t.queue.clone(),
+            accounts: t.members.iter().map(|m| m.presence.account_id).collect(),
+            events: vec![TraceEvent {
+                at_ms: 0,
+                kind: "enqueued".into(),
+                detail: serde_json::json!({
+                    "queue": t.queue, "members": t.members.len(), "min_count": t.min_count,
+                    "max_count": t.max_count, "query": t.query_src, "props": format!("{:?}", t.props),
+                    "party_id": t.party_id,
+                }),
+            }],
+            outcome: "waiting".into(),
+            wait_ms: 0,
+        };
+        tr.live.insert(t.id.clone(), (now, trace));
+        tr.order.push_back(t.id.clone());
+        while tr.order.len() > TRACE_CAP {
+            if let Some(old) = tr.order.pop_front() {
+                tr.live.remove(&old);
+            }
+        }
+    }
+
+    fn trace_event(tr: &mut Traces, id: &str, now: Instant, kind: &str, detail: serde_json::Value) {
+        if let Some((start, t)) = tr.live.get_mut(id) {
+            let at_ms = now.saturating_duration_since(*start).as_millis() as u64;
+            if t.events.len() < 256 {
+                t.events.push(TraceEvent {
+                    at_ms,
+                    kind: kind.into(),
+                    detail,
+                });
+            }
+            t.wait_ms = at_ms;
+        }
+    }
+
+    fn trace_finish(
+        tr: &mut Traces,
+        id: &str,
+        now: Instant,
+        outcome: &str,
+        detail: serde_json::Value,
+    ) {
+        Self::trace_event(tr, id, now, outcome, detail);
+        if let Some((_, mut t)) = tr.live.remove(id) {
+            t.outcome = outcome.into();
+            if tr.finished.len() < FINISHED_CAP {
+                tr.finished.push(t);
+            }
+        }
+    }
+
+    fn trace_matched(&self, out: &[Matched], now: Instant) {
+        if out.is_empty() {
+            return;
+        }
+        let mut tr = self.traces.lock();
+        for m in out {
+            let ids: Vec<String> = m.tickets.iter().map(|t| t.id.clone()).collect();
+            let rec = MatchRecord {
+                token: m.token.clone(),
+                queue: m.queue.clone(),
+                region: m.region.clone(),
+                quality: m.quality.as_ref().map(|q| q.score),
+                team_mmr_gap: m.quality.as_ref().map(|q| q.team_mmr_gap),
+                tickets: ids.clone(),
+                accounts: m
+                    .tickets
+                    .iter()
+                    .flat_map(|t| t.members.iter().map(|c| c.presence.account_id))
+                    .collect(),
+                wait_ms: m
+                    .tickets
+                    .iter()
+                    .map(|t| now.saturating_duration_since(t.created).as_millis() as u64)
+                    .collect(),
+            };
+            for t in &m.tickets {
+                let partners: Vec<&String> = ids.iter().filter(|i| **i != t.id).collect();
+                Self::trace_finish(
+                    &mut tr,
+                    &t.id,
+                    now,
+                    "matched",
+                    serde_json::json!({
+                        "token": m.token, "queue": m.queue, "region": m.region,
+                        "quality": rec.quality, "team_mmr_gap": rec.team_mmr_gap, "partners": partners,
+                    }),
+                );
+            }
+            if tr.matches.len() < FINISHED_CAP {
+                tr.matches.push(rec);
+            }
+        }
+    }
+
+    fn trace_dropped(&self, tickets: &[Ticket], outcome: &str) {
+        if tickets.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut tr = self.traces.lock();
+        for t in tickets {
+            Self::trace_finish(&mut tr, &t.id, now, outcome, serde_json::json!({}));
+        }
+    }
+
+    /// Note a per-ticket event from outside the core loop (ready check, requeue, dodge …).
+    pub fn trace_note(&self, ticket: &str, kind: &str, detail: serde_json::Value) {
+        let mut tr = self.traces.lock();
+        Self::trace_event(&mut tr, ticket, Instant::now(), kind, detail);
+    }
+
+    /// Live trace of a waiting ticket, or a finished one still queued for persistence.
+    pub fn trace(&self, ticket: &str) -> Option<TicketTrace> {
+        let tr = self.traces.lock();
+        tr.live.get(ticket).map(|(_, t)| t.clone()).or_else(|| {
+            tr.finished
+                .iter()
+                .rev()
+                .find(|t| t.ticket == ticket)
+                .cloned()
+        })
+    }
+
+    /// Finished traces since the last call (for persistence).
+    pub fn take_finished_traces(&self) -> Vec<TicketTrace> {
+        std::mem::take(&mut self.traces.lock().finished)
+    }
+
+    /// Formed matches since the last call (for persistence).
+    pub fn take_matches(&self) -> Vec<MatchRecord> {
+        std::mem::take(&mut self.traces.lock().matches)
+    }
+
+    /// Cumulative (queue, reason, count) since start.
+    pub fn rejection_totals(&self) -> Vec<(String, &'static str, u64)> {
+        let mut v: Vec<_> = self
+            .rejection_totals
+            .lock()
+            .iter()
+            .map(|((q, r), n)| (q.clone(), *r, *n))
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        v
     }
 }

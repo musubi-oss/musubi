@@ -195,7 +195,7 @@ soft-cap очередь, hysteresis, time dilation, размещение по р
   `POST …/bracket/matches/{mid}/forfeit` после дедлайна.
 - **Матчмейкер.** ~~Нет p50/p95 ожидания по очереди/региону и симулятора очереди~~ ✅ `GET /v1/server/matchmaker/stats`
   отдаёт `wait` (p50/p95/p99/max по очереди×региону, скользящее окно 2048 тикетов) и `waiting_ages`;
-  `POST /v1/server/matchmaker/simulate` гоняет синтетику (MMR, пинги по регионам, пати) через живой конфиг очереди на виртуальном времени.
+  `POST /v1/server/matchmaker/simulate` гоняет синтетику (MMR, пинги по регионам, пати) через живой конфиг очереди на виртуальном времени. Наблюдаемость решений (P0-58): трассировка по тикету `GET /v1/server/matchmaker/tickets/{id}/trace` (enqueued → ready-check/requeue/dodge → matched/expired/cancelled), сохранённые матчи `GET /v1/server/matchmaker/matches?token|queue|account_id` (`musubi.matchmaker_matches`), накопительная таблица отказов правил `GET /v1/server/matchmaker/rejections`; retention `matchmaker_log_days`.
 - **Чат и уведомления (5.5).** Нет typing-индикатора, вложений, перевода, внешнего automod-хука; у in-app
   уведомлений нет TTL; push без шаблонов/расписания по таймзоне/тихих пушей/deep-link, нет Huawei;
   ~~mailbox не умеет рассылку по аудитории~~ ✅ `audience` у `POST /v1/server/mail` (язык, регион, платформа, возраст, уровень трека, активность, дата регистрации, metadata) + `…/mail/audience/count`.

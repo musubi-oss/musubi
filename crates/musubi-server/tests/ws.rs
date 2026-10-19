@@ -19448,3 +19448,146 @@ async fn party_labels_update_and_listing() {
     .await;
     assert!(l["parties"].as_array().unwrap().is_empty(), "{l}");
 }
+
+#[tokio::test]
+async fn matchmaker_observability_trace_matches_and_rejections() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "binary";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let (tc, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    let mut c = connect(&addr, &tc, f).await;
+    let region = uuid::Uuid::now_v7().simple().to_string();
+    let add = |rank: f64| ClientMessage::MatchmakerAdd {
+        min_count: 2,
+        max_count: 2,
+        query: format!("+region:{region} +rank:>=5"),
+        string_properties: [("region".to_string(), region.clone())].into(),
+        numeric_properties: [("rank".to_string(), rank)].into(),
+        count_multiple: 1,
+    };
+    let get = |path: String| {
+        let router = router.clone();
+        async move {
+            let req = Request::get(path)
+                .header("x-musubi-server-key", "defaultkey")
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let status = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            (status, v)
+        }
+    };
+    // C's rank is too low for anyone's query → stays waiting, rejected on every pass
+    send(&mut c, f, None, add(1.0)).await;
+    let ticket_c = match recv(&mut c).await.msg {
+        ServerMessage::MatchmakerTicket { ticket } => ticket,
+        m => panic!("{m:?}"),
+    };
+    send(&mut a, f, None, add(10.0)).await;
+    let ticket_a = match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerTicket { ticket } => ticket,
+        m => panic!("{m:?}"),
+    };
+    // live trace of a waiting ticket
+    let (st, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_a}/trace")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["live"], true);
+    assert_eq!(v["trace"]["outcome"], "waiting");
+    assert_eq!(v["trace"]["events"][0]["kind"], "enqueued");
+    assert_eq!(v["trace"]["events"][0]["detail"]["min_count"], 2);
+
+    send(&mut b, f, None, add(7.0)).await;
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerTicket { .. }
+    ));
+    let token = match recv(&mut a).await.msg {
+        ServerMessage::MatchmakerMatched { token, .. } => token,
+        m => panic!("{m:?}"),
+    };
+    assert!(matches!(
+        recv(&mut b).await.msg,
+        ServerMessage::MatchmakerMatched { .. }
+    ));
+
+    // finished trace: matched, partner and token recorded (from memory or, after the drain, from the DB)
+    let (st, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_a}/trace")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["trace"]["outcome"], "matched");
+    let matched = v["trace"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "matched")
+        .cloned()
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(matched["detail"]["token"], token);
+    assert_eq!(matched["detail"]["partners"].as_array().unwrap().len(), 1);
+    assert_eq!(v["trace"]["accounts"].as_array().unwrap().len(), 1);
+
+    // stored match record appears once the drain ran
+    let mut rec = Value::Null;
+    for _ in 0..40 {
+        let (st, v) = get(format!("/v1/server/matchmaker/matches?token={token}")).await;
+        assert_eq!(st, 200, "{v}");
+        if let Some(m) = v["matches"].as_array().and_then(|a| a.first()) {
+            rec = m.clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(rec["token"], token, "match not persisted");
+    assert_eq!(rec["tickets"].as_array().unwrap().len(), 2);
+    assert_eq!(rec["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(rec["wait_ms"].as_array().unwrap().len(), 2);
+    // filter by account
+    let acc = rec["accounts"][0].as_str().unwrap().to_string();
+    let (_, v) = get(format!(
+        "/v1/server/matchmaker/matches?account_id={acc}&limit=5"
+    ))
+    .await;
+    assert!(v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["token"] == token));
+    // persisted trace is still readable after it left memory (same shape)
+    let (st, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_a}/trace")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["trace"]["outcome"], "matched");
+    let (st, _) = get("/v1/server/matchmaker/tickets/nope/trace".to_string()).await;
+    assert_eq!(st, 404);
+
+    // C was kept apart by the query rule at least once; the table is cumulative
+    let (st, v) = get("/v1/server/matchmaker/rejections".to_string()).await;
+    assert_eq!(st, 200, "{v}");
+    let rej = v["rejections"].as_array().unwrap();
+    assert!(
+        rej.iter().any(|r| r["count"].as_u64().unwrap_or(0) > 0),
+        "{v}"
+    );
+    let (_, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_c}/trace")).await;
+    assert_eq!(v["trace"]["outcome"], "waiting");
+
+    // cancelled ticket ends its trace
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::MatchmakerRemove {
+            ticket: ticket_c.clone(),
+        },
+    )
+    .await;
+    let _ = recv(&mut c).await;
+    let (_, v) = get(format!("/v1/server/matchmaker/tickets/{ticket_c}/trace")).await;
+    assert_eq!(v["trace"]["outcome"], "cancelled", "{v}");
+}

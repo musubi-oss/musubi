@@ -21,6 +21,12 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/matchmaker/queues/{name}", delete(delete_queue))
         .route("/v1/server/matchmaker/stats", get(stats))
         .route("/v1/server/matchmaker/simulate", post(simulate))
+        .route(
+            "/v1/server/matchmaker/tickets/{id}/trace",
+            get(ticket_trace),
+        )
+        .route("/v1/server/matchmaker/matches", get(matches))
+        .route("/v1/server/matchmaker/rejections", get(rejections))
 }
 
 async fn list_queues(
@@ -303,4 +309,160 @@ async fn simulate(
         },
         "matches_by_region": per_region,
     })))
+}
+
+/// Every few seconds, move finished ticket traces and formed matches from the matchmaker's
+/// memory into `musubi.matchmaker_ticket_log` / `musubi.matchmaker_matches` (observability).
+pub fn spawn_drain(db: sqlx::PgPool, mm: std::sync::Arc<musubi_matchmaker::Matchmaker>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if let Err(e) = matchmaker_drain(&db, &mm).await {
+                tracing::warn!(error = %e, "matchmaker trace drain failed");
+            }
+        }
+    });
+}
+
+pub async fn matchmaker_drain(
+    db: &sqlx::PgPool,
+    mm: &musubi_matchmaker::Matchmaker,
+) -> musubi_core::Result<()> {
+    use musubi_core::Error;
+    for t in mm.take_finished_traces() {
+        sqlx::query(
+            "insert into musubi.matchmaker_ticket_log (ticket, queue, accounts, outcome, wait_ms, events)
+             values ($1, $2, $3, $4, $5, $6) on conflict (ticket) do nothing",
+        )
+        .bind(&t.ticket)
+        .bind(&t.queue)
+        .bind(t.accounts.iter().map(|a| a.0).collect::<Vec<uuid::Uuid>>())
+        .bind(&t.outcome)
+        .bind(t.wait_ms as i64)
+        .bind(serde_json::to_value(&t.events).unwrap_or_default())
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+    }
+    for m in mm.take_matches() {
+        sqlx::query(
+            "insert into musubi.matchmaker_matches (token, queue, region, quality, team_mmr_gap, tickets, accounts, wait_ms)
+             values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (token) do nothing",
+        )
+        .bind(&m.token)
+        .bind(&m.queue)
+        .bind(&m.region)
+        .bind(m.quality)
+        .bind(m.team_mmr_gap)
+        .bind(&m.tickets)
+        .bind(m.accounts.iter().map(|a| a.0).collect::<Vec<uuid::Uuid>>())
+        .bind(m.wait_ms.iter().map(|w| *w as i64).collect::<Vec<i64>>())
+        .execute(db)
+        .await
+        .map_err(Error::internal)?;
+    }
+    Ok(())
+}
+
+/// `GET /v1/server/matchmaker/tickets/{id}/trace` — live decision trace of a waiting ticket or the
+/// persisted one of a finished ticket.
+async fn ticket_trace(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(t) = s.matchmaker.trace(&id) {
+        return Ok(Json(json!({ "live": t.outcome == "waiting", "trace": t })));
+    }
+    type R = (
+        String,
+        Option<String>,
+        Vec<uuid::Uuid>,
+        String,
+        i64,
+        Value,
+        i64,
+    );
+    let row: Option<R> = sqlx::query_as(
+        "select ticket, queue, accounts, outcome, wait_ms, events, extract(epoch from finished_at)::bigint
+         from musubi.matchmaker_ticket_log where ticket = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let Some((ticket, queue, accounts, outcome, wait_ms, events, at)) = row else {
+        return Err(musubi_core::Error::NotFound(format!("ticket {id}")).into());
+    };
+    Ok(Json(json!({ "live": false, "trace": {
+        "ticket": ticket, "queue": queue, "accounts": accounts, "outcome": outcome,
+        "wait_ms": wait_ms, "events": events, "finished_at": at,
+    }})))
+}
+
+#[derive(serde::Deserialize)]
+struct MatchesQ {
+    token: Option<String>,
+    queue: Option<String>,
+    account_id: Option<uuid::Uuid>,
+    limit: Option<i64>,
+}
+
+type MatchRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<f32>,
+    Option<f64>,
+    Vec<String>,
+    Vec<uuid::Uuid>,
+    Vec<i64>,
+    i64,
+);
+
+/// `GET /v1/server/matchmaker/matches?token|queue|account_id&limit` — stored matchmaking results.
+async fn matches(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    axum::extract::Query(q): axum::extract::Query<MatchesQ>,
+) -> Result<Json<Value>, ApiError> {
+    let rows: Vec<MatchRow> = sqlx::query_as(
+        "select token, queue, region, quality, team_mmr_gap, tickets, accounts, wait_ms, extract(epoch from created_at)::bigint
+         from musubi.matchmaker_matches
+         where ($1::text is null or token = $1) and ($2::text is null or queue = $2)
+           and ($3::uuid is null or $3 = any(accounts))
+         order by created_at desc limit $4",
+    )
+    .bind(q.token.as_deref())
+    .bind(q.queue.as_deref())
+    .bind(q.account_id)
+    .bind(q.limit.unwrap_or(50).clamp(1, 500))
+    .fetch_all(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let matches: Vec<Value> = rows
+        .into_iter()
+        .map(|(token, queue, region, quality, gap, tickets, accounts, wait_ms, at)| {
+            json!({
+                "token": token, "queue": queue, "region": region, "quality": quality, "team_mmr_gap": gap,
+                "tickets": tickets, "accounts": accounts, "wait_ms": wait_ms, "created_at": at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "matches": matches })))
+}
+
+/// `GET /v1/server/matchmaker/rejections` — why tickets were kept apart, cumulative per queue × rule.
+async fn rejections(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    let _ = s.matchmaker.take_rejections();
+    let rejections: Vec<Value> = s
+        .matchmaker
+        .rejection_totals()
+        .into_iter()
+        .map(|(q, r, n)| json!({ "queue": q, "reason": r, "count": n }))
+        .collect();
+    Ok(Json(json!({ "rejections": rejections })))
 }

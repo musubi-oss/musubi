@@ -25,7 +25,7 @@ mod liveops;
 mod lobbies;
 pub mod match_results;
 mod matches;
-mod matchmaker;
+pub(crate) mod matchmaker;
 mod notifications;
 mod offers;
 mod parties;

@@ -556,6 +556,15 @@ regions, party_sizes, seed}` dry-runs a queue's rules on virtual time with synth
 returns matches, wait percentiles and quality (MMR gap, ping) — tune `mmr`/`ping` expansion before
 real players feel it; same seed, same answer.
 
+Observability per decision: every ticket carries a bounded trace (`enqueued`, ready-check /
+requeue / dodge notes, then `matched` with token, quality, MMR gap and partners — or `expired` /
+`cancelled`), read live or after the fact with `GET /v1/server/matchmaker/tickets/{id}/trace`;
+formed matches are persisted (`musubi.matchmaker_matches`: token, queue, region, quality, tickets,
+accounts, per-ticket wait) and listed with `GET /v1/server/matchmaker/matches?token|queue|account_id`;
+`GET /v1/server/matchmaker/rejections` is the cumulative queue × rule table of why tickets were kept
+apart (`query`, `count`, `mmr`, `ping`, `party`, …) — Prometheus `musubi_matchmaker_rejections_total`
+has the same numbers. `[retention] matchmaker_log_days` (14) bounds both tables.
+
 ### Player statistics
 
 `PUT /v1/server/stats/defs` declares typed counters (`sum` / `max` / `min` / `last`, each

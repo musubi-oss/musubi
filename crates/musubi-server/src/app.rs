@@ -665,6 +665,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     let compliance_cfg = cfg.compliance.clone();
     let analytics = crate::analytics::Analytics::new(db.clone(), cfg.analytics.clone());
     analytics.spawn_flusher();
+    crate::http::matchmaker::spawn_drain(db.clone(), matchmaker.clone());
     let state = AppState(Arc::new(AppStateInner {
         blobs,
         audit: crate::audit::Sink::new(&db),
