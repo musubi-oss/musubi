@@ -313,6 +313,15 @@ ranks the current one), `global: true` (a game-wide aggregate per scope and cycl
 `GET /v1/server/stats/global`) and `client_writable: true` (players post their own via `POST /v1/stats {scope, stats}`,
 every other stat is 403). `POST /v1/server/stats/update {…, transaction_id}` is idempotent per id.
 
+League depth: `league` on a leaderboard takes `overrides: {"<tier>": {promote_pct, demote_pct, promote_score, demote_score}}`
+(per-tier rules), `promote_score` / `demote_score` (score-target races: anyone past the target moves regardless of rank),
+`idle_demote` (a tier > 0 player who posted nothing all window drops one tier), `rest_secs` (writes are 503
+`league is resting` for the first stretch of each window), `ending_soon_secs` and `rewards: {"<tier>": reward_table}`
+paid to every participant of the tier at rollover (`rollover.rewarded`, `league.rollover` event).
+`GET /v1/leaderboards/{id}/tier` is the player's league card: tier, bucket, window start/end, `seconds_left`,
+`ending_soon`, `resting`/`resting_until`, `rank`/`group_size`/`score`, `promote_cut`/`demote_cut`, the effective
+`rule` and `projected: promote|demote|stay` (idle players see the demotion coming).
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

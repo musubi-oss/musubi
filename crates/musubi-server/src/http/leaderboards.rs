@@ -296,22 +296,18 @@ async fn delete_as(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// League tier of the caller on this board (name and index).
+/// League card of the caller: tier, window phase (resting / ending soon), rank in the group and
+/// the projected move at the end of the window.
 async fn tier(
     State(s): State<AppState>,
     Bearer(me): Bearer,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let board = s.leaderboards.get(&id).await?;
-    let league = board
-        .league
-        .ok_or_else(|| musubi_core::Error::NotFound("leaderboard has no league".into()))?;
-    let tier = s.leaderboards.tier_of(&id, me.account_id).await?;
-    Ok(Json(json!({
-        "tier": tier,
-        "name": league.tiers.get(tier as usize),
-        "tiers": league.tiers,
-    })))
+    Ok(Json(
+        s.leaderboards
+            .tier_status(&id, me.account_id, time::OffsetDateTime::now_utc())
+            .await?,
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -329,7 +325,29 @@ async fn rollover(
     body: Option<Json<RolloverBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let expiry = body.and_then(|b| b.0.expiry);
-    Ok(Json(
-        json!({ "rollover": s.leaderboards.rollover(&id, expiry).await? }),
-    ))
+    let Some(mut r) = s.leaderboards.rollover(&id, expiry).await? else {
+        return Ok(Json(json!({ "rollover": null })));
+    };
+    let grants = std::mem::take(&mut r.rewards);
+    let mut rewarded = 0u32;
+    for (account, table) in grants {
+        if s.economy
+            .grant_table(account, &table, &format!("league:{id}:{}", r.expiry_time))
+            .await
+            .is_ok()
+        {
+            rewarded += 1;
+        }
+    }
+    let mut v = serde_json::to_value(&r).map_err(musubi_core::Error::internal)?;
+    v["rewarded"] = json!(rewarded);
+    s.events
+        .emit(
+            "league.rollover",
+            None,
+            json!({ "leaderboard_id": id, "expiry_time": r.expiry_time, "promoted": r.promoted,
+                    "demoted": r.demoted, "idle_demoted": r.idle_demoted, "rewarded": rewarded }),
+        )
+        .await;
+    Ok(Json(json!({ "rollover": v })))
 }

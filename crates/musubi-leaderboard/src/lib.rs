@@ -76,12 +76,49 @@ pub struct CreateLeaderboard {
 }
 
 /// League rules: at each reset the top `promote_pct` of every (tier, bucket) group moves one tier
-/// up and the bottom `demote_pct` one tier down; tier 0 is the first name.
+/// up and the bottom `demote_pct` one tier down; tier 0 is the first name. Per-tier `overrides`
+/// replace the percentages / add score targets for one tier; `promote_score` / `demote_score`
+/// promote or demote anyone past the target regardless of rank (score-target races);
+/// `idle_demote` drops players who posted nothing all window one tier; `rest_secs` keeps the
+/// board closed for writes at the start of each window; `ending_soon_secs` flags the last stretch;
+/// `rewards` pays a reward table per tier when the window closes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct League {
     pub tiers: Vec<String>,
     pub promote_pct: f64,
     pub demote_pct: f64,
+    #[serde(default)]
+    pub overrides: std::collections::BTreeMap<String, TierRule>,
+    #[serde(default)]
+    pub promote_score: Option<i64>,
+    #[serde(default)]
+    pub demote_score: Option<i64>,
+    #[serde(default)]
+    pub idle_demote: bool,
+    #[serde(default)]
+    pub rest_secs: i64,
+    #[serde(default)]
+    pub ending_soon_secs: i64,
+    #[serde(default)]
+    pub rewards: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct TierRule {
+    pub promote_pct: Option<f64>,
+    pub demote_pct: Option<f64>,
+    pub promote_score: Option<i64>,
+    pub demote_score: Option<i64>,
+}
+
+/// Effective rule for one tier.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct Rule {
+    pub promote_pct: f64,
+    pub demote_pct: f64,
+    pub promote_score: Option<i64>,
+    pub demote_score: Option<i64>,
 }
 
 impl League {
@@ -89,13 +126,83 @@ impl League {
         if self.tiers.len() < 2 || self.tiers.len() > 64 {
             return Err(Error::InvalidArgument("league needs 2..=64 tiers".into()));
         }
-        if !(0.0..=50.0).contains(&self.promote_pct) || !(0.0..=50.0).contains(&self.demote_pct) {
+        let pct_ok = |p: f64| (0.0..=50.0).contains(&p);
+        if !pct_ok(self.promote_pct) || !pct_ok(self.demote_pct) {
             return Err(Error::InvalidArgument(
                 "promote_pct/demote_pct must be in 0..=50".into(),
             ));
         }
+        for (k, r) in &self.overrides {
+            if !k.parse::<usize>().is_ok_and(|i| i < self.tiers.len()) {
+                return Err(Error::InvalidArgument(format!(
+                    "overrides: {k} is not a tier index"
+                )));
+            }
+            if r.promote_pct.is_some_and(|p| !pct_ok(p)) || r.demote_pct.is_some_and(|p| !pct_ok(p))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "overrides.{k}: percentages must be in 0..=50"
+                )));
+            }
+        }
+        for k in self.rewards.keys() {
+            if !k.parse::<usize>().is_ok_and(|i| i < self.tiers.len()) {
+                return Err(Error::InvalidArgument(format!(
+                    "rewards: {k} is not a tier index"
+                )));
+            }
+        }
+        if self.rest_secs < 0 || self.ending_soon_secs < 0 {
+            return Err(Error::InvalidArgument(
+                "rest_secs/ending_soon_secs must be non-negative".into(),
+            ));
+        }
         Ok(())
     }
+
+    pub fn rule(&self, tier: i16) -> Rule {
+        let o = self.overrides.get(&tier.to_string());
+        Rule {
+            promote_pct: o.and_then(|o| o.promote_pct).unwrap_or(self.promote_pct),
+            demote_pct: o.and_then(|o| o.demote_pct).unwrap_or(self.demote_pct),
+            promote_score: o.and_then(|o| o.promote_score).or(self.promote_score),
+            demote_score: o.and_then(|o| o.demote_score).or(self.demote_score),
+        }
+    }
+
+    /// Where a player ranked `rn` of `n` with `score` goes at the end of the window.
+    pub fn decide(&self, tier: i16, rn: i64, n: i64, score: i64, desc: bool) -> Move {
+        let top = self.tiers.len() as i16 - 1;
+        let r = self.rule(tier);
+        let up = ((n as f64) * r.promote_pct / 100.0).ceil() as i64;
+        let down = ((n as f64) * r.demote_pct / 100.0).ceil() as i64;
+        let passes = |t: Option<i64>, promote: bool| {
+            t.is_some_and(|t| {
+                if desc == promote {
+                    score >= t
+                } else {
+                    score <= t
+                }
+            })
+        };
+        if tier < top && ((rn <= up && r.promote_pct > 0.0) || passes(r.promote_score, true)) {
+            Move::Promote
+        } else if tier > 0
+            && ((rn > n - down && r.demote_pct > 0.0) || passes(r.demote_score, false))
+        {
+            Move::Demote
+        } else {
+            Move::Stay
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Move {
+    Promote,
+    Demote,
+    Stay,
 }
 
 /// What one rollover did.
@@ -105,6 +212,10 @@ pub struct Rollover {
     pub expiry_time: i64,
     pub promoted: u32,
     pub demoted: u32,
+    pub idle_demoted: u32,
+    /// (account, reward table) for every participant of a tier with a reward.
+    #[serde(skip)]
+    pub rewards: Vec<(AccountId, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -468,7 +579,18 @@ impl LeaderboardService {
             (None, _) => board.operator,
         };
         let now = OffsetDateTime::now_utc();
-        let (_, expiry) = window(board.reset_schedule.as_deref(), now)?;
+        let (start, expiry) = window(board.reset_schedule.as_deref(), now)?;
+        if let Some(l) = &board.league {
+            if l.rest_secs > 0 && start != OffsetDateTime::UNIX_EPOCH {
+                let until = start + time::Duration::seconds(l.rest_secs);
+                if now < until {
+                    return Err(Error::Unavailable(format!(
+                        "league is resting until {}",
+                        until.unix_timestamp()
+                    )));
+                }
+            }
+        }
         let better = match board.sort_order {
             SortOrder::Desc => "(excluded.score, excluded.subscore) > (r.score, r.subscore)",
             SortOrder::Asc => "(excluded.score, excluded.subscore) < (r.score, r.subscore)",
@@ -829,9 +951,10 @@ impl LeaderboardService {
             SortOrder::Desc => "score desc, subscore desc, updated_at asc, owner_id asc",
             SortOrder::Asc => "score asc, subscore asc, updated_at asc, owner_id asc",
         };
-        let rows: Vec<(Uuid, i16, i64, i64)> = sqlx::query_as(&format!(
+        let desc = board.sort_order == SortOrder::Desc;
+        let rows: Vec<(Uuid, i16, i64, i64, i64)> = sqlx::query_as(&format!(
             "select owner_id, tier, row_number() over (partition by tier, bucket order by {order}),
-                    count(*) over (partition by tier, bucket)
+                    count(*) over (partition by tier, bucket), score
              from musubi.leaderboard_records where leaderboard_id = $1 and expiry_time = $2"
         ))
         .bind(id)
@@ -839,20 +962,43 @@ impl LeaderboardService {
         .fetch_all(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        let top = league.tiers.len() as i16 - 1;
-        let (mut promoted, mut demoted) = (0u32, 0u32);
-        for (owner, tier, rn, n) in rows {
-            let up = ((n as f64) * league.promote_pct / 100.0).ceil() as i64;
-            let down = ((n as f64) * league.demote_pct / 100.0).ceil() as i64;
-            let new_tier = if rn <= up && tier < top && league.promote_pct > 0.0 {
-                promoted += 1;
-                tier + 1
-            } else if rn > n - down && tier > 0 && league.demote_pct > 0.0 {
-                demoted += 1;
-                tier - 1
-            } else {
-                continue;
-            };
+        let (mut promoted, mut demoted, mut idle_demoted) = (0u32, 0u32, 0u32);
+        let mut rewards = Vec::new();
+        let mut moves: Vec<(Uuid, i16)> = Vec::new();
+        for (owner, tier, rn, n, score) in rows {
+            if let Some(t) = league.rewards.get(&tier.to_string()) {
+                rewards.push((AccountId(owner), t.clone()));
+            }
+            match league.decide(tier, rn, n, score, desc) {
+                Move::Promote => {
+                    promoted += 1;
+                    moves.push((owner, tier + 1));
+                }
+                Move::Demote => {
+                    demoted += 1;
+                    moves.push((owner, tier - 1));
+                }
+                Move::Stay => {}
+            }
+        }
+        if league.idle_demote {
+            let idle: Vec<(Uuid, i16)> = sqlx::query_as(
+                "select t.owner_id, t.tier from musubi.leaderboard_tiers t
+                 where t.leaderboard_id = $1 and t.tier > 0 and not exists (
+                     select 1 from musubi.leaderboard_records r
+                     where r.leaderboard_id = $1 and r.expiry_time = $2 and r.owner_id = t.owner_id)",
+            )
+            .bind(id)
+            .bind(exp)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            for (owner, tier) in idle {
+                idle_demoted += 1;
+                moves.push((owner, tier - 1));
+            }
+        }
+        for (owner, new_tier) in moves {
             sqlx::query(
                 "insert into musubi.leaderboard_tiers (leaderboard_id, owner_id, tier) values ($1, $2, $3)
                  on conflict (leaderboard_id, owner_id) do update set tier = excluded.tier, updated_at = now()",
@@ -871,7 +1017,7 @@ impl LeaderboardService {
         .bind(id)
         .bind(exp)
         .bind(promoted as i32)
-        .bind(demoted as i32)
+        .bind((demoted + idle_demoted) as i32)
         .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
@@ -881,12 +1027,84 @@ impl LeaderboardService {
             expiry_time: exp.unix_timestamp(),
             promoted,
             demoted,
+            idle_demoted,
+            rewards,
         }))
     }
 
-    /// Windows that have finished and were not announced yet: (id, expiry, is_tournament). A board
-    /// with a reset schedule finishes a window at every reset; the returned expiry is the finished
-    /// window's `expiry_time` (what its records are keyed by).
+    /// League card of a player: tier, window, phase flags and where the current rank would send
+    /// them at the end of the window.
+    pub async fn tier_status(
+        &self,
+        id: &str,
+        owner: AccountId,
+        now: OffsetDateTime,
+    ) -> Result<serde_json::Value> {
+        let board = self.get(id).await?;
+        let Some(league) = board.league.clone() else {
+            return Err(Error::NotFound("leaderboard has no league".into()));
+        };
+        let (start, end) = window(board.reset_schedule.as_deref(), now)?;
+        // the league standing lives in leaderboard_tiers; this window's record (if any) only
+        // places the player in a bucket while it still belongs to that tier
+        let tier = self.tier_of(id, owner).await?;
+        let bucket = match self.scope_of(&board, end, Some(owner)).await? {
+            Some((t, b)) if t == tier => b,
+            _ => -1,
+        };
+        let order = match board.sort_order {
+            SortOrder::Desc => "score desc, subscore desc, updated_at asc, owner_id asc",
+            SortOrder::Asc => "score asc, subscore asc, updated_at asc, owner_id asc",
+        };
+        let mine: Option<(i64, i64, i64)> = sqlx::query_as(&format!(
+            "select rn, n, score from (
+                 select owner_id, row_number() over (order by {order}) as rn, count(*) over () as n, score
+                 from musubi.leaderboard_records
+                 where leaderboard_id = $1 and expiry_time = $2 and tier = $3 and bucket = $4) x
+             where owner_id = $5"
+        ))
+        .bind(id)
+        .bind(end)
+        .bind(tier)
+        .bind(bucket)
+        .bind(owner.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let rule = league.rule(tier);
+        let desc = board.sort_order == SortOrder::Desc;
+        let projected = match mine {
+            Some((rn, n, score)) => league.decide(tier, rn, n, score, desc),
+            None if league.idle_demote && tier > 0 => Move::Demote,
+            None => Move::Stay,
+        };
+        let resting_until = (league.rest_secs > 0 && start != OffsetDateTime::UNIX_EPOCH)
+            .then(|| start + time::Duration::seconds(league.rest_secs));
+        let seconds_left = (end != OffsetDateTime::UNIX_EPOCH).then(|| (end - now).whole_seconds());
+        let n = mine.map(|m| m.1).unwrap_or(0);
+        Ok(serde_json::json!({
+            "tier": tier,
+            "name": league.tiers.get(tier as usize),
+            "tiers": league.tiers,
+            "bucket": bucket,
+            "window_start": (start != OffsetDateTime::UNIX_EPOCH).then(|| start.unix_timestamp()),
+            "window_end": (end != OffsetDateTime::UNIX_EPOCH).then(|| end.unix_timestamp()),
+            "seconds_left": seconds_left,
+            "ending_soon": seconds_left.is_some_and(|s| league.ending_soon_secs > 0 && s <= league.ending_soon_secs),
+            "resting": resting_until.is_some_and(|u| now < u),
+            "resting_until": resting_until.map(|u| u.unix_timestamp()),
+            "rank": mine.map(|m| m.0),
+            "group_size": n,
+            "score": mine.map(|m| m.2),
+            "projected": projected,
+            "idle": mine.is_none(),
+            "promote_cut": ((n as f64) * rule.promote_pct / 100.0).ceil() as i64,
+            "demote_cut": ((n as f64) * rule.demote_pct / 100.0).ceil() as i64,
+            "rule": rule,
+            "reward_table": league.rewards.get(&tier.to_string()),
+        }))
+    }
+
     pub async fn unended_windows(&self) -> Result<Vec<(String, i64, bool)>> {
         let rows: Vec<(String, Option<String>, bool, OffsetDateTime)> = sqlx::query_as(
             "select id, reset_schedule, is_tournament, created_at from musubi.leaderboards where reset_schedule is not null",
@@ -953,6 +1171,54 @@ impl LeaderboardService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn league_rules_overrides_score_targets_and_moves() {
+        let mut l = League {
+            tiers: vec!["bronze".into(), "silver".into(), "gold".into()],
+            promote_pct: 20.0,
+            demote_pct: 20.0,
+            overrides: Default::default(),
+            promote_score: Some(1000),
+            demote_score: None,
+            idle_demote: true,
+            rest_secs: 0,
+            ending_soon_secs: 0,
+            rewards: Default::default(),
+        };
+        l.overrides.insert(
+            "1".into(),
+            TierRule {
+                demote_pct: Some(50.0),
+                ..Default::default()
+            },
+        );
+        assert!(l.validate().is_ok());
+        assert_eq!(l.rule(1).demote_pct, 50.0);
+        assert_eq!(l.rule(0).demote_pct, 20.0);
+        assert_eq!(l.decide(0, 2, 10, 5, true), Move::Promote);
+        assert_eq!(l.decide(0, 3, 10, 5, true), Move::Stay);
+        assert_eq!(l.decide(0, 10, 10, 5, true), Move::Stay, "bottom tier");
+        assert_eq!(
+            l.decide(1, 6, 10, 5, true),
+            Move::Demote,
+            "override: bottom half"
+        );
+        assert_eq!(l.decide(1, 5, 10, 5, true), Move::Stay);
+        assert_eq!(
+            l.decide(0, 9, 10, 1200, true),
+            Move::Promote,
+            "score target beats rank"
+        );
+        assert_eq!(l.decide(2, 1, 10, 5000, true), Move::Stay, "top tier");
+        assert_eq!(
+            l.decide(0, 9, 10, 900, false),
+            Move::Promote,
+            "asc board: at or below target"
+        );
+        l.overrides.insert("7".into(), TierRule::default());
+        assert!(l.validate().is_err(), "override for a missing tier");
+    }
 
     #[test]
     fn cron_windows() {

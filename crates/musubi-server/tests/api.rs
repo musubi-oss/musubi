@@ -22070,3 +22070,205 @@ async fn player_stats_depth_constraints_cycles_global_and_client_writes() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn league_depth_overrides_score_targets_idle_demotion_rest_and_projection() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let mut users = Vec::new();
+    for i in 0..4 {
+        let (_, sess) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(&format!("lg{i}"))})),
+        )
+        .await;
+        let t = sess["access_token"].as_str().unwrap().to_string();
+        let (_, acc) = call(&app, "GET", "/v1/account", Some(&t), None).await;
+        users.push((t, acc["id"].as_str().unwrap().to_string()));
+    }
+    let gold = unique("lgg").to_lowercase();
+    let rt = unique("lgrt").to_lowercase();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": rt, "name": rt, "kind": "weighted", "entries": [{"weight": 1, "currency": gold, "amount": 10}]}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let id = unique("lgd");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        k,
+        Some(json!({"id": id, "reset_schedule": "0 0 * * *",
+            "league": {"tiers": ["bronze", "silver", "gold"], "promote_pct": 50, "demote_pct": 50, "overrides": {"5": {}}}})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "override for a missing tier: {v}"
+    );
+    let (st, board) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        k,
+        Some(json!({"id": id, "reset_schedule": "0 0 * * *",
+            "league": {"tiers": ["bronze", "silver", "gold"], "promote_pct": 50, "demote_pct": 50,
+                "overrides": {"1": {"demote_pct": 0}}, "promote_score": 1000, "idle_demote": true,
+                "ending_soon_secs": 2 * 86400, "rewards": {"0": rt}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{board}");
+    assert_eq!(board["league"]["idle_demote"], true);
+    // u4 sits in silver from an earlier season and posts nothing this window
+    let db = sqlx::PgPool::connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("insert into musubi.leaderboard_tiers (leaderboard_id, owner_id, tier) values ($1, $2::uuid, 1)")
+        .bind(&id)
+        .bind(&users[3].1)
+        .execute(&db)
+        .await
+        .unwrap();
+    for (i, score) in [100, 50, 1200].iter().enumerate() {
+        let (st, r) = call(
+            &app,
+            "POST",
+            &format!("/v1/leaderboards/{id}/records"),
+            Some(&users[i].0),
+            Some(json!({"score": score})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+    }
+    let card = |t: String| {
+        let app = app.clone();
+        let id = id.clone();
+        async move {
+            let (st, v) = call(
+                &app,
+                "GET",
+                &format!("/v1/leaderboards/{id}/tier"),
+                Some(&t),
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v
+        }
+    };
+    let c1 = card(users[0].0.clone()).await;
+    assert_eq!(c1["tier"], 0);
+    assert_eq!(c1["rank"], 2);
+    assert_eq!(c1["group_size"], 3);
+    assert_eq!(c1["promote_cut"], 2);
+    assert_eq!(c1["projected"], "promote");
+    assert_eq!(
+        c1["ending_soon"], true,
+        "daily window is always inside 2 days: {c1}"
+    );
+    assert_eq!(c1["resting"], false);
+    assert_eq!(c1["reward_table"], rt);
+    assert_eq!(c1["rule"]["promote_score"], 1000);
+    let c2 = card(users[1].0.clone()).await;
+    assert_eq!(c2["rank"], 3);
+    assert_eq!(c2["projected"], "stay", "bottom tier never demotes: {c2}");
+    let c3 = card(users[2].0.clone()).await;
+    assert_eq!(c3["rank"], 1);
+    assert_eq!(c3["projected"], "promote");
+    let c4 = card(users[3].0.clone()).await;
+    assert_eq!(c4["tier"], 1);
+    assert_eq!(c4["idle"], true);
+    assert_eq!(c4["projected"], "demote", "idle demotion: {c4}");
+    assert_eq!(c4["rule"]["demote_pct"], 0.0, "per-tier override");
+
+    let expiry = c1["window_end"].as_i64().unwrap();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/leaderboards/{id}/rollover"),
+        k,
+        Some(json!({"expiry": expiry})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rollover"]["promoted"], 2, "{v}");
+    assert_eq!(v["rollover"]["demoted"], 0);
+    assert_eq!(v["rollover"]["idle_demoted"], 1);
+    assert_eq!(
+        v["rollover"]["rewarded"], 3,
+        "every bronze participant gets the tier reward"
+    );
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&users[0].0), None).await;
+    let bal = w["balances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["currency"] == gold || b["code"] == gold)
+        .and_then(|b| b["balance"].as_i64())
+        .unwrap_or(0);
+    assert_eq!(bal, 10);
+    let (_, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id}/tier"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(t["name"], "silver", "{t}");
+    let (_, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id}/tier"),
+        Some(&users[3].0),
+        None,
+    )
+    .await;
+    assert_eq!(t["name"], "bronze", "idle silver player dropped: {t}");
+
+    // rest phase: the board is closed for the first stretch of every window
+    let rest = unique("lgr");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        k,
+        Some(json!({"id": rest, "reset_schedule": "0 0 * * *",
+            "league": {"tiers": ["a", "b"], "promote_pct": 10, "demote_pct": 10, "rest_secs": 1_000_000}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, r) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{rest}/records"),
+        Some(&users[0].0),
+        Some(json!({"score": 1})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "resting: {r}");
+    assert!(r.to_string().contains("resting"), "{r}");
+    let (_, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{rest}/tier"),
+        Some(&users[0].0),
+        None,
+    )
+    .await;
+    assert_eq!(t["resting"], true, "{t}");
+    assert!(t["resting_until"].as_i64().unwrap() > expiry - 86_400);
+}
