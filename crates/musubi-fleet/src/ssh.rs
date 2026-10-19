@@ -322,8 +322,9 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            ssh_command: ssh,
-            ssh_args: vec![],
+            // run the fake through `sh` so a freshly written script never hits ETXTBSY
+            ssh_command: "sh".into(),
+            ssh_args: vec![ssh],
             connect_timeout_secs: 3,
         };
         let p = SshProvider::new(cfg);
