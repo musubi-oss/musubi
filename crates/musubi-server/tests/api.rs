@@ -20409,3 +20409,298 @@ async fn energy_modifiers_overfill_offline_spend_and_refill_count() {
     .await;
     assert_eq!(st, 400);
 }
+
+#[tokio::test]
+async fn group_pools_donations_and_team_store() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let mut users = vec![];
+    for _ in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("pool")})),
+        )
+        .await;
+        users.push((
+            s["access_token"].as_str().unwrap().to_string(),
+            s["account_id"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (ta, a) = users[0].clone();
+    let (tb, b) = users[1].clone();
+    let (tc, c) = users[2].clone();
+    let gold = unique("gold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for acc in [&a, &b, &c] {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/wallet/adjust",
+            k,
+            Some(json!({"account_id": acc, "currency": gold, "delta": 500, "reason": "seed"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let (st, g) = call(
+        &app,
+        "POST",
+        "/v1/groups",
+        Some(&ta),
+        Some(json!({"name": unique("guild"), "open": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    let gid = g["id"].as_str().unwrap().to_string();
+    for t in [&tb, &tc] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            &format!("/v1/groups/{gid}/join"),
+            Some(t),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let bal = |w: &Value| -> i64 {
+        w["balances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["currency"] == gold)
+            .and_then(|x| x["balance"].as_i64())
+            .unwrap_or(0)
+    };
+
+    // pool: members cannot create, the leader can; goal 300 with a tier at 200
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/pools"),
+        Some(&tb),
+        Some(json!({"name": "Hall", "currency": gold, "goal": 300})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, p) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/pools"),
+        Some(&ta),
+        Some(json!({"name": "Hall", "currency": gold, "goal": 300,
+            "tiers": [{"at": 200, "reward_table": "no-such-table"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    let pid = p["id"].as_str().unwrap().to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/pools/{pid}/contribute"),
+        Some(&tb),
+        Some(json!({"amount": 150})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["raised"], 150);
+    assert_eq!(v["status"], "open");
+    // overpaying is clamped to the goal; completion flips status
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/pools/{pid}/contribute"),
+        Some(&tc),
+        Some(json!({"amount": 400})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["contributed"], 150);
+    assert_eq!(v["raised"], 300);
+    assert_eq!(v["status"], "completed");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tc), None).await;
+    assert_eq!(bal(&w), 350);
+    let (_, t) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/treasury"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert!(t.to_string().contains("300"), "{t}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/pools/{pid}/contribute"),
+        Some(&tb),
+        Some(json!({"amount": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/pools/{pid}"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["contributors"].as_array().unwrap().len(), 2);
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/pools"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(v["pools"].as_array().unwrap().len(), 1);
+
+    // donations: B asks for 100, cannot fulfil own request, C gives
+    let (st, d) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/donations"),
+        Some(&tb),
+        Some(json!({"currency": gold, "amount": 100, "note": "need a sword"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let did = d["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/donations"),
+        Some(&tb),
+        Some(json!({"currency": gold, "amount": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "one open request per currency");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/donations/{did}/give"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/donations/{did}/give"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "fulfilled");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tc), None).await;
+    assert_eq!(bal(&w), 250);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tb), None).await;
+    assert_eq!(bal(&w), 450);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/donations/{did}/give"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "already fulfilled");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/donations"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(v["requests"][0]["fulfilled_by"], c);
+
+    // team store: leader lists an item for 120 gold, treasury (300) pays, member gets the item
+    let item = unique("banner").to_lowercase();
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": item, "name": "Banner"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("/v1/groups/{gid}/store/{item}"),
+        Some(&tb),
+        Some(json!({"currency": gold, "price": 120})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("/v1/groups/{gid}/store/{item}"),
+        Some(&ta),
+        Some(json!({"currency": gold, "price": 120})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/store/{item}/buy"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["paid"], 120);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tb), None).await;
+    assert_eq!(bal(&w), 450, "buyer's own wallet untouched");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/store/{item}/buy"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/groups/{gid}/store/{item}/buy"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "treasury has 60 left: {v}");
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tb), None).await;
+    assert!(inv.to_string().contains(&item), "{inv}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/groups/{gid}/store"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+}

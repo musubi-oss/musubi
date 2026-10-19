@@ -251,6 +251,16 @@ id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.
 | `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
 | QUIC `quic.listen` (UDP) | access JWT in the first frame `{token, format, status}` | same envelopes/encodings as WebSocket over one bidirectional quinn stream (`type:u8 \| len:u32be \| payload`); an unvalidated source is answered with a Retry token before any handshake state exists (`quic.retry`, default on — spoofed addresses cost nothing and amplification stays 1×), handshakes in flight are capped by `quic.max_pending_handshakes` (default 1024, refused above), 8 bidirectional / 0 unidirectional streams per connection, ALPN `musubi-rt/1`, PEM cert or self-signed dev cert; `match_data` with `reliable=false` travels as QUIC datagrams (clients may send datagrams too) |
 
+Group economies on top of the treasury: contribution pools (`POST /v1/groups/{id}/pools {name,
+currency, goal, tiers: [{at, reward_table}], contributor_reward_table?, ends_at?}` by officers;
+members `POST …/pools/{pid}/contribute {amount}` — wallet → treasury, clamped to the goal, every
+contributor is rewarded once per crossed tier, completion emits `group.pool_completed`; `GET …/pools`,
+`GET …/pools/{pid}` with top contributors, `…/close`), donation requests (`POST /v1/groups/{id}/donations
+{currency, amount, note}`, one open per currency; a guildmate `POST …/{did}/give` pays the full amount
+wallet-to-wallet through the audited treasury ledger; `…/cancel`), and a team store (`PUT
+/v1/groups/{id}/store/{item} {currency, price, quantity, enabled}` by officers, `POST …/{item}/buy
+{account_id?}` — the treasury pays and the member receives the inventory item).
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

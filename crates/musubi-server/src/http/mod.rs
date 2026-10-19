@@ -19,6 +19,7 @@ pub(crate) mod extract;
 mod fleets;
 mod friends;
 pub mod group_challenges;
+mod group_pools;
 mod groups;
 mod integrations;
 mod leaderboards;
@@ -232,6 +233,7 @@ pub fn router(state: AppState) -> Router {
             )),
         )
         .merge(bans::routes())
+        .merge(group_pools::routes())
         .merge(codes::routes())
         .merge(legal::routes())
         .merge(parties::routes())
