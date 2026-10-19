@@ -117,7 +117,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Локальная отладка: dev-сервер, фикстуры, replay запросов | ✅ `musubi dev`; фикстуры `POST /v1/admin/dev/fixtures`, запись/replay запросов `/v1/admin/dev/recording(s)`, канарейки модулей | ✅ | 🟡 | 🟡 | — |
 | Cron / schedule_-хуки | ✅ | ✅ | 🟡 | ✅ | ✅ |
 | Durable workflows / saga | ✅ `workflow_<name>` шаги с персистентным состоянием, sleep/wait_signal/retry/compensate | ❌ | ❌ | ✅ | ❌ |
-| Flags, live events, аудитории, A/B | ✅ через Zanshin (кэш + мгновенный пуш `liveops.changed`) + локальные аудитории: any/all/not, include/exclude, возраст аккаунта, hash-bucket, tracked-членство с enter/exit-действиями | ✅ | Satori платно | ✅ | ✅ |
+| Flags, live events, аудитории, A/B | ✅ нативно в ядре (`liveops.rs`: флаги с правилами/rollout, A/B со sticky-назначением, exclusion groups, outcomes и z-test scorecard, live events с фазами/повторами/локальным временем) + Zanshin как опциональный оверлей (кэш + мгновенный пуш `liveops.changed`) + локальные аудитории: any/all/not, include/exclude, возраст аккаунта, hash-bucket, tracked-членство с enter/exit-действиями | ✅ | Satori платно | ✅ | ✅ |
 | Аналитика событий | ✅ шина → Zanshin / вебхуки; клиентскую телеметрию пишет Zanshin SDK | ✅ | Satori | ✅ | ✅ |
 | Вебхуки: HMAC, backoff, dead-letter, redeliver, test | ✅ | 🟡 | ❌ | ✅ | ✅ |
 | Аудит админ-мутаций | ✅ `/v1/admin/audit` | ✅ | ❌ | ✅ | ✅ |

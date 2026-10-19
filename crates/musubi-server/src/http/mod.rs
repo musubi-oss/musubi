@@ -19,6 +19,7 @@ pub mod group_challenges;
 mod groups;
 mod integrations;
 mod leaderboards;
+mod liveops;
 mod lobbies;
 pub mod match_results;
 mod matches;
@@ -226,6 +227,7 @@ pub fn router(state: AppState) -> Router {
         .merge(bans::routes())
         .merge(parties::routes())
         .merge(subscriptions::routes())
+        .merge(liveops::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::hooks::before_after,

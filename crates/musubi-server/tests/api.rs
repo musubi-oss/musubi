@@ -17987,3 +17987,333 @@ async fn audiences_algebra_tracking_and_actions() {
         .await;
     }
 }
+
+/// Native LiveOps (competitive P0-17/52/53): flag rules + rollout, experiment assignment with
+/// flag overrides, outcomes and scorecards, live event phases.
+#[tokio::test]
+async fn native_flags_experiments_and_live_events() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("lo-a")})),
+    )
+    .await;
+    let (_, b) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("lo-b")})),
+    )
+    .await;
+    let (ta, aid) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        a["account_id"].as_str().unwrap().to_string(),
+    );
+    let tb = b["access_token"].as_str().unwrap().to_string();
+    let aud = unique("loaud").replace('-', "_");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{aud}"),
+        k,
+        Some(json!({"rules": {"include": [aid]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let f = unique("flag");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/flags/{f}"),
+        k,
+        Some(json!({
+            "default_value": false,
+            "rules": [{"audience": aud, "value": "aud"}, {"rollout_pct": 100, "value": true}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/flags/{f}-bad"),
+        k,
+        Some(json!({"rules": [{"rollout_pct": 150, "value": 1}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, fa) = call(
+        &app,
+        "GET",
+        &format!("/v1/liveops/flags?names={f}"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{fa}");
+    assert_eq!(fa["flags"][0]["value"], "aud", "{fa}");
+    assert_eq!(fa["flags"][0]["source"], "rule:0");
+    let (_, fb) = call(
+        &app,
+        "GET",
+        &format!("/v1/liveops/flags?names={f}"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(fb["flags"][0]["value"], true, "{fb}");
+    assert_eq!(fb["flags"][0]["source"], "rule:1");
+    // a change clears the cache everywhere
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/flags/{f}"),
+        k,
+        Some(json!({"default_value": "x", "rules": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, fb) = call(
+        &app,
+        "GET",
+        &format!("/v1/liveops/flags?names={f}"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(fb["flags"][0]["value"], "x", "{fb}");
+    assert_eq!(fb["flags"][0]["source"], "default");
+
+    // experiment: draft → nothing; running → sticky variant; variant flags override rules
+    let e = unique("exp");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/experiments/{e}"),
+        k,
+        Some(json!({"name": "one variant", "variants": [{"name": "only", "weight": 1}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let variants = json!([{"name": "control", "weight": 1}, {"name": "treat", "weight": 1, "flags": {f.clone(): "treat"}}]);
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/experiments/{e}"),
+        k,
+        Some(json!({"name": "Price test", "variants": variants, "exclusion_group": "pricing"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["status"], "draft");
+    let (_, mine) = call(&app, "GET", "/v1/liveops/experiments", Some(&ta), None).await;
+    assert!(
+        mine["experiments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["experiment_id"] != json!(e)),
+        "{mine}"
+    );
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/experiments/{e}/start"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["status"], "running");
+    let (st, _) = call_server(&app, "PUT", &format!("/v1/server/experiments/{e}"), k, Some(json!({"name": "Price test", "variants": [{"name": "a", "weight": 1}, {"name": "b", "weight": 1}]}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "variants frozen once started");
+    let (_, mine) = call(&app, "GET", "/v1/liveops/experiments", Some(&ta), None).await;
+    let my = mine["experiments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["experiment_id"] == json!(e))
+        .cloned()
+        .unwrap_or_else(|| panic!("{mine}"));
+    let variant = my["variant"].as_str().unwrap().to_string();
+    assert!(variant == "control" || variant == "treat");
+    let (_, mine2) = call(&app, "GET", "/v1/liveops/experiments", Some(&ta), None).await;
+    assert_eq!(
+        mine2["experiments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["experiment_id"] == json!(e))
+            .unwrap()["variant"],
+        json!(variant),
+        "sticky"
+    );
+    let (_, fa) = call(
+        &app,
+        "GET",
+        &format!("/v1/liveops/flags?names={f}"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    if variant == "treat" {
+        assert_eq!(fa["flags"][0]["value"], "treat", "{fa}");
+        assert_eq!(
+            fa["flags"][0]["source"],
+            json!(format!("experiment:{e}:treat"))
+        );
+    } else {
+        assert_eq!(fa["flags"][0]["value"], "x", "{fa}");
+    }
+    // a second experiment in the same exclusion group never takes A
+    let e2 = format!("{e}-2");
+    let (_, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/experiments/{e2}"),
+        k,
+        Some(json!({"name": "Other pricing", "variants": variants, "exclusion_group": "pricing"})),
+    )
+    .await;
+    let (_, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/experiments/{e2}/start"),
+        k,
+        None,
+    )
+    .await;
+    let (_, mine3) = call(&app, "GET", "/v1/liveops/experiments", Some(&ta), None).await;
+    assert!(
+        mine3["experiments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["experiment_id"] != json!(e2)),
+        "{mine3}"
+    );
+    // outcomes → scorecard
+    let (st, o) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/experiments/{e}/outcome"),
+        Some(&ta),
+        Some(json!({"metric": "purchase", "value": 5.0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{o}");
+    assert_eq!(o["variant"], json!(variant));
+    let (st, o) = call(
+        &app,
+        "POST",
+        &format!("/v1/liveops/experiments/{e2}/outcome"),
+        Some(&ta),
+        Some(json!({"metric": "purchase"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{o}");
+    let (st, res) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/experiments/{e}/results"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    assert_eq!(res["control"], "control");
+    let row = res["metrics"]["purchase"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["variant"] == json!(variant))
+        .unwrap()
+        .clone();
+    assert_eq!(row["n"], 1, "{res}");
+    assert_eq!(row["mean"], 5.0);
+    let (_, asg) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/experiments/{e}/assignments"),
+        k,
+        None,
+    )
+    .await;
+    assert!(
+        asg["assignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["account_id"] == json!(aid)),
+        "{asg}"
+    );
+    let (_, r) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/experiments/{e}/end"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(r["status"], "ended");
+
+    // live events: active phase now, an upcoming one, validation
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let ev = unique("ev");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/live_events/{ev}"), k, Some(json!({
+        "name": "Double XP weekend",
+        "phases": [{"name": "warmup", "offset_secs": 0, "duration_secs": 600}, {"name": "main", "offset_secs": 600, "duration_secs": 3000}],
+        "starts_at": now - 700, "recurrence_secs": 86400, "metadata": {"xp": 2}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call_server(&app, "PUT", &format!("/v1/server/live_events/{ev}-bad"), k, Some(json!({"name": "x", "phases": [{"name": "a", "offset_secs": 0, "duration_secs": 100}], "starts_at": now, "recurrence_secs": 50}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let soon = format!("{ev}-soon");
+    let (_, _) = call_server(&app, "PUT", &format!("/v1/server/live_events/{soon}"), k, Some(json!({"name": "Soon", "phases": [{"name": "go", "offset_secs": 0, "duration_secs": 100}], "starts_at": now + 3600}))).await;
+    let (st, le) = call(&app, "GET", "/v1/liveops/live-events", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{le}");
+    let list = le["live_events"].as_array().unwrap();
+    let act = list
+        .iter()
+        .find(|x| x["id"] == json!(ev))
+        .unwrap_or_else(|| panic!("{le}"));
+    assert_eq!(act["active"], true);
+    assert_eq!(act["phase"], "main");
+    assert_eq!(act["metadata"]["xp"], 2);
+    let up = list
+        .iter()
+        .find(|x| x["id"] == json!(soon))
+        .unwrap_or_else(|| panic!("{le}"));
+    assert_eq!(up["active"], false);
+    assert_eq!(up["starts_at"], json!(now + 3600));
+    let (st, ev_all) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/liveops/eval?account_id={aid}&names={f}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev_all}");
+    assert_eq!(ev_all["flags"][0]["name"], json!(f));
+    assert!(ev_all["live_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["id"] == json!(ev)));
+    for (path, id) in [
+        ("flags", f.clone()),
+        ("experiments", e),
+        ("experiments", e2),
+        ("live_events", ev),
+        ("live_events", soon),
+        ("audiences", aud),
+    ] {
+        let _ = call_server(&app, "DELETE", &format!("/v1/server/{path}/{id}"), k, None).await;
+    }
+}

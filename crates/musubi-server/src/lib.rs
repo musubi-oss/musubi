@@ -22,6 +22,7 @@ pub mod idl;
 pub mod jwt;
 pub mod keys;
 pub mod limits;
+pub mod liveops;
 pub mod lobby;
 pub mod logins;
 pub mod metrics;

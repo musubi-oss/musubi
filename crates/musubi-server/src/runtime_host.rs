@@ -330,10 +330,6 @@ impl ServerHost {
             }
             "liveops.flags" | "liveops.live_events" => {
                 let op = str_field(&req, "op")?.to_string();
-                let l = s
-                    .liveops
-                    .clone()
-                    .ok_or_else(|| Error::NotFound("liveops (zanshin) not configured".into()))?;
                 let acc = account(&req, ctx)?;
                 let names: Vec<String> = req["names"]
                     .as_array()
@@ -351,9 +347,9 @@ impl ServerHost {
                     }
                 }
                 let v = if op == "liveops.flags" {
-                    l.flags(&acc.to_string(), &names).await?
+                    crate::liveops::merged_flags(s, acc, &names).await?
                 } else {
-                    l.live_events(&acc.to_string()).await?
+                    crate::liveops::merged_live_events(s, acc).await?
                 };
                 let mut cache = self.state.liveops_cache.lock().unwrap();
                 cache.retain(|_, (at, _)| now.duration_since(*at) < LIVEOPS_TTL);

@@ -35,10 +35,6 @@ async fn flags(
     Bearer(me): Bearer,
     Query(q): Query<FlagsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let l = s
-        .liveops
-        .as_ref()
-        .ok_or_else(|| Error::NotFound("liveops (zanshin) not configured".into()))?;
     let names: Vec<String> = q
         .names
         .map(|n| {
@@ -52,12 +48,11 @@ async fn flags(
     if let Some(v) = cached(&s, &key) {
         return Ok(Json(json!({ "flags": v })));
     }
-    let v = l.flags(&me.account_id.to_string(), &names).await?;
+    let v = crate::liveops::merged_flags(&s, me.account_id, &names).await?;
     remember(&s, key, v.clone());
     Ok(Json(json!({ "flags": v })))
 }
 
-/// Same cache and key format as the module host ops, so one `liveops/changed` clears both.
 fn cached(s: &AppState, key: &str) -> Option<Value> {
     let cache = s.liveops_cache.lock().unwrap();
     cache
@@ -72,19 +67,17 @@ fn remember(s: &AppState, key: String, v: Value) {
     cache.insert(key, (std::time::Instant::now(), v));
 }
 
+/// Same cache and key format as the module host ops, so one `liveops/changed` clears both.
+/// Native live events (`musubi.live_events`) plus Zanshin's when configured.
 async fn live_events(
     State(s): State<AppState>,
     Bearer(me): Bearer,
 ) -> Result<Json<Value>, ApiError> {
-    let l = s
-        .liveops
-        .as_ref()
-        .ok_or_else(|| Error::NotFound("liveops (zanshin) not configured".into()))?;
     let key = format!("liveops.live_events|{}|", me.account_id);
     if let Some(v) = cached(&s, &key) {
         return Ok(Json(v));
     }
-    let v = l.live_events(&me.account_id.to_string()).await?;
+    let v = crate::liveops::merged_live_events(&s, me.account_id).await?;
     remember(&s, key, v.clone());
     Ok(Json(v))
 }

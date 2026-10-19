@@ -1,0 +1,684 @@
+//! Native LiveOps routes (see `crate::liveops`): flags, experiments, live events.
+
+use axum::extract::{Path, Query, State};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use musubi_core::{AccountId, Error, Result};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use crate::app::AppState;
+use crate::http::{ApiError, Bearer, ServerKey};
+use crate::liveops::{self, Experiment, Flag, LiveEvent};
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/server/flags", get(list_flags).post(post_flag))
+        .route(
+            "/v1/server/flags/{name}",
+            get(get_flag).put(put_flag).delete(delete_flag),
+        )
+        .route(
+            "/v1/server/experiments",
+            get(list_experiments).post(post_experiment),
+        )
+        .route(
+            "/v1/server/experiments/{id}",
+            get(get_experiment)
+                .put(put_experiment)
+                .delete(delete_experiment),
+        )
+        .route("/v1/server/experiments/{id}/start", post(start_experiment))
+        .route("/v1/server/experiments/{id}/pause", post(pause_experiment))
+        .route("/v1/server/experiments/{id}/end", post(end_experiment))
+        .route(
+            "/v1/server/experiments/{id}/results",
+            get(experiment_results),
+        )
+        .route(
+            "/v1/server/experiments/{id}/assignments",
+            get(experiment_assignments),
+        )
+        .route("/v1/server/live_events", get(list_events).post(post_event))
+        .route(
+            "/v1/server/live_events/{id}",
+            get(get_event).put(put_event).delete(delete_event),
+        )
+        .route("/v1/server/liveops/eval", get(eval_for))
+        .route("/v1/liveops/experiments", get(my_experiments))
+        .route("/v1/liveops/experiments/{id}/outcome", post(outcome))
+}
+
+fn valid_id(id: &str, what: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(Error::InvalidArgument(format!(
+            "{what}: [A-Za-z0-9_.-]{{1,64}}"
+        )));
+    }
+    Ok(())
+}
+
+async fn changed(s: &AppState, what: &str, id: &str) {
+    crate::runtime_host::liveops_changed(s, json!({ "source": "musubi", what: id }), true).await;
+}
+
+// ---------------------------------------------------------------- flags
+
+#[derive(Deserialize)]
+struct FlagBody {
+    #[serde(default)]
+    description: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    default_value: Value,
+    #[serde(default)]
+    rules: Vec<liveops::FlagRule>,
+}
+
+#[derive(Deserialize)]
+struct FlagBodyWithName {
+    name: String,
+    #[serde(flatten)]
+    body: FlagBody,
+}
+
+fn yes() -> bool {
+    true
+}
+
+async fn save_flag(s: &AppState, name: &str, b: FlagBody) -> Result<Flag> {
+    valid_id(name, "flag name")?;
+    if b.rules.len() > 64 {
+        return Err(Error::InvalidArgument("at most 64 rules".into()));
+    }
+    for r in &b.rules {
+        if r.rollout_pct.is_some_and(|p| p > 100) {
+            return Err(Error::InvalidArgument("rollout_pct: 0..=100".into()));
+        }
+    }
+    sqlx::query(
+        "insert into musubi.flags (name, description, enabled, default_value, rules)
+         values ($1, $2, $3, $4, $5)
+         on conflict (name) do update set description = excluded.description, enabled = excluded.enabled,
+            default_value = excluded.default_value, rules = excluded.rules, updated_at = now()",
+    )
+    .bind(name)
+    .bind(&b.description)
+    .bind(b.enabled)
+    .bind(&b.default_value)
+    .bind(serde_json::to_value(&b.rules).map_err(Error::internal)?)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    changed(s, "flag", name).await;
+    liveops::load_flag(s, name)
+        .await?
+        .ok_or_else(|| Error::NotFound("flag".into()))
+}
+
+async fn list_flags(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> std::result::Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "flags": liveops::load_flags(&s).await? })))
+}
+
+async fn get_flag(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+) -> std::result::Result<Json<Flag>, ApiError> {
+    Ok(Json(
+        liveops::load_flag(&s, &name)
+            .await?
+            .ok_or_else(|| Error::NotFound("flag".into()))?,
+    ))
+}
+
+async fn put_flag(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+    Json(b): Json<FlagBody>,
+) -> std::result::Result<Json<Flag>, ApiError> {
+    Ok(Json(save_flag(&s, &name, b).await?))
+}
+
+async fn post_flag(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(b): Json<FlagBodyWithName>,
+) -> std::result::Result<Json<Flag>, ApiError> {
+    Ok(Json(save_flag(&s, &b.name, b.body).await?))
+}
+
+async fn delete_flag(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let n = sqlx::query("delete from musubi.flags where name = $1")
+        .bind(&name)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    changed(&s, "flag", &name).await;
+    Ok(Json(json!({ "removed": n > 0 })))
+}
+
+// ---------------------------------------------------------------- experiments
+
+#[derive(Deserialize)]
+struct ExperimentBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    audience: Option<String>,
+    #[serde(default = "hundred")]
+    rollout_pct: i32,
+    #[serde(default)]
+    variants: Vec<liveops::Variant>,
+    #[serde(default)]
+    starts_at: Option<i64>,
+    #[serde(default)]
+    ends_at: Option<i64>,
+    #[serde(default)]
+    exclusion_group: Option<String>,
+    #[serde(default)]
+    metadata: Value,
+}
+
+#[derive(Deserialize)]
+struct ExperimentBodyWithId {
+    id: String,
+    #[serde(flatten)]
+    body: ExperimentBody,
+}
+
+fn hundred() -> i32 {
+    100
+}
+
+async fn save_experiment(s: &AppState, id: &str, b: ExperimentBody) -> Result<Experiment> {
+    valid_id(id, "experiment id")?;
+    if b.name.trim().is_empty() || b.name.len() > 128 {
+        return Err(Error::InvalidArgument("name: 1..128 chars".into()));
+    }
+    if !(0..=100).contains(&b.rollout_pct) {
+        return Err(Error::InvalidArgument("rollout_pct: 0..=100".into()));
+    }
+    if b.variants.len() < 2 || b.variants.len() > 16 {
+        return Err(Error::InvalidArgument("variants: 2..16".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for v in &b.variants {
+        valid_id(&v.name, "variant name")?;
+        if !seen.insert(v.name.clone()) {
+            return Err(Error::InvalidArgument(format!(
+                "duplicate variant {}",
+                v.name
+            )));
+        }
+    }
+    if b.variants.iter().all(|v| v.weight == 0) {
+        return Err(Error::InvalidArgument(
+            "at least one variant needs weight > 0".into(),
+        ));
+    }
+    let existing = liveops::load_experiment(s, id).await?;
+    if let Some(e) = &existing {
+        if e.status != "draft"
+            && e.variants
+                .iter()
+                .map(|v| &v.name)
+                .ne(b.variants.iter().map(|v| &v.name))
+        {
+            return Err(Error::Conflict(
+                "variants of a started experiment cannot change (end it and create a new one)"
+                    .into(),
+            ));
+        }
+    }
+    sqlx::query(
+        "insert into musubi.experiments (id, name, description, status, audience, rollout_pct, variants, starts_at, ends_at, exclusion_group, metadata)
+         values ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10)
+         on conflict (id) do update set name = excluded.name, description = excluded.description,
+            audience = excluded.audience, rollout_pct = excluded.rollout_pct, variants = excluded.variants,
+            starts_at = excluded.starts_at, ends_at = excluded.ends_at,
+            exclusion_group = excluded.exclusion_group, metadata = excluded.metadata, updated_at = now()",
+    )
+    .bind(id)
+    .bind(b.name.trim())
+    .bind(&b.description)
+    .bind(&b.audience)
+    .bind(b.rollout_pct)
+    .bind(serde_json::to_value(&b.variants).map_err(Error::internal)?)
+    .bind(b.starts_at)
+    .bind(b.ends_at)
+    .bind(&b.exclusion_group)
+    .bind(if b.metadata.is_null() { json!({}) } else { b.metadata })
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    changed(s, "experiment", id).await;
+    liveops::load_experiment(s, id)
+        .await?
+        .ok_or_else(|| Error::NotFound("experiment".into()))
+}
+
+async fn set_status(s: &AppState, id: &str, from: &[&str], to: &str) -> Result<Experiment> {
+    let e = liveops::load_experiment(s, id)
+        .await?
+        .ok_or_else(|| Error::NotFound("experiment".into()))?;
+    if !from.contains(&e.status.as_str()) {
+        return Err(Error::Conflict(format!("experiment is {}", e.status)));
+    }
+    sqlx::query("update musubi.experiments set status = $2, updated_at = now() where id = $1")
+        .bind(id)
+        .bind(to)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?;
+    changed(s, "experiment", id).await;
+    s.events
+        .emit(
+            &format!("experiment.{to}"),
+            None,
+            json!({ "experiment_id": id }),
+        )
+        .await;
+    liveops::load_experiment(s, id)
+        .await?
+        .ok_or_else(|| Error::NotFound("experiment".into()))
+}
+
+async fn list_experiments(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> std::result::Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "experiments": liveops::load_experiments(&s, false).await? }),
+    ))
+}
+
+async fn get_experiment(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Experiment>, ApiError> {
+    Ok(Json(
+        liveops::load_experiment(&s, &id)
+            .await?
+            .ok_or_else(|| Error::NotFound("experiment".into()))?,
+    ))
+}
+
+async fn put_experiment(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(b): Json<ExperimentBody>,
+) -> std::result::Result<Json<Experiment>, ApiError> {
+    Ok(Json(save_experiment(&s, &id, b).await?))
+}
+
+async fn post_experiment(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(b): Json<ExperimentBodyWithId>,
+) -> std::result::Result<Json<Experiment>, ApiError> {
+    Ok(Json(save_experiment(&s, &b.id, b.body).await?))
+}
+
+async fn delete_experiment(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let n = sqlx::query("delete from musubi.experiments where id = $1")
+        .bind(&id)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    changed(&s, "experiment", &id).await;
+    Ok(Json(json!({ "removed": n > 0 })))
+}
+
+async fn start_experiment(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Experiment>, ApiError> {
+    Ok(Json(
+        set_status(&s, &id, &["draft", "paused"], "running").await?,
+    ))
+}
+
+async fn pause_experiment(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Experiment>, ApiError> {
+    Ok(Json(set_status(&s, &id, &["running"], "paused").await?))
+}
+
+async fn end_experiment(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Experiment>, ApiError> {
+    Ok(Json(
+        set_status(&s, &id, &["draft", "running", "paused"], "ended").await?,
+    ))
+}
+
+async fn experiment_results(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let e = liveops::load_experiment(&s, &id)
+        .await?
+        .ok_or_else(|| Error::NotFound("experiment".into()))?;
+    Ok(Json(liveops::results(&s, &e).await?))
+}
+
+#[derive(Deserialize)]
+struct PageQ {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+    variant: Option<String>,
+}
+
+fn default_limit() -> i64 {
+    100
+}
+
+async fn experiment_assignments(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Query(q): Query<PageQ>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let rows: Vec<(Uuid, String, i64)> = sqlx::query_as(
+        "select account_id, variant, extract(epoch from assigned_at)::bigint from musubi.experiment_assignments
+         where experiment_id = $1 and ($2::text is null or variant = $2)
+         order by assigned_at desc limit $3 offset $4",
+    )
+    .bind(&id)
+    .bind(q.variant.as_deref())
+    .bind(q.limit.clamp(1, 1000))
+    .bind(q.offset.max(0))
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(json!({
+        "assignments": rows.iter().map(|(a, v, at)| json!({ "account_id": a, "variant": v, "assigned_at": at })).collect::<Vec<_>>()
+    })))
+}
+
+/// `GET /v1/liveops/experiments` — the caller's variants (assigning on first sight).
+async fn my_experiments(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let audiences = s.audiences.of(&s.db, &s.economy, me.account_id).await?;
+    let a = liveops::assignments(&s, me.account_id, &audiences).await?;
+    Ok(Json(json!({
+        "experiments": a.iter().map(|(e, v)| json!({ "experiment_id": e.id, "name": e.name, "variant": v })).collect::<Vec<_>>()
+    })))
+}
+
+#[derive(Deserialize)]
+struct OutcomeBody {
+    metric: String,
+    #[serde(default = "one")]
+    value: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+/// `POST /v1/liveops/experiments/{id}/outcome {metric, value}` — an outcome for the caller's
+/// variant (conversion = value 1, revenue = amount, …).
+async fn outcome(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<String>,
+    Json(b): Json<OutcomeBody>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    valid_id(&b.metric, "metric")?;
+    if !b.value.is_finite() {
+        return Err(Error::InvalidArgument("value must be finite".into()).into());
+    }
+    let variant: Option<String> = sqlx::query_scalar(
+        "select variant from musubi.experiment_assignments where experiment_id = $1 and account_id = $2",
+    )
+    .bind(&id)
+    .bind(me.account_id.0)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let Some(variant) = variant else {
+        return Err(Error::NotFound("not in this experiment".into()).into());
+    };
+    record_outcome(&s, &id, me.account_id, &variant, &b.metric, b.value).await?;
+    Ok(Json(json!({ "recorded": true, "variant": variant })))
+}
+
+pub(crate) async fn record_outcome(
+    s: &AppState,
+    experiment_id: &str,
+    account: AccountId,
+    variant: &str,
+    metric: &str,
+    value: f64,
+) -> Result<()> {
+    sqlx::query(
+        "insert into musubi.experiment_outcomes (id, experiment_id, account_id, variant, metric, value)
+         values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(experiment_id)
+    .bind(account.0)
+    .bind(variant)
+    .bind(metric)
+    .bind(value)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    s.events
+        .emit(
+            "experiment.outcome",
+            Some(account),
+            json!({ "experiment_id": experiment_id, "variant": variant, "metric": metric, "value": value }),
+        )
+        .await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- live events
+
+#[derive(Deserialize)]
+struct EventBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    phases: Vec<liveops::Phase>,
+    starts_at: i64,
+    #[serde(default)]
+    ends_at: Option<i64>,
+    #[serde(default)]
+    recurrence_secs: Option<i64>,
+    #[serde(default)]
+    local_time: bool,
+    #[serde(default)]
+    audience: Option<String>,
+    #[serde(default)]
+    metadata: Value,
+}
+
+#[derive(Deserialize)]
+struct EventBodyWithId {
+    id: String,
+    #[serde(flatten)]
+    body: EventBody,
+}
+
+async fn save_event(s: &AppState, id: &str, b: EventBody) -> Result<LiveEvent> {
+    valid_id(id, "live event id")?;
+    if b.name.trim().is_empty() || b.name.len() > 128 {
+        return Err(Error::InvalidArgument("name: 1..128 chars".into()));
+    }
+    if b.phases.is_empty() || b.phases.len() > 32 {
+        return Err(Error::InvalidArgument("phases: 1..32".into()));
+    }
+    let mut end = 0;
+    for p in &b.phases {
+        if p.offset_secs < end || p.duration_secs <= 0 {
+            return Err(Error::InvalidArgument(
+                "phases must be ordered, non-overlapping, with positive duration".into(),
+            ));
+        }
+        end = p.offset_secs + p.duration_secs;
+    }
+    if b.recurrence_secs.is_some_and(|r| r < end) {
+        return Err(Error::InvalidArgument(
+            "recurrence_secs must cover every phase".into(),
+        ));
+    }
+    if b.ends_at.is_some_and(|e| e <= b.starts_at) {
+        return Err(Error::InvalidArgument(
+            "ends_at must be after starts_at".into(),
+        ));
+    }
+    sqlx::query(
+        "insert into musubi.live_events (id, name, description, enabled, phases, starts_at, ends_at, recurrence_secs, local_time, audience, metadata)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         on conflict (id) do update set name = excluded.name, description = excluded.description,
+            enabled = excluded.enabled, phases = excluded.phases, starts_at = excluded.starts_at,
+            ends_at = excluded.ends_at, recurrence_secs = excluded.recurrence_secs,
+            local_time = excluded.local_time, audience = excluded.audience,
+            metadata = excluded.metadata, updated_at = now()",
+    )
+    .bind(id)
+    .bind(b.name.trim())
+    .bind(&b.description)
+    .bind(b.enabled)
+    .bind(serde_json::to_value(&b.phases).map_err(Error::internal)?)
+    .bind(b.starts_at)
+    .bind(b.ends_at)
+    .bind(b.recurrence_secs)
+    .bind(b.local_time)
+    .bind(&b.audience)
+    .bind(if b.metadata.is_null() { json!({}) } else { b.metadata })
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    changed(s, "live_event", id).await;
+    liveops::load_event(s, id)
+        .await?
+        .ok_or_else(|| Error::NotFound("live event".into()))
+}
+
+async fn list_events(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> std::result::Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "live_events": liveops::load_events(&s).await? }),
+    ))
+}
+
+async fn get_event(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<LiveEvent>, ApiError> {
+    Ok(Json(
+        liveops::load_event(&s, &id)
+            .await?
+            .ok_or_else(|| Error::NotFound("live event".into()))?,
+    ))
+}
+
+async fn put_event(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+    Json(b): Json<EventBody>,
+) -> std::result::Result<Json<LiveEvent>, ApiError> {
+    Ok(Json(save_event(&s, &id, b).await?))
+}
+
+async fn post_event(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(b): Json<EventBodyWithId>,
+) -> std::result::Result<Json<LiveEvent>, ApiError> {
+    Ok(Json(save_event(&s, &b.id, b.body).await?))
+}
+
+async fn delete_event(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let n = sqlx::query("delete from musubi.live_events where id = $1")
+        .bind(&id)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    changed(&s, "live_event", &id).await;
+    Ok(Json(json!({ "removed": n > 0 })))
+}
+
+#[derive(Deserialize)]
+struct EvalQ {
+    account_id: Uuid,
+    names: Option<String>,
+}
+
+/// `GET /v1/server/liveops/eval?account_id=` — what one account sees (support / debugging).
+async fn eval_for(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<EvalQ>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let acc = AccountId(q.account_id);
+    let names: Vec<String> = q
+        .names
+        .map(|n| {
+            n.split(',')
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let audiences = s.audiences.of(&s.db, &s.economy, acc).await?;
+    let exps = liveops::assignments(&s, acc, &audiences).await?;
+    Ok(Json(json!({
+        "account_id": acc,
+        "audiences": *audiences,
+        "flags": liveops::merged_flags(&s, acc, &names).await?,
+        "live_events": liveops::merged_live_events(&s, acc).await?["live_events"],
+        "experiments": exps.iter().map(|(e, v)| json!({ "experiment_id": e.id, "variant": v })).collect::<Vec<_>>(),
+    })))
+}
