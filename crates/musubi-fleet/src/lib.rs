@@ -124,9 +124,30 @@ pub struct PortSpec {
     pub host_port: Option<i32>,
 }
 
+/// Kubernetes placement and disruption options (P0-10), applied to the Pod (Pods mode) or the
+/// Agones `GameServer` template. `safe_to_evict`: `never` (default — the pod carries
+/// `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` so scale-down does not kill a live
+/// match) | `on_upgrade` | `always` (Agones `spec.eviction.safe`; CA annotation `"true"` only for
+/// `always`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct KubePlacement {
+    pub node_selector: HashMap<String, String>,
+    pub tolerations: Vec<serde_json::Value>,
+    pub affinity: Option<serde_json::Value>,
+    pub annotations: HashMap<String, String>,
+    pub priority_class: Option<String>,
+    pub service_account: Option<String>,
+    pub safe_to_evict: String,
+    pub host_network: bool,
+    pub termination_grace_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FleetSpec {
+    /// Kubernetes node placement / disruption (P0-10); ignored by other providers.
+    pub kubernetes: KubePlacement,
     /// Extra named ports besides the primary `MUSUBI_PORT` (P0-7).
     pub ports: Vec<PortSpec>,
     /// Protocol(s) published for the primary port: `udp` | `tcp` | `both` (default).
@@ -883,6 +904,39 @@ pub fn port_bindings(spec: &FleetSpec, primary: i32) -> Vec<(String, i32, i32, &
         }
     }
     out
+}
+
+pub fn validate_kubernetes(spec: &FleetSpec) -> Result<()> {
+    let k = &spec.kubernetes;
+    if !matches!(
+        k.safe_to_evict.as_str(),
+        "" | "never" | "on_upgrade" | "always"
+    ) {
+        return Err(Error::InvalidArgument(
+            "spec.kubernetes.safe_to_evict must be never|on_upgrade|always".into(),
+        ));
+    }
+    if k.tolerations.iter().any(|t| !t.is_object()) {
+        return Err(Error::InvalidArgument(
+            "spec.kubernetes.tolerations must be objects".into(),
+        ));
+    }
+    if k.affinity.as_ref().is_some_and(|a| !a.is_object()) {
+        return Err(Error::InvalidArgument(
+            "spec.kubernetes.affinity must be an object".into(),
+        ));
+    }
+    if k.node_selector.keys().any(|k| k.is_empty()) || k.annotations.keys().any(|k| k.is_empty()) {
+        return Err(Error::InvalidArgument(
+            "spec.kubernetes: empty node_selector/annotations key".into(),
+        ));
+    }
+    if k.termination_grace_secs.is_some_and(|g| g > 86_400) {
+        return Err(Error::InvalidArgument(
+            "spec.kubernetes.termination_grace_secs <= 86400".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_ports(spec: &FleetSpec) -> Result<()> {
@@ -2360,6 +2414,7 @@ impl FleetService {
         }
         validate_shape(c.min_servers, c.buffer, c.max_servers, &c.policy)?;
         validate_ports(&c.spec)?;
+        validate_kubernetes(&c.spec)?;
         if c.port_start < 1 || c.port_end < c.port_start || c.port_end > 65535 {
             return Err(Error::InvalidArgument("bad port range".into()));
         }

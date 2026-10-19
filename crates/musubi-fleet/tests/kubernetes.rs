@@ -259,3 +259,77 @@ async fn agones_provider_creates_gameserver_and_reads_dynamic_port() {
         "ghcr.io/example/gs:1"
     );
 }
+
+/// P0-10: placement / disruption options land on the Pod spec and the Agones template.
+#[tokio::test]
+async fn placement_and_eviction_options_reach_the_manifests() {
+    let (url, m) = mock_server().await;
+    let mut f = fleet();
+    f.spec.kubernetes = musubi_fleet::KubePlacement {
+        node_selector: [("pool".to_string(), "gameservers".to_string())].into(),
+        tolerations: vec![json!({ "key": "gs", "operator": "Exists", "effect": "NoSchedule" })],
+        affinity: Some(
+            json!({ "nodeAffinity": { "requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [{ "matchExpressions": [{ "key": "topology.kubernetes.io/zone", "operator": "In", "values": ["eu-west-1a"] }] }] } } }),
+        ),
+        annotations: [("team".to_string(), "ops".to_string())].into(),
+        priority_class: Some("game".into()),
+        service_account: Some("gs".into()),
+        safe_to_evict: "always".into(),
+        host_network: true,
+        termination_grace_secs: Some(90),
+    };
+    let p = provider(&url, Mode::Pods);
+    p.start(StartRequest {
+        fleet: &f,
+        server_id: Uuid::now_v7(),
+        port: 7777,
+        api_url: "http://api.musubi:8080",
+        server_key: "sk",
+    })
+    .await
+    .unwrap();
+    {
+        let calls = m.calls.lock().unwrap();
+        let (_, _, _, body) = &calls[0];
+        assert_eq!(body["kind"], "Pod");
+        assert_eq!(body["metadata"]["annotations"]["team"], "ops");
+        assert_eq!(
+            body["metadata"]["annotations"]["cluster-autoscaler.kubernetes.io/safe-to-evict"],
+            "true"
+        );
+        let s = &body["spec"];
+        assert_eq!(s["nodeSelector"]["pool"], "gameservers");
+        assert_eq!(s["tolerations"][0]["key"], "gs");
+        assert!(s["affinity"]["nodeAffinity"].is_object());
+        assert_eq!(s["priorityClassName"], "game");
+        assert_eq!(s["serviceAccountName"], "gs");
+        assert_eq!(s["hostNetwork"], true);
+        assert_eq!(s["terminationGracePeriodSeconds"], 90);
+        assert_eq!(s["restartPolicy"], "Never");
+    }
+    // defaults: no placement keys, eviction guard on
+    let (url2, m2) = mock_server().await;
+    let p2 = provider(&url2, Mode::Agones);
+    let f2 = fleet();
+    p2.start(StartRequest {
+        fleet: &f2,
+        server_id: Uuid::now_v7(),
+        port: 7777,
+        api_url: "http://api.musubi:8080",
+        server_key: "sk",
+    })
+    .await
+    .unwrap();
+    let calls = m2.calls.lock().unwrap();
+    let (_, _, _, body) = &calls[0];
+    assert_eq!(body["kind"], "GameServer");
+    assert_eq!(body["spec"]["eviction"]["safe"], "Never");
+    let tpl = &body["spec"]["template"];
+    assert_eq!(
+        tpl["metadata"]["annotations"]["cluster-autoscaler.kubernetes.io/safe-to-evict"],
+        "false"
+    );
+    assert!(tpl["spec"].get("nodeSelector").is_none());
+    assert!(tpl["spec"].get("hostNetwork").is_none());
+}

@@ -56,6 +56,49 @@ pub struct KubernetesProvider {
     ready_timeout: Duration,
 }
 
+/// Pod annotations: the operator's plus the Cluster Autoscaler eviction guard (P0-10).
+fn annotations(k: &crate::KubePlacement) -> Value {
+    let mut m: serde_json::Map<String, Value> = k
+        .annotations
+        .iter()
+        .map(|(a, b)| (a.clone(), json!(b)))
+        .collect();
+    m.insert(
+        "cluster-autoscaler.kubernetes.io/safe-to-evict".into(),
+        json!(if k.safe_to_evict == "always" {
+            "true"
+        } else {
+            "false"
+        }),
+    );
+    Value::Object(m)
+}
+
+/// Node placement / lifecycle fields onto a PodSpec (P0-10).
+fn place(k: &crate::KubePlacement, spec: &mut Value) {
+    if !k.node_selector.is_empty() {
+        spec["nodeSelector"] = json!(k.node_selector);
+    }
+    if !k.tolerations.is_empty() {
+        spec["tolerations"] = json!(k.tolerations);
+    }
+    if let Some(a) = &k.affinity {
+        spec["affinity"] = a.clone();
+    }
+    if let Some(p) = &k.priority_class {
+        spec["priorityClassName"] = json!(p);
+    }
+    if let Some(sa) = &k.service_account {
+        spec["serviceAccountName"] = json!(sa);
+    }
+    if k.host_network {
+        spec["hostNetwork"] = json!(true);
+    }
+    if let Some(g) = k.termination_grace_secs {
+        spec["terminationGracePeriodSeconds"] = json!(g);
+    }
+}
+
 fn name_of(id: Uuid) -> String {
     format!("musubi-gs-{}", id.simple())
 }
@@ -161,26 +204,34 @@ impl KubernetesProvider {
                     })
                     .collect();
                 container["ports"] = json!(ports);
+                let mut spec = json!({ "restartPolicy": "Never", "containers": [container] });
+                place(&req.fleet.spec.kubernetes, &mut spec);
                 json!({
                     "apiVersion": "v1",
                     "kind": "Pod",
-                    "metadata": { "name": name, "labels": labels },
-                    "spec": { "restartPolicy": "Never", "containers": [container] },
+                    "metadata": { "name": name, "labels": labels, "annotations": annotations(&req.fleet.spec.kubernetes) },
+                    "spec": spec,
                 })
             }
-            Mode::Agones => json!({
+            Mode::Agones => {
+                let k = &req.fleet.spec.kubernetes;
+                let mut tpl = json!({ "containers": [container] });
+                place(k, &mut tpl);
+                json!({
                 "apiVersion": "agones.dev/v1",
                 "kind": "GameServer",
                 "metadata": { "name": name, "labels": labels },
                 "spec": {
+                    "eviction": { "safe": match k.safe_to_evict.as_str() { "always" => "Always", "on_upgrade" => "OnUpgrade", _ => "Never" } },
                     "ports": crate::port_bindings(&req.fleet.spec, port).into_iter().map(|(n, _, container, proto)| json!({
                         "name": format!("{n}-{proto}"),
                         "portPolicy": if crate::port_policy_none(&req.fleet.spec) { "None" } else { "Dynamic" },
                         "containerPort": container, "protocol": proto.to_uppercase() })).collect::<Vec<Value>>(),
                     "health": { "disabled": true },
-                    "template": { "metadata": { "labels": labels }, "spec": { "containers": [container] } },
+                    "template": { "metadata": { "labels": labels, "annotations": annotations(k) }, "spec": tpl },
                 },
-            }),
+                })
+            }
         })
     }
 

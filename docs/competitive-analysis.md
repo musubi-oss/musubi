@@ -2484,7 +2484,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **Why it matters:** Studios have different infra constraints.
 - **Implementation sketch (musubi terms):** Exists: 9 providers (local/docker/k8s/agones/firecracker/ssh/webhook/edgegap/gamelift).
 - **What the reports found weaker/missing (merged rows):**
-  - ❌ Agones/OM: *`spec.eviction.safe` = `Never` / `OnUpgrade` / `Always` controls Cluster Autoscaler + node-upgrade disruption via `safe…* — No disruption policy; k8s provider Pods carry no safe-to-evict annotation/PDB (`rg -i eviction` → 0). Node drain in musubi is for control-plane nodes only (`POST /v1/admin/cluster/nodes/{id}/drain`)
+  - ✅ Agones/OM: *`spec.eviction.safe` = `Never` / `OnUpgrade` / `Always` controls Cluster Autoscaler + node-upgrade disruption* — `spec.kubernetes.safe_to_evict` → CA `safe-to-evict` annotation on Pods, `spec.eviction.safe` in Agones mode
   - ❌ Agones/OM: *Feature gates with Alpha/Beta/Stable stages (`agones.featureGates`), semver policy, deprecation path (e.g. PlayerTracki…* — No feature-flag mechanism or published stability tiers; README says "alpha" globally
   - ❌ Agones/OM: *KubeStellar Console (multi-cluster dashboard with fleet monitoring), Minikube Agones cluster automation* — Admin console not written (README:status)
   - ❌ Agones/OM: *`agones.allocator.tlsSecret`/`clientCASecret`/`generateTLS`/`generateClientTLS`/`disableMTLS`/`disableTLS`/`disableSecr…* — No built-in TLS/mTLS management
@@ -2917,7 +2917,7 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
   - ✅ Agones/OM: *`scheduling: Packed/Distributed` per allocation request* — `scheduling: packed|distributed` on every allocate request
   - ✅ Agones/OM: *`priorities[{type,key,order Ascending/Descending}]` to rank candidate servers by counter/list values* — `priorities: [{kind, key, order}]`
   - ✅ Agones/OM: *Label-locking alternative for high density (SDK `SetLabel` + label selector)* — `POST /v1/gameserver/label` + `labels`/`match_expressions` selectors
-  - ❌ Agones/OM: *`spec.template.spec.nodeSelector` / tolerations / affinity to target node pools (e.g. Windows, GPU, spot)* — k8s provider has no node placement options (kubernetes.rs)
+  - ✅ Agones/OM: *`spec.template.spec.nodeSelector` / tolerations / affinity to target node pools (e.g. Windows, GPU, spot)* — `spec.kubernetes {node_selector, tolerations, affinity, priority_class, service_account, host_network, termination_grace_secs, annotations}` on Pod spec / Agones template
   - ❌ Edgegap: *Memory allocation* — No memory field in `FleetSpec` (`rg memory_mib\|mem_limit` → none); docker/k8s providers don't set limits
   - 🟡 Agones/OM: *Lifecycle states `PortAllocation → Creating → Starting → Scheduled → RequestReady → Ready → Allocated/Reserved → Shutdo…* — States `starting / ready / allocated / in_game / shutdown / failed / terminated` (fleet/lib.rs, mig 0010/0067). No `Reserved`, no distinct `Unhealthy` (unhealthy servers are reaped by the 5 s reconciler, fleet/lib.rs `r…
   - 🟡 Agones/OM: *`spec.container` selects which container in a multi-container Pod is the game server* — `FleetSpec{command, image, env, working_dir, vcpu}` (fleet/lib.rs) — one process/container; k8s provider builds a single-container Pod (kubernetes.rs); no sidecars, volumes, node selectors, memory limits
