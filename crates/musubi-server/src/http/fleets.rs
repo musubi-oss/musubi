@@ -20,6 +20,15 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/fleets/{id}", get(get_one).delete(delete))
         .route("/v1/server/fleets/{id}/scale", post(scale))
         .route("/v1/server/fleets/{id}/reconcile", post(reconcile_now))
+        .route("/v1/server/fleets/{id}/autoscaler", get(autoscaler))
+        .route(
+            "/v1/server/fleets/{id}/autoscaler/suspend",
+            post(autoscaler_suspend),
+        )
+        .route(
+            "/v1/server/fleets/{id}/autoscaler/resume",
+            post(autoscaler_resume),
+        )
         .route(
             "/v1/server/fleets/providers/{name}/prepare",
             post(prepare_provider),
@@ -155,6 +164,37 @@ async fn reconcile_now(
 ) -> Result<Json<Value>, ApiError> {
     let (started, reaped) = s.fleets.reconcile_one(parse(&id)?).await?;
     Ok(Json(json!({ "started": started, "reaped": reaped })))
+}
+
+/// `GET /v1/server/fleets/{id}/autoscaler` — the autoscaler's last decision for the fleet (target
+/// breakdown: buffer/forecast/utilization base, rollout surge, counter shortfall, rule delta,
+/// webhook answer; plan vs applied after steps/cooldowns; suspended; gauges) and rule states.
+async fn autoscaler(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse(&id)?;
+    s.fleets.get(id).await?;
+    Ok(Json(s.fleets.autoscaler_status(id)))
+}
+
+/// `POST /v1/server/fleets/{id}/autoscaler/suspend` — freeze the server count (health reaping,
+/// rollouts and lifecycle limits keep running) until `resume`.
+async fn autoscaler_suspend(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Fleet>, ApiError> {
+    Ok(Json(s.fleets.set_suspended(parse(&id)?, true).await?))
+}
+
+async fn autoscaler_resume(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Fleet>, ApiError> {
+    Ok(Json(s.fleets.set_suspended(parse(&id)?, false).await?))
 }
 
 async fn scale(

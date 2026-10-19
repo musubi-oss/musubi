@@ -114,6 +114,43 @@ pub async fn render(
                     gauge!("musubi_fleet_servers", "project" => p.clone(), "fleet" => f.name.clone(), "state" => state)
                         .set(n as f64);
                 }
+                let st = s.fleets.autoscaler_status(f.id);
+                if let Some(last) = st["last"].as_object() {
+                    let flag = |k: &str| {
+                        if last[k].as_bool() == Some(true) {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    };
+                    let g = |name: &'static str, v: f64| {
+                        gauge!(name, "project" => p.clone(), "fleet" => f.name.clone()).set(v);
+                    };
+                    g(
+                        "musubi_fleet_autoscaler_target",
+                        last["target"].as_f64().unwrap_or(0.0),
+                    );
+                    g(
+                        "musubi_fleet_autoscaler_desired_start",
+                        last["applied"]["start"].as_f64().unwrap_or(0.0),
+                    );
+                    g(
+                        "musubi_fleet_autoscaler_desired_stop",
+                        last["applied"]["stop"].as_f64().unwrap_or(0.0),
+                    );
+                    g(
+                        "musubi_fleet_autoscaler_able_to_scale",
+                        flag("able_to_scale"),
+                    );
+                    g("musubi_fleet_autoscaler_limited", flag("limited"));
+                    g("musubi_fleet_autoscaler_suspended", flag("suspended"));
+                    g(
+                        "musubi_fleet_autoscaler_rules_firing",
+                        last["rules_fired"]
+                            .as_array()
+                            .map_or(0.0, |a| a.len() as f64),
+                    );
+                }
             }
         }
     }

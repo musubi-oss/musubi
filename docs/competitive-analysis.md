@@ -2385,11 +2385,11 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **Why it matters:** Cost vs. wait time.
 - **Implementation sketch (musubi terms):** Exists: integer buffer + weekday/hour windows + EWMA forecast + scale-to-zero. Gap: percentage buffer, webhook/WASM policy, metric-threshold rules, chain/fallback, suspend/resume.
 - **What the reports found weaker/missing (merged rows):**
-  - ❌ Agones/OM: *Policy `Webhook`: POST `FleetAutoscaleReview{request{uid,name,namespace,status,annotations}}` every sync to `service{na…* — No scaling webhook (musubi's `webhook` provider provisions servers, it does not decide replica counts). Scale to zero exists via cold-start allocation (README:allocate) but not via an external policy
-  - ❌ Agones/OM: *Fleet autoscaler metrics: `able_to_scale`, `buffer_limits`, `buffer_size`, `current_replicas_count`, `desired_replicas_…* — No autoscaler-specific metrics (only `musubi_fleet_servers`)
+  - ✅ Agones/OM: *Policy `Webhook`: POST `FleetAutoscaleReview{request{uid,name,namespace,status,annotations}}` every sync* — `policy.webhook {url, timeout_ms, headers}`: fleet status POSTed every reconcile, `{scale, replicas}` / `{response: {scale, replicas}}` honoured
+  - ✅ Agones/OM: *Fleet autoscaler metrics: `able_to_scale`, `buffer_limits`, `buffer_size`, `current_replicas_count`, `desired_replicas_count`, `limited`* — `musubi_fleet_autoscaler_{target,desired_start,desired_stop,able_to_scale,limited,suspended,rules_firing}` + `GET …/autoscaler`
   - ❌ GameLift: *Game server groups on customer Auto Scaling groups* — no EC2 ASG / Spot integration
-  - ❌ GameLift: *Rule-based autoscaling* — no metric/threshold rule engine for fleets (only buffer/schedule/forecast)
-  - ❌ GameLift: *Suspend/resume autoscaling* — no pause flag for reconciler (`rg -i 'suspend' or 'pause' crates/musubi-fleet (only firecracker VM pause)` → none)
+  - ✅ GameLift: *Rule-based autoscaling* — `policy.rules [{metric, op, threshold, for_secs, action, step, cooldown_secs}]` over fleet gauges (ready/allocated/players %, cpu/mem/tick, custom)
+  - ✅ GameLift: *Suspend/resume autoscaling* — `policy.suspended`, `POST /v1/server/fleets/{id}/autoscaler/suspend|resume`, events `autoscale.suspended|resumed`
   - 🟡 Agones/OM: *`FleetAutoscaler` policy `Buffer` with `bufferSize` absolute **or percentage**, `minReplicas`, `maxReplicas`* — `buffer`, `min_servers`, `max_servers` are integers (fleet/lib.rs, mig 0050); no percentage buffer
   - 🟡 Agones/OM: *Policy `Schedule`: `between{start,end}` absolute window, `activePeriod{timezone, startCron, duration}`, nested `policy`* — `ScalePolicy.schedule[{days, from_hour, to_hour, buffer}]` (fleet/lib.rs) — weekday/hour windows in server-local time; no cron, no timezone, no absolute start/end dates, no nested policy types
   - 🟡 Agones/OM: *Graceful termination: TERM → `terminationGracePeriodSeconds`; Cluster Autoscaler honours 10 min; PDB blocks node upgrad…* — Reaper kills on failure; allocated servers are left to finish; no grace-period contract documented

@@ -212,10 +212,45 @@ impl Resources {
     }
 }
 
+/// Metric-threshold scaling rule (P0-6): once `metric op threshold` has held for `for_secs`, add
+/// (`scale_up`) or remove (`scale_down`) `step` servers from the target, then rest `cooldown_secs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ScaleRule {
+    pub name: String,
+    /// `ready` | `ready_pct` | `allocated` | `allocated_pct` | `players` | `players_pct` |
+    /// `cpu_pct_avg` | `cpu_pct_max` | `mem_pct_avg` | `tick_p99_ms_max` | `custom.<key>`
+    pub metric: String,
+    /// `gt` | `gte` | `lt` | `lte`
+    pub op: String,
+    pub threshold: f64,
+    pub for_secs: u64,
+    /// `scale_up` | `scale_down`
+    pub action: String,
+    pub step: i32,
+    pub cooldown_secs: u64,
+}
+
+/// External scaler (P0-6, Agones `FleetAutoscaler` webhook policy): every reconcile the fleet's
+/// status is POSTed and the answer `{scale, replicas}` (or Agones' `{response: {scale, replicas}}`)
+/// sets the desired total server count; a failed call keeps the local decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ScaleWebhook {
+    pub url: String,
+    pub timeout_ms: u64,
+    pub headers: HashMap<String, String>,
+}
+
 /// Autoscale policy (plan 05): buffer overrides by schedule plus an optional demand forecast.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ScalePolicy {
+    /// Autoscaler paused (P0-6): health reaping, rollouts and lifecycle limits still run, the
+    /// server count is left alone until `resume`.
+    pub suspended: bool,
+    pub rules: Vec<ScaleRule>,
+    pub webhook: Option<ScaleWebhook>,
     /// Also size the ready pool from allocation history: ready ≈ allocations/hour × `horizon_min`/60.
     pub forecast: bool,
     /// How far ahead the forecast must cover, in minutes.
@@ -479,6 +514,9 @@ pub struct EventQuery {
 impl Default for ScalePolicy {
     fn default() -> Self {
         Self {
+            suspended: false,
+            rules: Vec::new(),
+            webhook: None,
             forecast: false,
             horizon_min: 10,
             schedule: Vec::new(),
@@ -653,8 +691,143 @@ impl ScalePolicy {
                 ));
             }
         }
+        for r in &self.rules {
+            if r.name.is_empty() || r.name.len() > 64 {
+                return Err(Error::InvalidArgument(
+                    "policy.rules[].name 1..=64 chars".into(),
+                ));
+            }
+            let known = matches!(
+                r.metric.as_str(),
+                "ready"
+                    | "ready_pct"
+                    | "allocated"
+                    | "allocated_pct"
+                    | "players"
+                    | "players_pct"
+                    | "cpu_pct_avg"
+                    | "cpu_pct_max"
+                    | "mem_pct_avg"
+                    | "tick_p99_ms_max"
+            ) || r
+                .metric
+                .strip_prefix("custom.")
+                .is_some_and(|k| !k.is_empty());
+            if !known {
+                return Err(Error::InvalidArgument(format!(
+                    "policy.rules `{}`: unknown metric `{}`",
+                    r.name, r.metric
+                )));
+            }
+            if !matches!(r.op.as_str(), "gt" | "gte" | "lt" | "lte") {
+                return Err(Error::InvalidArgument(format!(
+                    "policy.rules `{}`: op must be gt|gte|lt|lte",
+                    r.name
+                )));
+            }
+            if !matches!(r.action.as_str(), "scale_up" | "scale_down") {
+                return Err(Error::InvalidArgument(format!(
+                    "policy.rules `{}`: action must be scale_up|scale_down",
+                    r.name
+                )));
+            }
+            if r.step <= 0 || r.step > max_servers {
+                return Err(Error::InvalidArgument(format!(
+                    "policy.rules `{}`: step in 1..=max_servers",
+                    r.name
+                )));
+            }
+        }
+        if let Some(w) = &self.webhook {
+            if !(w.url.starts_with("http://") || w.url.starts_with("https://")) {
+                return Err(Error::InvalidArgument(
+                    "policy.webhook.url must be http(s)".into(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+/// Fleet-level numbers the scaling rules and the external scaler see.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FleetGauges {
+    pub live: i32,
+    pub ready: i32,
+    pub starting: i32,
+    pub allocated: i32,
+    pub in_game: i32,
+    pub players: i64,
+    pub capacity: i64,
+    pub cpu_pct_avg: Option<f64>,
+    pub cpu_pct_max: Option<f64>,
+    pub mem_pct_avg: Option<f64>,
+    pub tick_p99_ms_max: Option<f64>,
+    pub custom: HashMap<String, f64>,
+}
+
+pub fn fleet_metric(g: &FleetGauges, name: &str) -> Option<f64> {
+    let pct = |n: i64, d: i64| (d > 0).then(|| n as f64 * 100.0 / d as f64);
+    match name {
+        "ready" => Some(f64::from(g.ready)),
+        "ready_pct" => pct(i64::from(g.ready), i64::from(g.live)),
+        "allocated" => Some(f64::from(g.allocated + g.in_game)),
+        "allocated_pct" => pct(i64::from(g.allocated + g.in_game), i64::from(g.live)),
+        "players" => Some(g.players as f64),
+        "players_pct" => pct(g.players, g.capacity),
+        "cpu_pct_avg" => g.cpu_pct_avg,
+        "cpu_pct_max" => g.cpu_pct_max,
+        "mem_pct_avg" => g.mem_pct_avg,
+        "tick_p99_ms_max" => g.tick_p99_ms_max,
+        other => other
+            .strip_prefix("custom.")
+            .and_then(|k| g.custom.get(k).copied()),
+    }
+}
+
+pub fn rule_holds(r: &ScaleRule, v: f64) -> bool {
+    match r.op.as_str() {
+        "gt" => v > r.threshold,
+        "gte" => v >= r.threshold,
+        "lt" => v < r.threshold,
+        "lte" => v <= r.threshold,
+        _ => false,
+    }
+}
+
+/// One evaluation of a rule: `since` = when its condition first held (None = not holding),
+/// `last_fired` = unix seconds of its last action. Returns the target delta and the new state.
+pub fn step_rule(
+    r: &ScaleRule,
+    value: Option<f64>,
+    now: i64,
+    since: Option<i64>,
+    last_fired: Option<i64>,
+) -> (i32, Option<i64>, Option<i64>) {
+    let Some(v) = value else {
+        return (0, None, last_fired);
+    };
+    if !rule_holds(r, v) {
+        return (0, None, last_fired);
+    }
+    let since = since.unwrap_or(now);
+    let held = (now - since).max(0) as u64 >= r.for_secs;
+    let cooled = last_fired.is_none_or(|t| (now - t).max(0) as u64 >= r.cooldown_secs);
+    if held && cooled {
+        let d = if r.action == "scale_down" {
+            -r.step
+        } else {
+            r.step
+        };
+        (d, Some(since), Some(now))
+    } else {
+        (0, Some(since), last_fired)
+    }
+}
+
+/// An external scaler's desired total `replicas` → the ready/available target the planner uses.
+pub fn webhook_target(replicas: i32, busy: i32, max: i32) -> i32 {
+    (replicas.clamp(0, max) - busy).max(0)
 }
 
 fn validate_shape(min: i32, buffer: i32, max: i32, policy: &ScalePolicy) -> Result<()> {
@@ -1673,6 +1846,9 @@ impl Provider for LocalProcessProvider {
     }
 }
 
+/// (fleet, rule) → (condition holding since, last fired) in unix seconds.
+type RuleState = HashMap<(Uuid, String), (Option<i64>, Option<i64>)>;
+
 #[derive(Clone)]
 pub struct FleetService {
     db: PgPool,
@@ -1685,6 +1861,10 @@ pub struct FleetService {
     edge: Option<SocketAddr>,
     /// Per fleet: unix seconds of the last scale-up and of the last scale action (cooldowns).
     last_scale: Arc<std::sync::Mutex<HashMap<Uuid, (i64, i64)>>>,
+    /// (fleet, rule) → (condition holding since, last fired) in unix seconds.
+    rule_state: Arc<std::sync::Mutex<RuleState>>,
+    /// Last autoscaler decision per fleet (`GET …/autoscaler`, Prometheus gauges).
+    scale_status: Arc<std::sync::Mutex<HashMap<Uuid, serde_json::Value>>>,
     log_tx: LogSink,
     log_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<LogLine>>>>,
     /// Host pool + capacity pools behind the `ssh` provider (`enable_ssh`).
@@ -1795,6 +1975,8 @@ impl FleetService {
             server_key: server_key.to_string(),
             edge: None,
             last_scale: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rule_state: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            scale_status: Arc::new(std::sync::Mutex::new(HashMap::new())),
             log_tx,
             log_rx: Arc::new(std::sync::Mutex::new(Some(log_rx))),
             capacity: Arc::new(std::sync::RwLock::new(None)),
@@ -3792,10 +3974,46 @@ impl FleetService {
                 .as_ref()
                 .map(|ct| counter_shortfall(ct, &servers))
                 .unwrap_or(0);
-            let target = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour)
-                .max(utilization_target(&f.policy, allocated))
-                + surge
-                + counter_extra;
+            let base = target_ready(&f.policy, f.policy.buffer_at(now, f.buffer), per_hour)
+                .max(utilization_target(&f.policy, allocated));
+            let gauges = self.gauges(f.id, &servers).await;
+            let now_s = now.unix_timestamp();
+            let mut rule_delta = 0i32;
+            let mut rules_fired: Vec<String> = Vec::new();
+            let mut rules_holding: Vec<String> = Vec::new();
+            {
+                let mut rs = self.rule_state.lock().unwrap();
+                for r in &f.policy.rules {
+                    let key = (f.id, r.name.clone());
+                    let (since, last) = rs.get(&key).copied().unwrap_or((None, None));
+                    let (d, since, last) =
+                        step_rule(r, fleet_metric(&gauges, &r.metric), now_s, since, last);
+                    rs.insert(key, (since, last));
+                    if since.is_some() {
+                        rules_holding.push(r.name.clone());
+                    }
+                    if d != 0 {
+                        rule_delta += d;
+                        rules_fired.push(r.name.clone());
+                    }
+                }
+            }
+            let mut target = (base + surge + counter_extra + rule_delta).max(0);
+            let mut webhook_note: Option<String> = None;
+            if let Some(w) = &f.policy.webhook {
+                let busy = gauges.allocated + gauges.in_game;
+                match self.ask_webhook(w, &f, &gauges, target).await {
+                    Ok(Some(replicas)) => {
+                        target = webhook_target(replicas, busy, f.max_servers);
+                        webhook_note = Some(format!("replicas {replicas}"));
+                    }
+                    Ok(None) => webhook_note = Some("no scale".into()),
+                    Err(e) => {
+                        tracing::warn!(fleet = %f.name, error = %e, "scale webhook failed");
+                        webhook_note = Some(format!("error: {e}"));
+                    }
+                }
+            }
             let plan = plan_scale(
                 target,
                 f.min_servers,
@@ -3804,7 +4022,6 @@ impl FleetService {
                 available,
                 idle_ready,
             );
-            let now_s = now.unix_timestamp();
             let last = self.last_scale.lock().unwrap().get(&f.id).copied();
             let (start, stop) = apply_policy(
                 &f.policy,
@@ -3812,6 +4029,35 @@ impl FleetService {
                 last.map(|(up, _)| (now_s - up).max(0) as u64),
                 last.map(|(_, any)| (now_s - any).max(0) as u64),
             );
+            let limited = (start, stop) != plan;
+            let (start, stop) = if f.policy.suspended {
+                (0, 0)
+            } else {
+                (start, stop)
+            };
+            self.scale_status.lock().unwrap().insert(
+                f.id,
+                serde_json::json!({
+                    "at": now_s, "suspended": f.policy.suspended, "target": target, "base": base,
+                    "surge": surge, "counter_extra": counter_extra, "rule_delta": rule_delta,
+                    "rules_fired": &rules_fired, "rules_holding": rules_holding, "webhook": &webhook_note,
+                    "plan": {"start": plan.0, "stop": plan.1}, "applied": {"start": start, "stop": stop},
+                    "limited": limited,
+                    "able_to_scale": !f.policy.suspended && (live < f.max_servers || live > f.min_servers),
+                    "live": live, "available": available, "idle_ready": idle_ready, "gauges": gauges,
+                }),
+            );
+            if start > 0 || stop > 0 {
+                self.record_event(
+                    f.id,
+                    None,
+                    "autoscale.scaled",
+                    format!("autoscaler: start {start}, stop {stop} (target {target})"),
+                    serde_json::json!({ "start": start, "stop": stop, "target": target,
+                        "rules_fired": rules_fired, "webhook": webhook_note }),
+                )
+                .await;
+            }
             if start > 0 || stop > 0 {
                 let mut g = self.last_scale.lock().unwrap();
                 let e = g.entry(f.id).or_insert((i64::MIN / 2, i64::MIN / 2));
@@ -3850,6 +4096,142 @@ impl FleetService {
     }
 
     /// Background reconciler; `active` gates each pass (cluster-wide: only the lease holder runs it).
+    /// Fleet gauges for rules / the external scaler: server states from `servers`, resource
+    /// numbers from each live server's latest metrics sample (≤ 5 min old).
+    async fn gauges(&self, fleet_id: Uuid, servers: &[GameServer]) -> FleetGauges {
+        let mut g = FleetGauges::default();
+        for s in servers.iter().filter(|s| s.state != "terminated") {
+            g.live += 1;
+            match s.state.as_str() {
+                "ready" => g.ready += 1,
+                "starting" | "scheduled" => g.starting += 1,
+                "allocated" => g.allocated += 1,
+                "in_game" => g.in_game += 1,
+                _ => {}
+            }
+            g.players += i64::from(s.players);
+            g.capacity += i64::from(s.capacity);
+        }
+        type Row = (
+            Option<f32>,
+            Option<i64>,
+            Option<i64>,
+            Option<f32>,
+            serde_json::Value,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "select m.cpu_pct, m.mem_bytes, m.mem_limit_bytes, m.tick_p99_ms, m.custom from musubi.game_servers g
+               join lateral (select * from musubi.server_metrics s where s.server_id = g.id order by at desc limit 1) m on true
+              where g.fleet_id = $1 and g.state in ('ready', 'allocated', 'in_game') and m.at > now() - interval '5 minutes'",
+        )
+        .bind(fleet_id)
+        .fetch_all(&self.db)
+        .await
+        .unwrap_or_default();
+        let mut cpu: Vec<f64> = Vec::new();
+        let mut mem: Vec<f64> = Vec::new();
+        let mut custom: HashMap<String, Vec<f64>> = HashMap::new();
+        for (c, mb, ml, tick, cu) in rows {
+            if let Some(c) = c {
+                cpu.push(f64::from(c));
+            }
+            if let (Some(mb), Some(ml)) = (mb, ml) {
+                if ml > 0 {
+                    mem.push(mb as f64 * 100.0 / ml as f64);
+                }
+            }
+            if let Some(t) = tick {
+                let t = f64::from(t);
+                g.tick_p99_ms_max = Some(g.tick_p99_ms_max.map_or(t, |m| m.max(t)));
+            }
+            if let Some(o) = cu.as_object() {
+                for (k, v) in o {
+                    if let Some(n) = v.as_f64() {
+                        custom.entry(k.clone()).or_default().push(n);
+                    }
+                }
+            }
+        }
+        let avg = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+        g.cpu_pct_avg = avg(&cpu);
+        g.cpu_pct_max = cpu.iter().copied().reduce(f64::max);
+        g.mem_pct_avg = avg(&mem);
+        g.custom = custom
+            .iter()
+            .filter_map(|(k, v)| avg(v).map(|a| (k.clone(), a)))
+            .collect();
+        g
+    }
+
+    async fn ask_webhook(
+        &self,
+        w: &ScaleWebhook,
+        f: &Fleet,
+        g: &FleetGauges,
+        target: i32,
+    ) -> std::result::Result<Option<i32>, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(w.timeout_ms.clamp(100, 10_000)))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut req = client.post(&w.url).json(&serde_json::json!({
+            "fleet": { "id": f.id, "name": f.name, "region": f.region, "pool": f.pool,
+                "min_servers": f.min_servers, "max_servers": f.max_servers },
+            "status": g,
+            "target": target,
+        }));
+        for (k, v) in &w.headers {
+            req = req.header(k, v);
+        }
+        let res = req.send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("status {}", res.status()));
+        }
+        let v: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        let body = v.get("response").unwrap_or(&v);
+        if body["scale"].as_bool() != Some(true) {
+            return Ok(None);
+        }
+        body["replicas"]
+            .as_i64()
+            .map(|r| Some(r as i32))
+            .ok_or_else(|| "scale without replicas".to_string())
+    }
+
+    /// `GET /v1/server/fleets/{id}/autoscaler` — the last decision (target breakdown, plan vs
+    /// applied, rules, webhook answer, gauges) and every rule's holding/fired state.
+    pub fn autoscaler_status(&self, fleet_id: Uuid) -> serde_json::Value {
+        let last = self.scale_status.lock().unwrap().get(&fleet_id).cloned();
+        let mut rules: Vec<serde_json::Value> = self
+            .rule_state
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((f, _), _)| *f == fleet_id)
+            .map(|((_, name), (since, fired))| {
+                serde_json::json!({ "name": name, "holding_since": since, "last_fired": fired })
+            })
+            .collect();
+        rules.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        serde_json::json!({ "fleet_id": fleet_id, "last": last, "rules": rules })
+    }
+
+    /// `POST …/autoscaler/suspend|resume` — persist `policy.suspended` and log it.
+    pub async fn set_suspended(&self, fleet_id: Uuid, suspended: bool) -> Result<Fleet> {
+        let f = self.get(fleet_id).await?;
+        let mut policy = f.policy.clone();
+        policy.suspended = suspended;
+        let f = self.scale(fleet_id, None, None, None, Some(policy)).await?;
+        let (code, msg) = if suspended {
+            ("autoscale.suspended", "autoscaler suspended")
+        } else {
+            ("autoscale.resumed", "autoscaler resumed")
+        };
+        self.record_event(fleet_id, None, code, msg, serde_json::json!({}))
+            .await;
+        Ok(f)
+    }
+
     pub fn spawn_reconciler(
         self: Arc<Self>,
         every: Duration,
@@ -4284,5 +4666,125 @@ mod alloc_pick_tests {
             g.labels["map"], "nuke",
             "h1 has three free servers, h3 one; the emptiest on h1 wins"
         );
+    }
+}
+
+#[cfg(test)]
+mod autoscale_tests {
+    use super::*;
+
+    fn rule(metric: &str, op: &str, threshold: f64, action: &str) -> ScaleRule {
+        ScaleRule {
+            name: "r".into(),
+            metric: metric.into(),
+            op: op.into(),
+            threshold,
+            for_secs: 30,
+            action: action.into(),
+            step: 2,
+            cooldown_secs: 60,
+        }
+    }
+
+    #[test]
+    fn rules_hold_for_a_while_then_fire_once_per_cooldown() {
+        let r = rule("ready_pct", "lt", 20.0, "scale_up");
+        // not holding → no state
+        assert_eq!(step_rule(&r, Some(50.0), 1000, None, None), (0, None, None));
+        // starts holding at t=1000, fires at t=1030 (for_secs 30)
+        assert_eq!(
+            step_rule(&r, Some(10.0), 1000, None, None),
+            (0, Some(1000), None)
+        );
+        assert_eq!(
+            step_rule(&r, Some(10.0), 1020, Some(1000), None),
+            (0, Some(1000), None)
+        );
+        assert_eq!(
+            step_rule(&r, Some(10.0), 1030, Some(1000), None),
+            (2, Some(1000), Some(1030))
+        );
+        // still holding but cooling down; fires again after 60 s
+        assert_eq!(
+            step_rule(&r, Some(10.0), 1060, Some(1000), Some(1030)),
+            (0, Some(1000), Some(1030))
+        );
+        assert_eq!(
+            step_rule(&r, Some(10.0), 1090, Some(1000), Some(1030)),
+            (2, Some(1000), Some(1090))
+        );
+        // condition clears → holding resets, cooldown memory kept
+        assert_eq!(
+            step_rule(&r, Some(90.0), 1100, Some(1000), Some(1090)),
+            (0, None, Some(1090))
+        );
+        // missing metric never fires
+        assert_eq!(step_rule(&r, None, 1200, Some(1000), None), (0, None, None));
+        let down = rule("players_pct", "lte", 10.0, "scale_down");
+        assert_eq!(
+            step_rule(&down, Some(5.0), 100, Some(0), None),
+            (-2, Some(0), Some(100))
+        );
+    }
+
+    #[test]
+    fn gauges_feed_metrics_and_webhook_target_clamps() {
+        let g = FleetGauges {
+            live: 10,
+            ready: 2,
+            starting: 1,
+            allocated: 6,
+            in_game: 1,
+            players: 70,
+            capacity: 100,
+            cpu_pct_avg: Some(55.0),
+            cpu_pct_max: Some(91.0),
+            mem_pct_avg: None,
+            tick_p99_ms_max: Some(40.0),
+            custom: HashMap::from([("queue".to_string(), 3.0)]),
+        };
+        assert_eq!(fleet_metric(&g, "ready"), Some(2.0));
+        assert_eq!(fleet_metric(&g, "ready_pct"), Some(20.0));
+        assert_eq!(fleet_metric(&g, "allocated"), Some(7.0));
+        assert_eq!(fleet_metric(&g, "allocated_pct"), Some(70.0));
+        assert_eq!(fleet_metric(&g, "players_pct"), Some(70.0));
+        assert_eq!(fleet_metric(&g, "cpu_pct_max"), Some(91.0));
+        assert_eq!(fleet_metric(&g, "mem_pct_avg"), None);
+        assert_eq!(fleet_metric(&g, "custom.queue"), Some(3.0));
+        assert_eq!(fleet_metric(&g, "custom.nope"), None);
+        assert_eq!(fleet_metric(&g, "bogus"), None);
+        assert_eq!(fleet_metric(&FleetGauges::default(), "ready_pct"), None);
+        // external scaler asks for 12 total with 7 busy → 5 available wanted; clamped to max
+        assert_eq!(webhook_target(12, 7, 20), 5);
+        assert_eq!(webhook_target(12, 7, 8), 1);
+        assert_eq!(webhook_target(3, 7, 20), 0);
+    }
+
+    #[test]
+    fn policy_validation_rejects_bad_rules_and_webhooks() {
+        let mut p = ScalePolicy::default();
+        assert!(p.validate(4).is_ok());
+        p.rules.push(rule("cpu_pct_avg", "gt", 80.0, "scale_up"));
+        assert!(p.validate(4).is_ok());
+        p.rules[0].metric = "latency".into();
+        assert!(p.validate(4).is_err(), "unknown metric");
+        p.rules[0].metric = "custom.queue".into();
+        p.rules[0].op = "between".into();
+        assert!(p.validate(4).is_err(), "bad op");
+        p.rules[0].op = "gte".into();
+        p.rules[0].action = "explode".into();
+        assert!(p.validate(4).is_err(), "bad action");
+        p.rules[0].action = "scale_down".into();
+        p.rules[0].step = 9;
+        assert!(p.validate(4).is_err(), "step above max_servers");
+        p.rules[0].step = 1;
+        assert!(p.validate(4).is_ok());
+        p.webhook = Some(ScaleWebhook {
+            url: "ftp://scaler".into(),
+            ..Default::default()
+        });
+        assert!(p.validate(4).is_err(), "webhook scheme");
+        p.webhook.as_mut().unwrap().url = "https://scaler.internal/review".into();
+        assert!(p.validate(4).is_ok());
     }
 }

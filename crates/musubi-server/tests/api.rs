@@ -30946,3 +30946,170 @@ async fn fleet_allocation_selectors_priorities_scheduling() {
         Some(json!({"selectors": [{"labels": {"map": "dust"}}, {"match_expressions": [{"key": "map", "op": "exists"}]}]}))).await;
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
 }
+
+/// P0-6: metric rule engine, suspend/resume and the external webhook scaler on a local fleet.
+#[tokio::test]
+async fn fleet_autoscaler_rules_suspend_and_webhook() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let replicas: std::sync::Arc<std::sync::Mutex<Option<i64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let calls: std::sync::Arc<std::sync::Mutex<Vec<Value>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (r2, c2) = (replicas.clone(), calls.clone());
+    let mock = axum::Router::new().route(
+        "/review",
+        axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
+            let (r2, c2) = (r2.clone(), c2.clone());
+            async move {
+                c2.lock().unwrap().push(b);
+                match *r2.lock().unwrap() {
+                    Some(n) => axum::Json(json!({"response": {"scale": true, "replicas": n}})),
+                    None => axum::Json(json!({"scale": false})),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+    let name = unique("asfleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "region": "eu-west", "buffer": 1, "max_servers": 4,
+            "spec": {"command": ["sleep", "60"]},
+            "policy": {"rules": [{"name": "cold", "metric": "ready_pct", "op": "lt", "threshold": 50.0,
+                "for_secs": 0, "action": "scale_up", "step": 1, "cooldown_secs": 0}]}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let scale = format!("/v1/server/fleets/{fid}/scale");
+    let reconcile = format!("/v1/server/fleets/{fid}/reconcile");
+    let status = format!("/v1/server/fleets/{fid}/autoscaler");
+    // bad rules / webhook are rejected
+    for bad in [
+        json!({"rules": [{"name": "x", "metric": "latency", "op": "gt", "threshold": 1, "action": "scale_up", "step": 1}]}),
+        json!({"rules": [{"name": "x", "metric": "ready", "op": "between", "threshold": 1, "action": "scale_up", "step": 1}]}),
+        json!({"rules": [{"name": "x", "metric": "ready", "op": "gt", "threshold": 1, "action": "scale_up", "step": 9}]}),
+        json!({"webhook": {"url": "ftp://x"}}),
+    ] {
+        let (st, v) = call_server(&app, "POST", &scale, k, Some(json!({"policy": bad}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    // pass 1: nothing live → ready_pct unknown, buffer starts one
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["started"], 1);
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["base"], 1, "{v}");
+    assert_eq!(v["last"]["rule_delta"], 0);
+    assert_eq!(v["last"]["rules_fired"], json!([]));
+    // pass 2: one starting, none ready → ready_pct 0 < 50 → rule adds one
+    let (_, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(v["started"], 1, "{v}");
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["rule_delta"], 1, "{v}");
+    assert_eq!(v["last"]["rules_fired"], json!(["cold"]));
+    assert_eq!(v["last"]["target"], 2);
+    assert_eq!(v["last"]["applied"]["start"], 1);
+    assert_eq!(v["last"]["able_to_scale"], true);
+    assert_eq!(v["rules"][0]["name"], "cold");
+    assert!(v["rules"][0]["last_fired"].is_number());
+    // suspend: a bigger buffer is planned but nothing starts
+    let (st, v) = call_server(&app, "POST", &format!("{status}/suspend"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["policy"]["suspended"], true);
+    let (st, v) = call_server(&app, "POST", &scale, k, Some(json!({"buffer": 3}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(v["started"], 0, "{v}");
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["suspended"], true);
+    assert_eq!(v["last"]["target"], 4, "{v}");
+    assert_eq!(v["last"]["plan"]["start"], 2, "{v}");
+    assert_eq!(v["last"]["applied"]["start"], 0);
+    assert_eq!(v["last"]["able_to_scale"], false);
+    let (st, v) = call_server(&app, "POST", &format!("{status}/resume"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["policy"]["suspended"], false);
+    let (_, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(v["started"], 2, "{v}");
+    // webhook scaler confirms 4 replicas → nothing more to start (max 4)
+    let (st, v) = call_server(&app, "POST", &scale, k,
+        Some(json!({"policy": {"webhook": {"url": format!("{base}/review"), "timeout_ms": 2000, "headers": {"x-scaler": "t"}}}}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    *replicas.lock().unwrap() = Some(4);
+    let (_, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(v["started"], 0, "{v}");
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["webhook"], "replicas 4", "{v}");
+    assert_eq!(v["last"]["target"], 4);
+    {
+        let c = calls.lock().unwrap();
+        assert!(!c.is_empty());
+        let body = c.last().unwrap();
+        assert_eq!(body["fleet"]["name"], name);
+        assert_eq!(body["fleet"]["max_servers"], 4);
+        assert_eq!(body["status"]["live"], 4);
+        assert_eq!(body["status"]["starting"], 4);
+        // the webhook policy replaced the rules, so the local target is the buffer alone
+        assert_eq!(body["target"], 3, "local target offered to the scaler");
+    }
+    // scaler asks for 2 replicas → target 2, but only idle *ready* servers are stopped
+    *replicas.lock().unwrap() = Some(2);
+    let (_, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(v["started"], 0, "{v}");
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["webhook"], "replicas 2", "{v}");
+    assert_eq!(v["last"]["target"], 2);
+    assert_eq!(
+        v["last"]["plan"]["stop"], 0,
+        "nothing ready to stop yet: {v}"
+    );
+    // scaler declines → local decision (buffer 3)
+    *replicas.lock().unwrap() = None;
+    let (_, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(v["started"], 0, "{v}");
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["webhook"], "no scale", "{v}");
+    assert_eq!(v["last"]["target"], 3);
+    // scaler unreachable → noted, still the local decision
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &scale,
+        k,
+        Some(
+            json!({"policy": {"webhook": {"url": "http://127.0.0.1:1/review", "timeout_ms": 300}}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(v["started"], 0, "{v}");
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert!(
+        v["last"]["webhook"].as_str().unwrap().starts_with("error:"),
+        "{v}"
+    );
+    // events were logged
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?limit=50"),
+        k,
+        None,
+    )
+    .await;
+    let codes: Vec<&str> = ev["events"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|e| e["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        codes.contains(&"autoscale.scaled")
+            && codes.contains(&"autoscale.suspended")
+            && codes.contains(&"autoscale.resumed"),
+        "{ev}"
+    );
+    let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
+    assert!(st.is_success() || st == StatusCode::NO_CONTENT);
+}

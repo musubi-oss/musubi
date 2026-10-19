@@ -823,6 +823,13 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/fleets/{id}/rollout", "fleets"),
     ("GET", "/v1/server/fleets/{id}/health", "fleets"),
     ("POST", "/v1/server/fleets/{id}/reconcile", "fleets"),
+    ("GET", "/v1/server/fleets/{id}/autoscaler", "fleets"),
+    (
+        "POST",
+        "/v1/server/fleets/{id}/autoscaler/suspend",
+        "fleets",
+    ),
+    ("POST", "/v1/server/fleets/{id}/autoscaler/resume", "fleets"),
     ("GET", "/v1/server/fleets/hosts", "fleets"),
     ("POST", "/v1/server/fleets/hosts", "fleets"),
     ("GET", "/v1/server/fleets/hosts/classes", "fleets"),
