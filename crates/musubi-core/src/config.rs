@@ -63,6 +63,7 @@ pub struct Config {
     pub regions: RegionsConfig,
     pub operators: OperatorsConfig,
     pub ugc: UgcConfig,
+    pub files: FilesConfig,
     /// Further games/environments served by this same process, each on its own database and
     /// cluster group; requests pick one by `x-musubi-project` or `Host`.
     pub projects: Vec<ProjectConfig>,
@@ -2039,6 +2040,26 @@ impl Default for OperatorSsoConfig {
             default_role: String::new(),
             allowed_domains: Vec::new(),
             session_hours: 12,
+        }
+    }
+}
+
+/// Title / global files (`/v1/files`): patches, config blobs, localization tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FilesConfig {
+    /// Largest file `PUT /v1/server/files/{path}` accepts (bytes); 64 MiB unless set.
+    pub max_bytes: u64,
+    /// CDN origin fronting the files bucket; when set, public manifest URLs are `{base}/{path}`
+    /// instead of `/v1/files/{path}`. Blobs live in `[ugc.s3]` (or Postgres when unset).
+    pub public_base_url: String,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: 64 << 20,
+            public_base_url: String::new(),
         }
     }
 }

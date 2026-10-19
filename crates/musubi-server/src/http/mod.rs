@@ -16,6 +16,7 @@ pub mod entitlements;
 mod environments;
 pub(crate) mod error;
 pub(crate) mod extract;
+mod files;
 mod fleets;
 mod friends;
 pub mod group_challenges;
@@ -36,6 +37,7 @@ mod passkeys;
 pub mod push;
 pub mod rating;
 mod regions;
+pub mod remote_config;
 pub mod reports;
 mod rpc;
 mod rtc;
@@ -234,6 +236,8 @@ pub fn router(state: AppState) -> Router {
         )
         .merge(bans::routes())
         .merge(group_pools::routes())
+        .merge(remote_config::routes())
+        .merge(files::routes())
         .merge(codes::routes())
         .merge(legal::routes())
         .merge(parties::routes())

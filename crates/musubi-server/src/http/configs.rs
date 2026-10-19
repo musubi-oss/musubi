@@ -1,7 +1,8 @@
 //! Typed game configs (plan 3.8): JSON documents the server writes and clients read, validated
 //! against `[configs.<name>]` of the deployed IDL when declared (free-form otherwise).
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::get;
 use axum::{Json, Router};
 use musubi_core::Error;
@@ -9,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::app::AppState;
+use crate::http::remote_config::{ctx_from, resolve, Ctx};
 use crate::http::{ApiError, Bearer, ServerKey};
 
 pub fn router() -> Router<AppState> {
@@ -41,49 +43,84 @@ fn check_name(name: &str) -> Result<(), ApiError> {
     }
 }
 
-async fn all(s: &AppState) -> Result<Json<Value>, ApiError> {
-    let rows: Vec<Row> = sqlx::query_as(
-        "select name, value, version, extract(epoch from updated_at)::bigint
-         from musubi.configs order by name",
-    )
-    .fetch_all(&s.db)
-    .await
-    .map_err(Error::internal)?;
-    Ok(Json(
-        json!({ "configs": rows.into_iter().map(doc).collect::<Vec<_>>() }),
-    ))
+async fn list(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    headers: HeaderMap,
+    Query(q): Query<Ctx>,
+) -> Result<Json<Value>, ApiError> {
+    let ctx = ctx_from(q, &headers);
+    let configs = resolve(&s, None, &ctx, Some(me.account_id)).await?;
+    Ok(Json(json!({ "configs": configs })))
 }
 
-async fn list(State(s): State<AppState>, Bearer(_): Bearer) -> Result<Json<Value>, ApiError> {
-    all(&s).await
-}
-
-async fn list_server(State(s): State<AppState>, _k: ServerKey) -> Result<Json<Value>, ApiError> {
-    all(&s).await
+async fn list_server(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    headers: HeaderMap,
+    Query(q): Query<Ctx>,
+) -> Result<Json<Value>, ApiError> {
+    let ctx = ctx_from(q, &headers);
+    let configs = resolve(&s, None, &ctx, None).await?;
+    Ok(Json(json!({ "configs": configs })))
 }
 
 async fn get_one(
     State(s): State<AppState>,
-    Bearer(_): Bearer,
+    Bearer(me): Bearer,
     Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Ctx>,
 ) -> Result<Json<Value>, ApiError> {
-    let row: Option<Row> = sqlx::query_as(
-        "select name, value, version, extract(epoch from updated_at)::bigint
-         from musubi.configs where name = $1",
-    )
-    .bind(&name)
-    .fetch_optional(&s.db)
-    .await
-    .map_err(Error::internal)?;
-    match row {
-        Some(r) => Ok(Json(doc(r))),
+    let ctx = ctx_from(q, &headers);
+    let mut configs = resolve(&s, Some(&name), &ctx, Some(me.account_id)).await?;
+    match configs.pop() {
+        Some(c) => Ok(Json(c)),
         None => Err(Error::NotFound(format!("config `{name}`")).into()),
     }
+}
+
+/// Validates against the IDL, upserts, records a history entry. Shared with CSV import and
+/// rollback.
+pub async fn store(
+    s: &AppState,
+    name: &str,
+    value: &Value,
+    note: Option<&str>,
+) -> Result<Value, ApiError> {
+    check_name(name)?;
+    if serde_json::to_vec(value).map(|v| v.len()).unwrap_or(0) > 1 << 20 {
+        return Err(Error::InvalidArgument("config value: at most 1 MiB".into()).into());
+    }
+    let version = s.idl.check_config(name, value)?;
+    let row: Row = sqlx::query_as(
+        "insert into musubi.configs (name, value, version) values ($1, $2, $3)
+         on conflict (name) do update set value = excluded.value, version = excluded.version,
+             updated_at = now()
+         returning name, value, version, extract(epoch from updated_at)::bigint",
+    )
+    .bind(name)
+    .bind(value)
+    .bind(version)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    crate::http::remote_config::record(s, name, version, Some(value), note).await;
+    s.events
+        .emit(
+            "config.updated",
+            None,
+            json!({ "name": name, "version": version }),
+        )
+        .await;
+    Ok(doc(row))
 }
 
 #[derive(Deserialize)]
 struct PutBody {
     value: Value,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 async fn put(
@@ -92,24 +129,7 @@ async fn put(
     Path(name): Path<String>,
     Json(b): Json<PutBody>,
 ) -> Result<Json<Value>, ApiError> {
-    check_name(&name)?;
-    if serde_json::to_vec(&b.value).map(|v| v.len()).unwrap_or(0) > 1 << 20 {
-        return Err(Error::InvalidArgument("config value: at most 1 MiB".into()).into());
-    }
-    let version = s.idl.check_config(&name, &b.value)?;
-    let row: Row = sqlx::query_as(
-        "insert into musubi.configs (name, value, version) values ($1, $2, $3)
-         on conflict (name) do update set value = excluded.value, version = excluded.version,
-             updated_at = now()
-         returning name, value, version, extract(epoch from updated_at)::bigint",
-    )
-    .bind(&name)
-    .bind(&b.value)
-    .bind(version)
-    .fetch_one(&s.db)
-    .await
-    .map_err(Error::internal)?;
-    Ok(Json(doc(row)))
+    Ok(Json(store(&s, &name, &b.value, b.note.as_deref()).await?))
 }
 
 async fn delete(
@@ -123,5 +143,8 @@ async fn delete(
         .await
         .map_err(Error::internal)?
         .rows_affected();
+    if n > 0 {
+        crate::http::remote_config::record(&s, &name, 0, None, Some("deleted")).await;
+    }
     Ok(Json(json!({ "deleted": n > 0 })))
 }

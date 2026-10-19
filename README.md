@@ -261,6 +261,26 @@ wallet-to-wallet through the audited treasury ledger; `…/cancel`), and a team 
 /v1/groups/{id}/store/{item} {currency, price, quantity, enabled}` by officers, `POST …/{item}/buy
 {account_id?}` — the treasury pays and the member receives the inventory item).
 
+Remote config depth: variants layered on a base config — `PUT /v1/server/configs/{name}/variants/{variant}
+{selector: {environment, platforms, min_version, max_version, countries, rollout_pct}, patch, priority,
+enabled}` (RFC 7386 merge patch; `rollout_pct` is a deterministic per-account bucket); `GET /v1/configs[/{name}]
+?platform&version&country` (or `x-musubi-platform` / `x-musubi-client-version` headers) returns the resolved
+value with `variants` applied and a `checksum`; `GET /v1/configs/manifest` lists `{name, version, checksum}`
+with an `ETag` (304 on `If-None-Match`); `GET /v1/server/configs/{name}/preview?platform…&account_id` resolves
+as a given client would. Every write is a history entry (`…/history`, 200 kept), `…/diff?from&to` lists
+JSON-pointer changes, `POST …/rollback {id}` re-applies a past value, `PUT …/csv?key=col` (text/csv) ingests
+a spreadsheet as typed rows or a keyed object (dotted headers nest, `//` comments skipped). Client version
+gates: `PUT /v1/server/client_versions/{platform} {min_version, latest_version, store_url, redirects:
+[{min_version, url}], message}` and the tokenless `GET /v1/client/version?platform&version` →
+`{supported, update_required, update_available, redirect}` (newer clients are redirected to another host).
+
+Title / global files: `PUT /v1/server/files/{path}?public&platforms&min_version&max_version&environment`
+with the raw body (content-type kept; blobs in `[ugc.s3]` or Postgres, `[files] max_bytes`), `PATCH` metadata
+/ visibility, `DELETE`, `GET /v1/server/files?prefix`. Clients: `GET /v1/files/manifest?prefix&platform&version`
+(public files anonymously, private ones with a token; selector-filtered; `checksum` + `ETag`) and
+`GET /v1/files/{path}` with sha256 `ETag`/304, `Cache-Control`, `x-musubi-file-version`; `[files]
+public_base_url` rewrites manifest URLs to a CDN origin.
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

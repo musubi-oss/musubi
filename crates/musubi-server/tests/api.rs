@@ -20704,3 +20704,460 @@ async fn group_pools_donations_and_team_store() {
     .await;
     assert_eq!(v["items"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn remote_config_variants_history_csv_client_gate_and_title_files() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let (_, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("rc")})),
+    )
+    .await;
+    let t = sess["access_token"].as_str().unwrap().to_string();
+    let raw = |method: &'static str,
+               path: String,
+               headers: Vec<(&'static str, String)>,
+               body: Vec<u8>| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder().method(method).uri(path);
+            for (h, v) in headers {
+                req = req.header(h, v);
+            }
+            let res = app
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let st = res.status();
+            let hs = res.headers().clone();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (st, hs, bytes.to_vec())
+        }
+    };
+    let name = unique("tuning").to_lowercase();
+
+    // base + variants
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}"),
+        k,
+        Some(json!({"value": {"speed": 10, "ui": {"theme": "dark"}}, "note": "v1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}/variants/ios-fast"),
+        k,
+        Some(json!({"selector": {"platforms": ["ios"], "min_version": "1.2"}, "patch": {"speed": 20}, "priority": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}/variants/stage-only"),
+        k,
+        Some(json!({"selector": {"environment": ["stage"]}, "patch": {"speed": 99}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}/variants/everyone"),
+        k,
+        Some(json!({"selector": {"rollout_pct": 100}, "patch": {"ui": {"theme": null, "accent": "red"}}, "priority": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}/variants/bad"),
+        k,
+        Some(json!({"selector": {"planet": "mars"}, "patch": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/no-such-{name}/variants/x"),
+        k,
+        Some(json!({"patch": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}?platform=ios&version=1.3"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["value"]["speed"], 20);
+    assert_eq!(v["value"]["ui"]["accent"], "red");
+    assert!(v["value"]["ui"].get("theme").is_none(), "{v}");
+    assert_eq!(v["variants"], json!(["ios-fast", "everyone"]));
+    let ios_sum = v["checksum"].as_str().unwrap().to_string();
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}?platform=ios&version=1.1"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(v["value"]["speed"], 10, "below min_version: {v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}?platform=android"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(v["value"]["speed"], 10);
+    assert_ne!(v["checksum"], ios_sum);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/configs/{name}/preview?platform=ios&version=2.0"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["value"]["speed"], 20);
+    let (st, m) = call(
+        &app,
+        "GET",
+        "/v1/configs/manifest?platform=ios&version=1.3",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let entry = m["configs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .cloned()
+        .unwrap();
+    assert_eq!(entry["checksum"], ios_sum);
+    let (st, _, _) = raw(
+        "GET",
+        "/v1/configs/manifest?platform=ios&version=1.3".into(),
+        vec![
+            ("authorization", format!("Bearer {t}")),
+            (
+                "if-none-match",
+                format!("\"{}\"", m["checksum"].as_str().unwrap()),
+            ),
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_MODIFIED);
+
+    // history, diff, rollback
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}"),
+        k,
+        Some(json!({"value": {"speed": 12, "ui": {"theme": "dark"}}, "note": "v2"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/configs/{name}/history"),
+        k,
+        None,
+    )
+    .await;
+    let hist = h["history"].as_array().unwrap();
+    assert_eq!(hist.len(), 2, "{h}");
+    assert_eq!(hist[0]["note"], "v2");
+    let first = hist[1]["id"].as_i64().unwrap();
+    let (st, d) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/configs/{name}/diff"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(
+        d["changes"],
+        json!([{"path": "/speed", "op": "replace", "from": 10, "to": 12}])
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/configs/{name}/rollback"),
+        k,
+        Some(json!({"id": first})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["value"]["speed"], 10);
+    let (_, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/configs/{name}/history"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(h["history"].as_array().unwrap().len(), 3);
+    assert_eq!(h["history"][0]["note"], format!("rollback to #{first}"));
+
+    // CSV ingestion keyed by column
+    let csv =
+        "id,name,reward.gold,enabled\n// comment\nsword,\"Iron, Sword\",10,true\nbow,Bow,5,false\n";
+    let (st, _, body) = raw(
+        "PUT",
+        format!("/v1/server/configs/{name}-items/csv?key=id"),
+        vec![
+            ("x-musubi-server-key", k.into()),
+            ("content-type", "text/csv".into()),
+        ],
+        csv.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}-items"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(v["value"]["sword"]["name"], "Iron, Sword");
+    assert_eq!(v["value"]["sword"]["reward"]["gold"], 10);
+    assert_eq!(v["value"]["bow"]["enabled"], false);
+
+    // client version gate (no token)
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/client_versions/ios",
+        k,
+        Some(json!({"min_version": "1.5", "latest_version": "2.4", "store_url": "https://apps.example/x",
+            "redirects": [{"min_version": "2.0", "url": "https://v2.example"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=iOS&version=1.2",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["update_required"], true);
+    assert_eq!(v["store_url"], "https://apps.example/x");
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=ios&version=2.1",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["supported"], true);
+    assert_eq!(v["update_available"], true);
+    assert_eq!(v["redirect"]["url"], "https://v2.example");
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=android&version=0.1",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["configured"], false);
+    assert_eq!(v["supported"], true);
+    let (st, _) = call(&app, "GET", "/v1/client/version?platform=ios", None, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // title files
+    let dir = unique("loc").to_lowercase();
+    let (st, _, body) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/en.csv?platforms=ios,android&min_version=1.0"),
+        vec![
+            ("x-musubi-server-key", k.into()),
+            ("content-type", "text/csv".into()),
+        ],
+        b"key,text\nhello,Hello\n".to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let f: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(f["version"], 1);
+    assert_eq!(f["size"], 21);
+    assert_eq!(f["url"], format!("/v1/files/{dir}/en.csv"));
+    let (st, _, body) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/en.csv?platforms=ios,android&min_version=1.0"),
+        vec![
+            ("x-musubi-server-key", k.into()),
+            ("content-type", "text/csv".into()),
+        ],
+        b"key,text\nhello,Hi\n".to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let f: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(f["version"], 2);
+    let sha = f["sha256"].as_str().unwrap().to_string();
+    let (st, _, _) = raw(
+        "PUT",
+        format!("/v1/server/files/{dir}/secret.bin?public=false"),
+        vec![("x-musubi-server-key", k.into())],
+        vec![1, 2, 3],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = raw(
+        "PUT",
+        "/v1/server/files/manifest".into(),
+        vec![("x-musubi-server-key", k.into())],
+        vec![1],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&platform=ios&version=1.5"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let paths: Vec<&str> = m["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![format!("{dir}/en.csv").as_str()],
+        "anonymous: public, selector-matching only"
+    );
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&platform=web&version=1.5"),
+        None,
+        None,
+    )
+    .await;
+    assert!(m["files"].as_array().unwrap().is_empty(), "{m}");
+    let (_, m) = call(
+        &app,
+        "GET",
+        &format!("/v1/files/manifest?prefix={dir}/&platform=ios&version=1.5"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(
+        m["files"].as_array().unwrap().len(),
+        2,
+        "token sees private too: {m}"
+    );
+
+    let (st, hs, body) = raw("GET", format!("/v1/files/{dir}/en.csv"), vec![], vec![]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, b"key,text\nhello,Hi\n");
+    assert_eq!(
+        hs.get("etag").unwrap().to_str().unwrap(),
+        format!("\"{sha}\"")
+    );
+    assert_eq!(
+        hs.get("content-type").unwrap().to_str().unwrap(),
+        "text/csv"
+    );
+    assert_eq!(
+        hs.get("x-musubi-file-version").unwrap().to_str().unwrap(),
+        "2"
+    );
+    let (st, _, _) = raw(
+        "GET",
+        format!("/v1/files/{dir}/en.csv"),
+        vec![("if-none-match", format!("\"{sha}\""))],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_MODIFIED);
+    let (st, _, _) = raw("GET", format!("/v1/files/{dir}/secret.bin"), vec![], vec![]).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _, body) = raw(
+        "GET",
+        format!("/v1/files/{dir}/secret.bin"),
+        vec![("authorization", format!("Bearer {t}"))],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, vec![1, 2, 3]);
+    let (st, v) = call_server(
+        &app,
+        "PATCH",
+        &format!("/v1/server/files/{dir}/secret.bin"),
+        k,
+        Some(json!({"public": true, "metadata": {"note": "unlocked"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["public"], true);
+    let (st, _, _) = raw("GET", format!("/v1/files/{dir}/secret.bin"), vec![], vec![]).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, l) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/files?prefix={dir}/"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(l["files"].as_array().unwrap().len(), 2);
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/files/{dir}/secret.bin"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["deleted"], true);
+    let (st, _, _) = raw("GET", format!("/v1/files/{dir}/secret.bin"), vec![], vec![]).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
