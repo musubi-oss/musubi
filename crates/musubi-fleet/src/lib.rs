@@ -224,6 +224,12 @@ pub struct ScalePolicy {
     pub cooldown_up_secs: u64,
     /// Seconds after any scale action before a scale-down (0 = none).
     pub cooldown_down_secs: u64,
+    /// Lifecycle guards (P1-12): a server is terminated once it has lived this long …
+    pub max_duration_secs: Option<u64>,
+    /// … or has sat `ready` without an allocation this long (never below `min_servers`) …
+    pub idle_ttl_secs: Option<u64>,
+    /// … or has been allocated / in game this long (runaway or zombie matches).
+    pub allocated_max_secs: Option<u64>,
 }
 
 impl Default for ScalePolicy {
@@ -237,6 +243,9 @@ impl Default for ScalePolicy {
             step_down: None,
             cooldown_up_secs: 0,
             cooldown_down_secs: 0,
+            max_duration_secs: None,
+            idle_ttl_secs: None,
+            allocated_max_secs: None,
         }
     }
 }
@@ -528,6 +537,8 @@ pub struct GameServer {
     /// Change counter, bumped by every update; `GET /v1/gameserver/watch` long-polls on it.
     #[serde(default)]
     pub version: i64,
+    /// When the server last became `ready` (idle TTL counts from here).
+    pub ready_at: Option<OffsetDateTime>,
 }
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
@@ -822,6 +833,7 @@ type ServerRow = (
     i32,
     i32,
     i64,
+    Option<OffsetDateTime>,
 );
 
 fn row_to_server(r: ServerRow) -> GameServer {
@@ -841,13 +853,14 @@ fn row_to_server(r: ServerRow) -> GameServer {
         players: r.12,
         capacity: r.13,
         version: r.14,
+        ready_at: r.15,
     }
 }
 
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at";
 
 impl FleetService {
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
@@ -1797,6 +1810,12 @@ impl FleetService {
                 let stale = now - s.last_health > HEALTH_TIMEOUT && s.state != "starting";
                 let stuck_starting =
                     s.state == "starting" && now - s.created_at > Duration::from_secs(120);
+                if let Some(why) = lifecycle_expired(&f, s, now, live_min_guard(&servers, &f)) {
+                    tracing::info!(server = %s.id, fleet = %f.name, state = %s.state, why, "server lifecycle limit reached");
+                    self.terminate(&f, s.id).await;
+                    reaped += 1;
+                    continue;
+                }
                 if dead_process || stale || stuck_starting {
                     tracing::warn!(server = %s.id, fleet = %f.name, state = %s.state, dead_process, stale, "reaping game server");
                     self.terminate(&f, s.id).await;
@@ -2042,5 +2061,131 @@ mod log_tests {
         assert_eq!(level_of("level=debug x", "stdout"), "debug");
         assert_eq!(level_of("hello", "stdout"), "info");
         assert_eq!(level_of("hello", "stderr"), "warn");
+    }
+}
+
+/// How many servers may be reaped for idleness before the fleet drops below `min_servers`.
+fn live_min_guard(servers: &[GameServer], f: &Fleet) -> i32 {
+    let live = servers.iter().filter(|s| s.state != "terminated").count() as i32;
+    (live - f.min_servers).max(0)
+}
+
+/// Which lifecycle limit (if any) a server has hit: `max_duration`, `idle_ttl` or
+/// `allocated_max`. `spare` is how many servers may go before `min_servers` is violated.
+pub fn lifecycle_expired(
+    f: &Fleet,
+    s: &GameServer,
+    now: OffsetDateTime,
+    spare: i32,
+) -> Option<&'static str> {
+    let p = &f.policy;
+    let age = (now - s.created_at).whole_seconds().max(0) as u64;
+    if p.max_duration_secs.is_some_and(|m| m > 0 && age >= m) {
+        return Some("max_duration");
+    }
+    if s.state == "ready" && spare > 0 {
+        if let (Some(ttl), Some(ready_at)) = (p.idle_ttl_secs, s.ready_at) {
+            if ttl > 0 && (now - ready_at).whole_seconds().max(0) as u64 >= ttl {
+                return Some("idle_ttl");
+            }
+        }
+    }
+    if s.state == "allocated" || s.state == "in_game" {
+        if let Some(m) = p.allocated_max_secs.filter(|m| *m > 0) {
+            let since = s
+                .allocation
+                .as_ref()
+                .and_then(|a| a.get("at"))
+                .and_then(|a| a.as_i64())
+                .unwrap_or_else(|| s.created_at.unix_timestamp());
+            if now.unix_timestamp() - since >= m as i64 {
+                return Some("allocated_max");
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn fleet(p: ScalePolicy) -> Fleet {
+        let json = serde_json::json!({
+            "id": Uuid::nil(), "name": "f", "provider": "local", "region": "eu", "pool": "default",
+            "spec": {}, "buffer": 0, "max_servers": 10, "min_servers": 1, "policy": {},
+            "port_start": 1, "port_end": 2, "created_at": "2026-01-01T00:00:00Z",
+        });
+        let mut f: Fleet = serde_json::from_value(json).expect("fleet");
+        f.policy = p;
+        f
+    }
+
+    fn server(
+        state: &str,
+        age_secs: u64,
+        ready_secs: Option<u64>,
+        alloc_secs: Option<i64>,
+    ) -> GameServer {
+        let now = OffsetDateTime::now_utc();
+        GameServer {
+            id: Uuid::now_v7(),
+            fleet_id: Uuid::nil(),
+            state: state.into(),
+            node_id: None,
+            address: String::new(),
+            port: 0,
+            pid: None,
+            labels: serde_json::json!({}),
+            allocation: alloc_secs.map(|a| serde_json::json!({ "at": (now.unix_timestamp() - a) })),
+            last_health: now,
+            created_at: now - Duration::from_secs(age_secs),
+            build_version: None,
+            players: 0,
+            capacity: 0,
+            version: 0,
+            ready_at: ready_secs.map(|r| now - Duration::from_secs(r)),
+        }
+    }
+
+    #[test]
+    fn limits_fire_and_respect_min_servers() {
+        let now = OffsetDateTime::now_utc();
+        let f = fleet(ScalePolicy {
+            max_duration_secs: Some(3600),
+            idle_ttl_secs: Some(600),
+            allocated_max_secs: Some(1800),
+            ..Default::default()
+        });
+        assert_eq!(
+            lifecycle_expired(&f, &server("ready", 4000, Some(10), None), now, 1),
+            Some("max_duration")
+        );
+        assert_eq!(
+            lifecycle_expired(&f, &server("ready", 100, Some(700), None), now, 1),
+            Some("idle_ttl")
+        );
+        assert_eq!(
+            lifecycle_expired(&f, &server("ready", 100, Some(700), None), now, 0),
+            None,
+            "min_servers guard"
+        );
+        assert_eq!(
+            lifecycle_expired(&f, &server("ready", 100, Some(100), None), now, 1),
+            None
+        );
+        assert_eq!(
+            lifecycle_expired(&f, &server("in_game", 100, None, Some(2000)), now, 0),
+            Some("allocated_max")
+        );
+        assert_eq!(
+            lifecycle_expired(&f, &server("allocated", 100, None, Some(100)), now, 0),
+            None
+        );
+        let none = fleet(ScalePolicy::default());
+        assert_eq!(
+            lifecycle_expired(&none, &server("ready", 99999, Some(99999), None), now, 5),
+            None
+        );
     }
 }

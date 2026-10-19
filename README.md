@@ -251,6 +251,11 @@ id); that is fixed and covered by `killed_node_rejoins_with_same_identity`.
 | `GET /ws?token=…&format=json\|binary` | token | realtime socket: ping, status/presence follow, rpc (envelope `{cid, msg}`, JSON or postcard) |
 | QUIC `quic.listen` (UDP) | access JWT in the first frame `{token, format, status}` | same envelopes/encodings as WebSocket over one bidirectional quinn stream (`type:u8 \| len:u32be \| payload`); an unvalidated source is answered with a Retry token before any handshake state exists (`quic.retry`, default on — spoofed addresses cost nothing and amplification stays 1×), handshakes in flight are capped by `quic.max_pending_handshakes` (default 1024, refused above), 8 bidirectional / 0 unidirectional streams per connection, ALPN `musubi-rt/1`, PEM cert or self-signed dev cert; `match_data` with `reliable=false` travels as QUIC datagrams (clients may send datagrams too) |
 
+Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
+server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
+(never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`
+for too long (runaway sessions); each reap is logged with its reason and the autoscaler refills.
+
 Redemption codes are campaigns, not discounts: `PUT /v1/server/codes/campaigns/{id} {name,
 reward_table?, key_group?, per_account, max_redemptions?, starts_at?, ends_at?, audience?, enabled,
 metadata}`; `POST …/{id}/generate {count, length, prefix, max_uses, batch}` mints single-use codes

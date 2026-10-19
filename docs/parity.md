@@ -78,7 +78,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Аукционы, P2P-трейд, ордербук | ✅ | ❌ | ❌ | ❌ | ❌ |
 | IAP: Apple / Google / Steam, уведомления, отзыв + Huawei / Samsung | ✅ `iap.rs` (`POST /v1/iap/{huawei|samsung}` по токену покупки) | ✅ | ✅ | ✅ | ✅ |
 | Планы подписок вне сторов (VIP/сезон-пасс из кошелька или prepaid сервером: trial, grace, pause, cancel-at-period-end, награды за период, feature-entitlement) | ✅ `http/subscriptions.rs` | 🟡 только сторы | 🟡 | 🟡 | ❌ |
-| Offers / placements (приоритет, лимиты на игрока, cooldown, цепочки-предшественники, force-enable, статистика показов/покупок) | ✅ `http/offers.rs` | ❌ | 🟡 Metaplay-класс | ❌ | ❌ |
+| Offers / placements (приоритет, лимиты на игрока, cooldown, цепочки-предшественники, force-enable, статистика показов/покупок) | ✅ `http/offers.rs` | ❌ | 🟡 Metaplay-класс | ❌ | ❌ | Лимиты жизни серверов (P1-12): `policy.max_duration_secs` / `idle_ttl_secs` (не ниже `min_servers`) / `allocated_max_secs` — reaper в reconcile с причиной в логе.
 | Продуктовая аналитика: инжест клиентских событий (схемы, семплинг, pre-login ключ), DAU/MAU, retention-когорты, воронки, revenue, экспорт/sinks (JSONL, ClickHouse, webhook) | ✅ `analytics.rs` (без UI-дэшбордов) | 🟡 Satori | ✅ | ✅ | ❌ |
 | Scoped-токены / publishable-ключи (down-scoped сессии игрока, ресурсные скоупы серверных ключей, проверка по маршрутам и на сокете) | ✅ `scopes.rs` | ❌ | 🟡 | 🟡 UGS restricted tokens | ❌ |
 | IAP: PSN / Xbox / Nintendo / Epic | ✅ `POST /v1/iap/{platform}`: s2s entitlement lookup + consume, `[iap.<platform>]` с переопределяемыми путями | ✅ | ❌ | ✅ | ✅ |
