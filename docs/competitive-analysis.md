@@ -2912,11 +2912,11 @@ Every `missing` and `partial` inventory row is here exactly once: 174 deduplicat
 - **Why it matters:** Core DS flow.
 - **Implementation sketch (musubi terms):** Exists: `POST /v1/server/allocate` (fleet id / pool+region). Gap: label selectors with ordered fallback, counter/list priorities, Packed/Distributed strategy.
 - **What the reports found weaker/missing (merged rows):**
-  - ❌ Agones/OM: *`priorities[{type: Counter/List, key, order}]` → scale-down order and Packed tie-breaker* — No priority ordering
-  - ❌ Agones/OM: *`GameServerAllocation` CR: ordered `selectors[]` with `matchLabels`, `matchExpressions` (In/NotIn/Exists/DoesNotExist),…* — Allocation targets a fleet id (`POST /v1/server/fleets/{id}/allocate`) or `{pool, region}` (`POST /v1/server/allocate`); labels on servers are not an allocation filter (`rg -i 'label_selector\|match_labels'` → 0)
-  - ❌ Agones/OM: *`scheduling: Packed/Distributed` per allocation request* — No per-request placement strategy
-  - ❌ Agones/OM: *`priorities[{type,key,order Ascending/Descending}]` to rank candidate servers by counter/list values* — No ranking; routed allocation picks region then any free server
-  - ❌ Agones/OM: *Label-locking alternative for high density (SDK `SetLabel` + label selector)* — Labels can be set but not selected on
+  - 🟡 Agones/OM: *`priorities[{type: Counter/List, key, order}]` → scale-down order and Packed tie-breaker* — allocation `priorities` rank candidates by counter/list; scale-down order still by age/idle
+  - ✅ Agones/OM: *`GameServerAllocation` CR: ordered `selectors[]` with `matchLabels`, `matchExpressions` (In/NotIn/Exists/DoesNotExist)* — `selector` + ordered `selectors[]` fallback chain with `labels` and `match_expressions`; `matched_selector` in the response
+  - ✅ Agones/OM: *`scheduling: Packed/Distributed` per allocation request* — `scheduling: packed|distributed` on every allocate request
+  - ✅ Agones/OM: *`priorities[{type,key,order Ascending/Descending}]` to rank candidate servers by counter/list values* — `priorities: [{kind, key, order}]`
+  - ✅ Agones/OM: *Label-locking alternative for high density (SDK `SetLabel` + label selector)* — `POST /v1/gameserver/label` + `labels`/`match_expressions` selectors
   - ❌ Agones/OM: *`spec.template.spec.nodeSelector` / tolerations / affinity to target node pools (e.g. Windows, GPU, spot)* — k8s provider has no node placement options (kubernetes.rs)
   - ❌ Edgegap: *Memory allocation* — No memory field in `FleetSpec` (`rg memory_mib\|mem_limit` → none); docker/k8s providers don't set limits
   - 🟡 Agones/OM: *Lifecycle states `PortAllocation → Creating → Starting → Scheduled → RequestReady → Ready → Allocated/Reserved → Shutdo…* — States `starting / ready / allocated / in_game / shutdown / failed / terminated` (fleet/lib.rs, mig 0010/0067). No `Reserved`, no distinct `Unhealthy` (unhealthy servers are reaped by the 5 s reconciler, fleet/lib.rs `r…

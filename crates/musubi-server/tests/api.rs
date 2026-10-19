@@ -30820,3 +30820,129 @@ secret = true
     .await;
     let _ = call_server(&app, "DELETE", "/v1/admin/idl", "defaultkey", None).await;
 }
+
+/// P0-30: set-based label expressions, ordered selector chain, counter/list priorities and
+/// packed|distributed scheduling on allocation requests.
+#[tokio::test]
+async fn fleet_allocation_selectors_priorities_scheduling() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("pfleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "region": "eu-west", "buffer": 3, "max_servers": 3,
+            "spec": {"command": ["sleep", "60"]}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(fuid).await.unwrap();
+    let mut starting = svc.servers(fuid, Some("starting")).await.unwrap();
+    starting.sort_by_key(|s| s.created_at);
+    assert_eq!(starting.len(), 3, "buffer 3 starts three servers");
+    let ids: Vec<String> = starting.iter().map(|s| s.id.to_string()).collect();
+    let sdk = |sid: String, path: &str, body: Value| {
+        let app = app.clone();
+        let path = path.to_string();
+        async move {
+            let req = Request::post(&path)
+                .header("x-musubi-server-key", k)
+                .header("x-musubi-server-id", &sid)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let st = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                st,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let setup = [
+        (json!({"map": "dust", "tier": "gold"}), 1),
+        (json!({"map": "inferno", "tier": "silver"}), 3),
+        (json!({"map": "nuke"}), 2),
+    ];
+    for (sid, (labels, rooms)) in ids.iter().zip(setup.iter()) {
+        let (st, v) = sdk(sid.clone(), "/v1/gameserver/ready", json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = sdk(sid.clone(), "/v1/gameserver/label", labels.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = sdk(
+            sid.clone(),
+            "/v1/gameserver/counters",
+            json!({"rooms": {"capacity": 8, "count": rooms}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let alloc = format!("/v1/server/fleets/{fid}/allocate");
+    // malformed requests are rejected before any server is touched
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &alloc,
+        k,
+        Some(
+            json!({"selector": {"match_expressions": [{"key": "map", "op": "in", "values": []}]}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &alloc,
+        k,
+        Some(json!({"priorities": [{"kind": "weird", "key": "rooms"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &alloc,
+        k,
+        Some(json!({"priorities": [{"kind": "counter", "key": "rooms", "order": "sideways"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // not_in over every map → nothing matches
+    let (st, v) = call_server(&app, "POST", &alloc, k,
+        Some(json!({"selector": {"match_expressions": [{"key": "map", "op": "not_in", "values": ["dust", "inferno", "nuke"]}]}}))).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    // in + fewest rooms first → dust (1 room); distributed scheduling accepted
+    let (st, v) = call_server(&app, "POST", &alloc, k,
+        Some(json!({"selector": {"match_expressions": [{"key": "map", "op": "in", "values": ["dust", "inferno", "nuke"]}]},
+            "priorities": [{"kind": "counter", "key": "rooms", "order": "asc"}], "scheduling": "distributed"}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["server_id"], ids[0], "{v}");
+    assert_eq!(v["matched_selector"], 0);
+    // does_not_exist → the server without a tier label
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &alloc,
+        k,
+        Some(json!({"selector": {"match_expressions": [{"key": "tier", "op": "does_not_exist"}]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["server_id"], ids[2], "{v}");
+    // routed allocation with a fallback chain: no mirage server, inferno matches second
+    let (st, v) = call_server(&app, "POST", "/v1/server/allocate", k,
+        Some(json!({"pool": name, "selectors": [{"labels": {"map": "mirage"}}, {"labels": {"map": "inferno"}}]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["server_id"], ids[1], "{v}");
+    assert_eq!(v["matched_selector"], 1);
+    // everything is allocated now: a chain with no match is exhausted, not an error
+    let (st, v) = call_server(&app, "POST", &alloc, k,
+        Some(json!({"selectors": [{"labels": {"map": "dust"}}, {"match_expressions": [{"key": "map", "op": "exists"}]}]}))).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+}

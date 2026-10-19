@@ -860,6 +860,50 @@ pub struct AllocSelector {
     pub lists: HashMap<String, ListSel>,
     /// Exactly this server (server browser joins).
     pub server_id: Option<Uuid>,
+    /// Set-based label requirements (P0-30): `[{key, op: in|not_in|exists|does_not_exist, values}]`,
+    /// all must hold. `in`/`not_in` compare against `values` (strings or JSON scalars).
+    pub match_expressions: Vec<MatchExpression>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchOp {
+    In,
+    NotIn,
+    #[default]
+    Exists,
+    DoesNotExist,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MatchExpression {
+    pub key: String,
+    pub op: MatchOp,
+    pub values: Vec<serde_json::Value>,
+}
+
+/// How candidates that satisfy a selector are ranked (P0-30): by a counter's count or a list's
+/// length, ascending or descending; earlier entries win, ties fall through to `scheduling`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Priority {
+    /// `counter` | `list`
+    pub kind: String,
+    pub key: String,
+    /// `asc` (default) | `desc`
+    pub order: String,
+}
+
+/// Tie-break placement for an allocation request (P0-30). `packed` (default) fills the fullest /
+/// oldest server first so idle ones can scale down; `distributed` prefers a fresh server, then the
+/// host with most free servers, the emptiest and newest — spreading load and blast radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Scheduling {
+    #[default]
+    Packed,
+    Distributed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -907,6 +951,11 @@ pub struct AllocateRequest {
     pub selector: AllocSelector,
     pub counter_actions: HashMap<String, CounterAction>,
     pub list_actions: HashMap<String, ListAction>,
+    /// Ordered fallback chain tried after `selector` (or instead of it when `selector` is empty):
+    /// the first selector with a matching server wins; `Allocation::matched_selector` says which.
+    pub selectors: Vec<AllocSelector>,
+    pub priorities: Vec<Priority>,
+    pub scheduling: Scheduling,
 }
 
 fn valid_slot_name(n: &str) -> Result<()> {
@@ -1029,6 +1078,25 @@ pub fn selector_matches(s: &GameServer, sel: &AllocSelector) -> bool {
     if sel.labels.iter().any(|(k, v)| s.labels.get(k) != Some(v)) {
         return false;
     }
+    if !sel.states.is_empty() && !sel.states.contains(&s.state) {
+        return false;
+    }
+    if sel.server_id.is_some_and(|id| id != s.id) {
+        return false;
+    }
+    for e in &sel.match_expressions {
+        let have = s.labels.get(&e.key);
+        let listed = have.is_some_and(|v| e.values.iter().any(|w| label_eq(v, w)));
+        let ok = match e.op {
+            MatchOp::Exists => have.is_some(),
+            MatchOp::DoesNotExist => have.is_none(),
+            MatchOp::In => listed,
+            MatchOp::NotIn => !listed,
+        };
+        if !ok {
+            return false;
+        }
+    }
     if sel
         .build_version
         .as_ref()
@@ -1056,6 +1124,133 @@ pub fn selector_matches(s: &GameServer, sel: &AllocSelector) -> bool {
         }
     }
     true
+}
+
+/// Labels are compared as JSON, and a string label also matches the textual form of a scalar
+/// (`"3"` vs `3`, `"true"` vs `true`) so CLI/query-string callers need not care about types.
+fn label_eq(have: &serde_json::Value, want: &serde_json::Value) -> bool {
+    if have == want {
+        return true;
+    }
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    (have.is_string() || want.is_string()) && text(have) == text(want)
+}
+
+/// Reject malformed selectors/priorities before touching the store (P0-30).
+pub fn validate_alloc(req: &AllocateRequest) -> Result<()> {
+    for sel in std::iter::once(&req.selector).chain(req.selectors.iter()) {
+        for e in &sel.match_expressions {
+            if e.key.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "match_expressions[].key is required".into(),
+                ));
+            }
+            if matches!(e.op, MatchOp::In | MatchOp::NotIn) && e.values.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "match_expressions `{}`: in/not_in need values",
+                    e.key
+                )));
+            }
+        }
+    }
+    for p in &req.priorities {
+        if !matches!(p.kind.as_str(), "counter" | "list") {
+            return Err(Error::InvalidArgument(
+                "priorities[].kind must be `counter` or `list`".into(),
+            ));
+        }
+        valid_slot_name(&p.key)?;
+        if !matches!(p.order.as_str(), "" | "asc" | "desc") {
+            return Err(Error::InvalidArgument(
+                "priorities[].order must be `asc` or `desc`".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The selectors an allocation tries, in order: the primary one when it says anything (or when
+/// there is nothing else), then `selectors[]`.
+pub fn selector_chain(req: &AllocateRequest) -> Vec<&AllocSelector> {
+    let p = &req.selector;
+    let primary_set = !p.labels.is_empty()
+        || p.build_version.is_some()
+        || !p.counters.is_empty()
+        || !p.lists.is_empty()
+        || !p.match_expressions.is_empty()
+        || !p.states.is_empty()
+        || p.server_id.is_some();
+    let mut chain = Vec::with_capacity(req.selectors.len() + 1);
+    if primary_set || req.selectors.is_empty() {
+        chain.push(p);
+    }
+    chain.extend(req.selectors.iter());
+    chain
+}
+
+fn priority_value(s: &GameServer, p: &Priority) -> i64 {
+    match p.kind.as_str() {
+        "list" => list_parts(&s.lists, &p.key).0.len() as i64,
+        _ => counter_parts(&s.counters, &p.key).0,
+    }
+}
+
+fn host_key(s: &GameServer) -> String {
+    s.host_id
+        .map(|h| h.to_string())
+        .or_else(|| s.node_id.map(|n| n.to_string()))
+        .unwrap_or_else(|| s.address.clone())
+}
+
+/// Choose the server for an allocation from `candidates` (in the store's packed order: fullest /
+/// ready-first, oldest first): walk the selector chain, rank the matches by `priorities`, break
+/// ties by `scheduling`. Returns the server and the index of the selector that matched.
+pub fn pick_candidate(
+    mut candidates: Vec<GameServer>,
+    req: &AllocateRequest,
+) -> Option<(GameServer, usize)> {
+    let per_host: HashMap<String, usize> = candidates.iter().fold(HashMap::new(), |mut m, g| {
+        *m.entry(host_key(g)).or_default() += 1;
+        m
+    });
+    for (idx, sel) in selector_chain(req).into_iter().enumerate() {
+        let mut matched: Vec<usize> = (0..candidates.len())
+            .filter(|i| selector_matches(&candidates[*i], sel))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        let by_priority = |a: &GameServer, b: &GameServer| {
+            for p in &req.priorities {
+                let (ka, kb) = (priority_value(a, p), priority_value(b, p));
+                let ord = if p.order == "desc" {
+                    kb.cmp(&ka)
+                } else {
+                    ka.cmp(&kb)
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        };
+        matched.sort_by(|&a, &b| {
+            let (ga, gb) = (&candidates[a], &candidates[b]);
+            let ord = by_priority(ga, gb);
+            if req.scheduling != Scheduling::Distributed {
+                return ord;
+            }
+            ord.then_with(|| per_host[&host_key(gb)].cmp(&per_host[&host_key(ga)]))
+                .then_with(|| ga.slots_used.cmp(&gb.slots_used))
+                .then_with(|| gb.created_at.cmp(&ga.created_at))
+        });
+        let i = matched[0];
+        return Some((candidates.swap_remove(i), idx));
+    }
+    None
 }
 
 /// Keep at least `buffer` units of `counter` capacity free across the fleet's live servers
@@ -1320,6 +1515,9 @@ pub struct Allocation {
     pub backfill: bool,
     /// Token the game server validates through `/v1/gameserver/connect` (shared by the group).
     pub connect_token: String,
+    /// Index into the request's selector chain that matched (0 = the primary selector).
+    #[serde(default)]
+    pub matched_selector: usize,
 }
 
 #[derive(Debug)]
@@ -2259,6 +2457,7 @@ impl FleetService {
                     port,
                     connect_token: token,
                     backfill: true,
+                    matched_selector: 0,
                 })
             }
             _ => None,
@@ -2291,10 +2490,8 @@ impl FleetService {
         .fetch_all(&mut **tx)
         .await
         .map_err(Error::internal)?;
-        let Some(mut gs) = rows
-            .into_iter()
-            .map(row_to_server)
-            .find(|g| selector_matches(g, &req.selector))
+        let Some((mut gs, matched)) =
+            pick_candidate(rows.into_iter().map(row_to_server).collect(), req)
         else {
             return Ok(None);
         };
@@ -2329,6 +2526,7 @@ impl FleetService {
             port,
             connect_token: token,
             backfill: true,
+            matched_selector: matched,
         }))
     }
 
@@ -2379,6 +2577,7 @@ impl FleetService {
     }
 
     pub async fn allocate_with(&self, fleet_id: Uuid, req: AllocateRequest) -> Result<Allocation> {
+        validate_alloc(&req)?;
         if req.backfill {
             if let Some(a) = self.try_backfill(fleet_id, &req.payload).await? {
                 return Ok(a);
@@ -2387,14 +2586,18 @@ impl FleetService {
         for n in req.counter_actions.keys().chain(req.list_actions.keys()) {
             valid_slot_name(n)?;
         }
-        let states: Vec<String> = if req.selector.states.is_empty() {
-            vec!["ready".into()]
-        } else {
-            req.selector.states.clone()
-        };
+        let mut states: Vec<String> = selector_chain(&req)
+            .iter()
+            .flat_map(|s| s.states.iter().cloned())
+            .collect();
+        states.sort();
+        states.dedup();
+        if states.is_empty() {
+            states.push("ready".into());
+        }
         let slots = slots_per_server(&self.get(fleet_id).await?.spec);
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        if slots > 1 {
+        if slots > 1 && req.scheduling == Scheduling::Packed {
             if let Some(a) = self.pack_allocation(&mut tx, fleet_id, slots, &req).await? {
                 tx.commit().await.map_err(Error::internal)?;
                 self.record_event(
@@ -2419,11 +2622,23 @@ impl FleetService {
         .fetch_all(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        let Some(mut gs) = rows
-            .into_iter()
-            .map(row_to_server)
-            .find(|g| selector_matches(g, &req.selector))
+        let Some((mut gs, matched)) =
+            pick_candidate(rows.into_iter().map(row_to_server).collect(), &req)
         else {
+            if slots > 1 && req.scheduling == Scheduling::Distributed {
+                if let Some(a) = self.pack_allocation(&mut tx, fleet_id, slots, &req).await? {
+                    tx.commit().await.map_err(Error::internal)?;
+                    self.record_event(
+                        fleet_id,
+                        Some(a.server_id),
+                        "server.allocated",
+                        "allocation packed onto a live server",
+                        serde_json::json!({ "self": false, "packed": true, "selector": req.selector }),
+                    )
+                    .await;
+                    return Ok(a);
+                }
+            }
             return Err(Error::ResourceExhausted(
                 "no ready server in fleet matches the selector".into(),
             ));
@@ -2507,6 +2722,7 @@ impl FleetService {
             port,
             connect_token: token,
             backfill: shared,
+            matched_selector: matched,
         })
     }
 
@@ -3977,5 +4193,96 @@ mod health_tests {
         assert!(p.validate(10).is_ok());
         p.eviction = "sometimes".into();
         assert!(p.validate(10).is_err());
+    }
+}
+
+#[cfg(test)]
+mod alloc_pick_tests {
+    use super::*;
+
+    fn gs(labels: serde_json::Value, rooms: i64, slots_used: i32, host: &str) -> GameServer {
+        GameServer {
+            id: Uuid::now_v7(),
+            fleet_id: Uuid::nil(),
+            state: "ready".into(),
+            node_id: None,
+            address: host.into(),
+            port: 7777,
+            pid: None,
+            labels,
+            allocation: None,
+            last_health: OffsetDateTime::UNIX_EPOCH,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            build_version: None,
+            players: 0,
+            capacity: 0,
+            version: 0,
+            ready_at: None,
+            counters: serde_json::json!({"rooms": {"count": rooms, "capacity": 8}}),
+            lists: serde_json::json!({"players": {"values": ["a", "b"], "capacity": 10}}),
+            slots_used,
+            host_id: None,
+        }
+    }
+
+    fn req(v: serde_json::Value) -> AllocateRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn match_expressions_and_chain() {
+        let c = vec![
+            gs(
+                serde_json::json!({"map": "dust", "tier": "gold"}),
+                1,
+                1,
+                "h1",
+            ),
+            gs(
+                serde_json::json!({"map": "inferno", "tier": "silver"}),
+                3,
+                2,
+                "h1",
+            ),
+            gs(serde_json::json!({"map": "nuke"}), 2, 0, "h2"),
+        ];
+        let r = req(serde_json::json!({"selector": {"match_expressions": [
+            {"key": "map", "op": "in", "values": ["dust", "inferno"]}]},
+            "priorities": [{"kind": "counter", "key": "rooms", "order": "desc"}]}));
+        let (g, i) = pick_candidate(c.clone(), &r).unwrap();
+        assert_eq!((g.labels["map"].as_str(), i), (Some("inferno"), 0));
+        let r = req(serde_json::json!({"selectors": [
+            {"labels": {"map": "mirage"}},
+            {"match_expressions": [{"key": "tier", "op": "does_not_exist"}]}]}));
+        let (g, i) = pick_candidate(c.clone(), &r).unwrap();
+        assert_eq!((g.labels["map"].as_str(), i), (Some("nuke"), 1));
+        let r = req(serde_json::json!({"selector": {"match_expressions": [
+            {"key": "map", "op": "not_in", "values": ["dust", "inferno", "nuke"]}]}}));
+        assert!(pick_candidate(c.clone(), &r).is_none());
+        let r = req(serde_json::json!({"selector": {"match_expressions": [
+            {"key": "map", "op": "in", "values": []}]}}));
+        assert!(validate_alloc(&r).is_err());
+        let r = req(serde_json::json!({"priorities": [{"kind": "weird", "key": "rooms"}]}));
+        assert!(validate_alloc(&r).is_err());
+        // packed keeps store order (first candidate); distributed spreads to the host with
+        // most free servers, then the emptiest server
+        let r = req(serde_json::json!({}));
+        assert_eq!(
+            pick_candidate(c.clone(), &r).unwrap().0.labels["map"],
+            "dust"
+        );
+        let r = req(serde_json::json!({"scheduling": "distributed"}));
+        assert_eq!(
+            pick_candidate(c.clone(), &r).unwrap().0.labels["map"],
+            "dust"
+        );
+        let mut c2 = c.clone();
+        c2[2].address = "h1".into();
+        c2.push(gs(serde_json::json!({"map": "train"}), 0, 0, "h3"));
+        let (g, _) = pick_candidate(c2, &r).unwrap();
+        assert_eq!(
+            g.labels["map"], "nuke",
+            "h1 has three free servers, h3 one; the emptiest on h1 wins"
+        );
     }
 }

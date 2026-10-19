@@ -191,6 +191,12 @@ struct AllocateReq {
     counter_actions: std::collections::HashMap<String, musubi_fleet::CounterAction>,
     /// `{name: {add, remove, values, capacity}}` applied atomically with the allocation.
     list_actions: std::collections::HashMap<String, musubi_fleet::ListAction>,
+    /// Ordered fallback selectors tried after `selector` (P0-30).
+    selectors: Vec<musubi_fleet::AllocSelector>,
+    /// `[{kind: counter|list, key, order: asc|desc}]` ranking of matching servers.
+    priorities: Vec<musubi_fleet::Priority>,
+    /// `packed` (default) | `distributed`.
+    scheduling: musubi_fleet::Scheduling,
 }
 
 #[derive(Deserialize, Default)]
@@ -206,6 +212,12 @@ struct RoutedAllocateReq {
     selector: musubi_fleet::AllocSelector,
     counter_actions: std::collections::HashMap<String, musubi_fleet::CounterAction>,
     list_actions: std::collections::HashMap<String, musubi_fleet::ListAction>,
+    /// Ordered fallback selectors tried after `selector` (P0-30).
+    selectors: Vec<musubi_fleet::AllocSelector>,
+    /// `[{kind: counter|list, key, order: asc|desc}]` ranking of matching servers.
+    priorities: Vec<musubi_fleet::Priority>,
+    /// `packed` (default) | `distributed`.
+    scheduling: musubi_fleet::Scheduling,
 }
 
 /// Allocate across a pool of fleets: the hinted region first, then any; `wait_secs` cold-starts a
@@ -229,6 +241,9 @@ async fn allocate_routed(
                     selector: r.selector,
                     counter_actions: r.counter_actions,
                     list_actions: r.list_actions,
+                    selectors: r.selectors,
+                    priorities: r.priorities,
+                    scheduling: r.scheduling,
                 },
                 std::time::Duration::from_secs(r.wait_secs.min(300)),
             )
@@ -254,6 +269,9 @@ async fn allocate(
                     selector: r.selector,
                     counter_actions: r.counter_actions,
                     list_actions: r.list_actions,
+                    selectors: r.selectors,
+                    priorities: r.priorities,
+                    scheduling: r.scheduling,
                 },
                 std::time::Duration::from_secs(r.wait_secs.min(300)),
             )
