@@ -19692,7 +19692,7 @@ async fn legal_documents_versions_consent_gate_and_withdrawal() {
     assert_eq!(st, 200);
     let (st, _) = srv(
         "PUT",
-        "/v1/admin/legal/Bad Key/1".to_string(),
+        "/v1/admin/legal/BAD-KEY/1".to_string(),
         doc(true, 0, "en"),
     )
     .await;
