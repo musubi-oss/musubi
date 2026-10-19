@@ -1,6 +1,7 @@
 //! Developer tools HTTP: request recording/replay and fixtures (admin key).
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
@@ -30,6 +31,19 @@ pub fn routes() -> Router<AppState> {
             get(netsim_get).put(netsim_put).delete(netsim_clear),
         )
         .route("/v1/admin/dev/netsim/reset", post(netsim_reset))
+        .route(
+            "/v1/admin/dev/loadtests",
+            get(loadtest_list).post(loadtest_start),
+        )
+        .route(
+            "/v1/admin/dev/loadtests/{id}",
+            get(loadtest_get).delete(loadtest_delete),
+        )
+        .route("/v1/admin/dev/loadtests/{id}/stop", post(loadtest_stop))
+        .route(
+            "/v1/admin/dev/loadtests/{id}/compare/{base}",
+            get(loadtest_compare),
+        )
         .route(
             "/v1/admin/dev/netsim/sessions/{id}",
             axum::routing::put(netsim_session_put).delete(netsim_session_delete),
@@ -228,4 +242,80 @@ async fn netsim_session_delete(
         return Err(Error::NotFound("netsim override for this session".into()).into());
     }
     Ok(Json(netsim::snapshot()))
+}
+
+async fn loadtest_start(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Json(req): Json<crate::loadtest::Request>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let v = crate::loadtest::start(&s, req).await?;
+    Ok((StatusCode::ACCEPTED, Json(v)))
+}
+
+#[derive(Deserialize)]
+struct LoadtestListQuery {
+    state: Option<String>,
+    #[serde(default = "default_lt_limit")]
+    limit: i64,
+}
+
+fn default_lt_limit() -> i64 {
+    50
+}
+
+async fn loadtest_list(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Query(q): Query<LoadtestListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        crate::loadtest::list(&s, q.state.as_deref(), q.limit.clamp(1, 500)).await?,
+    ))
+}
+
+async fn loadtest_get(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::loadtest::get(&s, id).await?))
+}
+
+async fn loadtest_stop(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::loadtest::stop(&s, id).await?))
+}
+
+async fn loadtest_delete(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    crate::loadtest::delete(&s, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct CompareQuery {
+    #[serde(default = "default_threshold")]
+    threshold_pct: f64,
+}
+
+fn default_threshold() -> f64 {
+    20.0
+}
+
+async fn loadtest_compare(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path((id, base)): Path<(Uuid, Uuid)>,
+    Query(q): Query<CompareQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        crate::loadtest::compare(&s, id, base, q.threshold_pct).await?,
+    ))
 }

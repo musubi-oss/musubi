@@ -431,6 +431,32 @@ impl Config {
 #[serde(default)]
 pub struct DevConfig {
     pub netsim: NetsimConfig,
+    pub loadtest: LoadtestConfig,
+}
+
+/// `[dev.loadtest]` — server-driven simulated players (`POST /v1/admin/dev/loadtests`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoadtestConfig {
+    /// Upper bound on bots per run (a run is one node's tokio tasks; 2000 ≈ 2000 sockets).
+    pub max_bots: u32,
+    /// Upper bound on run duration.
+    pub max_duration_secs: u64,
+    /// Allow `url` other than this node (load another environment from here).
+    pub allow_remote: bool,
+    /// Finished runs kept in `musubi.loadtest_runs`.
+    pub keep_runs: u32,
+}
+
+impl Default for LoadtestConfig {
+    fn default() -> Self {
+        Self {
+            max_bots: 2000,
+            max_duration_secs: 3600,
+            allow_remote: false,
+            keep_runs: 200,
+        }
+    }
 }
 
 /// `[dev.netsim]` — inject latency/jitter/loss around every realtime connection at startup; the

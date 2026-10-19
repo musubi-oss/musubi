@@ -29,6 +29,7 @@ pub mod keys;
 pub mod legal;
 pub mod limits;
 pub mod liveops;
+pub mod loadtest;
 pub mod lobby;
 pub mod logins;
 pub mod metrics;

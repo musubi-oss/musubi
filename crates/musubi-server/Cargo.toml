@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 rand.workspace = true
+tokio-tungstenite.workspace = true
 rayon = "1"
 musubi-core.workspace = true
 musubi-auth.workspace = true
@@ -81,7 +82,6 @@ quinn.workspace = true
 tower = { workspace = true, features = ["util"] }
 musubi-account.workspace = true
 musubi-social.workspace = true
-tokio-tungstenite.workspace = true
 musubi-proto.workspace = true
 jsonwebtoken.workspace = true
 rcgen.workspace = true

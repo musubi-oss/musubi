@@ -28973,3 +28973,266 @@ async fn dev_netsim_profiles_and_session_overrides() {
     assert_eq!(v["active"], false);
     assert!(v["global"].is_null());
 }
+
+/// P1-35: server-driven simulated players.
+#[tokio::test]
+async fn dev_loadtest_simulated_players() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    for bad in [
+        json!({"bots": 0}),
+        json!({"scenario": "world"}),
+        json!({"scenario": "rpc"}),
+        json!({"rate_hz": 1000}),
+        json!({"scenario": "custom", "steps": []}),
+        json!({"url": "http://127.0.0.1:1/ws"}),
+    ] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/admin/dev/loadtests",
+            k,
+            Some(bad.clone()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/dev/loadtests",
+        k,
+        Some(json!({"url": "ws://prod.example/ws"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+    // A long run occupies the node: second start → 409, stop → `stopped` with a report.
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/dev/loadtests",
+        k,
+        Some(json!({"name": "long", "url": url, "bots": 2, "duration_secs": 120, "rate_hz": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let long_id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["state"], "running");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/dev/loadtests",
+        k,
+        Some(json!({"url": url, "bots": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/dev/loadtests/{long_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/dev/loadtests/{long_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["live"]["totals"]["sent"].as_u64().unwrap_or(0) > 0, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/dev/loadtests/{long_id}/stop"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "stopped", "{v}");
+    assert_eq!(v["report"]["summary"]["bots"]["connected"], 2, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/dev/loadtests/{long_id}/stop"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+
+    async fn finish(app: &axum::Router, url: &str, body: Value) -> Value {
+        let (st, v) = call_server(
+            app,
+            "POST",
+            "/v1/admin/dev/loadtests",
+            "defaultkey",
+            Some(
+                json!({"url": url})
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .chain(body.as_object().unwrap().iter())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        let id = v["id"].as_str().unwrap().to_string();
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let (_, v) = call_server(
+                app,
+                "GET",
+                &format!("/v1/admin/dev/loadtests/{id}"),
+                "defaultkey",
+                None,
+            )
+            .await;
+            if v["state"] != "running" && v["state"] != "stopping" {
+                return v;
+            }
+        }
+        panic!("run {id} did not finish");
+    }
+    // ping: every request answered, RTT measured end to end.
+    let v = finish(
+        &app,
+        &url,
+        json!({"name": "ping", "bots": 6, "ramp_secs": 1, "duration_secs": 3, "rate_hz": 20}),
+    )
+    .await;
+    assert_eq!(v["state"], "finished", "{v}");
+    let s = &v["report"]["summary"];
+    assert_eq!(s["bots"]["connected"], 6, "{s}");
+    assert!(s["rtt"]["count"].as_u64().unwrap() >= 100, "{s}");
+    assert!(s["rtt"]["p99"].as_f64().unwrap() < 2000.0, "{s}");
+    assert_eq!(s["errors"]["total"], 0, "{s}");
+    assert!(
+        s["throughput"]["requests_per_sec"].as_f64().unwrap() > 20.0,
+        "{s}"
+    );
+    assert!(
+        v["report"]["timeline"].as_array().unwrap().len() >= 3,
+        "{v}"
+    );
+    assert!(v["report"]["by_kind"]["ping"]["count"].as_u64().unwrap() > 0);
+    let ping_id = v["id"].as_str().unwrap().to_string();
+    // chat: bots share a room; each post is acked and fanned out to the others.
+    let v = finish(&app, &url, json!({"name": "chat", "scenario": "chat", "channel": "lt-room", "bots": 3, "duration_secs": 2, "rate_hz": 10})).await;
+    let s = &v["report"]["summary"];
+    assert_eq!(v["state"], "finished", "{v}");
+    assert!(s["rtt"]["count"].as_u64().unwrap() >= 20, "{s}");
+    assert!(
+        s["throughput"]["received"].as_u64().unwrap() > s["throughput"]["sent"].as_u64().unwrap(),
+        "{s}"
+    );
+    // match: pairs in relayed matches, echo latency via payload ticks.
+    let v = finish(&app, &url, json!({"name": "match", "scenario": "match", "match_size": 2, "bots": 4, "duration_secs": 2, "rate_hz": 20})).await;
+    let s = &v["report"]["summary"];
+    assert_eq!(v["state"], "finished", "{v}");
+    assert_eq!(s["bots"]["connected"], 4, "{s}");
+    assert!(s["rtt"]["count"].as_u64().unwrap() >= 20, "{s}");
+    assert!(
+        v["report"]["by_kind"]["match"]["count"].as_u64().unwrap() > 0,
+        "{v}"
+    );
+    // custom steps including a server error (unknown rpc) and a pause.
+    let v = finish(&app, &url, json!({"name": "custom", "scenario": "custom", "bots": 2, "duration_secs": 2, "rate_hz": 20, "steps": [{"op": "ping"}, {"op": "status", "status": "busy"}, {"op": "rpc", "id": "no_such_fn"}, {"op": "sleep", "ms": 100}]})).await;
+    let s = &v["report"]["summary"];
+    assert_eq!(v["state"], "finished", "{v}");
+    assert!(
+        s["errors"]["by_kind"]["server_error"].as_u64().unwrap() > 0,
+        "{s}"
+    );
+    assert!(
+        v["report"]["by_kind"]["ping"]["count"].as_u64().unwrap() > 0,
+        "{v}"
+    );
+    let custom_id = v["id"].as_str().unwrap().to_string();
+    // compare: same run → ok; ping vs custom (errors appeared) → regressed on error rate.
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/dev/loadtests/{ping_id}/compare/{ping_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["verdict"], "ok", "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/dev/loadtests/{custom_id}/compare/{ping_id}?threshold_pct=5"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["verdict"], "regressed", "{v}");
+    assert!(
+        v["regressions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "error_rate_pct"),
+        "{v}"
+    );
+    assert_eq!(v["comparable"], false);
+    // list / delete.
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/dev/loadtests?state=finished",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["runs"].as_array().unwrap().len() >= 4, "{v}");
+    assert!(v["runs"][0]["report"]["rtt"].is_object(), "{v}");
+    assert!(v["active"].is_null());
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/dev/loadtests/{long_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/dev/loadtests/{long_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/dev/loadtests/{long_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

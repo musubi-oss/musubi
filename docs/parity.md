@@ -37,6 +37,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 | Secrets management (ссылки на env/файлы в конфиге, шифрование учёток в БД, ротация мастер-ключа) | ✅ `${env:}`/`${file:}` в любом значении конфига, `[security] master_keys` + ChaCha20-Poly1305 для webhook/IdP секретов, `GET /v1/admin/secrets/status`, `POST …/reencrypt`  | ❌  | ❌  | ✅ Pragma/AccelByte secret manager, Vault  | ❌  | —  | —  | —  |
 | Запросы к storage: in/like/regex/exists/contains/size/between, $or, случайная выборка, ранжирование полнотекста | ✅ `$where` операторы + `$or` группы, `sort=random`, `sort=rank` по `$q`  | ❌ (только equality/где-фильтры)  | ❌  | ✅ PlayFab/Beamable query, Nakama storage index  | ❌  | —  | —  | —  |
 | Симуляция сети (latency/jitter/loss) на сервере для разработки | ✅ `[dev.netsim]` + `/v1/admin/dev/netsim` глобально и по сессии, счётчики  | ❌  | ❌  | ✅ Photon Fusion/Unity Transport network simulator (client-side)  | ❌  | —  | —  | —  |
+| Симулированные игроки / нагрузочные прогоны из самого сервера | ✅ `/v1/admin/dev/loadtests` — боты по сценариям ping/chat/match/rpc/custom, таймлайн, отчёт, сравнение с базовой линией  | ❌  | ❌  | 🟡 UGS thin clients / Hathora soak — внешние инструменты  | ❌  | —  | —  | —  |
 | Passkeys / WebAuthn | ✅ | ❌ | ❌ | ❌ | ❌ |
 | MFA: TOTP + recovery codes + e-mail коды, таймлайн security-событий, MFA операторов через IdP (`require_mfa`) | ✅ | ❌ | ❌ | ❌ | 🟡 |
 | Magic-link вход | ✅ `POST /v1/auth/email/magic/request` → событие `account.magic_link`, `POST /v1/auth/email/magic {token}` | ❌ | ❌ | ✅ | ❌ |
