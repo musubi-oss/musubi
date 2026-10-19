@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::app::AppState;
 use crate::http::{ApiError, Bearer};
 
-const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 pub fn routes() -> Router<AppState> {
     Router::new()

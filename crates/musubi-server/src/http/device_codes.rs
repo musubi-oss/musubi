@@ -24,7 +24,7 @@ use uuid::Uuid;
 pub const TTL_SECS: i64 = 600;
 pub const INTERVAL_SECS: i64 = 5;
 pub const PROVIDER: &str = "device_code";
-const USER_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const USER_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 pub fn routes() -> Router<AppState> {
     Router::new()

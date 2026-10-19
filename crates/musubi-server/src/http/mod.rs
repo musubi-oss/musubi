@@ -203,9 +203,15 @@ impl tower::Service<axum::http::Request<axum::body::Body>> for ProjectDispatch {
 }
 
 pub fn router(state: AppState) -> Router {
+    let cors_on = state
+        .cfg
+        .http
+        .cors_origins
+        .iter()
+        .any(|o| !o.trim().is_empty());
     let cors = cors_layer(&state.cfg.http);
     crate::realtime::netsim::configure(&state.cfg.dev.netsim);
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/metrics", get(crate::metrics::render))
@@ -328,15 +334,17 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::dev::record,
-        ))
-        .layer(cors)
-        .with_state(state)
+        ));
+    // Only mount the CORS layer when origins are configured: tower-http answers every OPTIONS
+    // request itself (200), which would shadow module routes' own OPTIONS/405 handling.
+    let router = if cors_on { router.layer(cors) } else { router };
+    router.with_state(state)
 }
 
 /// CORS for browser / WebGL clients from `[http] cors_origins` (exact, `*.suffix` or `*`).
 /// Bearer tokens travel in headers, so credentials are never allowed and `*` is safe to echo.
-/// With an empty list the layer stays inert: no `Access-Control-*` headers, preflights get 200
-/// without allowances and the browser blocks the call.
+/// With an empty list (the default) the layer is not mounted at all: no `Access-Control-*`
+/// headers, OPTIONS behaves as without CORS and the browser blocks cross-origin calls.
 pub fn cors_layer(cfg: &musubi_core::config::HttpConfig) -> tower_http::cors::CorsLayer {
     use axum::http::{header, HeaderName, HeaderValue, Method};
     use tower_http::cors::{AllowOrigin, CorsLayer};
