@@ -25529,3 +25529,327 @@ async fn gameserver_custom_events_and_wildcard_webhooks() {
     .await;
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }
+
+/// Player server browser: browsable fleets/servers only, filters and sort, join through a shared
+/// allocation (history recorded), favourites by key with online resolution, reputation votes.
+#[tokio::test]
+async fn server_browser_list_join_favorites_history_and_rating() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let mk = |name: String, browsable: bool| {
+        let app = app.clone();
+        let svc = svc.clone();
+        async move {
+            let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+                Some(json!({"name": name, "provider": "local", "region": "eu-west", "buffer": 1, "max_servers": 1,
+                    "spec": {"command": ["sleep", "60"]}, "policy": {"browsable": browsable}}))).await;
+            assert!(st.is_success(), "{st} {f}");
+            let fuid = uuid::Uuid::parse_str(f["id"].as_str().unwrap()).unwrap();
+            svc.reconcile_one(fuid).await.unwrap();
+            let sid = svc.servers(fuid, Some("starting")).await.unwrap()[0].id;
+            svc.sdk_ready(sid).await.unwrap();
+            (fuid, sid)
+        }
+    };
+    let pub_name = unique("sb-pub");
+    let (fid_pub, sid) = mk(pub_name.clone(), true).await;
+    let (fid_priv, sid_priv) = mk(unique("sb-priv"), false).await;
+    svc.sdk_labels(
+        sid,
+        json!({"name": "Dusty Arena", "map": "dust", "mode": "ctf"}),
+    )
+    .await
+    .unwrap();
+    svc.sdk_players(sid, 2, Some(8)).await.unwrap();
+    svc.sdk_players(sid_priv, 1, Some(8)).await.unwrap();
+    let (_, d) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("sbdev")})),
+    )
+    .await;
+    let t = d["access_token"].as_str().unwrap().to_string();
+    let (_, d2) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("sbdev")})),
+    )
+    .await;
+    let t2 = d2["access_token"].as_str().unwrap().to_string();
+
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/servers?region=eu-west&labels=map=dust&q=dusty",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mine: Vec<&Value> = v["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["fleet_id"] == fid_pub.to_string())
+        .collect();
+    assert_eq!(mine.len(), 1, "{v}");
+    let card = mine[0];
+    assert_eq!(card["name"], "Dusty Arena");
+    assert_eq!(card["free_slots"], 6);
+    assert_eq!(card["map"], "dust");
+    assert_eq!(card["favorite"], false);
+    let key = card["key"].as_str().unwrap().to_string();
+    assert!(key.contains(':'), "{key}");
+    // address:port keys outlive servers: wipe votes left by earlier runs on this port
+    sqlx::query("delete from musubi.server_ratings where key = $1")
+        .bind(&key)
+        .execute(&db)
+        .await
+        .unwrap();
+    // the non-browsable fleet never shows; label public=true would
+    let (_, v) = call(&app, "GET", "/v1/servers?limit=200", Some(&t), None).await;
+    assert!(
+        v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["fleet_id"] != fid_priv.to_string()),
+        "{v}"
+    );
+    svc.sdk_labels(sid_priv, json!({"public": "true"}))
+        .await
+        .unwrap();
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/servers?region=eu-west&limit=200",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert!(
+        v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["fleet_id"] == fid_priv.to_string()),
+        "{v}"
+    );
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/servers?min_free_slots=7&labels=map=dust",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"] != sid.to_string()),
+        "{v}"
+    );
+    let (st, v) = call(&app, "GET", "/v1/servers?sort=sideways", Some(&t), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/servers/{sid_priv}"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/servers/{}", uuid::Uuid::now_v7()),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // rating requires a join first
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/rate"),
+        Some(&t),
+        Some(json!({"score": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    // join → connect + history; second player shares the allocated server
+    let (st, j1) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/join"),
+        Some(&t),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{j1}");
+    assert_eq!(j1["server_id"], sid.to_string());
+    assert_eq!(j1["shared"], false);
+    assert!(j1["connect_token"].as_str().unwrap().len() > 20);
+    let (st, j2) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/join"),
+        Some(&t2),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{j2}");
+    assert_eq!(j2["shared"], true);
+    assert_eq!(j2["connect_token"], j1["connect_token"]);
+    let (_, h) = call(&app, "GET", "/v1/servers/history", Some(&t), None).await;
+    assert_eq!(h["history"].as_array().unwrap().len(), 1, "{h}");
+    assert_eq!(h["history"][0]["key"], key);
+    assert_eq!(h["history"][0]["online"], true);
+    assert_eq!(h["history"][0]["joins"], 1);
+    let _ = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/join"),
+        Some(&t),
+        Some(json!({})),
+    )
+    .await;
+    let (_, h) = call(&app, "GET", "/v1/servers/history", Some(&t), None).await;
+    assert_eq!(h["history"][0]["joins"], 2);
+    // full server → 429
+    svc.sdk_players(sid, 8, Some(8)).await.unwrap();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/join"),
+        Some(&t2),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    svc.sdk_players(sid, 3, Some(8)).await.unwrap();
+
+    // favourites by id or key, resolved online, removed
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("/v1/servers/favorites/{sid}"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["key"], key);
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/servers/favorites/10.0.0.9:27015",
+        Some(&t),
+        Some(json!({"name": "Offline box"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(&app, "PUT", "/v1/servers/favorites/nocolon", Some(&t), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, f) = call(&app, "GET", "/v1/servers/favorites", Some(&t), None).await;
+    let favs = f["favorites"].as_array().unwrap();
+    assert_eq!(favs.len(), 2, "{f}");
+    let on = favs.iter().find(|x| x["key"] == key).unwrap();
+    assert_eq!(on["online"], true);
+    assert_eq!(on["name"], "Dusty Arena");
+    assert_eq!(on["server"]["players"], 3);
+    let off = favs.iter().find(|x| x["key"] == "10.0.0.9:27015").unwrap();
+    assert_eq!(off["online"], false);
+    let (_, v) = call(&app, "GET", &format!("/v1/servers/{sid}"), Some(&t), None).await;
+    assert_eq!(v["favorite"], true);
+    assert!(v["last_joined_at"].is_string());
+    let (_, v) = call(
+        &app,
+        "DELETE",
+        "/v1/servers/favorites/10.0.0.9:27015",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(v["removed"], true);
+
+    // reputation: one vote per player, re-vote replaces, tags aggregate, sort by rating
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/rate"),
+        Some(&t),
+        Some(json!({"score": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/rate"),
+        Some(&t),
+        Some(json!({"score": 5, "tags": ["friendly", "low-ping"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rating"]["avg"], 5.0);
+    let (_, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/rate"),
+        Some(&t2),
+        Some(json!({"score": 3, "tags": ["friendly"]})),
+    )
+    .await;
+    assert_eq!(v["rating"], json!({"avg": 4.0, "votes": 2}));
+    assert_eq!(v["tags"][0], json!({"tag": "friendly", "votes": 2}));
+    let (_, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/servers/{sid}/rate"),
+        Some(&t2),
+        Some(json!({"score": 1})),
+    )
+    .await;
+    assert_eq!(v["rating"], json!({"avg": 3.0, "votes": 2}));
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/servers?sort=rating&labels=map=dust",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(v["servers"][0]["id"], sid.to_string(), "{v}");
+    assert_eq!(v["servers"][0]["rating"]["votes"], 2);
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/{fid_pub}"),
+        k,
+        None,
+    )
+    .await;
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/{fid_priv}"),
+        k,
+        None,
+    )
+    .await;
+}

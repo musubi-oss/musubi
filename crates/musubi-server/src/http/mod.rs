@@ -49,6 +49,7 @@ pub mod reports;
 mod rpc;
 mod rtc;
 pub mod sanctions;
+mod server_browser;
 mod sso;
 pub mod stats;
 mod storage;
@@ -250,6 +251,7 @@ pub fn router(state: AppState) -> Router {
         .merge(async_mm::routes())
         .merge(auth_providers::routes())
         .merge(fleet_metrics::routes())
+        .merge(server_browser::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
         .merge(codes::routes())

@@ -234,6 +234,8 @@ pub struct ScalePolicy {
     pub rollout: RolloutPolicy,
     /// Keep this much aggregate free counter capacity across the fleet (adds to the ready target).
     pub counter_target: Option<CounterTarget>,
+    /// List this fleet's servers in the player server browser (`GET /v1/servers`).
+    pub browsable: bool,
 }
 
 /// Build rollout strategy (plan P1-29): `manual` only affects new servers; `rolling` replaces
@@ -406,6 +408,7 @@ impl Default for ScalePolicy {
             allocated_max_secs: None,
             rollout: RolloutPolicy::default(),
             counter_target: None,
+            browsable: false,
         }
     }
 }
@@ -729,6 +732,8 @@ pub struct AllocSelector {
     pub states: Vec<String>,
     pub counters: HashMap<String, CounterSel>,
     pub lists: HashMap<String, ListSel>,
+    /// Exactly this server (server browser joins).
+    pub server_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2101,10 +2106,12 @@ impl FleetService {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let rows: Vec<ServerRow> = sqlx::query_as(&format!(
             "select {SERVER_COLS} from musubi.game_servers where fleet_id = $1 and state = any($2)
+               and ($3::uuid is null or id = $3)
              order by (case state when 'ready' then 0 else 1 end), created_at for update skip locked"
         ))
         .bind(fleet_id)
         .bind(&states)
+        .bind(req.selector.server_id)
         .fetch_all(&mut *tx)
         .await
         .map_err(Error::internal)?;

@@ -443,6 +443,14 @@ webhook `kinds` accept wildcards (`match.*`, `gameserver.*`, `gameserver.custom.
 server posts its own events `POST /v1/gameserver/events {kind, data}` → `gameserver.custom.<kind>` on the bus (webhooks,
 LiveOps, `GET /v1/server/events`) and in the fleet log.
 
+Player server browser: fleets with `policy.browsable` (or servers labelled `public=true`) appear in `GET /v1/servers?region
+&labels=map=dust,mode=ctf&q=<name>&min_free_slots&not_full&not_empty&build_version&sort=-players|age|rating|name&limit&offset`
+— name (`labels.name`), map/mode, players/capacity/free slots, counters, uptime, reputation, the caller's favourite and
+last-joined marks; `GET /v1/servers/{id}`. `POST /v1/servers/{id}/join {payload}` connects through a shared allocation on
+exactly that server (`connect_token`, 429 when full) and records `GET /v1/servers/history`; favourites keyed by
+`address:port` (`PUT|DELETE /v1/servers/favorites/{key|id}`, `GET /v1/servers/favorites` resolves which are online);
+reputation `POST /v1/servers/{id}/rate {score: 1..5, tags}` (one vote per player, after joining).
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`
