@@ -179,6 +179,7 @@ async fn build_state_cfg_with(
         game_sessions: musubi_server::game_sessions::GameSessionService::new(db.clone()),
         async_mm: musubi_server::async_mm::AsyncMatchService::new(db.clone()),
         auth_providers: musubi_server::auth_providers::AuthProviderService::new(db.clone()),
+        fleet_metrics: musubi_server::fleet_metrics::FleetMetricsService::new(db.clone()),
         lobbies: musubi_server::lobby::LobbyService::new(
             db.clone(),
             musubi_server::notify::Notifier::new(

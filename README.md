@@ -398,6 +398,18 @@ email/name are kept on the identity for support. Linking: `POST /v1/account/link
 (409 when the identity belongs to another account), unlink via `DELETE /v1/account/unlink/oidc/{name}`. Events
 `auth.provider_login`, `account.linked`, `auth.provider_updated`.
 
+Per-server fleet metrics: the game server (agent/SDK) reports `POST /v1/gameserver/metrics {cpu_pct, mem_bytes,
+mem_limit_bytes, net_in_bps, net_out_bps, tick_ms, tick_p99_ms, tick_hz, players, capacity, custom: {k: number}}`
+(also updates occupancy); operators read `GET /v1/server/fleets/{id}/servers/{sid}/metrics?since_secs&step_secs&limit`
+(raw or bucketed history, latest sample, that server's alerts) and `GET /v1/server/fleets/{id}/metrics?window_secs&stale_secs`
+(latest sample per live server with `age_secs`, window aggregates, `stale_servers`, `firing_alerts`). Alert rules per fleet:
+`PUT /v1/server/fleets/{id}/alerts/rules/{name} {metric, op: gt|gte|lt|lte, threshold, for_secs, severity: info|warning|critical,
+enabled}` over `cpu_pct|mem_bytes|mem_pct|net_in_bps|net_out_bps|tick_ms|tick_p99_ms|tick_hz|players|occupancy_pct|custom.<key>`
+plus `silence_secs` (agent stopped reporting; checked by the lease holder every 15 s or `POST …/alerts/sweep`). A breach opens a
+pending alert, after `for_secs` it fires (`fleet.alert_fired` event → webhooks), recovery resolves it (`fleet.alert_resolved`);
+`GET /v1/server/fleets/{id}/alerts?state=firing|pending|resolved|all&server_id`. Samples/resolved alerts kept
+`[retention] server_metrics_days` (7).
+
 Lifecycle guards in the same `policy` keep fleets free of zombies: `max_duration_secs` terminates any
 server that has lived that long, `idle_ttl_secs` reaps servers that sat `ready` without an allocation
 (never below `min_servers`), `allocated_max_secs` ends matches that have been `allocated`/`in_game`

@@ -16,6 +16,7 @@ pub mod dev;
 pub mod edge;
 pub mod events;
 pub mod fanout;
+pub mod fleet_metrics;
 pub mod fraud;
 pub mod game_sessions;
 pub mod grant_limits;

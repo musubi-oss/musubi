@@ -53,6 +53,7 @@ pub struct AppStateInner {
     pub game_sessions: crate::game_sessions::GameSessionService,
     pub async_mm: crate::async_mm::AsyncMatchService,
     pub auth_providers: crate::auth_providers::AuthProviderService,
+    pub fleet_metrics: crate::fleet_metrics::FleetMetricsService,
     pub chat: ChatService,
     pub leaderboards: LeaderboardService,
     pub tournaments: TournamentService,
@@ -704,6 +705,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         game_sessions: crate::game_sessions::GameSessionService::new(db.clone()),
         async_mm: crate::async_mm::AsyncMatchService::new(db.clone()),
         auth_providers: crate::auth_providers::AuthProviderService::new(db.clone()),
+        fleet_metrics: crate::fleet_metrics::FleetMetricsService::new(db.clone()),
         db,
         auth,
         storage,
@@ -820,6 +822,27 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "webhook dispatch failed"),
+                }
+            }
+        });
+    }
+    if let Some(c) = state.cluster.clone() {
+        let st = state.clone();
+        let lease = c.lease("fleet_metrics", musubi_cluster::DEAD_AFTER);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                if !lease.held() {
+                    continue;
+                }
+                match st
+                    .fleet_metrics
+                    .sweep(st.cfg.retention.server_metrics_days as i64)
+                    .await
+                {
+                    Ok(ts) => crate::http::fleet_metrics::emit(&st, &ts).await,
+                    Err(e) => tracing::warn!(error = %e, "fleet metrics sweep failed"),
                 }
             }
         });

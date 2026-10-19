@@ -657,6 +657,26 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("PUT", "/v1/admin/auth/providers/{name}", "auth"),
     ("DELETE", "/v1/admin/auth/providers/{name}", "auth"),
     ("POST", "/v1/admin/auth/providers/{name}/test", "auth"),
+    ("POST", "/v1/gameserver/metrics", "fleets"),
+    ("GET", "/v1/server/fleets/{id}/metrics", "fleets"),
+    (
+        "GET",
+        "/v1/server/fleets/{id}/servers/{sid}/metrics",
+        "fleets",
+    ),
+    ("GET", "/v1/server/fleets/{id}/alerts", "fleets"),
+    ("POST", "/v1/server/fleets/{id}/alerts/sweep", "fleets"),
+    ("GET", "/v1/server/fleets/{id}/alerts/rules", "fleets"),
+    (
+        "PUT",
+        "/v1/server/fleets/{id}/alerts/rules/{name}",
+        "fleets",
+    ),
+    (
+        "DELETE",
+        "/v1/server/fleets/{id}/alerts/rules/{name}",
+        "fleets",
+    ),
     ("GET", "/v1/rating/{queue}", "leaderboards"),
     ("GET", "/v1/leaderboards/{id}/tier", "leaderboards"),
     (

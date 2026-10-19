@@ -95,6 +95,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         game_sessions: musubi_server::game_sessions::GameSessionService::new(db.clone()),
         async_mm: musubi_server::async_mm::AsyncMatchService::new(db.clone()),
         auth_providers: musubi_server::auth_providers::AuthProviderService::new(db.clone()),
+        fleet_metrics: musubi_server::fleet_metrics::FleetMetricsService::new(db.clone()),
         lobbies: musubi_server::lobby::LobbyService::new(
             db.clone(),
             musubi_server::notify::Notifier::new(
@@ -24285,4 +24286,357 @@ async fn auth_provider_catalog_code_flow_pkce_link_and_claims() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// Per-server metrics from the gameserver agent, history/buckets, fleet summary, alert rules with
+/// breach → fired → resolved life cycle, `for_secs` pending state, silence alerts via sweep.
+#[tokio::test]
+async fn fleet_metrics_history_summary_and_alerts() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("mfleet");
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "buffer": 1, "max_servers": 1, "spec": {"command": ["sleep", "30"]}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile().await.unwrap();
+    let (_, list) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let sid = list["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["state"] == "starting")
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .unwrap_or_else(|| panic!("{list}"));
+    let sdk = |path: &str, body: Value| {
+        let app = app.clone();
+        let sid = sid.clone();
+        let path = path.to_string();
+        async move {
+            let req = Request::post(&path)
+                .header("x-musubi-server-key", k)
+                .header("x-musubi-server-id", &sid)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let st = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, _) = sdk("/v1/gameserver/ready", json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // rules: validation + create
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/hot"),
+        k,
+        Some(json!({"metric": "cpu_temp", "op": "gt", "threshold": 90})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/hot"),
+        k,
+        Some(json!({"metric": "cpu_pct", "op": "eq", "threshold": 90})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/hot"),
+        k,
+        Some(json!({"metric": "cpu_pct", "op": "gt", "threshold": 90, "severity": "critical"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/slow"),
+        k,
+        Some(json!({"metric": "tick_p99_ms", "op": "gte", "threshold": 50, "for_secs": 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/full"),
+        k,
+        Some(json!({"metric": "occupancy_pct", "op": "gte", "threshold": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/ents"),
+        k,
+        Some(json!({"metric": "custom.entities", "op": "gt", "threshold": 1000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/alerts/rules"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["rules"].as_array().unwrap().len(), 4);
+
+    // samples: validation, healthy, then hot + slow (pending) + custom
+    let (st, v) = sdk("/v1/gameserver/metrics", json!({"cpu_pct": -5})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = sdk("/v1/gameserver/metrics", json!({"cpu_pct": 35.5, "mem_bytes": 512, "mem_limit_bytes": 1024,
+        "tick_ms": 10.0, "tick_p99_ms": 20.0, "tick_hz": 60, "players": 2, "capacity": 8, "net_in_bps": 1000, "net_out_bps": 2000})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["alerts"].as_array().unwrap().is_empty(), "{v}");
+    let (_, gs) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers"),
+        k,
+        None,
+    )
+    .await;
+    let me = gs["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == sid)
+        .unwrap();
+    assert_eq!(me["players"], 2, "metrics report updates occupancy");
+    assert_eq!(me["capacity"], 8);
+    let (st, v) = sdk(
+        "/v1/gameserver/metrics",
+        json!({"cpu_pct": 95.0, "tick_p99_ms": 80.0, "custom": {"entities": 1500}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let fired: Vec<&str> = v["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["alert"]["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        fired,
+        vec!["ents", "hot"],
+        "slow has for_secs and stays pending: {v}"
+    );
+    assert_eq!(v["alerts"][1]["kind"], "fired");
+    assert_eq!(v["alerts"][1]["alert"]["severity"], "critical");
+    assert_eq!(v["alerts"][1]["alert"]["value"], 95.0);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/alerts"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["alerts"].as_array().unwrap().len(), 2, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/alerts?state=pending"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["alerts"][0]["rule"], "slow", "{v}");
+    // repeat breach does not re-fire; recovery resolves hot + ents and drops pending slow
+    let (_, v) = sdk(
+        "/v1/gameserver/metrics",
+        json!({"cpu_pct": 97.0, "custom": {"entities": 1600}}),
+    )
+    .await;
+    assert!(v["alerts"].as_array().unwrap().is_empty(), "{v}");
+    let (_, v) = sdk(
+        "/v1/gameserver/metrics",
+        json!({"cpu_pct": 20.0, "tick_p99_ms": 10.0, "custom": {"entities": 10}}),
+    )
+    .await;
+    let resolved: Vec<&str> = v["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["kind"] == "resolved")
+        .map(|a| a["alert"]["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(resolved, vec!["ents", "hot"], "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/alerts?state=all"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(
+        v["alerts"].as_array().unwrap().len(),
+        2,
+        "pending slow was dropped silently: {v}"
+    );
+    assert!(v["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|a| a["resolved_at"].is_string()));
+    // occupancy breach fires at 8/8
+    let (_, v) = sdk(
+        "/v1/gameserver/metrics",
+        json!({"players": 8, "capacity": 8}),
+    )
+    .await;
+    assert_eq!(v["alerts"][0]["alert"]["rule"], "full", "{v}");
+    assert_eq!(v["alerts"][0]["alert"]["value"], 100.0);
+
+    // history: raw + bucketed, and fleet summary
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers/{sid}/metrics"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["samples"].as_array().unwrap().len(), 5);
+    assert_eq!(v["latest"]["players"], 8);
+    assert_eq!(v["samples"][4]["cpu_pct"], 35.5);
+    assert!(v["alerts"].as_array().unwrap().len() >= 3);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/servers/{sid}/metrics?step_secs=3600"),
+        k,
+        None,
+    )
+    .await;
+    let b = &v["samples"][0];
+    assert_eq!(b["samples"], 5, "{v}");
+    assert_eq!(b["cpu_pct_max"], 97.0);
+    assert_eq!(b["tick_p99_ms"], 80.0);
+    assert_eq!(b["players"], 8);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/fleets/{fid}/servers/{}/metrics",
+            uuid::Uuid::now_v7()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/metrics?window_secs=600"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["live_servers"], 1);
+    assert_eq!(v["stale_servers"], 0);
+    assert_eq!(v["players"], 8);
+    assert_eq!(v["firing_alerts"], 1);
+    assert_eq!(v["aggregate"]["samples"], 5);
+    assert_eq!(v["aggregate"]["cpu_pct_max"], 97.0);
+    assert_eq!(v["servers"][0]["server_id"], sid);
+    assert!(v["servers"][0]["age_secs"].as_f64().unwrap() < 30.0);
+
+    // silence: rule with 0 s threshold fires on sweep (last sample is already in the past), next
+    // report resolves it; deleting a rule closes its alerts
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/quiet"),
+        k,
+        Some(json!({"metric": "silence_secs", "op": "gte", "threshold": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/alerts/sweep"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["transitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["alert"]["rule"] == "quiet" && t["kind"] == "fired"),
+        "{v}"
+    );
+    let (_, v) = sdk("/v1/gameserver/metrics", json!({"cpu_pct": 1.0})).await;
+    assert!(
+        v["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["alert"]["rule"] == "quiet" && t["kind"] == "resolved"),
+        "{v}"
+    );
+    let (_, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/fleets/{fid}/alerts/rules/full"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["deleted"], true);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/alerts"),
+        k,
+        None,
+    )
+    .await;
+    assert!(v["alerts"].as_array().unwrap().is_empty(), "{v}");
+    // unknown server id → 404 at ingest
+    let req = Request::post("/v1/gameserver/metrics")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", uuid::Uuid::now_v7().to_string())
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }
