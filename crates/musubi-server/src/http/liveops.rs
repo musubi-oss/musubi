@@ -101,6 +101,8 @@ struct FlagBody {
     default_value: Value,
     #[serde(default)]
     rules: Vec<liveops::FlagRule>,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -124,17 +126,19 @@ async fn save_flag(s: &AppState, name: &str, b: FlagBody) -> Result<Flag> {
             return Err(Error::InvalidArgument("rollout_pct: 0..=100".into()));
         }
     }
+    valid_labels(&b.labels)?;
     sqlx::query(
-        "insert into musubi.flags (name, description, enabled, default_value, rules)
-         values ($1, $2, $3, $4, $5)
+        "insert into musubi.flags (name, description, enabled, default_value, rules, labels)
+         values ($1, $2, $3, $4, $5, $6)
          on conflict (name) do update set description = excluded.description, enabled = excluded.enabled,
-            default_value = excluded.default_value, rules = excluded.rules, updated_at = now()",
+            default_value = excluded.default_value, rules = excluded.rules, labels = excluded.labels, updated_at = now()",
     )
     .bind(name)
     .bind(&b.description)
     .bind(b.enabled)
     .bind(&b.default_value)
     .bind(serde_json::to_value(&b.rules).map_err(Error::internal)?)
+    .bind(json!(b.labels))
     .execute(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -147,8 +151,13 @@ async fn save_flag(s: &AppState, name: &str, b: FlagBody) -> Result<Flag> {
 async fn list_flags(
     State(s): State<AppState>,
     ServerKey: ServerKey,
+    Query(lq): Query<LabelQ>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "flags": liveops::load_flags(&s).await? })))
+    let mut flags = liveops::load_flags(&s).await?;
+    if let Some(l) = &lq.label {
+        flags.retain(|f| f.labels.contains(l));
+    }
+    Ok(Json(json!({ "flags": flags })))
 }
 
 async fn get_flag(
@@ -216,6 +225,8 @@ struct ExperimentBody {
     exclusion_group: Option<String>,
     #[serde(default)]
     metadata: Value,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -269,13 +280,14 @@ async fn save_experiment(s: &AppState, id: &str, b: ExperimentBody) -> Result<Ex
             ));
         }
     }
+    valid_labels(&b.labels)?;
     sqlx::query(
-        "insert into musubi.experiments (id, name, description, status, audience, rollout_pct, variants, starts_at, ends_at, exclusion_group, metadata)
-         values ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10)
+        "insert into musubi.experiments (id, name, description, status, audience, rollout_pct, variants, starts_at, ends_at, exclusion_group, metadata, labels)
+         values ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11)
          on conflict (id) do update set name = excluded.name, description = excluded.description,
             audience = excluded.audience, rollout_pct = excluded.rollout_pct, variants = excluded.variants,
             starts_at = excluded.starts_at, ends_at = excluded.ends_at,
-            exclusion_group = excluded.exclusion_group, metadata = excluded.metadata, updated_at = now()",
+            exclusion_group = excluded.exclusion_group, metadata = excluded.metadata, labels = excluded.labels, updated_at = now()",
     )
     .bind(id)
     .bind(b.name.trim())
@@ -287,6 +299,7 @@ async fn save_experiment(s: &AppState, id: &str, b: ExperimentBody) -> Result<Ex
     .bind(b.ends_at)
     .bind(&b.exclusion_group)
     .bind(if b.metadata.is_null() { json!({}) } else { b.metadata })
+    .bind(json!(b.labels))
     .execute(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -325,10 +338,13 @@ async fn set_status(s: &AppState, id: &str, from: &[&str], to: &str) -> Result<E
 async fn list_experiments(
     State(s): State<AppState>,
     ServerKey: ServerKey,
+    Query(lq): Query<LabelQ>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({ "experiments": liveops::load_experiments(&s, false).await? }),
-    ))
+    let mut exps = liveops::load_experiments(&s, false).await?;
+    if let Some(l) = &lq.label {
+        exps.retain(|e| e.labels.contains(l));
+    }
+    Ok(Json(json!({ "experiments": exps })))
 }
 
 async fn get_experiment(
@@ -959,6 +975,12 @@ async fn delete_event(
     Ok(Json(json!({ "removed": n > 0 })))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LabelQ {
+    label: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct EvalQ {
     account_id: Uuid,
@@ -1008,7 +1030,7 @@ struct TimelineQ {
 }
 
 /// (id, name, status, starts_at, ends_at)
-type ExpTimelineRow = (String, String, String, Option<i64>, Option<i64>);
+type ExpTimelineRow = (String, String, String, Option<i64>, Option<i64>, Value);
 /// (id, name, placement_id, enabled, starts_at, ends_at, audience)
 type OfferTimelineRow = (
     String,
@@ -1175,13 +1197,17 @@ async fn timeline(
             }
         }
     }
-    if want("flag") && q.label.is_none() {
-        let rows: Vec<(String, bool, Value)> =
-            sqlx::query_as("select name, enabled, rules from musubi.flags order by name")
+    if want("flag") {
+        let rows: Vec<(String, bool, Value, Value)> =
+            sqlx::query_as("select name, enabled, rules, labels from musubi.flags order by name")
                 .fetch_all(&s.db)
                 .await
                 .map_err(Error::internal)?;
-        for (name, enabled, rules) in rows {
+        for (name, enabled, rules, labels) in rows {
+            let labels: Vec<String> = serde_json::from_value(labels).unwrap_or_default();
+            if q.label.as_ref().is_some_and(|l| !labels.contains(l)) {
+                continue;
+            }
             let rules: Vec<liveops::FlagRule> = serde_json::from_value(rules).unwrap_or_default();
             for (i, r) in rules.iter().enumerate() {
                 if r.starts_at.is_none() && r.ends_at.is_none() {
@@ -1189,21 +1215,25 @@ async fn timeline(
                 }
                 let start = r.starts_at.unwrap_or(i64::MIN / 2);
                 if intersects(start, r.ends_at, from, to) {
-                    out.push(entry("flag", &name, &name, start.max(from.min(start)), r.ends_at, now, json!([]),
+                    out.push(entry("flag", &name, &name, start.max(from.min(start)), r.ends_at, now, json!(labels),
                         json!({ "rule_index": i, "value": r.value, "audience": r.audience, "rollout_pct": r.rollout_pct, "enabled": enabled })));
                 }
             }
         }
     }
-    if want("experiment") && q.label.is_none() {
+    if want("experiment") {
         let rows: Vec<ExpTimelineRow> = sqlx::query_as(
-            "select id, name, status, starts_at, ends_at from musubi.experiments order by starts_at nulls last, id",
+            "select id, name, status, starts_at, ends_at, labels from musubi.experiments order by starts_at nulls last, id",
         )
         .fetch_all(&s.db)
         .await
         .map_err(Error::internal)?;
-        for (id, name, status, st, en) in rows {
+        for (id, name, status, st, en, labels) in rows {
             if st.is_none() && en.is_none() {
+                continue;
+            }
+            let labels: Vec<String> = serde_json::from_value(labels).unwrap_or_default();
+            if q.label.as_ref().is_some_and(|l| !labels.contains(l)) {
                 continue;
             }
             let start = st.unwrap_or(from);
@@ -1215,7 +1245,7 @@ async fn timeline(
                     start,
                     en,
                     now,
-                    json!([]),
+                    json!(labels),
                     json!({ "status": status }),
                 ));
             }

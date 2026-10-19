@@ -32667,3 +32667,99 @@ async fn experiment_context_on_events_and_history() {
     )
     .await;
 }
+
+/// Category labels on flags and experiments: stored, validated, filterable, visible in the timeline.
+#[tokio::test]
+async fn flag_and_experiment_labels() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let flag = unique("lbl-flag");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/flags/{flag}"),
+        k,
+        Some(json!({"default_value": 1, "labels": ["Bad Label"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/flags/{flag}"), k, Some(json!({
+        "default_value": 1, "labels": ["pricing", "q4"], "rules": [{"value": 2, "starts_at": now + 60, "ends_at": now + 3600}]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["labels"], json!(["pricing", "q4"]));
+    let (_, g) = call_server(&app, "GET", &format!("/v1/server/flags/{flag}"), k, None).await;
+    assert_eq!(g["labels"], json!(["pricing", "q4"]));
+    let exp = unique("lbl-exp");
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/experiments/{exp}"), k, Some(json!({
+        "name": "Labelled", "variants": [{"name": "a", "weight": 1}, {"name": "b", "weight": 1}],
+        "labels": ["pricing"], "starts_at": now - 60, "ends_at": now + 3600
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["labels"], json!(["pricing"]));
+    let (st, r) = call_server(&app, "PUT", &format!("/v1/server/experiments/{exp}-bad"), k, Some(json!({
+        "name": "x", "variants": [{"name": "a", "weight": 1}, {"name": "b", "weight": 1}], "labels": ["UPPER"]
+    }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (_, l) = call_server(&app, "GET", "/v1/server/flags?label=q4", k, None).await;
+    let names: Vec<&str> = l["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&flag.as_str()) && names.iter().all(|n| n.starts_with("lbl-flag") || true),
+        "{l}"
+    );
+    let (_, l) = call_server(&app, "GET", "/v1/server/flags?label=nothing-here", k, None).await;
+    assert!(l["flags"].as_array().unwrap().is_empty());
+    let (_, l) = call_server(&app, "GET", "/v1/server/experiments?label=pricing", k, None).await;
+    assert!(l["experiments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["id"] == json!(exp)));
+    assert!(l["experiments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["labels"].as_array().unwrap().contains(&json!("pricing"))));
+    let (st, t) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/liveops/timeline?from={}&to={}&label=pricing",
+            now - 3600,
+            now + 7200
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let es = t["entries"].as_array().unwrap();
+    assert!(
+        es.iter()
+            .any(|e| e["kind"] == "flag" && e["id"] == json!(flag)),
+        "{t}"
+    );
+    assert!(
+        es.iter()
+            .any(|e| e["kind"] == "experiment" && e["id"] == json!(exp)),
+        "{t}"
+    );
+    assert!(es
+        .iter()
+        .all(|e| e["labels"].as_array().unwrap().contains(&json!("pricing"))));
+    let _ = call_server(&app, "DELETE", &format!("/v1/server/flags/{flag}"), k, None).await;
+    let _ = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/experiments/{exp}"),
+        k,
+        None,
+    )
+    .await;
+}

@@ -35,6 +35,9 @@ pub struct Flag {
     pub default_value: Value,
     #[serde(default)]
     pub rules: Vec<FlagRule>,
+    /// Category labels (filter in lists, group in tooling).
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -74,6 +77,8 @@ pub struct Experiment {
     pub exclusion_group: Option<String>,
     #[serde(default)]
     pub metadata: Value,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 fn draft() -> String {
@@ -234,16 +239,17 @@ pub fn phase_at(
 // ---------------------------------------------------------------- loading
 
 const FLAG_SELECT: &str =
-    "select name, description, enabled, default_value, rules from musubi.flags";
-type FlagRow = (String, String, bool, Value, Value);
+    "select name, description, enabled, default_value, rules, labels from musubi.flags";
+type FlagRow = (String, String, bool, Value, Value, Value);
 
-fn flag_of((name, description, enabled, default_value, rules): FlagRow) -> Flag {
+fn flag_of((name, description, enabled, default_value, rules, labels): FlagRow) -> Flag {
     Flag {
         name,
         description,
         enabled,
         default_value,
         rules: serde_json::from_value(rules).unwrap_or_default(),
+        labels: serde_json::from_value(labels).unwrap_or_default(),
     }
 }
 
@@ -264,7 +270,7 @@ pub async fn load_flag(s: &AppState, name: &str) -> Result<Option<Flag>> {
     Ok(row.map(flag_of))
 }
 
-const EXP_SELECT: &str = "select id, name, description, status, audience, rollout_pct, variants, starts_at, ends_at, exclusion_group, metadata from musubi.experiments";
+const EXP_SELECT: &str = "select id, name, description, status, audience, rollout_pct, variants, starts_at, ends_at, exclusion_group, metadata, labels from musubi.experiments";
 type ExpRow = (
     String,
     String,
@@ -276,6 +282,7 @@ type ExpRow = (
     Option<i64>,
     Option<i64>,
     Option<String>,
+    Value,
     Value,
 );
 
@@ -292,6 +299,7 @@ fn exp_of(r: ExpRow) -> Experiment {
         ends_at,
         exclusion_group,
         metadata,
+        labels,
     ) = r;
     Experiment {
         id,
@@ -305,6 +313,7 @@ fn exp_of(r: ExpRow) -> Experiment {
         ends_at,
         exclusion_group,
         metadata,
+        labels: serde_json::from_value(labels).unwrap_or_default(),
     }
 }
 
