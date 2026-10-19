@@ -1,5 +1,6 @@
 mod account;
 pub mod admin;
+mod analytics;
 mod anticheat;
 pub mod audiences;
 mod auth;
@@ -230,6 +231,7 @@ pub fn router(state: AppState) -> Router {
         .merge(subscriptions::routes())
         .merge(liveops::routes())
         .merge(offers::routes())
+        .merge(analytics::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::hooks::before_after,

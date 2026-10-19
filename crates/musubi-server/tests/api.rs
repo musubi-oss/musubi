@@ -140,6 +140,7 @@ async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<Router> {
         ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
+        analytics: musubi_server::analytics::Analytics::new(db.clone(), Default::default()),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -18645,4 +18646,215 @@ async fn offers_and_placements_lifecycle() {
         None,
     )
     .await;
+}
+
+/// Product analytics (competitive P0-26/22/35): schema registry + sampling on ingest, raw export,
+/// KPI queries.
+#[tokio::test]
+async fn analytics_ingest_schemas_export_and_kpis() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, a) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("an-a")})),
+    )
+    .await;
+    let (ta, aid) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        a["account_id"].as_str().unwrap().to_string(),
+    );
+    let lvl = unique("level_up").replace('-', "_");
+    let noisy = unique("noisy").replace('-', "_");
+    let open = unique("app_open").replace('-', "_");
+    let (st, r) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/analytics/schemas/{lvl}"),
+        k,
+        Some(json!({"required": ["level"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/analytics/schemas/{noisy}"),
+        k,
+        Some(json!({"sampling_pct": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/analytics/schemas/{noisy}_bad"),
+        k,
+        Some(json!({"sampling_pct": 150})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let (st, rep) = call(&app, "POST", "/v1/telemetry/events", Some(&ta), Some(json!({
+        "device_id": "dev-1",
+        "events": [
+            {"name": open, "at": now - 10, "properties": {"build": "1.2.3"}, "session_id": "s1", "platform": "android", "country": "DE"},
+            {"name": lvl, "at": (now - 5) * 1000, "properties": {"level": 3}, "session_id": "s1"},
+            {"name": lvl, "properties": {}},
+            {"name": noisy, "properties": {"x": 1}},
+            {"name": "bad name!", "properties": {}}
+        ]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{rep}");
+    assert_eq!(rep["accepted"], 2, "{rep}");
+    assert_eq!(rep["sampled_out"], 1);
+    assert_eq!(rep["rejected"].as_array().unwrap().len(), 2);
+    assert_eq!(rep["rejected"][0]["reason"], "missing property level");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/anonymous",
+        None,
+        Some(json!({"device_id": "dev-2", "events": [{"name": open}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "no telemetry key configured");
+
+    let (st, ex) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/analytics/events?account_id={aid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ex}");
+    let evs = ex["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 2, "{ex}");
+    assert_eq!(evs[0]["name"], json!(open));
+    assert_eq!(evs[0]["at"], json!(now - 10));
+    assert_eq!(evs[0]["device_id"], "dev-1");
+    assert_eq!(evs[0]["country"], "DE");
+    assert_eq!(evs[1]["at"], json!(now - 5), "milliseconds normalised");
+    assert_eq!(evs[1]["properties"]["level"], 3);
+    assert!(ex["next_cursor"].is_string());
+    let (_, ex2) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/analytics/events?account_id={aid}&cursor={}",
+            ex["next_cursor"].as_str().unwrap()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(ex2["events"].as_array().unwrap().len(), 0);
+    let (_, ex3) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/analytics/events?name={lvl}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(ex3["events"].as_array().unwrap().len(), 1);
+
+    let (st, au) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/kpi/active_users?days=1",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{au}");
+    assert!(au["dau"].as_i64().unwrap() >= 1, "{au}");
+    assert!(au["mau"].as_i64().unwrap() >= au["dau"].as_i64().unwrap());
+    let (st, fu) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/analytics/kpi/funnel?steps={open},{lvl}&days=1"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{fu}");
+    assert_eq!(fu["steps"][0]["users"], 1, "{fu}");
+    assert_eq!(fu["steps"][1]["users"], 1, "{fu}");
+    assert_eq!(fu["steps"][1]["conversion_from_previous"], 1.0);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/kpi/funnel?steps=only_one",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, re) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/kpi/retention?days=7",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{re}");
+    assert!(
+        re["cohorts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["size"].as_i64().unwrap() >= 1),
+        "{re}"
+    );
+    let (st, rv) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/kpi/revenue?days=7",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rv}");
+    assert!(rv["daily"].is_array());
+    let (st, ec) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/kpi/events?days=1",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ec}");
+    assert!(
+        ec["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == json!(open) && e["count"].as_i64().unwrap() >= 1),
+        "{ec}"
+    );
+    let (st, fl) = call_server(&app, "POST", "/v1/server/analytics/flush", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{fl}");
+    let (_, sc) = call_server(&app, "GET", "/v1/server/analytics/schemas", k, None).await;
+    assert!(sc["schemas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["name"] == json!(lvl)));
+    for n in [lvl, noisy] {
+        let (_, d) = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/analytics/schemas/{n}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(d["removed"], true);
+    }
 }

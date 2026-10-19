@@ -30,6 +30,7 @@ pub struct Events {
         std::sync::Arc<std::sync::OnceLock<std::sync::Arc<musubi_integrations::ZanshinClient>>>,
     /// SMTP sink for `account.email_verification` / `account.password_reset`.
     mailer: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<musubi_integrations::Mailer>>>,
+    analytics: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::analytics::Analytics>>>,
 }
 
 /// Which events become mail: (template, to, subject, text).
@@ -99,6 +100,7 @@ impl Events {
                 .expect("reqwest client"),
             liveops: Default::default(),
             mailer: Default::default(),
+            analytics: Default::default(),
         }
     }
 
@@ -195,7 +197,15 @@ impl Events {
         .await
         .map_err(Error::internal)?;
         tx.commit().await.map_err(Error::internal)?;
+        if let Some(a) = self.analytics.get() {
+            a.push_domain(kind, account, payload);
+        }
         Ok(id)
+    }
+
+    /// Mirror domain events into analytics (`[analytics] mirror_domain_events`).
+    pub fn set_analytics(&self, a: std::sync::Arc<crate::analytics::Analytics>) {
+        let _ = self.analytics.set(a);
     }
 
     /// Deliver up to 50 due deliveries. Returns (delivered, failed).

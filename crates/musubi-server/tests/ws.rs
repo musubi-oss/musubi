@@ -212,6 +212,7 @@ async fn build_state_cfg_with(
         ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
+        analytics: musubi_server::analytics::Analytics::new(db.clone(), Default::default()),
         keys: Arc::new(musubi_server::keys::ServerKeys::default()),
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),

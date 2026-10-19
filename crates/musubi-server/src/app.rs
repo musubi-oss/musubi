@@ -87,6 +87,7 @@ pub struct AppStateInner {
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
     pub dev: Arc<crate::dev::DevTools>,
     pub liveops_cache: crate::runtime_host::LiveopsCache,
+    pub analytics: std::sync::Arc<crate::analytics::Analytics>,
     pub keys: Arc<crate::keys::ServerKeys>,
     pub logins: Arc<crate::logins::Social>,
     /// UGC blobs in object storage (`[ugc.s3]`); `None` keeps them in Postgres.
@@ -662,6 +663,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         tracing::info!(bucket = b.bucket(), "ugc blobs in object storage");
     }
     let compliance_cfg = cfg.compliance.clone();
+    let analytics = crate::analytics::Analytics::new(db.clone(), cfg.analytics.clone());
+    analytics.spawn_flusher();
     let state = AppState(Arc::new(AppStateInner {
         blobs,
         audit: crate::audit::Sink::new(&db),
@@ -674,6 +677,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             if let Some(m) = &mailer {
                 e.set_mailer(m.clone());
             }
+            e.set_analytics(analytics.clone());
             Arc::new(e)
         },
         banned: Arc::new(crate::bans::Bans::default()),
@@ -682,6 +686,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         anticheat: Arc::new(crate::anticheat::AntiCheat::new()),
         dev: Arc::new(crate::dev::DevTools::new()),
         liveops_cache: Default::default(),
+        analytics: analytics.clone(),
         keys: Arc::new(crate::keys::ServerKeys::default()),
         logins,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),

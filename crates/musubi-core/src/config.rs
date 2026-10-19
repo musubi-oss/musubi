@@ -41,6 +41,7 @@ pub struct Config {
     pub udp: UdpConfig,
     pub edge: EdgeConfig,
     pub zanshin: ZanshinConfig,
+    pub analytics: AnalyticsConfig,
     pub aurix: AurixConfig,
     pub iap: IapConfig,
     pub market: MarketConfig,
@@ -688,6 +689,56 @@ pub struct UdpConfig {
     pub secret: Option<String>,
 }
 
+/// Product analytics: client telemetry ingest (`POST /v1/telemetry/events`), KPIs and export
+/// sinks. `telemetry_keys` let pre-login clients send events (`X-Telemetry-Key` header).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsConfig {
+    pub enabled: bool,
+    pub telemetry_keys: Vec<String>,
+    /// Events per ingest request.
+    pub max_batch: usize,
+    /// Property payload cap per event, bytes.
+    pub max_event_bytes: usize,
+    /// Events without a registered schema: accept (`true`) or drop.
+    pub accept_unregistered: bool,
+    /// Also copy server-side domain events (`musubi.events`) into analytics + sinks.
+    pub mirror_domain_events: bool,
+    pub flush_secs: u64,
+    pub sinks: Vec<AnalyticsSink>,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            telemetry_keys: Vec::new(),
+            max_batch: 500,
+            max_event_bytes: 16 * 1024,
+            accept_unregistered: true,
+            mirror_domain_events: false,
+            flush_secs: 10,
+            sinks: Vec::new(),
+        }
+    }
+}
+
+/// Export sink: `jsonl` (rotating files in `path`, ship with any S3 sync), `clickhouse`
+/// (HTTP interface `url`, `INSERT INTO table FORMAT JSONEachRow`), `webhook` (batched JSON
+/// `POST url {events: [...]}` — Kafka REST proxy, Amplitude/Segment adapters, your own).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AnalyticsSink {
+    pub kind: String,
+    pub name: String,
+    pub path: Option<String>,
+    pub url: Option<String>,
+    pub table: Option<String>,
+    pub headers: std::collections::HashMap<String, String>,
+    /// Only these event names (empty = all).
+    pub names: Vec<String>,
+}
+
 /// Zanshin LiveOps (flags, experiments, analytics). Unset `url` = disabled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -1116,6 +1167,7 @@ impl Default for StorageConfig {
 pub struct RetentionConfig {
     pub interval_secs: u64,
     pub events_days: u64,
+    pub analytics_events_days: u64,
     /// Captured game server log lines (`musubi.server_logs`).
     pub server_logs_days: u64,
     /// Delivered or dead webhook deliveries.
@@ -1143,6 +1195,7 @@ impl Default for RetentionConfig {
         Self {
             interval_secs: 600,
             events_days: 30,
+            analytics_events_days: 90,
             server_logs_days: 7,
             deliveries_days: 7,
             audit_days: 90,
