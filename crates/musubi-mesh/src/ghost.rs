@@ -243,6 +243,7 @@ impl GhostCache {
                 cell: u.cell,
                 components: BTreeMap::new(),
                 persistent: u.persistent,
+                global: false,
                 transit: None,
                 attached_to: None,
                 handover_attempts: 0,

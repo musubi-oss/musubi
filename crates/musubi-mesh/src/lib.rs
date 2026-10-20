@@ -224,6 +224,10 @@ pub struct Entity {
     pub components: BTreeMap<String, Component>,
     /// Survives everyone leaving and cluster restarts (persistent entity streaming).
     pub persistent: bool,
+    /// Always relevant: delivered to every subscriber of the world whatever their interest
+    /// radius or cell (match state, world bosses, weather) — coherence "Is Global".
+    #[serde(default)]
+    pub global: bool,
     pub transit: Option<Transit>,
     /// Root of the group this entity belongs to (passenger → vehicle, part → construction): it
     /// never hands over on its own and moves cells together with the root (plan 4.5).
@@ -591,6 +595,9 @@ pub struct World {
     /// Last simulator granted each cell, kept after the lease lapses (who to tell about it).
     last_owners: HashMap<CellId, SimId>,
     interests: HashMap<ClientId, Interest>,
+    /// Tick of the last change to the set of always-relevant entities (flag flipped, global
+    /// despawned): every interest must rescan after it, whatever cells it watches.
+    globals_changed: u64,
     /// Inputs that arrived while the target entity was in transit; delivered to the new owner.
     buffered_inputs: HashMap<EntityId, Vec<serde_json::Value>>,
     /// Recent `(tick, pos)` samples per entity, newest last (lag compensation rewind).
@@ -621,6 +628,7 @@ impl World {
             last_owners: HashMap::new(),
             leases: HashMap::new(),
             interests: HashMap::new(),
+            globals_changed: 0,
             buffered_inputs: HashMap::new(),
             history: HashMap::new(),
             pins: HashMap::new(),
@@ -1001,6 +1009,13 @@ impl World {
             split: self.split.clone(),
             tick: self.tick,
             cfg: self.cfg.clone(),
+            globals: self
+                .entities
+                .values()
+                .filter(|e| e.global)
+                .map(|e| (e.id, e.cell))
+                .collect(),
+            globals_changed: self.globals_changed,
             entities: self.entities.clone(),
             by_cell: self.by_cell.clone(),
             cell_scale: self.cell_scale.clone(),
@@ -1180,6 +1195,7 @@ impl World {
                 .map(|(k, v)| (k, Component::new(v, 1, 1)))
                 .collect(),
             persistent,
+            global: false,
             transit: None,
             attached_to: None,
             handover_attempts: 0,
@@ -1237,6 +1253,9 @@ impl World {
         let Some(e) = self.entities.remove(&id) else {
             return false;
         };
+        if e.global {
+            self.globals_changed = self.tick;
+        }
         self.by_cell.remove(&e.cell, &id, self.tick);
         self.buffered_inputs.remove(&id);
         self.history.remove(&id);
@@ -1291,6 +1310,36 @@ impl World {
             }
             None => false,
         }
+    }
+
+    /// Flags the entity always-relevant (or back to radius-bound); every subscriber learns of
+    /// the change with its next delta.
+    pub fn set_global(&mut self, id: EntityId, global: bool) -> bool {
+        let tick = self.tick;
+        match self.entities.get_mut(&id) {
+            Some(e) => {
+                if e.global != global {
+                    e.global = global;
+                    e.changed_tick = tick;
+                    self.by_cell.mark(e.cell, e.id, tick);
+                    self.globals_changed = tick;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ids of the always-relevant entities, sorted.
+    pub fn globals(&self) -> Vec<EntityId> {
+        let mut v: Vec<EntityId> = self
+            .entities
+            .values()
+            .filter(|e| e.global)
+            .map(|e| e.id)
+            .collect();
+        v.sort();
+        v
     }
 
     /// Marks the entity as touched this tick (resets its decay clock).
@@ -2773,6 +2822,91 @@ mod tests {
     }
 
     #[test]
+    fn global_entities_reach_every_subscriber() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..Default::default()
+        });
+        let s1 = Uuid::now_v7();
+        for (x, y) in [(0, 0), (9, 9)] {
+            w.grant_lease(
+                CellId {
+                    x,
+                    y,
+                    level: 0,
+                    z: 0,
+                },
+                s1,
+            );
+        }
+        let c = Uuid::now_v7();
+        w.subscribe(c, at(5.0, 5.0), 20.0);
+        let boss = w.spawn(
+            at(950.0, 950.0),
+            comps(serde_json::json!({"hp": 100})),
+            false,
+        );
+        let litter = w.spawn(at(960.0, 960.0), BTreeMap::new(), false);
+        assert_eq!(
+            w.delta_for(c).unwrap(),
+            Delta::default(),
+            "far and radius-bound"
+        );
+        assert!(w.set_global(boss, true));
+        assert!(!w.set_global(Uuid::now_v7(), true));
+        assert_eq!(w.globals(), vec![boss]);
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(
+            d.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![boss],
+            "global boss arrives, litter stays invisible"
+        );
+        assert_eq!(w.delta_for(c).unwrap(), Delta::default());
+        // writes on the far global entity keep flowing
+        w.apply(s1, boss, None, comps(serde_json::json!({"hp": 90})))
+            .unwrap();
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(d.updated.len(), 1);
+        assert_eq!(d.updated[0].component("hp").unwrap().version, 2);
+        // a late subscriber gets it in its first delta
+        let c2 = Uuid::now_v7();
+        w.subscribe(c2, at(50.0, 50.0), 1.0);
+        let d = w.delta_for(c2).unwrap();
+        assert_eq!(
+            d.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![boss]
+        );
+        // the fine filter still applies to globals
+        let c3 = Uuid::now_v7();
+        w.subscribe_with(
+            c3,
+            at(50.0, 50.0),
+            1.0,
+            None,
+            comps(serde_json::json!({"team": "red"})),
+            1,
+        );
+        assert_eq!(w.delta_for(c3).unwrap(), Delta::default());
+        // back to radius-bound: it leaves the far client
+        assert!(w.set_global(boss, false));
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(d.despawned, vec![boss]);
+        assert!(w.globals().is_empty());
+        // and a global spawned later is picked up by the incremental path
+        w.set_global(litter, true);
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(
+            d.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![litter]
+        );
+        assert_eq!(w.delta_for(c).unwrap(), Delta::default());
+        // despawning a far global reaches the subscriber too
+        w.despawn(litter);
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(d.despawned, vec![litter]);
+    }
+
+    #[test]
     fn delta_budget_sends_nearest_first_and_catches_up() {
         let mut w = World::new(WorldConfig {
             cell_size: 1000.0,
@@ -3311,6 +3445,9 @@ fn grid_cells_in_radius(
 pub struct WorldView {
     pub tick: u64,
     pub cfg: WorldConfig,
+    /// Always-relevant entities and the cells they sit in (scanned for every interest).
+    globals: Vec<(EntityId, CellId)>,
+    globals_changed: u64,
     entities: HashMap<EntityId, Entity>,
     by_cell: CellIndex,
     cell_scale: HashMap<CellId, f64>,
@@ -3373,6 +3510,11 @@ impl WorldView {
             && cells
                 .iter()
                 .all(|c| self.by_cell.changed(c) < interest.last_delta_tick)
+            && self
+                .globals
+                .iter()
+                .all(|(_, c)| self.by_cell.changed(c) < interest.last_delta_tick)
+            && self.globals_changed < interest.last_delta_tick
         {
             return Some(Delta::default());
         }
@@ -3411,16 +3553,30 @@ impl WorldView {
             }
             v
         } else {
-            cells
+            let mut v: Vec<&Entity> = cells
                 .iter()
                 .filter_map(|c| self.by_cell.get(c))
                 .flatten()
                 .filter_map(|id| self.entities.get(id))
-                .collect()
+                .collect();
+            // always-relevant entities outside the interest's cells
+            for (id, c) in &self.globals {
+                if !cells.contains(c) {
+                    if let Some(e) = self.entities.get(id) {
+                        v.push(e);
+                    }
+                }
+            }
+            v
         };
         for e in scan {
-            let dist = e.pos.dist(&interest.pos);
-            let visible = dist <= interest.radius
+            // a global entity is as relevant as one standing on the client
+            let dist = if e.global {
+                0.0
+            } else {
+                e.pos.dist(&interest.pos)
+            };
+            let visible = (e.global || dist <= interest.radius)
                 && interest
                     .filter
                     .iter()

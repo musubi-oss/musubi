@@ -262,6 +262,7 @@ struct Queued {
     pos: Pos,
     components: std::collections::BTreeMap<String, Value>,
     persistent: bool,
+    global: bool,
     decay_ticks: Option<u64>,
     enqueued_tick: u64,
     /// (position, eta) last told to the simulator, to report only changes.
@@ -289,6 +290,8 @@ pub struct SpawnSpec {
     pub pos: Pos,
     pub components: Value,
     pub persistent: bool,
+    /// Always relevant: every subscriber of the world receives it whatever their interest.
+    pub global: bool,
     /// Despawn after this many ticks without a write, interaction or handover (litter).
     pub decay_ticks: Option<u64>,
     /// Wait in the cell's admission queue instead of failing on `soft_cap`.
@@ -355,6 +358,8 @@ pub enum WorldMutation {
         components: Value,
         #[serde(default)]
         decay_ticks: Option<u64>,
+        #[serde(default)]
+        global: bool,
     },
     Despawn {
         id: Uuid,
@@ -407,10 +412,12 @@ fn replay(
                 pos,
                 components,
                 decay_ticks,
+                global,
             } => {
                 if world.get(*id).is_none() {
                     world.spawn_with_id(*id, *pos, comps(components), true);
                     world.set_decay(*id, *decay_ticks);
+                    world.set_global(*id, *global);
                     src.insert(*id, node);
                 }
             }
@@ -2434,6 +2441,7 @@ impl WorldRegistry {
             pos,
             components,
             persistent,
+            global: false,
             decay_ticks: None,
             queue: false,
         };
@@ -2454,6 +2462,7 @@ impl WorldRegistry {
             pos,
             components,
             persistent,
+            global,
             decay_ticks,
             queue,
         } = spec;
@@ -2506,6 +2515,7 @@ impl WorldRegistry {
                 pos,
                 components: comps,
                 persistent,
+                global,
                 decay_ticks,
                 enqueued_tick: tick,
                 reported: (position, eta_ticks),
@@ -2523,7 +2533,7 @@ impl WorldRegistry {
                 eta_ticks,
             });
         }
-        let id = spawn_entity(st, pos, comps, persistent, decay_ticks);
+        let id = spawn_entity(st, pos, comps, persistent, global, decay_ticks);
         Ok(SpawnOutcome::Spawned(to_wire(st.world.get(id).unwrap())))
     }
 
@@ -2655,6 +2665,52 @@ impl WorldRegistry {
             });
         }
         Ok(())
+    }
+
+    /// Flags an owned entity always-relevant (coherence "Is Global"): every subscriber of the
+    /// world receives it regardless of interest radius or cell, until flagged back.
+    pub fn set_global(&self, name: &str, sim: Uuid, entity: &str, global: bool) -> Result<Value> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        let e = st
+            .world
+            .get(id)
+            .ok_or_else(|| Error::NotFound("entity".into()))?;
+        if st.world.owner(e.cell) != Some(sim) {
+            return Err(Error::PermissionDenied("not the owner".into()));
+        }
+        let (persistent, pos, decay_ticks, components) = (
+            e.persistent,
+            e.pos,
+            e.decay_ticks,
+            Value::Object(
+                e.components
+                    .iter()
+                    .map(|(k, c)| (k.clone(), c.value.clone()))
+                    .collect(),
+            ),
+        );
+        st.world.set_global(id, global);
+        if persistent {
+            // re-journal the spawn so a replay restores the flag
+            st.journal.push(WorldOp {
+                tick: st.world.tick,
+                source: Some(Provenance {
+                    by: "sim".into(),
+                    sim: Some(sim),
+                }),
+                op: WorldMutation::Spawn {
+                    id,
+                    pos,
+                    components,
+                    decay_ticks,
+                    global,
+                },
+            });
+        }
+        Ok(json!({ "entity": id, "global": global, "globals": st.world.globals().len() }))
     }
 
     /// `entity` rides with `root` from now on (plan 4.5): both must be owned by `sim`.
@@ -2858,6 +2914,7 @@ impl WorldRegistry {
             "owner": st.world.owner(cell),
             "owned": v.owned.iter().map(to_wire).collect::<Vec<_>>(),
             "ghosts": v.ghosts.iter().map(to_wire).collect::<Vec<_>>(),
+            "globals": st.world.globals(),
         }))
     }
 
@@ -3082,6 +3139,7 @@ impl WorldRegistry {
                     id,
                     pos: entity.pos,
                     decay_ticks: entity.decay_ticks,
+                    global: entity.global,
                     components: Value::Object(
                         entity
                             .components
@@ -4656,10 +4714,12 @@ fn spawn_entity(
     pos: Pos,
     comps: std::collections::BTreeMap<String, Value>,
     persistent: bool,
+    global: bool,
     decay_ticks: Option<u64>,
 ) -> EntityId {
     let id = st.world.spawn(pos, comps.clone(), persistent);
     st.world.set_decay(id, decay_ticks);
+    st.world.set_global(id, global);
     if persistent {
         st.journal.push(WorldOp {
             tick: st.world.tick,
@@ -4672,6 +4732,7 @@ fn spawn_entity(
                 pos,
                 components: Value::Object(comps.into_iter().collect()),
                 decay_ticks,
+                global,
             },
         });
     }
@@ -4752,6 +4813,7 @@ fn drain_admission(st: &mut WorldState) {
             };
             let id = st.world.spawn(e.pos, e.components.clone(), e.persistent);
             st.world.set_decay(id, e.decay_ticks);
+            st.world.set_global(id, e.global);
             if e.persistent {
                 st.journal.push(WorldOp {
                     tick,
@@ -4764,6 +4826,7 @@ fn drain_admission(st: &mut WorldState) {
                         pos: e.pos,
                         components: Value::Object(e.components.into_iter().collect()),
                         decay_ticks: e.decay_ticks,
+                        global: e.global,
                     },
                 });
             }

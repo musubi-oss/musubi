@@ -148,6 +148,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/spawn", post(spawn))
         .route("/v1/server/worlds/{w}/despawn", post(despawn))
         .route("/v1/server/worlds/{w}/attach", post(attach))
+        .route("/v1/server/worlds/{w}/global", post(set_global))
         .route("/v1/server/worlds/{w}/detach", post(detach))
         .route("/v1/server/worlds/{w}/apply", post(apply))
         .route("/v1/server/worlds/{w}/view/{x}/{y}", get(view))
@@ -212,12 +213,36 @@ struct SpawnReq {
     components: Value,
     #[serde(default)]
     persistent: bool,
+    /// Always relevant: delivered to every subscriber whatever their interest (bosses, match
+    /// state, weather).
+    #[serde(default)]
+    global: bool,
     /// Wait in the cell's admission queue instead of failing when `soft_cap` is reached.
     #[serde(default)]
     queue: bool,
     /// Despawn after this many ticks without a write, interaction or handover (litter).
     #[serde(default)]
     decay_ticks: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GlobalReq {
+    sim: Uuid,
+    entity: String,
+    global: bool,
+}
+
+async fn set_global(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Json(r): Json<GlobalReq>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let out: Result<Json<Value>, ApiError> =
+        async { Ok(Json(s.worlds.set_global(&w, r.sim, &r.entity, r.global)?)) }.await;
+    out.map_err(IntoResponse::into_response)
 }
 
 #[derive(Deserialize)]
@@ -475,6 +500,7 @@ async fn spawn(
                 },
                 components: r.components,
                 persistent: r.persistent,
+                global: r.global,
                 decay_ticks: r.decay_ticks,
                 queue: r.queue,
             },
@@ -818,6 +844,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                         pos,
                         components: r.components,
                         persistent: r.persistent,
+                        global: r.global,
                         decay_ticks: r.decay_ticks,
                         queue: r.queue,
                     },

@@ -20601,3 +20601,151 @@ async fn ugc_dependencies_and_collections() {
     .await;
     assert_eq!(r["count"], 1);
 }
+
+/// Always-relevant entities (coherence "Is Global"): a global entity reaches a subscriber whose
+/// interest is far away; flipping the flag off despawns it for that subscriber; only the owner
+/// may flip; cell views list globals.
+#[tokio::test]
+async fn world_global_entities_reach_far_subscribers() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let k = "defaultkey";
+    let world = format!("g{}", uuid::Uuid::now_v7().simple());
+    let call = |method: &'static str, path: String, body: Option<Value>| {
+        let router = router.clone();
+        async move {
+            let req = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/json");
+            let req = match body {
+                Some(b) => req.body(Body::from(b.to_string())).unwrap(),
+                None => req.body(Body::empty()).unwrap(),
+            };
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, _) = call(
+        "POST",
+        "/v1/server/worlds".into(),
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 5.0, "lease_ttl_ticks": 600}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let s1 = uuid::Uuid::now_v7();
+    let s2 = uuid::Uuid::now_v7();
+    for (sim, x, y) in [(s1, 0, 0), (s2, 9, 9)] {
+        let (st, _) = call(
+            "POST",
+            format!("/v1/server/worlds/{world}/lease"),
+            Some(json!({"sim": sim, "cells": [{"x": x, "y": y}]})),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    let f = "json";
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::WorldSubscribe {
+            world: world.clone(),
+            x: 5.0,
+            y: 5.0,
+            radius: 20.0,
+            budget_bytes: None,
+            filter: None,
+            max_hz: None,
+            unreliable_updates: false,
+        },
+    )
+    .await;
+    // plain far litter first: radius-bound, never delivered
+    let (st, _) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/spawn"),
+        Some(json!({"sim": s2, "x": 960.0, "y": 960.0, "components": {"kind": "litter"}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, e) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/spawn"),
+        Some(json!({"sim": s2, "x": 950.0, "y": 950.0, "components": {"hp": 100}, "global": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let boss: uuid::Uuid = e["id"].as_str().unwrap().parse().unwrap();
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { spawned, .. } => {
+            assert_eq!(spawned.iter().map(|e| e.id).collect::<Vec<_>>(), vec![boss]);
+            assert_eq!(spawned[0].components[0].name, "hp");
+        }
+        m => panic!("{m:?}"),
+    }
+    // writes on the far boss keep flowing
+    let (st, _) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/apply"),
+        Some(json!({"sim": s2, "entity": boss, "components": {"hp": 90}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { updated, .. } => {
+            assert_eq!(updated.len(), 1);
+            assert_eq!(updated[0].id, boss);
+        }
+        m => panic!("{m:?}"),
+    }
+    let (st, v) = call("GET", format!("/v1/server/worlds/{world}/view/9/9"), None).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["globals"], json!([boss]));
+    // only the owner flips the flag; unknown entity 404
+    let (st, _) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/global"),
+        Some(json!({"sim": s1, "entity": boss, "global": false})),
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, _) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/global"),
+        Some(json!({"sim": s2, "entity": uuid::Uuid::now_v7(), "global": false})),
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, v) = call(
+        "POST",
+        format!("/v1/server/worlds/{world}/global"),
+        Some(json!({"sim": s2, "entity": boss, "global": false})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["global"], false);
+    assert_eq!(v["globals"], 0);
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { despawned, .. } => {
+            assert_eq!(despawned, vec![boss]);
+        }
+        m => panic!("{m:?}"),
+    }
+    let (st, v) = call("GET", format!("/v1/server/worlds/{world}/view/9/9"), None).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["globals"], json!([]));
+}

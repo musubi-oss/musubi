@@ -1605,6 +1605,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("DELETE", "/v1/server/worlds/{w}", "worlds"),
     ("GET", "/v1/server/worlds/{w}", "worlds"),
     ("POST", "/v1/server/worlds/{w}/apply", "worlds"),
+    ("POST", "/v1/server/worlds/{w}/global", "worlds"),
     ("POST", "/v1/server/worlds/{w}/attach", "worlds"),
     ("POST", "/v1/server/worlds/{w}/despawn", "worlds"),
     ("POST", "/v1/server/worlds/{w}/detach", "worlds"),
