@@ -744,8 +744,11 @@ impl Runtime {
             })
             .map_err(Error::internal)?;
         let mut component_linker = wasmtime::component::Linker::new(&engine);
-        wit::Guest::add_to_linker(&mut component_linker, |s: &mut State| s)
-            .map_err(Error::internal)?;
+        wit::Guest::add_to_linker::<_, wasmtime::component::HasSelf<State>>(
+            &mut component_linker,
+            |s| s,
+        )
+        .map_err(Error::internal)?;
         Ok(Self {
             engine,
             linker,

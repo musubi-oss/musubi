@@ -6,8 +6,9 @@ const f = ref({ actor: '', method: '', path: '', since: '', status: '' })
 async function load(more = false) {
   loading.value = true; err.value = ''
   try {
-    const r = await get('/v1/admin/audit' + qs({ limit: 100, cursor: more ? cursor.value : undefined, actor: f.value.actor || undefined, method: f.value.method || undefined, path: f.value.path || undefined, since: f.value.since ? new Date(f.value.since).toISOString() : undefined }))
-    const list = (r.entries ?? []).filter((e: any) => !f.value.status || String(e.status).startsWith(f.value.status))
+    const r = await get('/v1/admin/audit' + qs({ limit: 100, cursor: more ? cursor.value : undefined, actor: f.value.actor || undefined, path_prefix: f.value.path || undefined }))
+    const since = f.value.since ? new Date(f.value.since).getTime() : 0
+    const list = (r.entries ?? []).filter((e: any) => (!f.value.status || String(e.status).startsWith(f.value.status)) && (!f.value.method || e.method === f.value.method) && (!since || new Date(e.at).getTime() >= since))
     rows.value = more ? [...rows.value, ...list] : list; cursor.value = r.cursor ?? null
   } catch (e: any) { err.value = e.message } finally { loading.value = false }
 }
@@ -15,7 +16,7 @@ onMounted(() => load())
 const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 19) : '—'
 </script>
 <template>
-  <div class="crumb"><span>Audit log</span><span class="id">{{ rows.length }} loaded{{ cursor ? ' · more available' : '' }}</span></div>
+  <div class="crumb"><span>Audit log</span><span class="id">{{ rows.length }} loaded{{ cursor ? ' · more available' : '' }} · actor and path filter server-side, method / since / status filter the loaded page</span></div>
   <p class="err" v-if="err">{{ err }}</p>
   <div class="card">
     <div class="filters" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">

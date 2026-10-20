@@ -23,7 +23,7 @@ function copy(s: string) { navigator.clipboard?.writeText(s); toast.show('copied
   <div class="card">
     <p class="note">Keys authenticate operators and servers on <code>x-musubi-server-key</code>. The secret is shown once at creation; revoking takes effect at once on every node. Limits throttle a key's requests per second.</p>
     <DataTable :cols="[{ key: 'name' }, { key: 'role' }, { key: 'subject', fmt: (r) => r.subject ?? '', dim: true }, { key: 'state', fmt: state }, { key: 'created_at', fmt: (r) => ts(r.created_at), dim: true }, { key: 'last_used_at', fmt: (r) => ts(r.last_used_at), dim: true }, { key: 'expires_at', fmt: (r) => ts(r.expires_at), dim: true }, { key: 'limit', fmt: (r) => r.limit ? `${r.limit.rps} rps / burst ${r.limit.burst}` : '—', dim: true }]" :rows="view">
-      <template #actions="{ row }"><template v-if="!row.revoked_at"><button class="btn s" @click="sel = row; dlg = 'limits'; form = { rps: row.limit?.rps ?? null, burst: row.limit?.burst ?? null }">Limits</button> <button class="btn s d" @click="ask(`Revoke key “${row.name}”? Clients using it stop working at once.`) && act(() => api('DELETE', `/v1/admin/keys/${row.id}`), 'revoked')">Revoke</button></template></template>
+      <template #actions="{ row }"><template v-if="!row.revoked_at"><button class="btn s" @click="sel = row; dlg = 'limits'; form = { rps: row.limit?.rps ?? null, burst: row.limit?.burst ?? null }">Limits</button> <button class="btn s" @click="ask(`Revoke key “${row.name}”? Clients using it stop working at once.`) && act(() => api('DELETE', `/v1/admin/keys/${row.id}`), 'revoked')">Revoke</button></template></template>
     </DataTable>
   </div>
   <Drawer v-if="dlg === 'new'" title="Create operator key" @close="dlg = ''"><div class="form">

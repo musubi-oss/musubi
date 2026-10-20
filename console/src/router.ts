@@ -59,12 +59,14 @@ export const router = createRouter({
     ]},
     { path: '/content', component: () => import('./pages/content/Index.vue'), children: [
       { path: '', component: () => import('./pages/content/Versions.vue') },
+      { path: 'bundles', component: () => import('./pages/content/Versions.vue') },
       { path: 'bundles/:id', component: () => import('./pages/content/Version.vue') },
       { path: 'modules/:name', component: () => import('./pages/content/Module.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.content.find((x) => x.id === r.params.page) ?? catalog.content[0] }) },
     ]},
     { path: '/settings', component: () => import('./pages/settings/Index.vue'), children: [
       { path: '', component: () => import('./pages/settings/Keys.vue') },
+      { path: 'keys', component: () => import('./pages/settings/Keys.vue') },
       { path: 'audit', component: () => import('./pages/settings/Audit.vue') },
       { path: 'operators', component: () => import('./pages/settings/Access.vue') },
       { path: 'invites', redirect: '/settings/operators' },

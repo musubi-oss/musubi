@@ -270,41 +270,28 @@ impl GeoIp {
         if self.is_stale(&db) {
             return None;
         }
-        let city: geoip2::City = db.reader.lookup(ip).ok()?;
+        let city: geoip2::City = db.reader.lookup(ip).ok()?.decode().ok()??;
         let country = city
             .country
-            .as_ref()
-            .and_then(|c| c.iso_code)
-            .or_else(|| city.registered_country.as_ref().and_then(|c| c.iso_code))?
+            .iso_code
+            .or(city.registered_country.iso_code)?
             .to_ascii_uppercase();
         let region = city
             .subdivisions
-            .as_ref()
-            .and_then(|s| s.first())
+            .first()
             .and_then(|s| s.iso_code)
             .unwrap_or("")
             .to_string();
-        let name_en = |names: &Option<std::collections::BTreeMap<&str, &str>>| {
-            names
-                .as_ref()
-                .and_then(|n| n.get("en").copied())
-                .unwrap_or("")
-                .to_string()
-        };
-        let city_name = city
-            .city
-            .as_ref()
-            .map(|c| name_en(&c.names))
-            .unwrap_or_default();
-        let loc = city.location.as_ref();
+        let city_name = city.city.names.english.unwrap_or("").to_string();
+        let loc = &city.location;
         Some(Location {
             country,
             region,
             city: city_name,
-            lat: loc.and_then(|l| l.latitude),
-            lon: loc.and_then(|l| l.longitude),
-            time_zone: loc.and_then(|l| l.time_zone).map(str::to_string),
-            accuracy_km: loc.and_then(|l| l.accuracy_radius),
+            lat: loc.latitude,
+            lon: loc.longitude,
+            time_zone: loc.time_zone.map(str::to_string),
+            accuracy_km: loc.accuracy_radius,
             source: "mmdb".into(),
         })
     }
