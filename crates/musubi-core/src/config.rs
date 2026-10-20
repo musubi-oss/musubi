@@ -2334,6 +2334,13 @@ pub struct FilesConfig {
     /// CDN origin fronting the files bucket; when set, public manifest URLs are `{base}/{path}`
     /// instead of `/v1/files/{path}`. Blobs live in `[ugc.s3]` (or Postgres when unset).
     pub public_base_url: String,
+    /// Largest per-player file (`PUT /v1/account/files/{key}`), bytes; 8 MiB unless set.
+    pub player_max_bytes: u64,
+    /// Files (keys) a player may keep; 100 unless set.
+    pub player_max_files: u32,
+    /// Revisions kept per player file (older ones are dropped; any kept one can be promoted back
+    /// to current); 5 unless set.
+    pub player_keep_revisions: u32,
 }
 
 impl Default for FilesConfig {
@@ -2341,6 +2348,9 @@ impl Default for FilesConfig {
         Self {
             max_bytes: 64 << 20,
             public_base_url: String::new(),
+            player_max_bytes: 8 << 20,
+            player_max_files: 100,
+            player_keep_revisions: 5,
         }
     }
 }

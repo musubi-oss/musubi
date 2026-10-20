@@ -37805,3 +37805,511 @@ async fn steam_openid2_browser_login_and_encrypted_app_tickets() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
 }
+
+/// Raw-body request with a bearer token (binary uploads); returns status, headers and body bytes.
+#[allow(clippy::too_many_arguments)]
+async fn call_bytes(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    server_key: Option<&str>,
+    content_type: &str,
+    body: Vec<u8>,
+    extra: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method(method).uri(path);
+    if let Some(t) = token {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    if let Some(k) = server_key {
+        req = req.header("x-musubi-server-key", k);
+    }
+    if !content_type.is_empty() {
+        req = req.header(header::CONTENT_TYPE, content_type);
+    }
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let headers = res.headers().clone();
+    let bytes = axum::body::to_bytes(res.into_body(), 64 << 20)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+async fn login(app: &Router) -> (String, String) {
+    let (st, s) = call(
+        app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("pf")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s}");
+    (
+        s["access_token"].as_str().unwrap().to_string(),
+        s["account_id"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn player_files_revisions_promote_public_and_server_access() {
+    let Some(app) = app_with(|c| {
+        c.files.player_max_bytes = 64;
+        c.files.player_max_files = 3;
+        c.files.player_keep_revisions = 2;
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let (t1, acc1) = login(&app).await;
+    let (t2, _acc2) = login(&app).await;
+    let js = |b: &[u8]| -> Value { serde_json::from_slice(b).unwrap_or(Value::Null) };
+
+    // validation: key, purpose, tags, metadata, size, empty body, no token
+    for (path, body, why) in [
+        ("/v1/account/files/a//b", b"x".to_vec(), "key //"),
+        ("/v1/account/files/../x", b"x".to_vec(), "key .."),
+        ("/v1/account/files/ok?purpose=Bad", b"x".to_vec(), "purpose"),
+        ("/v1/account/files/ok?tags=bad%20tag", b"x".to_vec(), "tag"),
+        (
+            "/v1/account/files/ok?metadata=[1]",
+            b"x".to_vec(),
+            "metadata",
+        ),
+        ("/v1/account/files/ok", vec![0u8; 65], "size"),
+        ("/v1/account/files/ok", vec![], "empty"),
+    ] {
+        let (st, _, b) = call_bytes(
+            &app,
+            "PUT",
+            path,
+            Some(&t1),
+            None,
+            "application/octet-stream",
+            body,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "{why}: {}",
+            String::from_utf8_lossy(&b)
+        );
+    }
+    let (st, _, _) = call_bytes(
+        &app,
+        "PUT",
+        "/v1/account/files/saves/slot1.bin",
+        None,
+        None,
+        "",
+        b"x".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // upload → revision 1, private by default
+    let (st, _, b) = call_bytes(&app, "PUT", "/v1/account/files/saves/slot1.bin?purpose=save&tags=Slot,slot&metadata=%7B%22level%22%3A3%7D",
+        Some(&t1), None, "application/x-save", b"save-v1".to_vec(), &[]).await;
+    let d = js(&b);
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["revision"], 1);
+    assert_eq!(d["latest_revision"], 1);
+    assert_eq!(d["public"], false);
+    assert_eq!(d["purpose"], "save");
+    assert_eq!(d["tags"], json!(["slot"]));
+    assert_eq!(d["metadata"]["level"], 3);
+    assert_eq!(d["mime"], "application/x-save");
+    assert_eq!(d["size"], 7);
+    assert!(d["url"].is_null(), "{d}");
+    assert_eq!(d["storage"], "db");
+    // download current: body, headers, 304 on ETag
+    let (st, h, b) = call_bytes(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin",
+        Some(&t1),
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, b"save-v1");
+    assert_eq!(h["content-type"], "application/x-save");
+    assert_eq!(h["x-musubi-file-revision"], "1");
+    assert_eq!(h["content-disposition"], "inline; filename=\"slot1.bin\"");
+    assert_eq!(h["cache-control"], "private, no-store");
+    let etag = h["etag"].to_str().unwrap().to_string();
+    let (st, _, _) = call_bytes(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin",
+        Some(&t1),
+        None,
+        "",
+        vec![],
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_MODIFIED);
+    // re-uploads: revisions 2, 3 — keep 2 → revision 1 pruned; metadata merged, tags kept, purpose kept
+    for (i, body) in [(2, "save-v2"), (3, "save-v3")] {
+        let (st, _, b) = call_bytes(
+            &app,
+            "PUT",
+            "/v1/account/files/saves/slot1.bin?metadata=%7B%22n%22%3A1%7D",
+            Some(&t1),
+            None,
+            "",
+            body.as_bytes().to_vec(),
+            &[],
+        )
+        .await;
+        let d = js(&b);
+        assert_eq!(st, StatusCode::OK, "{d}");
+        assert_eq!(d["revision"], i);
+        assert_eq!(d["purpose"], "save");
+        assert_eq!(d["tags"], json!(["slot"]));
+        assert_eq!(d["metadata"]["level"], 3);
+        assert_eq!(d["metadata"]["n"], 1);
+    }
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin?revisions=1",
+        Some(&t1),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["current_revision"], 3);
+    let revs: Vec<i64> = v["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["revision"].as_i64().unwrap())
+        .collect();
+    assert_eq!(revs, vec![3, 2], "{v}");
+    assert_eq!(v["revisions"][0]["current"], true);
+    assert_eq!(v["revisions"][1]["by"], "client");
+    let (st, _, b) = call_bytes(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin?revision=2",
+        Some(&t1),
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, b"save-v2");
+    let (st, _, _) = call_bytes(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin?revision=1",
+        Some(&t1),
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "pruned revision");
+    // promote revision 2 back to current (kept revisions untouched); unknown revision → 404
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        "/v1/account/files/saves/slot1.bin",
+        Some(&t1),
+        Some(json!({"current_revision": 9})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        "/v1/account/files/saves/slot1.bin",
+        Some(&t1),
+        Some(json!({"current_revision": 2, "metadata": {"level": null, "cloud": true}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["revision"], 2);
+    assert_eq!(v["latest_revision"], 3);
+    assert_eq!(v["size"], 7);
+    assert!(v["metadata"].get("level").is_none(), "{v}");
+    assert_eq!(v["metadata"]["cloud"], true);
+    let (_, _, b) = call_bytes(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin",
+        Some(&t1),
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(b, b"save-v2");
+    // meta view + list filters
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin?meta=1",
+        Some(&t1),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["key"], "saves/slot1.bin");
+    let (st, _, _) = call_bytes(
+        &app,
+        "PUT",
+        "/v1/account/files/shots/1.png?purpose=screenshot&public=true&tags=hd",
+        Some(&t1),
+        None,
+        "image/png",
+        b"PNG".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call(&app, "GET", "/v1/account/files", Some(&t1), None).await;
+    assert_eq!(v["files"].as_array().unwrap().len(), 2, "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/account/files?purpose=screenshot",
+        Some(&t1),
+        None,
+    )
+    .await;
+    assert_eq!(v["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["files"][0]["url"],
+        format!("/v1/accounts/{acc1}/files/shots/1.png")
+    );
+    let (_, v) = call(&app, "GET", "/v1/account/files?tag=SLOT", Some(&t1), None).await;
+    assert_eq!(v["files"].as_array().unwrap().len(), 1);
+    assert_eq!(v["files"][0]["key"], "saves/slot1.bin");
+    // quota: 3 keys max
+    let (st, _, _) = call_bytes(
+        &app,
+        "PUT",
+        "/v1/account/files/c",
+        Some(&t1),
+        None,
+        "",
+        b"c".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, b) = call_bytes(
+        &app,
+        "PUT",
+        "/v1/account/files/d",
+        Some(&t1),
+        None,
+        "",
+        b"d".to_vec(),
+        &[],
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "quota: {}", String::from_utf8_lossy(&b));
+    assert!(String::from_utf8_lossy(&b).contains("quota"));
+
+    // other players: public files only, private ones look absent
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/accounts/{acc1}/files"),
+        Some(&t2),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["files"].as_array().unwrap().len(), 1);
+    assert_eq!(v["files"][0]["key"], "shots/1.png");
+    let (st, h, b) = call_bytes(
+        &app,
+        "GET",
+        &format!("/v1/accounts/{acc1}/files/shots/1.png"),
+        Some(&t2),
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, b"PNG");
+    assert_eq!(h["cache-control"], "public, max-age=60");
+    let (st, _, _) = call_bytes(
+        &app,
+        "GET",
+        &format!("/v1/accounts/{acc1}/files/saves/slot1.bin"),
+        Some(&t2),
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = call_bytes(
+        &app,
+        "GET",
+        &format!("/v1/accounts/{acc1}/files/shots/1.png"),
+        None,
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call(
+        &app,
+        "GET",
+        "/v1/accounts/not-a-uuid/files",
+        Some(&t2),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // flip to private → gone for others; owner still sees it
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        "/v1/account/files/shots/1.png",
+        Some(&t1),
+        Some(json!({"public": false, "tags": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["tags"], json!([]));
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/accounts/{acc1}/files"),
+        Some(&t2),
+        None,
+    )
+    .await;
+    assert_eq!(v["files"].as_array().unwrap().len(), 0);
+
+    // server: sees private files, writes revisions as `server`, promotes, deletes; 404 on unknown account
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{acc1}/files"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["files"].as_array().unwrap().len(), 3);
+    let (st, _, b) = call_bytes(
+        &app,
+        "PUT",
+        &format!("/v1/server/accounts/{acc1}/files/saves/slot1.bin"),
+        None,
+        Some(k),
+        "",
+        b"save-v4".to_vec(),
+        &[],
+    )
+    .await;
+    let d = js(&b);
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["revision"], 4);
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{acc1}/files/saves/slot1.bin?revisions=1"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(v["revisions"][0]["by"], "server", "{v}");
+    assert_eq!(v["revisions"].as_array().unwrap().len(), 2, "{v}");
+    let (st, _, b) = call_bytes(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{acc1}/files/saves/slot1.bin"),
+        None,
+        Some(k),
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, b"save-v4");
+    let (st, _, _) = call_bytes(
+        &app,
+        "PUT",
+        &format!("/v1/server/accounts/{}/files/x", uuid::Uuid::now_v7()),
+        None,
+        Some(k),
+        "",
+        b"x".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "unknown account");
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/accounts/{acc1}/files/c"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(&app, "DELETE", "/v1/account/files/c", Some(&t1), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // owner deletes; revisions go with it
+    let (st, v) = call(
+        &app,
+        "DELETE",
+        "/v1/account/files/saves/slot1.bin",
+        Some(&t1),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _, _) = call_bytes(
+        &app,
+        "GET",
+        "/v1/account/files/saves/slot1.bin?revision=4",
+        Some(&t1),
+        None,
+        "",
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call(&app, "GET", "/v1/account/files", Some(&t1), None).await;
+    assert_eq!(v["files"].as_array().unwrap().len(), 1, "{v}");
+}

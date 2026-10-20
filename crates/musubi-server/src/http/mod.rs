@@ -58,6 +58,7 @@ mod offers;
 mod parties;
 mod passkeys;
 pub mod placements;
+mod player_files;
 pub mod push;
 pub mod qa_clock;
 pub mod rating;
@@ -300,6 +301,7 @@ pub fn router(state: AppState) -> Router {
         .merge(module_routes::routes())
         .merge(remote_config::routes())
         .merge(files::routes())
+        .merge(player_files::routes())
         .merge(codes::routes())
         .merge(legal::routes())
         .merge(parties::routes())
