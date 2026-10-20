@@ -19,6 +19,13 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/telemetry/anonymous", post(ingest_anonymous))
         .route("/v1/telemetry/sampling", get(client_sampling))
         .route("/v1/account/event_properties", get(my_event_props))
+        .route("/v1/telemetry/attribution", post(attribute))
+        .route("/v1/account/attribution", get(my_attribution))
+        .route(
+            "/v1/server/accounts/{id}/attribution",
+            get(account_attribution).delete(forget_attribution),
+        )
+        .route("/v1/server/analytics/attribution", get(attribution_cohorts))
         .route(
             "/v1/server/accounts/{id}/event_properties",
             get(account_event_props).delete(reset_event_props),
@@ -402,4 +409,132 @@ async fn reset_event_prop(
         return Err(Error::NotFound(format!("event {event} never seen for this account")).into());
     }
     Ok(Json(json!({ "deleted": n })))
+}
+
+/// `POST /v1/telemetry/attribution {source, medium, campaign, content, term, network, click_id,
+/// installed_at}` — a UA touch (install referrer, MMP postback relayed by the client, deep link).
+/// First touch stays, last touch follows; mirrored as a `platform_ua_attribution` analytics event.
+async fn attribute(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(obj) = body.as_object() else {
+        return Err(Error::InvalidArgument("body must be an object".into()).into());
+    };
+    let mut touch = serde_json::Map::new();
+    for (k, v) in obj {
+        if !crate::analytics::ATTRIBUTION_KEYS.contains(&k.as_str()) {
+            return Err(Error::InvalidArgument(format!(
+                "unknown attribution key {k}; allowed: {}",
+                crate::analytics::ATTRIBUTION_KEYS.join(", ")
+            ))
+            .into());
+        }
+        let Some(sv) = v.as_str() else {
+            return Err(Error::InvalidArgument(format!("{k} must be a string")).into());
+        };
+        let sv = sv.trim();
+        if sv.is_empty() || sv.len() > 256 {
+            return Err(Error::InvalidArgument(format!("{k} must be 1..=256 chars")).into());
+        }
+        touch.insert(k.clone(), json!(sv));
+    }
+    if !touch.contains_key("source") && !touch.contains_key("campaign") {
+        return Err(Error::InvalidArgument("source or campaign is required".into()).into());
+    }
+    let touch = Value::Object(touch);
+    let doc = s.analytics.attribute(me.account_id.0, &touch).await?;
+    s.analytics.push_domain(
+        "platform_ua_attribution",
+        Some(me.account_id),
+        touch.clone(),
+    );
+    s.events
+        .emit("account.attributed", Some(me.account_id), touch)
+        .await;
+    Ok(Json(doc))
+}
+
+async fn my_attribution(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        s.analytics
+            .attribution(me.account_id.0)
+            .await?
+            .unwrap_or_else(|| json!({ "account_id": me.account_id.0, "first": null, "last": null, "touches": 0 })),
+    ))
+}
+
+async fn account_attribution(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    account_exists(&s, id).await?;
+    match s.analytics.attribution(id).await? {
+        Some(v) => Ok(Json(v)),
+        None => Err(Error::NotFound("no attribution recorded for this account".into()).into()),
+    }
+}
+
+async fn forget_attribution(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    account_exists(&s, id).await?;
+    if !s.analytics.forget_attribution(id).await? {
+        return Err(Error::NotFound("no attribution recorded for this account".into()).into());
+    }
+    Ok(Json(json!({ "deleted": true })))
+}
+
+#[derive(Deserialize, Default)]
+struct CohortQ {
+    group_by: Option<String>,
+    touch: Option<String>,
+    since: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `GET /v1/server/analytics/attribution?group_by=source|medium|campaign|network|content|term&touch=first|last&since&limit`
+async fn attribution_cohorts(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Query(q): Query<CohortQ>,
+) -> Result<Json<Value>, ApiError> {
+    let group_by = q.group_by.unwrap_or_else(|| "campaign".into());
+    if !["source", "medium", "campaign", "content", "term", "network"].contains(&group_by.as_str())
+    {
+        return Err(Error::InvalidArgument(
+            "group_by must be source|medium|campaign|content|term|network".into(),
+        )
+        .into());
+    }
+    let touch = q.touch.unwrap_or_else(|| "first".into());
+    if !["first", "last"].contains(&touch.as_str()) {
+        return Err(Error::InvalidArgument("touch must be first|last".into()).into());
+    }
+    let since = q
+        .since
+        .as_deref()
+        .map(|t| {
+            time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| Error::InvalidArgument("since must be RFC 3339".into()))
+        })
+        .transpose()?;
+    let limit = q.limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err(Error::InvalidArgument("limit must be 1..=1000".into()).into());
+    }
+    let groups = s
+        .analytics
+        .attribution_cohorts(&group_by, &touch, since, limit)
+        .await?;
+    Ok(Json(
+        json!({ "group_by": group_by, "touch": touch, "groups": groups }),
+    ))
 }

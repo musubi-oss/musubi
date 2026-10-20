@@ -70,6 +70,31 @@ pub struct IngestReport {
 }
 
 /// A stored / exported event.
+type AttributionRow = (Uuid, Value, OffsetDateTime, Value, OffsetDateTime, i32);
+
+fn attribution_doc(r: &AttributionRow) -> Value {
+    let rfc = |t: OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    };
+    json!({
+        "account_id": r.0, "first": r.1, "first_at": rfc(r.2),
+        "last": r.3, "last_at": rfc(r.4), "touches": r.5,
+    })
+}
+
+/// Allowed UA touch keys; values are short strings.
+pub const ATTRIBUTION_KEYS: [&str; 8] = [
+    "source",
+    "medium",
+    "campaign",
+    "content",
+    "term",
+    "network",
+    "click_id",
+    "installed_at",
+];
+
 type EventPropRow = (
     String,
     i64,
@@ -595,6 +620,73 @@ impl Analytics {
         .await
         .map(|r| r.rows_affected())
         .map_err(Error::internal)
+    }
+
+    /// Record a UA touch for an account: the first touch is immutable, the last touch follows,
+    /// `touches` counts. Returns the stored row.
+    pub async fn attribute(&self, account: Uuid, touch: &Value) -> Result<Value> {
+        let row: AttributionRow = sqlx::query_as(
+            "insert into musubi.account_attribution (account_id, first, last)
+             values ($1, $2, $2)
+             on conflict (account_id) do update set last = excluded.last, last_at = now(),
+                touches = musubi.account_attribution.touches + 1
+             returning account_id, first, first_at, last, last_at, touches",
+        )
+        .bind(account)
+        .bind(touch)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(attribution_doc(&row))
+    }
+
+    pub async fn attribution(&self, account: Uuid) -> Result<Option<Value>> {
+        let row: Option<AttributionRow> = sqlx::query_as(
+            "select account_id, first, first_at, last, last_at, touches
+             from musubi.account_attribution where account_id = $1",
+        )
+        .bind(account)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.as_ref().map(attribution_doc))
+    }
+
+    pub async fn forget_attribution(&self, account: Uuid) -> Result<bool> {
+        sqlx::query("delete from musubi.account_attribution where account_id = $1")
+            .bind(account)
+            .execute(&self.db)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .map_err(Error::internal)
+    }
+
+    /// Accounts per `group_by` value of the first (or last) touch since `since` (by touch time).
+    pub async fn attribution_cohorts(
+        &self,
+        group_by: &str,
+        touch: &str,
+        since: Option<OffsetDateTime>,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let (col, at) = match touch {
+            "last" => ("last", "last_at"),
+            _ => ("first", "first_at"),
+        };
+        let rows: Vec<(Option<String>, i64)> = sqlx::query_as(&format!(
+            "select {col}->>'{group_by}', count(*) from musubi.account_attribution
+             where $1::timestamptz is null or {at} >= $1
+             group by 1 order by 2 desc, 1 limit $2"
+        ))
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(k, n)| json!({ group_by: k, "accounts": n }))
+            .collect())
     }
 
     /// Copy of a server-side domain event (when `mirror_domain_events`).

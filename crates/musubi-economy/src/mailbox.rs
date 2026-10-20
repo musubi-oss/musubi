@@ -61,6 +61,8 @@ pub struct Audience {
     pub exclude: Vec<Uuid>,
     /// Telemetry-derived rules on `player_event_props` (count / value aggregates / recency).
     pub events: Vec<EventRule>,
+    /// UA attribution: the account's first (default) or last touch matches every listed value set.
+    pub attribution: Option<AttributionRule>,
     /// Algebra: at least one of `any` holds, every one of `all` holds, `not` does not hold.
     pub any: Vec<Audience>,
     pub all: Vec<Audience>,
@@ -81,6 +83,71 @@ pub struct EventRule {
     pub seen_within_days: Option<i64>,
     pub not_seen_days: Option<i64>,
     pub never: bool,
+}
+
+/// Match on `account_attribution`: every non-empty list must contain the touch's value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AttributionRule {
+    pub source: Vec<String>,
+    pub medium: Vec<String>,
+    pub campaign: Vec<String>,
+    pub network: Vec<String>,
+    /// `first` (default) or `last`.
+    pub touch: Option<String>,
+}
+
+impl AttributionRule {
+    fn validate(&self) -> Result<()> {
+        if self
+            .touch
+            .as_deref()
+            .is_some_and(|t| !["first", "last"].contains(&t))
+        {
+            return Err(Error::InvalidArgument(
+                "attribution.touch must be first|last".into(),
+            ));
+        }
+        let lists = [&self.source, &self.medium, &self.campaign, &self.network];
+        if lists.iter().all(|l| l.is_empty()) {
+            return Err(Error::InvalidArgument(
+                "attribution needs at least one of source/medium/campaign/network".into(),
+            ));
+        }
+        if lists
+            .iter()
+            .any(|l| l.len() > 64 || l.iter().any(|v| v.is_empty() || v.len() > 256))
+        {
+            return Err(Error::InvalidArgument(
+                "attribution lists: <= 64 values of 1..=256 chars".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn push(&self, qb: &mut QueryBuilder<'_, Postgres>) {
+        let col = if self.touch.as_deref() == Some("last") {
+            "last"
+        } else {
+            "first"
+        };
+        qb.push(
+            " and exists (select 1 from musubi.account_attribution t where t.account_id = a.id",
+        );
+        for (key, vals) in [
+            ("source", &self.source),
+            ("medium", &self.medium),
+            ("campaign", &self.campaign),
+            ("network", &self.network),
+        ] {
+            if !vals.is_empty() {
+                qb.push(format!(" and t.{col}->>'{key}' = any("))
+                    .push_bind(vals.clone())
+                    .push(")");
+            }
+        }
+        qb.push(")");
+    }
 }
 
 const EVENT_FIELDS: [&str; 6] = [
@@ -174,6 +241,9 @@ impl Audience {
         for e in &self.events {
             e.validate()?;
         }
+        if let Some(a) = &self.attribution {
+            a.validate()?;
+        }
         if (self.min_level.is_some() || self.max_level.is_some()) && self.track.is_none() {
             return Err(Error::InvalidArgument(
                 "min_level/max_level need track".into(),
@@ -264,6 +334,7 @@ impl Audience {
             && self.bucket_min.is_none()
             && self.bucket_max.is_none()
             && self.events.is_empty()
+            && self.attribution.is_none()
             && self.any.is_empty()
             && self.all.is_empty()
             && self.not.is_none())
@@ -342,6 +413,9 @@ impl Audience {
         }
         for e in &self.events {
             e.push(qb, now);
+        }
+        if let Some(a) = &self.attribution {
+            a.push(qb);
         }
         if !self.any.is_empty() {
             qb.push(" and (");

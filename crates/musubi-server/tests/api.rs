@@ -42838,3 +42838,265 @@ async fn referral_programs_invite_redeem_milestones_and_void() {
     let (st, _) = call(&app, "GET", "/v1/referrals", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// UA attribution (Beamable `platform_ua_attribution` parity): first touch is kept, last touch
+/// follows, cohorts per campaign for the operator, audiences can target a source/campaign.
+#[tokio::test]
+async fn ua_attribution_first_last_touch_cohorts_and_audience() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("ua")})),
+    )
+    .await;
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let camp = unique("camp").replace('-', "_");
+
+    let (st, v) = call(&app, "GET", "/v1/account/attribution", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["touches"], 0);
+    assert!(v["first"].is_null());
+    for body in [
+        json!([]),
+        json!({"medium": "cpc"}),
+        json!({"source": "", "campaign": camp}),
+        json!({"source": 1}),
+        json!({"source": "x", "weird": "y"}),
+        json!({"source": "y".repeat(300)}),
+    ] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/telemetry/attribution",
+            Some(&tok),
+            Some(body),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call(&app, "POST", "/v1/telemetry/attribution", Some(&tok), Some(json!({
+        "source": "tiktok", "medium": "cpc", "campaign": camp, "network": "tiktok_ads", "click_id": "abc"
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["touches"], 1);
+    assert_eq!(v["first"]["campaign"], camp);
+    assert_eq!(v["last"]["source"], "tiktok");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/attribution",
+        Some(&tok),
+        Some(json!({
+            "source": "organic", "campaign": format!("{camp}_retarget")
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["touches"], 2);
+    assert_eq!(
+        v["first"]["source"], "tiktok",
+        "first touch is immutable: {v}"
+    );
+    assert_eq!(v["last"]["source"], "organic");
+    assert!(v["first_at"].as_str().unwrap() <= v["last_at"].as_str().unwrap());
+
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{me}/attribution"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["first"]["network"], "tiktok_ads");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{}/attribution", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // cohorts by first-touch campaign / last-touch source
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/attribution?group_by=campaign",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["campaign"] == camp && g["accounts"] == 1),
+        "{v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/attribution?group_by=source&touch=last",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["source"] == "organic"),
+        "{v}"
+    );
+    for q in [
+        "group_by=weird",
+        "touch=middle",
+        "since=yesterday",
+        "limit=0",
+    ] {
+        let (st, _) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/analytics/attribution?{q}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{q}");
+    }
+
+    // audience rule on attribution
+    let sfx = unique("").replace('-', "_");
+    for rules in [
+        json!({"attribution": {}}),
+        json!({"attribution": {"source": ["tiktok"], "touch": "middle"}}),
+        json!({"attribution": {"source": [""]}}),
+    ] {
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/server/audiences/bad_{sfx}"),
+            k,
+            Some(json!({"rules": rules})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{rules} {v}");
+    }
+    let tt = format!("tiktok_{sfx}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{tt}"),
+        k,
+        Some(json!({"rules": {"attribution": {"source": ["tiktok"], "campaign": [camp]}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 1, "{v}");
+    let org = format!("organic_{sfx}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{org}"),
+        k,
+        Some(json!({"rules": {"attribution": {"source": ["organic"]}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let org_last = format!("organic_last_{sfx}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{org_last}"),
+        k,
+        Some(json!({"rules": {"attribution": {"source": ["organic"], "touch": "last"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{me}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mine: Vec<&str> = v["audiences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a.as_str())
+        .collect();
+    assert!(mine.contains(&tt.as_str()), "{v}");
+    assert!(!mine.contains(&org.as_str()), "first touch is tiktok: {v}");
+    assert!(mine.contains(&org_last.as_str()), "{v}");
+
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=account.attributed&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["payload"]["campaign"] == camp || e["data"]["campaign"] == camp),
+        "{ev}"
+    );
+
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/accounts/{me}/attribution"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/accounts/{me}/attribution"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/attribution",
+        None,
+        Some(json!({"source": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    for a in [&tt, &org, &org_last] {
+        let _ = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/audiences/{a}"),
+            k,
+            None,
+        )
+        .await;
+    }
+}
