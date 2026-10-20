@@ -771,6 +771,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/analytics/geo", "analytics"),
     ("GET", "/v1/server/analytics/sinks", "analytics"),
     ("POST", "/v1/server/analytics/sinks/flush", "analytics"),
+    ("GET", "/console", "system"),
+    ("GET", "/console/{*path}", "system"),
     ("GET", "/v1/server/edge", "edge"),
     ("POST", "/v1/server/edge/block", "edge"),
     ("POST", "/v1/server/edge/unblock", "edge"),

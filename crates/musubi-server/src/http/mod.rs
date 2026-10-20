@@ -19,6 +19,7 @@ mod cluster;
 mod codes;
 pub mod config_sources;
 pub mod configs;
+pub mod console;
 pub mod content;
 pub mod content_tags;
 pub mod countries;
@@ -262,6 +263,7 @@ pub fn router(state: AppState) -> Router {
         .merge(qa_clock::router())
         .merge(countries::router())
         .merge(edge_guard::router())
+        .merge(console::routes())
         .merge(config_sources::router())
         .merge(build_artifacts::router())
         .merge(placements::router())

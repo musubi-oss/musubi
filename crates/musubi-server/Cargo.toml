@@ -73,6 +73,7 @@ maxminddb.workspace = true
 tar.workspace = true
 flate2.workspace = true
 hex.workspace = true
+include_dir.workspace = true
 
 jsonwebtoken.workspace = true
 opentelemetry.workspace = true

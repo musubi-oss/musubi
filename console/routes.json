@@ -1,0 +1,4032 @@
+[
+{
+"m": "GET",
+"p": "/v1/admin/debug/profile",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/admin/idl",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/idl",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/idl",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/configs",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/server/configs/{name}",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/configs/{name}",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/files",
+"tag": "server"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/files/{*key}",
+"tag": "server"
+},
+{
+"m": "PUT",
+"p": "/v1/server/accounts/{id}/files/{*key}",
+"tag": "server"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/accounts/{id}/files/{*key}",
+"tag": "server"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/accounts/{id}/files/{*key}",
+"tag": "server"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/policy",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/accounts/policy",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/lookup",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/dormant/sweep",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/auth/locks/{email}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/auth/queue",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/auth/queue",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/auth/locks/{email}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/accounts/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}",
+"tag": "admin"
+},
+{
+"m": "PATCH",
+"p": "/v1/admin/accounts/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/{id}/ban",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/baggage",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/server/accounts/{id}/baggage/{scope}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/accounts/{id}/baggage/{scope}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/developers",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/developer",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/accounts/{id}/developer",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/accounts/{id}/developer",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/ban",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/export",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/{id}/restore",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/deletions",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/deletions/import",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/deletions/sweep",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/logs",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/logs/nodes",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/deletions/{id}/lift",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/limits",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/accounts/{id}/limits",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/accounts/{id}/limits",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/keys/{id}/limits",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/accounts/{id}/identities/{provider}/{subject}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/{id}/kick",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/sessions",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/{id}/unban",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/bans",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/{id}/sanctions",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/sanctions",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/sanctions",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/sanctions/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/sanctions/{id}/approve",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/sanctions/{id}/reject",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/sanctions/{id}/revoke",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/appeals",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/appeals/{id}/decide",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/sanctions",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/sanctions/sync",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/bans/check",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/bans/rules",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/bans/rules",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/bans/rules/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/bans/reasons",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/bans/reasons/{code}",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/bans/reasons/{code}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/bans/reasons/{code}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/devices",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/ips",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/{id}/ban/devices",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/security_events",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/audit",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/cluster/matches",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/cluster/nodes/{id}/drain",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/cluster/worlds",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/config",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/content",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/content/import",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/content/versions",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/content/versions/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/content/versions/{id}/rollback",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/content/tags",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/content/tags",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/content/tags/{tag}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/changesets",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/changesets",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/changesets/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/economy/changesets/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/economy/changesets/{id}/changes",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/economy/changesets/{id}/changes/{table}/{key}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/changesets/{id}/diff",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/changesets/{id}/validate",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/changesets/{id}/preview",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/changesets/{id}/submit",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/changesets/{id}/approve",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/changesets/{id}/reject",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/changesets/{id}/publish",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/changesets/{id}/cancel",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/strings",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/strings/csv",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/strings/csv",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/economy/strings/{kind}/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/economy/strings/{kind}/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/economy/strings/{kind}/{id}/{locale}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/admin/environments",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/environments/{name}",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/environments/{name}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/environments/{name}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/environments/{name}/status",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/environments/{name}/promote",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/promotions",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/keys",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/sso",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/sso/login",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/sso/callback",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/keys",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/keys/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/runtime/schedules",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/runtime/schedules/{name}/run",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/audiences",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/audiences/{name}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/audiences/{name}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/audiences/of/{account_id}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/audiences/refresh",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/audiences/{name}/members",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/news",
+"tag": "social"
+},
+{
+"m": "POST",
+"p": "/v1/server/news",
+"tag": "social"
+},
+{
+"m": "GET",
+"p": "/v1/server/news/{id}",
+"tag": "social"
+},
+{
+"m": "PUT",
+"p": "/v1/server/news/{id}",
+"tag": "social"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/news/{id}",
+"tag": "social"
+},
+{
+"m": "PUT",
+"p": "/v1/server/news/{id}/locales/{locale}",
+"tag": "social"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/news/{id}/locales/{locale}",
+"tag": "social"
+},
+{
+"m": "GET",
+"p": "/v1/server/news/{id}/stats",
+"tag": "social"
+},
+{
+"m": "PUT",
+"p": "/v1/server/audiences/{name}/members",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/audiences/{name}/members/csv",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/audiences/{name}/overrides",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/audiences/{name}/overrides",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/audiences/{name}/overrides",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/audiences/{name}/overrides/{account_id}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/audiences/{name}/refresh",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/admin/runtime/timers",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/runtime/timers/sweep",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/runtime/timers/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/worlds/{w}/cells/{x}/{y}/host",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/worlds/{w}/entities",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/worlds/{w}/at",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/worlds/{w}/history",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/worlds/{w}/verify",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/worlds/{w}/snapshot",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/retention/run",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/jwt/keys",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/jwt/keys",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/jwt/rotate",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/jwt/keys/{kid}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/rewind",
+"tag": "server"
+},
+{
+"m": "POST",
+"p": "/v1/server/tx",
+"tag": "server"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/colocate",
+"tag": "server"
+},
+{
+"m": "GET",
+"p": "/v1/server/presence/{account_id}",
+"tag": "server"
+},
+{
+"m": "GET",
+"p": "/v1/admin/chat/{id}/moderation",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/chat/filters",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/chat/filters",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/chat/filters/{filter_id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/chat/{id}/settings",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/chat/{id}/settings",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/chat/reports",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/ugc",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/server/anticheat/flag",
+"tag": "anticheat"
+},
+{
+"m": "GET",
+"p": "/v1/server/stats/defs",
+"tag": "stats"
+},
+{
+"m": "PUT",
+"p": "/v1/server/stats/defs",
+"tag": "stats"
+},
+{
+"m": "POST",
+"p": "/v1/server/stats/update",
+"tag": "stats"
+},
+{
+"m": "GET",
+"p": "/v1/server/stats/top",
+"tag": "stats"
+},
+{
+"m": "GET",
+"p": "/v1/server/stats/{account_id}",
+"tag": "stats"
+},
+{
+"m": "GET",
+"p": "/v1/server/stats/global",
+"tag": "stats"
+},
+{
+"m": "GET",
+"p": "/v1/server/stats/{account_id}/history",
+"tag": "stats"
+},
+{
+"m": "POST",
+"p": "/v1/server/anticheat/verify",
+"tag": "anticheat"
+},
+{
+"m": "GET",
+"p": "/v1/admin/anticheat",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/runtime/modules/{name}/canary",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/runtime/modules/{name}/canary",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/runtime/modules/{name}/canary/promote",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/runtime/modules/{name}/versions",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/runtime/modules/{name}/env",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/runtime/modules/{name}/env",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/runtime/modules/{name}/env",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/runtime/modules/{name}/env/{key}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/runtime/modules/{name}/versions/{version}/rollback",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/recording",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/dev/recording",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/recordings",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/dev/recordings",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/recordings/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/dev/recordings/{id}/replay",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/fixtures",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/dev/fixtures",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/dev/fixtures/{name}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/anticheat",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/ugc/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/reports",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/reports/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/reports/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/reports",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/chat/reports/{report_id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/chat/reports/{report_id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/chat/{id}/moderation",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/chat/{id}/moderation/{account_id}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/chat/{id}/messages/{message_id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/runtime/modules",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/runtime/modules/{name}",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/runtime/modules/{name}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/storage/{collection}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/storage/{collection}/{key}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/storage_schemas",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/storage_schemas/{collection}",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/storage_schemas/{collection}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/storage_schemas/{collection}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/storage_schemas/{collection}/migrate",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/storage/{collection}/{key}",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/storage/{collection}/{key}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/webhooks",
+"tag": "webhooks"
+},
+{
+"m": "POST",
+"p": "/v1/admin/webhooks",
+"tag": "webhooks"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/webhooks/{id}",
+"tag": "webhooks"
+},
+{
+"m": "PATCH",
+"p": "/v1/admin/webhooks/{id}",
+"tag": "webhooks"
+},
+{
+"m": "GET",
+"p": "/v1/admin/webhooks/{id}/deliveries",
+"tag": "webhooks"
+},
+{
+"m": "POST",
+"p": "/v1/admin/webhooks/{id}/test",
+"tag": "webhooks"
+},
+{
+"m": "POST",
+"p": "/v1/admin/webhooks/{id}/deliveries/{event_id}/redeliver",
+"tag": "webhooks"
+},
+{
+"m": "POST",
+"p": "/v1/server/steam/app_ticket",
+"tag": "server"
+},
+{
+"m": "GET",
+"p": "/v1/admin/legal",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/legal/{key}/{version}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/legal/{key}/{version}/retire",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/legal/{key}/consents",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/consents",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/server/accounts/{id}/age",
+"tag": "account"
+},
+{
+"m": "POST",
+"p": "/v1/server/auth/custom",
+"tag": "auth"
+},
+{
+"m": "POST",
+"p": "/v1/server/accounts/{id}/token",
+"tag": "auth"
+},
+{
+"m": "POST",
+"p": "/v1/server/friends/platform-match",
+"tag": "friends"
+},
+{
+"m": "GET",
+"p": "/v1/server/turns",
+"tag": "turns"
+},
+{
+"m": "GET",
+"p": "/v1/server/turns/{id}",
+"tag": "turns"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/turns/{id}",
+"tag": "turns"
+},
+{
+"m": "POST",
+"p": "/v1/server/turns/{id}/finish",
+"tag": "turns"
+},
+{
+"m": "POST",
+"p": "/v1/server/turns/sweep",
+"tag": "turns"
+},
+{
+"m": "GET",
+"p": "/v1/server/device_codes",
+"tag": "auth"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/device_codes/{id}",
+"tag": "auth"
+},
+{
+"m": "POST",
+"p": "/v1/server/lobbies/{id}/bulk",
+"tag": "lobbies"
+},
+{
+"m": "GET",
+"p": "/v1/admin/oauth/clients/{id}/grants",
+"tag": "auth"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/oauth/clients/{id}/grants",
+"tag": "auth"
+},
+{
+"m": "GET",
+"p": "/v1/admin/secrets/status",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/netsim",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/dev/netsim",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/dev/netsim",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/dev/netsim/reset",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/dev/netsim/sessions/{id}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/dev/netsim/sessions/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/loadtests",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/dev/loadtests",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/loadtests/{id}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/dev/loadtests/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/dev/loadtests/{id}/stop",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/dev/loadtests/{id}/compare/{base}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/secrets/reencrypt",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/oauth/clients",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/oauth/clients",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/oauth/clients/{id}",
+"tag": "admin"
+},
+{
+"m": "PATCH",
+"p": "/v1/admin/oauth/clients/{id}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/oauth/clients/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/oauth/clients/{id}/secrets",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/oauth/clients/{id}/secrets/{sid}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/oauth/clients/{id}/tokens",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/oauth/clients/{id}/tokens",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/access/policy",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/access/policy",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/access/enforce",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/access/check",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/access/denials",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/access/allowlist",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/access/allowlist/import",
+"tag": "admin"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/access/allowlist/{kind}/{value}",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/access/allowlist/{kind}/{value}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/gameservers/{id}/reputation",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/gameservers/by-name/{hostname}",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/reputation",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/gameservers/{id}/egress",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/egress",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/installs",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/fleets/{id}/installs",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/installs/reset",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/groups/{id}/xp",
+"tag": "groups"
+},
+{
+"m": "POST",
+"p": "/v1/server/group_challenges",
+"tag": "groups"
+},
+{
+"m": "GET",
+"p": "/v1/server/group_challenges",
+"tag": "groups"
+},
+{
+"m": "GET",
+"p": "/v1/server/group_challenges/{id}",
+"tag": "groups"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/group_challenges/{id}",
+"tag": "groups"
+},
+{
+"m": "POST",
+"p": "/v1/server/group_challenges/{id}/score",
+"tag": "groups"
+},
+{
+"m": "POST",
+"p": "/v1/server/group_challenges/{id}/settle",
+"tag": "groups"
+},
+{
+"m": "POST",
+"p": "/v1/server/group_challenges/sweep",
+"tag": "groups"
+},
+{
+"m": "GET",
+"p": "/v1/server/configs/{name}/variants",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/server/configs/{name}/variants/{variant}",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/configs/{name}/variants/{variant}",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/configs/{name}/history",
+"tag": "system"
+},
+{
+"m": "POST",
+"p": "/v1/server/configs/{name}/rollback",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/configs/{name}/diff",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/server/configs/{name}/csv",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/configs/{name}/preview",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/client_versions",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/server/client_versions/{platform}",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/client_versions/{platform}",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/server/client_versions/{platform}/logic/{logic_version}",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/client_versions/{platform}/logic/{logic_version}",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/files",
+"tag": "storage"
+},
+{
+"m": "PUT",
+"p": "/v1/server/files/{*path}",
+"tag": "storage"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/files/{*path}",
+"tag": "storage"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/files/{*path}",
+"tag": "storage"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/fraud/flags",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/mail/audience/count",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/economy/fraud/flags/{id}/resolve",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/economy/fraud/{account}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/subscription_plans",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/subscription_plans",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/subscription_plans/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/subscription_plans/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/subscription_plans/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/subscriptions",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/subscriptions",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/subscriptions/{id}/cancel",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/subscriptions/{id}/pause",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/subscriptions/{id}/resume",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/subscriptions/{id}/revoke",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/subscriptions/sweep",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/iap/subscriptions",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/effects/{account_id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/effects/{account_id}/{key}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/effects/{account_id}/{key}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/effects/{account_id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/effects",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/effects/sweep",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/attribution",
+"tag": "analytics"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/accounts/{id}/attribution",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/attribution",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/geo",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/sinks",
+"tag": "analytics"
+},
+{
+"m": "POST",
+"p": "/v1/server/analytics/sinks/flush",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/edge",
+"tag": "edge"
+},
+{
+"m": "POST",
+"p": "/v1/server/edge/block",
+"tag": "edge"
+},
+{
+"m": "POST",
+"p": "/v1/server/edge/unblock",
+"tag": "edge"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/geo",
+"tag": "account"
+},
+{
+"m": "GET",
+"p": "/v1/server/geoip",
+"tag": "geoip"
+},
+{
+"m": "POST",
+"p": "/v1/server/geoip/update",
+"tag": "geoip"
+},
+{
+"m": "POST",
+"p": "/v1/server/geoip/reload",
+"tag": "geoip"
+},
+{
+"m": "GET",
+"p": "/v1/server/geoip/lookup/{ip}",
+"tag": "geoip"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/reports",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/admin/operators",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/operators/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/operators/invites",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/operators/invites",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/operators/invites/{id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/storage_endpoints",
+"tag": "fleet"
+},
+{
+"m": "GET",
+"p": "/v1/server/storage_endpoints/{name}",
+"tag": "fleet"
+},
+{
+"m": "PUT",
+"p": "/v1/server/storage_endpoints/{name}",
+"tag": "fleet"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/storage_endpoints/{name}",
+"tag": "fleet"
+},
+{
+"m": "POST",
+"p": "/v1/server/storage_endpoints/{name}/test",
+"tag": "fleet"
+},
+{
+"m": "GET",
+"p": "/v1/server/hero_classes",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/hero_classes/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/hero_classes/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/hero_classes/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/heroes",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/privacy",
+"tag": "account"
+},
+{
+"m": "GET",
+"p": "/v1/server/data_rights",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/server/data_rights",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/server/data_rights/run",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/data_rights/{id}",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/server/data_rights/{id}/cancel",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/server/analytics/reports",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/reports/latest",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/reports/by-date/{date}",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/reports/{id}",
+"tag": "analytics"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/analytics/reports/{id}",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/referrals/programs",
+"tag": "social"
+},
+{
+"m": "PUT",
+"p": "/v1/server/referrals/programs/{id}",
+"tag": "social"
+},
+{
+"m": "GET",
+"p": "/v1/server/referrals/programs/{id}",
+"tag": "social"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/referrals/programs/{id}",
+"tag": "social"
+},
+{
+"m": "GET",
+"p": "/v1/server/referrals/programs/{id}/referrals",
+"tag": "social"
+},
+{
+"m": "POST",
+"p": "/v1/server/referrals/{id}/void",
+"tag": "social"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/referrals",
+"tag": "social"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/event_properties",
+"tag": "analytics"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/accounts/{id}/event_properties",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/event_properties/{event}",
+"tag": "analytics"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/accounts/{id}/event_properties/{event}",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/tutorials",
+"tag": "progression"
+},
+{
+"m": "PUT",
+"p": "/v1/server/tutorials/{id}",
+"tag": "progression"
+},
+{
+"m": "GET",
+"p": "/v1/server/tutorials/{id}",
+"tag": "progression"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/tutorials/{id}",
+"tag": "progression"
+},
+{
+"m": "GET",
+"p": "/v1/server/tutorials/{id}/progress",
+"tag": "progression"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/tutorials",
+"tag": "progression"
+},
+{
+"m": "POST",
+"p": "/v1/server/accounts/{id}/tutorials/{tid}/reset",
+"tag": "progression"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/clock",
+"tag": "liveops"
+},
+{
+"m": "PUT",
+"p": "/v1/server/accounts/{id}/clock",
+"tag": "liveops"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/accounts/{id}/clock",
+"tag": "liveops"
+},
+{
+"m": "GET",
+"p": "/v1/server/clocks",
+"tag": "liveops"
+},
+{
+"m": "PUT",
+"p": "/v1/server/countries/{code}",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/countries/{code}",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/country_groups",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/country_groups/{name}",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/server/country_groups/{name}",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/country_groups/{name}",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/config_sources",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/configs/{name}/source",
+"tag": "system"
+},
+{
+"m": "PUT",
+"p": "/v1/server/configs/{name}/source",
+"tag": "system"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/configs/{name}/source",
+"tag": "system"
+},
+{
+"m": "POST",
+"p": "/v1/server/configs/{name}/source/sync",
+"tag": "system"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/sessions/{sid}/vars",
+"tag": "auth"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/accounts/{id}/sessions/{sid}/vars",
+"tag": "auth"
+},
+{
+"m": "PUT",
+"p": "/v1/server/items/{id}/lifecycle",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/items/{id}/status",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/items/{id}/revoke",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/inventory/repair",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/sampling",
+"tag": "analytics"
+},
+{
+"m": "PUT",
+"p": "/v1/server/analytics/sampling",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/crashes",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/crashes/summary",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/crashes/reports/{id}",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/crashes/reports/{id}/minidump",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/crashes/{fp}",
+"tag": "analytics"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/crashes/{fp}",
+"tag": "analytics"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/crashes/{fp}",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/crashes/{fp}/reports",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/crashes",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/steam",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/events",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/timeline",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/notes",
+"tag": "admin"
+},
+{
+"m": "POST",
+"p": "/v1/admin/accounts/{id}/notes",
+"tag": "admin"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/accounts/{id}/notes/{note_id}",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/schemas",
+"tag": "analytics"
+},
+{
+"m": "POST",
+"p": "/v1/server/analytics/schemas",
+"tag": "analytics"
+},
+{
+"m": "PUT",
+"p": "/v1/server/analytics/schemas/{name}",
+"tag": "analytics"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/analytics/schemas/{name}",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/events",
+"tag": "analytics"
+},
+{
+"m": "POST",
+"p": "/v1/server/analytics/flush",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/kpi/active_users",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/kpi/retention",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/kpi/funnel",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/kpi/revenue",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/analytics/kpi/events",
+"tag": "analytics"
+},
+{
+"m": "GET",
+"p": "/v1/server/flags",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/flags",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/flags/{name}",
+"tag": "integrations"
+},
+{
+"m": "PUT",
+"p": "/v1/server/flags/{name}",
+"tag": "integrations"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/flags/{name}",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/experiments",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/experiments",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/experiments/{id}",
+"tag": "integrations"
+},
+{
+"m": "PUT",
+"p": "/v1/server/experiments/{id}",
+"tag": "integrations"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/experiments/{id}",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/experiments/of/{account_id}",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/experiments/{id}/start",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/experiments/{id}/pause",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/experiments/{id}/end",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/experiments/{id}/results",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/experiments/{id}/assignments",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/live_events",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/liveops/timeline",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/live_events",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/live_events/{id}",
+"tag": "integrations"
+},
+{
+"m": "PUT",
+"p": "/v1/server/live_events/{id}",
+"tag": "integrations"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/live_events/{id}",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/live_events/{id}/participants",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/live_events/from_template",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/live_event_templates",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/live_event_templates/{id}",
+"tag": "integrations"
+},
+{
+"m": "PUT",
+"p": "/v1/server/live_event_templates/{id}",
+"tag": "integrations"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/live_event_templates/{id}",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/liveops/eval",
+"tag": "integrations"
+},
+{
+"m": "POST",
+"p": "/v1/server/liveops/changed",
+"tag": "integrations"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/queues",
+"tag": "matches"
+},
+{
+"m": "PUT",
+"p": "/v1/server/matchmaker/queues",
+"tag": "matches"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/matchmaker/queues/{name}",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/stats",
+"tag": "matches"
+},
+{
+"m": "POST",
+"p": "/v1/server/matchmaker/queues/{name}/pause",
+"tag": "matches"
+},
+{
+"m": "POST",
+"p": "/v1/server/matchmaker/queues/{name}/drain",
+"tag": "matches"
+},
+{
+"m": "POST",
+"p": "/v1/server/matchmaker/queues/{name}/resume",
+"tag": "matches"
+},
+{
+"m": "POST",
+"p": "/v1/server/matchmaker/simulate",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/tickets/{id}/trace",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/matches",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/rejections",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/mmf",
+"tag": "matchmaker"
+},
+{
+"m": "POST",
+"p": "/v1/server/matchmaker/queues/{name}/mmf/test",
+"tag": "matchmaker"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/async",
+"tag": "matchmaker"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/async/{queue}",
+"tag": "matchmaker"
+},
+{
+"m": "PUT",
+"p": "/v1/server/matchmaker/async/{queue}",
+"tag": "matchmaker"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/matchmaker/async/{queue}",
+"tag": "matchmaker"
+},
+{
+"m": "POST",
+"p": "/v1/server/matchmaker/async/{queue}/shields",
+"tag": "matchmaker"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/matchmaker/async/{queue}/shields/{account_id}",
+"tag": "matchmaker"
+},
+{
+"m": "GET",
+"p": "/v1/server/matchmaker/async/{queue}/attacks",
+"tag": "matchmaker"
+},
+{
+"m": "POST",
+"p": "/v1/server/matchmaker/async/attacks/{id}/resolve",
+"tag": "matchmaker"
+},
+{
+"m": "GET",
+"p": "/v1/admin/auth/providers",
+"tag": "auth"
+},
+{
+"m": "GET",
+"p": "/v1/admin/auth/providers/{name}",
+"tag": "auth"
+},
+{
+"m": "PUT",
+"p": "/v1/admin/auth/providers/{name}",
+"tag": "auth"
+},
+{
+"m": "DELETE",
+"p": "/v1/admin/auth/providers/{name}",
+"tag": "auth"
+},
+{
+"m": "POST",
+"p": "/v1/admin/auth/providers/{name}/test",
+"tag": "auth"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/metrics",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/servers/{sid}/metrics",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/alerts",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/alerts/sweep",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/alerts/rules",
+"tag": "fleets"
+},
+{
+"m": "PUT",
+"p": "/v1/server/fleets/{id}/alerts/rules/{name}",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/fleets/{id}/alerts/rules/{name}",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/rollout",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/health",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/reconcile",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/autoscaler",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/autoscaler/suspend",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/autoscaler/resume",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/hosts",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/hosts",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/hosts/classes",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/hosts/notice",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/hosts/{id}",
+"tag": "fleets"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/fleets/hosts/{id}",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/fleets/hosts/{id}",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/hosts/{id}/drain",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/hosts/{id}/undrain",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/hosts/{id}/probe",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/hosts/{id}/termination-notice",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/capacity",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/capacity/reconcile",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/rollouts",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/rollout/pause",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/rollout/resume",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/rollout/rollback",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/events",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/counters",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/gameservers",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/gameservers/counts",
+"tag": "fleets"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/gameservers/{id}/counters",
+"tag": "fleets"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/gameservers/{id}/lists",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/matches/{id}/events",
+"tag": "matches"
+},
+{
+"m": "POST",
+"p": "/v1/server/leaderboards/{id}/rollover",
+"tag": "leaderboards"
+},
+{
+"m": "GET",
+"p": "/v1/server/rating/queues",
+"tag": "leaderboards"
+},
+{
+"m": "PUT",
+"p": "/v1/server/rating/queues",
+"tag": "leaderboards"
+},
+{
+"m": "GET",
+"p": "/v1/server/rating/queues/{id}",
+"tag": "leaderboards"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/rating/queues/{id}",
+"tag": "leaderboards"
+},
+{
+"m": "POST",
+"p": "/v1/server/rating/queues/{id}/results",
+"tag": "leaderboards"
+},
+{
+"m": "POST",
+"p": "/v1/server/rating/queues/{id}/season",
+"tag": "leaderboards"
+},
+{
+"m": "POST",
+"p": "/v1/server/rating/queues/{id}/decay",
+"tag": "leaderboards"
+},
+{
+"m": "POST",
+"p": "/v1/server/notifications",
+"tag": "notifications"
+},
+{
+"m": "POST",
+"p": "/v1/server/notifications/broadcast",
+"tag": "notifications"
+},
+{
+"m": "GET",
+"p": "/v1/server/notifications/broadcasts/{id}",
+"tag": "notifications"
+},
+{
+"m": "GET",
+"p": "/v1/server/push/templates",
+"tag": "account"
+},
+{
+"m": "PUT",
+"p": "/v1/server/push/templates",
+"tag": "account"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/push/templates/{id}",
+"tag": "account"
+},
+{
+"m": "POST",
+"p": "/v1/server/push",
+"tag": "account"
+},
+{
+"m": "GET",
+"p": "/v1/server/push/schedule",
+"tag": "account"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/push/schedule/{id}",
+"tag": "account"
+},
+{
+"m": "GET",
+"p": "/v1/server/quests/pools",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/quests/pools",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/quests/pools/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/quests/pools/{id}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/quests/pools/{id}/accelerate",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/quests/pools/{id}/retire",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/quests/pools/{id}/preview/{account_id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/challenge_templates",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/challenge_templates",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/challenges/sweep",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/donations/defs",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/donations/defs/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/donations/defs/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/donations/defs/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/donations",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/donations/sweep",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/sweepstakes",
+"tag": "sweepstakes"
+},
+{
+"m": "POST",
+"p": "/v1/server/sweepstakes/sweep",
+"tag": "sweepstakes"
+},
+{
+"m": "GET",
+"p": "/v1/server/sweepstakes/{id}",
+"tag": "sweepstakes"
+},
+{
+"m": "PUT",
+"p": "/v1/server/sweepstakes/{id}",
+"tag": "sweepstakes"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/sweepstakes/{id}",
+"tag": "sweepstakes"
+},
+{
+"m": "GET",
+"p": "/v1/server/sweepstakes/{id}/entries",
+"tag": "sweepstakes"
+},
+{
+"m": "POST",
+"p": "/v1/server/sweepstakes/{id}/draw",
+"tag": "sweepstakes"
+},
+{
+"m": "POST",
+"p": "/v1/server/sweepstakes/{id}/cancel",
+"tag": "sweepstakes"
+},
+{
+"m": "GET",
+"p": "/v1/server/vip/programs",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/vip/programs/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/vip/programs/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/vip/programs/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/accounts/{id}/vip",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/accounts/{id}/vip/{program}/points",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/streaks/{id}/state/{account_id}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/streaks/{id}/reset",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/streaks/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/entitlements",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/entitlements",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/entitlements/{provider}/{external_id}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/entitlements/grant",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/entitlements/revoke",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/entitlements/sweep",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/streams",
+"tag": "streams"
+},
+{
+"m": "GET",
+"p": "/v1/server/streams/{id}",
+"tag": "streams"
+},
+{
+"m": "POST",
+"p": "/v1/server/streams/{id}/join",
+"tag": "streams"
+},
+{
+"m": "POST",
+"p": "/v1/server/streams/{id}/leave",
+"tag": "streams"
+},
+{
+"m": "POST",
+"p": "/v1/server/streams/{id}/send",
+"tag": "streams"
+},
+{
+"m": "GET",
+"p": "/v1/server/achievements",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/achievements",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/achievements/progress",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/cluster/directory/{key}",
+"tag": "cluster"
+},
+{
+"m": "GET",
+"p": "/v1/server/cluster/mesh_net",
+"tag": "cluster"
+},
+{
+"m": "GET",
+"p": "/v1/server/cluster/mesh_net/config",
+"tag": "cluster"
+},
+{
+"m": "POST",
+"p": "/v1/server/cluster/mesh_net/refresh",
+"tag": "cluster"
+},
+{
+"m": "POST",
+"p": "/v1/server/cluster/mesh_net/rotate",
+"tag": "cluster"
+},
+{
+"m": "GET",
+"p": "/v1/server/cluster/nodes",
+"tag": "cluster"
+},
+{
+"m": "GET",
+"p": "/v1/server/cluster/raft",
+"tag": "cluster"
+},
+{
+"m": "GET",
+"p": "/v1/server/currencies",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/currencies",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/energy",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/energy",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/energy/grant",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/energy/modifiers",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/energy/modifiers",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/energy/modifiers/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/events",
+"tag": "webhooks"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/fleets/{id}",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/allocate",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/allocate",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/aliases",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/aliases/{name}",
+"tag": "fleets"
+},
+{
+"m": "PUT",
+"p": "/v1/server/aliases/{name}",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/aliases/{name}",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/aliases/{name}/allocate",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/session_placements",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/session_placements",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/session_placements/{id}",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/session_placements/{id}",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/demand",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/builds",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/builds",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/builds/{name}/{version}",
+"tag": "fleets"
+},
+{
+"m": "PUT",
+"p": "/v1/server/builds/{name}/{version}",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/builds/{name}/{version}",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/builds/{name}/{version}/download",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/cost",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/builds/chunking",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/builds/gc",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/builds/{name}/{version}/manifest",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/builds/{name}/{version}/delta",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/builds/{name}/{version}/upload",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/builds/{name}/{version}/commit",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/builds/{name}/{version}/chunks/{hash}",
+"tag": "fleets"
+},
+{
+"m": "PUT",
+"p": "/v1/server/builds/{name}/{version}/chunks/{hash}",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/builds",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/fleets/{id}/builds/{version}",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/builds/{version}/promote",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/usage",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/workflows",
+"tag": "workflows"
+},
+{
+"m": "POST",
+"p": "/v1/server/workflows",
+"tag": "workflows"
+},
+{
+"m": "POST",
+"p": "/v1/server/workflows/run",
+"tag": "workflows"
+},
+{
+"m": "GET",
+"p": "/v1/server/workflows/{id}",
+"tag": "workflows"
+},
+{
+"m": "POST",
+"p": "/v1/server/workflows/{id}/signal",
+"tag": "workflows"
+},
+{
+"m": "POST",
+"p": "/v1/server/workflows/{id}/cancel",
+"tag": "workflows"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/scale",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/providers/{name}/prepare",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/servers",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/servers/{sid}/logs",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/fleets/{id}/servers/{sid}/logs/archive",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/servers/{sid}/logs/stream",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/gameservers/{id}/reserve",
+"tag": "fleets"
+},
+{
+"m": "POST",
+"p": "/v1/server/gameservers/{id}/unreserve",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/servers/{sid}/logs/download",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/servers/{sid}/logs/archives",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/fleets/{id}/logs/archives/{aid}",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/fleets/{id}/logs/archives/{aid}",
+"tag": "fleets"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/gameservers/{id}",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/gameservers/{id}",
+"tag": "fleets"
+},
+{
+"m": "GET",
+"p": "/v1/server/iap/products",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/iap/products",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/iap/receipts",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/iap/steam/reconcile",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/inventory/grant",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/inventory/limits",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/inventory/limits",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/inventory/{id}/instance",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/grant_limits",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/grant_limits",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/grant_limits/{kind}/{key}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/admin/accounts/{id}/grants",
+"tag": "admin"
+},
+{
+"m": "GET",
+"p": "/v1/server/items",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/items",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/items/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/items/{id}/versions",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/items/{id}/versions/{version}/rollback",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/items/{id}/migrate",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/items/{id}/convert",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/leaderboards/{id}",
+"tag": "leaderboards"
+},
+{
+"m": "POST",
+"p": "/v1/server/leaderboards",
+"tag": "leaderboards"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/leaderboards/{id}/records/{owner}",
+"tag": "leaderboards"
+},
+{
+"m": "POST",
+"p": "/v1/server/leaderboards/{id}/records/{owner}",
+"tag": "leaderboards"
+},
+{
+"m": "POST",
+"p": "/v1/server/mail",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/market/settle",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/sessions",
+"tag": "sessions"
+},
+{
+"m": "POST",
+"p": "/v1/server/sessions/stop",
+"tag": "sessions"
+},
+{
+"m": "POST",
+"p": "/v1/server/sessions/search",
+"tag": "sessions"
+},
+{
+"m": "GET",
+"p": "/v1/server/sessions/{id}",
+"tag": "sessions"
+},
+{
+"m": "PATCH",
+"p": "/v1/server/sessions/{id}",
+"tag": "sessions"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/sessions/{id}",
+"tag": "sessions"
+},
+{
+"m": "GET",
+"p": "/v1/server/sessions/{id}/members",
+"tag": "sessions"
+},
+{
+"m": "POST",
+"p": "/v1/server/sessions/{id}/members",
+"tag": "sessions"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/sessions/{id}/members/{account_id}",
+"tag": "sessions"
+},
+{
+"m": "GET",
+"p": "/v1/server/session_templates",
+"tag": "sessions"
+},
+{
+"m": "PUT",
+"p": "/v1/server/session_templates/{id}",
+"tag": "sessions"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/session_templates/{id}",
+"tag": "sessions"
+},
+{
+"m": "POST",
+"p": "/v1/server/matches",
+"tag": "matches"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/matches/{id}",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/matches/{id}",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/matches/{id}/results",
+"tag": "matches"
+},
+{
+"m": "POST",
+"p": "/v1/server/matches/{id}/results",
+"tag": "matches"
+},
+{
+"m": "POST",
+"p": "/v1/server/matches/{id}/backfill",
+"tag": "matches"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/matches/{id}/replay",
+"tag": "matches"
+},
+{
+"m": "GET",
+"p": "/v1/server/progression/tracks",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/progression/tracks",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/progression/xp",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/quests",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/quests",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/quests/event",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/rewards/grant",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/graphs",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/graphs",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/graphs/{graph}/progress/{account}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/rewards/modifiers",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/rewards/modifiers",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/rewards/modifiers/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/rewards/tables",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/rewards/tables",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/seasons",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/seasons",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/seasons/{id}/premium",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/store",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/store/coupons",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/codes/campaigns",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/codes/campaigns/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/codes/campaigns/{id}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/codes/campaigns/{id}/generate",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/codes/campaigns/{id}/codes",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/codes/campaigns/{id}/codes",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/codes/campaigns/{id}/redemptions",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/codes/{code}/revoke",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/key_groups",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/key_groups/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/key_groups/{id}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/key_groups/{id}/keys",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/store/coupons",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/store/coupons/{code}",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/store",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/streaks",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/streaks",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/tournaments",
+"tag": "tournaments"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/tournaments/{id}",
+"tag": "tournaments"
+},
+{
+"m": "POST",
+"p": "/v1/server/tournaments/{id}/end",
+"tag": "tournaments"
+},
+{
+"m": "POST",
+"p": "/v1/server/tournaments/{id}/bracket",
+"tag": "tournaments"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/tournaments/{id}/bracket",
+"tag": "tournaments"
+},
+{
+"m": "POST",
+"p": "/v1/server/tournaments/{id}/bracket/matches/{mid}",
+"tag": "tournaments"
+},
+{
+"m": "POST",
+"p": "/v1/server/tournaments/{id}/bracket/matches/{mid}/forfeit",
+"tag": "tournaments"
+},
+{
+"m": "POST",
+"p": "/v1/server/tournaments/{id}/bracket/rounds",
+"tag": "tournaments"
+},
+{
+"m": "POST",
+"p": "/v1/server/tournaments/{id}/records/{owner}",
+"tag": "tournaments"
+},
+{
+"m": "POST",
+"p": "/v1/server/wallet/adjust",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/webhooks/dispatch",
+"tag": "webhooks"
+},
+{
+"m": "GET",
+"p": "/v1/server/worlds",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds",
+"tag": "worlds"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/worlds/{w}",
+"tag": "worlds"
+},
+{
+"m": "GET",
+"p": "/v1/server/worlds/{w}",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/apply",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/global",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/attach",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/despawn",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/detach",
+"tag": "worlds"
+},
+{
+"m": "GET",
+"p": "/v1/server/worlds/{w}/events",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/handover/ack",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/interact",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/lease",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/renew",
+"tag": "worlds"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/worlds/{w}/sims",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/sims",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/spawn",
+"tag": "worlds"
+},
+{
+"m": "POST",
+"p": "/v1/server/worlds/{w}/tx",
+"tag": "worlds"
+},
+{
+"m": "GET",
+"p": "/v1/server/worlds/{w}/tx/{id}",
+"tag": "worlds"
+},
+{
+"m": "GET",
+"p": "/v1/server/worlds/{w}/stream",
+"tag": "worlds"
+},
+{
+"m": "GET",
+"p": "/v1/server/worlds/{w}/view/{x}/{y}",
+"tag": "worlds"
+},
+{
+"m": "GET",
+"p": "/v1/server/placements",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/ad_placements",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/ad_placements/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/ad_placements/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/ad_placements/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/ad_placements/{id}/stats",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/ads/rewards",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/placements",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/placements/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/placements/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/placements/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/placements/{id}/offers",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/offers",
+"tag": "economy"
+},
+{
+"m": "POST",
+"p": "/v1/server/offers",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/offers/{id}",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/offers/{id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/offers/{id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/offers/{id}/stats",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/offers/{id}/force/{account_id}",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/offers/{id}/force/{account_id}",
+"tag": "economy"
+},
+{
+"m": "GET",
+"p": "/v1/server/crafting/recipes",
+"tag": "economy"
+},
+{
+"m": "PUT",
+"p": "/v1/server/crafting/recipes",
+"tag": "economy"
+},
+{
+"m": "DELETE",
+"p": "/v1/server/crafting/recipes/{id}",
+"tag": "economy"
+}
+]
