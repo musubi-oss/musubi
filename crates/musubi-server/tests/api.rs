@@ -45281,3 +45281,284 @@ async fn storage_endpoints_register_probe_and_redact() {
     let (st, _) = call(&app, "GET", "/v1/server/storage_endpoints", None, None).await;
     assert!(st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN);
 }
+
+/// Operator invites: validation, one pending per address, peek/accept (key issued, works for the
+/// role), reject, rescind, expiry, members list, removal revokes the key.
+#[tokio::test]
+async fn operator_invites_accept_reject_rescind_and_members() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let inv = "/v1/admin/operators/invites";
+    for bad in [
+        json!({"email": "nope", "role": "admin"}),
+        json!({"email": format!("a-{sfx}@x.io"), "role": "god"}),
+        json!({"email": format!("a-{sfx}@x.io"), "role": "admin", "ttl_hours": 0}),
+    ] {
+        let (st, v) = call_server(&app, "POST", inv, k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let email = format!("Ops-{sfx}@Example.io");
+    let (st, a) = call_server(
+        &app,
+        "POST",
+        inv,
+        k,
+        Some(json!({"email": email, "role": "admin", "note": "welcome", "ttl_hours": 48})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["email"], email.to_ascii_lowercase());
+    assert_eq!(a["status"], "invited");
+    assert!(
+        a["invited_by"].as_str().is_some_and(|n| !n.is_empty()),
+        "{a}"
+    );
+    let tok = a["token"].as_str().unwrap().to_string();
+    assert_eq!(a["path"], format!("/v1/operator_invites/{tok}"));
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        inv,
+        k,
+        Some(json!({"email": email.to_ascii_uppercase(), "role": "support"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call_server(&app, "GET", &format!("{inv}?status=invited"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let mine = v["invites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == a["id"])
+        .cloned()
+        .unwrap();
+    assert!(
+        mine.get("token").is_none(),
+        "list never echoes tokens: {mine}"
+    );
+    let (st, _) = call_server(&app, "GET", &format!("{inv}?status=weird"), k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // invitee peeks and accepts; the issued key works as admin
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/operator_invites/{tok}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["role"], "admin");
+    assert_eq!(v["note"], "welcome");
+    assert!(v.get("token").is_none());
+    let (st, _) = call(&app, "GET", "/v1/operator_invites/nope", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, m) = call(
+        &app,
+        "POST",
+        &format!("/v1/operator_invites/{tok}/accept"),
+        None,
+        Some(json!({"name": "Ops Person"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let secret = m["secret"].as_str().unwrap().to_string();
+    assert_eq!(m["role"], "admin");
+    let (st, v) = call_server(&app, "GET", "/v1/admin/operators", &secret, None).await;
+    assert_eq!(st, StatusCode::OK, "new admin key works: {v}");
+    assert!(
+        v["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["id"] == m["member_id"] && x["name"] == "Ops Person"),
+        "{v}"
+    );
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/operator_invites/{tok}/accept"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "accepted twice");
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("{inv}/{}", a["id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "rescind after accept");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        inv,
+        k,
+        Some(json!({"email": email, "role": "server"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "already a member: {v}");
+    // reject
+    let (st, b) = call_server(
+        &app,
+        "POST",
+        inv,
+        k,
+        Some(json!({"email": format!("b-{sfx}@x.io"), "role": "support"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!(
+            "/v1/operator_invites/{}/reject",
+            b["token"].as_str().unwrap()
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/operator_invites/{}", b["token"].as_str().unwrap()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // rescind
+    let (st, c) = call_server(
+        &app,
+        "POST",
+        inv,
+        k,
+        Some(json!({"email": format!("c-{sfx}@x.io"), "role": "server"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("{inv}/{}", c["id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "rescinded");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!(
+            "/v1/operator_invites/{}/accept",
+            c["token"].as_str().unwrap()
+        ),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("{inv}/{}", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // expiry
+    let (st, d) = call_server(
+        &app,
+        "POST",
+        inv,
+        k,
+        Some(json!({"email": format!("d-{sfx}@x.io"), "role": "server", "ttl_hours": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let db = sqlx::PgPool::connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "update musubi.operator_invites set expires_at = now() - interval '1 minute' where id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(d["id"].as_str().unwrap()).unwrap())
+    .execute(&db)
+    .await
+    .unwrap();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!(
+            "/v1/operator_invites/{}/accept",
+            d["token"].as_str().unwrap()
+        ),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call_server(&app, "GET", &format!("{inv}?status=invited"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        v["invites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"] == d["id"] && i["expired"] == true),
+        "{v}"
+    );
+    // removal revokes the key
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/operators/{}", m["member_id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["key_revoked"], true);
+    let (st, _) = call_server(&app, "GET", "/v1/admin/operators", &secret, None).await;
+    assert!(
+        st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN,
+        "revoked key: {st}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/operators/{}", m["member_id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, ev) = call_server(&app, "GET", "/v1/server/events?kinds=operator.invited,operator.joined,operator.invite_rejected,operator.invite_rescinded,operator.removed&limit=1000", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let kinds: Vec<String> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str().map(String::from))
+        .collect();
+    for want in [
+        "operator.invited",
+        "operator.joined",
+        "operator.invite_rejected",
+        "operator.invite_rescinded",
+        "operator.removed",
+    ] {
+        assert!(kinds.iter().any(|x| x == want), "{want}: {kinds:?}");
+    }
+    let (st, _) = call(&app, "GET", inv, None, None).await;
+    assert!(st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN);
+}

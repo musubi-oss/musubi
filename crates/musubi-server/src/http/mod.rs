@@ -65,6 +65,7 @@ mod notifications;
 pub mod oauth;
 mod oauth_authz;
 mod offers;
+pub mod operator_invites;
 mod parties;
 mod passkeys;
 pub mod placements;
@@ -251,6 +252,7 @@ pub fn router(state: AppState) -> Router {
         .merge(data_rights::router())
         .merge(inspect::router())
         .merge(privacy::router())
+        .merge(operator_invites::router())
         .merge(storage_endpoints::router())
         .merge(heroes::router())
         .merge(content_tags::router())
