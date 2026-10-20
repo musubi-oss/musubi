@@ -88,6 +88,7 @@ mod sso;
 pub mod stats;
 pub mod steam_ownership;
 mod storage;
+pub mod storage_endpoints;
 pub mod streams;
 pub(crate) mod subscriptions;
 pub mod sweepstakes;
@@ -250,6 +251,7 @@ pub fn router(state: AppState) -> Router {
         .merge(data_rights::router())
         .merge(inspect::router())
         .merge(privacy::router())
+        .merge(storage_endpoints::router())
         .merge(heroes::router())
         .merge(content_tags::router())
         .merge(session_vars::router())

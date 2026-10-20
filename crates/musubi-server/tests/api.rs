@@ -45075,3 +45075,209 @@ async fn config_sources_feed_content_tables_from_sheets() {
         assert_eq!(st, StatusCode::OK);
     }
 }
+
+/// Storage endpoints: validation, sealed secret at rest, redacted listing, probe against a mock
+/// S3 (path-style PUT/GET/DELETE), probe failure recorded, credential-preserving update, delete.
+#[tokio::test]
+async fn storage_endpoints_register_probe_and_redact() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let objects: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+        Default::default();
+    let o1 = objects.clone();
+    let o2 = objects.clone();
+    let o3 = objects.clone();
+    let mock = axum::Router::new().route(
+        "/{bucket}/{*key}",
+        axum::routing::put(
+            move |axum::extract::Path((b, key)): axum::extract::Path<(String, String)>,
+                  body: axum::body::Bytes| {
+                let o = o1.clone();
+                async move {
+                    o.lock()
+                        .unwrap()
+                        .insert(format!("{b}/{key}"), body.to_vec());
+                    axum::http::StatusCode::OK
+                }
+            },
+        )
+        .get(
+            move |axum::extract::Path((b, key)): axum::extract::Path<(String, String)>| {
+                let o = o2.clone();
+                async move {
+                    match o.lock().unwrap().get(&format!("{b}/{key}")).cloned() {
+                        Some(v) => (axum::http::StatusCode::OK, v),
+                        None => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                    }
+                }
+            },
+        )
+        .delete(
+            move |axum::extract::Path((b, key)): axum::extract::Path<(String, String)>| {
+                let o = o3.clone();
+                async move {
+                    o.lock().unwrap().remove(&format!("{b}/{key}"));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let name = unique("minio").to_lowercase();
+    let path = format!("/v1/server/storage_endpoints/{name}");
+    for bad in [
+        json!({"endpoint": "ftp://x", "bucket": "logs", "access_key": "a", "secret_key": "s"}),
+        json!({"endpoint": base, "bucket": "Bad_Bucket", "access_key": "a", "secret_key": "s"}),
+        json!({"endpoint": base, "bucket": "logs"}),
+        json!({"endpoint": base, "bucket": "logs", "access_key": "a", "secret_key": "s", "labels": ["bad label"]}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/storage_endpoints/bad%20name",
+        k,
+        Some(json!({"endpoint": base, "bucket": "logs", "access_key": "a", "secret_key": "s"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(&app, "PUT", &path, k, Some(json!({
+        "endpoint": format!("{base}/"), "region": "us-east-1", "bucket": "game-logs", "prefix": "eu/",
+        "access_key": "AKIAEXAMPLE1234", "secret_key": "topsecret", "labels": ["logs", "builds"], "note": "minio in eu"}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["secret_key"], "***");
+    assert_eq!(v["access_key_hint"], "…1234");
+    assert_eq!(v["prefix"], "eu");
+    assert_eq!(v["endpoint"], base);
+    assert!(v["last_status"].is_null());
+    // sealed at rest
+    let db = sqlx::PgPool::connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let (stored,): (String,) =
+        sqlx::query_as("select secret_key from musubi.storage_endpoints where name = $1")
+            .bind(&name)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    if musubi_core::secrets::configured() {
+        assert!(musubi_core::secrets::is_sealed(&stored), "{stored}");
+        assert!(!stored.contains("topsecret"), "{stored}");
+    } else {
+        assert_eq!(
+            stored, "topsecret",
+            "plaintext passthrough without a master key"
+        );
+    }
+    // probe: upload + read back + delete against the mock
+    let (st, v) = call_server(&app, "POST", &format!("{path}/test"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "ok", "{v}");
+    assert!(
+        v["key"].as_str().unwrap().starts_with("eu/musubi-probe-"),
+        "{v}"
+    );
+    assert!(objects.lock().unwrap().is_empty(), "probe object deleted");
+    let (st, v) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["last_status"], "ok");
+    assert!(v["last_test_at"].is_string());
+    // update without credentials keeps them; listing is redacted
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({
+        "endpoint": base, "bucket": "game-logs", "note": "renamed"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["access_key_hint"], "…1234");
+    assert_eq!(v["note"], "renamed");
+    let (st, v) = call_server(&app, "GET", "/v1/server/storage_endpoints", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let mine = v["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == name)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["secret_key"], "***");
+    assert!(!v.to_string().contains("topsecret"));
+    // dead endpoint → probe error recorded
+    let dead = unique("dead").to_lowercase();
+    let (st, _) = call_server(&app, "PUT", &format!("/v1/server/storage_endpoints/{dead}"), k, Some(json!({
+        "endpoint": "http://127.0.0.1:9", "bucket": "nowhere", "access_key": "a", "secret_key": "s"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/storage_endpoints/{dead}/test"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "error", "{v}");
+    assert!(v["error"].is_string());
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/storage_endpoints/{dead}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["last_status"], "error");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/storage_endpoints/nope/test",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=storage_endpoint.tested&limit=500",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        ev["events"].as_array().unwrap().iter().any(|e| {
+            let p = if e.get("payload").is_some() {
+                &e["payload"]
+            } else {
+                &e["data"]
+            };
+            p["name"] == name && p["status"] == "ok"
+        }),
+        "{ev}"
+    );
+    for n in [&name, &dead] {
+        let (st, _) = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/storage_endpoints/{n}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let (st, _) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", "/v1/server/storage_endpoints", None, None).await;
+    assert!(st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN);
+}
