@@ -211,6 +211,16 @@ impl AccountService {
         if r.rows_affected() == 0 {
             return Err(Error::NotFound("account".into()));
         }
+        // deletion ledger: survives as the record that this account must stay deleted
+        sqlx::query(
+            "insert into musubi.account_deletions (account_id, deleted_at, source)
+             values ($1, now(), 'delete')
+             on conflict (account_id) do update set deleted_at = now(), lifted_at = null, lifted_by = null",
+        )
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
         sqlx::query("delete from musubi.identities where account_id = $1")
             .bind(id.0)
             .execute(&mut *tx)

@@ -95,6 +95,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/admin/accounts/{id}/kick", post(kick))
         .route("/v1/admin/accounts/{id}/export", get(export))
         .route("/v1/admin/accounts/{id}/restore", post(restore))
+        .route("/v1/admin/deletions", get(deletions))
+        .route("/v1/admin/deletions/import", post(deletions_import))
+        .route("/v1/admin/deletions/sweep", post(deletions_sweep))
+        .route("/v1/admin/deletions/{id}/lift", post(deletions_lift))
         .route(
             "/v1/admin/accounts/{id}/limits",
             get(account_limits_get)
@@ -498,6 +502,9 @@ struct RestoreBody {
     /// Recreate the account row from the bundle when it was purged.
     #[serde(default)]
     create_missing: bool,
+    /// The account is in the deletion ledger: lift the entry and restore anyway.
+    #[serde(default)]
+    override_deletion: bool,
 }
 
 fn default_restore_mode() -> String {
@@ -521,6 +528,22 @@ async fn restore(
             .into())
         }
     };
+    let ledgered: bool = sqlx::query_scalar(
+        "select exists(select 1 from musubi.account_deletions where account_id = $1 and lifted_at is null)",
+    )
+    .bind(id)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    if ledgered {
+        if !b.override_deletion {
+            return Err(Error::Conflict(format!(
+                "account {id} is in the deletion ledger (it was deleted and must stay deleted); pass override_deletion to restore it anyway"
+            ))
+            .into());
+        }
+        lift_entry(&s, id, "restore", "restored with override_deletion").await?;
+    }
     let out = s
         .accounts
         .restore(
@@ -1433,4 +1456,175 @@ async fn module_rollback(
     Path((name, version)): Path<(String, i32)>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(crate::modules::rollback(&s, &name, version).await?))
+}
+
+// ---- deletion ledger (backup re-deletion safeguard) ----------------------------------------
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DeletionsQ {
+    /// Unix seconds: entries deleted at or after this time.
+    since: Option<i64>,
+    /// Include lifted entries.
+    all: bool,
+    limit: Option<i64>,
+}
+
+fn deletion_json(r: &sqlx::postgres::PgRow) -> Value {
+    use sqlx::Row as _;
+    let ts = |c: &str| {
+        r.get::<Option<time::OffsetDateTime>, _>(c)
+            .map(|t| t.unix_timestamp())
+    };
+    json!({
+        "account_id": r.get::<Uuid, _>("account_id"),
+        "deleted_at": r.get::<time::OffsetDateTime, _>("deleted_at").unix_timestamp(),
+        "source": r.get::<String, _>("source"),
+        "reason": r.get::<String, _>("reason"),
+        "lifted_at": ts("lifted_at"),
+        "lifted_by": r.get::<Option<String>, _>("lifted_by"),
+        "reapplied": r.get::<i32, _>("reapplied"),
+        "last_reapplied_at": ts("last_reapplied_at"),
+    })
+}
+
+/// `GET /v1/admin/deletions?since&all&limit` — the ledger, exportable for safekeeping.
+async fn deletions(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Query(q): Query<DeletionsQ>,
+) -> Result<Json<Value>, ApiError> {
+    let since = q
+        .since
+        .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok());
+    let rows = sqlx::query(
+        "select account_id, deleted_at, source, reason, lifted_at, lifted_by, reapplied, last_reapplied_at
+         from musubi.account_deletions
+         where ($1::timestamptz is null or deleted_at >= $1) and ($2 or lifted_at is null)
+         order by deleted_at desc limit $3",
+    )
+    .bind(since)
+    .bind(q.all)
+    .bind(q.limit.unwrap_or(1000).clamp(1, 10_000))
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(
+        json!({ "deletions": rows.iter().map(deletion_json).collect::<Vec<_>>() }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct DeletionEntry {
+    account_id: Uuid,
+    #[serde(default)]
+    deleted_at: Option<i64>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct DeletionsImport {
+    entries: Vec<DeletionEntry>,
+}
+
+/// `POST /v1/admin/deletions/import {entries: [{account_id, deleted_at, reason}]}` — re-apply a
+/// ledger exported before the database was restored from a backup.
+async fn deletions_import(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Json(b): Json<DeletionsImport>,
+) -> Result<Json<Value>, ApiError> {
+    if b.entries.is_empty() || b.entries.len() > 10_000 {
+        return Err(Error::InvalidArgument("entries: 1..=10000".into()).into());
+    }
+    let mut n = 0u64;
+    for e in &b.entries {
+        if e.reason.len() > 512 {
+            return Err(Error::InvalidArgument("reason ≤ 512".into()).into());
+        }
+        let at = e
+            .deleted_at
+            .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok())
+            .unwrap_or_else(time::OffsetDateTime::now_utc);
+        n += sqlx::query(
+            "insert into musubi.account_deletions (account_id, deleted_at, source, reason)
+             values ($1, $2, 'import', $3)
+             on conflict (account_id) do update set deleted_at = least(musubi.account_deletions.deleted_at, excluded.deleted_at),
+                 reason = case when excluded.reason = '' then musubi.account_deletions.reason else excluded.reason end,
+                 lifted_at = null, lifted_by = null",
+        )
+        .bind(e.account_id)
+        .bind(at)
+        .bind(&e.reason)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    }
+    Ok(Json(json!({ "imported": n })))
+}
+
+async fn lift_entry(s: &AppState, id: Uuid, by: &str, reason: &str) -> Result<bool, Error> {
+    let n = sqlx::query(
+        "update musubi.account_deletions set lifted_at = now(), lifted_by = $2,
+             reason = case when $3 = '' then reason else $3 end
+         where account_id = $1 and lifted_at is null",
+    )
+    .bind(id)
+    .bind(by)
+    .bind(reason)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    Ok(n > 0)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LiftBody {
+    by: String,
+    reason: String,
+}
+
+/// `POST /v1/admin/deletions/{id}/lift {by, reason}` — this account may live again.
+async fn deletions_lift(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<LiftBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let b = body.map(|b| b.0).unwrap_or_default();
+    if b.by.len() > 128 || b.reason.len() > 512 {
+        return Err(Error::InvalidArgument("by ≤ 128, reason ≤ 512".into()).into());
+    }
+    if !lift_entry(
+        &s,
+        id,
+        if b.by.is_empty() { "operator" } else { &b.by },
+        &b.reason,
+    )
+    .await?
+    {
+        return Err(Error::NotFound("deletion ledger entry".into()).into());
+    }
+    s.events
+        .emit(
+            "account.deletion_lifted",
+            Some(AccountId(id)),
+            json!({ "by": b.by, "reason": b.reason }),
+        )
+        .await;
+    Ok(Json(json!({ "lifted": true })))
+}
+
+/// `POST /v1/admin/deletions/sweep` — re-delete resurrected accounts now (the leader does this
+/// every five minutes).
+async fn deletions_sweep(
+    _k: ServerKey,
+    State(s): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let ids = crate::deletion_ledger::sweep(&s).await?;
+    Ok(Json(json!({ "redeleted": ids })))
 }

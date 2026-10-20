@@ -1049,6 +1049,18 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                 }
                 n += 1;
                 // finished windows: fire `hook_tournament_end` / `hook_leaderboard_reset` once each
+                if n % 60 == 0 {
+                    match crate::deletion_ledger::sweep(&st).await {
+                        Ok(ids) if !ids.is_empty() => {
+                            tracing::info!(
+                                count = ids.len(),
+                                "re-deleted accounts from the deletion ledger"
+                            )
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "deletion ledger sweep"),
+                    }
+                }
                 if n % 12 == 0 {
                     match st.economy.draw_due_sweepstakes().await {
                         Ok(ids) => {

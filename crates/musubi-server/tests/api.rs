@@ -41120,3 +41120,179 @@ async fn fleet_aliases_route_allocations_and_retire_with_a_message() {
     let (st, _) = call_server(&app, "GET", &path, k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn deletion_ledger_redeletes_restored_accounts_unless_lifted() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (ta, a) = login(&app).await;
+    let (tb, b) = login(&app).await;
+    let (tc, c) = login(&app).await;
+    let (st, export_a) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{a}/export"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{export_a}");
+    // self-deletion lands in the ledger and ends the session
+    let (st, v) = call(&app, "POST", "/v1/account/delete", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&ta), None).await;
+    assert!(
+        st == StatusCode::NOT_FOUND || st == StatusCode::UNAUTHORIZED,
+        "{st}"
+    );
+    let (st, v) = call_server(&app, "GET", "/v1/admin/deletions?limit=10000", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let entry = v["deletions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["account_id"] == a)
+        .cloned();
+    assert!(entry.is_some(), "{v}");
+    assert_eq!(entry.unwrap()["source"], "delete");
+    // restoring a ledgered account from its export is refused unless overridden
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{a}/restore"),
+        k,
+        Some(json!({"export": export_a, "mode": "replace"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("deletion ledger"),
+        "{v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/accounts/{a}/restore"),
+        k,
+        Some(json!({"export": export_a, "mode": "replace", "override_deletion": true})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::CONFLICT, "{v}");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/deletions?all=true&limit=10000",
+        k,
+        None,
+    )
+    .await;
+    let entry = v["deletions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["account_id"] == a)
+        .cloned()
+        .unwrap();
+    assert_eq!(entry["lifted_by"], "restore", "{entry}");
+    // a ledger exported before a backup restore is re-applied: live accounts in it get re-deleted
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/deletions/import",
+        k,
+        Some(json!({"entries": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/deletions/import",
+        k,
+        Some(
+            json!({"entries": [{"account_id": b, "deleted_at": 1700000000, "reason": "gdpr"},
+                                {"account_id": c, "reason": "gdpr"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["imported"], 2);
+    // c is deliberately allowed to live again
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/deletions/{c}/lift"),
+        k,
+        Some(json!({"by": "ops", "reason": "restored on request"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/deletions/{c}/lift"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "already lifted");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/deletions/{}/lift", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&tb), None).await;
+    assert_eq!(st, StatusCode::OK, "b is alive until the sweep");
+    let (st, v) = call_server(&app, "POST", "/v1/admin/deletions/sweep", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let gone: Vec<&str> = v["redeleted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x.as_str())
+        .collect();
+    assert!(gone.contains(&b.as_str()), "{v}");
+    assert!(!gone.contains(&c.as_str()), "{v}");
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&tb), None).await;
+    assert!(
+        st == StatusCode::NOT_FOUND || st == StatusCode::UNAUTHORIZED,
+        "b re-deleted: {st}"
+    );
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&tc), None).await;
+    assert_eq!(st, StatusCode::OK, "c lifted");
+    let (_, v) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/deletions?since=1600000000&limit=10000",
+        k,
+        None,
+    )
+    .await;
+    let entry = v["deletions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["account_id"] == b)
+        .cloned()
+        .unwrap();
+    assert_eq!(entry["reapplied"], 1, "{entry}");
+    assert_eq!(
+        entry["deleted_at"], 1700000000,
+        "original deletion time kept: {entry}"
+    );
+    assert_eq!(entry["reason"], "gdpr");
+    // a second sweep has nothing to do
+    let (_, v) = call_server(&app, "POST", "/v1/admin/deletions/sweep", k, None).await;
+    assert!(
+        v["redeleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x != &json!(b)),
+        "{v}"
+    );
+}

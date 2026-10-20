@@ -12,6 +12,7 @@ pub mod bans;
 pub mod blobstore;
 pub mod compliance;
 pub mod db;
+pub mod deletion_ledger;
 pub mod dev;
 pub mod edge;
 pub mod events;
