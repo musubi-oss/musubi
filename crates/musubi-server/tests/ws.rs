@@ -20269,3 +20269,87 @@ async fn relayed_match_suppress_presence_skips_join_leave_events_and_member_list
         m => panic!("expected pong (no leave event), got {m:?}"),
     }
 }
+
+#[tokio::test]
+async fn notification_broadcast_reaches_every_connected_player_in_batches() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "json";
+    let mut socks = Vec::new();
+    for _ in 0..3 {
+        let (t, _) = token(&router).await;
+        socks.push(connect(&addr, &t, f).await);
+    }
+    let post = |body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::post("/v1/server/notifications/broadcast")
+                .header("x-musubi-server-key", "defaultkey")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, _) = post(json!({"subject": "", "content": {}})).await;
+    assert_eq!(st, 400);
+    let (st, _) = post(json!({"subject": "x", "batch_size": 0})).await;
+    assert_eq!(st, 400);
+    let (st, _) = post(json!({"subject": "x", "batch_interval_ms": 60001})).await;
+    assert_eq!(st, 400);
+    let (st, v) = post(json!({"subject": "maintenance", "dry_run": true, "batch_size": 2, "batch_interval_ms": 1000})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["local_targets"], 3);
+    assert_eq!(v["batches"], 2);
+    assert_eq!(v["estimated_secs"], 1.0);
+    let (st, v) = post(
+        json!({"subject": "maintenance in 10 min", "content": {"at": 123}, "code": 42,
+        "batch_size": 2, "batch_interval_ms": 50}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["targets"], 3);
+    let id = v["id"].as_str().unwrap().to_string();
+    for s in socks.iter_mut() {
+        match recv(s).await.msg {
+            ServerMessage::Notification { code, subject, .. } => {
+                assert_eq!(code, 42);
+                assert_eq!(subject, "maintenance in 10 min");
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+    let mut done = Value::Null;
+    for _ in 0..40 {
+        let req = Request::get(format!("/v1/server/notifications/broadcasts/{id}"))
+            .header("x-musubi-server-key", "defaultkey")
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), 200);
+        let v: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        if v["done"] == true {
+            done = v;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(done["sent"], 3, "{done}");
+    assert_eq!(done["batches"], 2, "{done}");
+    assert_eq!(done["errors"], 0, "{done}");
+    let req = Request::get(format!(
+        "/v1/server/notifications/broadcasts/{}",
+        uuid::Uuid::now_v7()
+    ))
+    .header("x-musubi-server-key", "defaultkey")
+    .body(Body::empty())
+    .unwrap();
+    assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
+}

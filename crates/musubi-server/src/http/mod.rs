@@ -11,6 +11,7 @@ mod auth;
 pub mod auth_providers;
 pub mod baggage;
 mod bans;
+pub mod broadcasts;
 pub mod build_artifacts;
 pub mod challenges;
 mod chat;
@@ -295,6 +296,7 @@ pub fn router(state: AppState) -> Router {
         .merge(group_pools::routes())
         .merge(challenges::routes())
         .merge(baggage::routes())
+        .merge(broadcasts::routes())
         .merge(developers::routes())
         .merge(donations::routes())
         .merge(egress::routes())

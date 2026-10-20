@@ -1081,6 +1081,16 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/notifications", "notifications"),
     ("POST", "/v1/notifications/read", "notifications"),
     ("POST", "/v1/server/notifications", "notifications"),
+    (
+        "POST",
+        "/v1/server/notifications/broadcast",
+        "notifications",
+    ),
+    (
+        "GET",
+        "/v1/server/notifications/broadcasts/{id}",
+        "notifications",
+    ),
     ("GET", "/v1/server/push/templates", "account"),
     ("PUT", "/v1/server/push/templates", "account"),
     ("DELETE", "/v1/server/push/templates/{id}", "account"),

@@ -150,6 +150,15 @@ impl Hub {
         self.sessions.len()
     }
 
+    /// Accounts with at least one live socket on this node (broadcasts).
+    pub fn online_account_ids(&self) -> Vec<AccountId> {
+        self.by_account
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| *e.key())
+            .collect()
+    }
+
     /// Distinct accounts with at least one live socket on this node.
     pub fn online_accounts(&self) -> usize {
         self.by_account
