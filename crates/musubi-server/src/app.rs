@@ -1050,6 +1050,23 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                 n += 1;
                 // finished windows: fire `hook_tournament_end` / `hook_leaderboard_reset` once each
                 if n % 12 == 0 {
+                    match st.economy.draw_due_sweepstakes().await {
+                        Ok(ids) => {
+                            for id in ids {
+                                tracing::info!(id, "sweepstake drawn");
+                                st.events
+                                    .emit(
+                                        "sweepstake.drawn",
+                                        None,
+                                        serde_json::json!({ "id": id, "forced": false, "by": "sweeper" }),
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "sweepstake sweep"),
+                    }
+                }
+                if n % 12 == 0 {
                     match st.leaderboards.unended_windows().await {
                         Ok(wins) => {
                             for (id, expiry, is_t) in wins {

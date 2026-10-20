@@ -82,6 +82,7 @@ pub mod steam_ownership;
 mod storage;
 pub mod streams;
 pub(crate) mod subscriptions;
+pub mod sweepstakes;
 pub mod timers;
 pub mod tournaments;
 mod turns;
@@ -297,6 +298,7 @@ pub fn router(state: AppState) -> Router {
         .merge(challenges::routes())
         .merge(baggage::routes())
         .merge(broadcasts::routes())
+        .merge(sweepstakes::routes())
         .merge(developers::routes())
         .merge(donations::routes())
         .merge(egress::routes())
