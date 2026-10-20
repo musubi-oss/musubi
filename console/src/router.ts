@@ -33,6 +33,10 @@ export const router = createRouter({
     ]},
     { path: '/liveops', component: () => import('./pages/liveops/Index.vue'), children: [
       { path: '', component: () => import('./pages/liveops/Timeline.vue') },
+      { path: 'flags/:name', component: () => import('./pages/liveops/Flag.vue') },
+      { path: 'experiments/:id', component: () => import('./pages/liveops/Experiment.vue') },
+      { path: 'configs/:name', component: () => import('./pages/liveops/Config.vue') },
+      { path: 'audiences/:name', component: () => import('./pages/liveops/Audience.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.liveops.find((x) => x.id === r.params.page) ?? catalog.liveops[1] }) },
     ]},
     { path: '/world', component: () => import('./pages/world/Index.vue'), children: [
