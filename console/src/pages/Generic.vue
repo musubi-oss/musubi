@@ -55,7 +55,7 @@ async function remove() {
   const p = itemPath(open.value); if (!p || !confirm('Delete this record?')) return
   try { await api('DELETE', p); toast.show('deleted'); open.value = null; load() } catch (e: any) { toast.err(e) }
 }
-function startCreate() { creating.value = true; text.value = JSON.stringify({ ...(props.res.key ? { [props.res.key]: '' } : {}), ...(props.res.template ?? {}) }, null, 2) }
+function startCreate() { if (props.res.newPath) { router.push(props.res.newPath); return } creating.value = true; text.value = JSON.stringify({ ...(props.res.key ? { [props.res.key]: '' } : {}), ...(props.res.template ?? {}) }, null, 2) }
 async function create() {
   try {
     const body = JSON.parse(text.value)
@@ -85,7 +85,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>
       <span style="margin-left:auto;display:flex;gap:8px">
         <button v-for="a in res.pageActions ?? []" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, null)">{{ a.label }}</button>
-        <button class="btn p" v-if="res.template || (!res.method && res.item)" @click="startCreate">Create</button>
+        <button class="btn p" v-if="res.newPath || res.template || (!res.method && res.item)" @click="startCreate">Create</button>
       </span>
     </div>
     <p class="err" v-if="err">{{ err }}</p>

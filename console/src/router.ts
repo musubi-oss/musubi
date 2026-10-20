@@ -48,6 +48,15 @@ export const router = createRouter({
       { path: '', component: () => import('./pages/cluster/Overview.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
     ]},
+    { path: '/economy', component: () => import('./pages/economy/Index.vue'), children: [
+      { path: '', component: () => import('./pages/Generic.vue'), props: () => ({ res: catalog.economy[0] }) },
+      { path: 'items/:id', component: () => import('./pages/economy/Item.vue') },
+      { path: 'reward_tables/:id', component: () => import('./pages/economy/RewardTable.vue') },
+      { path: 'store/:id', component: () => import('./pages/economy/StoreItem.vue') },
+      { path: 'seasons/:id', component: () => import('./pages/economy/Season.vue') },
+      { path: 'progression/:id', component: () => import('./pages/economy/Track.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.economy.find((x) => x.id === r.params.page) ?? catalog.economy[0] }) },
+    ]},
     { path: '/:section/:page?', component: () => import('./pages/Section.vue') },
   ],
 })
