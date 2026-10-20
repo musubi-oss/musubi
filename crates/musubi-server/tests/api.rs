@@ -40711,15 +40711,12 @@ async fn sweepstakes_enter_draw_cancel_and_sweep() {
     assert_eq!(st, StatusCode::CONFLICT);
     // sweep draws the ones whose window ended
     let id3 = format!("raffle3{tag}");
-    let mut past = base.clone();
-    past["starts_at"] = json!(now - 100);
-    past["ends_at"] = json!(now + 1);
     let (st, v) = call_server(
         &app,
         "PUT",
         &format!("/v1/server/sweepstakes/{id3}"),
         k,
-        Some(past),
+        Some(base.clone()),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -40732,7 +40729,19 @@ async fn sweepstakes_enter_draw_cancel_and_sweep() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // the operator moves the window into the past (no sleeping on slow CI runners)
+    let mut past = base.clone();
+    past["starts_at"] = json!(now - 100);
+    past["ends_at"] = json!(now - 50);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/sweepstakes/{id3}"),
+        k,
+        Some(past),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
     let (st, v) = call_server(&app, "POST", "/v1/server/sweepstakes/sweep", k, None).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(
