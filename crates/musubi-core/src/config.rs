@@ -170,6 +170,8 @@ pub struct SessionConfig {
 pub struct LogConfig {
     pub filter: String,
     pub json: bool,
+    /// Lines kept in memory for `GET /v1/admin/logs` (operator log tail).
+    pub ring_lines: usize,
 }
 
 impl Default for NodeConfig {
@@ -241,6 +243,7 @@ impl Default for LogConfig {
         Self {
             filter: "info".into(),
             json: false,
+            ring_lines: 5000,
         }
     }
 }

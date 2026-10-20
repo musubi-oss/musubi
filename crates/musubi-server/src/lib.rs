@@ -52,6 +52,7 @@ pub mod schedules;
 pub mod scopes;
 pub mod security;
 pub mod steam_ticket;
+pub mod system_logs;
 pub mod telemetry;
 pub mod translate;
 pub mod turns;
@@ -65,7 +66,9 @@ pub fn init_tracing(cfg: &Config) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(cfg.log.filter.clone()));
-    let reg = tracing_subscriber::registry().with(filter);
+    let reg = tracing_subscriber::registry()
+        .with(filter)
+        .with(crate::system_logs::layer(cfg.log.ring_lines));
     if cfg.log.json {
         let reg = reg.with(fmt::layer().json());
         match crate::telemetry::otlp_layer(&cfg.tracing) {

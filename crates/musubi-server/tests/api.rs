@@ -41561,3 +41561,129 @@ async fn stable_server_hostnames_from_dns_zone() {
     .await;
     assert!(h2["servers"][0]["hostname"].is_null(), "{h2}");
 }
+
+#[tokio::test]
+async fn admin_system_logs_ring_tail() {
+    use tracing_subscriber::prelude::*;
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let probe = unique("ringprobe");
+    let sub = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(musubi_server::system_logs::layer(1000)),
+    );
+    tracing::callsite::rebuild_interest_cache();
+    tracing::dispatcher::with_default(&sub, || {
+        tracing::warn!(target: "musubi_probe::fleet", code = 7, "ring {} warn", probe);
+        tracing::info!(target: "musubi_probe::fleet", "ring {} info", probe);
+        tracing::error!(target: "musubi_probe::other", "ring {} error", probe);
+    });
+    let (st, v) = call_server(&app, "GET", &format!("/v1/admin/logs?q={probe}"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let lines = v["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 3, "{v}");
+    assert_eq!(lines[0]["level"], "error", "newest first: {v}");
+    assert_eq!(lines[2]["level"], "warn");
+    assert_eq!(lines[2]["fields"]["code"], 7);
+    assert_eq!(lines[2]["target"], "musubi_probe::fleet");
+    assert!(lines[2]["message"].as_str().unwrap().ends_with("warn"));
+    assert!(
+        v["held"].as_u64().unwrap() >= 3 && v["capacity"].as_u64().unwrap() >= 16,
+        "{v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/logs?q={probe}&level=warn"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["lines"].as_array().unwrap().len(), 2, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/logs?q={probe}&target=musubi_probe::other"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["lines"].as_array().unwrap().len(), 1, "{v}");
+    let last = v["lines"][0]["seq"].as_u64().unwrap();
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/logs?q={probe}&before={last}&limit=1"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["lines"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["lines"][0]["level"], "info", "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/logs?q={probe}&since=2999-01-01T00:00:00Z"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["lines"].as_array().unwrap().is_empty(), "{v}");
+    let (st, _) = call_server(&app, "GET", "/v1/admin/logs?level=loud", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(&app, "GET", "/v1/admin/logs?limit=0", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(&app, "GET", "/v1/admin/logs?node=all&wait_ms=5", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(&app, "GET", "/v1/admin/logs?node=not-a-uuid", k, None).await;
+    assert!(
+        st == StatusCode::BAD_REQUEST || st == StatusCode::NOT_FOUND,
+        "{st}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/logs?node={}", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, n) = call_server(&app, "GET", "/v1/admin/logs/nodes", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{n}");
+    let me = n["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["me"] == true)
+        .expect("self node")
+        .clone();
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/admin/logs?q={probe}&node={}",
+            me["id"].as_str().unwrap()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["lines"].as_array().unwrap().len(), 3, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/logs?q={probe}&node=all&wait_ms=100"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["nodes"][0]["lines"].as_array().unwrap().len(), 3, "{v}");
+    let (st, _) = call(&app, "GET", "/v1/admin/logs", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

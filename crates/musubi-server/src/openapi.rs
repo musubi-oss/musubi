@@ -97,6 +97,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/admin/deletions", "admin"),
     ("POST", "/v1/admin/deletions/import", "admin"),
     ("POST", "/v1/admin/deletions/sweep", "admin"),
+    ("GET", "/v1/admin/logs", "admin"),
+    ("GET", "/v1/admin/logs/nodes", "admin"),
     ("POST", "/v1/admin/deletions/{id}/lift", "admin"),
     ("GET", "/v1/admin/accounts/{id}/limits", "admin"),
     ("PUT", "/v1/admin/accounts/{id}/limits", "admin"),

@@ -766,6 +766,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 - **Explicit matchmaking sort** — queue `sort: absolute|distance` on any numeric property decides which candidates a match fills from first (FlexMatch absoluteSort / distanceSort).
 - **Server reputation** — game servers report gameplay stats (rounds, players, kicks, crashes); operators get a per-server / per-fleet reputation card combining them with player ratings.
 - **Stable server names** — `spec.dns_zone` gives each game server a DNS-style hostname (pod hostname/subdomain on Kubernetes, by-name lookup everywhere).
+- **Operator log tail** — in-memory ring of each node's log lines, `GET /v1/admin/logs` with level/target/text/time filters across the cluster.
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),
