@@ -654,7 +654,7 @@ async fn create(
         b.token_ttl_secs,
         &b.allowed_ips,
     )?;
-    let client_id = format!("mc_{}", &Uuid::now_v7().simple().to_string()[..20]);
+    let client_id = format!("mc_{}", Uuid::now_v7().simple());
     let (secret, mut entry) = new_secret();
     entry["label"] = json!(b.secret_label);
     let secrets = if b.kind == "public" {
