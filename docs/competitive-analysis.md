@@ -1277,7 +1277,7 @@ Rows are normalized features grouped by area. The first block in each area holds
 | Commerce `stats-update` & purchase status |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — Purchase hooks via modules |
 | Content snapshots in Git / CLI snapshot & restore |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — Content bundle versions + export/import to files; no snapshot/restore CLI workflow |
 | Deprecated item types & pruning |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ |
-| VIP tiers (`VipContent`) |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ❌ · P1 — No VIP tier system (grep vip hits are unrelated) |
+| VIP tiers (`VipContent`) |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✅ VIP programs (`PUT /v1/server/vip/programs/{id}`: tiers with thresholds, free-form perks, tier-up reward tables; points = lifetime spend in chosen currencies × points-per-unit, optionally by ledger reason, + directly granted points) — `GET /v1/vip[/{program}]` (tier, perks, progress to next), server `GET /v1/server/accounts/{id}/vip`, `POST …/vip/{program}/points`; `vip.tier_up` events |
 | Blockchain (Ultra.io) |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | — — partner-specific |
 | Platform ID catalogue |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — platforms tracked for store/entitlements/crossplay, not a canonical client platform enum |
 | Lifecycle hooks: onCreate, onAuth (instance or static, ctx token/headers/ip), onJoin(client, options, auth),… |  |  |  |  | ✅ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | 🟡 · P2 — WASM exports init/join_attempt/join/leave/tick/terminate; disconnect-vs-leave is handled… |
@@ -4633,7 +4633,7 @@ Features only one report listed (after normalization). Each line: priority · co
 
 **P1 · economy/IAP** — owner: musubi-economy (`/v1/store*`, `/v1/iap/*`, `/v1/inventory*`, `/v1/server/rewards/*`)
 
-- ❌ **Beamable** · VIP tiers (`VipContent`) — Content type for VIP levels — *No VIP tier system (grep vip hits are unrelated)* — [source](https://docs.beamable.com/docs/content-overview)
+- ✅ **Beamable** · VIP tiers (`VipContent`) — Content type for VIP levels — *done: VIP programs with spend/points-based tiers, perks and tier-up rewards*
 - ❌ **Metaplay** · Item references `MetaRef`/`MetaConfigId`, cross/recursive references, late resolution, reference analyzer, item aliases/renaming without data migration — *no typed reference graph in content documents* — [source](https://docs.metaplay.io/feature-cookbooks/game-configs/game-config-item-references)
 - ✅ **Hiro/Satori** · Donations (ask friends/team for items) — Donation defs: cost, max_count, duration_sec, user_contribution_max_count, recipient_reward, contributor_reward; per-user storage; RPCs req… — *done: `/v1/donations` request/give/claim with dual rewards, audience friends|groups|anyone, per-helper cap, snapshotted definitions*
 - ❌ **Hiro/Satori** · Offline sync (BASE_SYNC, device prefs) — client stores offline changes and syncs; `ForceNetworkProbe`; offline mode for Unity — *no offline-first client reconciliation (no SDK)* — [source](https://github.com/heroiclabs/hiro/blob/master/hiro-openapi.yml)

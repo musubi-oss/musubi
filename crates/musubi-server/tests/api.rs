@@ -38652,3 +38652,207 @@ async fn donations_request_give_claim_with_audience_and_limits() {
     let (st, _) = call_server(&app, "DELETE", &path, k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn vip_tiers_from_spend_and_points_with_tier_up_rewards() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let tag = &uuid::Uuid::now_v7().simple().to_string()[20..];
+    let gems = format!("vgem{tag}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gems, "name": "Gems"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let bonus = format!("vbonus{tag}");
+    let (st, v) = call_server(&app, "POST", "/v1/server/rewards/tables", k,
+        Some(json!({"id": bonus, "name": bonus, "kind": "guaranteed", "entries": [{"currency": gems, "amount": 50}]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let prog = format!("club{tag}");
+    let path = format!("/v1/server/vip/programs/{prog}");
+    let tiers = json!([
+        {"name": "bronze", "threshold": 10, "perks": {"discount_pct": 5}},
+        {"name": "silver", "threshold": 50, "perks": {"discount_pct": 10}, "tier_up_reward": bonus},
+        {"name": "gold", "threshold": 200, "perks": {"discount_pct": 20}, "tier_up_reward": bonus}
+    ]);
+    for (body, why) in [
+        (json!({"tiers": []}), "no tiers"),
+        (
+            json!({"tiers": [{"name": "a", "threshold": 5}, {"name": "b", "threshold": 5}]}),
+            "not ascending",
+        ),
+        (json!({"tiers": [{"name": "", "threshold": 5}]}), "name"),
+        (
+            json!({"tiers": [{"name": "a", "threshold": 5, "tier_up_reward": "nope"}]}),
+            "reward table",
+        ),
+        (
+            json!({"tiers": tiers, "spend_currencies": {"nope": 1}}),
+            "currency",
+        ),
+        (
+            json!({"tiers": tiers, "spend_currencies": {gems.clone(): 0}}),
+            "ppu",
+        ),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{why}: {v}");
+    }
+    let (st, v) = call_server(&app, "PUT", &path, k, Some(json!({
+        "name": "Club", "tiers": tiers, "spend_currencies": {gems.clone(): 2}, "spend_reasons": ["purchase"]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["tiers"].as_array().unwrap().len(), 3);
+    assert_eq!(v["enabled"], true);
+
+    let (t, a) = login(&app).await;
+    // nothing spent → below bronze, next tier shown
+    let (st, v) = call(&app, "GET", &format!("/v1/vip/{prog}"), Some(&t), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["tier"], -1);
+    assert!(v["tier_name"].is_null());
+    assert_eq!(v["next_tier"]["name"], "bronze");
+    assert_eq!(v["next_tier"]["remaining"], 10);
+    // fund and spend: only `purchase` spending counts (2 points per gem)
+    let adj = |delta: i64, reason: &str| {
+        let app = app.clone();
+        let gems = gems.clone();
+        let a = a.clone();
+        let reason = reason.to_string();
+        async move {
+            let (st, v) = call_server(&app, "POST", "/v1/server/wallet/adjust", k,
+                Some(json!({"account_id": a, "currency": gems, "delta": delta, "reason": reason, "reference": uuid::Uuid::now_v7().to_string()}))).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+        }
+    };
+    adj(100, "grant").await;
+    adj(-8, "refund").await; // ignored by spend_reasons
+    adj(-7, "purchase").await; // 14 points → bronze
+    let (_, v) = call(&app, "GET", &format!("/v1/vip/{prog}"), Some(&t), None).await;
+    assert_eq!(v["points"], 14, "{v}");
+    assert_eq!(v["spend_points"], 14);
+    assert_eq!(v["tier_name"], "bronze");
+    assert_eq!(v["perks"]["discount_pct"], 5);
+    assert!(
+        v["rewards"].as_array().unwrap().is_empty(),
+        "bronze has no reward: {v}"
+    );
+    // manual points push to silver → tier-up reward granted exactly once
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/accounts/{a}/vip/{prog}/points"),
+        k,
+        Some(json!({"delta": 40, "reason": "event"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["points"], 54);
+    assert_eq!(v["manual_points"], 40);
+    assert_eq!(v["tier_name"], "silver");
+    assert_eq!(v["rewards"][0]["amount"], 50, "{v}");
+    let (_, v) = call(&app, "GET", "/v1/vip", Some(&t), None).await;
+    let mine = v["programs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["program_id"] == prog)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["tier_name"], "silver");
+    assert!(
+        mine["rewards"].as_array().unwrap().is_empty(),
+        "no double grant: {mine}"
+    );
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&t), None).await;
+    let bal = w["balances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|x| x["currency"] == gems)
+        .map(|x| x["balance"].as_i64().unwrap())
+        .unwrap_or(0);
+    assert_eq!(bal, 100 - 8 - 7 + 50, "{w}");
+    // skip straight past gold: both pending tier-ups? silver already granted → only gold's reward
+    adj(-80, "purchase").await; // +160 → 214 points → gold
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{a}/vip"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mine = v["programs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["program_id"] == prog)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["tier_name"], "gold", "{mine}");
+    assert_eq!(mine["rewards"].as_array().unwrap().len(), 1);
+    assert!(mine["next_tier"].is_null());
+    // removing manual points never drops the granted tier reward; tier itself follows points
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/accounts/{a}/vip/{prog}/points"),
+        k,
+        Some(json!({"delta": -40})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["manual_points"], 0);
+    assert_eq!(v["points"], 174);
+    assert_eq!(v["tier_name"], "silver");
+    assert!(v["rewards"].as_array().unwrap().is_empty());
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/accounts/{a}/vip/{prog}/points"),
+        k,
+        Some(json!({"delta": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!(
+            "/v1/server/accounts/{}/vip/{prog}/points",
+            uuid::Uuid::now_v7()
+        ),
+        k,
+        Some(json!({"delta": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // disabled → hidden from players; delete → 404
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"tiers": tiers, "enabled": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", &format!("/v1/vip/{prog}"), Some(&t), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call_server(&app, "GET", "/v1/server/vip/programs", k, None).await;
+    assert!(v["programs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == prog));
+    let (st, _) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

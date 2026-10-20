@@ -83,6 +83,7 @@ pub mod tournaments;
 mod turns;
 mod tx;
 mod ugc;
+mod vip;
 mod workflows;
 mod worlds;
 mod ws;
@@ -291,6 +292,7 @@ pub fn router(state: AppState) -> Router {
         .merge(group_pools::routes())
         .merge(challenges::routes())
         .merge(donations::routes())
+        .merge(vip::routes())
         .merge(account_policy::routes())
         .merge(items_lifecycle::routes())
         .merge(game_sessions::routes())

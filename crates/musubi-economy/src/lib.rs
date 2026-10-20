@@ -31,6 +31,7 @@ pub mod quest_pools;
 pub mod quests;
 pub mod seasons;
 pub mod treasury;
+pub mod vip;
 pub use group_inventory::{GroupInventoryEntry, GroupItem};
 pub use iap::{IapProduct, Receipt, ReceiptInput, SteamOrder};
 pub use quests::Quest;
