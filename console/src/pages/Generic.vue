@@ -3,13 +3,16 @@
 // template, delete. Non-list endpoints render as a key/value sheet of the JSON object.
 import { ref, onMounted, computed } from 'vue'
 import { api, get, qs } from '../api/client'
-import type { Res } from '../catalog'
+import type { Res, Act } from '../catalog'
+import { useRouter } from 'vue-router'
 import DataTable, { type Col } from '../components/DataTable.vue'
 import Drawer from '../components/Drawer.vue'
 import JsonView from '../components/JsonView.vue'
 import Kv from '../components/Kv.vue'
 import { toast } from '../stores/toast'
 const props = defineProps<{ res: Res }>()
+const router = useRouter()
+const pending = ref<{ act: Act; row: any; text: string } | null>(null)
 const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const busy = ref(false)
 const q = ref(''); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
 const open = ref<any>(null); const edit = ref(''); const creating = ref(false); const text = ref('')
@@ -61,6 +64,17 @@ async function create() {
     toast.show('created'); creating.value = false; load()
   } catch (e: any) { toast.err(e) }
 }
+function fill(path: string, row: any) { return path.replace(/\{([^}]+)\}/g, (_, k) => encodeURIComponent(row?.[k] ?? '')) }
+async function run(act: Act, row: any) {
+  if (act.body && !pending.value) { pending.value = { act, row, text: JSON.stringify(act.body, null, 2) }; return }
+  if (act.confirm && !window.confirm(act.confirm)) return
+  try {
+    const body = pending.value ? JSON.parse(pending.value.text) : undefined
+    await api(act.method, fill(act.path, { ...(row ?? {}), ...(body ?? {}) }), body)
+    toast.show(act.label + ': ok'); pending.value = null; open.value = null; load()
+  } catch (e: any) { toast.err(e) }
+}
+function visible(acts: Act[] | undefined, row: any) { return (acts ?? []).filter((a) => !a.when || a.when(row)) }
 onMounted(load)
 </script>
 <template>
@@ -69,11 +83,21 @@ onMounted(load)
     <div class="tools" v-if="isList">
       <input class="in" v-model="q" placeholder="search" @keyup.enter="load()" />
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>
-      <button class="btn p" v-if="res.template || (!res.method && res.item)" @click="startCreate" style="margin-left:auto">Create</button>
+      <span style="margin-left:auto;display:flex;gap:8px">
+        <button v-for="a in res.pageActions ?? []" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, null)">{{ a.label }}</button>
+        <button class="btn p" v-if="res.template || (!res.method && res.item)" @click="startCreate">Create</button>
+      </span>
     </div>
     <p class="err" v-if="err">{{ err }}</p>
     <template v-if="isList">
-      <DataTable :cols="cols" :rows="rows" pick @pick="pick" />
+      <DataTable :cols="cols" :rows="rows" pick @pick="pick">
+        <template #actions="{ row }" v-if="res.actions || res.link">
+          <span style="display:flex;gap:6px;justify-content:flex-end">
+            <button v-if="res.link && res.link(row)" class="btn s" @click="router.push(res.link(row)!)">Open</button>
+            <button v-for="a in visible(res.actions, row)" :key="a.label" class="btn s" :class="{ d: a.danger }" @click="run(a, row)">{{ a.label }}</button>
+          </span>
+        </template>
+      </DataTable>
       <div class="pager" v-if="cursor || stack.length"><button class="btn s" :disabled="!stack.length" @click="prev">Prev</button><button class="btn s" :disabled="!cursor" @click="next">Next</button></div>
     </template>
     <template v-else-if="data && typeof data === 'object'">
@@ -81,20 +105,26 @@ onMounted(load)
         <div v-for="(v, k) in data" :key="String(k)" style="border:0;margin:0"><Kv :k="String(k).replace(/_/g, ' ')" :v="typeof v === 'object' && v !== null ? undefined : v" :mono="typeof v === 'string'">
           <JsonView v-if="typeof v === 'object' && v !== null" :value="v" /><template v-else>{{ v ?? '—' }}</template></Kv></div>
       </div>
-      <div class="tools"><button class="btn" @click="load()">Refresh</button></div>
+      <div class="tools"><button class="btn" @click="load()">Refresh</button><button v-for="a in res.pageActions ?? []" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, data)">{{ a.label }}</button></div>
     </template>
     <div v-else-if="!err && !busy" class="empty">No Data</div>
   </div>
   <Drawer v-if="open" :title="res.title.replace(/s$/, '')" @close="open = null">
-    <JsonView v-if="!res.item" :value="open" />
+    <template v-if="!res.item"><JsonView :value="open" />
+      <div class="form" v-if="res.actions?.length"><div class="row"><button v-for="a in visible(res.actions, open)" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, open)">{{ a.label }}</button></div></div></template>
     <template v-else>
       <textarea class="in" v-model="edit" style="min-height:360px"></textarea>
-      <div class="form"><div class="row"><button class="btn d" @click="remove">Delete</button><button class="btn" @click="open = null">Close</button><button class="btn p" @click="save">Save</button></div></div>
+      <div class="form"><div class="row"><button v-for="a in visible(res.actions, open)" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, open)">{{ a.label }}</button><button class="btn d" @click="remove">Delete</button><button class="btn" @click="open = null">Close</button><button class="btn p" @click="save">Save</button></div></div>
     </template>
   </Drawer>
   <Drawer v-if="creating" :title="'New ' + res.title.replace(/s$/, '').toLowerCase()" @close="creating = false">
     <textarea class="in" v-model="text" style="min-height:300px"></textarea>
     <div class="form"><div class="row"><button class="btn" @click="creating = false">Cancel</button><button class="btn p" @click="create">Create</button></div></div>
+  </Drawer>
+  <Drawer v-if="pending" :title="pending.act.label" @close="pending = null">
+    <p class="note m">{{ pending.act.method }} {{ fill(pending.act.path, pending.row ?? {}) }}</p>
+    <textarea class="in" v-model="pending.text" style="min-height:260px"></textarea>
+    <div class="form"><div class="row"><button class="btn" @click="pending = null">Cancel</button><button class="btn p" :class="{ d: pending.act.danger }" @click="run(pending.act, pending.row)">Send</button></div></div>
   </Drawer>
   <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

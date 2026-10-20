@@ -2321,6 +2321,155 @@ async fn fraud_velocity_flags_and_blocks() {
 }
 
 #[tokio::test]
+async fn operator_account_economy_views() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, sess) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("opeco")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let acc = sess["account_id"].as_str().unwrap().to_string();
+    let gold = unique("ogold");
+    let sword = unique("osword");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for (delta, reason) in [(300, "quest"), (-50, "repair")] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/wallet/adjust",
+            k,
+            Some(json!({"account_id": acc, "currency": gold, "delta": delta, "reason": reason})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": sword, "name": "Sword", "category": "weapon", "stackable": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": acc, "item_id": sword, "instance": {"durability": 7}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let table = unique("otable");
+    let (st, v) = call_server(&app, "POST", "/v1/server/rewards/tables", k, Some(json!({"id": table, "kind": "weighted", "entries": [{"weight": 1, "item_id": sword, "amount": 1}]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/entitlements",
+        k,
+        Some(json!({"provider": "xbox", "external_id": "OP-SEASON", "reward_table": table})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/entitlements/grant",
+        k,
+        Some(json!({"account_id": acc, "provider": "xbox", "external_id": "OP-SEASON"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // the operator reads the same data the player sees, addressed by account id
+    let base = format!("/v1/server/accounts/{acc}");
+    let (st, w) = call_server(&app, "GET", &format!("{base}/wallet"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+    let b = w["balances"].as_array().unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0]["currency"], gold);
+    assert_eq!(b[0]["balance"], 250);
+    let (st, l) = call_server(&app, "GET", &format!("{base}/ledger?limit=10"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let e = l["entries"].as_array().unwrap();
+    assert_eq!(e.len(), 2, "{l}");
+    assert!(
+        e.iter()
+            .any(|x| x["reason"] == "repair" && x["delta"] == -50),
+        "{l}"
+    );
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/ledger?currency=nope"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(l["entries"].as_array().unwrap().len(), 0);
+    let (st, inv) = call_server(&app, "GET", &format!("{base}/inventory"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{inv}");
+    // the granted sword plus the one the entitlement's reward table paid out
+    let items = inv["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{inv}");
+    assert!(items.iter().all(|i| i["item_id"] == sword), "{inv}");
+    assert!(
+        items.iter().any(|i| i["instance"]["durability"] == 7),
+        "{inv}"
+    );
+    let (st, en) = call_server(&app, "GET", &format!("{base}/entitlements"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{en}");
+    let en = en["entitlements"].as_array().unwrap();
+    assert_eq!(en.len(), 1, "{en:?}");
+    assert_eq!(en[0]["provider"], "xbox");
+    assert_eq!(en[0]["external_id"], "OP-SEASON");
+    assert_eq!(en[0]["active"], true);
+
+    // bad ids and missing key
+    for p in ["wallet", "ledger", "inventory", "entitlements"] {
+        let (st, _) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/server/accounts/not-a-uuid/{p}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{p}");
+        let (st, _) = call(&app, "GET", &format!("{base}/{p}"), None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{p}");
+    }
+    // an unknown but well-formed account is simply empty
+    let ghost = uuid::Uuid::now_v7();
+    let (st, w) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{ghost}/wallet"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(w["balances"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn economy_wallet_ledger_inventory_and_store() {
     let Some(app) = app().await else { return };
     let k = "defaultkey";

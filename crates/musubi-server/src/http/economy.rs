@@ -156,6 +156,9 @@ pub fn routes() -> Router<AppState> {
             get(currencies).post(upsert_currency),
         )
         .route("/v1/server/wallet/adjust", post(adjust))
+        .route("/v1/server/accounts/{id}/wallet", get(account_wallet))
+        .route("/v1/server/accounts/{id}/ledger", get(account_ledger))
+        .route("/v1/server/accounts/{id}/inventory", get(account_inventory))
         .route("/v1/server/items", get(items).post(upsert_item))
         .route("/v1/server/items/{id}", get(item))
         .route("/v1/server/items/{id}/versions", get(item_versions))
@@ -231,6 +234,39 @@ async fn ledger(
 async fn inventory(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         json!({ "items": s.economy.inventory(me.account_id).await? }),
+    ))
+}
+
+/// Operator views of a player's economy (console / support): the same data the player sees
+/// through the bearer routes, addressed by account id under a server key.
+async fn account_wallet(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "balances": s.economy.wallet(account(&id)?).await? }),
+    ))
+}
+
+async fn account_ledger(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<String>,
+    Query(q): Query<LedgerQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "entries": s.economy.ledger(account(&id)?, q.currency.as_deref(), q.limit.unwrap_or(50)).await? }),
+    ))
+}
+
+async fn account_inventory(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "items": s.economy.inventory(account(&id)?).await? }),
     ))
 }
 

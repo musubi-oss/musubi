@@ -24,6 +24,10 @@ pub fn routes() -> Router<AppState> {
             "/v1/server/entitlements/{provider}/{external_id}",
             delete(remove),
         )
+        .route(
+            "/v1/server/accounts/{id}/entitlements",
+            get(account_entitlements),
+        )
         .route("/v1/server/entitlements/grant", post(server_grant))
         .route("/v1/server/entitlements/revoke", post(server_revoke))
         .route("/v1/server/entitlements/sweep", post(server_sweep))
@@ -360,11 +364,27 @@ type GrantRow = (
 );
 
 async fn mine(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json<Value>, ApiError> {
+    grants_of(&s, me.account_id).await
+}
+
+/// Operator view of one player's grants (console / support), same shape as `GET /v1/entitlements`.
+async fn account_entitlements(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = Uuid::parse_str(&id)
+        .map(AccountId)
+        .map_err(|_| ApiError::from(Error::InvalidArgument("bad account id".into())))?;
+    grants_of(&s, id).await
+}
+
+async fn grants_of(s: &AppState, account_id: AccountId) -> Result<Json<Value>, ApiError> {
     let rows: Vec<GrantRow> = sqlx::query_as(
         "select provider, external_id, granted_at, revoked_at, license, expires_at, source
              from musubi.entitlement_grants where account_id = $1 order by granted_at",
     )
-    .bind(me.account_id.0)
+    .bind(account_id.0)
     .fetch_all(&s.db)
     .await
     .map_err(Error::internal)?;
