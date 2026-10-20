@@ -37,6 +37,10 @@ export const router = createRouter({
       { path: 'experiments/:id', component: () => import('./pages/liveops/Experiment.vue') },
       { path: 'configs/:name', component: () => import('./pages/liveops/Config.vue') },
       { path: 'audiences/:name', component: () => import('./pages/liveops/Audience.vue') },
+      { path: 'live_events/:id', component: () => import('./pages/liveops/LiveEvent.vue') },
+      { path: 'offers/:id', component: () => import('./pages/liveops/Offer.vue') },
+      { path: 'news/:id', component: () => import('./pages/liveops/News.vue') },
+      { path: 'changesets/:id', component: () => import('./pages/liveops/Changeset.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.liveops.find((x) => x.id === r.params.page) ?? catalog.liveops[1] }) },
     ]},
     { path: '/world', component: () => import('./pages/world/Index.vue'), children: [
