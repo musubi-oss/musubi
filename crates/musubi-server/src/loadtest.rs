@@ -906,7 +906,10 @@ impl Bot {
         }
         if r.scenario == "match" {
             let join = if self.leader {
-                ClientMessage::MatchCreate { name: None }
+                ClientMessage::MatchCreate {
+                    name: None,
+                    suppress_presence: false,
+                }
             } else {
                 let mut rx = self.group.subscribe();
                 let id = match tokio::time::timeout(

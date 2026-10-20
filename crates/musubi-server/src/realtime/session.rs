@@ -897,9 +897,12 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
         ClientMessage::PartyMatchmakerRemove { party_id, ticket } => {
             party_dispatch(ctx, &party_id, PartyCmd::MatchmakerRemove { ticket })
         }
-        ClientMessage::MatchCreate { name } => Some(
+        ClientMessage::MatchCreate {
+            name,
+            suppress_presence,
+        } => Some(
             ctx.relayed
-                .create(ctx.presence, name)
+                .create(ctx.presence, name, suppress_presence)
                 .unwrap_or_else(|e| ServerMessage::error(&e)),
         ),
         ClientMessage::WorldSubscribe {

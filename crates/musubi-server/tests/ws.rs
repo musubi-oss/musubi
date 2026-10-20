@@ -1056,6 +1056,7 @@ async fn relayed_matches_create_join_data_and_matchmaker_token() {
         Some("m"),
         ClientMessage::MatchCreate {
             name: Some("duel".into()),
+            suppress_presence: false,
         },
     )
     .await;
@@ -2191,6 +2192,7 @@ async fn cross_node_relayed_match() {
         None,
         ClientMessage::MatchCreate {
             name: Some("xn".into()),
+            suppress_presence: false,
         },
     )
     .await;
@@ -5774,6 +5776,7 @@ async fn match_join_records_recent_players() {
         Some("c"),
         ClientMessage::MatchCreate {
             name: Some("recent".into()),
+            suppress_presence: false,
         },
     )
     .await;
@@ -9622,7 +9625,16 @@ async fn relayed_host_migrates_by_rtt() {
     let mut a = connect(&addr, &ta, f).await;
     let mut b = connect(&addr, &tb, f).await;
     let mut c = connect(&addr, &tc, f).await;
-    send(&mut a, f, None, ClientMessage::MatchCreate { name: None }).await;
+    send(
+        &mut a,
+        f,
+        None,
+        ClientMessage::MatchCreate {
+            name: None,
+            suppress_presence: false,
+        },
+    )
+    .await;
     let (mid, a_sid) = match recv(&mut a).await.msg {
         ServerMessage::Match {
             match_id, host, me, ..
@@ -18509,7 +18521,10 @@ async fn transport_channels_and_lz4() {
         &mut a,
         f,
         Some("m"),
-        ClientMessage::MatchCreate { name: None },
+        ClientMessage::MatchCreate {
+            name: None,
+            suppress_presence: false,
+        },
     )
     .await;
     let mid = match recv(&mut a).await.msg {
@@ -20149,4 +20164,108 @@ async fn generic_streams_join_send_leave_and_server_fanout() {
     .await;
     assert_eq!(v["left"], true);
     assert_eq!(v["count"], 0);
+}
+
+#[tokio::test]
+async fn relayed_match_suppress_presence_skips_join_leave_events_and_member_list() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let f = "binary";
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mut a = connect(&addr, &ta, f).await;
+    let mut b = connect(&addr, &tb, f).await;
+    send(
+        &mut a,
+        f,
+        Some("m"),
+        ClientMessage::MatchCreate {
+            name: Some("big-room".into()),
+            suppress_presence: true,
+        },
+    )
+    .await;
+    let mid = match recv(&mut a).await.msg {
+        ServerMessage::Match {
+            match_id,
+            size,
+            presences,
+            suppress_presence,
+            host,
+            ..
+        } => {
+            assert_eq!(size, 1);
+            assert!(presences.is_empty(), "no member list when suppressed");
+            assert!(suppress_presence);
+            assert!(host.is_some(), "host is still announced");
+            match_id
+        }
+        m => panic!("{m:?}"),
+    };
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchJoin {
+            match_id: Some(mid.clone()),
+            token: None,
+            metadata: Default::default(),
+            spectator: false,
+            delay_ticks: 0,
+        },
+    )
+    .await;
+    match recv(&mut b).await.msg {
+        ServerMessage::Match {
+            size, presences, ..
+        } => {
+            assert_eq!(size, 2);
+            assert!(presences.is_empty());
+        }
+        m => panic!("{m:?}"),
+    }
+    // a gets no join event: the next thing it sees is b's data
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchDataSend {
+            match_id: mid.clone(),
+            op_code: 7,
+            data: vec![1, 2],
+            presences: vec![],
+            reliable: true,
+            channel: None,
+        },
+    )
+    .await;
+    match recv(&mut a).await.msg {
+        ServerMessage::MatchData { op_code, data, .. } => {
+            assert_eq!(op_code, 7);
+            assert_eq!(data, vec![1, 2]);
+        }
+        m => panic!("expected data, not a presence event: {m:?}"),
+    }
+    // b leaves: a gets no leave event either; a later data message from a still works
+    send(
+        &mut b,
+        f,
+        None,
+        ClientMessage::MatchLeave {
+            match_id: mid.clone(),
+        },
+    )
+    .await;
+    send(&mut b, f, Some("pb"), ClientMessage::Ping).await;
+    loop {
+        if matches!(recv(&mut b).await.msg, ServerMessage::Pong) {
+            break;
+        }
+    }
+    send(&mut a, f, Some("p"), ClientMessage::Ping).await;
+    match recv(&mut a).await.msg {
+        ServerMessage::Pong => {}
+        m => panic!("expected pong (no leave event), got {m:?}"),
+    }
 }

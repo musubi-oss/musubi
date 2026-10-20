@@ -790,7 +790,10 @@ async fn match_loop(
         return fail(Instant::now());
     };
     let join = if group.leader {
-        ClientMessage::MatchCreate { name: None }
+        ClientMessage::MatchCreate {
+            name: None,
+            suppress_presence: false,
+        }
     } else {
         let id =
             match tokio::time::timeout(Duration::from_secs(15), group.rx.wait_for(|v| v.is_some()))

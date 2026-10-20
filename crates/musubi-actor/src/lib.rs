@@ -948,6 +948,7 @@ fn snapshot(
         presences: members.to_vec(),
         me: me.clone(),
         host: None,
+        suppress_presence: false,
     }
 }
 

@@ -25,6 +25,8 @@ struct Relayed {
     host: Option<SessionId>,
     /// Latest client-reported round trip per member, for host election.
     rtt: std::collections::HashMap<SessionId, u32>,
+    /// No join / leave events, no member list in replies (Photon `SuppressRoomEvents`).
+    suppress_presence: bool,
 }
 
 impl Relayed {
@@ -34,9 +36,14 @@ impl Relayed {
             authoritative: false,
             label: self.label.clone(),
             size: self.members.len() as u32,
-            presences: self.members.clone(),
+            presences: if self.suppress_presence {
+                Vec::new()
+            } else {
+                self.members.clone()
+            },
             me: me.clone(),
             host: self.host_presence(),
+            suppress_presence: self.suppress_presence,
         }
     }
 
@@ -144,11 +151,17 @@ impl RelayedRegistry {
                     members: vec![],
                     host: None,
                     rtt: Default::default(),
+                    suppress_presence: false,
                 });
         }
     }
 
-    pub fn create(&self, me: &UserPresence, name: Option<String>) -> Result<ServerMessage> {
+    pub fn create(
+        &self,
+        me: &UserPresence,
+        name: Option<String>,
+        suppress_presence: bool,
+    ) -> Result<ServerMessage> {
         if name.as_ref().is_some_and(|n| n.chars().count() > 64) {
             return Err(Error::InvalidArgument("match name ≤ 64 chars".into()));
         }
@@ -159,6 +172,7 @@ impl RelayedRegistry {
             members: vec![me.clone()],
             host: Some(me.session_id),
             rtt: Default::default(),
+            suppress_presence,
         };
         let snap = m.snapshot(me);
         let label = m.label.clone();
@@ -219,8 +233,11 @@ impl RelayedRegistry {
             joins: vec![me.clone()],
             leaves: vec![],
         };
+        let quiet = m.suppress_presence;
         for s in others {
-            fanout.session(s, ev.clone());
+            if !quiet {
+                fanout.session(s, ev.clone());
+            }
             if let Some(h) = &host_ev {
                 fanout.session(s, h.clone());
             }
@@ -249,8 +266,11 @@ impl RelayedRegistry {
             joins: vec![],
             leaves: vec![gone],
         };
+        let quiet = m.suppress_presence;
         for s in m.sessions() {
-            fanout.session(s, ev.clone());
+            if !quiet {
+                fanout.session(s, ev.clone());
+            }
             if let Some(h) = &host_ev {
                 fanout.session(s, h.clone());
             }

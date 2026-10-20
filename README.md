@@ -755,6 +755,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 - **Session baggage** — per-session key/value in `social` / `game` / `service` scopes (friends, game servers, event stamping), Pragma-style limits.
 - **Reserved servers** — `POST /v1/gameserver/reserve {seconds}` / `…/gameservers/{id}/reserve|unreserve`: hold a ready server out of allocation and scale-down, timed or until cancelled.
 - **Telemetry sampling policy** — global keep rate × per-schema rate, `always_enabled` events, deterministic per session; clients fetch `GET /v1/telemetry/sampling` and skip what would be dropped.
+- **Quiet relayed rooms** — `MatchCreate { suppress_presence }` drops join/leave events and member lists for large relayed matches (Photon `SuppressRoomEvents`).
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

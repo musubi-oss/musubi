@@ -229,6 +229,11 @@ pub enum ClientMessage {
     MatchCreate {
         #[serde(default)]
         name: Option<String>,
+        /// Photon `SuppressRoomEvents` / `SuppressPlayerInfo`: members get no join / leave
+        /// presence events and the `Match` reply carries no member list (`size` only) — for big
+        /// rooms where the game tracks players through its own data messages.
+        #[serde(default)]
+        suppress_presence: bool,
     },
     /// Client-measured round trip to the server (ping→pong), used to pick relayed-match hosts.
     Rtt {
@@ -534,6 +539,10 @@ pub enum ServerMessage {
         /// Relayed matches: the member that simulates the game; `None` for authoritative ones.
         #[serde(default)]
         host: Option<UserPresence>,
+        /// Relayed matches created with `suppress_presence`: `presences` is empty and no
+        /// `MatchPresenceEvent` is sent for this match.
+        #[serde(default)]
+        suppress_presence: bool,
     },
     /// Relayed matches: the host changed (left, dropped or handed over) — `host` simulates now.
     MatchHost {
