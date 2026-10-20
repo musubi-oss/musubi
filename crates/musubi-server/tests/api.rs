@@ -6337,25 +6337,20 @@ async fn trace_id_is_returned_on_errors() {
         tracing_subscriber::registry()
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
     );
-    // Other tests in this binary may have hit the request-span callsite under the no-op
-    // subscriber while our dispatcher was being registered, caching it as disabled; force a
-    // recomputation so the scoped subscriber definitely sees the span.
-    tracing::callsite::rebuild_interest_cache();
-    let (st, mut v) = call(&app, "GET", "/v1/account", Some("not-a-token"), None)
-        .with_subscriber(sub.clone())
-        .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
-    if v["trace_id"].is_null() {
-        // a parallel test re-registered a callsite in between; recompute once more and retry
+    // `rebuild_interest_cache` must run *while our dispatcher is the current one*: with a single
+    // live dispatcher tracing-core recomputes every callsite's interest against the thread's
+    // current default, and outside the scope that is the no-op subscriber, which would cache the
+    // request-span callsite as `never` (how this test went red once enough tests shared the binary).
+    let (st, v) = async {
         tracing::callsite::rebuild_interest_cache();
-        v = call(&app, "GET", "/v1/account", Some("not-a-token"), None)
-            .with_subscriber(sub)
-            .await
-            .1;
+        call(&app, "GET", "/v1/account", Some("not-a-token"), None).await
     }
+    .with_subscriber(sub)
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
     let trace_id = v["trace_id"]
         .as_str()
-        .expect("trace_id in error body")
+        .unwrap_or_else(|| panic!("trace_id in error body: {v}"))
         .to_string();
     assert_eq!(trace_id.len(), 32, "{trace_id}");
     provider.force_flush().unwrap();
