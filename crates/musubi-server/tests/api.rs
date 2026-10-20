@@ -195,6 +195,18 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
     Some((musubi_server::http::router(state.clone()), state))
 }
 
+/// Tests that switch the global access policy (maintenance / limited) take the write side; logins
+/// made through `call` / `call_server` take the read side, so a parallel test never sees another
+/// test's maintenance window (the api suite shares one database).
+static LOGIN_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+tokio::task_local! {
+    static GATE_HELD: ();
+}
+fn gated_login(path: &str) -> bool {
+    (path.starts_with("/v1/auth/") || path.starts_with("/v1/server/auth/"))
+        && GATE_HELD.try_with(|_| ()).is_err()
+}
+
 async fn call(
     app: &Router,
     method: &str,
@@ -202,6 +214,11 @@ async fn call(
     token: Option<&str>,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    let _gate = if gated_login(path) {
+        Some(LOGIN_GATE.read().await)
+    } else {
+        None
+    };
     let mut req = Request::builder().method(method).uri(path);
     if let Some(t) = token {
         req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
@@ -1036,6 +1053,11 @@ async fn call_server(
     key: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    let _gate = if gated_login(path) {
+        Some(LOGIN_GATE.read().await)
+    } else {
+        None
+    };
     let mut req = Request::builder()
         .method(method)
         .uri(path)
@@ -28155,292 +28177,297 @@ async fn fleet_slots_per_server_packing_and_release() {
 #[tokio::test]
 async fn limited_access_mode_allowlist_windows_and_maintenance() {
     let Some(app) = app().await else { return };
-    let k = "defaultkey";
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let login = |id: String| {
-        let app = app.clone();
-        async move {
-            call_server(
-                &app,
-                "POST",
-                "/v1/server/auth/custom",
-                "defaultkey",
-                Some(json!({"id": id})),
-            )
-            .await
-        }
-    };
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        "/v1/admin/access/policy",
-        k,
-        Some(json!({"mode": "closed"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
-        "mode": "limited", "providers": ["custom"], "message": "closed beta", "retry_after_secs": 600
-    }))).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["effective"]["mode"], "limited");
-    // policy scoped to custom logins: device logins are untouched
-    let (st, _) = call(
-        &app,
-        "POST",
-        "/v1/auth/device",
-        None,
-        Some(json!({"id": unique("dev")})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    let a = unique("acc-a");
-    let (st, v) = login(a.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    let msg = v["message"].as_str().unwrap();
-    assert!(
-        msg.contains("signups_closed")
-            && msg.contains("closed beta")
-            && msg.contains("retry after 600s"),
-        "{msg}"
-    );
-    let (st, pubv) = call(&app, "GET", "/v1/access", None, None).await;
-    assert_eq!(st, StatusCode::OK);
-    assert_eq!(pubv["mode"], "limited");
-    assert_eq!(pubv["message"], "closed beta");
-    // allow-list by identity → in
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        &format!("/v1/admin/access/allowlist/identity/Custom:{a}"),
-        k,
-        Some(json!({"note": "press"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["key"], format!("identity:custom:{a}"));
-    let (st, sa) = login(a.clone()).await;
-    assert_eq!(st, StatusCode::OK, "{sa}");
-    let a_id = sa["account_id"].as_str().unwrap().to_string();
-    let a_rt = sa["refresh_token"].as_str().unwrap().to_string();
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/admin/access/check?account_id={a_id}&provider=custom"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["decision"]["allowed"], true);
-    assert_eq!(v["decision"]["reason"], "allowlist");
-    assert_eq!(v["decision"]["via"], format!("identity:custom:{a}"));
-    // second account: first attempt creates it but is denied; later it is "existing"
-    let b = unique("acc-b");
-    let (st, v) = login(b.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    let (st, v) = login(b.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    assert!(
-        v["message"].as_str().unwrap().contains("not_allowlisted"),
-        "{v}"
-    );
-    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
-        "mode": "limited", "providers": ["custom"], "allow_existing_accounts": true, "kick_on_change": false
-    }))).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, sb) = login(b.clone()).await;
-    assert_eq!(
-        st,
-        StatusCode::OK,
-        "soft launch lets existing accounts in: {sb}"
-    );
-    let b_rt = sb["refresh_token"].as_str().unwrap().to_string();
-    let c = unique("acc-c");
-    let (st, v) = login(c.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "new accounts still closed: {v}");
-    // expired entries do not match; import validates per entry
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        &format!("/v1/admin/access/allowlist/identity/custom:{c}"),
-        k,
-        Some(json!({"expires_at": now - 10})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        "/v1/admin/access/policy",
-        k,
-        Some(json!({
-            "mode": "limited", "providers": ["custom"], "kick_on_change": false
-        })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, _) = login(c.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN);
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/admin/access/allowlist?kind=identity&include_expired=true&q={c}"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["total"], 1, "{v}");
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/admin/access/allowlist?kind=identity&q={c}"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(v["total"], 0, "{v} {st}");
-    let (st, v) = call_server(&app, "GET", "/v1/admin/access/allowlist?kind=nope", k, None).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    let (st, v) = call_server(
-        &app,
-        "POST",
-        "/v1/admin/access/allowlist/import",
-        k,
-        Some(json!({
-            "added_by": "csv", "entries": [
-                {"kind": "email_domain", "value": "@Studio.Example", "note": "staff"},
-                {"kind": "account", "value": "not-a-uuid"},
-                {"kind": "account", "value": a_id}
-            ]
-        })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["imported"], 2);
-    assert_eq!(v["rejected"], 1);
-    let (st, _) = call_server(
-        &app,
-        "DELETE",
-        "/v1/admin/access/allowlist/email_domain/studio.example",
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    let (st, _) = call_server(
-        &app,
-        "DELETE",
-        "/v1/admin/access/allowlist/email_domain/studio.example",
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-    // denials are recorded for the operator
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        "/v1/admin/access/denials?since_secs=600",
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(v["total"].as_i64().unwrap() >= 4, "{v}");
-    assert!(
-        v["by_reason"]["signups_closed"].as_i64().unwrap() >= 2,
-        "{v}"
-    );
-    assert!(
-        v["by_reason"]["not_allowlisted"].as_i64().unwrap() >= 2,
-        "{v}"
-    );
-    assert!(v["by_provider"]["custom"].as_i64().unwrap() >= 4, "{v}");
-    // a scheduled open window lets everyone in and is announced publicly
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        "/v1/admin/access/policy",
-        k,
-        Some(json!({
-            "mode": "limited", "providers": ["custom"], "kick_on_change": false,
-            "windows": [{"name": "playtest", "start": now - 10, "end": now + 600, "mode": "open"},
-                        {"name": "later", "start": now + 1000, "end": now + 2000, "mode": "open"}]
-        })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["effective"]["mode"], "open");
-    assert_eq!(v["effective"]["window"], "playtest");
-    assert_eq!(v["effective"]["next_change_at"], now + 600);
-    let (_, pubv) = call(&app, "GET", "/v1/access", None, None).await;
-    assert_eq!(pubv["mode"], "open");
-    assert_eq!(pubv["upcoming"].as_array().unwrap().len(), 2, "{pubv}");
-    let (st, _) = login(c.clone()).await;
-    assert_eq!(st, StatusCode::OK, "window open");
-    // maintenance: only bypass gets in, live sessions of everyone else are revoked
-    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
-        "mode": "maintenance", "providers": ["custom"], "message": "back at 18:00", "kick_on_change": true
-    }))).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(v["enforced"]["kicked"].as_i64().unwrap() >= 2, "{v}");
-    let (st, v) = call(
-        &app,
-        "POST",
-        "/v1/auth/refresh",
-        None,
-        Some(json!({"refresh_token": a_rt})),
-    )
-    .await;
-    assert_eq!(
-        st,
-        StatusCode::UNAUTHORIZED,
-        "allow-list does not bypass maintenance: {v}"
-    );
-    let (st, v) = call(
-        &app,
-        "POST",
-        "/v1/auth/refresh",
-        None,
-        Some(json!({"refresh_token": b_rt})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
-    let (st, v) = login(a.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    assert!(
-        v["message"]
-            .as_str()
-            .unwrap()
-            .contains("maintenance: back at 18:00"),
-        "{v}"
-    );
-    let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
-        "mode": "maintenance", "providers": ["custom"], "bypass_providers": ["custom"], "kick_on_change": false
-    }))).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = login(a.clone()).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = call_server(&app, "POST", "/v1/admin/access/enforce", k, None).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["mode"], "maintenance");
-    // back to open
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        "/v1/admin/access/policy",
-        k,
-        Some(json!({"mode": "open"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = call_server(&app, "GET", "/v1/admin/access/policy", k, None).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["effective"]["mode"], "open");
-    let (st, _) = login(c).await;
-    assert_eq!(st, StatusCode::OK);
+    let _gate = LOGIN_GATE.write().await;
+    GATE_HELD
+        .scope((), async {
+        let k = "defaultkey";
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let login = |id: String| {
+            let app = app.clone();
+            async move {
+                call_server(
+                    &app,
+                    "POST",
+                    "/v1/server/auth/custom",
+                    "defaultkey",
+                    Some(json!({"id": id})),
+                )
+                .await
+            }
+        };
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/admin/access/policy",
+            k,
+            Some(json!({"mode": "closed"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+            "mode": "limited", "providers": ["custom"], "message": "closed beta", "retry_after_secs": 600
+        }))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["effective"]["mode"], "limited");
+        // policy scoped to custom logins: device logins are untouched
+        let (st, _) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique("dev")})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let a = unique("acc-a");
+        let (st, v) = login(a.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let msg = v["message"].as_str().unwrap();
+        assert!(
+            msg.contains("signups_closed")
+                && msg.contains("closed beta")
+                && msg.contains("retry after 600s"),
+            "{msg}"
+        );
+        let (st, pubv) = call(&app, "GET", "/v1/access", None, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(pubv["mode"], "limited");
+        assert_eq!(pubv["message"], "closed beta");
+        // allow-list by identity → in
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/admin/access/allowlist/identity/Custom:{a}"),
+            k,
+            Some(json!({"note": "press"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["key"], format!("identity:custom:{a}"));
+        let (st, sa) = login(a.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{sa}");
+        let a_id = sa["account_id"].as_str().unwrap().to_string();
+        let a_rt = sa["refresh_token"].as_str().unwrap().to_string();
+        let (st, v) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/admin/access/check?account_id={a_id}&provider=custom"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["decision"]["allowed"], true);
+        assert_eq!(v["decision"]["reason"], "allowlist");
+        assert_eq!(v["decision"]["via"], format!("identity:custom:{a}"));
+        // second account: first attempt creates it but is denied; later it is "existing"
+        let b = unique("acc-b");
+        let (st, v) = login(b.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let (st, v) = login(b.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("not_allowlisted"),
+            "{v}"
+        );
+        let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+            "mode": "limited", "providers": ["custom"], "allow_existing_accounts": true, "kick_on_change": false
+        }))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, sb) = login(b.clone()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "soft launch lets existing accounts in: {sb}"
+        );
+        let b_rt = sb["refresh_token"].as_str().unwrap().to_string();
+        let c = unique("acc-c");
+        let (st, v) = login(c.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "new accounts still closed: {v}");
+        // expired entries do not match; import validates per entry
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/admin/access/allowlist/identity/custom:{c}"),
+            k,
+            Some(json!({"expires_at": now - 10})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/admin/access/policy",
+            k,
+            Some(json!({
+                "mode": "limited", "providers": ["custom"], "kick_on_change": false
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _) = login(c.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, v) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/admin/access/allowlist?kind=identity&include_expired=true&q={c}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["total"], 1, "{v}");
+        let (st, v) = call_server(
+            &app,
+            "GET",
+            &format!("/v1/admin/access/allowlist?kind=identity&q={c}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(v["total"], 0, "{v} {st}");
+        let (st, v) = call_server(&app, "GET", "/v1/admin/access/allowlist?kind=nope", k, None).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/admin/access/allowlist/import",
+            k,
+            Some(json!({
+                "added_by": "csv", "entries": [
+                    {"kind": "email_domain", "value": "@Studio.Example", "note": "staff"},
+                    {"kind": "account", "value": "not-a-uuid"},
+                    {"kind": "account", "value": a_id}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["imported"], 2);
+        assert_eq!(v["rejected"], 1);
+        let (st, _) = call_server(
+            &app,
+            "DELETE",
+            "/v1/admin/access/allowlist/email_domain/studio.example",
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = call_server(
+            &app,
+            "DELETE",
+            "/v1/admin/access/allowlist/email_domain/studio.example",
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // denials are recorded for the operator
+        let (st, v) = call_server(
+            &app,
+            "GET",
+            "/v1/admin/access/denials?since_secs=600",
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(v["total"].as_i64().unwrap() >= 4, "{v}");
+        assert!(
+            v["by_reason"]["signups_closed"].as_i64().unwrap() >= 2,
+            "{v}"
+        );
+        assert!(
+            v["by_reason"]["not_allowlisted"].as_i64().unwrap() >= 2,
+            "{v}"
+        );
+        assert!(v["by_provider"]["custom"].as_i64().unwrap() >= 4, "{v}");
+        // a scheduled open window lets everyone in and is announced publicly
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/admin/access/policy",
+            k,
+            Some(json!({
+                "mode": "limited", "providers": ["custom"], "kick_on_change": false,
+                "windows": [{"name": "playtest", "start": now - 10, "end": now + 600, "mode": "open"},
+                            {"name": "later", "start": now + 1000, "end": now + 2000, "mode": "open"}]
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["effective"]["mode"], "open");
+        assert_eq!(v["effective"]["window"], "playtest");
+        assert_eq!(v["effective"]["next_change_at"], now + 600);
+        let (_, pubv) = call(&app, "GET", "/v1/access", None, None).await;
+        assert_eq!(pubv["mode"], "open");
+        assert_eq!(pubv["upcoming"].as_array().unwrap().len(), 2, "{pubv}");
+        let (st, _) = login(c.clone()).await;
+        assert_eq!(st, StatusCode::OK, "window open");
+        // maintenance: only bypass gets in, live sessions of everyone else are revoked
+        let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+            "mode": "maintenance", "providers": ["custom"], "message": "back at 18:00", "kick_on_change": true
+        }))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(v["enforced"]["kicked"].as_i64().unwrap() >= 2, "{v}");
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            Some(json!({"refresh_token": a_rt})),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "allow-list does not bypass maintenance: {v}"
+        );
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            Some(json!({"refresh_token": b_rt})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        let (st, v) = login(a.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("maintenance: back at 18:00"),
+            "{v}"
+        );
+        let (st, v) = call_server(&app, "PUT", "/v1/admin/access/policy", k, Some(json!({
+            "mode": "maintenance", "providers": ["custom"], "bypass_providers": ["custom"], "kick_on_change": false
+        }))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = login(a.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call_server(&app, "POST", "/v1/admin/access/enforce", k, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["mode"], "maintenance");
+        // back to open
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/admin/access/policy",
+            k,
+            Some(json!({"mode": "open"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call_server(&app, "GET", "/v1/admin/access/policy", k, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["effective"]["mode"], "open");
+        let (st, _) = login(c).await;
+        assert_eq!(st, StatusCode::OK);
+        })
+        .await;
 }
 
 /// P1-23: OAuth2 clients — client credentials grant, scoped tokens, rotation, introspection.
@@ -39535,189 +39562,194 @@ async fn fleet_policy_max_pending_and_deletion_parallelism() {
 #[tokio::test]
 async fn developer_players_bypass_maintenance_and_get_virtual_audience() {
     let Some(app) = app().await else { return };
-    let k = "defaultkey";
-    let login = |id: String| {
-        let app = app.clone();
-        async move {
-            call_server(
+    let _gate = LOGIN_GATE.write().await;
+    GATE_HELD
+        .scope((), async {
+            let k = "defaultkey";
+            let login = |id: String| {
+                let app = app.clone();
+                async move {
+                    call_server(
+                        &app,
+                        "POST",
+                        "/v1/server/auth/custom",
+                        k,
+                        Some(json!({"id": id})),
+                    )
+                    .await
+                }
+            };
+            // start from an open gate whatever an aborted run left behind
+            let (st, _) = call_server(
                 &app,
-                "POST",
-                "/v1/server/auth/custom",
+                "PUT",
+                "/v1/admin/access/policy",
                 k,
-                Some(json!({"id": id})),
+                Some(json!({"mode": "open", "providers": ["custom"], "kick_on_change": false})),
             )
-            .await
-        }
-    };
-    // start from an open gate whatever an aborted run left behind
-    let (st, _) = call_server(
-        &app,
-        "PUT",
-        "/v1/admin/access/policy",
-        k,
-        Some(json!({"mode": "open", "providers": ["custom"], "kick_on_change": false})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    let dev = unique("dev-p");
-    let player = unique("dev-n");
-    let (st, d) = login(dev.clone()).await;
-    assert_eq!(st, StatusCode::OK, "{d}");
-    let (st, p) = login(player.clone()).await;
-    assert_eq!(st, StatusCode::OK, "{p}");
-    let did = d["account_id"].as_str().unwrap().to_string();
-    let pid = p["account_id"].as_str().unwrap().to_string();
-    let dtoken = d["access_token"].as_str().unwrap().to_string();
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            let dev = unique("dev-p");
+            let player = unique("dev-n");
+            let (st, d) = login(dev.clone()).await;
+            assert_eq!(st, StatusCode::OK, "{d}");
+            let (st, p) = login(player.clone()).await;
+            assert_eq!(st, StatusCode::OK, "{p}");
+            let did = d["account_id"].as_str().unwrap().to_string();
+            let pid = p["account_id"].as_str().unwrap().to_string();
+            let dtoken = d["access_token"].as_str().unwrap().to_string();
 
-    // not a developer yet
-    let (st, v) = call(&app, "GET", "/v1/account/developer", Some(&dtoken), None).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["developer"], false);
-    assert_eq!(v["environment"], "production");
-    assert_eq!(v["development_actions"], false);
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/admin/accounts/{did}/developer"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["developer"], false);
-    // validation / unknown account
-    let (st, _) = call_server(
-        &app,
-        "PUT",
-        &format!("/v1/admin/accounts/{did}/developer"),
-        k,
-        Some(json!({"note": "x".repeat(513)})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
-    let (st, _) = call_server(
-        &app,
-        "PUT",
-        &format!("/v1/admin/accounts/{}/developer", uuid::Uuid::now_v7()),
-        k,
-        Some(json!({})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-    let (st, _) = call_server(
-        &app,
-        "DELETE",
-        &format!("/v1/admin/accounts/{did}/developer"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
-    // mark as developer
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        &format!("/v1/admin/accounts/{did}/developer"),
-        k,
-        Some(json!({"note": "gameplay team", "set_by": "ops@studio"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["developer"], true);
-    assert_eq!(v["note"], "gameplay team");
-    assert_eq!(v["set_by"], "ops@studio");
-    let (st, v) = call(&app, "GET", "/v1/account/developer", Some(&dtoken), None).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["developer"], true);
-    assert_eq!(v["development_actions"], true);
-    let (st, v) = call_server(&app, "GET", "/v1/admin/developers", k, None).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(
-        v["developers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["account_id"] == did),
-        "{v}"
-    );
-    // virtual audience `developers`
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/server/audiences/of/{did}"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(v.to_string().contains("developers"), "{v}");
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/server/audiences/of/{pid}"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(!v.to_string().contains("developers"), "{v}");
-    // maintenance: the developer gets in, the player does not
-    let (st, v) = call_server(
-        &app,
-        "PUT",
-        "/v1/admin/access/policy",
-        k,
-        Some(json!({"mode": "maintenance", "providers": ["custom"], "kick_on_change": false})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = login(player.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    let (st, v) = login(dev.clone()).await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/admin/access/check?account_id={did}&provider=custom"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["decision"]["reason"], "developer", "{v}");
-    // unmark → locked out like everyone else
-    let (st, v) = call_server(
-        &app,
-        "DELETE",
-        &format!("/v1/admin/accounts/{did}/developer"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["developer"], false);
-    let (st, v) = login(dev.clone()).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    let (st, v) = call_server(
-        &app,
-        "GET",
-        &format!("/v1/server/audiences/of/{did}"),
-        k,
-        None,
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(!v.to_string().contains("developers"), "{v}");
-    // back to open for the other tests
-    let (st, _) = call_server(
-        &app,
-        "PUT",
-        "/v1/admin/access/policy",
-        k,
-        Some(json!({"mode": "open", "providers": ["custom"], "kick_on_change": false})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
+            // not a developer yet
+            let (st, v) = call(&app, "GET", "/v1/account/developer", Some(&dtoken), None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["developer"], false);
+            assert_eq!(v["environment"], "production");
+            assert_eq!(v["development_actions"], false);
+            let (st, v) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/admin/accounts/{did}/developer"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["developer"], false);
+            // validation / unknown account
+            let (st, _) = call_server(
+                &app,
+                "PUT",
+                &format!("/v1/admin/accounts/{did}/developer"),
+                k,
+                Some(json!({"note": "x".repeat(513)})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+            let (st, _) = call_server(
+                &app,
+                "PUT",
+                &format!("/v1/admin/accounts/{}/developer", uuid::Uuid::now_v7()),
+                k,
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+            let (st, _) = call_server(
+                &app,
+                "DELETE",
+                &format!("/v1/admin/accounts/{did}/developer"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+            // mark as developer
+            let (st, v) = call_server(
+                &app,
+                "PUT",
+                &format!("/v1/admin/accounts/{did}/developer"),
+                k,
+                Some(json!({"note": "gameplay team", "set_by": "ops@studio"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["developer"], true);
+            assert_eq!(v["note"], "gameplay team");
+            assert_eq!(v["set_by"], "ops@studio");
+            let (st, v) = call(&app, "GET", "/v1/account/developer", Some(&dtoken), None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["developer"], true);
+            assert_eq!(v["development_actions"], true);
+            let (st, v) = call_server(&app, "GET", "/v1/admin/developers", k, None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(
+                v["developers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|d| d["account_id"] == did),
+                "{v}"
+            );
+            // virtual audience `developers`
+            let (st, v) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/server/audiences/of/{did}"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(v.to_string().contains("developers"), "{v}");
+            let (st, v) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/server/audiences/of/{pid}"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(!v.to_string().contains("developers"), "{v}");
+            // maintenance: the developer gets in, the player does not
+            let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/admin/access/policy",
+            k,
+            Some(json!({"mode": "maintenance", "providers": ["custom"], "kick_on_change": false})),
+        )
+        .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            let (st, v) = login(player.clone()).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+            let (st, v) = login(dev.clone()).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            let (st, v) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/admin/access/check?account_id={did}&provider=custom"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["decision"]["reason"], "developer", "{v}");
+            // unmark → locked out like everyone else
+            let (st, v) = call_server(
+                &app,
+                "DELETE",
+                &format!("/v1/admin/accounts/{did}/developer"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["developer"], false);
+            let (st, v) = login(dev.clone()).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+            let (st, v) = call_server(
+                &app,
+                "GET",
+                &format!("/v1/server/audiences/of/{did}"),
+                k,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(!v.to_string().contains("developers"), "{v}");
+            // back to open for the other tests
+            let (st, _) = call_server(
+                &app,
+                "PUT",
+                "/v1/admin/access/policy",
+                k,
+                Some(json!({"mode": "open", "providers": ["custom"], "kick_on_change": false})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -40024,4 +40056,203 @@ async fn session_baggage_scopes_limits_and_event_stamp() {
     assert_eq!(v["baggage"]["social"], json!({}));
     assert_eq!(v["baggage"]["service"], json!({}));
     assert_eq!(v["baggage"]["game"]["loadout"], "sniper");
+}
+
+#[tokio::test]
+async fn fleet_reserve_holds_server_out_of_allocation_and_scale_down() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("reserve"), "provider": "local", "buffer": 1, "max_servers": 2,
+            "port_start": 48100, "port_end": 48200, "spec": {"command": ["sleep", "60"]},
+            "policy": {"idle_ttl_secs": 1}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let reconcile = format!("/v1/server/fleets/{fid}/reconcile");
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let sid = svc.servers(fuid, Some("starting")).await.unwrap()[0].id;
+    let reserve = format!("/v1/server/gameservers/{sid}/reserve");
+    // only ready servers can be held; validation
+    let (st, v) = call_server(&app, "POST", &reserve, k, Some(json!({"seconds": 30}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    svc.sdk_ready(sid).await.unwrap();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &reserve,
+        k,
+        Some(json!({"seconds": 999_999_999})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/gameservers/{}/reserve", uuid::Uuid::now_v7()),
+        k,
+        Some(json!({"seconds": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // timed hold from the server itself through the SDK route
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/gameserver/reserve")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", sid.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"seconds": 600}).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let gs: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(gs["state"], "reserved");
+    assert!(!gs["reserved_until"].is_null(), "{gs}");
+    // not allocatable
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/allocate"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_ne!(
+        st,
+        StatusCode::OK,
+        "reserved server must not be allocated: {v}"
+    );
+    // counted as live (buffer 1 satisfied → no extra start), not reaped by idle TTL / scale to zero
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"buffer": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(svc.server(sid).await.unwrap().state, "reserved");
+    assert_eq!(svc.servers(fuid, Some("starting")).await.unwrap().len(), 0);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/autoscaler"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // ready cancels the hold
+    let gs = svc.sdk_ready(sid).await.unwrap();
+    assert_eq!(gs.state, "ready");
+    assert!(gs.reserved_until.is_none());
+    // forever hold by an operator, then explicit release
+    let (st, v) = call_server(&app, "POST", &reserve, k, Some(json!({"seconds": 0}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "reserved");
+    assert!(v["reserved_until"].is_null(), "{v}");
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        svc.server(sid).await.unwrap().state,
+        "reserved",
+        "forever hold survives passes"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/gameservers/{sid}/unreserve"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "ready");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/gameservers/{sid}/unreserve"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // short hold lapses on the next pass
+    let (st, v) = call_server(&app, "POST", &reserve, k, Some(json!({"seconds": 1}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let gs = svc.server(sid).await.unwrap();
+    assert!(
+        gs.state == "ready" || gs.state == "terminated",
+        "lapsed hold → ready (then idle TTL may reap): {}",
+        gs.state
+    );
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events?limit=100"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    let kinds: Vec<&str> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["code"].as_str())
+        .collect();
+    for want in [
+        "server.reserved",
+        "server.unreserved",
+        "server.reserve_expired",
+    ] {
+        assert!(kinds.contains(&want), "missing {want}: {kinds:?}");
+    }
+    // allocate cancels a hold too
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"buffer": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let s2 = svc
+        .servers(fuid, Some("starting"))
+        .await
+        .unwrap()
+        .first()
+        .map(|s| s.id);
+    if let Some(s2) = s2 {
+        svc.sdk_ready(s2).await.unwrap();
+        svc.reserve(s2, 0, "test").await.unwrap();
+        let gs = svc.sdk_allocate(s2).await.unwrap();
+        assert_eq!(gs.state, "allocated");
+        assert!(gs.reserved_until.is_none());
+    }
 }

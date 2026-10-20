@@ -108,6 +108,12 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/gameserver/allocate", post(sdk_allocate))
         .route("/v1/gameserver/shutdown", post(sdk_shutdown))
         .route("/v1/gameserver/label", post(sdk_label))
+        .route("/v1/gameserver/reserve", post(sdk_reserve))
+        .route("/v1/server/gameservers/{id}/reserve", post(reserve_server))
+        .route(
+            "/v1/server/gameservers/{id}/unreserve",
+            post(unreserve_server),
+        )
         .route("/v1/gameserver/players", post(sdk_players))
         .route("/v1/gameserver/watch", get(sdk_watch))
         .route("/v1/gameserver/connect", post(sdk_connect))
@@ -470,6 +476,50 @@ async fn sdk_label(
     Json(labels): Json<Value>,
 ) -> Result<Json<GameServer>, ApiError> {
     Ok(Json(s.fleets.sdk_labels(self_id(&headers)?, labels).await?))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ReserveReq {
+    /// 0 = until cancelled.
+    seconds: u64,
+}
+
+/// `POST /v1/gameserver/reserve {seconds}` — the server holds itself out of allocation and
+/// scale-down (Agones `Reserve`); `ready` / `allocate` cancel, the reconciler releases timed holds.
+async fn sdk_reserve(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    headers: HeaderMap,
+    body: Option<Json<ReserveReq>>,
+) -> Result<Json<GameServer>, ApiError> {
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(
+        s.fleets
+            .reserve(self_id(&headers)?, b.seconds, "server")
+            .await?,
+    ))
+}
+
+/// `POST /v1/server/gameservers/{id}/reserve {seconds}` — an external matchmaker / server
+/// browser holds a ready server (UGS "reserve on machine").
+async fn reserve_server(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<Uuid>,
+    body: Option<Json<ReserveReq>>,
+) -> Result<Json<GameServer>, ApiError> {
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(s.fleets.reserve(id, b.seconds, "operator").await?))
+}
+
+/// `POST /v1/server/gameservers/{id}/unreserve` — release the hold, server is `ready` again.
+async fn unreserve_server(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<GameServer>, ApiError> {
+    Ok(Json(s.fleets.unreserve(id, "operator").await?))
 }
 
 #[derive(Deserialize, Default)]

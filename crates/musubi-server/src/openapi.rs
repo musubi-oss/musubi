@@ -1254,6 +1254,9 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
         "/v1/server/fleets/{id}/servers/{sid}/logs/stream",
         "fleets",
     ),
+    ("POST", "/v1/gameserver/reserve", "fleets"),
+    ("POST", "/v1/server/gameservers/{id}/reserve", "fleets"),
+    ("POST", "/v1/server/gameservers/{id}/unreserve", "fleets"),
     (
         "GET",
         "/v1/server/fleets/{id}/servers/{sid}/logs/download",

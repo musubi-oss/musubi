@@ -753,6 +753,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 - **Developer players** — operator-flagged team accounts: enter maintenance mode, virtual audience `developers` for developer-only content, development-only actions in production (`[dev].environment`).
 - **Log follow / download** — `…/servers/{sid}/logs/stream` (SSE: `tail` history then live lines) and `…/logs/download` (plain-text file).
 - **Session baggage** — per-session key/value in `social` / `game` / `service` scopes (friends, game servers, event stamping), Pragma-style limits.
+- **Reserved servers** — `POST /v1/gameserver/reserve {seconds}` / `…/gameservers/{id}/reserve|unreserve`: hold a ready server out of allocation and scale-down, timed or until cancelled.
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

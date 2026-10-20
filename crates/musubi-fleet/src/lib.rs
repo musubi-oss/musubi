@@ -48,6 +48,9 @@ pub type LogSink = tokio::sync::mpsc::UnboundedSender<LogLine>;
 
 pub const LOG_LINE_MAX: usize = 8 * 1024;
 
+/// Longest timed hold (`FleetService::reserve`); 0 means until cancelled.
+pub const RESERVE_MAX_SECS: u64 = 7 * 24 * 3600;
+
 /// Level guessed from a raw stdout/stderr line (`[ERROR]`, `WARN:`, `level=debug`, …).
 pub fn level_of(line: &str, source: &str) -> &'static str {
     let l = line.get(..96).unwrap_or(line).to_ascii_lowercase();
@@ -1110,6 +1113,7 @@ pub struct FleetGauges {
     pub starting: i32,
     pub allocated: i32,
     pub in_game: i32,
+    pub reserved: i32,
     pub players: i64,
     pub capacity: i64,
     pub cpu_pct_avg: Option<f64>,
@@ -1547,6 +1551,9 @@ pub struct GameServer {
     pub version: i64,
     /// When the server last became `ready` (idle TTL counts from here).
     pub ready_at: Option<OffsetDateTime>,
+    /// `reserved` servers: when the hold lapses back to `ready` (null = until cancelled).
+    #[serde(default)]
+    pub reserved_until: Option<OffsetDateTime>,
     /// Named counters `{name: {count, capacity}}` (rooms, bots, …) the server reports; allocation
     /// selectors and `policy.counter_target` use them.
     #[serde(default)]
@@ -2156,7 +2163,7 @@ fn push_server_filters(
     Ok(())
 }
 
-const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, g.ports, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
+const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, g.ports, g.reserved_until, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
 /// `canary_percent` of new servers (optionally only in `canary_regions`), `retired` is kept for rollback.
@@ -2623,10 +2630,12 @@ struct ServerRow {
     slots_used: i32,
     host_id: Option<Uuid>,
     ports: serde_json::Value,
+    reserved_until: Option<OffsetDateTime>,
 }
 
 fn row_to_server(r: ServerRow) -> GameServer {
     GameServer {
+        reserved_until: r.reserved_until,
         id: r.id,
         fleet_id: r.fleet_id,
         state: r.state,
@@ -2654,7 +2663,7 @@ fn row_to_server(r: ServerRow) -> GameServer {
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports, reserved_until";
 
 impl FleetService {
     /// Base URL game servers use to reach this API (`MUSUBI_API`).
@@ -3130,7 +3139,7 @@ impl FleetService {
                 .filter(|s| {
                     matches!(
                         s.state.as_str(),
-                        "starting" | "ready" | "allocated" | "in_game"
+                        "starting" | "ready" | "allocated" | "in_game" | "reserved"
                     )
                 })
                 .count() as i32;
@@ -3322,6 +3331,7 @@ impl FleetService {
         let r = sqlx::query_as::<_, ServerRow>(&format!(
             "update musubi.game_servers set state = $2, updated_at = now(), last_health = now(),
                ready_at = case when $2 = 'ready' then coalesce(ready_at, now()) else ready_at end,
+               reserved_until = case when $2 = 'reserved' then reserved_until else null end,
                terminated_at = case when $2 = 'terminated' then coalesce(terminated_at, now()) else terminated_at end
              where id = $1 and (cardinality($3::text[]) = 0 or state = any($3)) returning {SERVER_COLS}"
         ))
@@ -3343,13 +3353,101 @@ impl FleetService {
         }
     }
 
+    /// Hold a `ready` server out of allocation and scale-down (Agones `Reserve(seconds)`):
+    /// `seconds = 0` keeps it reserved until `unreserve` / `ready` / `allocate`, otherwise the
+    /// reconciler hands it back to `ready` once the hold lapses. Re-reserving extends / re-times.
+    pub async fn reserve(&self, id: Uuid, seconds: u64, by: &str) -> Result<GameServer> {
+        if seconds > RESERVE_MAX_SECS {
+            return Err(Error::InvalidArgument(format!(
+                "seconds must be 0 (forever) or <= {RESERVE_MAX_SECS}"
+            )));
+        }
+        let until = (seconds > 0).then(|| OffsetDateTime::now_utc() + Duration::from_secs(seconds));
+        let r = sqlx::query_as::<_, ServerRow>(&format!(
+            "update musubi.game_servers set state = 'reserved', reserved_until = $2,
+                    updated_at = now(), last_health = now()
+             where id = $1 and state in ('ready', 'reserved') returning {SERVER_COLS}"
+        ))
+        .bind(id)
+        .bind(until)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let Some(r) = r else {
+            let cur = self.server(id).await?;
+            return Err(Error::Conflict(format!(
+                "server is {}, only ready servers can be reserved",
+                cur.state
+            )));
+        };
+        let s = row_to_server(r);
+        self.record_event(
+            s.fleet_id,
+            Some(id),
+            "server.reserved",
+            "server reserved",
+            serde_json::json!({ "by": by, "seconds": seconds, "until": s.reserved_until }),
+        )
+        .await;
+        Ok(s)
+    }
+
+    /// Cancel a hold: `reserved` → `ready` (idle TTL restarts).
+    pub async fn unreserve(&self, id: Uuid, by: &str) -> Result<GameServer> {
+        let s = self.set_state(id, &["reserved"], "ready").await?;
+        self.record_event(
+            s.fleet_id,
+            Some(id),
+            "server.unreserved",
+            "reservation cancelled",
+            serde_json::json!({ "by": by }),
+        )
+        .await;
+        Ok(s)
+    }
+
+    /// Reconciler pass: lapsed holds go back to `ready`.
+    async fn expire_reservations(&self, fleet: &Fleet) -> Result<usize> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "update musubi.game_servers set state = 'ready', reserved_until = null,
+                    updated_at = now(), ready_at = now()
+             where fleet_id = $1 and state = 'reserved'
+               and reserved_until is not null and reserved_until <= now() returning id",
+        )
+        .bind(fleet.id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        for id in &ids {
+            self.record_event(
+                fleet.id,
+                Some(*id),
+                "server.reserve_expired",
+                "reservation lapsed, server ready again",
+                serde_json::json!({}),
+            )
+            .await;
+        }
+        Ok(ids.len())
+    }
+
     // ----- SDK surface (called by the game server itself) -----
 
     pub async fn sdk_ready(&self, id: Uuid) -> Result<GameServer> {
         let was = self.server(id).await?.state;
         let s = self
-            .set_state(id, &["scheduled", "starting", "ready"], "ready")
+            .set_state(id, &["scheduled", "starting", "ready", "reserved"], "ready")
             .await?;
+        if was == "reserved" {
+            self.record_event(
+                s.fleet_id,
+                Some(id),
+                "server.unreserved",
+                "reservation cancelled by ready",
+                serde_json::json!({ "by": "server" }),
+            )
+            .await;
+        }
         if was != "ready" {
             self.record_event(
                 s.fleet_id,
@@ -3418,7 +3516,7 @@ impl FleetService {
     pub async fn sdk_allocate(&self, id: Uuid) -> Result<GameServer> {
         let was = self.server(id).await?.state;
         let s = self
-            .set_state(id, &["ready", "allocated"], "allocated")
+            .set_state(id, &["ready", "allocated", "reserved"], "allocated")
             .await?;
         if was != "allocated" {
             self.record_event(
@@ -4901,6 +4999,9 @@ impl FleetService {
         let mut started = 0;
         let mut reaped = 0;
         for f in fleets {
+            if let Err(e) = self.expire_reservations(&f).await {
+                tracing::warn!(fleet = %f.id, error = %e, "reservation expiry failed");
+            }
             let provider = self.provider_of(&f.provider);
             let servers = self.servers(f.id, None).await?;
             let now = OffsetDateTime::now_utc();
@@ -5181,6 +5282,7 @@ impl FleetService {
                 "starting" | "scheduled" => g.starting += 1,
                 "allocated" => g.allocated += 1,
                 "in_game" => g.in_game += 1,
+                "reserved" => g.reserved += 1,
                 _ => {}
             }
             g.players += i64::from(s.players);
@@ -5550,6 +5652,7 @@ mod lifecycle_tests {
     ) -> GameServer {
         let now = OffsetDateTime::now_utc();
         GameServer {
+            reserved_until: None,
             id: Uuid::now_v7(),
             fleet_id: Uuid::nil(),
             state: state.into(),
@@ -5659,6 +5762,7 @@ mod alloc_pick_tests {
 
     fn gs(labels: serde_json::Value, rooms: i64, slots_used: i32, host: &str) -> GameServer {
         GameServer {
+            reserved_until: None,
             id: Uuid::now_v7(),
             fleet_id: Uuid::nil(),
             state: "ready".into(),
@@ -5806,6 +5910,7 @@ mod autoscale_tests {
     #[test]
     fn gauges_feed_metrics_and_webhook_target_clamps() {
         let g = FleetGauges {
+            reserved: 0,
             live: 10,
             ready: 2,
             starting: 1,
