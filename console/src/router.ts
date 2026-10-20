@@ -57,6 +57,21 @@ export const router = createRouter({
       { path: 'progression/:id', component: () => import('./pages/economy/Track.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.economy.find((x) => x.id === r.params.page) ?? catalog.economy[0] }) },
     ]},
+    { path: '/content', component: () => import('./pages/content/Index.vue'), children: [
+      { path: '', component: () => import('./pages/content/Versions.vue') },
+      { path: 'bundles/:id', component: () => import('./pages/content/Version.vue') },
+      { path: 'modules/:name', component: () => import('./pages/content/Module.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.content.find((x) => x.id === r.params.page) ?? catalog.content[0] }) },
+    ]},
+    { path: '/settings', component: () => import('./pages/settings/Index.vue'), children: [
+      { path: '', component: () => import('./pages/settings/Keys.vue') },
+      { path: 'audit', component: () => import('./pages/settings/Audit.vue') },
+      { path: 'operators', component: () => import('./pages/settings/Access.vue') },
+      { path: 'invites', redirect: '/settings/operators' },
+      { path: 'jwt_keys', redirect: '/settings/operators' },
+      { path: 'sso', redirect: '/settings/operators' },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.settings.find((x) => x.id === r.params.page) ?? catalog.settings[0] }) },
+    ]},
     { path: '/:section/:page?', component: () => import('./pages/Section.vue') },
   ],
 })
