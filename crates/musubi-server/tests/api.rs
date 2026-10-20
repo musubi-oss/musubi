@@ -44249,3 +44249,212 @@ async fn content_tags_update_lookup_export_filter_and_drop() {
     let (st, _) = call(&app, "GET", "/v1/content/tags/x", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Race-to-target cohorts: validation, cohort assignment, finishing closes the cohort (409 for
+/// members), re-roll into the newest open cohort with rolls/cooldown limits, time limit.
+#[tokio::test]
+async fn leaderboard_race_cohorts_finish_time_limit_and_reroll() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut toks = Vec::new();
+    for i in 0..3 {
+        let (_, s) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(&format!("race{i}"))})),
+        )
+        .await;
+        toks.push(s["access_token"].as_str().unwrap().to_string());
+    }
+    let (a, b, c) = (toks[0].as_str(), toks[1].as_str(), toks[2].as_str());
+    let id = unique("race");
+    for body in [
+        json!({"id": id, "race": {"score_target": 100}}),
+        json!({"id": id, "bucket_size": 2, "race": {"score_target": 100, "target_players": 0}}),
+        json!({"id": id, "bucket_size": 2, "race": {"score_target": 100, "max_rolls": -1}}),
+        json!({"id": id, "bucket_size": 2, "race": {"score_target": 100, "time_limit_secs": -5}}),
+    ] {
+        let (st, v) = call_server(&app, "POST", "/v1/server/leaderboards", k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        k,
+        Some(json!({
+        "id": id, "bucket_size": 2, "operator": "incr",
+        "race": {"score_target": 100, "target_players": 1, "max_rolls": 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["race"]["score_target"], 100);
+    assert_eq!(v["race"]["roll_cooldown_secs"], 0);
+    let rec = format!("/v1/leaderboards/{id}/records");
+    let coh = format!("/v1/leaderboards/{id}/cohort");
+    let roll = format!("/v1/leaderboards/{id}/reroll");
+    // no record yet: empty card
+    let (st, v) = call(&app, "GET", &coh, Some(a), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["bucket"].is_null());
+    assert_eq!(v["rolls_left"], 1);
+    let (st, _) = call(&app, "POST", &roll, Some(a), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // a and b share cohort 1, c opens cohort 2
+    let (st, v) = call(&app, "POST", &rec, Some(a), Some(json!({"score": 50}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["bucket"], 1);
+    let (st, v) = call(&app, "POST", &rec, Some(b), Some(json!({"score": 60}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["bucket"], 1);
+    let (st, v) = call(&app, "POST", &rec, Some(c), Some(json!({"score": 10}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["bucket"], 2);
+    let (st, v) = call(&app, "GET", &coh, Some(a), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["members"], 2);
+    assert_eq!(v["finishers"], 0);
+    assert_eq!(v["closed"], false);
+    assert_eq!(v["can_reroll"], false);
+    let (st, v) = call(&app, "POST", &roll, Some(a), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    // a reaches the target: cohort 1 finishes
+    let (st, v) = call(&app, "POST", &rec, Some(a), Some(json!({"score": 50}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["score"], 100);
+    let (st, v) = call(&app, "GET", &coh, Some(a), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["closed"], true);
+    assert_eq!(v["finished"], true);
+    assert_eq!(v["finishers"], 1);
+    assert!(v["closed_at"].is_number());
+    assert_eq!(v["can_reroll"], true);
+    let (st, v) = call(&app, "POST", &rec, Some(b), Some(json!({"score": 5}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=leaderboard.cohort_finished&limit=500",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        ev["events"].as_array().unwrap().iter().any(|e| {
+            let p = if e.get("payload").is_some() {
+                &e["payload"]
+            } else {
+                &e["data"]
+            };
+            p["leaderboard_id"] == id && p["bucket"] == 1
+        }),
+        "{ev}"
+    );
+    // b re-rolls into the newest open cohort (2, with c), score reset
+    let (st, v) = call(&app, "POST", &roll, Some(b), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["bucket"], 2);
+    assert_eq!(v["rolls"], 1);
+    assert_eq!(v["rolls_left"], 0);
+    assert_eq!(v["members"], 2);
+    assert_eq!(v["closed"], false);
+    let (st, v) = call(&app, "POST", &rec, Some(b), Some(json!({"score": 20}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["score"], 20, "score started from zero");
+    assert_eq!(v["bucket"], 2);
+    // c finishes cohort 2; b (no rolls left) cannot roll again
+    let (st, _) = call(&app, "POST", &rec, Some(c), Some(json!({"score": 90}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(&app, "POST", &roll, Some(b), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("no rolls left"), "{v}");
+    // c (1 roll) rolls into a brand-new cohort 3 (1 and 2 are finished)
+    let (st, v) = call(&app, "POST", &roll, Some(c), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["bucket"], 3);
+    assert_eq!(v["members"], 1);
+    // time limit: a second board where the first score opens a 60 s window
+    let id2 = unique("racet");
+    let (st, _) = call_server(&app, "POST", "/v1/server/leaderboards", k, Some(json!({
+        "id": id2, "bucket_size": 2, "operator": "incr",
+        "race": {"score_target": 1000, "time_limit_secs": 60, "max_rolls": 2, "roll_cooldown_secs": 3600}}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let rec2 = format!("/v1/leaderboards/{id2}/records");
+    let (st, _) = call(&app, "POST", &rec2, Some(a), Some(json!({"score": 1}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id2}/cohort"),
+        Some(a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(v["time_left_secs"].as_i64().unwrap() > 50, "{v}");
+    let db = sqlx::PgPool::connect(&std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("update musubi.leaderboard_records set created_at = now() - interval '2 minutes' where leaderboard_id = $1")
+        .bind(&id2).execute(&db).await.unwrap();
+    let (st, v) = call(&app, "POST", &rec2, Some(a), Some(json!({"score": 1}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{id2}/cohort"),
+        Some(a),
+        None,
+    )
+    .await;
+    assert_eq!(v["time_left_secs"], 0, "{v}");
+    assert_eq!(v["can_reroll"], true);
+    let (st2, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{id2}/reroll"),
+        Some(a),
+        None,
+    )
+    .await;
+    assert_eq!((st, st2), (StatusCode::OK, StatusCode::OK), "{v}");
+    assert!(v["cooldown_left_secs"].as_i64().unwrap() > 3500, "{v}");
+    assert_eq!(v["can_reroll"], false);
+    sqlx::query("update musubi.leaderboard_records set created_at = now() - interval '2 minutes' where leaderboard_id = $1")
+        .bind(&id2).execute(&db).await.unwrap();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/leaderboards/{id2}/reroll"),
+        Some(a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("cooldown"), "{v}");
+    // no race → 400; unauthenticated → 401
+    let plain = unique("norace");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/leaderboards",
+        k,
+        Some(json!({"id": plain})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/leaderboards/{plain}/cohort"),
+        Some(a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(&app, "GET", &coh, None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

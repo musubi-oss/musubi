@@ -49,6 +49,8 @@ pub struct Leaderboard {
     pub bucket_size: i32,
     /// Tiers with promotion/demotion at every reset (needs `reset_schedule`).
     pub league: Option<League>,
+    /// Race-to-target cohorts (needs `bucket_size`).
+    pub race: Option<Race>,
     #[serde(with = "time::serde::rfc3339")]
     pub create_time: OffsetDateTime,
     /// Start of the next reset window (unix seconds), 0 if the board never resets.
@@ -73,6 +75,78 @@ pub struct CreateLeaderboard {
     pub bucket_size: i32,
     #[serde(default)]
     pub league: Option<League>,
+    #[serde(default)]
+    pub race: Option<Race>,
+}
+
+/// Race-to-target cohorts (Hiro score-based event leaderboards): a cohort (bucket) finishes as
+/// soon as `target_players` of its members reach `score_target`, after which nobody in it can
+/// post; every member has `time_limit_secs` from their first score (0 = the whole window); a
+/// player whose cohort finished (or who finished / ran out of time) may re-roll into a fresh
+/// cohort up to `max_rolls` times, waiting `roll_cooldown_secs` between rolls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Race {
+    pub score_target: i64,
+    #[serde(default = "one_player")]
+    pub target_players: i32,
+    #[serde(default)]
+    pub time_limit_secs: i64,
+    #[serde(default)]
+    pub max_rolls: i32,
+    #[serde(default)]
+    pub roll_cooldown_secs: i64,
+}
+
+fn one_player() -> i32 {
+    1
+}
+
+impl Race {
+    fn validate(&self) -> Result<()> {
+        if self.target_players < 1 || self.target_players > 10_000 {
+            return Err(Error::InvalidArgument(
+                "race.target_players must be in 1..=10000".into(),
+            ));
+        }
+        if self.time_limit_secs < 0 || self.roll_cooldown_secs < 0 {
+            return Err(Error::InvalidArgument(
+                "race.time_limit_secs/roll_cooldown_secs must be non-negative".into(),
+            ));
+        }
+        if !(0..=1000).contains(&self.max_rolls) {
+            return Err(Error::InvalidArgument(
+                "race.max_rolls must be in 0..=1000".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reached(&self, order: SortOrder, score: i64) -> bool {
+        match order {
+            SortOrder::Desc => score >= self.score_target,
+            SortOrder::Asc => score <= self.score_target,
+        }
+    }
+}
+
+/// A player's cohort card on a race board.
+#[derive(Debug, Clone, Serialize)]
+pub struct Cohort {
+    pub tier: i16,
+    pub bucket: Option<i32>,
+    pub members: i64,
+    pub finishers: i64,
+    pub closed: bool,
+    pub closed_at: Option<i64>,
+    pub finished: bool,
+    pub score_target: i64,
+    pub target_players: i32,
+    /// Seconds this player may still post (None = no limit or no record yet).
+    pub time_left_secs: Option<i64>,
+    pub rolls: i32,
+    pub rolls_left: i32,
+    pub cooldown_left_secs: i64,
+    pub can_reroll: bool,
 }
 
 /// League rules: at each reset the top `promote_pct` of every (tier, bucket) group moves one tier
@@ -274,9 +348,10 @@ type BoardRow = (
     OffsetDateTime,
     i32,
     Option<serde_json::Value>,
+    Option<serde_json::Value>,
 );
 const BOARD_COLS: &str =
-    "id, authoritative, sort_order, operator, reset_schedule, metadata, created_at, bucket_size, league";
+    "id, authoritative, sort_order, operator, reset_schedule, metadata, created_at, bucket_size, league, race";
 type RecordRow = (
     String,
     Uuid,
@@ -378,6 +453,105 @@ pub(crate) fn parse_cron(s: &str) -> Result<(cron::Schedule, chrono_tz::Tz)> {
         .map_err(|e| Error::InvalidArgument(format!("bad reset_schedule: {e}")))
 }
 
+/// Race boards: open the cohort row, refuse writes into a finished cohort or past the player's
+/// time limit.
+#[allow(clippy::too_many_arguments)]
+async fn race_gate(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    board: &Leaderboard,
+    race: &Race,
+    expiry: OffsetDateTime,
+    tier: i16,
+    bucket: i32,
+    owner: AccountId,
+    now: OffsetDateTime,
+) -> Result<()> {
+    sqlx::query(
+        "insert into musubi.leaderboard_cohorts (leaderboard_id, expiry_time, tier, bucket)
+         values ($1, $2, $3, $4) on conflict do nothing",
+    )
+    .bind(&board.id)
+    .bind(expiry)
+    .bind(tier)
+    .bind(bucket)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    let closed: Option<Option<OffsetDateTime>> = sqlx::query_scalar(
+        "select closed_at from musubi.leaderboard_cohorts
+         where leaderboard_id = $1 and expiry_time = $2 and tier = $3 and bucket = $4",
+    )
+    .bind(&board.id)
+    .bind(expiry)
+    .bind(tier)
+    .bind(bucket)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    if closed.flatten().is_some() {
+        return Err(Error::Conflict("cohort finished".into()));
+    }
+    if race.time_limit_secs > 0 {
+        let created: Option<OffsetDateTime> = sqlx::query_scalar(
+            "select created_at from musubi.leaderboard_records
+             where leaderboard_id = $1 and expiry_time = $2 and owner_id = $3",
+        )
+        .bind(&board.id)
+        .bind(expiry)
+        .bind(owner.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        if created.is_some_and(|c| (now - c).whole_seconds() >= race.time_limit_secs) {
+            return Err(Error::Conflict("race time limit over".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Recount a cohort's finishers; closes it when `target_players` reached the target. Returns
+/// whether it closed just now.
+async fn refresh_cohort(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    board: &Leaderboard,
+    race: &Race,
+    expiry: OffsetDateTime,
+    tier: i16,
+    bucket: i32,
+) -> Result<bool> {
+    let finishers: i64 = sqlx::query_scalar(
+        "select count(*) from musubi.leaderboard_records
+         where leaderboard_id = $1 and expiry_time = $2 and tier = $3 and bucket = $4
+           and case when $6 then score >= $5 else score <= $5 end",
+    )
+    .bind(&board.id)
+    .bind(expiry)
+    .bind(tier)
+    .bind(bucket)
+    .bind(race.score_target)
+    .bind(matches!(board.sort_order, SortOrder::Desc))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    let closed_now: Option<bool> = sqlx::query_scalar(
+        "update musubi.leaderboard_cohorts
+         set finishers = $5,
+             closed_at = case when closed_at is null and $5 >= $6 then now() else closed_at end
+         where leaderboard_id = $1 and expiry_time = $2 and tier = $3 and bucket = $4
+         returning closed_at is not null and $5 >= $6 and closed_at >= now()",
+    )
+    .bind(&board.id)
+    .bind(expiry)
+    .bind(tier)
+    .bind(bucket)
+    .bind(finishers as i32)
+    .bind(race.target_players)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(closed_now.unwrap_or(false))
+}
+
 fn to_board(r: BoardRow, now: OffsetDateTime) -> Result<Leaderboard> {
     let (prev, next) = window(r.4.as_deref(), now)?;
     Ok(Leaderboard {
@@ -398,6 +572,11 @@ fn to_board(r: BoardRow, now: OffsetDateTime) -> Result<Leaderboard> {
         bucket_size: r.7,
         league: r
             .8
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Error::internal)?,
+        race: r
+            .9
             .map(serde_json::from_value)
             .transpose()
             .map_err(Error::internal)?,
@@ -466,16 +645,30 @@ impl LeaderboardService {
                 ));
             }
         }
+        if let Some(r) = &c.race {
+            r.validate()?;
+            if c.bucket_size < 2 {
+                return Err(Error::InvalidArgument(
+                    "a race needs bucket_size >= 2 (cohorts)".into(),
+                ));
+            }
+        }
         let league_json = c
             .league
             .as_ref()
             .map(serde_json::to_value)
             .transpose()
             .map_err(Error::internal)?;
+        let race_json = c
+            .race
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(Error::internal)?;
         let res = sqlx::query_as::<_, BoardRow>(
             &format!(
-                "insert into musubi.leaderboards (id, authoritative, sort_order, operator, reset_schedule, metadata, bucket_size, league)
-                 values ($1, $2, $3, $4, $5, coalesce($6, '{{}}'::jsonb), $7, $8)
+                "insert into musubi.leaderboards (id, authoritative, sort_order, operator, reset_schedule, metadata, bucket_size, league, race)
+                 values ($1, $2, $3, $4, $5, coalesce($6, '{{}}'::jsonb), $7, $8, $9)
                  returning {BOARD_COLS}"
             ),
         )
@@ -487,6 +680,7 @@ impl LeaderboardService {
         .bind(&c.metadata)
         .bind(c.bucket_size)
         .bind(league_json)
+        .bind(race_json)
         .fetch_one(&self.db)
         .await;
         match res {
@@ -556,6 +750,18 @@ impl LeaderboardService {
         w: WriteRecord,
         server: bool,
     ) -> Result<Record> {
+        Ok(self.write_ext(id, owner, username, w, server).await?.0)
+    }
+
+    /// `write` plus whether this score just finished the player's race cohort.
+    pub async fn write_ext(
+        &self,
+        id: &str,
+        owner: AccountId,
+        username: Option<&str>,
+        w: WriteRecord,
+        server: bool,
+    ) -> Result<(Record, bool)> {
         let board = self.get(id).await?;
         if board.authoritative && !server {
             return Err(Error::PermissionDenied(
@@ -618,6 +824,9 @@ impl LeaderboardService {
         );
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let (tier, bucket) = self.scope_for_write(&mut tx, &board, expiry, owner).await?;
+        if let Some(race) = &board.race {
+            race_gate(&mut tx, &board, race, expiry, tier, bucket, owner, now).await?;
+        }
         let row = sqlx::query_as::<_, RecordRow>(&sql)
             .bind(id)
             .bind(owner.0)
@@ -631,10 +840,183 @@ impl LeaderboardService {
             .fetch_one(&mut *tx)
             .await
             .map_err(Error::internal)?;
+        let mut closed = false;
+        if let Some(race) = &board.race {
+            if race.reached(board.sort_order, row.3) {
+                closed = refresh_cohort(&mut tx, &board, race, expiry, tier, bucket).await?;
+            }
+        }
         tx.commit().await.map_err(Error::internal)?;
         let mut rec = to_record(row);
         rec.rank = self.rank_of(&board, expiry, owner).await?;
-        Ok(rec)
+        Ok((rec, closed))
+    }
+
+    /// The player's race cohort card for the current window.
+    pub async fn cohort(&self, id: &str, owner: AccountId) -> Result<Cohort> {
+        let board = self.get(id).await?;
+        let Some(race) = &board.race else {
+            return Err(Error::InvalidArgument("leaderboard has no race".into()));
+        };
+        let now = OffsetDateTime::now_utc();
+        let (_, expiry) = window(board.reset_schedule.as_deref(), now)?;
+        let rec: Option<(i16, i32, i64, OffsetDateTime)> = sqlx::query_as(
+            "select tier, bucket, score, created_at from musubi.leaderboard_records
+             where leaderboard_id = $1 and expiry_time = $2 and owner_id = $3",
+        )
+        .bind(id)
+        .bind(expiry)
+        .bind(owner.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let roll: Option<(i32, OffsetDateTime)> = sqlx::query_as(
+            "select rolls, last_roll_at from musubi.leaderboard_rolls
+             where leaderboard_id = $1 and expiry_time = $2 and owner_id = $3",
+        )
+        .bind(id)
+        .bind(expiry)
+        .bind(owner.0)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let rolls = roll.map_or(0, |r| r.0);
+        let cooldown_left = roll
+            .map(|(_, at)| race.roll_cooldown_secs - (now - at).whole_seconds())
+            .unwrap_or(0)
+            .max(0);
+        let mut c = Cohort {
+            tier: rec.map_or(0, |r| r.0),
+            bucket: rec.map(|r| r.1),
+            members: 0,
+            finishers: 0,
+            closed: false,
+            closed_at: None,
+            finished: false,
+            score_target: race.score_target,
+            target_players: race.target_players,
+            time_left_secs: None,
+            rolls,
+            rolls_left: (race.max_rolls - rolls).max(0),
+            cooldown_left_secs: cooldown_left,
+            can_reroll: false,
+        };
+        let Some((tier, bucket, score, created)) = rec else {
+            return Ok(c);
+        };
+        let (members, finishers, closed_at): (i64, i64, Option<OffsetDateTime>) = sqlx::query_as(
+            "select (select count(*) from musubi.leaderboard_records r
+                     where r.leaderboard_id = $1 and r.expiry_time = $2 and r.tier = $3 and r.bucket = $4),
+                    (select count(*) from musubi.leaderboard_records r
+                     where r.leaderboard_id = $1 and r.expiry_time = $2 and r.tier = $3 and r.bucket = $4
+                       and case when $6 then r.score >= $5 else r.score <= $5 end),
+                    (select closed_at from musubi.leaderboard_cohorts c
+                     where c.leaderboard_id = $1 and c.expiry_time = $2 and c.tier = $3 and c.bucket = $4)",
+        )
+        .bind(id)
+        .bind(expiry)
+        .bind(tier)
+        .bind(bucket)
+        .bind(race.score_target)
+        .bind(matches!(board.sort_order, SortOrder::Desc))
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        c.members = members;
+        c.finishers = finishers;
+        c.closed = closed_at.is_some();
+        c.closed_at = closed_at.map(|t| t.unix_timestamp());
+        c.finished = race.reached(board.sort_order, score);
+        if race.time_limit_secs > 0 {
+            c.time_left_secs =
+                Some((race.time_limit_secs - (now - created).whole_seconds()).max(0));
+        }
+        let over = c.closed || c.finished || c.time_left_secs == Some(0);
+        c.can_reroll = over && c.rolls_left > 0 && c.cooldown_left_secs == 0;
+        Ok(c)
+    }
+
+    /// Re-roll into a fresh cohort: the player's record is reset to zero scores in the newest
+    /// open bucket of their tier; allowed once their cohort finished, they reached the target or
+    /// their time ran out, within `max_rolls` and after `roll_cooldown_secs`.
+    pub async fn reroll(&self, id: &str, owner: AccountId) -> Result<Cohort> {
+        let board = self.get(id).await?;
+        let Some(race) = board.race.clone() else {
+            return Err(Error::InvalidArgument("leaderboard has no race".into()));
+        };
+        let before = self.cohort(id, owner).await?;
+        if before.bucket.is_none() {
+            return Err(Error::NotFound("no record to re-roll".into()));
+        }
+        if !(before.closed || before.finished || before.time_left_secs == Some(0)) {
+            return Err(Error::Conflict("cohort still running".into()));
+        }
+        if before.rolls_left == 0 {
+            return Err(Error::Conflict("no rolls left".into()));
+        }
+        if before.cooldown_left_secs > 0 {
+            return Err(Error::Conflict(format!(
+                "roll cooldown: {} s left",
+                before.cooldown_left_secs
+            )));
+        }
+        let now = OffsetDateTime::now_utc();
+        let (_, expiry) = window(board.reset_schedule.as_deref(), now)?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let old: Option<(i16, i32, Option<String>)> = sqlx::query_as(
+            "delete from musubi.leaderboard_records
+             where leaderboard_id = $1 and expiry_time = $2 and owner_id = $3
+             returning tier, bucket, username",
+        )
+        .bind(id)
+        .bind(expiry)
+        .bind(owner.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        let Some((tier, old_bucket, username)) = old else {
+            return Err(Error::NotFound("no record to re-roll".into()));
+        };
+        refresh_cohort(&mut tx, &board, &race, expiry, tier, old_bucket).await?;
+        let (tier, bucket) = self.scope_for_write(&mut tx, &board, expiry, owner).await?;
+        sqlx::query(
+            "insert into musubi.leaderboard_records (leaderboard_id, owner_id, username, score, subscore, num_score, expiry_time, tier, bucket)
+             values ($1, $2, $3, 0, 0, 0, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(owner.0)
+        .bind(&username)
+        .bind(expiry)
+        .bind(tier)
+        .bind(bucket)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        sqlx::query(
+            "insert into musubi.leaderboard_cohorts (leaderboard_id, expiry_time, tier, bucket)
+             values ($1, $2, $3, $4) on conflict do nothing",
+        )
+        .bind(id)
+        .bind(expiry)
+        .bind(tier)
+        .bind(bucket)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        sqlx::query(
+            "insert into musubi.leaderboard_rolls (leaderboard_id, expiry_time, owner_id, rolls, last_roll_at)
+             values ($1, $2, $3, 1, now())
+             on conflict (leaderboard_id, expiry_time, owner_id) do update
+                 set rolls = musubi.leaderboard_rolls.rolls + 1, last_roll_at = now()",
+        )
+        .bind(id)
+        .bind(expiry)
+        .bind(owner.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        self.cohort(id, owner).await
     }
 
     pub async fn delete_record(&self, id: &str, owner: AccountId, server: bool) -> Result<()> {
@@ -910,6 +1292,31 @@ impl LeaderboardService {
         .fetch_optional(&mut **tx)
         .await
         .map_err(Error::internal)?;
+        if board.race.is_some() {
+            // race boards: the newest *open* cohort with room, else a new one past the newest
+            let open: Option<(i32, i64)> = sqlx::query_as(
+                "select r.bucket, count(*) from musubi.leaderboard_records r
+                 where r.leaderboard_id = $1 and r.expiry_time = $2 and r.tier = $3
+                   and not exists (select 1 from musubi.leaderboard_cohorts c
+                                   where c.leaderboard_id = r.leaderboard_id and c.expiry_time = r.expiry_time
+                                     and c.tier = r.tier and c.bucket = r.bucket and c.closed_at is not null)
+                 group by r.bucket order by r.bucket desc limit 1",
+            )
+            .bind(&board.id)
+            .bind(expiry)
+            .bind(tier)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+            let newest = last.map_or(0, |(b, _)| b);
+            return Ok((
+                tier,
+                match open {
+                    Some((b, n)) if n < board.bucket_size as i64 => b,
+                    _ => newest + 1,
+                },
+            ));
+        }
         let bucket = match last {
             Some((b, n)) if n < board.bucket_size as i64 => b,
             Some((b, _)) => b + 1,

@@ -20,6 +20,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/leaderboards/{id}/around/{owner}", get(around))
         .route("/v1/leaderboards/{id}/windows", get(windows))
         .route("/v1/leaderboards/{id}/tier", get(tier))
+        .route("/v1/leaderboards/{id}/cohort", get(cohort))
+        .route("/v1/leaderboards/{id}/reroll", post(reroll))
         // server-to-server
         .route("/v1/server/leaderboards", post(create))
         .route("/v1/server/leaderboards/{id}", delete(delete_board))
@@ -219,9 +221,9 @@ async fn write(
         .await?
         .pop()
         .map(|u| u.username);
-    let r = s
+    let (r, closed) = s
         .leaderboards
-        .write(&id, me.account_id, username.as_deref(), w, false)
+        .write_ext(&id, me.account_id, username.as_deref(), w, false)
         .await?;
     s.events
         .emit(
@@ -230,7 +232,44 @@ async fn write(
             json!({ "leaderboard_id": id, "record": r }),
         )
         .await;
+    if closed {
+        s.events
+            .emit(
+                "leaderboard.cohort_finished",
+                Some(me.account_id),
+                json!({ "leaderboard_id": id, "tier": r.tier, "bucket": r.bucket, "expiry_time": r.expiry_time }),
+            )
+            .await;
+    }
     Ok(Json(r))
+}
+
+/// The caller's race cohort: members, finishers, closed, time left, rolls.
+async fn cohort(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<String>,
+) -> Result<Json<musubi_leaderboard::Cohort>, ApiError> {
+    Ok(Json(s.leaderboards.cohort(&id, me.account_id).await?))
+}
+
+/// Re-roll into a fresh cohort once the current one is over (finished cohort, target reached
+/// or time limit out), within `max_rolls` and after the cooldown.
+async fn reroll(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<String>,
+) -> Result<Json<musubi_leaderboard::Cohort>, ApiError> {
+    s.banned.check_feature(me.account_id, "leaderboards")?;
+    let c = s.leaderboards.reroll(&id, me.account_id).await?;
+    s.events
+        .emit(
+            "leaderboard.reroll",
+            Some(me.account_id),
+            json!({ "leaderboard_id": id, "tier": c.tier, "bucket": c.bucket, "rolls": c.rolls }),
+        )
+        .await;
+    Ok(Json(c))
 }
 
 async fn delete_own(
