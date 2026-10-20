@@ -6341,10 +6341,18 @@ async fn trace_id_is_returned_on_errors() {
     // subscriber while our dispatcher was being registered, caching it as disabled; force a
     // recomputation so the scoped subscriber definitely sees the span.
     tracing::callsite::rebuild_interest_cache();
-    let (st, v) = call(&app, "GET", "/v1/account", Some("not-a-token"), None)
-        .with_subscriber(sub)
+    let (st, mut v) = call(&app, "GET", "/v1/account", Some("not-a-token"), None)
+        .with_subscriber(sub.clone())
         .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    if v["trace_id"].is_null() {
+        // a parallel test re-registered a callsite in between; recompute once more and retry
+        tracing::callsite::rebuild_interest_cache();
+        v = call(&app, "GET", "/v1/account", Some("not-a-token"), None)
+            .with_subscriber(sub)
+            .await
+            .1;
+    }
     let trace_id = v["trace_id"]
         .as_str()
         .expect("trace_id in error body")
@@ -41571,7 +41579,6 @@ async fn admin_system_logs_ring_tail() {
     let sub = tracing::Dispatch::new(
         tracing_subscriber::registry().with(musubi_server::system_logs::layer(1000)),
     );
-    tracing::callsite::rebuild_interest_cache();
     tracing::dispatcher::with_default(&sub, || {
         tracing::warn!(target: "musubi_probe::fleet", code = 7, "ring {} warn", probe);
         tracing::info!(target: "musubi_probe::fleet", "ring {} info", probe);
@@ -41686,4 +41693,213 @@ async fn admin_system_logs_ring_tail() {
     assert_eq!(v["nodes"][0]["lines"].as_array().unwrap().len(), 3, "{v}");
     let (st, _) = call(&app, "GET", "/v1/admin/logs", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn fleet_install_script_runs_once_per_build() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mark = std::env::temp_dir().join(format!("musubi-install-{}", uuid::Uuid::now_v7()));
+    let mark_s = mark.to_string_lossy().to_string();
+    let base = |install: Value, port: i32| {
+        json!({
+            "name": unique("Inst").to_lowercase(), "provider": "local", "buffer": 2, "max_servers": 3,
+            "port_start": port, "port_end": port + 50,
+            "spec": {"command": ["sleep", "60"], "env": {"GAME_ASSET": "pak1"}, "install": install},
+            "policy": {"health": {"period_secs": 1, "failure_threshold": 2, "initial_delay_secs": 60}, "eviction": "never"}
+        })
+    };
+    for bad in [
+        json!({"command": []}),
+        json!({"command": ["sh", ""]}),
+        json!({"command": ["true"], "timeout_secs": 0}),
+        json!({"command": ["true"], "timeout_secs": 3601}),
+    ] {
+        let (st, v) =
+            call_server(&app, "POST", "/v1/server/fleets", k, Some(base(bad, 48200))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(base(
+            json!({
+                "command": ["sh", "-c", format!("echo installed-$GAME_ASSET-$EXTRA >> {mark_s}")],
+                "env": {"EXTRA": "x"}, "timeout_secs": 30
+            }),
+            48200,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["spec"]["install"]["timeout_secs"], 30, "{f}");
+    let fid = uuid::Uuid::parse_str(f["id"].as_str().unwrap()).unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(fid).await.unwrap();
+    let (st, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    assert_eq!(h["servers"].as_array().unwrap().len(), 2, "{h}");
+    let lines = std::fs::read_to_string(&mark).unwrap();
+    assert_eq!(
+        lines.trim(),
+        "installed-pak1-x",
+        "ran once for two servers: {lines:?}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/installs"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+    assert_eq!(v["failed"], 0);
+    assert_eq!(v["runs"][0]["ok"], true);
+    assert_eq!(v["runs"][0]["exit_code"], 0);
+    assert!(
+        v["runs"][0]["target"]
+            .as_str()
+            .unwrap()
+            .starts_with("node:"),
+        "{v}"
+    );
+    assert_eq!(v["runs"][0]["install_hash"], v["install_hash"], "{v}");
+    assert!(v["runs"][0]["ran_at"].is_string());
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/events"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["code"] == "fleet.install_succeeded"),
+        "{ev}"
+    );
+    // Reset → the next start runs the script again.
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/installs/reset"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["cleared"], 1);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"buffer": 3, "max_servers": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    svc.reconcile_one(fid).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&mark).unwrap().lines().count(), 2);
+    let _ = std::fs::remove_file(&mark);
+    // Failing script: no server starts, the run is recorded with its exit code and output.
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(base(
+            json!({
+                "command": ["sh", "-c", "echo missing dependency >&2; exit 3"]
+            }),
+            48300,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid2 = uuid::Uuid::parse_str(f["id"].as_str().unwrap()).unwrap();
+    let _ = svc.reconcile_one(fid2).await;
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid2}/installs"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["failed"], 1, "{v}");
+    assert_eq!(v["runs"][0]["exit_code"], 3);
+    assert!(
+        v["runs"][0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("missing dependency"),
+        "{v}"
+    );
+    let (st, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid2}/health"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    assert!(
+        h["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["state"] != "ready" && s["state"] != "starting"),
+        "{h}"
+    );
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid2}/events"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["code"] == "fleet.install_failed"),
+        "{ev}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{}/installs", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    for id in [fid, fid2] {
+        let (st, _) =
+            call_server(&app, "DELETE", &format!("/v1/server/fleets/{id}"), k, None).await;
+        assert_eq!(st, StatusCode::OK);
+    }
 }

@@ -174,6 +174,97 @@ impl Default for LogSpec {
 
 pub const LOG_ARCHIVE_PREFIX: &str = "server-logs/";
 
+/// `spec.install`: a command run once per target (this node for `local`, each host for `ssh`)
+/// and build version before the first server starts there — unpack assets, install runtime
+/// dependencies, warm caches. Failure blocks the start and raises `fleet.install_failed`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct InstallSpec {
+    pub command: Vec<String>,
+    /// Extra environment on top of `spec.env` (default none).
+    pub env: HashMap<String, String>,
+    /// Wall-clock limit (1..=3600, default 600).
+    pub timeout_secs: Option<u64>,
+    /// Working directory (default `spec.working_dir`).
+    pub working_dir: Option<String>,
+}
+
+impl InstallSpec {
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(600))
+    }
+    /// Stable fingerprint; a changed script re-installs even for the same build version.
+    pub fn hash(&self) -> String {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(serde_json::to_vec(self).unwrap_or_default());
+        hex::encode(&h.finalize()[..12])
+    }
+}
+
+pub fn validate_install(spec: &FleetSpec) -> Result<()> {
+    let Some(i) = &spec.install else {
+        return Ok(());
+    };
+    if i.command.is_empty() || i.command.iter().any(|a| a.is_empty()) {
+        return Err(Error::InvalidArgument(
+            "install.command must be a non-empty argv".into(),
+        ));
+    }
+    if i.command.len() > 64 || i.command.iter().map(|a| a.len()).sum::<usize>() > 8192 {
+        return Err(Error::InvalidArgument(
+            "install.command: at most 64 arguments / 8 KiB".into(),
+        ));
+    }
+    if let Some(t) = i.timeout_secs {
+        if !(1..=3600).contains(&t) {
+            return Err(Error::InvalidArgument(
+                "install.timeout_secs must be 1..=3600".into(),
+            ));
+        }
+    }
+    if i.env.len() > 64 {
+        return Err(Error::InvalidArgument(
+            "install.env: at most 64 variables".into(),
+        ));
+    }
+    Ok(())
+}
+
+type InstallRow = (
+    String,
+    String,
+    String,
+    bool,
+    Option<i32>,
+    String,
+    i64,
+    OffsetDateTime,
+);
+
+/// Result of one install-script run on one target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallRun {
+    /// `node:<id>` for the local provider, `host:<id>` for ssh.
+    pub target: String,
+    pub ok: bool,
+    pub exit_code: Option<i32>,
+    /// Last 4 KiB of combined stdout/stderr.
+    pub output: String,
+    pub duration_ms: u64,
+}
+
+fn tail_4k(s: &str) -> String {
+    if s.len() <= 4096 {
+        return s.to_string();
+    }
+    let mut cut = s.len() - 4096;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s[cut..].to_string()
+}
+
 pub fn validate_logs(spec: &FleetSpec) -> Result<()> {
     let l = &spec.logs;
     if l.delay_secs > 3600 {
@@ -333,6 +424,10 @@ pub struct FleetSpec {
     /// that starts the server, where they join `env` for the provider.
     pub secret_env: HashMap<String, String>,
     pub working_dir: Option<String>,
+    /// Install script (GameLift `install.sh` parity): run once per node/host and build before the
+    /// first server of that build starts there (`local` and `ssh` providers; images bake it in).
+    #[serde(default)]
+    pub install: Option<InstallSpec>,
     /// vCPUs one server uses, for usage accounting (default 1).
     pub vcpu: Option<f64>,
     /// Per-server resource specification handed to the provider (Kubernetes requests/limits,
@@ -2450,6 +2545,20 @@ pub trait Provider: Send + Sync {
     {
         Box::pin(async { Ok(None) })
     }
+    /// Run `fleet.spec.install` on every target this start could land on that has not yet run
+    /// this (build, hash); returns the runs performed (empty = nothing to do / cached), stopping
+    /// at the first failed one — the caller must not start the server then. Default: unsupported.
+    fn install<'a>(
+        &'a self,
+        _fleet: &'a Fleet,
+        _build_version: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<InstallRun>>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    /// Forget cached install results for the fleet so the next start re-runs the script.
+    fn forget_installs(&self, _fleet_id: Uuid) {}
+
     /// One-off preparation that makes later starts faster (firecracker: boot once, snapshot,
     /// fill the warm pool). Providers without such a step reject.
     fn prepare<'a>(
@@ -2470,6 +2579,60 @@ pub struct LocalProcessProvider {
     children: DashMap<Uuid, Arc<tokio::sync::Mutex<tokio::process::Child>>>,
     exited: DashMap<Uuid, i32>,
     sink: std::sync::RwLock<Option<LogSink>>,
+    /// (fleet, build version, install hash) already installed on this node.
+    installed: DashMap<(Uuid, String, String), ()>,
+    install_lock: tokio::sync::Mutex<()>,
+}
+
+/// Run an install command locally with a wall-clock limit; never fails on exit status.
+pub async fn run_install_local(spec: &FleetSpec, i: &InstallSpec, target: &str) -> InstallRun {
+    let started = std::time::Instant::now();
+    let (bin, args) = i.command.split_first().expect("validated");
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .envs(&spec.env)
+        .envs(&i.env)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(d) = i.working_dir.as_ref().or(spec.working_dir.as_ref()) {
+        cmd.current_dir(d);
+    }
+    let out = tokio::time::timeout(i.timeout(), cmd.output()).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match out {
+        Ok(Ok(o)) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            if !o.stderr.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&String::from_utf8_lossy(&o.stderr));
+            }
+            InstallRun {
+                target: target.into(),
+                ok: o.status.success(),
+                exit_code: o.status.code(),
+                output: tail_4k(&text),
+                duration_ms,
+            }
+        }
+        Ok(Err(e)) => InstallRun {
+            target: target.into(),
+            ok: false,
+            exit_code: None,
+            output: format!("spawn {bin}: {e}"),
+            duration_ms,
+        },
+        Err(_) => InstallRun {
+            target: target.into(),
+            ok: false,
+            exit_code: None,
+            output: format!("timed out after {} s", i.timeout().as_secs()),
+            duration_ms,
+        },
+    }
 }
 
 impl LocalProcessProvider {
@@ -2482,6 +2645,37 @@ impl LocalProcessProvider {
 impl Provider for LocalProcessProvider {
     fn name(&self) -> &'static str {
         "local"
+    }
+
+    fn install<'a>(
+        &'a self,
+        fleet: &'a Fleet,
+        build_version: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<InstallRun>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(i) = &fleet.spec.install else {
+                return Ok(Vec::new());
+            };
+            let key = (fleet.id, build_version.to_string(), i.hash());
+            if self.installed.contains_key(&key) {
+                return Ok(Vec::new());
+            }
+            let _g = self.install_lock.lock().await;
+            if self.installed.contains_key(&key) {
+                return Ok(Vec::new());
+            }
+            let target = format!("node:{}", local_node_name());
+            let run = run_install_local(&fleet.spec, i, &target).await;
+            if run.ok {
+                self.installed.insert(key, ());
+            }
+            Ok(vec![run])
+        })
+    }
+
+    fn forget_installs(&self, fleet_id: Uuid) {
+        self.installed.retain(|k, _| k.0 != fleet_id);
     }
 
     fn start<'a>(
@@ -2648,6 +2842,20 @@ struct ServerRow {
     reserved_until: Option<OffsetDateTime>,
     hostname: Option<String>,
     terminated_at: Option<OffsetDateTime>,
+}
+
+/// Hostname of this machine for install targets (`node:<name>`).
+pub fn local_node_name() -> String {
+    std::env::var("MUSUBI_NODE_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "local".into())
 }
 
 /// `<first 8 hex of id>.<fleet name>.<dns_zone>` when the fleet sets `spec.dns_zone`.
@@ -3228,6 +3436,7 @@ impl FleetService {
         validate_ports(&c.spec)?;
         validate_kubernetes(&c.spec)?;
         validate_logs(&c.spec)?;
+        validate_install(&c.spec)?;
         if c.port_start < 1 || c.port_end < c.port_start || c.port_end > 65535 {
             return Err(Error::InvalidArgument("bad port range".into()));
         }
@@ -4294,6 +4503,134 @@ impl FleetService {
 
     /// Append to the fleet's lifecycle log (best effort; the server crate forwards undispatched
     /// rows to the event bus / webhooks).
+    /// Provider install with a cross-node reset check: when the provider's in-memory cache says
+    /// "done" but no successful row for this (fleet, build, hash) exists any more (an operator
+    /// reset it, possibly on another node), forget the cache and run again.
+    async fn run_install(
+        &self,
+        provider: &dyn Provider,
+        f: &Fleet,
+        build_version: &str,
+    ) -> Result<Vec<InstallRun>> {
+        let Some(i) = &f.spec.install else {
+            return Ok(Vec::new());
+        };
+        let runs = provider.install(f, build_version).await?;
+        if !runs.is_empty() {
+            return Ok(runs);
+        }
+        let n: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.fleet_installs
+             where fleet_id = $1 and build_version = $2 and install_hash = $3 and ok",
+        )
+        .bind(f.id)
+        .bind(build_version)
+        .bind(i.hash())
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        if n > 0 {
+            return Ok(runs);
+        }
+        provider.forget_installs(f.id);
+        provider.install(f, build_version).await
+    }
+
+    /// Persist one install-script run and raise `fleet.install_succeeded|failed`.
+    pub async fn record_install(
+        &self,
+        fleet_id: Uuid,
+        build_version: &str,
+        spec: Option<&InstallSpec>,
+        run: &InstallRun,
+    ) {
+        let hash = spec.map(|s| s.hash()).unwrap_or_default();
+        let _ = sqlx::query(
+            "insert into musubi.fleet_installs
+             (fleet_id, target, build_version, install_hash, ok, exit_code, output, duration_ms, ran_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, now())
+             on conflict (fleet_id, target, build_version, install_hash) do update set
+               ok = excluded.ok, exit_code = excluded.exit_code, output = excluded.output,
+               duration_ms = excluded.duration_ms, ran_at = now()",
+        )
+        .bind(fleet_id)
+        .bind(&run.target)
+        .bind(build_version)
+        .bind(&hash)
+        .bind(run.ok)
+        .bind(run.exit_code)
+        .bind(&run.output)
+        .bind(run.duration_ms as i64)
+        .execute(&self.db)
+        .await;
+        self.record_event(
+            fleet_id,
+            None,
+            if run.ok {
+                "fleet.install_succeeded"
+            } else {
+                "fleet.install_failed"
+            },
+            format!(
+                "install script {} on {} in {} ms",
+                if run.ok { "succeeded" } else { "failed" },
+                run.target,
+                run.duration_ms
+            ),
+            serde_json::json!({
+                "target": run.target, "build_version": build_version, "install_hash": hash,
+                "exit_code": run.exit_code, "duration_ms": run.duration_ms,
+            }),
+        )
+        .await;
+    }
+
+    /// Install runs recorded for the fleet, newest first.
+    pub async fn installs(&self, fleet_id: Uuid) -> Result<Vec<serde_json::Value>> {
+        self.get(fleet_id).await?;
+        let rows: Vec<InstallRow> = sqlx::query_as(
+            "select target, build_version, install_hash, ok, exit_code, output, duration_ms, ran_at
+                 from musubi.fleet_installs where fleet_id = $1 order by ran_at desc limit 500",
+        )
+        .bind(fleet_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(t, bv, h, ok, ec, out, ms, at)| {
+                serde_json::json!({
+                    "target": t, "build_version": bv, "install_hash": h, "ok": ok,
+                    "exit_code": ec, "output": out, "duration_ms": ms,
+                    "ran_at": at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// Drop install results so the next start re-runs the script on every target.
+    pub async fn reset_installs(&self, fleet_id: Uuid) -> Result<u64> {
+        let f = self.get(fleet_id).await?;
+        if let Some(p) = self.provider_of(&f.provider) {
+            p.forget_installs(fleet_id);
+        }
+        let n = sqlx::query("delete from musubi.fleet_installs where fleet_id = $1")
+            .bind(fleet_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+        self.record_event(
+            fleet_id,
+            None,
+            "fleet.installs_reset",
+            format!("{n} install record(s) cleared"),
+            serde_json::json!({ "cleared": n }),
+        )
+        .await;
+        Ok(n)
+    }
+
     pub async fn record_event(
         &self,
         fleet_id: Uuid,
@@ -4741,16 +5078,43 @@ impl FleetService {
             serde_json::json!({ "port": port, "ports": named, "build_version": build.as_ref().map(|b| b.version.clone()), "node_id": self.node_id }),
         )
         .await;
-        match provider
-            .start(StartRequest {
-                fleet: f,
-                server_id: id,
-                port,
-                api_url: &self.api_url,
-                server_key: &self.server_key,
-            })
-            .await
-        {
+        let bv = build
+            .as_ref()
+            .map(|b| b.version.clone())
+            .unwrap_or_default();
+        let started = match self.run_install(provider.as_ref(), f, &bv).await {
+            Ok(runs) => {
+                let mut failed = None;
+                for r in &runs {
+                    self.record_install(f.id, &bv, f.spec.install.as_ref(), r)
+                        .await;
+                    if !r.ok && failed.is_none() {
+                        failed = Some(r.clone());
+                    }
+                }
+                match failed {
+                    Some(r) => Err(Error::Unavailable(format!(
+                        "install script failed on {}: exit {:?} — {}",
+                        r.target,
+                        r.exit_code,
+                        r.output.lines().last().unwrap_or("")
+                    ))),
+                    None => {
+                        provider
+                            .start(StartRequest {
+                                fleet: f,
+                                server_id: id,
+                                port,
+                                api_url: &self.api_url,
+                                server_key: &self.server_key,
+                            })
+                            .await
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match started {
             Ok(st) => {
                 sqlx::query("update musubi.game_servers set address = $2, port = $3, pid = $4, host_id = $5, updated_at = now() where id = $1")
                     .bind(id)

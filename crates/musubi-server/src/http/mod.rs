@@ -45,6 +45,7 @@ pub mod game_sessions;
 pub mod group_challenges;
 mod group_pools;
 mod groups;
+pub mod installs;
 mod integrations;
 pub mod items_lifecycle;
 mod leaderboards;
@@ -302,6 +303,7 @@ pub fn router(state: AppState) -> Router {
         .merge(broadcasts::routes())
         .merge(sweepstakes::routes())
         .merge(reputation::routes())
+        .merge(installs::routes())
         .merge(system_logs::routes())
         .merge(developers::routes())
         .merge(donations::routes())

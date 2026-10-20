@@ -23,6 +23,8 @@ pub struct SshProvider {
     /// server → (host id, remote pid)
     running: DashMap<Uuid, (Uuid, i64)>,
     dead: DashMap<Uuid, ()>,
+    /// (fleet, host, build version, install hash) already installed.
+    installed: DashMap<(Uuid, Uuid, String, String), ()>,
 }
 
 /// Single-quote for a POSIX shell.
@@ -40,6 +42,7 @@ impl SshProvider {
         Self {
             hosts,
             running: DashMap::new(),
+            installed: DashMap::new(),
             dead: DashMap::new(),
         }
     }
@@ -194,6 +197,95 @@ pub fn log_path(server_id: Uuid) -> String {
 impl Provider for SshProvider {
     fn name(&self) -> &'static str {
         "ssh"
+    }
+
+    fn install<'a>(
+        &'a self,
+        fleet: &'a crate::Fleet,
+        build_version: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<crate::InstallRun>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let Some(i) = &fleet.spec.install else {
+                return Ok(Vec::new());
+            };
+            let hash = i.hash();
+            let class = fleet.spec.host_class.as_deref();
+            let labels = fleet
+                .spec
+                .host_labels
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            let mut runs = Vec::new();
+            for host in self
+                .hosts
+                .snapshot()
+                .into_iter()
+                .filter(|h| h.accepts(&fleet.region, class, &labels))
+            {
+                let key = (fleet.id, host.id, build_version.to_string(), hash.clone());
+                if self.installed.contains_key(&key) {
+                    continue;
+                }
+                let mut script = String::new();
+                if let Some(d) = i.working_dir.as_ref().or(fleet.spec.working_dir.as_ref()) {
+                    script.push_str(&format!("cd {} && ", sq(d)));
+                }
+                let mut env: Vec<(&String, &String)> =
+                    fleet.spec.env.iter().chain(i.env.iter()).collect();
+                env.sort();
+                script.push_str(&format!("timeout {} env", i.timeout().as_secs()));
+                for (k, v) in env {
+                    script.push_str(&format!(" {}={}", k, sq(v)));
+                }
+                for a in &i.command {
+                    script.push(' ');
+                    script.push_str(&sq(a));
+                }
+                script.push_str(" 2>&1");
+                let started = std::time::Instant::now();
+                let target = format!("host:{}", host.id);
+                let res = self.ssh(&host, &script).await;
+                let run = match res {
+                    Ok(out) => crate::InstallRun {
+                        target: target.clone(),
+                        ok: true,
+                        exit_code: Some(0),
+                        output: out
+                            .chars()
+                            .rev()
+                            .take(4096)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    },
+                    Err(e) => crate::InstallRun {
+                        target: target.clone(),
+                        ok: false,
+                        exit_code: None,
+                        output: e.to_string(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    },
+                };
+                let ok = run.ok;
+                if ok {
+                    self.installed.insert(key, ());
+                }
+                runs.push(run);
+                if !ok {
+                    break;
+                }
+            }
+            Ok(runs)
+        })
+    }
+
+    fn forget_installs(&self, fleet_id: Uuid) {
+        self.installed.retain(|k, _| k.0 != fleet_id);
     }
 
     fn start<'a>(
