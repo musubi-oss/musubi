@@ -46970,3 +46970,181 @@ async fn telemetry_s3_sink_batches_dedicated_role_and_redirect() {
     let (st, _) = call(&app, "GET", "/v1/server/analytics/sinks", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn edge_flood_guard_strikes_blocks_and_operator_controls() {
+    let Some((app, state)) = app_and_state_with(|_| {}).await else {
+        return;
+    };
+    let k = "defaultkey";
+    if musubi_server::edge::EDGE.get().is_none() {
+        let (st, v) = call_server(&app, "GET", "/v1/server/edge", k, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    }
+    assert!(
+        musubi_server::edge::guard_config(&musubi_core::config::EdgeGuardConfig {
+            deny: vec!["300.1.1.1/8".into()],
+            ..Default::default()
+        })
+        .is_err()
+    );
+    let guard = musubi_server::edge::guard_config(&musubi_core::config::EdgeGuardConfig {
+        strikes_to_block: 3,
+        block_secs: 120,
+        allow: vec!["10.0.0.0/8".into()],
+        deny: vec!["198.51.100.0/24".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let proxy = musubi_edge::UdpProxy::start_with_guard(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(musubi_server::edge::FleetRouter(state.fleets.clone())),
+        std::time::Duration::from_secs(5),
+        guard,
+    )
+    .await
+    .unwrap();
+    let _ = musubi_server::edge::EDGE.set(proxy.clone());
+    let proxy = musubi_server::edge::EDGE.get().unwrap().clone();
+    let (st, v) = call_server(&app, "GET", "/v1/server/edge", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["guard"]["enabled"], true);
+    assert_eq!(v["sessions"], 0);
+
+    // garbage datagrams from one source: 3 strikes → blocked
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = proxy.local_addr();
+    for _ in 0..3 {
+        client.send_to(b"not a musubi frame", target).await.unwrap();
+    }
+    client
+        .send_to(
+            &musubi_edge::with_header(b"unknown-token", b"hello"),
+            target,
+        )
+        .await
+        .unwrap();
+    let mut v = Value::Null;
+    for _ in 0..40 {
+        let (_, s) = call_server(&app, "GET", "/v1/server/edge", k, None).await;
+        v = s;
+        if v["guard"]["counters"]["blocked"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let g = &v["guard"];
+    assert!(g["counters"]["strikes"].as_u64().unwrap() >= 3, "{v}");
+    assert_eq!(g["counters"]["blocks_issued"], 1, "{v}");
+    assert!(g["counters"]["blocked"].as_u64().unwrap() >= 1, "{v}");
+    assert_eq!(v["dropped"].as_u64().unwrap(), 4, "{v}");
+    assert_eq!(v["forwarded"], 0);
+    let bl = g["blocklist"].as_array().unwrap();
+    assert_eq!(bl.len(), 1, "{v}");
+    assert_eq!(bl[0]["ip"], "127.0.0.1");
+    assert!(bl[0]["remaining_secs"].as_u64().unwrap() <= 120);
+    assert!(bl[0]["remaining_secs"].as_u64().unwrap() >= 118);
+    assert_eq!(bl[0]["blocks"], 1);
+
+    // operator unblock / block
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/edge/unblock",
+        k,
+        Some(json!({"ip": "127.0.0.1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["unblocked"], true);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/edge/unblock",
+        k,
+        Some(json!({"ip": "127.0.0.1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/edge/unblock",
+        k,
+        Some(json!({"ip": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, v) = call_server(&app, "GET", "/v1/server/edge", k, None).await;
+    assert!(
+        v["guard"]["blocklist"].as_array().unwrap().is_empty(),
+        "{v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/edge/block",
+        k,
+        Some(json!({"ip": "10.1.2.3"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "allow-listed: {v}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/edge/block",
+        k,
+        Some(json!({"ip": "203.0.113.5", "secs": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/edge/block",
+        k,
+        Some(json!({"ip": "203.0.113.5", "secs": 600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["blocked_secs"], 600);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/edge/block",
+        k,
+        Some(json!({"ip": "2001:db8::7"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["blocked_secs"], 120, "default block_secs: {v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/edge", k, None).await;
+    let ips: Vec<&str> = v["guard"]["blocklist"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["ip"].as_str().unwrap())
+        .collect();
+    assert_eq!(ips, vec!["203.0.113.5", "2001:db8::7"], "{v}");
+    assert_eq!(v["guard"]["allow"], json!(["10.0.0.0/8"]));
+    assert_eq!(v["guard"]["deny"], json!(["198.51.100.0/24"]));
+    assert_eq!(v["guard"]["strikes_to_block"], 3);
+    // a well-formed frame from the unblocked source is judged again (unknown token → strike, not blocked yet)
+    client
+        .send_to(&musubi_edge::with_header(b"still-unknown", b"x"), target)
+        .await
+        .unwrap();
+    let mut v = Value::Null;
+    for _ in 0..40 {
+        let (_, s) = call_server(&app, "GET", "/v1/server/edge", k, None).await;
+        v = s;
+        if v["dropped"].as_u64().unwrap_or(0) >= 5 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(v["dropped"], 5, "{v}");
+    assert_eq!(v["guard"]["counters"]["blocks_issued"], 1, "{v}");
+    let (st, _) = call(&app, "GET", "/v1/server/edge", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

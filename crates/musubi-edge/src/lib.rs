@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+
+pub mod guard;
+pub use guard::{Guard, GuardConfig, Verdict};
 use tokio::net::UdpSocket;
 
 pub const MAGIC: [u8; 2] = [0xED, 0x6E];
@@ -66,6 +69,7 @@ pub struct UdpProxy {
     epoch: Instant,
     forwarded: AtomicU64,
     dropped: AtomicU64,
+    guard: Arc<Guard>,
 }
 
 impl UdpProxy {
@@ -73,6 +77,16 @@ impl UdpProxy {
         listen: SocketAddr,
         router: Arc<dyn Router>,
         idle: Duration,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::start_with_guard(listen, router, idle, GuardConfig::default()).await
+    }
+
+    /// Flood guard in front of the proxy (see [`guard`]).
+    pub async fn start_with_guard(
+        listen: SocketAddr,
+        router: Arc<dyn Router>,
+        idle: Duration,
+        guard: GuardConfig,
     ) -> std::io::Result<Arc<Self>> {
         let sock = Arc::new(UdpSocket::bind(listen).await?);
         let proxy = Arc::new(Self {
@@ -83,6 +97,7 @@ impl UdpProxy {
             epoch: Instant::now(),
             forwarded: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            guard: Arc::new(Guard::new(guard)),
         });
         tokio::spawn(proxy.clone().ingress());
         tokio::spawn(proxy.clone().sweeper());
@@ -95,6 +110,10 @@ impl UdpProxy {
 
     pub fn sessions(&self) -> usize {
         self.sessions.len()
+    }
+
+    pub fn guard(&self) -> &Arc<Guard> {
+        &self.guard
     }
 
     /// (datagrams forwarded upstream, datagrams dropped at the edge).
@@ -120,7 +139,14 @@ impl UdpProxy {
                     continue;
                 }
             };
+            // judged by source before anything is parsed
+            let known = self.sessions.contains_key(&from);
+            if self.guard.check(from, n, !known) != Verdict::Pass {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let Some((token, payload)) = split_header(&buf[..n]) else {
+                self.guard.strike(from);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -133,6 +159,7 @@ impl UdpProxy {
                 None => match self.open(from, token).await {
                     Some(s) => s,
                     None => {
+                        self.guard.strike(from);
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -216,6 +243,7 @@ impl UdpProxy {
         let every = (self.idle / 2).max(Duration::from_millis(10));
         loop {
             tokio::time::sleep(every).await;
+            self.guard.sweep(self.idle.max(Duration::from_secs(60)));
             let cutoff = self.now_ms().saturating_sub(self.idle.as_millis() as u64);
             let stale: Vec<SocketAddr> = self
                 .sessions

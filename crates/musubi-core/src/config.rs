@@ -785,6 +785,8 @@ pub struct EdgeConfig {
     pub public_addr: Option<SocketAddr>,
     /// Drop a client's proxy session after this long without packets.
     pub idle_secs: u64,
+    /// Flood guard in front of the proxy (`[edge.guard]`).
+    pub guard: EdgeGuardConfig,
 }
 
 impl Default for EdgeConfig {
@@ -793,6 +795,47 @@ impl Default for EdgeConfig {
             listen: None,
             public_addr: None,
             idle_secs: 60,
+            guard: EdgeGuardConfig::default(),
+        }
+    }
+}
+
+/// First line of volumetric defence for the UDP edge: per-source packet/byte budgets, a budget
+/// for session-opening packets, a global packet ceiling, strikes (malformed / unknown token /
+/// over budget) that turn into escalating blocks, and allow/deny CIDR lists. Judged before any
+/// parsing; `GET /v1/server/edge` shows counters and the blocklist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct EdgeGuardConfig {
+    pub enabled: bool,
+    pub max_pps_per_source: u32,
+    pub max_bytes_per_source: u32,
+    pub max_opens_per_source: u32,
+    /// 0 = unlimited.
+    pub global_max_pps: u32,
+    pub min_packet_bytes: usize,
+    pub strikes_to_block: u32,
+    pub strike_window_secs: u64,
+    pub block_secs: u64,
+    /// CIDRs never limited (own servers, QA) / always dropped.
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl Default for EdgeGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_pps_per_source: 2000,
+            max_bytes_per_source: 2_000_000,
+            max_opens_per_source: 10,
+            global_max_pps: 0,
+            min_packet_bytes: 4,
+            strikes_to_block: 20,
+            strike_window_secs: 10,
+            block_secs: 300,
+            allow: Vec::new(),
+            deny: Vec::new(),
         }
     }
 }

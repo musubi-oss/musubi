@@ -1377,14 +1377,16 @@ async fn start_listeners(state: &AppState, base: Option<&Config>) -> anyhow::Res
         state.cfg.edge.listen,
         base.and_then(|b| b.edge.listen),
     ) {
-        let proxy = musubi_edge::UdpProxy::start(
+        let guard = crate::edge::guard_config(&state.cfg.edge.guard)?;
+        let proxy = musubi_edge::UdpProxy::start_with_guard(
             listen,
             Arc::new(crate::edge::FleetRouter(state.fleets.clone())),
             std::time::Duration::from_secs(state.cfg.edge.idle_secs.max(1)),
+            guard,
         )
         .await?;
-        tracing::info!(listen = %proxy.local_addr(), public = ?state.fleets.edge(), "udp edge proxy listening");
-        std::mem::forget(proxy);
+        tracing::info!(listen = %proxy.local_addr(), public = ?state.fleets.edge(), guard = state.cfg.edge.guard.enabled, "udp edge proxy listening");
+        let _ = crate::edge::EDGE.set(proxy);
     }
     if let Some(listen) = own(
         "regions.echo",

@@ -31,6 +31,7 @@ mod device_codes;
 mod donations;
 pub mod economy;
 pub mod economy_changesets;
+pub mod edge_guard;
 pub mod effects;
 mod egress;
 pub mod entitlements;
@@ -260,6 +261,7 @@ pub fn router(state: AppState) -> Router {
         .merge(session_vars::router())
         .merge(qa_clock::router())
         .merge(countries::router())
+        .merge(edge_guard::router())
         .merge(config_sources::router())
         .merge(build_artifacts::router())
         .merge(placements::router())

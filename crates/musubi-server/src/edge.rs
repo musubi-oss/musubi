@@ -15,3 +15,36 @@ impl musubi_edge::Router for FleetRouter {
         self.0.route_token(token).await
     }
 }
+
+/// The node's UDP edge proxy, once started (`GET /v1/server/edge`).
+pub static EDGE: std::sync::OnceLock<Arc<musubi_edge::UdpProxy>> = std::sync::OnceLock::new();
+
+/// `[edge.guard]` → the proxy's guard settings; bad CIDRs are a startup error.
+pub fn guard_config(
+    c: &musubi_core::config::EdgeGuardConfig,
+) -> musubi_core::Result<musubi_edge::GuardConfig> {
+    let cidrs = |list: &[String], what: &str| -> musubi_core::Result<Vec<(std::net::IpAddr, u8)>> {
+        list.iter()
+            .map(|t| {
+                musubi_edge::guard::parse_cidr(t).ok_or_else(|| {
+                    musubi_core::Error::InvalidArgument(format!(
+                        "edge.guard.{what}: bad CIDR {t:?}"
+                    ))
+                })
+            })
+            .collect()
+    };
+    Ok(musubi_edge::GuardConfig {
+        enabled: c.enabled,
+        max_pps_per_source: c.max_pps_per_source,
+        max_bytes_per_source: c.max_bytes_per_source,
+        max_opens_per_source: c.max_opens_per_source,
+        global_max_pps: c.global_max_pps,
+        min_packet_bytes: c.min_packet_bytes,
+        strikes_to_block: c.strikes_to_block,
+        strike_window_secs: c.strike_window_secs,
+        block_secs: c.block_secs,
+        allow: cidrs(&c.allow, "allow")?,
+        deny: cidrs(&c.deny, "deny")?,
+    })
+}
