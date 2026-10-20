@@ -2560,6 +2560,8 @@ pub struct FleetService {
     scale_status: Arc<std::sync::Mutex<HashMap<Uuid, serde_json::Value>>>,
     log_tx: LogSink,
     log_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<LogLine>>>>,
+    /// Live fan-out of every stored line (`…/logs/stream` followers).
+    log_tap: tokio::sync::broadcast::Sender<LogLine>,
     /// Host pool + capacity pools behind the `ssh` provider (`enable_ssh`).
     capacity: Arc<std::sync::RwLock<Option<Arc<capacity::CapacityState>>>>,
 }
@@ -2686,6 +2688,7 @@ impl FleetService {
             scale_status: Arc::new(std::sync::Mutex::new(HashMap::new())),
             log_tx,
             log_rx: Arc::new(std::sync::Mutex::new(Some(log_rx))),
+            log_tap: tokio::sync::broadcast::channel(4096).0,
             capacity: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -2702,6 +2705,7 @@ impl FleetService {
             return;
         };
         let db = self.db.clone();
+        let tap = self.log_tap.clone();
         tokio::spawn(async move {
             let mut buf = Vec::with_capacity(512);
             loop {
@@ -2712,13 +2716,24 @@ impl FleetService {
                 if let Err(e) = write_logs(&db, &buf).await {
                     tracing::warn!(error = %e, lines = buf.len(), "server log write failed");
                 }
+                if tap.receiver_count() > 0 {
+                    for l in &buf {
+                        let _ = tap.send(l.clone());
+                    }
+                }
                 buf.clear();
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         });
     }
 
-    /// Stored log lines of one server, newest first.
+    /// Subscribe to every line stored from now on (all fleets; filter by `server_id`). Slow
+    /// readers lag and skip, they never block the writer.
+    pub fn log_tap(&self) -> tokio::sync::broadcast::Receiver<LogLine> {
+        self.log_tap.subscribe()
+    }
+
+    /// Stored log lines of one server, newest first (`limit` clamped to 1..=5000).
     pub async fn logs(
         &self,
         fleet_id: Uuid,
@@ -2749,7 +2764,7 @@ impl FleetService {
             q.after
                 .and_then(|a| OffsetDateTime::from_unix_timestamp(a).ok()),
         )
-        .bind(q.limit.clamp(1, 1000) as i64)
+        .bind(q.limit.clamp(1, 5000) as i64)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;

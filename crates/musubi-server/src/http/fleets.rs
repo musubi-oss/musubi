@@ -2,7 +2,7 @@
 //! (server key + `X-Musubi-Server-Id`, Agones-like: ready / health / allocate / shutdown / label / connect).
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
@@ -39,6 +39,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/v1/server/fleets/{id}/servers/{sid}/logs",
             get(server_logs),
+        )
+        .route(
+            "/v1/server/fleets/{id}/servers/{sid}/logs/stream",
+            get(stream_logs),
+        )
+        .route(
+            "/v1/server/fleets/{id}/servers/{sid}/logs/download",
+            get(download_logs),
         )
         .route(
             "/v1/server/fleets/{id}/servers/{sid}/logs/archive",
@@ -664,6 +672,177 @@ async fn server_logs(
     Ok(Json(
         json!({ "lines": lines, "next_before": next, "archived": archived }),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct TailQ {
+    /// Lines of history before going live (Hathora `tailLines`), 1..=5000.
+    tail: u32,
+    level: Option<String>,
+    source: Option<String>,
+}
+
+impl Default for TailQ {
+    fn default() -> Self {
+        Self {
+            tail: 100,
+            level: None,
+            source: None,
+        }
+    }
+}
+
+/// The server must belong to the fleet; a terminated / deleted server still counts while its
+/// lines are stored (logs outlive the process).
+async fn owned_server(s: &AppState, fid: Uuid, sid: Uuid) -> Result<(), ApiError> {
+    match s.fleets.server(sid).await {
+        Ok(gs) if gs.fleet_id == fid => return Ok(()),
+        Ok(_) => return Err(Error::NotFound("game server".into()).into()),
+        Err(Error::NotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let stored: bool = sqlx::query_scalar(
+        "select exists(select 1 from musubi.server_logs where fleet_id = $1 and server_id = $2)",
+    )
+    .bind(fid)
+    .bind(sid)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    if !stored {
+        return Err(Error::NotFound("game server".into()).into());
+    }
+    Ok(())
+}
+
+fn line_event(l: &musubi_fleet::LogLine) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event("line")
+        .id(l.at.unix_timestamp_nanos().to_string())
+        .json_data(l)
+        .unwrap_or_default()
+}
+
+/// `GET /v1/server/fleets/{id}/servers/{sid}/logs/stream?tail&level&source` — follow a game
+/// server's log as SSE: the last `tail` stored lines oldest-first, then every new line as it is
+/// stored (`event: line`, JSON `LogLine`; `event: open` first). Keep-alive comments every 15 s;
+/// the stream stays open until the client goes away.
+async fn stream_logs(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, sid)): Path<(String, String)>,
+    Query(q): Query<TailQ>,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    ApiError,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt;
+    let (fid, sid) = (parse(&id)?, parse(&sid)?);
+    if !(1..=5000).contains(&q.tail) {
+        return Err(Error::InvalidArgument("tail must be 1..=5000".into()).into());
+    }
+    owned_server(&s, fid, sid).await?;
+    let rx = s.fleets.log_tap();
+    let mut history = s
+        .fleets
+        .logs(
+            fid,
+            sid,
+            &musubi_fleet::LogQuery {
+                level: q.level.clone(),
+                source: q.source.clone(),
+                q: None,
+                before: None,
+                after: None,
+                limit: q.tail,
+            },
+        )
+        .await?;
+    history.reverse();
+    let open = Event::default().event("open").json_data(json!({
+        "server_id": sid, "fleet_id": fid, "tail": history.len(), "live": true,
+    }));
+    let head = futures::stream::iter(
+        open.into_iter()
+            .chain(history.iter().map(line_event))
+            .map(Ok::<_, std::convert::Infallible>)
+            .collect::<Vec<_>>(),
+    );
+    let (level, source) = (q.level, q.source);
+    let live = futures::stream::unfold(rx, move |mut rx| {
+        let (level, source) = (level.clone(), source.clone());
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(l) => {
+                        if l.server_id != sid
+                            || level.as_deref().is_some_and(|v| v != l.level)
+                            || source.as_deref().is_some_and(|v| v != l.source)
+                        {
+                            continue;
+                        }
+                        return Some((Ok(line_event(&l)), rx));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }
+    });
+    Ok(Sse::new(head.chain(live))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))))
+}
+
+/// `GET /v1/server/fleets/{id}/servers/{sid}/logs/download?level&source&q&before&after&limit` —
+/// the stored lines as a plain-text file (`at level source message`, oldest first, up to 5000
+/// per call; page with `before`).
+async fn download_logs(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path((id, sid)): Path<(String, String)>,
+    Query(q): Query<LogsQ>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let (fid, sid) = (parse(&id)?, parse(&sid)?);
+    owned_server(&s, fid, sid).await?;
+    let mut filter = q.filter;
+    if filter.limit == 0 {
+        filter.limit = 5000;
+    }
+    let mut lines = s.fleets.logs(fid, sid, &filter).await?;
+    lines.reverse();
+    let mut out = String::with_capacity(lines.len() * 96);
+    for l in &lines {
+        let at =
+            l.at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+        out.push_str(&format!(
+            "{at} {:<5} {:<6} {}\n",
+            l.level, l.source, l.message
+        ));
+    }
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"server-{sid}.log\""),
+            ),
+            (
+                axum::http::HeaderName::from_static("x-musubi-log-lines"),
+                lines.len().to_string(),
+            ),
+        ],
+        out,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize, Default)]

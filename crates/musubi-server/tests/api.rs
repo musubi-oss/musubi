@@ -17728,8 +17728,130 @@ async fn game_server_logs_capture_filters_and_sdk_push() {
     .await;
     assert_eq!(st, StatusCode::OK, "{p}");
     assert_eq!(p["supported"], false, "local keeps nothing of its own: {p}");
+    // download as a text file, oldest first
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/v1/server/fleets/{fid}/servers/{sid}/logs/download"
+        ))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain"));
+    assert!(res.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .contains(&format!("server-{sid}.log")));
+    let n: usize = res.headers()["x-musubi-log-lines"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let text =
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert_eq!(text.lines().count(), n);
+    assert!(n >= 3, "{text}");
+    assert!(
+        text.contains("crash imminent") && text.contains("round started"),
+        "{text}"
+    );
+    let crash = text.find("crash imminent").unwrap();
+    let round = text.find("round started").unwrap();
+    assert!(crash < round, "oldest first: {text}");
+    // tail validation + follow: history first, then a live line pushed through the SDK
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/v1/server/fleets/{fid}/servers/{sid}/logs/stream?tail=0"
+        ))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/v1/server/fleets/{fid}/servers/{}/logs/stream",
+            uuid::Uuid::now_v7()
+        ))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/v1/server/fleets/{fid}/servers/{sid}/logs/stream?tail=2&source=sdk"
+        ))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let mut body = res.into_body().into_data_stream();
+    let mut got = String::new();
+    async fn read_until(got: &mut String, body: &mut axum::body::BodyDataStream, needle: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !got.contains(needle) {
+            let chunk = tokio::time::timeout_at(deadline, futures::StreamExt::next(body))
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {needle}; got: {got}"))
+                .expect("stream ended")
+                .unwrap();
+            got.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+    read_until(&mut got, &mut body, "round started").await;
+    assert!(got.contains("event: open"), "{got}");
+    assert!(got.contains("\"tail\":2"), "{got}");
+    assert!(got.contains("crash imminent"), "{got}");
+    assert!(!got.contains("HELLO"), "source filter: {got}");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/gameserver/logs")
+        .header("x-musubi-server-key", k)
+        .header("x-musubi-server-id", &sid)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"lines": [{"message": "live-line-42"}]}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    read_until(&mut got, &mut body, "live-line-42").await;
+    assert!(got.matches("event: line").count() >= 3, "{got}");
+    assert!(got.contains("event: line"));
     let (st, _) = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
     assert_eq!(st, StatusCode::OK);
+    // logs outlive the server: download still answers after the fleet is gone
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/v1/server/fleets/{fid}/servers/{sid}/logs/download?q=live-line"
+        ))
+        .header("x-musubi-server-key", k)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["x-musubi-log-lines"], "1");
 }
 
 /// Plan subscriptions (competitive P0-12): wallet-paid plan with trial, grace on an empty wallet,

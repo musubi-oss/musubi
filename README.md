@@ -751,6 +751,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 - **Egress accounting** — game servers report cumulative `bytes_out`/`bytes_in`; per-server totals and live rate, fleet rollup with cost (`spec.cost.egress_per_gb`).
 - **Rollout throttles** — `policy.max_pending` caps servers in `starting`, `creation_parallelism` / `deletion_parallelism` bound concurrent starts and terminations, `step_up` / `step_down` the per-pass batch.
 - **Developer players** — operator-flagged team accounts: enter maintenance mode, virtual audience `developers` for developer-only content, development-only actions in production (`[dev].environment`).
+- **Log follow / download** — `…/servers/{sid}/logs/stream` (SSE: `tail` history then live lines) and `…/logs/download` (plain-text file).
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

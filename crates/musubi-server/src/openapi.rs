@@ -1240,6 +1240,16 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ),
     (
         "GET",
+        "/v1/server/fleets/{id}/servers/{sid}/logs/stream",
+        "fleets",
+    ),
+    (
+        "GET",
+        "/v1/server/fleets/{id}/servers/{sid}/logs/download",
+        "fleets",
+    ),
+    (
+        "GET",
         "/v1/server/fleets/{id}/servers/{sid}/logs/archives",
         "fleets",
     ),
