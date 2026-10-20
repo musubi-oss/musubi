@@ -26,6 +26,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lobbies/{id}/team", post(team))
         .route("/v1/lobbies/{id}/heartbeat", post(heartbeat))
         .route("/v1/lobbies/{id}/start", post(start))
+        .route("/v1/server/lobbies/{id}/bulk", post(bulk))
 }
 
 async fn username(s: &AppState, me: &musubi_auth::Authenticated) -> Result<String, ApiError> {
@@ -253,4 +254,23 @@ async fn member_data(
             .set_member_data(me.account_id, &id, r.data)
             .await?,
     ))
+}
+
+/// `POST /v1/server/lobbies/{id}/bulk {lobby?, host_id?, add[], remove[], players{}, ignore_ineffectual_updates}`
+/// — the server mutates settings and roster in one transaction (UGS bulk update): either every
+/// operation lands or none does; with `ignore_ineffectual_updates` no-ops are reported in
+/// `result.skipped` instead of failing the call.
+async fn bulk(
+    State(s): State<AppState>,
+    _k: super::ServerKey,
+    Path(id): Path<String>,
+    Json(req): Json<crate::lobby::BulkUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    let mut names = std::collections::HashMap::new();
+    for a in &req.add {
+        let acc = s.accounts.get(a.account_id).await?;
+        names.insert(a.account_id, acc.username);
+    }
+    let (lobby, result) = s.lobbies.bulk_update(&id, req, &names).await?;
+    Ok(Json(json!({ "lobby": lobby, "result": result })))
 }

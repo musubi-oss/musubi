@@ -735,17 +735,14 @@ impl LobbyService {
     }
 
     /// Host-only settings change; shrinking below the current member count is rejected.
-    pub async fn update(&self, me: AccountId, id: &str, req: UpdateLobby) -> Result<Lobby> {
-        let id = parse_id(id)?;
-        let mut tx = self.db.begin().await.map_err(Error::internal)?;
-        let row = Self::lock(&mut tx, id).await?;
-        if AccountId(row.2) != me {
-            return Err(Error::PermissionDenied("only the host can update".into()));
-        }
-        if row.11 != "waiting" {
-            return Err(Error::Conflict("lobby already started".into()));
-        }
-        let members = Self::members_tx(&mut tx, id).await?;
+    /// Validates and writes a lobby patch inside `tx` (`members` = current roster).
+    async fn apply_update(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+        row: &LobbyRow,
+        members: &[Member],
+        req: &UpdateLobby,
+    ) -> Result<()> {
         let name = req.name.clone().unwrap_or(row.1.clone());
         validate_name(&name)?;
         let visibility = req.visibility.clone().unwrap_or(row.3.clone());
@@ -808,9 +805,24 @@ impl LobbyService {
         .bind(&metadata)
         .bind(&attributes)
         .bind(&private_attributes)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(Error::internal)?;
+        Ok(())
+    }
+
+    pub async fn update(&self, me: AccountId, id: &str, req: UpdateLobby) -> Result<Lobby> {
+        let id = parse_id(id)?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let row = Self::lock(&mut tx, id).await?;
+        if AccountId(row.2) != me {
+            return Err(Error::PermissionDenied("only the host can update".into()));
+        }
+        if row.11 != "waiting" {
+            return Err(Error::Conflict("lobby already started".into()));
+        }
+        let members = Self::members_tx(&mut tx, id).await?;
+        Self::apply_update(&mut tx, id, &row, &members, &req).await?;
         tx.commit().await.map_err(Error::internal)?;
         let to: Vec<AccountId> = members
             .iter()
@@ -961,6 +973,270 @@ impl LobbyService {
 }
 
 /// Attributes are a flat object of up to 32 string / number / bool values (keys `[A-Za-z0-9_.-]`).
+/// One-call roster + settings mutation for the server (UGS "bulk update" parity): everything
+/// applies in one transaction or nothing does.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct BulkUpdate {
+    pub lobby: Option<UpdateLobby>,
+    /// New host (must be a member after adds/removes).
+    pub host_id: Option<AccountId>,
+    /// Members to add: `[{account_id, team?, data?}]`.
+    pub add: Vec<BulkAdd>,
+    pub remove: Vec<AccountId>,
+    /// Per-member patches keyed by account id.
+    pub players: std::collections::HashMap<AccountId, BulkPlayer>,
+    /// Skip no-op operations (removing a non-member, adding a member, patching a non-member)
+    /// instead of failing the whole call.
+    pub ignore_ineffectual_updates: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct BulkAdd {
+    pub account_id: AccountId,
+    pub team: Option<i32>,
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct BulkPlayer {
+    pub team: Option<i32>,
+    pub ready: Option<bool>,
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BulkResult {
+    pub removed: Vec<AccountId>,
+    pub added: Vec<AccountId>,
+    pub updated: Vec<AccountId>,
+    pub skipped: Vec<Value>,
+    pub new_host: Option<AccountId>,
+}
+
+impl LobbyService {
+    /// Applies `req` atomically: removes, lobby settings, adds, member patches, host change,
+    /// then a final shape check (capacity / team sizes). `usernames` supplies display names
+    /// for added members.
+    pub async fn bulk_update(
+        &self,
+        id: &str,
+        req: BulkUpdate,
+        usernames: &std::collections::HashMap<AccountId, String>,
+    ) -> Result<(Lobby, BulkResult)> {
+        let id = parse_id(id)?;
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        let row = Self::lock(&mut tx, id).await?;
+        if row.11 != "waiting" {
+            return Err(Error::Conflict("lobby already started".into()));
+        }
+        let mut res = BulkResult::default();
+        let mut members = Self::members_tx(&mut tx, id).await?;
+        let before: Vec<AccountId> = members.iter().map(|m| m.account_id).collect();
+        let skip = |res: &mut BulkResult, who: AccountId, op: &str, why: &str| {
+            res.skipped
+                .push(json!({ "account_id": who, "op": op, "reason": why }));
+        };
+        for who in &req.remove {
+            if !members.iter().any(|m| m.account_id == *who) {
+                if req.ignore_ineffectual_updates {
+                    skip(&mut res, *who, "remove", "not a member");
+                    continue;
+                }
+                return Err(Error::NotFound(format!("{} is not a member", who.0)));
+            }
+            sqlx::query("delete from musubi.lobby_members where lobby_id = $1 and account_id = $2")
+                .bind(id)
+                .bind(who.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+            members.retain(|m| m.account_id != *who);
+            res.removed.push(*who);
+        }
+        let mut row = row;
+        if let Some(patch) = &req.lobby {
+            Self::apply_update(&mut tx, id, &row, &members, patch).await?;
+            row = Self::lock(&mut tx, id).await?;
+        }
+        for a in &req.add {
+            if members.iter().any(|m| m.account_id == a.account_id) {
+                if req.ignore_ineffectual_updates {
+                    skip(&mut res, a.account_id, "add", "already a member");
+                    continue;
+                }
+                return Err(Error::Conflict(format!(
+                    "{} is already in this lobby",
+                    a.account_id.0
+                )));
+            }
+            let elsewhere: Option<Uuid> = sqlx::query_scalar(
+                "select lobby_id from musubi.lobby_members where account_id = $1",
+            )
+            .bind(a.account_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            if elsewhere.is_some() {
+                return Err(Error::Conflict(format!(
+                    "{} is already in another lobby",
+                    a.account_id.0
+                )));
+            }
+            let team = match a.team {
+                Some(t) => {
+                    team_ok(t, row.7)?;
+                    t
+                }
+                None if row.7 > 0 => (0..row.7)
+                    .min_by_key(|t| members.iter().filter(|m| m.team == *t).count())
+                    .unwrap_or(0),
+                None => 0,
+            };
+            let data = match &a.data {
+                Some(d) if d.is_object() && d.to_string().len() <= 8192 => d.clone(),
+                Some(_) => {
+                    return Err(Error::InvalidArgument(
+                        "data must be an object up to 8 KiB".into(),
+                    ))
+                }
+                None => json!({}),
+            };
+            let username = usernames
+                .get(&a.account_id)
+                .cloned()
+                .unwrap_or_else(|| a.account_id.0.to_string());
+            sqlx::query(
+                "insert into musubi.lobby_members (lobby_id, account_id, username, team, data) values ($1, $2, $3, $4, $5)",
+            )
+            .bind(id)
+            .bind(a.account_id.0)
+            .bind(&username)
+            .bind(team)
+            .bind(&data)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
+                    Error::NotFound(format!("account {}", a.account_id.0))
+                }
+                e => Error::internal(e),
+            })?;
+            members.push(Member {
+                account_id: a.account_id,
+                username,
+                team,
+                ready: false,
+                joined_at: OffsetDateTime::now_utc().unix_timestamp(),
+                data,
+            });
+            res.added.push(a.account_id);
+        }
+        for (who, p) in &req.players {
+            let Some(m) = members.iter_mut().find(|m| m.account_id == *who) else {
+                if req.ignore_ineffectual_updates {
+                    skip(&mut res, *who, "update", "not a member");
+                    continue;
+                }
+                return Err(Error::NotFound(format!("{} is not a member", who.0)));
+            };
+            if let Some(t) = p.team {
+                team_ok(t, row.7)?;
+                m.team = t;
+            }
+            if let Some(r) = p.ready {
+                m.ready = r;
+            }
+            if let Some(d) = &p.data {
+                if !d.is_object() || d.to_string().len() > 8192 {
+                    return Err(Error::InvalidArgument(
+                        "data must be an object up to 8 KiB".into(),
+                    ));
+                }
+                m.data = d.clone();
+            }
+            sqlx::query(
+                "update musubi.lobby_members set team = $3, ready = $4, data = $5 where lobby_id = $1 and account_id = $2",
+            )
+            .bind(id)
+            .bind(who.0)
+            .bind(m.team)
+            .bind(m.ready)
+            .bind(&m.data)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            res.updated.push(*who);
+        }
+        // shape after everything
+        if members.len() as i32 > row.6 {
+            return Err(Error::Conflict("more members than max_members".into()));
+        }
+        if row.7 > 0 {
+            for t in 0..row.7 {
+                if members.iter().filter(|m| m.team == t).count() as i32 > row.8 {
+                    return Err(Error::Conflict(format!("team {t} would overflow")));
+                }
+            }
+        }
+        if members.is_empty() {
+            sqlx::query("delete from musubi.lobbies where id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+            tx.commit().await.map_err(Error::internal)?;
+            self.emit(&before, None, "closed", json!({ "lobby_id": id }))
+                .await;
+            return Err(Error::NotFound(
+                "lobby closed: no members left after the update".into(),
+            ));
+        }
+        let host = AccountId(row.2);
+        let new_host = match req.host_id {
+            Some(h) => {
+                if !members.iter().any(|m| m.account_id == h) {
+                    return Err(Error::InvalidArgument(
+                        "host_id must be a member after the update".into(),
+                    ));
+                }
+                (h != host).then_some(h)
+            }
+            None if !members.iter().any(|m| m.account_id == host) => Some(members[0].account_id),
+            None => None,
+        };
+        if let Some(h) = new_host {
+            sqlx::query("update musubi.lobbies set host_id = $2 where id = $1")
+                .bind(id)
+                .bind(h.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(Error::internal)?;
+            res.new_host = Some(h);
+        }
+        Self::touch(&mut tx, id).await?;
+        tx.commit().await.map_err(Error::internal)?;
+        let roster: Vec<AccountId> = members.iter().map(|m| m.account_id).collect();
+        self.emit(
+            &roster,
+            None,
+            "updated",
+            json!({ "lobby_id": id, "bulk": true, "added": res.added, "removed": res.removed,
+                "updated": res.updated, "new_host": res.new_host }),
+        )
+        .await;
+        if !res.removed.is_empty() {
+            self.emit(&res.removed, None, "kicked", json!({ "lobby_id": id }))
+                .await;
+        }
+        let viewer = res.new_host.unwrap_or(host);
+        let lobby = self.get(&id.to_string(), Some(viewer)).await?;
+        Ok((lobby, res))
+    }
+}
+
 pub fn validate_attrs(v: &Value, what: &str) -> Result<Value> {
     if v.is_null() {
         return Ok(json!({}));

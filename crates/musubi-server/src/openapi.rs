@@ -482,6 +482,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/v1/lobbies/{id}/team", "lobbies"),
     ("POST", "/v1/lobbies/{id}/heartbeat", "lobbies"),
     ("POST", "/v1/lobbies/{id}/start", "lobbies"),
+    ("POST", "/v1/server/lobbies/{id}/bulk", "lobbies"),
     ("POST", "/v1/channel/{id}/read", "chat"),
     (
         "GET",

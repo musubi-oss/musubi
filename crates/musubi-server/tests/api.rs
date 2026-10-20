@@ -38856,3 +38856,120 @@ async fn vip_tiers_from_spend_and_points_with_tier_up_rewards() {
     let (st, _) = call_server(&app, "GET", &path, k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn lobby_bulk_update_is_atomic_and_reports_skips() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (ta, a) = login(&app).await;
+    let (_tb, b) = login(&app).await;
+    let (_tc, c) = login(&app).await;
+    let (st, l) = call(
+        &app,
+        "POST",
+        "/v1/lobbies",
+        Some(&ta),
+        Some(json!({"name": "squad", "team_count": 2, "team_size": 2, "max_members": 4})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let id = l["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/server/lobbies/{id}/bulk");
+    // add B (team 1, data) + C, rename, mark A ready — one call
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({
+            "lobby": {"name": "renamed"},
+            "add": [{"account_id": b, "team": 1, "data": {"skin": "red"}}, {"account_id": c}],
+            "players": {a.clone(): {"ready": true}}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["lobby"]["name"], "renamed");
+    assert_eq!(v["lobby"]["member_count"], 3);
+    assert_eq!(v["result"]["added"].as_array().unwrap().len(), 2);
+    assert_eq!(v["result"]["updated"], json!([a]));
+    let members = v["lobby"]["members"].as_array().unwrap().clone();
+    let m = |id: &str| {
+        members
+            .iter()
+            .find(|m| m["account_id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(m(&b)["team"], 1);
+    assert_eq!(m(&b)["data"]["skin"], "red");
+    assert_eq!(m(&a)["ready"], true);
+    assert!(!m(&b)["username"].as_str().unwrap().is_empty());
+    // atomic: a valid remove plus an overflowing team patch → nothing changes
+    let (st, v) = call_server(&app, "POST", &path, k, Some(json!({
+        "players": {b.clone(): {"team": 0}, c.clone(): {"team": 0}}, "lobby": {"max_members": 2, "team_size": 1}
+    }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (_, l) = call(&app, "GET", &format!("/v1/lobbies/{id}"), Some(&ta), None).await;
+    assert_eq!(l["member_count"], 3, "rolled back: {l}");
+    assert_eq!(l["team_size"], 2);
+    // no-ops: strict → 404; with the flag → skipped and the rest applies
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({"remove": [uuid::Uuid::now_v7()]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({
+            "ignore_ineffectual_updates": true,
+            "remove": [c, uuid::Uuid::now_v7()], "add": [{"account_id": b}],
+            "players": {uuid::Uuid::now_v7().to_string(): {"ready": true}}, "host_id": b
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["removed"], json!([c]));
+    assert_eq!(v["result"]["skipped"].as_array().unwrap().len(), 3, "{v}");
+    assert_eq!(v["result"]["new_host"], b);
+    assert_eq!(v["lobby"]["host_id"], b);
+    assert_eq!(v["lobby"]["member_count"], 2);
+    // host_id must be a member; unknown account on add → 404; bad data → 400
+    let (st, _) = call_server(&app, "POST", &path, k, Some(json!({"host_id": c}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({"add": [{"account_id": uuid::Uuid::now_v7()}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &path,
+        k,
+        Some(json!({"players": {a.clone(): {"data": [1]}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // removing the host hands the lobby over; removing everyone closes it
+    let (st, v) = call_server(&app, "POST", &path, k, Some(json!({"remove": [b]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["new_host"], a);
+    let (st, _) = call_server(&app, "POST", &path, k, Some(json!({"remove": [a]}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", &format!("/v1/lobbies/{id}"), Some(&ta), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "POST", &path, Some(&ta), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
