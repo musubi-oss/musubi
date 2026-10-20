@@ -326,6 +326,19 @@ pub async fn prepare_spec(s: &AppState, spec: &mut FleetSpec) -> Result<()> {
             ));
         }
     }
+    if spec.verify_image {
+        let Some(image) = spec.image.clone() else {
+            return Err(Error::InvalidArgument(
+                "spec.verify_image needs spec.image".into(),
+            ));
+        };
+        let auth = spec.secret_env.get("REGISTRY_AUTH").cloned();
+        let digest =
+            crate::registry::verify_image(s.logins.http(), &image, auth.as_deref()).await?;
+        spec.image_digest = Some(digest);
+    } else {
+        spec.image_digest = None;
+    }
     let Some(a) = spec.artifact.clone() else {
         return Ok(());
     };

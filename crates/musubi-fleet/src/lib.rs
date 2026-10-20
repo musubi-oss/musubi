@@ -306,6 +306,14 @@ pub struct FleetSpec {
     /// Executable + args for the `local` provider (or image for container providers).
     pub command: Vec<String>,
     pub image: Option<String>,
+    /// Check at save time that `image` can be pulled: the registry's manifest is fetched
+    /// (anonymous or bearer-token auth; `secret_env.REGISTRY_AUTH = "user:password"` for private
+    /// registries) and its digest pinned into `image_digest`. A missing / unreachable image is a
+    /// 400 instead of a fleet that never comes up.
+    pub verify_image: bool,
+    /// Manifest digest resolved by `verify_image` (`sha256:…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
     pub env: HashMap<String, String>,
     /// Secret environment (P1): values are sealed with the `[security] master_keys` ring when
     /// the fleet/build is stored, shown as `***` by the API, and decrypted only on the node

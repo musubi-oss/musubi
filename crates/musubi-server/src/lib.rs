@@ -44,6 +44,7 @@ pub mod profile;
 pub mod push;
 pub mod realtime;
 pub mod regions;
+pub mod registry;
 pub mod retention;
 pub mod runtime_host;
 pub mod schedules;

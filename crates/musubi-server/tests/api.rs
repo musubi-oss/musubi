@@ -38973,3 +38973,138 @@ async fn lobby_bulk_update_is_atomic_and_reports_skips() {
     let (st, _) = call(&app, "POST", &path, Some(&ta), Some(json!({}))).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn fleet_verify_image_checks_registry_manifest_with_token_auth() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    // mock OCI registry: manifests need a bearer token from /token; `missing` does not exist
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits2 = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let realm = format!("http://127.0.0.1:{port}/token");
+    let realm2 = realm.clone();
+    let registry = Router::new()
+        .route(
+            "/token",
+            axum::routing::get(
+                |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    assert_eq!(q.get("service").map(String::as_str), Some("mock"));
+                    assert_eq!(q.get("scope").map(String::as_str), Some("repository:game/server:pull"));
+                    Json(json!({ "token": "t0k" }))
+                },
+            ),
+        )
+        .route(
+            "/v2/game/server/manifests/{reference}",
+            axum::routing::head(
+                move |axum::extract::Path(reference): axum::extract::Path<String>, headers: axum::http::HeaderMap| {
+                    let hits = hits2.clone();
+                    let realm = realm2.clone();
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer t0k") {
+                            return axum::response::Response::builder()
+                                .status(401)
+                                .header("www-authenticate", format!("Bearer realm=\"{realm}\",service=\"mock\",scope=\"repository:game/server:pull\""))
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                        }
+                        assert!(headers.get("accept").unwrap().to_str().unwrap().contains("oci.image.index"));
+                        if reference == "missing" {
+                            return axum::response::Response::builder().status(404).body(axum::body::Body::empty()).unwrap();
+                        }
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("docker-content-digest", "sha256:feedface")
+                            .body(axum::body::Body::empty())
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+    tokio::spawn(async move { axum::serve(listener, registry).await.unwrap() });
+    let fleet = |image: &str, verify: bool| {
+        json!({
+            "name": format!("img{}", &uuid::Uuid::now_v7().simple().to_string()[24..]), "provider": "docker",
+            "buffer": 0, "max_servers": 1, "port_start": 48000, "port_end": 48010,
+            "spec": {"image": image, "verify_image": verify, "secret_env": {"REGISTRY_AUTH": "bob:pw"}}
+        })
+    };
+    // pullable → fleet saved with the digest pinned
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(&format!("127.0.0.1:{port}/game/server:1.0"), true)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["spec"]["image_digest"], "sha256:feedface");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "anonymous try, then with token"
+    );
+    let fid = v["id"].as_str().unwrap().to_string();
+    // builds go through the same check
+    let (st, v) = call_server(&app, "POST", &format!("/v1/server/fleets/{fid}/builds"), k,
+        Some(json!({"version": "2", "spec": {"image": format!("127.0.0.1:{port}/game/server@sha256:feedface"), "verify_image": true}}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["spec"]["image_digest"], "sha256:feedface");
+    // missing tag → 400 with the image named; unknown repository → 400 (registry 404 path)
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(
+            &format!("127.0.0.1:{port}/game/server:missing"),
+            true,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("not found"), "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(&format!("127.0.0.1:{port}/other/thing:1"), true)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // verify without image → 400; unreachable registry → 503; verify off → no registry call, no digest
+    let (st, v) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+        "name": "noimg", "provider": "local", "buffer": 0, "max_servers": 1, "port_start": 48000, "port_end": 48010,
+        "spec": {"command": ["sleep", "1"], "verify_image": true}
+    }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet("127.0.0.1:1/game/server:1.0", true)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(fleet(
+            &format!("127.0.0.1:{port}/game/server:missing"),
+            false,
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["spec"].get("image_digest").is_none(), "{v}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before);
+}
