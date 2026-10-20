@@ -198,13 +198,20 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     );
     cluster = cluster.with_group(&cfg.node.cluster_group);
     cluster = cluster.with_data_dir(&cfg.node.data_dir)?;
+    cluster = cluster.with_mesh_net(&cfg.mesh_net).await?;
     if !cfg.node.bus_listen.is_empty() {
         let listen: std::net::SocketAddr = cfg
             .node
             .bus_listen
             .parse()
             .map_err(|_| musubi_core::Error::InvalidArgument("node.bus_listen".into()))?;
-        let adv = (!cfg.node.bus_advertise.is_empty()).then_some(cfg.node.bus_advertise.as_str());
+        let overlay = cluster
+            .mesh_net()
+            .filter(|m| m.settings.bind_bus)
+            .map(|m| m.overlay_addr(listen.port()).to_string());
+        let adv = overlay
+            .as_deref()
+            .or((!cfg.node.bus_advertise.is_empty()).then_some(cfg.node.bus_advertise.as_str()));
         cluster = cluster.with_bus(listen, adv)?;
         tracing::info!(addr = ?cluster.bus_addr(), "quic node bus enabled");
     }

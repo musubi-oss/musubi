@@ -40,6 +40,7 @@ pub struct Config {
     pub webrtc: WebRtcConfig,
     pub udp: UdpConfig,
     pub edge: EdgeConfig,
+    pub mesh_net: MeshNetConfig,
     pub zanshin: ZanshinConfig,
     pub analytics: AnalyticsConfig,
     pub aurix: AurixConfig,
@@ -786,6 +787,49 @@ impl Default for EdgeConfig {
             listen: None,
             public_addr: None,
             idle_secs: 60,
+        }
+    }
+}
+
+/// WireGuard-style private mesh between nodes (`[mesh_net]`): every node owns an x25519 key pair
+/// and an address in `subnet`, publishes key + endpoint in the node registry and derives its peer
+/// list from it, so hosts rented from different providers share one encrypted private network
+/// (bus, simulators, game servers) without public ports. The node renders the WireGuard
+/// configuration itself (`GET /v1/server/cluster/mesh_net/config`) and, with `apply = auto|wg`,
+/// keeps the kernel interface in sync when `wg`/`ip` are available.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MeshNetConfig {
+    pub enabled: bool,
+    /// IPv4 overlay subnet shared by the cluster group, e.g. `10.77.0.0/16`.
+    pub subnet: String,
+    /// WireGuard UDP port this node listens on.
+    pub listen_port: u16,
+    /// `host:port` peers dial for this node's WireGuard socket; empty = host of `http.listen`
+    /// when it is a routable address, otherwise this node only answers (peers must have one).
+    pub endpoint: String,
+    /// Kernel interface name.
+    pub interface: String,
+    /// `auto` = configure the interface when `wg` and `ip` are on PATH, `wg` = require them,
+    /// `none` = only publish/render (operators apply the rendered config themselves).
+    pub apply: String,
+    /// PersistentKeepalive seconds (0 = off); keeps NAT mappings alive between providers.
+    pub keepalive_secs: u16,
+    /// Advertise the QUIC node bus on the overlay address instead of `node.bus_advertise`.
+    pub bind_bus: bool,
+}
+
+impl Default for MeshNetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            subnet: "10.77.0.0/16".into(),
+            listen_port: 51820,
+            endpoint: String::new(),
+            interface: "musubi0".into(),
+            apply: "auto".into(),
+            keepalive_secs: 25,
+            bind_bus: false,
         }
     }
 }

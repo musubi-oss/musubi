@@ -22,7 +22,8 @@ jobs:
       # the 7 GB / 14 GB hosted runner was being shut down mid-link ("runner has received a
       # shutdown signal", exit 143) while building the test binaries: fewer parallel rustc jobs
       # and no debuginfo keep peak memory and target size down
-      CARGO_BUILD_JOBS: 2
+      # (still killed ~9 min into `cargo test` while compiling musubi-server with 2 jobs → 1)
+      CARGO_BUILD_JOBS: 1
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       # incremental artifacts double the target dir; the 14 GB runner disk ran out at link time

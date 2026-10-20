@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 pub mod log_store;
 pub mod raft;
 pub mod swim;
+pub mod wg;
 pub use raft::{DirectoryOp, DirectoryResp, RaftNodeId};
 pub use swim::{MemberUpdate, State};
 
@@ -55,6 +56,13 @@ pub struct NodeInfo {
     /// Independent clusters sharing one Postgres are separated by group.
     #[serde(default = "default_group")]
     pub group: String,
+    /// WireGuard mesh: public key, dialable endpoint and overlay address (empty = not meshed).
+    #[serde(default)]
+    pub wg_pubkey: String,
+    #[serde(default)]
+    pub wg_endpoint: String,
+    #[serde(default)]
+    pub wg_addr: String,
 }
 
 fn default_group() -> String {
@@ -73,6 +81,9 @@ type NodeRow = (
     String,
     String,
     i64,
+    String,
+    String,
+    String,
     String,
 );
 
@@ -114,6 +125,88 @@ pub struct Cluster {
     /// Set by `leave()`: stop heartbeating so the deleted row does not come back.
     left: Arc<AtomicBool>,
     pub(crate) member_tx: broadcast::Sender<MemberEvent>,
+    /// WireGuard mesh of this node (`[mesh_net]`), `None` = not meshed.
+    mesh: Option<Arc<MeshNet>>,
+}
+
+/// Live WireGuard mesh state of this node: its key, overlay address, the peer set last derived
+/// from the registry and what happened when it was applied to the kernel interface.
+pub struct MeshNet {
+    pub settings: wg::Settings,
+    ident: std::sync::Mutex<wg::Identity>,
+    key_path: std::path::PathBuf,
+    scratch: std::path::PathBuf,
+    pub address: std::net::Ipv4Addr,
+    peers: std::sync::Mutex<Vec<wg::Peer>>,
+    state: std::sync::Mutex<wg::ApplyState>,
+}
+
+/// Peers silent for longer than this drop out of the rendered config even before their row is
+/// reaped.
+const MESH_PEER_STALE: Duration = Duration::from_secs(600);
+const MESH_REFRESH: Duration = Duration::from_secs(10);
+
+impl MeshNet {
+    pub fn public_key(&self) -> String {
+        self.ident.lock().unwrap().public_b64()
+    }
+
+    pub fn peers(&self) -> Vec<wg::Peer> {
+        self.peers.lock().unwrap().clone()
+    }
+
+    pub fn state(&self) -> wg::ApplyState {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// `wg-quick` file (`quick`) or `wg setconf` input for the current peer set.
+    pub fn render(&self, quick: bool) -> String {
+        let peers = self.peers();
+        wg::render(
+            &self.ident.lock().unwrap(),
+            self.address,
+            &self.settings.subnet,
+            self.settings.listen_port,
+            self.settings.keepalive_secs,
+            &peers,
+            quick,
+        )
+    }
+
+    /// Overlay `host:port` for a service on this node.
+    pub fn overlay_addr(&self, port: u16) -> SocketAddr {
+        SocketAddr::from((self.address, port))
+    }
+
+    pub fn status(&self) -> serde_json::Value {
+        let st = self.state();
+        let peers = self.peers();
+        serde_json::json!({
+            "enabled": true,
+            "interface": self.settings.interface,
+            "address": self.address.to_string(),
+            "subnet": self.settings.subnet.to_string(),
+            "listen_port": self.settings.listen_port,
+            "endpoint": self.settings.endpoint,
+            "public_key": self.public_key(),
+            "apply": match self.settings.apply {
+                wg::ApplyMode::Auto => "auto",
+                wg::ApplyMode::Wg => "wg",
+                wg::ApplyMode::None => "none",
+            },
+            "keepalive_secs": self.settings.keepalive_secs,
+            "bind_bus": self.settings.bind_bus,
+            "applied": st.applied,
+            "tools_missing": st.tools_missing,
+            "last_error": st.last_error,
+            "applied_at": st.applied_at.map(|t| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default()),
+            "generation": st.generation,
+            "peers_hash": st.peers_hash,
+            "peer_count": peers.len(),
+            "alive_peers": peers.iter().filter(|p| p.alive).count(),
+            "peers": peers,
+        })
+    }
 }
 
 /// SWIM membership change: `state` is `alive` (new member), `suspect` or `dead`.
@@ -160,6 +253,9 @@ impl Cluster {
                 state: "alive".into(),
                 raft_id: 0,
                 group: default_group(),
+                wg_pubkey: String::new(),
+                wg_endpoint: String::new(),
+                wg_addr: String::new(),
             },
             bus_tx,
             peers: Arc::new(RwLock::new(Vec::new())),
@@ -177,7 +273,188 @@ impl Cluster {
             data_dir: None,
             left: Arc::new(AtomicBool::new(false)),
             member_tx: broadcast::channel(256).0,
+            mesh: None,
         }
+    }
+
+    /// Join the WireGuard mesh (`[mesh_net]`, after `with_data_dir`): load or create the key,
+    /// claim the sticky overlay address (lowest free in the subnet, kept across restarts in the
+    /// data dir) and publish key/endpoint/address so peers can configure us before we start.
+    pub async fn with_mesh_net(mut self, cfg: &musubi_core::config::MeshNetConfig) -> Result<Self> {
+        if !cfg.enabled {
+            return Ok(self);
+        }
+        let settings = wg::Settings::from_config(cfg, &self.me.advertise)?;
+        let dir = self.data_dir.clone().ok_or_else(|| {
+            Error::InvalidArgument("mesh_net needs node.data_dir (set with_data_dir first)".into())
+        })?;
+        let key_path = dir.join("wg_private_key");
+        let ident = wg::Identity::load_or_create(&key_path)?;
+        let addr_path = dir.join("wg_addr");
+        let mut preferred: Option<std::net::Ipv4Addr> = std::fs::read_to_string(&addr_path)
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        let pubkey = ident.public_b64();
+        let mut address = None;
+        for _ in 0..32 {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "select wg_addr from musubi.nodes where cluster_group = $1 and wg_addr <> '' and id <> $2",
+            )
+            .bind(&self.me.group)
+            .bind(self.me.id.0)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::internal)?;
+            let taken: std::collections::BTreeSet<std::net::Ipv4Addr> =
+                rows.into_iter().filter_map(|(a,)| a.parse().ok()).collect();
+            let Some(candidate) = wg::allocate(&settings.subnet, &taken, preferred) else {
+                return Err(Error::InvalidArgument(format!(
+                    "mesh_net.subnet {} has no free address",
+                    settings.subnet
+                )));
+            };
+            let claim = sqlx::query(
+                "insert into musubi.nodes (id, name, region, roles, version, advertise, cluster_group, wg_pubkey, wg_endpoint, wg_addr) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 on conflict (id) do update set wg_pubkey = excluded.wg_pubkey, wg_endpoint = excluded.wg_endpoint, wg_addr = excluded.wg_addr",
+            )
+            .bind(self.me.id.0)
+            .bind(&self.me.name)
+            .bind(&self.me.region)
+            .bind(&self.me.roles)
+            .bind(&self.me.version)
+            .bind(&self.me.advertise)
+            .bind(&self.me.group)
+            .bind(&pubkey)
+            .bind(&settings.endpoint)
+            .bind(candidate.to_string())
+            .execute(&self.db)
+            .await;
+            match claim {
+                Ok(_) => {
+                    address = Some(candidate);
+                    break;
+                }
+                Err(e)
+                    if e.as_database_error()
+                        .is_some_and(|d| d.is_unique_violation()) =>
+                {
+                    preferred = None;
+                }
+                Err(e) => return Err(Error::internal(e)),
+            }
+        }
+        let address = address.ok_or_else(|| {
+            Error::Internal("mesh_net: could not claim an overlay address".into())
+        })?;
+        let _ = std::fs::write(&addr_path, format!("{address}\n"));
+        self.me.wg_pubkey = pubkey;
+        self.me.wg_endpoint = settings.endpoint.clone();
+        self.me.wg_addr = address.to_string();
+        tracing::info!(address = %address, subnet = %settings.subnet, endpoint = %settings.endpoint, "wireguard mesh joined");
+        self.mesh = Some(Arc::new(MeshNet {
+            settings,
+            ident: std::sync::Mutex::new(ident),
+            key_path,
+            scratch: dir,
+            address,
+            peers: std::sync::Mutex::new(Vec::new()),
+            state: std::sync::Mutex::new(wg::ApplyState::default()),
+        }));
+        Ok(self)
+    }
+
+    pub fn mesh_net(&self) -> Option<&Arc<MeshNet>> {
+        self.mesh.as_ref()
+    }
+
+    /// Re-derive the peer set from the registry and, when it changed (or the last apply
+    /// failed), load it into the kernel interface.
+    pub async fn refresh_mesh(self: &Arc<Self>) -> Result<()> {
+        let Some(m) = &self.mesh else {
+            return Ok(());
+        };
+        let now = OffsetDateTime::now_utc();
+        let peers: Vec<wg::Peer> = self
+            .nodes()
+            .await?
+            .into_iter()
+            .filter(|n| {
+                n.id != self.me.id
+                    && !n.wg_addr.is_empty()
+                    && wg::valid_public_key(&n.wg_pubkey)
+                    && now - n.heartbeat_at < MESH_PEER_STALE
+            })
+            .map(|n| wg::Peer {
+                node: n.id.0,
+                name: n.name,
+                region: n.region,
+                public_key: n.wg_pubkey,
+                endpoint: n.wg_endpoint,
+                address: n.wg_addr,
+                alive: n.alive,
+            })
+            .collect();
+        let hash = wg::peers_hash(&peers, m.settings.keepalive_secs);
+        let (changed, retry) = {
+            let st = m.state.lock().unwrap();
+            (
+                st.peers_hash != hash,
+                st.last_error.is_some() || (st.generation == 0 && !st.applied && !st.tools_missing),
+            )
+        };
+        *m.peers.lock().unwrap() = peers;
+        if !changed && !retry {
+            return Ok(());
+        }
+        let conf = m.render(false);
+        let res = wg::apply(&m.settings, m.address, &conf, &m.scratch).await;
+        let mut st = m.state.lock().unwrap();
+        if changed || st.generation == 0 {
+            st.generation += 1;
+        }
+        st.peers_hash = hash;
+        match res {
+            Ok(true) => {
+                st.applied = true;
+                st.tools_missing = false;
+                st.last_error = None;
+                st.applied_at = Some(now);
+            }
+            Ok(false) => {
+                st.applied = false;
+                st.tools_missing = m.settings.apply == wg::ApplyMode::Auto;
+                st.last_error = None;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "wireguard apply failed");
+                st.applied = false;
+                st.tools_missing = false;
+                st.last_error = Some(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// New key pair: saved, published, and pushed to the interface on the next refresh (which
+    /// is forced). Peers pick the new key up from the registry within one refresh interval.
+    pub async fn rotate_mesh_key(self: &Arc<Self>) -> Result<String> {
+        let Some(m) = &self.mesh else {
+            return Err(Error::InvalidArgument("mesh_net is not enabled".into()));
+        };
+        let ident = wg::Identity::generate();
+        ident.save(&m.key_path)?;
+        let pubkey = ident.public_b64();
+        sqlx::query("update musubi.nodes set wg_pubkey = $2 where id = $1")
+            .bind(self.me.id.0)
+            .bind(&pubkey)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
+        *m.ident.lock().unwrap() = ident;
+        m.state.lock().unwrap().peers_hash.clear();
+        self.refresh_mesh().await?;
+        Ok(pubkey)
     }
 
     /// Membership scope: nodes only see, gossip with and replicate to their own group.
@@ -341,6 +618,29 @@ impl Cluster {
                 .await;
             }
         });
+        if self.mesh.is_some() {
+            // first peer set synchronously, so the interface is up before anything dials it
+            if let Err(e) = self.refresh_mesh().await {
+                tracing::warn!(error = %e, "wireguard mesh initial refresh failed");
+            }
+            let mesh = self.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(MESH_REFRESH);
+                let mut events = mesh.member_events();
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        ev = events.recv() => if ev.is_err() { tokio::time::sleep(MESH_REFRESH).await; }
+                    }
+                    if mesh.left.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Err(e) = mesh.refresh_mesh().await {
+                        tracing::warn!(error = %e, "wireguard mesh refresh failed");
+                    }
+                }
+            });
+        }
         let mut listener = PgListener::connect_with(&self.db)
             .await
             .map_err(Error::internal)?;
@@ -506,7 +806,7 @@ impl Cluster {
 
     pub async fn nodes(&self) -> Result<Vec<NodeInfo>> {
         let rows = sqlx::query_as::<_, NodeRow>(
-            "select id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group from musubi.nodes where cluster_group = $1 order by started_at",
+            "select id, name, region, roles, version, advertise, started_at, heartbeat_at, bus_addr, bus_cert, raft_id, cluster_group, wg_pubkey, wg_endpoint, wg_addr from musubi.nodes where cluster_group = $1 order by started_at",
         )
         .bind(&self.me.group)
         .fetch_all(&self.db)
@@ -540,6 +840,9 @@ impl Cluster {
                     state: state.into(),
                     raft_id: r.10 as u64,
                     group: r.11,
+                    wg_pubkey: r.12,
+                    wg_endpoint: r.13,
+                    wg_addr: r.14,
                 }
             })
             .collect())

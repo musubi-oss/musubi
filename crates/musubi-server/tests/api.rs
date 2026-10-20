@@ -42,7 +42,7 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
         runtime.clone(),
         &cfg.session,
     )));
-    let cluster = test_cluster(&db, &unique("grp")).await;
+    let cluster = test_cluster(&db, &unique("grp"), &cfg).await;
     let matchmaker = Arc::new(musubi_matchmaker::Matchmaker::default());
     let mmf = Arc::new(musubi_server::realtime::matchmaking::MmfClient::new());
     let parties = Arc::new(
@@ -1551,17 +1551,28 @@ async fn rpc_over_http_with_bearer_and_server_key() {
     assert!(l["rpcs"].as_array().unwrap().iter().any(|r| r == "echo"));
 }
 
-async fn test_cluster(db: &sqlx::PgPool, group: &str) -> Option<Arc<musubi_cluster::Cluster>> {
-    let c = Arc::new(
-        musubi_cluster::Cluster::new(
-            db.clone(),
-            "test-node",
-            "local",
-            vec!["all".into()],
-            "127.0.0.1:0",
-        )
-        .with_group(group),
-    );
+async fn test_cluster(
+    db: &sqlx::PgPool,
+    group: &str,
+    cfg: &Config,
+) -> Option<Arc<musubi_cluster::Cluster>> {
+    let mut c = musubi_cluster::Cluster::new(
+        db.clone(),
+        "test-node",
+        "local",
+        vec!["all".into()],
+        "127.0.0.1:0",
+    )
+    .with_group(group);
+    if cfg.mesh_net.enabled {
+        c = c
+            .with_data_dir(&cfg.node.data_dir)
+            .unwrap()
+            .with_mesh_net(&cfg.mesh_net)
+            .await
+            .unwrap();
+    }
+    let c = Arc::new(c);
     c.start().await.unwrap();
     Some(c)
 }
@@ -45726,4 +45737,367 @@ async fn fleet_wasm_scaler_decides_replicas_in_process() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+}
+
+async fn meshed_cluster(
+    db: &sqlx::PgPool,
+    group: &str,
+    name: &str,
+    advertise: &str,
+    dir: &std::path::Path,
+    cfg: &musubi_core::config::MeshNetConfig,
+) -> musubi_core::Result<Arc<musubi_cluster::Cluster>> {
+    let c = musubi_cluster::Cluster::new(db.clone(), name, "eu", vec!["all".into()], advertise)
+        .with_group(group)
+        .with_data_dir(dir)?
+        .with_mesh_net(cfg)
+        .await?;
+    let c = Arc::new(c);
+    c.start().await?;
+    Ok(c)
+}
+
+#[tokio::test]
+async fn cluster_mesh_net_allocates_addresses_publishes_keys_and_renders_peers() {
+    let Some(app) = app().await else {
+        return;
+    };
+    // a node without [mesh_net]
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/cluster/mesh_net",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["enabled"], false);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/server/cluster/mesh_net/config",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/cluster/mesh_net/rotate",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let root = std::env::temp_dir().join(unique("musubi-meshnet-"));
+    let mut cfg = musubi_core::config::MeshNetConfig {
+        enabled: true,
+        apply: "none".into(),
+        endpoint: "203.0.113.1:51820".into(),
+        ..Default::default()
+    };
+    // node a is the test server itself, meshed through its config
+    let mesh_cfg = cfg.clone();
+    let dir_a = root.join("a");
+    let Some((app_a, state)) = app_and_state_with(move |c| {
+        c.mesh_net = mesh_cfg;
+        c.node.data_dir = dir_a.to_string_lossy().to_string();
+    })
+    .await
+    else {
+        return;
+    };
+    // the app's 3-connection pool is for the app; extra nodes heartbeat on their own pool
+    let db = {
+        let dbcfg = musubi_core::config::DatabaseConfig {
+            url: std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap(),
+            max_connections: 8,
+            ..Default::default()
+        };
+        musubi_server::db::connect(&dbcfg).await.unwrap()
+    };
+    let a = state.cluster.clone().unwrap();
+    let group = a.me().group.clone();
+    // bad config is rejected up front
+    let bad = musubi_core::config::MeshNetConfig {
+        subnet: "10.77.0.0/31".into(),
+        ..cfg.clone()
+    };
+    assert!(
+        meshed_cluster(&db, &group, "bad", "0.0.0.0:1", &root.join("bad"), &bad)
+            .await
+            .is_err()
+    );
+
+    let mesh_a = a.mesh_net().unwrap().clone();
+    assert_eq!(mesh_a.address.to_string(), "10.77.0.1");
+    assert_eq!(a.me().wg_addr, "10.77.0.1");
+    assert_eq!(a.me().wg_pubkey.len(), 44);
+    assert_eq!(a.me().wg_endpoint, "203.0.113.1:51820");
+
+    let (st, v) = call_server(
+        &app_a,
+        "GET",
+        "/v1/server/cluster/mesh_net",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["address"], "10.77.0.1");
+    assert_eq!(v["subnet"], "10.77.0.0/16");
+    assert_eq!(v["interface"], "musubi0");
+    assert_eq!(v["listen_port"], 51820);
+    assert_eq!(v["endpoint"], "203.0.113.1:51820");
+    assert_eq!(v["apply"], "none");
+    assert_eq!(v["public_key"], a.me().wg_pubkey);
+    assert_eq!(v["applied"], false);
+    assert_eq!(v["tools_missing"], false);
+    assert_eq!(v["peer_count"], 0);
+    assert_eq!(
+        v["generation"], 1,
+        "initial (empty) peer set applied at start"
+    );
+    let pubkey_a = v["public_key"].as_str().unwrap().to_string();
+
+    let raw_conf = |app: Router, path: &'static str| async move {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("x-musubi-server-key", "defaultkey")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let ct = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, ct, String::from_utf8_lossy(&bytes).to_string())
+    };
+    let (st, ct, quick) = raw_conf(app_a.clone(), "/v1/server/cluster/mesh_net/config").await;
+    assert_eq!(st, StatusCode::OK, "{quick}");
+    assert!(ct.starts_with("text/plain"));
+    assert!(quick.starts_with("[Interface]\nPrivateKey = "));
+    assert!(quick.contains("Address = 10.77.0.1/16\n"));
+    assert!(quick.contains("ListenPort = 51820\n"));
+    assert!(!quick.contains("[Peer]"));
+    let (st, _, setconf) = raw_conf(
+        app_a.clone(),
+        "/v1/server/cluster/mesh_net/config?format=setconf",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!setconf.contains("Address ="));
+    let (st, _, _) = raw_conf(
+        app_a.clone(),
+        "/v1/server/cluster/mesh_net/config?format=yaml",
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // second node behind NAT (no routable advertise, no endpoint): next address, dials us
+    cfg.endpoint.clear();
+    let b = meshed_cluster(&db, &group, "node-b", "0.0.0.0:8080", &root.join("b"), &cfg)
+        .await
+        .unwrap();
+    assert_eq!(b.me().wg_addr, "10.77.0.2");
+    assert_eq!(b.me().wg_endpoint, "");
+    let (st, v) = call_server(
+        &app_a,
+        "POST",
+        "/v1/server/cluster/mesh_net/refresh",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["peer_count"], 1, "{v}");
+    assert_eq!(v["peers"][0]["name"], "node-b");
+    assert_eq!(v["peers"][0]["address"], "10.77.0.2");
+    assert_eq!(v["peers"][0]["endpoint"], "");
+    assert_eq!(v["peers"][0]["public_key"], b.me().wg_pubkey);
+    assert_eq!(v["peers"][0]["alive"], true);
+    assert_eq!(v["generation"], 2);
+    let (_, _, quick) = raw_conf(app_a.clone(), "/v1/server/cluster/mesh_net/config").await;
+    assert!(quick.contains("[Peer]\n# node-b (eu)"));
+    assert!(quick.contains("AllowedIPs = 10.77.0.2/32\n"));
+    assert!(quick.contains("PersistentKeepalive = 25\n"));
+    assert!(!quick.contains("Endpoint ="), "{quick}");
+    // b sees a with a's endpoint
+    b.refresh_mesh().await.unwrap();
+    let conf_b = b.mesh_net().unwrap().render(true);
+    assert!(conf_b.contains("Address = 10.77.0.2/16"));
+    assert!(
+        conf_b.contains("Endpoint = 203.0.113.1:51820\n"),
+        "{conf_b}"
+    );
+    assert!(conf_b.contains(&format!("PublicKey = {pubkey_a}\n")));
+
+    // a node from another provider registered directly (as its own process would), then stale
+    let c_id = musubi_core::NodeId::new().0;
+    let c_key = musubi_cluster::wg::Identity::generate().public_b64();
+    sqlx::query(
+        "insert into musubi.nodes (id, name, region, cluster_group, wg_pubkey, wg_endpoint, wg_addr) values ($1, 'node-c', 'us', $2, $3, '198.51.100.3:51820', '10.77.0.3')",
+    )
+    .bind(c_id)
+    .bind(&group)
+    .bind(&c_key)
+    .execute(&db)
+    .await
+    .unwrap();
+    let (st, v) = call_server(
+        &app_a,
+        "POST",
+        "/v1/server/cluster/mesh_net/refresh",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["peer_count"], 2, "{v}");
+    assert_eq!(v["generation"], 3);
+    let (_, _, quick) = raw_conf(app_a.clone(), "/v1/server/cluster/mesh_net/config").await;
+    assert!(quick.contains("Endpoint = 198.51.100.3:51820\n"));
+    let p_b = quick.find("# node-b").unwrap();
+    let p_c = quick.find("# node-c").unwrap();
+    assert!(p_b < p_c, "sorted by address");
+    // unchanged registry → same generation
+    let (_, v) = call_server(
+        &app_a,
+        "POST",
+        "/v1/server/cluster/mesh_net/refresh",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(v["generation"], 3);
+    // a silent node drops out of the config before its row is reaped
+    sqlx::query(
+        "update musubi.nodes set heartbeat_at = now() - interval '20 minutes' where id = $1",
+    )
+    .bind(c_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let (_, v) = call_server(
+        &app_a,
+        "POST",
+        "/v1/server/cluster/mesh_net/refresh",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(v["peer_count"], 1, "{v}");
+    assert_eq!(v["generation"], 4);
+    // a bogus key never reaches the kernel config
+    sqlx::query(
+        "update musubi.nodes set heartbeat_at = now(), wg_pubkey = 'garbage' where id = $1",
+    )
+    .bind(c_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let (_, v) = call_server(
+        &app_a,
+        "POST",
+        "/v1/server/cluster/mesh_net/refresh",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(v["peer_count"], 1, "{v}");
+
+    // rotation: new key published, peers pick it up, config re-rendered
+    let (st, v) = call_server(
+        &app_a,
+        "POST",
+        "/v1/server/cluster/mesh_net/rotate",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rotated"], true);
+    let new_key = v["public_key"].as_str().unwrap().to_string();
+    assert_ne!(new_key, pubkey_a);
+    assert_eq!(new_key.len(), 44);
+    let (_, v) = call_server(
+        &app_a,
+        "GET",
+        "/v1/server/cluster/mesh_net",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(v["public_key"], new_key);
+    let (row,): (String,) = sqlx::query_as("select wg_pubkey from musubi.nodes where id = $1")
+        .bind(a.node_id().0)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(row, new_key);
+    b.refresh_mesh().await.unwrap();
+    let conf_b = b.mesh_net().unwrap().render(true);
+    assert!(conf_b.contains(&format!("PublicKey = {new_key}\n")));
+    assert!(!conf_b.contains(&pubkey_a));
+
+    // restart with the same data dir: same node id, same key, same address
+    a.leave().await;
+    drop(a);
+    let a2 = meshed_cluster(
+        &db,
+        &group,
+        "test-node",
+        "203.0.113.1:8080",
+        &root.join("a"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+    assert_eq!(a2.me().wg_addr, "10.77.0.1");
+    assert_eq!(a2.me().wg_pubkey, new_key);
+
+    // exhaustion: /30 has two hosts
+    let tiny = musubi_core::config::MeshNetConfig {
+        subnet: "192.168.9.0/30".into(),
+        ..cfg.clone()
+    };
+    let tgroup = unique("meshtiny");
+    let t1 = meshed_cluster(&db, &tgroup, "t1", "0.0.0.0:1", &root.join("t1"), &tiny)
+        .await
+        .unwrap();
+    let t2 = meshed_cluster(&db, &tgroup, "t2", "0.0.0.0:1", &root.join("t2"), &tiny)
+        .await
+        .unwrap();
+    assert_eq!(t1.me().wg_addr, "192.168.9.1");
+    assert_eq!(t2.me().wg_addr, "192.168.9.2");
+    let err = meshed_cluster(&db, &tgroup, "t3", "0.0.0.0:1", &root.join("t3"), &tiny)
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("no free address"), "{err}");
+
+    // mesh needs a data dir for the key
+    let err = musubi_cluster::Cluster::new(db.clone(), "nodir", "eu", vec![], "0.0.0.0:1")
+        .with_group(&group)
+        .with_mesh_net(&cfg)
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("data_dir"), "{err}");
+
+    let (st, _) = call(&app_a, "GET", "/v1/server/cluster/mesh_net", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    for c in [b, a2, t1, t2] {
+        c.leave().await;
+    }
+    let _ = std::fs::remove_dir_all(root);
 }

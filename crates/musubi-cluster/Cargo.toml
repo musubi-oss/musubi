@@ -24,3 +24,6 @@ openraft.workspace = true
 sha2.workspace = true
 metrics = "0.24.6"
 redb = "2"
+base64.workspace = true
+rand.workspace = true
+x25519-dalek.workspace = true
