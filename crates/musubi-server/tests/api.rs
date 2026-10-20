@@ -26655,6 +26655,55 @@ async fn crash_reports_grouping_triage_and_player_timeline() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // custom incident kinds: `custom.<name>`, plus built-in connection / exception
+    for bad in [
+        "custom.",
+        "custom.Bad!",
+        "custom.averyveryveryveryverylongincidentname",
+    ] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/telemetry/crash",
+            Some(&ta),
+            Some(json!({"kind": bad, "message": "x"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let custom_msg = unique("desync_at_tick").replace([' ', ':'], "_");
+    for kind in ["custom.desync", "connection"] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/telemetry/crash",
+            Some(&ta),
+            Some(json!({"kind": kind, "message": custom_msg, "app_version": "1.0.0"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{kind}: {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/crashes?kind=custom.desync&q={custom_msg}"),
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let groups = v["groups"].as_array().cloned().unwrap_or_default();
+    assert_eq!(groups.len(), 1, "{v}");
+    assert_eq!(groups[0]["kind"], "custom.desync");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/server/crashes?kind=custom.Bad",
+        "defaultkey",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 
     // fingerprints are deterministic and the test database persists across runs: salt the stacks
     let salt: String = unique("fp")
@@ -27003,7 +27052,16 @@ async fn crash_reports_grouping_triage_and_player_timeline() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(v["reports"].as_array().unwrap().len(), 1);
+    // the crash plus the two custom incidents reported above
+    assert_eq!(v["reports"].as_array().unwrap().len(), 3, "{v}");
+    let mut seen: Vec<&str> = v["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap())
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, vec!["connection", "crash", "custom.desync"], "{v}");
     let (st, v) = call_server(
         &app,
         "POST",
@@ -27142,7 +27200,8 @@ async fn crash_reports_grouping_triage_and_player_timeline() {
         .unwrap()
         .iter()
         .all(|i| i["source"] == "notes" || i["source"] == "crashes"));
-    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    // one note + three incident reports (crash, custom.desync, connection)
+    assert_eq!(v["items"].as_array().unwrap().len(), 4, "{v}");
     let (_, v) = call_server(
         &app,
         "GET",

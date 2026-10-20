@@ -760,6 +760,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 - **UGC dependencies & collections** — dependency graph with transitive resolution, `collection` items with ordered children, `subscribe?include_dependencies` installs a whole pack.
 - **Sweepstakes / raffles** — paid entries, per-player cap, seeded reproducible weighted draw, prize + consolation reward tables, cancel-with-refund, auto-draw at `ends_at`.
 - **Fleet aliases** — stable allocation names (`alias:prod`) routed to a fleet/pool or retired with a message, swap fleets without touching clients.
+- **Custom incident kinds** — crash reports accept `connection`, `exception` and game-defined `custom.<name>` incidents, grouped and filtered like crashes.
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

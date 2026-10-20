@@ -35,7 +35,25 @@ const MAX_TAGS: usize = 32;
 const MAX_CUSTOM_BYTES: usize = 16 * 1024;
 const MAX_FINGERPRINT: usize = 128;
 const MAX_FIELD: usize = 128;
-pub const KINDS: [&str; 3] = ["crash", "error", "hang"];
+/// Built-in incident kinds; games add their own as `custom.<name>` (`[a-z0-9_-]`, ≤ 32) —
+/// Metaplay-style custom incident reports (desyncs, asset-load failures, cheat suspicions…).
+pub const KINDS: [&str; 5] = ["crash", "error", "hang", "connection", "exception"];
+pub const CUSTOM_PREFIX: &str = "custom.";
+
+pub fn valid_kind(k: &str) -> bool {
+    if KINDS.contains(&k) {
+        return true;
+    }
+    match k.strip_prefix(CUSTOM_PREFIX) {
+        Some(n) => {
+            !n.is_empty()
+                && n.len() <= 32
+                && n.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        }
+        None => false,
+    }
+}
 pub const STATUSES: [&str; 4] = ["open", "resolved", "ignored", "regressed"];
 
 pub fn routes() -> Router<AppState> {
@@ -269,9 +287,9 @@ async fn store(
 ) -> Result<Value> {
     let cfg = &s.analytics.cfg;
     let kind = r.kind.trim().to_ascii_lowercase();
-    if !KINDS.contains(&kind.as_str()) {
+    if !valid_kind(&kind) {
         return Err(Error::InvalidArgument(format!(
-            "kind must be one of {}",
+            "kind must be one of {} or custom.<name> ([a-z0-9_-], ≤ 32)",
             KINDS.join("|")
         )));
     }
@@ -627,7 +645,7 @@ async fn list_groups_rows(db: &PgPool, q: &ListQ) -> Result<Vec<GroupRow>> {
         }
     };
     if let Some(k) = q.kind.as_deref() {
-        if !KINDS.contains(&k) {
+        if !valid_kind(k) {
             return Err(Error::InvalidArgument("kind".into()));
         }
     }
