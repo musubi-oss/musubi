@@ -46,6 +46,7 @@ pub mod game_sessions;
 pub mod group_challenges;
 mod group_pools;
 mod groups;
+pub mod inspect;
 pub mod installs;
 mod integrations;
 pub mod items_lifecycle;
@@ -244,6 +245,7 @@ pub fn router(state: AppState) -> Router {
         .merge(tutorials::router())
         .merge(referrals::router())
         .merge(data_rights::router())
+        .merge(inspect::router())
         .merge(session_vars::router())
         .merge(qa_clock::router())
         .merge(countries::router())

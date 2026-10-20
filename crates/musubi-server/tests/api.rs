@@ -43524,3 +43524,203 @@ async fn data_rights_queue_export_erase_and_poll() {
     let (st, _) = call(&app, "GET", "/v1/account/data_rights", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Inspect links (Steamworks InspectItem parity): the owner mints a public token for an inventory
+/// entry, anyone opens it without a session, links expire / revoke / die with the item.
+#[tokio::test]
+async fn inventory_inspect_links_public_view_revoke_and_expiry() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let skin = unique("skin");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(
+            json!({"id": skin, "name": "Dragon Lore", "category": "skin", "stackable": false,
+            "properties": {"rarity": "legendary"}}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let hidden = unique("hid");
+    let (st, _) = call_server(&app, "POST", "/v1/server/items", k,
+        Some(json!({"id": hidden, "name": "Secret", "category": "key", "properties": {"inspectable": false}}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("insp")})),
+    )
+    .await;
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    for item in [&skin, &hidden] {
+        let (st, v) = call_server(&app, "POST", "/v1/server/inventory/grant", k,
+            Some(json!({"account_id": me, "item_id": item, "quantity": 1, "instance": {"float": 0.01}}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    let entries = inv["items"]
+        .as_array()
+        .or_else(|| inv["inventory"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let find = |id: &str| {
+        entries
+            .iter()
+            .find(|e| e["item_id"] == id)
+            .and_then(|e| e["id"].as_str())
+            .map(str::to_string)
+    };
+    let (skin_inv, hidden_inv) = (
+        find(&skin).unwrap_or_else(|| panic!("{inv}")),
+        find(&hidden).unwrap(),
+    );
+
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/inventory/{skin_inv}/share"),
+        Some(&tok),
+        Some(json!({"ttl_secs": 10})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/inventory/{hidden_inv}/share"),
+        Some(&tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/inventory/{}/share", uuid::Uuid::now_v7()),
+        Some(&tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/inventory/{skin_inv}/share"),
+        Some(&tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let token = v["token"].as_str().unwrap().to_string();
+    assert_eq!(v["path"], format!("/v1/inspect/{token}"));
+    assert!(v["expires_at"].is_null());
+    let (_, v2) = call(
+        &app,
+        "POST",
+        &format!("/v1/inventory/{skin_inv}/share"),
+        Some(&tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(v2["token"], token, "live link is reused");
+    // public view, no session
+    let (st, p) = call(&app, "GET", &format!("/v1/inspect/{token}"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    assert_eq!(p["item"]["id"], skin);
+    assert_eq!(p["item"]["properties"]["rarity"], "legendary");
+    assert_eq!(p["instance"]["float"], 0.01);
+    assert_eq!(p["owner"]["account_id"], me);
+    assert_eq!(p["views"], 1);
+    let (_, p) = call(&app, "GET", &format!("/v1/inspect/{token}"), None, None).await;
+    assert_eq!(p["views"], 2);
+    let (st, _) = call(&app, "GET", "/v1/inspect/nope", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, l) = call(&app, "GET", "/v1/inventory/shares", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(l["shares"][0]["token"], token);
+    assert_eq!(l["shares"][0]["views"], 2);
+    // another player cannot revoke; owner revokes → 404 public, 404 on second revoke
+    let (_, o) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("insp2")})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/inventory/{skin_inv}/share"),
+        Some(o["access_token"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/inventory/{skin_inv}/share"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["revoked"], 1);
+    let (st, _) = call(&app, "GET", &format!("/v1/inspect/{token}"), None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/inventory/{skin_inv}/share"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // a new link with expiry; expiry shows in the public card
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/inventory/{skin_inv}/share"),
+        Some(&tok),
+        Some(json!({"ttl_secs": 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["expires_at"].is_string());
+    assert_ne!(v["token"], token);
+    let t2 = v["token"].as_str().unwrap().to_string();
+    let (st, p) = call(&app, "GET", &format!("/v1/inspect/{t2}"), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(p["expires_at"].is_string());
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=inventory.shared,inventory.share_revoked&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for kind in ["inventory.shared", "inventory.share_revoked"] {
+        assert!(
+            ev["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| (e["code"] == kind || e["kind"] == kind)
+                    && (e["payload"]["inventory_id"] == skin_inv
+                        || e["data"]["inventory_id"] == skin_inv)),
+            "{kind} missing"
+        );
+    }
+    let (st, _) = call(&app, "GET", "/v1/inventory/shares", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
