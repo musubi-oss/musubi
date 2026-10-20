@@ -50,8 +50,10 @@ impl Default for ClaimsMap {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderInput {
-    /// `oidc` (id_token verified against JWKS, discovery from `issuer`) or `oauth2` (plain access
-    /// token + `userinfo_url`).
+    /// `oidc` (id_token verified against JWKS, discovery from `issuer`), `oauth2` (plain access
+    /// token + `userinfo_url`) or `openid2` (OpenID 2.0 relying party — Steam's browser login:
+    /// `authorize_url` defaults to `https://steamcommunity.com/openid/login`, `claims.subject`
+    /// `steam_id` maps the identity onto the `steam` provider, `claimed_id` keeps it generic).
     pub kind: String,
     pub display_name: String,
     pub enabled: bool,
@@ -253,6 +255,22 @@ pub struct AuthProviderService {
     discovery: Mutex<HashMap<String, (Instant, Value)>>,
 }
 
+pub const STEAM_OPENID_ENDPOINT: &str = "https://steamcommunity.com/openid/login";
+const OPENID2_NS: &str = "http://specs.openid.net/auth/2.0";
+const OPENID2_IDENTIFIER_SELECT: &str = "http://specs.openid.net/auth/2.0/identifier_select";
+
+/// `scheme://host[:port]` of an absolute URL (OpenID realm / claimed_id origin checks).
+fn origin(url: &str) -> Result<String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| Error::InvalidArgument(format!("`{url}` is not an absolute URL")))?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(Error::InvalidArgument(format!("`{url}` has no host")));
+    }
+    Ok(format!("{scheme}://{host}"))
+}
+
 pub fn valid_name(name: &str) -> bool {
     crate::logins::valid_oidc_name(name)
 }
@@ -361,8 +379,10 @@ fn validate(name: &str, p: &ProviderInput) -> Result<()> {
             "provider name: 1..=32 of [a-z0-9_-]".into(),
         ));
     }
-    if p.kind != "oidc" && p.kind != "oauth2" {
-        return Err(Error::InvalidArgument("kind must be oidc or oauth2".into()));
+    if p.kind != "oidc" && p.kind != "oauth2" && p.kind != "openid2" {
+        return Err(Error::InvalidArgument(
+            "kind must be oidc, oauth2 or openid2".into(),
+        ));
     }
     if p.client_id.trim().is_empty() || p.client_id.len() > 512 {
         return Err(Error::InvalidArgument("client_id is required".into()));
@@ -391,6 +411,17 @@ fn validate(name: &str, p: &ProviderInput) -> Result<()> {
         {
             return Err(Error::InvalidArgument(
                 "oidc: set issuer (discovery) or authorize_url + token_url + jwks_url".into(),
+            ));
+        }
+    } else if p.kind == "openid2" {
+        if p.claims.subject != "steam_id" && p.claims.subject != "claimed_id" {
+            return Err(Error::InvalidArgument(
+                "openid2: claims.subject must be steam_id or claimed_id".into(),
+            ));
+        }
+        if p.authorize_url.is_empty() {
+            return Err(Error::InvalidArgument(
+                "openid2: authorize_url (the OP endpoint) is required".into(),
             ));
         }
     } else if p.authorize_url.is_empty() || p.token_url.is_empty() || p.userinfo_url.is_empty() {
@@ -468,7 +499,19 @@ impl AuthProviderService {
         Ok(p)
     }
 
-    pub async fn put(&self, name: &str, p: ProviderInput) -> Result<Provider> {
+    pub async fn put(&self, name: &str, mut p: ProviderInput) -> Result<Provider> {
+        if p.kind == "openid2" {
+            if p.authorize_url.is_empty() {
+                p.authorize_url = STEAM_OPENID_ENDPOINT.into();
+            }
+            if p.claims.subject == "sub" {
+                p.claims.subject = "steam_id".into();
+            }
+            if p.client_id.is_empty() {
+                p.client_id = "openid2".into();
+            }
+            p.pkce = false;
+        }
         validate(name, &p)?;
         let secret = match &p.client_secret {
             Some(s) => s.clone(),
@@ -548,9 +591,10 @@ impl AuthProviderService {
             userinfo_url: p.userinfo_url.clone(),
             jwks_url: p.jwks_url.clone(),
         };
-        let needs = e.authorize_url.is_empty()
-            || e.token_url.is_empty()
-            || (p.kind == "oidc" && e.jwks_url.is_empty());
+        let needs = p.kind != "openid2"
+            && (e.authorize_url.is_empty()
+                || e.token_url.is_empty()
+                || (p.kind == "oidc" && e.jwks_url.is_empty()));
         if needs {
             if p.issuer.is_empty() {
                 return Err(Error::InvalidArgument(format!(
@@ -643,6 +687,33 @@ impl AuthProviderService {
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
+        if p.kind == "openid2" {
+            let return_to = format!(
+                "{callback}{}state={}",
+                if callback.contains('?') { '&' } else { '?' },
+                enc(&state)
+            );
+            let sep = if eps.authorize_url.contains('?') {
+                '&'
+            } else {
+                '?'
+            };
+            let url = format!(
+                "{}{sep}openid.ns={}&openid.mode=checkid_setup&openid.return_to={}&openid.realm={}&openid.identity={}&openid.claimed_id={}",
+                eps.authorize_url,
+                enc(OPENID2_NS),
+                enc(&return_to),
+                enc(&origin(&callback)?),
+                enc(OPENID2_IDENTIFIER_SELECT),
+                enc(OPENID2_IDENTIFIER_SELECT),
+            );
+            return Ok(Started {
+                url,
+                state,
+                nonce,
+                expires_in: FLOW_TTL_SECS,
+            });
+        }
         let mut scopes: Vec<String> = Vec::new();
         if p.kind == "oidc" {
             scopes.push("openid".into());
@@ -680,6 +751,117 @@ impl AuthProviderService {
             nonce,
             expires_in: FLOW_TTL_SECS,
         })
+    }
+
+    /// OpenID 2.0 positive assertion (the `openid.*` query the OP appended to `return_to`) →
+    /// verified identity: mode/ns/return_to/op_endpoint/claimed_id checks, signed-field coverage,
+    /// then `check_authentication` at the OP (stateless mode — no association needed).
+    pub async fn verify_openid2(
+        &self,
+        social: &Social,
+        p: &Provider,
+        eps: &Endpoints,
+        flow: &Flow,
+        params: &HashMap<String, String>,
+    ) -> Result<External> {
+        let get = |k: &str| params.get(k).map(String::as_str).unwrap_or("");
+        let refused = |what: &str| Error::Unauthenticated(format!("openid: {what}"));
+        match get("openid.mode") {
+            "id_res" => {}
+            "cancel" => return Err(refused("the user cancelled at the provider")),
+            m => return Err(refused(&format!("unexpected mode `{m}`"))),
+        }
+        if get("openid.ns") != OPENID2_NS {
+            return Err(refused("not an OpenID 2.0 response"));
+        }
+        let return_to = get("openid.return_to");
+        if !return_to.starts_with(flow.callback_url.as_str())
+            || !return_to.contains(&format!("state={}", flow.state))
+        {
+            return Err(refused("return_to does not match this flow"));
+        }
+        if get("openid.op_endpoint") != eps.authorize_url {
+            return Err(refused("op_endpoint is not this provider"));
+        }
+        let claimed = get("openid.claimed_id");
+        if claimed.is_empty() || claimed != get("openid.identity") {
+            return Err(refused("claimed_id/identity mismatch"));
+        }
+        if !claimed.starts_with(&origin(&eps.authorize_url)?) {
+            return Err(refused("claimed_id belongs to another provider"));
+        }
+        let signed: Vec<&str> = get("openid.signed").split(',').collect();
+        for f in [
+            "op_endpoint",
+            "return_to",
+            "response_nonce",
+            "assoc_handle",
+            "claimed_id",
+            "identity",
+        ] {
+            if !signed.contains(&f) {
+                return Err(refused(&format!("field `{f}` is not signed")));
+            }
+        }
+        if get("openid.sig").is_empty() {
+            return Err(refused("missing signature"));
+        }
+        let form: Vec<(String, String)> = params
+            .iter()
+            .filter(|(k, _)| k.starts_with("openid."))
+            .map(|(k, v)| {
+                if k == "openid.mode" {
+                    (k.clone(), "check_authentication".to_string())
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect();
+        let body = social
+            .http()
+            .post(&eps.authorize_url)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| Error::Unavailable(format!("openid check_authentication: {e}")))?
+            .error_for_status()
+            .map_err(|e| Error::Unavailable(format!("openid check_authentication: {e}")))?
+            .text()
+            .await
+            .map_err(|e| Error::Unavailable(format!("openid check_authentication: {e}")))?;
+        if !body.lines().any(|l| l.trim() == "is_valid:true") {
+            return Err(refused("assertion rejected by the provider"));
+        }
+        let subject = if p.claims.subject == "steam_id" {
+            claimed
+                .rsplit('/')
+                .next()
+                .filter(|id| id.len() == 17 && id.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| refused("claimed_id is not a SteamID64"))?
+                .to_string()
+        } else {
+            claimed.to_string()
+        };
+        let mut ext = External {
+            subject,
+            email: None,
+            email_verified: false,
+            display_name: None,
+            avatar_url: None,
+            username: None,
+            claims: json!({
+                "claimed_id": claimed,
+                "op_endpoint": get("openid.op_endpoint"),
+                "response_nonce": get("openid.response_nonce"),
+            }),
+        };
+        if p.claims.subject == "steam_id" {
+            if let Some((name, avatar)) = social.steam_persona(&ext.subject).await {
+                ext.display_name = Some(name);
+                ext.avatar_url = avatar;
+            }
+        }
+        Ok(ext)
     }
 
     /// Consumes the flow (single use); 400 when unknown, expired or for another provider.

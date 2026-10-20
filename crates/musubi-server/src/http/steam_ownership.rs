@@ -4,7 +4,7 @@
 //! (`metadata.ownership`) and reused for `[social.steam] ownership_cache_secs`.
 
 use axum::extract::{Path, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error, Result};
 use serde_json::{json, Value};
@@ -15,7 +15,9 @@ use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/v1/admin/accounts/{id}/steam", get(account_steam))
+    Router::new()
+        .route("/v1/admin/accounts/{id}/steam", get(account_steam))
+        .route("/v1/server/steam/app_ticket", post(verify_app_ticket))
 }
 
 const STEAM: &str = musubi_auth::provider::STEAM;
@@ -197,4 +199,32 @@ async fn account_steam(
         },
         "identities": identities,
     })))
+}
+
+#[derive(serde::Deserialize)]
+struct VerifyTicketBody {
+    ticket: String,
+}
+
+/// `POST /v1/server/steam/app_ticket {ticket}` — a game server hands over the encrypted app
+/// ticket a peer presented; the backend decrypts it with the SDK Auth key and returns who it is
+/// (`steam_id`, `app_id`, licenses, dlc, `user_data`) plus the Musubi account linked to that
+/// Steam identity, if any.
+async fn verify_app_ticket(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    axum::Json(b): axum::Json<VerifyTicketBody>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let t = s.logins.steam_app_ticket(&b.ticket)?;
+    let account: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "select account_id from musubi.identities where provider = $1 and subject = $2",
+    )
+    .bind(musubi_auth::provider::STEAM)
+    .bind(&t.steam_id)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(musubi_core::Error::internal)?;
+    let mut v = serde_json::to_value(&t).unwrap_or_default();
+    v["account_id"] = serde_json::json!(account.map(|a| a.0));
+    Ok(axum::Json(v))
 }

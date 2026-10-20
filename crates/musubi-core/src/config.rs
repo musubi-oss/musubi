@@ -1595,6 +1595,13 @@ pub struct SteamLoginConfig {
     pub ban_propagation: String,
     /// Reuse a stored ownership answer this long before asking Steam again (0 = every login).
     pub ownership_cache_secs: u64,
+    /// Encrypted app ticket key (Steamworks → Security → SDK Auth; 64 hex chars). Lets
+    /// `POST /v1/auth/steam/app_ticket` and `/v1/server/steam/app_ticket` verify
+    /// `ISteamUser::RequestEncryptedAppTicket` tickets offline — no Web API key, no egress to
+    /// Steam. Empty = disabled.
+    pub app_ticket_key: String,
+    /// Reject app tickets issued longer ago than this (replay window; 0 = no age check).
+    pub app_ticket_max_age_secs: u64,
 }
 
 /// Xbox Live profile service used to validate XSTS tokens (`Authorization: XBL3.0 x=<uhs>;<token>`).
@@ -1626,6 +1633,8 @@ impl Default for SteamLoginConfig {
             family_sharing: "allow".into(),
             ban_propagation: "owner_to_borrower".into(),
             ownership_cache_secs: 3600,
+            app_ticket_key: String::new(),
+            app_ticket_max_age_secs: 86_400,
         }
     }
 }

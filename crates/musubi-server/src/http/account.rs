@@ -20,6 +20,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/account/link/device", post(link_device))
         .route("/v1/account/link/email", post(link_email))
         .route("/v1/account/link/steam", post(link_steam))
+        .route(
+            "/v1/account/link/steam/app_ticket",
+            post(link_steam_app_ticket),
+        )
         .route("/v1/account/link/xbox", post(link_xbox))
         .route("/v1/account/link/psn", post(link_psn))
         .route("/v1/account/link/nintendo", post(link_nintendo))
@@ -229,6 +233,18 @@ async fn link_steam(
         .link_external(me.account_id, musubi_auth::provider::STEAM, &id)
         .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn link_steam_app_ticket(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Json(b): Json<LinkSteamBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let t = s.logins.steam_app_ticket(&b.ticket)?;
+    s.auth
+        .link_external(me.account_id, musubi_auth::provider::STEAM, &t.steam_id)
+        .await?;
+    Ok(Json(json!({ "ok": true, "steam_id": t.steam_id })))
 }
 
 #[derive(Deserialize)]

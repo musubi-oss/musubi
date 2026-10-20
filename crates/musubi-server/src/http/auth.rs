@@ -22,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth/queue", post(queue))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/steam", post(steam))
+        .route("/v1/auth/steam/app_ticket", post(steam_app_ticket))
         .route("/v1/auth/xbox", post(xbox))
         .route("/v1/auth/psn", post(psn))
         .route("/v1/auth/nintendo", post(nintendo))
@@ -577,6 +578,34 @@ async fn steam(
     }
     authenticated(&s, &sess, musubi_auth::provider::STEAM, &ip.0).await?;
     Ok(Json(sess))
+}
+
+/// `POST /v1/auth/steam/app_ticket {ticket, ...}` — login with an encrypted app ticket (hex or
+/// base64), verified offline with the SDK Auth key; the response carries `steam` (steam_id,
+/// licenses, dlc, user_data) next to the session.
+async fn steam_app_ticket(
+    State(s): State<AppState>,
+    ip: super::ClientIp,
+    Json(r): Json<SteamReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    s.limits.auth_ip(&ip.0)?;
+    let t = s.logins.steam_app_ticket(&r.ticket)?;
+    let ownership = if s.cfg.social.steam.web_api_key.is_empty() {
+        None
+    } else {
+        super::steam_ownership::gate(&s, &t.steam_id).await?
+    };
+    let sess = s
+        .auth
+        .authenticate_external(musubi_auth::provider::STEAM, &t.steam_id, r.opts)
+        .await?;
+    if let Some(o) = ownership {
+        super::steam_ownership::store(&s, &t.steam_id, &o).await?;
+    }
+    authenticated(&s, &sess, musubi_auth::provider::STEAM, &ip.0).await?;
+    let mut v = serde_json::to_value(&sess).unwrap_or_default();
+    v["steam"] = serde_json::to_value(&t).unwrap_or_default();
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]

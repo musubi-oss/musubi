@@ -37397,3 +37397,411 @@ async fn entitlement_timed_trials_upgrade_and_expiry() {
     assert_eq!(e["active"], true);
     assert_eq!(e["license"], "full");
 }
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn steam_openid2_browser_login_and_encrypted_app_tickets() {
+    use axum::routing::{get as ax_get, post as ax_post};
+    use musubi_server::steam_ticket::{encrypt, Dlc, Fixture};
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        % 10_000_000_000;
+    let sid1 = format!("7656119{nonce:010}");
+    let sid2 = format!("7656118{nonce:010}");
+    let sid3 = format!("7656117{nonce:010}");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mock = Router::new()
+        .route(
+            "/openid/login",
+            ax_post(|axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+                let ok = f.get("openid.mode").map(String::as_str) == Some("check_authentication")
+                    && f.get("openid.sig").map(String::as_str) == Some("good");
+                format!("ns:http://specs.openid.net/auth/2.0\nis_valid:{}\n", ok)
+            }),
+        )
+        .route(
+            "/ISteamUser/GetPlayerSummaries/v2/",
+            ax_get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                axum::Json(json!({"response": {"players": [{"steamid": q.get("steamids"), "personaname": "Gabe", "avatarfull": "https://cdn.example/gabe.jpg"}]}}))
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    const KEY: [u8; 32] = [0x5a; 32];
+    let b = base.clone();
+    let Some(app) = app_with(move |c| {
+        c.social.steam.url = b.clone();
+        c.social.steam.web_api_key = "k".into();
+        c.social.steam.app_id = 480;
+        c.social.steam.app_ticket_key = hex::encode(KEY);
+        c.social.steam.app_ticket_max_age_secs = 3600;
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let tag = &uuid::Uuid::now_v7().simple().to_string()[20..];
+    let name = format!("st{tag}");
+    let op = format!("{base}/openid/login");
+    let cb = format!("{base}/cb");
+
+    // admin: openid2 provider; defaults (steam_id subject, no pkce); subject validation
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{name}"), k,
+        Some(json!({"kind": "openid2", "authorize_url": op, "redirect_urls": [cb], "claims": {"subject": "email"}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{name}"), k,
+        Some(json!({"kind": "openid2", "display_name": "Steam", "authorize_url": op, "redirect_urls": [cb], "return_urls": ["https://game.example/"]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["claims"]["subject"], "steam_id");
+    assert_eq!(v["pkce"], false);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/admin/auth/providers/{name}/test"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["authorize_url_example"]
+            .as_str()
+            .unwrap()
+            .contains("openid.mode=checkid_setup"),
+        "{v}"
+    );
+
+    // start → checkid_setup URL with return_to carrying our state and realm = callback origin
+    let start = |rt: &str| {
+        let app = app.clone();
+        let name = name.clone();
+        let rt = rt.to_string();
+        async move {
+            let (st, v) = call(
+                &app,
+                "POST",
+                &format!("/v1/auth/providers/{name}/start"),
+                None,
+                Some(json!({"return_url": rt})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            let url = v["url"].as_str().unwrap().to_string();
+            let q: std::collections::HashMap<String, String> = url
+                .split_once('?')
+                .unwrap()
+                .1
+                .split('&')
+                .filter_map(|p| p.split_once('='))
+                .map(|(a, b)| (a.to_string(), pct_decode(b)))
+                .collect();
+            (url, q, v["state"].as_str().unwrap().to_string())
+        }
+    };
+    let (url, q, state1) = start("").await;
+    assert!(url.starts_with(&format!("{op}?")), "{url}");
+    assert_eq!(q["openid.mode"], "checkid_setup");
+    assert_eq!(q["openid.ns"], "http://specs.openid.net/auth/2.0");
+    assert_eq!(q["openid.realm"], base);
+    assert_eq!(
+        q["openid.identity"],
+        "http://specs.openid.net/auth/2.0/identifier_select"
+    );
+    assert_eq!(q["openid.return_to"], format!("{cb}?state={state1}"));
+    assert!(!q.contains_key("code_challenge"));
+
+    // the OP sends the browser back: positive assertion → check_authentication → steam identity
+    let assertion = |state: &str, sid: &str, tweak: &[(&str, &str)]| {
+        let mut p: Vec<(String, String)> = vec![
+            ("state", state),
+            ("openid.ns", "http://specs.openid.net/auth/2.0"),
+            ("openid.mode", "id_res"),
+            ("openid.op_endpoint", &op),
+            ("openid.claimed_id", &format!("{base}/openid/id/{sid}")),
+            ("openid.identity", &format!("{base}/openid/id/{sid}")),
+            ("openid.return_to", &format!("{cb}?state={state}")),
+            ("openid.response_nonce", "2026-10-14T20:00:00Zabc"),
+            ("openid.assoc_handle", "1234567890"),
+            (
+                "openid.signed",
+                "signed,op_endpoint,claimed_id,identity,return_to,response_nonce,assoc_handle",
+            ),
+            ("openid.sig", "good"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        for (k, v) in tweak {
+            if let Some(e) = p.iter_mut().find(|(a, _)| a == k) {
+                e.1 = v.to_string();
+            } else {
+                p.push((k.to_string(), v.to_string()));
+            }
+        }
+        let enc = |s: &str| {
+            s.replace('%', "%25")
+                .replace('#', "%23")
+                .replace('&', "%26")
+                .replace('+', "%2B")
+                .replace(' ', "%20")
+        };
+        format!(
+            "/v1/auth/providers/{name}/callback?{}",
+            p.iter()
+                .map(|(a, b)| format!("{a}={}", enc(b)))
+                .collect::<Vec<_>>()
+                .join("&")
+        )
+    };
+    let (st, s1) = call(&app, "GET", &assertion(&state1, &sid1, &[]), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{s1}");
+    assert_eq!(s1["created"], true);
+    assert_eq!(s1["provider"], "steam", "{s1}");
+    let acc1 = s1["account_id"].as_str().unwrap().to_string();
+    let t1 = s1["access_token"].as_str().unwrap().to_string();
+    let (_, acc) = call(&app, "GET", "/v1/account", Some(&t1), None).await;
+    assert_eq!(acc["display_name"], "Gabe", "{acc}");
+    assert_eq!(acc["avatar_url"], "https://cdn.example/gabe.jpg", "{acc}");
+    // state single use
+    let (st, _) = call(&app, "GET", &assertion(&state1, &sid1, &[]), None, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // refused assertions: bad signature, foreign claimed_id, other OP, unsigned field, cancel, wrong return_to
+    for (tweak, why) in [
+        (vec![("openid.sig", "bad")], "sig"),
+        (
+            vec![
+                (
+                    "openid.claimed_id",
+                    "https://evil.example/openid/id/76561198000000001",
+                ),
+                (
+                    "openid.identity",
+                    "https://evil.example/openid/id/76561198000000001",
+                ),
+            ],
+            "foreign",
+        ),
+        (
+            vec![("openid.op_endpoint", "https://evil.example/openid/login")],
+            "op",
+        ),
+        (
+            vec![(
+                "openid.signed",
+                "signed,op_endpoint,claimed_id,identity,return_to",
+            )],
+            "unsigned",
+        ),
+        (vec![("openid.mode", "cancel")], "cancel"),
+        (
+            vec![("openid.return_to", "https://evil.example/cb?state=x")],
+            "return_to",
+        ),
+        (
+            vec![
+                ("openid.claimed_id", "X/openid/id/notanid"),
+                ("openid.identity", "X/openid/id/notanid"),
+            ],
+            "steamid",
+        ),
+    ] {
+        let (_, _, state) = start("").await;
+        let tweak: Vec<(&str, String)> = tweak
+            .into_iter()
+            .map(|(a, b)| (a, b.replace('X', &base)))
+            .collect();
+        let tweak: Vec<(&str, &str)> = tweak.iter().map(|(a, b)| (*a, b.as_str())).collect();
+        let (st, v) = call(&app, "GET", &assertion(&state, &sid1, &tweak), None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{why}: {v}");
+    }
+    // no tokens for openid2
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/auth/providers/{name}/token"),
+        None,
+        Some(json!({"id_token": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // encrypted app ticket login lands on the same account as the browser login
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let fx = |sid: &str, app_id: u32, issued_at: u32, dlc: Vec<Dlc>| Fixture {
+        steam_id: sid.parse().unwrap(),
+        app_id,
+        issued_at,
+        licenses: vec![1234],
+        dlc,
+        user_data: b"hello".to_vec(),
+        signed: true,
+        version: 1,
+    };
+    let ticket1 = encrypt(&fx(&sid1, 480, now, vec![]), &KEY);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/auth/steam/app_ticket",
+        None,
+        Some(json!({"ticket": hex::encode(&ticket1)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["account_id"], acc1, "{v}");
+    assert_eq!(v["created"], false);
+    assert_eq!(v["steam"]["steam_id"], sid1);
+    assert_eq!(v["steam"]["app_id"], 480);
+    assert_eq!(v["steam"]["licenses"], json!([1234]));
+    assert_eq!(v["steam"]["user_data"], "aGVsbG8=");
+    assert_eq!(v["steam"]["issued_at"], now);
+    {
+        use base64::Engine;
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/steam/app_ticket",
+            None,
+            Some(json!({"ticket": base64::engine::general_purpose::STANDARD.encode(&ticket1)})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "base64 form: {v}");
+        assert_eq!(v["account_id"], acc1);
+    }
+    // wrong app, too old, garbage, wrong key → 401; DLC of our app → ok
+    for (ticket, why) in [
+        (
+            hex::encode(encrypt(&fx(&sid1, 570, now, vec![]), &KEY)),
+            "other app",
+        ),
+        (
+            hex::encode(encrypt(&fx(&sid1, 480, now - 7200, vec![]), &KEY)),
+            "too old",
+        ),
+        ("zz".to_string(), "garbage"),
+        (
+            hex::encode(encrypt(&fx(&sid1, 480, now, vec![]), &[1u8; 32])),
+            "wrong key",
+        ),
+    ] {
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/v1/auth/steam/app_ticket",
+            None,
+            Some(json!({"ticket": ticket})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{why}: {v}");
+    }
+    let dlc_ticket = encrypt(
+        &fx(
+            &sid2,
+            570,
+            now,
+            vec![Dlc {
+                app_id: 480,
+                licenses: vec![7],
+            }],
+        ),
+        &KEY,
+    );
+    let (st, s2) = call(
+        &app,
+        "POST",
+        "/v1/auth/steam/app_ticket",
+        None,
+        Some(json!({"ticket": hex::encode(&dlc_ticket)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{s2}");
+    assert_eq!(s2["created"], true);
+    let t2 = s2["access_token"].as_str().unwrap().to_string();
+    // link a third Steam identity to account 2 via app ticket; one owned by account 1 → conflict
+    let ticket3 = encrypt(&fx(&sid3, 480, now, vec![]), &KEY);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/link/steam/app_ticket",
+        Some(&t2),
+        Some(json!({"ticket": hex::encode(&ticket3)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["steam_id"], sid3);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/link/steam/app_ticket",
+        Some(&t2),
+        Some(json!({"ticket": hex::encode(&ticket1)})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    // game server verifies a peer's ticket: identity + linked account
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/steam/app_ticket",
+        k,
+        Some(json!({"ticket": hex::encode(&ticket3)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["steam_id"], sid3);
+    assert_eq!(v["account_id"], s2["account_id"]);
+    let unknown = encrypt(&fx("76561190000000001", 480, now, vec![]), &KEY);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/steam/app_ticket",
+        k,
+        Some(json!({"ticket": hex::encode(&unknown)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["account_id"].is_null(), "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/server/steam/app_ticket",
+        None,
+        Some(json!({"ticket": hex::encode(&ticket3)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // not configured → 400
+    let Some(plain) = self::app().await else {
+        return;
+    };
+    let (st, v) = call(
+        &plain,
+        "POST",
+        "/v1/auth/steam/app_ticket",
+        None,
+        Some(json!({"ticket": hex::encode(&ticket1)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+}

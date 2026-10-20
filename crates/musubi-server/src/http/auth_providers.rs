@@ -1,6 +1,8 @@
 //! Generic OAuth2 / OIDC provider catalog: `/v1/auth/providers/*` (players), link flows under
 //! `/v1/account/link/providers/*`, admin CRUD under `/v1/admin/auth/providers/*`.
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -101,10 +103,17 @@ async fn callback(
     State(s): State<AppState>,
     ip: super::ClientIp,
     Path(name): Path<String>,
-    Query(q): Query<CallbackQuery>,
+    Query(raw): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
     s.limits.auth_ip(&ip.0)?;
     let p = s.auth_providers.enabled(&name).await?;
+    let pick = |k: &str| raw.get(k).cloned().unwrap_or_default();
+    let q = CallbackQuery {
+        code: pick("code"),
+        state: pick("state"),
+        error: pick("error"),
+        error_description: pick("error_description"),
+    };
     let flow = s.auth_providers.take_flow(&name, &q.state).await?;
     let return_url = flow.return_url.clone();
     let res = async {
@@ -114,7 +123,7 @@ async fn callback(
                 q.error, q.error_description
             )));
         }
-        finish(&s, &p, flow, &q.code, &ip.0).await
+        finish(&s, &p, flow, &q.code, &ip.0, Some(&raw)).await
     }
     .await;
     if return_url.is_empty() {
@@ -156,7 +165,7 @@ async fn exchange(
     s.limits.auth_ip(&ip.0)?;
     let p = s.auth_providers.enabled(&name).await?;
     let flow = s.auth_providers.take_flow(&name, &r.state).await?;
-    Ok(Json(finish(&s, &p, flow, &r.code, &ip.0).await?))
+    Ok(Json(finish(&s, &p, flow, &r.code, &ip.0, None).await?))
 }
 
 async fn finish(
@@ -165,17 +174,34 @@ async fn finish(
     flow: Flow,
     code: &str,
     ip: &str,
+    openid: Option<&HashMap<String, String>>,
 ) -> musubi_core::Result<Value> {
     let eps = s.auth_providers.endpoints(&s.logins, p).await?;
-    let tokens = s
-        .auth_providers
-        .exchange_code(&s.logins, p, &eps, code, &flow)
-        .await?;
-    let ext = s
-        .auth_providers
-        .identify(&s.logins, p, &eps, &tokens, Some(&flow.nonce))
-        .await?;
-    let provider = crate::logins::oidc_provider(&p.name);
+    let (ext, provider) = if p.kind == "openid2" {
+        let params = openid.ok_or_else(|| {
+            Error::InvalidArgument("openid2 providers finish through the browser callback".into())
+        })?;
+        let ext = s
+            .auth_providers
+            .verify_openid2(&s.logins, p, &eps, &flow, params)
+            .await?;
+        let provider = if p.claims.subject == "steam_id" {
+            musubi_auth::provider::STEAM.to_string()
+        } else {
+            crate::logins::oidc_provider(&p.name)
+        };
+        (ext, provider)
+    } else {
+        let tokens = s
+            .auth_providers
+            .exchange_code(&s.logins, p, &eps, code, &flow)
+            .await?;
+        let ext = s
+            .auth_providers
+            .identify(&s.logins, p, &eps, &tokens, Some(&flow.nonce))
+            .await?;
+        (ext, crate::logins::oidc_provider(&p.name))
+    };
     if let Some(account) = flow.account_id {
         s.auth
             .link_external(account, &provider, &ext.subject)
@@ -283,6 +309,11 @@ async fn identify_token(
     id_token: Option<String>,
     access_token: Option<String>,
 ) -> musubi_core::Result<External> {
+    if p.kind == "openid2" {
+        return Err(Error::InvalidArgument(
+            "openid2 providers issue no tokens; use the browser flow".into(),
+        ));
+    }
     if p.kind == "oidc" && id_token.is_none() {
         return Err(Error::InvalidArgument("id_token is required".into()));
     }

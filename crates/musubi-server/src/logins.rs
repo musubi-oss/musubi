@@ -172,6 +172,65 @@ impl Social {
 
     /// Steam: `ISteamUser/CheckAppOwnership` for `app_id` — ownership, Family Sharing lender
     /// (`ownersteamid` differs from the player), permanence and timed trials.
+    /// Encrypted app ticket (`ISteamUser::RequestEncryptedAppTicket`) → verified ticket, offline
+    /// with `[social.steam].app_ticket_key`; must be for `app_id` (or one of its DLC) and younger
+    /// than `app_ticket_max_age_secs`.
+    pub fn steam_app_ticket(&self, ticket: &str) -> Result<crate::steam_ticket::AppTicket> {
+        let c = &self.cfg.steam;
+        if c.app_ticket_key.is_empty() {
+            return Err(Error::InvalidArgument(
+                "steam app tickets are not configured ([social.steam].app_ticket_key)".into(),
+            ));
+        }
+        let key: [u8; 32] = hex::decode(c.app_ticket_key.trim())
+            .ok()
+            .and_then(|k| k.try_into().ok())
+            .ok_or_else(|| {
+                Error::Internal("[social.steam].app_ticket_key must be 64 hex chars".into())
+            })?;
+        let raw = crate::steam_ticket::decode_text(ticket)?;
+        let t = crate::steam_ticket::decrypt(&raw, &key)?;
+        if c.app_id != 0 && t.app_id != c.app_id && !t.dlc.iter().any(|d| d.app_id == c.app_id) {
+            return Err(Error::Unauthenticated(format!(
+                "steam app ticket is for app {}, not {}",
+                t.app_id, c.app_id
+            )));
+        }
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if c.app_ticket_max_age_secs > 0 && now - t.issued_at > c.app_ticket_max_age_secs as i64 {
+            return Err(Error::Unauthenticated(
+                "steam app ticket is too old; request a fresh one".into(),
+            ));
+        }
+        Ok(t)
+    }
+
+    /// Persona name + avatar from `ISteamUser/GetPlayerSummaries` (best effort; `None` without a
+    /// Web API key or when Steam does not answer).
+    pub async fn steam_persona(&self, steam_id: &str) -> Option<(String, Option<String>)> {
+        let c = &self.cfg.steam;
+        if c.web_api_key.is_empty() {
+            return None;
+        }
+        let url = format!(
+            "{}/ISteamUser/GetPlayerSummaries/v2/",
+            c.url.trim_end_matches('/')
+        );
+        let v: serde_json::Value = self
+            .http
+            .get(url)
+            .query(&[("key", c.web_api_key.as_str()), ("steamids", steam_id)])
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let p = v["response"]["players"].get(0)?;
+        let name = p["personaname"].as_str()?.to_string();
+        Some((name, p["avatarfull"].as_str().map(str::to_string)))
+    }
+
     pub async fn steam_ownership(&self, steam_id: &str) -> Result<SteamOwnership> {
         let c = &self.cfg.steam;
         if c.web_api_key.is_empty() || c.app_id == 0 {

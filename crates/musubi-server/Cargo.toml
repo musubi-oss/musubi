@@ -63,6 +63,11 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 hmac = "0.12"
 md-5 = "0.10"
 sha2.workspace = true
+sha1.workspace = true
+prost.workspace = true
+aes.workspace = true
+cbc.workspace = true
+crc32fast.workspace = true
 reqwest.workspace = true
 hex.workspace = true
 
