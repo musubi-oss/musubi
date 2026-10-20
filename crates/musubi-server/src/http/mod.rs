@@ -70,6 +70,7 @@ pub mod rating;
 mod regions;
 pub mod remote_config;
 pub mod reports;
+pub mod reputation;
 mod rpc;
 mod rtc;
 pub mod sanctions;
@@ -299,6 +300,7 @@ pub fn router(state: AppState) -> Router {
         .merge(baggage::routes())
         .merge(broadcasts::routes())
         .merge(sweepstakes::routes())
+        .merge(reputation::routes())
         .merge(developers::routes())
         .merge(donations::routes())
         .merge(egress::routes())

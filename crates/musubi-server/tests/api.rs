@@ -41296,3 +41296,135 @@ async fn deletion_ledger_redeletes_restored_accounts_unless_lifted() {
         "{v}"
     );
 }
+
+#[tokio::test]
+async fn server_reputation_from_gameplay_stats_and_ratings() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+        "name": unique("rep"), "provider": "local", "buffer": 1, "max_servers": 1,
+        "port_start": 47800, "port_end": 47900, "spec": {"command": ["sleep", "60"]},
+        "policy": {"health": {"period_secs": 1, "failure_threshold": 2, "initial_delay_secs": 60}, "eviction": "never"}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
+    let (st, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    let sid = h["servers"][0]["id"].as_str().unwrap().to_string();
+    let sdk = |sid: Option<String>, body: Value| {
+        let app = app.clone();
+        async move {
+            let mut req =
+                Request::post("/v1/gameserver/gameplay_stats").header("x-musubi-server-key", k);
+            if let Some(sid) = sid {
+                req = req.header("x-musubi-server-id", sid);
+            }
+            let res = app
+                .oneshot(
+                    req.header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let st = res.status();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    // neutral card before any report
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}/reputation"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["gameplay"]["reports"], 0);
+    assert_eq!(v["rating"]["votes"], 0);
+    // neutral rating 0.6*60 = 36, stability 25, moderation 15
+    assert_eq!(v["score"], 76.0, "neutral: {v}");
+    let (st, _) = sdk(None, json!({"rounds": 1})).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = sdk(Some(sid.clone()), json!({"rounds": -1})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = sdk(Some(uuid::Uuid::now_v7().to_string()), json!({"rounds": 1})).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = sdk(
+        Some(sid.clone()),
+        json!({"rounds": 10, "players": 100, "play_secs": 3600}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rounds"], 10);
+    let (st, v) = sdk(
+        Some(sid.clone()),
+        json!({"rounds": 10, "players": 100, "kicks": 25, "crashes": 1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["rounds"], 20, "cumulative");
+    assert_eq!(v["players_served"], 200);
+    assert_eq!(v["reports"], 2);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}/reputation"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["gameplay"]["crashes"], 1);
+    assert_eq!(v["gameplay"]["kicks"], 25);
+    // rating neutral 0.6*60 = 36; stability 1 - 10/20 = 0.5 → 12.5; moderation kicks 12.5/100 → 1 - 0.25 = 0.75 → 11.25 → 60
+    assert_eq!(v["score"], 60.0, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/reputation"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["servers"].as_array().unwrap().len(), 1);
+    assert_eq!(v["gameplay"]["rounds"], 20);
+    assert_eq!(v["score"], 60.0);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{}/reputation", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{}/reputation", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
