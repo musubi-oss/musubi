@@ -668,7 +668,7 @@ mod tests {
     fn defaults_load_without_file() {
         let c = Config::load(None).unwrap();
         assert_eq!(c.http.listen.port(), 7350);
-        assert_eq!(c.node.roles.len(), 6);
+        assert_eq!(c.node.roles.len(), 7);
     }
 }
 
