@@ -35,6 +35,11 @@ export const router = createRouter({
       { path: '', component: () => import('./pages/liveops/Timeline.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.liveops.find((x) => x.id === r.params.page) ?? catalog.liveops[1] }) },
     ]},
+    { path: '/world', component: () => import('./pages/world/Index.vue'), children: [
+      { path: '', component: () => import('./pages/world/Worlds.vue') },
+      { path: 'worlds/:w', component: () => import('./pages/world/World.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.world.find((x) => x.id === r.params.page) ?? catalog.world[0] }) },
+    ]},
     { path: '/:section/:page?', component: () => import('./pages/Section.vue') },
   ],
 })
