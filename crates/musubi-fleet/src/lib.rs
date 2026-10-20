@@ -450,6 +450,10 @@ pub struct ScaleWebhook {
     pub headers: HashMap<String, String>,
 }
 
+fn one() -> u32 {
+    1
+}
+
 /// Autoscale policy (plan 05): buffer overrides by schedule plus an optional demand forecast.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -499,6 +503,15 @@ pub struct ScalePolicy {
     /// Servers started concurrently per reconcile batch (1 = one after another; Agones
     /// `maxCreationParallelism`). `step_up` / `step_down` cap each batch.
     pub creation_parallelism: u32,
+    /// Servers terminated concurrently per reconcile batch (Agones `maxDeletionParallelism`);
+    /// `step_down` caps the batch itself.
+    #[serde(default = "one")]
+    pub deletion_parallelism: u32,
+    /// Never have more than this many servers in `starting` at once (Agones
+    /// `maxPodPendingCount`): a pass starts only `max_pending - starting` more, the rest waits for
+    /// the next pass. Protects the node / cluster from a thundering herd of cold starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pending: Option<u32>,
     /// Ordered policy chain: the first entry whose window matches `now` supplies the buffer,
     /// utilisation target and/or webhook; a failing webhook falls through to the next matching
     /// entry, then to the fleet-level `webhook`/`buffer`. Agones `Chain`.
@@ -793,6 +806,8 @@ impl Default for ScalePolicy {
             health: HealthPolicy::default(),
             eviction: "on_upgrade".into(),
             creation_parallelism: 1,
+            deletion_parallelism: 1,
+            max_pending: None,
             chain: Vec::new(),
             overflow_labels: HashMap::new(),
         }
@@ -939,6 +954,16 @@ impl ScalePolicy {
         if !(1..=64).contains(&self.creation_parallelism) {
             return Err(Error::InvalidArgument(
                 "policy.creation_parallelism must be 1..=64".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.deletion_parallelism) {
+            return Err(Error::InvalidArgument(
+                "policy.deletion_parallelism must be 1..=64".into(),
+            ));
+        }
+        if self.max_pending == Some(0) {
+            return Err(Error::InvalidArgument(
+                "policy.max_pending must be >= 1 (omit to disable)".into(),
             ));
         }
         if self.chain.len() > 16 {
@@ -5005,6 +5030,11 @@ impl FleetService {
                 last.map(|(up, _)| (now_s - up).max(0) as u64),
                 last.map(|(_, any)| (now_s - any).max(0) as u64),
             );
+            let pending = servers.iter().filter(|s| s.state == "starting").count() as i32;
+            let start = match f.policy.max_pending {
+                Some(m) => start.min((m as i32 - pending).max(0)),
+                None => start,
+            };
             let limited = (start, stop) != plan;
             let (start, stop) = if f.policy.suspended {
                 (0, 0)
@@ -5019,7 +5049,7 @@ impl FleetService {
                     "rules_fired": &rules_fired, "rules_holding": rules_holding, "webhook": &webhook_note,
                     "chain": chain_note, "buffer": buffer,
                     "plan": {"start": plan.0, "stop": plan.1}, "applied": {"start": start, "stop": stop},
-                    "limited": limited,
+                    "limited": limited, "pending": pending, "max_pending": f.policy.max_pending,
                     "able_to_scale": !f.policy.suspended && (live < f.max_servers || live > f.min_servers),
                     "live": live, "available": available, "idle_ready": idle_ready, "gauges": gauges,
                 }),
@@ -5069,10 +5099,14 @@ impl FleetService {
                     busy.sort_by_key(|s| (s.players, s.created_at));
                     idle.extend(busy);
                 }
-                for s in idle.into_iter().take(stop as usize) {
-                    tracing::info!(server = %s.id, fleet = %f.name, target, "scaling down idle game server");
-                    self.terminate_reason(&f, s.id, "scale_down").await;
-                    reaped += 1;
+                let victims: Vec<Uuid> = idle.iter().take(stop as usize).map(|s| s.id).collect();
+                for batch in victims.chunks(f.policy.deletion_parallelism.max(1) as usize) {
+                    futures::future::join_all(batch.iter().map(|id| {
+                        tracing::info!(server = %id, fleet = %f.name, target, "scaling down idle game server");
+                        self.terminate_reason(&f, *id, "scale_down")
+                    }))
+                    .await;
+                    reaped += batch.len();
                 }
             }
             let overflow = live - stop - f.max_servers;

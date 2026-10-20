@@ -36032,6 +36032,9 @@ async fn fleet_policy_chain_parallelism_and_overflow_labels() {
     for bad in [
         json!({"creation_parallelism": 0}),
         json!({"creation_parallelism": 65}),
+        json!({"deletion_parallelism": 0}),
+        json!({"deletion_parallelism": 65}),
+        json!({"max_pending": 0}),
         json!({"chain": [{"id": "x"}]}),
         json!({"chain": [{"id": "x", "buffer": 1}, {"id": "x", "buffer": 2}]}),
         json!({"chain": [{"id": "x", "buffer": 1, "when": {"from_hour": 25, "to_hour": 2}}]}),
@@ -39316,4 +39319,93 @@ async fn fleet_egress_accounting_per_server_and_rollup() {
     assert_eq!(r["cost"]["configured"], false);
     assert_eq!(r["servers_reporting"], 0);
     assert_eq!(r["bytes_out"], 0);
+}
+
+#[tokio::test]
+async fn fleet_policy_max_pending_and_deletion_parallelism() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("pending"), "provider": "local", "buffer": 3, "max_servers": 3,
+            "port_start": 47800, "port_end": 47900, "spec": {"command": ["sleep", "60"]},
+            "policy": {"max_pending": 1, "deletion_parallelism": 4}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["policy"]["max_pending"], 1);
+    assert_eq!(f["policy"]["deletion_parallelism"], 4);
+    let fid = f["id"].as_str().unwrap().to_string();
+    let fuid = uuid::Uuid::parse_str(&fid).unwrap();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    let status = format!("/v1/server/fleets/{fid}/autoscaler");
+    let reconcile = format!("/v1/server/fleets/{fid}/reconcile");
+    let run = || async {
+        let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v
+    };
+    // pass 1: wants 3, only one may be pending
+    run().await;
+    assert_eq!(svc.servers(fuid, Some("starting")).await.unwrap().len(), 1);
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["plan"]["start"], 3, "{v}");
+    assert_eq!(v["last"]["applied"]["start"], 1, "{v}");
+    assert_eq!(v["last"]["limited"], true);
+    assert_eq!(v["last"]["pending"], 0);
+    assert_eq!(v["last"]["max_pending"], 1);
+    // pass 2: still one pending → nothing new
+    run().await;
+    assert_eq!(svc.servers(fuid, Some("starting")).await.unwrap().len(), 1);
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["applied"]["start"], 0, "{v}");
+    assert_eq!(v["last"]["pending"], 1);
+    // it becomes ready → the next pass may start one more
+    for s in svc.servers(fuid, Some("starting")).await.unwrap() {
+        svc.sdk_ready(s.id).await.unwrap();
+    }
+    run().await;
+    assert_eq!(svc.servers(fuid, Some("starting")).await.unwrap().len(), 1);
+    assert_eq!(svc.servers(fuid, Some("ready")).await.unwrap().len(), 1);
+    // lift the limit → the rest starts in one pass
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"policy": {"max_pending": null, "deletion_parallelism": 4}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["policy"].get("max_pending").is_none(), "{v}");
+    run().await;
+    for s in svc.servers(fuid, Some("starting")).await.unwrap() {
+        svc.sdk_ready(s.id).await.unwrap();
+    }
+    assert_eq!(svc.servers(fuid, Some("ready")).await.unwrap().len(), 3);
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["limited"], false, "{v}");
+    // scale to zero: three idle servers terminated in one parallel batch
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/fleets/{fid}/scale"),
+        k,
+        Some(json!({"buffer": 0, "min_servers": 0})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let r = run().await;
+    assert_eq!(r["reaped"], 3, "{r}");
+    assert_eq!(svc.servers(fuid, Some("ready")).await.unwrap().len(), 0);
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["applied"]["stop"], 3, "{v}");
 }
