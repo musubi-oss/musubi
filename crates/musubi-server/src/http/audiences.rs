@@ -92,7 +92,11 @@ impl Audiences {
                 .audiences_of(account, &defs, time::OffsetDateTime::now_utc())
                 .await?
         };
-        let names = Arc::new(apply_overrides(db, account, names).await?);
+        let mut names = apply_overrides(db, account, names).await?;
+        if crate::http::developers::is_developer(db, account).await? {
+            names.push(crate::http::developers::AUDIENCE.to_string());
+        }
+        let names = Arc::new(names);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.members.retain(|_, (at, _)| at.elapsed() < TTL);
         g.members.insert(account, (Instant::now(), names.clone()));

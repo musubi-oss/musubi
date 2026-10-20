@@ -211,7 +211,7 @@ pub async fn load(db: &PgPool) -> Result<Policy> {
 pub struct Decision {
     pub allowed: bool,
     /// `open`, `provider_bypass`, `audience_bypass`, `allowlist`, `existing_account`,
-    /// `not_allowlisted`, `signups_closed`, `maintenance`, `not_applicable`.
+    /// `not_allowlisted`, `signups_closed`, `maintenance`, `not_applicable`, `developer`.
     pub reason: String,
     /// The allow-list key or audience that let the player in.
     pub via: Option<String>,
@@ -297,6 +297,9 @@ pub async fn decide(
     };
     if let Some(a) = auds.iter().find(|a| pol.bypass_audiences.contains(a)) {
         return Ok(ok("audience_bypass", Some(a.clone())));
+    }
+    if super::developers::is_developer(&s.db, account).await? {
+        return Ok(ok("developer", None));
     }
     if eff.mode == "maintenance" {
         return Ok(deny("maintenance"));

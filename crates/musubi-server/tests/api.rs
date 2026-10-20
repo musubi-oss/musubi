@@ -39409,3 +39409,191 @@ async fn fleet_policy_max_pending_and_deletion_parallelism() {
     let (_, v) = call_server(&app, "GET", &status, k, None).await;
     assert_eq!(v["last"]["applied"]["stop"], 3, "{v}");
 }
+
+#[tokio::test]
+async fn developer_players_bypass_maintenance_and_get_virtual_audience() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let login = |id: String| {
+        let app = app.clone();
+        async move {
+            call_server(
+                &app,
+                "POST",
+                "/v1/server/auth/custom",
+                k,
+                Some(json!({"id": id})),
+            )
+            .await
+        }
+    };
+    // start from an open gate whatever an aborted run left behind
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/access/policy",
+        k,
+        Some(json!({"mode": "open", "providers": ["custom"], "kick_on_change": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let dev = unique("dev-p");
+    let player = unique("dev-n");
+    let (st, d) = login(dev.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let (st, p) = login(player.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    let did = d["account_id"].as_str().unwrap().to_string();
+    let pid = p["account_id"].as_str().unwrap().to_string();
+    let dtoken = d["access_token"].as_str().unwrap().to_string();
+
+    // not a developer yet
+    let (st, v) = call(&app, "GET", "/v1/account/developer", Some(&dtoken), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["developer"], false);
+    assert_eq!(v["environment"], "production");
+    assert_eq!(v["development_actions"], false);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/accounts/{did}/developer"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["developer"], false);
+    // validation / unknown account
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/accounts/{did}/developer"),
+        k,
+        Some(json!({"note": "x".repeat(513)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/accounts/{}/developer", uuid::Uuid::now_v7()),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/accounts/{did}/developer"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // mark as developer
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/accounts/{did}/developer"),
+        k,
+        Some(json!({"note": "gameplay team", "set_by": "ops@studio"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["developer"], true);
+    assert_eq!(v["note"], "gameplay team");
+    assert_eq!(v["set_by"], "ops@studio");
+    let (st, v) = call(&app, "GET", "/v1/account/developer", Some(&dtoken), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["developer"], true);
+    assert_eq!(v["development_actions"], true);
+    let (st, v) = call_server(&app, "GET", "/v1/admin/developers", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["developers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["account_id"] == did),
+        "{v}"
+    );
+    // virtual audience `developers`
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{did}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v.to_string().contains("developers"), "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{pid}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!v.to_string().contains("developers"), "{v}");
+    // maintenance: the developer gets in, the player does not
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/access/policy",
+        k,
+        Some(json!({"mode": "maintenance", "providers": ["custom"], "kick_on_change": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = login(player.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = login(dev.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/access/check?account_id={did}&provider=custom"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["decision"]["reason"], "developer", "{v}");
+    // unmark → locked out like everyone else
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/accounts/{did}/developer"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["developer"], false);
+    let (st, v) = login(dev.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{did}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!v.to_string().contains("developers"), "{v}");
+    // back to open for the other tests
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/access/policy",
+        k,
+        Some(json!({"mode": "open", "providers": ["custom"], "kick_on_change": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}

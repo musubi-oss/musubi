@@ -750,6 +750,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 | image verification: `spec.verify_image` on `POST /v1/server/fleets` / `…/builds` | Before a fleet or build is saved the registry is asked for the image manifest (Docker Registry v2 / OCI distribution: anonymous first, then the `WWW-Authenticate: Bearer` token dance; `secret_env.REGISTRY_AUTH = "user:password"` for private registries, docker.io shorthand understood) — a typo in the tag or a private image without credentials is a 400 at save time instead of a fleet that never comes up; the manifest digest is pinned into `spec.image_digest` so what was verified is what runs |
 - **Egress accounting** — game servers report cumulative `bytes_out`/`bytes_in`; per-server totals and live rate, fleet rollup with cost (`spec.cost.egress_per_gb`).
 - **Rollout throttles** — `policy.max_pending` caps servers in `starting`, `creation_parallelism` / `deletion_parallelism` bound concurrent starts and terminations, `step_up` / `step_down` the per-pass batch.
+- **Developer players** — operator-flagged team accounts: enter maintenance mode, virtual audience `developers` for developer-only content, development-only actions in production (`[dev].environment`).
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

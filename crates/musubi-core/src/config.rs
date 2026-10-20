@@ -436,11 +436,24 @@ impl Config {
 }
 
 /// `[dev]` — development aids, never meant for production nodes.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevConfig {
     pub netsim: NetsimConfig,
     pub loadtest: LoadtestConfig,
+    /// `development` | `staging` | `production` (default). Development-only actions are open to
+    /// everyone outside `production`; in production only developer players may run them.
+    pub environment: String,
+}
+
+impl Default for DevConfig {
+    fn default() -> Self {
+        Self {
+            netsim: NetsimConfig::default(),
+            loadtest: LoadtestConfig::default(),
+            environment: "production".into(),
+        }
+    }
 }
 
 /// `[dev.loadtest]` — server-driven simulated players (`POST /v1/admin/dev/loadtests`).
