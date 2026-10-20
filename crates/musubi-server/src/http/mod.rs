@@ -68,6 +68,7 @@ mod player_files;
 pub mod push;
 pub mod qa_clock;
 pub mod rating;
+pub mod referrals;
 mod regions;
 pub mod remote_config;
 pub mod reports;
@@ -240,6 +241,7 @@ pub fn router(state: AppState) -> Router {
         .merge(news::router())
         .merge(effects::router())
         .merge(tutorials::router())
+        .merge(referrals::router())
         .merge(session_vars::router())
         .merge(qa_clock::router())
         .merge(countries::router())

@@ -42443,3 +42443,398 @@ async fn event_properties_fold_and_audience_rules() {
         .await;
     }
 }
+
+/// Referral programs (LootLocker parity): invite code per player and program, redeem once with
+/// referee / referrer / milestone rewards, caps (per-player, account age, window), operator stats,
+/// listing and voiding.
+#[tokio::test]
+async fn referral_programs_invite_redeem_milestones_and_void() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let gold = unique("rgold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut tables = Vec::new();
+    for (sfx, amount) in [("referee", 10), ("referrer", 25), ("m2", 100)] {
+        let t = unique(&format!("rt{sfx}"));
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            "/v1/server/rewards/tables",
+            k,
+            Some(json!({"id": t, "name": sfx, "kind": "guaranteed",
+                "entries": [{"currency": gold, "amount": amount}]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        tables.push(t);
+    }
+    let (t_referee, t_referrer, t_m2) = (&tables[0], &tables[1], &tables[2]);
+    let pid = unique("refp").to_lowercase();
+    let base = format!("/v1/server/referrals/programs/{pid}");
+    for (path, body) in [
+        (
+            "/v1/server/referrals/programs/Bad%20Id".to_string(),
+            json!({}),
+        ),
+        (base.clone(), json!({"max_referrals_per_player": 0})),
+        (base.clone(), json!({"referee_max_account_age_days": 0})),
+        (
+            base.clone(),
+            json!({"milestones": [{"count": 2, "reward_table": t_m2}, {"count": 2, "reward_table": t_m2}]}),
+        ),
+        (base.clone(), json!({"starts_at": 200, "ends_at": 100})),
+        (base.clone(), json!({"metadata": []})),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{path} {v}");
+    }
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &base,
+        k,
+        Some(json!({"referee_reward_table": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &base,
+        k,
+        Some(
+            json!({"name": "Invite a friend", "referee_reward_table": t_referee,
+            "referrer_reward_table": t_referrer, "milestones": [{"count": 2, "reward_table": t_m2}],
+            "max_referrals_per_player": 2, "referee_max_account_age_days": 30}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], pid);
+    assert_eq!(v["milestones"][0]["count"], 2);
+
+    let mut users = Vec::new();
+    for i in 0..4 {
+        let (_, u) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(&format!("rf{i}"))})),
+        )
+        .await;
+        users.push((
+            u["account_id"].as_str().unwrap().to_string(),
+            u["access_token"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (inviter, tok_a) = (&users[0].0, &users[0].1);
+
+    // invite code: minted once, stable, 8 chars with dash
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/referrals/{pid}/invite"),
+        Some(tok_a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let code = v["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 9);
+    assert_eq!(v["referrals"], 0);
+    assert_eq!(v["remaining"], 2);
+    let (_, v2) = call(
+        &app,
+        "GET",
+        &format!("/v1/referrals/{pid}/invite"),
+        Some(tok_a),
+        None,
+    )
+    .await;
+    assert_eq!(v2["code"], code);
+    let (st, _) = call(&app, "GET", "/v1/referrals/nope/invite", Some(tok_a), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // redeem: own code 400, malformed 400, unknown 404, success pays both sides
+    let p = format!("/v1/referrals/{pid}/redeem");
+    let (st, _) = call(&app, "POST", &p, Some(tok_a), Some(json!({"code": code}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &p,
+        Some(&users[1].1),
+        Some(json!({"code": "zz"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &p,
+        Some(&users[1].1),
+        Some(json!({"code": "AAAA-AAAA"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let lower = code.to_lowercase().replace('-', " ");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &p,
+        Some(&users[1].1),
+        Some(json!({"code": lower})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["referrer_id"], *inviter);
+    assert_eq!(v["rewards"][0]["amount"], 10, "{v}");
+    assert_eq!(v["referrer_rewards"][0]["amount"], 25, "{v}");
+    assert!(v["milestones"].as_array().unwrap().is_empty());
+    let (st, _) = call(
+        &app,
+        "POST",
+        &p,
+        Some(&users[1].1),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // second referral crosses the milestone (2) → +25 +100 for the inviter
+    let (st, v) = call(
+        &app,
+        "POST",
+        &p,
+        Some(&users[2].1),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["milestones"][0]["count"], 2, "{v}");
+    assert_eq!(v["milestones"][0]["rewards"][0]["amount"], 100, "{v}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(tok_a), None).await;
+    assert!(
+        w["balances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["currency"] == gold && b["balance"] == 150),
+        "{w}"
+    );
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&users[1].1), None).await;
+    assert!(
+        w["balances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["currency"] == gold && b["balance"] == 10),
+        "{w}"
+    );
+    // cap reached → 429 for the third friend
+    let (st, _) = call(
+        &app,
+        "POST",
+        &p,
+        Some(&users[3].1),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+
+    // player views
+    let (st, v) = call(&app, "GET", "/v1/referrals", Some(tok_a), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mine = v["programs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == pid)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["invite_code"], code);
+    assert_eq!(mine["referrals"], 2);
+    assert_eq!(mine["remaining"], 0);
+    assert!(mine["next_milestone"].is_null());
+    assert!(mine["redeemed"].is_null());
+    let (_, v) = call(&app, "GET", "/v1/referrals", Some(&users[1].1), None).await;
+    let theirs = v["programs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == pid)
+        .cloned()
+        .unwrap();
+    assert_eq!(theirs["redeemed"]["referrer_id"], *inviter);
+    assert!(theirs["invite_code"].is_null());
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/referrals/{pid}/referrals"),
+        Some(tok_a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["referrals"].as_array().unwrap().len(), 2);
+    let rid = v["referrals"][0]["id"].as_str().unwrap().to_string();
+
+    // operator: stats, list, void
+    let (st, v) = call_server(&app, "GET", &base, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["active"], true);
+    assert_eq!(v["stats"]["accepted"], 2);
+    assert_eq!(v["stats"]["referrers"], 1);
+    assert_eq!(v["stats"]["invite_codes"], 1);
+    assert_eq!(v["stats"]["top_referrers"][0]["referrals"], 2);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/referrals?referrer={inviter}&status=accepted"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["referrals"].as_array().unwrap().len(), 2);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/referrals?status=weird"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/referrals/{rid}/void"),
+        k,
+        Some(json!({"reason": "fraud ring"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "voided");
+    assert_eq!(v["void_reason"], "fraud ring");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/referrals/{rid}/void"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/referrals/{}/void", uuid::Uuid::now_v7()),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // voided frees a slot: the third friend can now be referred
+    let (st, v) = call(
+        &app,
+        "POST",
+        &p,
+        Some(&users[3].1),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{inviter}/referrals"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let row = v["programs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == pid)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["referrals"], 2);
+    assert_eq!(row["voided"], 1);
+
+    // window: a program that ended → 409; disabled → invisible to clients
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &base,
+        k,
+        Some(json!({"starts_at": 1_000, "ends_at": 2_000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("rf9")})),
+    )
+    .await;
+    let (st, _) = call(
+        &app,
+        "POST",
+        &p,
+        Some(u["access_token"].as_str().unwrap()),
+        Some(json!({"code": code})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call_server(&app, "PUT", &base, k, Some(json!({"enabled": false}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/referrals/{pid}/invite"),
+        Some(tok_a),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=referral.accepted,referral.redeemed,referral.voided&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    for kind in ["referral.accepted", "referral.redeemed", "referral.voided"] {
+        assert!(
+            ev["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| (e["code"] == kind || e["kind"] == kind)
+                    && (e["payload"]["program_id"] == pid || e["data"]["program_id"] == pid)),
+            "{kind} missing"
+        );
+    }
+    let (st, _) = call_server(&app, "DELETE", &base, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "DELETE", &base, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", "/v1/referrals", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
