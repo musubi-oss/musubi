@@ -44,6 +44,15 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     )
     .await?;
     let server_logs = purge(db, "musubi.server_logs", &age("at"), cfg.server_logs_days).await?;
+    let session_baggage = sqlx::query(
+        "delete from musubi.session_baggage b where not exists
+           (select 1 from musubi.sessions s
+             where s.family = b.family and s.revoked_at is null and s.expires_at > now())",
+    )
+    .execute(db)
+    .await
+    .map_err(musubi_core::Error::internal)?
+    .rows_affected();
     let fleet_events = purge(
         db,
         "musubi.fleet_events",
@@ -164,7 +173,7 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     .map_err(Error::internal)?
     .rows_affected();
     Ok(json!({
-        "events": events, "crash_reports": crash_reports, "server_logs": server_logs, "fleet_events": fleet_events, "matchmaker_log": mm_log, "analytics_events": analytics_events, "webhook_deliveries": deliveries, "audit_log": audit, "game_sessions": game_sessions,
+        "events": events, "crash_reports": crash_reports, "server_logs": server_logs, "session_baggage": session_baggage, "fleet_events": fleet_events, "matchmaker_log": mm_log, "analytics_events": analytics_events, "webhook_deliveries": deliveries, "audit_log": audit, "game_sessions": game_sessions,
         "notifications": notifications, "chat_messages": chat, "sessions": sessions, "idempotency": idempotency, "storage_objects": storage, "resumable_sessions": resumable,
         "match_journal": match_journal, "world_journal": world_journal, "world_history": world_history, "replays": replays,
     }))

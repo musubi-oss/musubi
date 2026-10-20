@@ -9,6 +9,7 @@ pub mod async_mm;
 pub mod audiences;
 mod auth;
 pub mod auth_providers;
+pub mod baggage;
 mod bans;
 pub mod build_artifacts;
 pub mod challenges;
@@ -293,6 +294,7 @@ pub fn router(state: AppState) -> Router {
         .merge(bans::routes())
         .merge(group_pools::routes())
         .merge(challenges::routes())
+        .merge(baggage::routes())
         .merge(developers::routes())
         .merge(donations::routes())
         .merge(egress::routes())

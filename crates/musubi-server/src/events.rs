@@ -34,6 +34,9 @@ pub struct Events {
     /// Per-account `{experiment_id: variant}` of running experiments, stamped onto account-bound
     /// events so analytics can split every metric by variant (cached for 60 s).
     experiments: ExperimentCtxCache,
+    /// Per-account `service` session baggage (latest write per key across live sessions),
+    /// stamped as `baggage` onto account-bound events (cached for 60 s).
+    baggage: ExperimentCtxCache,
 }
 
 const EXPERIMENT_CTX_TTL: Duration = Duration::from_secs(60);
@@ -114,7 +117,38 @@ impl Events {
             mailer: Default::default(),
             analytics: Default::default(),
             experiments: Default::default(),
+            baggage: Default::default(),
         }
+    }
+
+    /// Forget cached `service` baggage of an account (set / cleared by the server).
+    pub fn invalidate_baggage(&self, account: AccountId) {
+        self.baggage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&account);
+    }
+
+    /// `service` session baggage of the account's live sessions, cached for 60 s.
+    pub async fn baggage_context(&self, account: AccountId) -> std::sync::Arc<Value> {
+        if let Some((at, v)) = self
+            .baggage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&account)
+        {
+            if at.elapsed() < EXPERIMENT_CTX_TTL {
+                return v.clone();
+            }
+        }
+        let m = crate::http::baggage::service_context(&self.db, account)
+            .await
+            .unwrap_or_default();
+        let v = std::sync::Arc::new(Value::Object(m));
+        let mut g = self.baggage.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|_, (at, _)| at.elapsed() < EXPERIMENT_CTX_TTL);
+        g.insert(account, (std::time::Instant::now(), v.clone()));
+        v
     }
 
     /// Forget cached experiment context (assignments or experiment status changed).
@@ -187,6 +221,12 @@ impl Events {
                 let ctx = self.experiment_context(a).await;
                 if ctx.as_object().is_some_and(|m| !m.is_empty()) {
                     payload["experiments"] = (*ctx).clone();
+                }
+            }
+            if payload.is_object() && payload.get("baggage").is_none() {
+                let ctx = self.baggage_context(a).await;
+                if ctx.as_object().is_some_and(|m| !m.is_empty()) {
+                    payload["baggage"] = (*ctx).clone();
                 }
             }
         }

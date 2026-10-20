@@ -39719,3 +39719,309 @@ async fn developer_players_bypass_maintenance_and_get_virtual_audience() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn session_baggage_scopes_limits_and_event_stamp() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, a) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": unique("bag-a")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let (st, b) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": unique("bag-b")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st, c) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": unique("bag-c")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let (ta, tb, tc) = (
+        a["access_token"].as_str().unwrap().to_string(),
+        b["access_token"].as_str().unwrap().to_string(),
+        c["access_token"].as_str().unwrap().to_string(),
+    );
+    let (aid, bid) = (
+        a["account_id"].as_str().unwrap().to_string(),
+        b["account_id"].as_str().unwrap().to_string(),
+    );
+
+    // empty
+    let (st, v) = call(&app, "GET", "/v1/session/baggage", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["baggage"]["social"], json!({}));
+    assert_eq!(v["limits"]["entries_per_scope"], 32);
+    // validation
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/nope",
+        Some(&ta),
+        Some(json!({"entries": {"a": 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/service",
+        Some(&ta),
+        Some(json!({"entries": {"a": 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/social",
+        Some(&ta),
+        Some(json!({"entries": {"x".repeat(65): 1}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/social",
+        Some(&ta),
+        Some(json!({"entries": {"big": "y".repeat(1100)}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v.to_string().contains("baggage_entry_limit_exceeded"),
+        "{v}"
+    );
+    let many: serde_json::Map<String, Value> =
+        (0..33).map(|i| (format!("k{i}"), json!(i))).collect();
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/social",
+        Some(&ta),
+        Some(json!({"entries": many})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v.to_string().contains("baggage_entry_limit_exceeded"),
+        "{v}"
+    );
+    let fat: serde_json::Map<String, Value> = (0..20)
+        .map(|i| (format!("f{i}"), json!("z".repeat(1000))))
+        .collect();
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/game",
+        Some(&ta),
+        Some(json!({"entries": fat})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v.to_string().contains("baggage_total_limit_exceeded"),
+        "{v}"
+    );
+    // set + merge + remove with null
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/social",
+        Some(&ta),
+        Some(json!({"entries": {"mood": "grinding", "party": "p1"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"]["mood"], "grinding");
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/social",
+        Some(&ta),
+        Some(json!({"entries": {"party": null, "lfg": true}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"], json!({"mood": "grinding", "lfg": true}));
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/session/baggage/game",
+        Some(&ta),
+        Some(json!({"entries": {"loadout": "sniper"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(&app, "GET", "/v1/session/baggage", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["baggage"]["social"]["lfg"], true);
+    assert_eq!(v["baggage"]["game"]["loadout"], "sniper");
+    // a stranger can't read social baggage; a mutual friend can (social only)
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/accounts/{aid}/baggage"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&ta),
+        Some(json!({"ids": [bid]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&tb),
+        Some(json!({"ids": [aid]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/accounts/{aid}/baggage"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["online"], true);
+    assert_eq!(v["social"]["mood"], "grinding");
+    assert!(v.get("game").is_none(), "{v}");
+    // server view + service scope set by the server on every live session
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{aid}/baggage"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["live_sessions"], 1);
+    assert_eq!(v["baggage"]["game"]["loadout"], "sniper");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/accounts/{aid}/baggage/weird"),
+        k,
+        Some(json!({"entries": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!(
+            "/v1/server/accounts/{}/baggage/service",
+            uuid::Uuid::now_v7()
+        ),
+        k,
+        Some(json!({"entries": {}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/accounts/{aid}/baggage/service"),
+        k,
+        Some(json!({"entries": {"build": "1.4.2-rc1", "cohort": "beta"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["sessions"], 1);
+    let (st, v) = call(&app, "GET", "/v1/session/baggage", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["baggage"]["service"]["build"], "1.4.2-rc1");
+    // stamped onto account-bound events
+    let (st, v) = call(
+        &app,
+        "PATCH",
+        "/v1/account",
+        Some(&ta),
+        Some(json!({"display_name": "Bag Carrier"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mut stamped = false;
+    for _ in 0..20 {
+        let (st, ev) = call_server(
+            &app,
+            "GET",
+            "/v1/server/events?kinds=account.profile_updated&limit=1000",
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{ev}");
+        if ev["events"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|e| e["account_id"] == aid && e["payload"]["baggage"]["cohort"] == "beta")
+        }) {
+            stamped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(stamped, "service baggage not stamped onto events");
+    // clear scopes
+    let (st, v) = call(
+        &app,
+        "DELETE",
+        "/v1/session/baggage/social",
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], 2);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        "/v1/session/baggage/service",
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/accounts/{aid}/baggage/service"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], 2);
+    let (st, v) = call(&app, "GET", "/v1/session/baggage", Some(&ta), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["baggage"]["social"], json!({}));
+    assert_eq!(v["baggage"]["service"], json!({}));
+    assert_eq!(v["baggage"]["game"]["loadout"], "sniper");
+}
