@@ -89,6 +89,7 @@ pub mod system_logs;
 pub mod timers;
 pub mod tournaments;
 mod turns;
+pub mod tutorials;
 mod tx;
 mod ugc;
 mod vip;
@@ -238,6 +239,7 @@ pub fn router(state: AppState) -> Router {
         .merge(audiences::router())
         .merge(news::router())
         .merge(effects::router())
+        .merge(tutorials::router())
         .merge(session_vars::router())
         .merge(qa_clock::router())
         .merge(countries::router())

@@ -41903,3 +41903,305 @@ async fn fleet_install_script_runs_once_per_build() {
         assert_eq!(st, StatusCode::OK);
     }
 }
+
+/// Tutorial sequences (Hiro parity): a server-defined tutorial with `start_step`/`max_step` and a
+/// reward table; the player accepts, advances monotonically, completes (reward granted once) or
+/// declines/abandons on the way; reset reads as `none` again but counts; every transition emits a
+/// `tutorial.*` event; the server sees per-tutorial progress and per-account state.
+#[tokio::test]
+async fn tutorial_sequences_step_tracking() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let gold = unique("tgold");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold", "max_balance": 100000})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let table = unique("ttab");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/rewards/tables",
+        k,
+        Some(
+            json!({"id": table, "name": "Tutorial reward", "kind": "guaranteed",
+            "entries": [{"currency": gold, "amount": 25}]}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let tid = unique("tut").to_lowercase();
+    let base = format!("/v1/server/tutorials/{tid}");
+    for (path, body) in [
+        (
+            "/v1/server/tutorials/Bad%20Id".to_string(),
+            json!({"max_step": 3}),
+        ),
+        (base.clone(), json!({"max_step": 0})),
+        (base.clone(), json!({"start_step": 5, "max_step": 3})),
+        (base.clone(), json!({"max_step": 10_001})),
+        (base.clone(), json!({"max_step": 3, "labels": [""]})),
+        (base.clone(), json!({"max_step": 3, "metadata": 1})),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{path} {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &base,
+        k,
+        Some(json!({"max_step": 3, "reward_table": "nope-table"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &base,
+        k,
+        Some(json!({"title": "Movement", "start_step": 1, "max_step": 3,
+            "reward_table": table, "labels": ["onboarding"], "metadata": {"scene": "intro"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], tid);
+    assert_eq!(v["max_step"], 3);
+    assert_eq!(v["reward_table"], table);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        "/v1/server/tutorials?label=onboarding",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["tutorials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["id"] == tid));
+
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("tu")})),
+    )
+    .await;
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call(&app, "GET", "/v1/tutorials", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mine = v["tutorials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == tid)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["state"], "none", "{mine}");
+    assert_eq!(mine["step"], 1);
+
+    let p = format!("/v1/tutorials/{tid}");
+    // step before accepting / abandon from none → 409; unknown → 404
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("{p}/step"),
+        Some(&tok),
+        Some(json!({"step": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, _) = call(&app, "POST", &format!("{p}/abandon"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call(&app, "POST", "/v1/tutorials/nope/accept", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // reset with no progress → 404
+    let (st, _) = call(&app, "POST", &format!("{p}/reset"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, v) = call(&app, "POST", &format!("{p}/accept"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "accepted");
+    assert_eq!(v["step"], 1);
+    let (st, _) = call(&app, "POST", &format!("{p}/accept"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // backwards / over max / no step → 400
+    for body in [json!({"step": 1}), json!({"step": 4}), json!({})] {
+        let (st, v) = call(&app, "PUT", &format!("{p}/step"), Some(&tok), Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("{p}/step"),
+        Some(&tok),
+        Some(json!({"step": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "accepted");
+    assert_eq!(v["step"], 2);
+    assert!(v.get("rewards").is_none());
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("{p}/step"),
+        Some(&tok),
+        Some(json!({"complete": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "completed");
+    assert_eq!(v["step"], 3);
+    assert!(v["completed_at"].is_string());
+    assert_eq!(v["rewards"][0]["amount"], 25, "{v}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tok), None).await;
+    assert!(
+        w["balances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["currency"] == gold && b["balance"] == 25),
+        "{w}"
+    );
+    // completed: no more steps, decline refused
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("{p}/step"),
+        Some(&tok),
+        Some(json!({"step": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call(&app, "POST", &format!("{p}/decline"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // server views
+    let (st, v) = call_server(&app, "GET", &base, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["counts"]["completed"], 1, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/progress?state=completed"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["progress"][0]["account_id"], me);
+    assert_eq!(v["progress"][0]["step"], 3);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/progress?state=weird"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{me}/tutorials"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let row = v["tutorials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == tid)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["state"], "completed");
+
+    // reset → none again, counted; accept again, decline; a second completion does not re-pay here
+    let (st, v) = call(&app, "POST", &format!("{p}/reset"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "none");
+    assert_eq!(v["step"], 1);
+    assert_eq!(v["resets"], 1);
+    assert!(v["completed_at"].is_null());
+    let (st, _) = call(&app, "POST", &format!("{p}/reset"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v) = call(&app, "POST", &format!("{p}/accept"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(&app, "POST", &format!("{p}/decline"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["state"], "declined");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/accounts/{me}/tutorials/{tid}/reset"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["resets"], 2);
+
+    // disabled tutorial disappears for the client, still visible to the server
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &base,
+        k,
+        Some(json!({"max_step": 3, "enabled": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", &p, Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "GET", &base, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=tutorial.accepted,tutorial.step,tutorial.completed,tutorial.reset,tutorial.declined&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    let mine: Vec<&Value> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["payload"]["tutorial_id"] == tid || e["data"]["tutorial_id"] == tid)
+        .collect();
+    for kind in [
+        "tutorial.accepted",
+        "tutorial.step",
+        "tutorial.completed",
+        "tutorial.reset",
+        "tutorial.declined",
+    ] {
+        assert!(
+            mine.iter().any(|e| e["code"] == kind || e["kind"] == kind),
+            "{kind} missing: {ev}"
+        );
+    }
+
+    let (st, _) = call_server(&app, "DELETE", &base, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "DELETE", &base, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", "/v1/tutorials", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
