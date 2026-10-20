@@ -44022,3 +44022,230 @@ async fn account_privacy_profile_and_inventory_visibility() {
     let (st, _) = call(&app, "GET", "/v1/account/privacy", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Content tags (Beamable parity): add/remove/set on content rows, lookups, tag-filtered export,
+/// omit_tags, tags travel in bundles, drop tag.
+#[tokio::test]
+async fn content_tags_update_lookup_export_filter_and_drop() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (cur, item, item2) = (
+        format!("ct{sfx}"),
+        format!("tagged-{sfx}"),
+        format!("plain-{sfx}"),
+    );
+    let tag = format!("feat-{}", &sfx[..10]);
+    let seed = json!({"format": 1, "tables": {
+        "currencies": [{"code": cur, "name": "Tag Gold", "max_balance": 1000}],
+        "items": [{"id": item, "name": "Sword", "category": "weapon"}, {"id": item2, "name": "Shield", "category": "armor"}],
+    }});
+    let (st, r) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/content/import",
+        k,
+        Some(json!({"bundle": seed})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    for body in [
+        json!({"entries": [], "add": [&tag]}),
+        json!({"entries": [{"table": "items", "id": item}]}),
+        json!({"entries": [{"table": "items", "id": item}], "add": ["Bad Tag"]}),
+        json!({"entries": [{"table": "items", "id": item}], "add": ["a"], "set": ["b"]}),
+        json!({"entries": [{"table": "accounts", "id": item}], "add": ["a"]}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", "/v1/admin/content/tags", k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/content/tags",
+        k,
+        Some(json!({"entries": [{"table": "items", "id": format!("nope-{sfx}")}], "add": [&tag]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/content/tags",
+        k,
+        Some(json!({
+        "entries": [{"table": "items", "id": item}, {"table": "currencies", "id": cur}],
+        "add": [&tag, "season-4"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(v["entries"][1]["tags"], json!([&tag, "season-4"]));
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/content/tags",
+        k,
+        Some(json!({
+        "entries": [{"table": "currencies", "id": cur}], "remove": ["season-4"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"][0]["tags"], json!([&tag]));
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/content/tags?tag={tag}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/content/tags?tag={tag}&table=items"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(v["entries"][0]["tags"], json!([&tag, "season-4"]));
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/admin/content/tags?table=accounts",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("ct")})),
+    )
+    .await;
+    let tok = u["access_token"].as_str().unwrap();
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/content/tags/{tag}?table=items"),
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"], json!([{"table": "items", "id": item}]));
+    let (st, b) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/content?tags={tag}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let ids = |t: &str, key: &str| -> Vec<String> {
+        b["tables"][t]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[key].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids("items", "id"),
+        vec![item.clone()],
+        "only tagged item exported"
+    );
+    assert_eq!(ids("currencies", "code"), vec![cur.clone()]);
+    assert!(
+        b["tables"]["content_tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["tag"] == tag),
+        "{b}"
+    );
+    assert_eq!(b["tables"]["content_tags"].as_array().unwrap().len(), 2);
+    let (st, b) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/admin/content?tags={tag}&omit_tags=true"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(b["tables"].get("content_tags").is_none(), "{b}");
+    let (st, _) = call_server(&app, "GET", "/v1/admin/content?tags=Bad", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, b) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        b["tables"]["content_tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["entry_key"] == item2 || r["entry_key"] == item),
+        "tags travel in the full bundle"
+    );
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/content/tags",
+        k,
+        Some(json!({
+        "entries": [{"table": "items", "id": item}], "set": ["x-only"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"][0]["tags"], json!(["x-only"]));
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/content/tags/{tag}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["removed"], 1);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/admin/content/tags/{tag}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/content/tags/{tag}"),
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(v["entries"].as_array().unwrap().is_empty());
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/admin/content/tags",
+        k,
+        Some(json!({
+        "entries": [{"table": "items", "id": item}], "set": []})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["entries"][0]["tags"], json!([]));
+    let (st, _) = call(&app, "GET", "/v1/content/tags/x", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

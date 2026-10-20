@@ -38,6 +38,7 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
             "entitlements",
             "iap_products",
             "leaderboards",
+            "content_tags",
         ],
     ),
     (
@@ -50,6 +51,29 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
 ];
+
+/// Tags on content entries; last in the content section so entries exist before their tags.
+pub(crate) const TAGS_TABLE: &str = "content_tags";
+
+/// Export filter: keep only entries carrying one of `tags`; drop the tag table when `omit`.
+#[derive(Default)]
+pub(crate) struct TagFilter {
+    pub(crate) tags: Vec<String>,
+    pub(crate) omit: bool,
+}
+
+/// Row key as stored in `content_tags.entry_key`: the plain primary-key value for single-column
+/// keys, else the `|`-joined export key.
+pub(crate) fn entry_key(row: &Value, pk: &[String]) -> String {
+    if pk.len() == 1 {
+        return match row.get(&pk[0]) {
+            Some(Value::String(s)) => s.clone(),
+            Some(v) => v.to_string(),
+            None => String::new(),
+        };
+    }
+    key_of(row, pk)
+}
 
 fn all_tables() -> Vec<&'static str> {
     SECTIONS
@@ -205,10 +229,42 @@ pub(crate) async fn export_bundle(
     sections: &[String],
     environment: &str,
 ) -> Result<Value, Error> {
+    export_bundle_with(tx, sections, environment, &TagFilter::default()).await
+}
+
+pub(crate) async fn export_bundle_with(
+    tx: &mut Tx<'_>,
+    sections: &[String],
+    environment: &str,
+    f: &TagFilter,
+) -> Result<Value, Error> {
     let mut tables = Map::new();
     for t in tables_of(sections)? {
+        if t == TAGS_TABLE && f.omit {
+            continue;
+        }
         let sh = shape(tx, t).await?;
-        tables.insert(t.to_string(), Value::Array(rows(tx, t, &sh).await?));
+        let mut rs = rows(tx, t, &sh).await?;
+        if !f.tags.is_empty() {
+            if t == TAGS_TABLE {
+                rs.retain(|r| {
+                    r["tag"]
+                        .as_str()
+                        .is_some_and(|x| f.tags.iter().any(|y| y == x))
+                });
+            } else {
+                let keys: Vec<(String,)> = sqlx::query_as(
+                    "select distinct entry_key from musubi.content_tags where table_name = $1 and tag = any($2)",
+                )
+                .bind(t)
+                .bind(&f.tags)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(Error::internal)?;
+                rs.retain(|r| keys.iter().any(|(k,)| *k == entry_key(r, &sh.pk)));
+            }
+        }
+        tables.insert(t.to_string(), Value::Array(rs));
     }
     let (at,): (String,) = sqlx::query_as("select now()::text")
         .fetch_one(&mut **tx)
@@ -552,6 +608,12 @@ async fn after_import(s: &AppState, after: &Value) {
 struct ExportQuery {
     /// Comma-separated sections (`content`, `config`); default `content`.
     sections: String,
+    /// Comma-separated tags: export only entries carrying one of them (tag-based content query).
+    #[serde(default)]
+    tags: String,
+    /// Leave the `content_tags` table out of the bundle.
+    #[serde(default)]
+    omit_tags: bool,
 }
 
 async fn export(
@@ -568,8 +630,21 @@ async fn export(
             .filter(|x| !x.is_empty())
             .collect()
     };
+    let tags: Vec<String> = q
+        .tags
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    for t in &tags {
+        super::content_tags::valid_tag(t)?;
+    }
+    let f = TagFilter {
+        tags,
+        omit: q.omit_tags,
+    };
     let mut tx = s.db.begin().await.map_err(Error::internal)?;
-    let b = export_bundle(&mut tx, &sections, &s.cfg.node.environment).await?;
+    let b = export_bundle_with(&mut tx, &sections, &s.cfg.node.environment, &f).await?;
     tx.rollback().await.map_err(Error::internal)?;
     Ok(Json(b))
 }
