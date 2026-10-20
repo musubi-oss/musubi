@@ -44458,3 +44458,468 @@ async fn leaderboard_race_cohorts_finish_time_limit_and_reroll() {
     let (st, _) = call(&app, "GET", &coh, None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Hero classes and heroes: class validation and CRUD, hero limits/default, equip rules (item
+/// slots, class slots, can/can't equip), moving an entry between heroes, unequip, privacy of
+/// other players' loadouts, default re-assignment on delete, class cascade.
+#[tokio::test]
+async fn hero_classes_heroes_loadouts_and_privacy() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let cls = unique("knight").replace('-', "_");
+    let bad = [
+        json!({"name": ""}),
+        json!({"name": "Knight", "slots": ["bad slot"]}),
+        json!({"name": "Knight", "max_per_player": 0}),
+        json!({"name": "Knight", "can_equip": {"categories": "weapon"}}),
+    ];
+    for body in bad {
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/server/hero_classes/{cls}"),
+            k,
+            Some(body),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (sword, helm, cursed, potion, ring) = (
+        unique("sw"),
+        unique("hm"),
+        unique("cu"),
+        unique("po"),
+        unique("ri"),
+    );
+    for (id, cat, slots, bind) in [
+        (&sword, "weapon", json!(["main_hand"]), "none"),
+        (&helm, "armor", json!(["head"]), "equip"),
+        (&cursed, "weapon", json!(["main_hand"]), "none"),
+        (&potion, "consumable", json!([]), "none"),
+        (&ring, "trinket", json!(["ring_left", "ring_right"]), "none"),
+    ] {
+        let (st, v) = call_server(&app, "POST", "/v1/server/items", k,
+            Some(json!({"id": id, "name": id, "category": cat, "stackable": false, "slots": slots, "bind": bind}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (st, v) = call_server(&app, "PUT", &format!("/v1/server/hero_classes/{cls}"), k, Some(json!({
+        "name": "Knight", "slots": ["main_hand", "head", "ring_left"], "max_per_player": 2,
+        "can_equip": {"categories": ["weapon", "armor", "trinket"]}, "cant_equip": {"items": [cursed]}}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["max_per_player"], 2);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/hero_classes/{cls}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["heroes"], 0);
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("hero")})),
+    )
+    .await;
+    let (tok, me) = (
+        u["access_token"].as_str().unwrap().to_string(),
+        u["account_id"].as_str().unwrap().to_string(),
+    );
+    let (_, o) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("hero2")})),
+    )
+    .await;
+    let other = o["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call(&app, "GET", "/v1/hero_classes", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        v["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == cls),
+        "{v}"
+    );
+    for id in [&sword, &helm, &cursed, &potion, &ring] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/inventory/grant",
+            k,
+            Some(json!({"account_id": me, "item_id": id, "quantity": 1})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    let entry = |item: &str| -> String {
+        inv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["item_id"] == item)
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    // heroes: unknown class, bad name, create (first = default), second, third → 409
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/heroes",
+        Some(&tok),
+        Some(json!({"class_id": "nope", "name": "x"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/heroes",
+        Some(&tok),
+        Some(json!({"class_id": cls, "name": ""})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, h1) = call(
+        &app,
+        "POST",
+        "/v1/heroes",
+        Some(&tok),
+        Some(json!({"class_id": cls, "name": "Sir A"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h1}");
+    assert_eq!(h1["default"], true);
+    assert_eq!(h1["class_name"], "Knight");
+    let (st, h2) = call(
+        &app,
+        "POST",
+        "/v1/heroes",
+        Some(&tok),
+        Some(json!({"class_id": cls, "name": "Sir B"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h2}");
+    assert_eq!(h2["default"], false);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/heroes",
+        Some(&tok),
+        Some(json!({"class_id": cls, "name": "Sir C"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (hid1, hid2) = (
+        h1["id"].as_str().unwrap().to_string(),
+        h2["id"].as_str().unwrap().to_string(),
+    );
+    let (st, v) = call(&app, "GET", "/v1/heroes/default", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], hid1);
+    // equip rules
+    let eq1 = format!("/v1/heroes/{hid1}/equip");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&potion)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&helm), "slot": "main_hand"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&cursed)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("cannot equip"), "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&ring)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("several slots"), "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&ring), "slot": "ring_right"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "class has no ring_right: {v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": uuid::Uuid::now_v7()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&sword)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["loadout"][0]["slot"], "main_hand");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&helm)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["loadout"].as_array().unwrap().len(), 2);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &eq1,
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&ring), "slot": "ring_left"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["loadout"].as_array().unwrap().len(), 3);
+    // bind-on-equip helm is bound now
+    let (_, inv2) = call(&app, "GET", "/v1/inventory", Some(&tok), None).await;
+    let helm_e = inv2["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["item_id"] == helm)
+        .unwrap();
+    assert_eq!(helm_e["bound"], true, "{helm_e}");
+    // the sword moves to hero 2
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/heroes/{hid2}/equip"),
+        Some(&tok),
+        Some(json!({"inventory_id": entry(&sword)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["loadout"][0]["item_id"], sword);
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/heroes/{hid1}/loadout"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        v["loadout"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["item_id"] != sword),
+        "{v}"
+    );
+    assert_eq!(v["loadout"].as_array().unwrap().len(), 2);
+    let (st, v) = call(&app, "GET", "/v1/heroes", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["heroes"][0]["id"], hid1, "default first");
+    assert_eq!(v["heroes"][0]["equipped"], 2);
+    // another player sees them while inventory is public, not once private
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/{me}/heroes"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["heroes"].as_array().unwrap().len(), 2);
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/{me}/heroes/default/loadout"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["loadout"].as_array().unwrap().len(), 2);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/account/privacy",
+        Some(&tok),
+        Some(json!({"inventory": "private"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/{me}/heroes"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/users/{me}/heroes/{hid1}/loadout"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // unequip by slot, then nothing left there
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/heroes/{hid1}/unequip"),
+        Some(&tok),
+        Some(json!({"slot": "head"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["loadout"].as_array().unwrap().len(), 1);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/heroes/{hid1}/unequip"),
+        Some(&tok),
+        Some(json!({"slot": "head"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/heroes/{hid1}/unequip"),
+        Some(&tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // rename + make hero 2 default; delete hero 2 → hero 1 default again
+    let (st, v) = call(
+        &app,
+        "PUT",
+        &format!("/v1/heroes/{hid2}"),
+        Some(&tok),
+        Some(json!({"name": "Sir Bee", "default": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "Sir Bee");
+    assert_eq!(v["default"], true);
+    let (st, v) = call(&app, "GET", &format!("/v1/heroes/{hid1}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["default"], false);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("/v1/heroes/{hid2}"),
+        Some(&tok),
+        Some(json!({"default": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/heroes/{hid2}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(&app, "GET", "/v1/heroes/default", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], hid1);
+    let (st, _) = call(&app, "GET", &format!("/v1/heroes/{hid2}"), Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // server view, events, class cascade
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{me}/heroes"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["heroes"].as_array().unwrap().len(), 1);
+    assert_eq!(v["heroes"][0]["loadout"].as_array().unwrap().len(), 1);
+    let (st, ev) = call_server(&app, "GET", "/v1/server/events?kinds=hero.created,hero.equipped,hero.unequipped,hero.deleted,hero.updated&limit=1000", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let kinds: Vec<String> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str().map(String::from))
+        .collect();
+    for want in [
+        "hero.created",
+        "hero.equipped",
+        "hero.unequipped",
+        "hero.deleted",
+        "hero.updated",
+    ] {
+        assert!(kinds.iter().any(|x| x == want), "{want}: {kinds:?}");
+    }
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/hero_classes/{cls}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/hero_classes/{cls}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(&app, "GET", "/v1/heroes", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(v["heroes"].as_array().unwrap().is_empty(), "{v}");
+    let (st, _) = call(&app, "GET", "/v1/heroes", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
