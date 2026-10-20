@@ -763,6 +763,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 - **Custom incident kinds** — crash reports accept `connection`, `exception` and game-defined `custom.<name>` incidents, grouped and filtered like crashes.
 - **Client patch versions per logic version** — per-platform min/latest patch for each protocol version, hotfix bump and retirement endpoints, folded into the client version gate.
 - **Deletion ledger** — deleted accounts that come back from a backup are re-deleted automatically; export/import the ledger, lift entries on purpose.
+- **Explicit matchmaking sort** — queue `sort: absolute|distance` on any numeric property decides which candidates a match fills from first (FlexMatch absoluteSort / distanceSort).
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

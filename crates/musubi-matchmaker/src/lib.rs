@@ -1428,9 +1428,34 @@ fn greedy_queue(
                 bump(reason);
                 continue;
             }
-            let d = match (cfg.mmr_of(seed), cfg.mmr_of(t)) {
-                (Some(a), Some(b)) => (a - b).abs(),
-                _ => 0.0,
+            let d = match &cfg.sort {
+                // explicit sort (FlexMatch absoluteSort / distanceSort); missing property -> last
+                Some(s) => {
+                    let v = t.props.numbers.get(s.property.as_str()).copied();
+                    match (s.kind.as_str(), v) {
+                        ("distance", Some(v)) => {
+                            let anchor = seed
+                                .props
+                                .numbers
+                                .get(s.property.as_str())
+                                .copied()
+                                .unwrap_or(v);
+                            (anchor - v).abs()
+                        }
+                        ("absolute", Some(v)) => {
+                            if s.order == "desc" {
+                                -v
+                            } else {
+                                v
+                            }
+                        }
+                        _ => f64::INFINITY,
+                    }
+                }
+                None => match (cfg.mmr_of(seed), cfg.mmr_of(t)) {
+                    (Some(a), Some(b)) => (a - b).abs(),
+                    _ => 0.0,
+                },
             };
             cands.push((c, d));
         }
@@ -1705,6 +1730,90 @@ mod tests {
         };
         assert_eq!(mm.remove_session(s2), vec![id2]);
         assert_eq!(mm.ticket_count(), 0);
+    }
+
+    #[test]
+    fn explicit_sort_absolute_and_distance_pick_candidates_in_order() {
+        use crate::queue::SortRule;
+        let sort = |kind: &str, order: &str| {
+            Some(SortRule {
+                kind: kind.into(),
+                property: "skill".into(),
+                order: order.into(),
+            })
+        };
+        for (kind, order) in [("weird", ""), ("absolute", "sideways")] {
+            assert!(Matchmaker::new(Duration::ZERO)
+                .with_queues(vec![QueueConfig {
+                    name: "bad".into(),
+                    min_count: 2,
+                    max_count: 2,
+                    sort: sort(kind, order),
+                    ..Default::default()
+                }])
+                .is_err());
+        }
+        let mm = Matchmaker::new(Duration::ZERO)
+            .with_queues(vec![
+                QueueConfig {
+                    name: "top".into(),
+                    min_count: 2,
+                    max_count: 2,
+                    sort: sort("absolute", "desc"),
+                    ..Default::default()
+                },
+                QueueConfig {
+                    name: "near".into(),
+                    min_count: 2,
+                    max_count: 2,
+                    sort: sort("distance", ""),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+        let t0 = Instant::now();
+        let mk = |queue: &str, skill: Option<f64>, age_ms: u64| {
+            let mut c = cand("eu", 1000.0);
+            c.string_properties.insert("queue".into(), queue.into());
+            if let Some(s) = skill {
+                c.numeric_properties.insert("skill".into(), s);
+            }
+            (
+                ticket(vec![c], "", 2, 2),
+                t0 + Duration::from_millis(age_ms),
+            )
+        };
+        // absolute desc: the oldest ticket seeds (skill 10), the highest-skill candidate joins
+        for (skill, age) in [
+            (Some(10.0), 0),
+            (Some(50.0), 10),
+            (Some(90.0), 20),
+            (None, 30),
+        ] {
+            let (t, at) = mk("top", skill, age);
+            mm.add_at(t, at).unwrap();
+        }
+        let m = mm.process_at(t0 + Duration::from_secs(1));
+        assert_eq!(m.len(), 2, "{m:?}");
+        let first: Vec<f64> = m[0]
+            .tickets
+            .iter()
+            .filter_map(|t| t.props.numbers.get("skill").copied())
+            .collect();
+        assert!(first.contains(&10.0) && first.contains(&90.0), "{first:?}");
+        // distance: seed skill 10 picks the closest (12) over the older 50
+        for (skill, age) in [(Some(10.0), 0), (Some(50.0), 10), (Some(12.0), 20)] {
+            let (t, at) = mk("near", skill, age);
+            mm.add_at(t, at).unwrap();
+        }
+        let m = mm.process_at(t0 + Duration::from_secs(1));
+        assert_eq!(m.len(), 1, "{m:?}");
+        let got: Vec<f64> = m[0]
+            .tickets
+            .iter()
+            .filter_map(|t| t.props.numbers.get("skill").copied())
+            .collect();
+        assert!(got.contains(&10.0) && got.contains(&12.0), "{got:?}");
     }
 
     #[test]

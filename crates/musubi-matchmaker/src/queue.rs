@@ -26,6 +26,9 @@ pub struct QueueConfig {
     pub mmr: Option<MmrRule>,
     /// Attribute rules (PlayFab-style): pairwise `difference|match|set_intersection`, group `stddev`.
     pub rules: Vec<AttributeRule>,
+    /// Explicit pre-sort of the candidate batch (FlexMatch `absoluteSort` / `distanceSort`): who
+    /// gets considered first when a seed fills its match.
+    pub sort: Option<SortRule>,
     pub ping: Option<PingRule>,
     /// Per-team (or per-match without teams) maximum per `role`.
     pub roles: BTreeMap<String, usize>,
@@ -109,6 +112,7 @@ impl Default for QueueConfig {
             teams: None,
             mmr: None,
             rules: Vec::new(),
+            sort: None,
             ping: None,
             roles: BTreeMap::new(),
             no_repeat_secs: 0,
@@ -130,6 +134,17 @@ impl Default for QueueConfig {
 pub struct Teams {
     pub count: usize,
     pub size: usize,
+}
+
+/// `absolute`: candidates ordered by a numeric property (`asc` | `desc`), ties by age;
+/// `distance`: candidates ordered by |seed.property - candidate.property|, ties by age (replaces
+/// the default MMR-distance order). Tickets missing the property sort last.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct SortRule {
+    pub kind: String,
+    pub property: String,
+    pub order: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +239,26 @@ fn widen(initial: f64, step: f64, every_secs: u64, max: f64, waited: Duration) -
 
 impl QueueConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(s) = &self.sort {
+            if !["absolute", "distance"].contains(&s.kind.as_str()) {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: sort kind must be absolute|distance",
+                    self.name
+                )));
+            }
+            if s.property.is_empty() || s.property.len() > 64 {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: sort property must be 1..=64 chars",
+                    self.name
+                )));
+            }
+            if !["", "asc", "desc"].contains(&s.order.as_str()) {
+                return Err(Error::InvalidArgument(format!(
+                    "queue {}: sort order must be asc|desc",
+                    self.name
+                )));
+            }
+        }
         for r in &self.rules {
             if !["difference", "match", "set_intersection", "stddev"].contains(&r.kind.as_str()) {
                 return Err(Error::InvalidArgument(format!(
