@@ -38,6 +38,10 @@ pub fn routes() -> Router<AppState> {
             put(put_client_version).delete(delete_client_version),
         )
         .route("/v1/client/version", get(client_version))
+        .route(
+            "/v1/server/client_versions/{platform}/logic/{logic_version}",
+            put(put_logic_rule).delete(delete_logic_rule),
+        )
 }
 
 /// Who is asking: from the query string, falling back to `x-musubi-platform`,
@@ -951,11 +955,75 @@ type CvRow = (
     Value,
     Option<String>,
     i64,
+    Value,
 );
 
-fn cv_doc((platform, min, latest, store, redirects, message, at): &CvRow) -> Value {
+fn cv_doc((platform, min, latest, store, redirects, message, at, logic): &CvRow) -> Value {
     json!({ "platform": platform, "min_version": min, "latest_version": latest, "store_url": store,
-        "redirects": redirects, "message": message, "updated_at": at })
+        "redirects": redirects, "message": message, "updated_at": at, "logic_rules": logic })
+}
+
+/// Per logic (protocol) version: the client patch range a platform still serves. A client whose
+/// logic version has no rule is retired when any rule exists; below `min_patch` it must hotfix.
+#[derive(Deserialize, serde::Serialize, Clone)]
+pub struct LogicRule {
+    pub logic_version: i64,
+    pub min_patch: String,
+    #[serde(default)]
+    pub latest_patch: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+fn validate_logic_rules(rules: &[LogicRule]) -> Result<(), Error> {
+    if rules.len() > 32 {
+        return Err(Error::InvalidArgument("at most 32 logic rules".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for l in rules {
+        if l.logic_version < 0 || !seen.insert(l.logic_version) {
+            return Err(Error::InvalidArgument(
+                "logic_rules: logic_version must be unique and >= 0".into(),
+            ));
+        }
+        if l.min_patch.trim().is_empty() || l.min_patch.len() > 64 {
+            return Err(Error::InvalidArgument(
+                "logic_rules: min_patch required".into(),
+            ));
+        }
+        if let Some(lp) = &l.latest_patch {
+            if cmp_version(&l.min_patch, lp) == Ordering::Greater {
+                return Err(Error::InvalidArgument(format!(
+                    "logic {}: min_patch above latest_patch",
+                    l.logic_version
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a client at (`logic_version`, `version`) should do under `rules`.
+fn logic_gate(rules: &[LogicRule], logic_version: i64, version: &str) -> Value {
+    if rules.is_empty() {
+        return json!({ "logic_version": logic_version, "logic_supported": true, "patch_required": false,
+            "patch_available": false, "logic_configured": false });
+    }
+    let Some(rule) = rules.iter().find(|l| l.logic_version == logic_version) else {
+        let newest = rules.iter().map(|l| l.logic_version).max();
+        return json!({ "logic_version": logic_version, "logic_supported": false, "patch_required": false,
+            "patch_available": false, "logic_configured": true, "newest_logic_version": newest,
+            "logic_message": Value::Null });
+    };
+    let patch_required = cmp_version(version, &rule.min_patch) == Ordering::Less;
+    let patch_available = rule
+        .latest_patch
+        .as_deref()
+        .map(|lp| cmp_version(version, lp) == Ordering::Less)
+        .unwrap_or(false);
+    json!({ "logic_version": logic_version, "logic_supported": true, "patch_required": patch_required,
+        "patch_available": patch_available, "logic_configured": true, "min_patch": rule.min_patch,
+        "latest_patch": rule.latest_patch, "logic_message": rule.message })
 }
 
 #[derive(Deserialize)]
@@ -966,6 +1034,9 @@ struct CvBody {
     #[serde(default)]
     redirects: Vec<Redirect>,
     message: Option<String>,
+    /// Per logic version patch requirements (hotfix workflow: bump `min_patch`).
+    #[serde(default)]
+    logic_rules: Vec<LogicRule>,
 }
 
 #[derive(Deserialize, serde::Serialize, Clone)]
@@ -1001,14 +1072,16 @@ async fn put_client_version(
             return Err(Error::InvalidArgument("min_version above latest_version".into()).into());
         }
     }
+    validate_logic_rules(&b.logic_rules)?;
     let row: CvRow = sqlx::query_as(
-        "insert into musubi.client_versions (platform, min_version, latest_version, store_url, redirects, message)
-         values ($1, $2, $3, $4, $5, $6)
+        "insert into musubi.client_versions (platform, min_version, latest_version, store_url, redirects, message, logic_rules)
+         values ($1, $2, $3, $4, $5, $6, $7)
          on conflict (platform) do update set min_version = excluded.min_version,
              latest_version = excluded.latest_version, store_url = excluded.store_url,
-             redirects = excluded.redirects, message = excluded.message, updated_at = now()
+             redirects = excluded.redirects, message = excluded.message,
+             logic_rules = excluded.logic_rules, updated_at = now()
          returning platform, min_version, latest_version, store_url, redirects, message,
-                   extract(epoch from updated_at)::bigint",
+                   extract(epoch from updated_at)::bigint, logic_rules",
     )
     .bind(&platform)
     .bind(&b.min_version)
@@ -1016,6 +1089,7 @@ async fn put_client_version(
     .bind(&b.store_url)
     .bind(serde_json::to_value(&b.redirects).unwrap_or(json!([])))
     .bind(&b.message)
+    .bind(serde_json::to_value(&b.logic_rules).unwrap_or(json!([])))
     .fetch_one(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -1049,7 +1123,7 @@ async fn list_client_versions(
 ) -> Result<Json<Value>, ApiError> {
     let rows: Vec<CvRow> = sqlx::query_as(
         "select platform, min_version, latest_version, store_url, redirects, message,
-                extract(epoch from updated_at)::bigint
+                extract(epoch from updated_at)::bigint, logic_rules
          from musubi.client_versions order by platform",
     )
     .fetch_all(&s.db)
@@ -1086,15 +1160,31 @@ fn gate(min: Option<&str>, latest: Option<&str>, redirects: &[Redirect], version
 async fn client_version(
     State(s): State<AppState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(q): Query<Ctx>,
 ) -> Result<Json<Value>, ApiError> {
+    // logic (protocol) version: `?logic_version=` or `x-musubi-logic-version`
+    let logic_version: Option<i64> = uri
+        .query()
+        .and_then(|qs| {
+            qs.split('&').find_map(|kv| {
+                kv.strip_prefix("logic_version=")
+                    .and_then(|v| v.parse().ok())
+            })
+        })
+        .or_else(|| {
+            headers
+                .get("x-musubi-logic-version")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok())
+        });
     let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let (Some(platform), Some(version)) = (ctx.platform, ctx.version) else {
         return Err(Error::InvalidArgument("platform and version required".into()).into());
     };
     let row: Option<CvRow> = sqlx::query_as(
         "select platform, min_version, latest_version, store_url, redirects, message,
-                extract(epoch from updated_at)::bigint
+                extract(epoch from updated_at)::bigint, logic_rules
          from musubi.client_versions where platform = $1",
     )
     .bind(platform.to_ascii_lowercase())
@@ -1115,6 +1205,19 @@ async fn client_version(
     v["store_url"] = json!(row.3);
     v["message"] = json!(row.5);
     v["configured"] = json!(true);
+    if let Some(lv) = logic_version {
+        let rules: Vec<LogicRule> = serde_json::from_value(row.7.clone()).unwrap_or_default();
+        let lg = logic_gate(&rules, lv, &version);
+        let blocked = lg["logic_supported"] == false || lg["patch_required"] == true;
+        if blocked {
+            v["supported"] = json!(false);
+            v["update_required"] = json!(true);
+        }
+        if lg["patch_available"] == true {
+            v["update_available"] = json!(true);
+        }
+        v["logic"] = lg;
+    }
     Ok(Json(v))
 }
 
@@ -1222,4 +1325,89 @@ mod tests {
         assert_eq!(g["redirect"]["url"], "https://v3");
         assert_eq!(g["update_available"], false);
     }
+}
+
+#[derive(Deserialize)]
+struct LogicRuleBody {
+    min_patch: String,
+    #[serde(default)]
+    latest_patch: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+async fn load_logic_rules(s: &AppState, platform: &str) -> Result<Vec<LogicRule>, ApiError> {
+    let row: Option<Value> =
+        sqlx::query_scalar("select logic_rules from musubi.client_versions where platform = $1")
+            .bind(platform)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(Error::internal)?;
+    match row {
+        Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
+        None => Err(Error::NotFound(format!("client_versions/{platform}")).into()),
+    }
+}
+
+async fn save_logic_rules(
+    s: &AppState,
+    platform: &str,
+    rules: &[LogicRule],
+    logic_version: i64,
+    action: &str,
+) -> Result<Json<Value>, ApiError> {
+    validate_logic_rules(rules)?;
+    sqlx::query(
+        "update musubi.client_versions set logic_rules = $2, updated_at = now() where platform = $1",
+    )
+    .bind(platform)
+    .bind(serde_json::to_value(rules).unwrap_or(json!([])))
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    s.events
+        .emit(
+            "client_version.updated",
+            None,
+            json!({ "platform": platform, "logic_version": logic_version, "action": action }),
+        )
+        .await;
+    Ok(Json(json!({ "platform": platform, "logic_rules": rules })))
+}
+
+/// Hotfix workflow: `PUT /v1/server/client_versions/{platform}/logic/{lv} {min_patch, latest_patch,
+/// message}` adds or replaces one logic version's patch requirement without resending the rest.
+async fn put_logic_rule(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path((platform, logic_version)): Path<(String, i64)>,
+    Json(b): Json<LogicRuleBody>,
+) -> Result<Json<Value>, ApiError> {
+    let platform = platform.to_ascii_lowercase();
+    let mut rules = load_logic_rules(&s, &platform).await?;
+    rules.retain(|l| l.logic_version != logic_version);
+    rules.push(LogicRule {
+        logic_version,
+        min_patch: b.min_patch,
+        latest_patch: b.latest_patch,
+        message: b.message,
+    });
+    rules.sort_by_key(|l| l.logic_version);
+    save_logic_rules(&s, &platform, &rules, logic_version, "upsert").await
+}
+
+/// Retire a logic version: clients on it get `logic_supported: false`.
+async fn delete_logic_rule(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path((platform, logic_version)): Path<(String, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    let platform = platform.to_ascii_lowercase();
+    let mut rules = load_logic_rules(&s, &platform).await?;
+    let before = rules.len();
+    rules.retain(|l| l.logic_version != logic_version);
+    if rules.len() == before {
+        return Err(Error::NotFound(format!("logic version {logic_version}")).into());
+    }
+    save_logic_rules(&s, &platform, &rules, logic_version, "delete").await
 }

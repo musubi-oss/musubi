@@ -21404,6 +21404,144 @@ async fn remote_config_variants_history_csv_client_gate_and_title_files() {
     assert_eq!(v["supported"], true);
     let (st, _) = call(&app, "GET", "/v1/client/version?platform=ios", None, None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+    // logic versions: patch requirements per protocol version, hotfix bump, retirement
+    let (st, v) = call_server(&app, "PUT", "/v1/server/client_versions/ios", k,
+        Some(json!({"min_version": "1.5", "latest_version": "2.4",
+            "logic_rules": [{"logic_version": 7, "min_patch": "2.0"}, {"logic_version": 7, "min_patch": "2.1"}]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "dup logic: {v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/client_versions/ios",
+        k,
+        Some(json!({"min_version": "1.5", "latest_version": "2.4",
+            "logic_rules": [{"logic_version": 7, "min_patch": "2.3", "latest_patch": "2.1"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "min above latest: {v}");
+    let (st, v) = call_server(&app, "PUT", "/v1/server/client_versions/ios", k,
+        Some(json!({"min_version": "1.5", "latest_version": "2.4", "store_url": "https://apps.example/x",
+            "logic_rules": [
+                {"logic_version": 7, "min_patch": "2.0.3", "latest_patch": "2.0.5", "message": "hotfix for save corruption"},
+                {"logic_version": 8, "min_patch": "2.4"}]}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["logic_rules"].as_array().unwrap().len(), 2);
+    // old patch of logic 7 → must update even though 2.0.1 >= min_version
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=ios&version=2.0.1&logic_version=7",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["supported"], false, "{v}");
+    assert_eq!(v["update_required"], true);
+    assert_eq!(v["logic"]["patch_required"], true);
+    assert_eq!(v["logic"]["logic_message"], "hotfix for save corruption");
+    // current patch of logic 7 → fine, newer patch available
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=ios&version=2.0.3&logic_version=7",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["supported"], true, "{v}");
+    assert_eq!(v["logic"]["patch_required"], false);
+    assert_eq!(v["logic"]["patch_available"], true);
+    // header form; retired logic version → unsupported, newest advertised
+    let (st, _, v) = raw_call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=ios&version=2.4",
+        &[("x-musubi-logic-version", "5")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["logic"]["logic_supported"], false, "{v}");
+    assert_eq!(v["logic"]["newest_logic_version"], 8);
+    assert_eq!(v["supported"], false);
+    // no logic version given → classic gate only
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=ios&version=2.4",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["supported"], true);
+    assert!(v.get("logic").is_none(), "{v}");
+    // hotfix: bump logic 7's min patch without resending the rest
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/client_versions/ios/logic/7",
+        k,
+        Some(json!({"min_patch": "2.0.5", "latest_patch": "2.0.5"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["logic_rules"].as_array().unwrap().len(), 2);
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=ios&version=2.0.3&logic_version=7",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["logic"]["patch_required"], true, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/client_versions/ios/logic/9",
+        k,
+        Some(json!({"min_patch": "3.0", "latest_patch": "2.9"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/client_versions/switch/logic/1",
+        k,
+        Some(json!({"min_patch": "1.0"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // retire logic 7
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        "/v1/server/client_versions/ios/logic/7",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["logic_rules"].as_array().unwrap().len(), 1);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        "/v1/server/client_versions/ios/logic/7",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/client/version?platform=ios&version=2.0.5&logic_version=7",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v["logic"]["logic_supported"], false, "{v}");
 
     // title files
     let dir = unique("loc").to_lowercase();

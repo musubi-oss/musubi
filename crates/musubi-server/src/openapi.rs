@@ -669,6 +669,16 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/client_versions", "system"),
     ("PUT", "/v1/server/client_versions/{platform}", "system"),
     ("DELETE", "/v1/server/client_versions/{platform}", "system"),
+    (
+        "PUT",
+        "/v1/server/client_versions/{platform}/logic/{logic_version}",
+        "system",
+    ),
+    (
+        "DELETE",
+        "/v1/server/client_versions/{platform}/logic/{logic_version}",
+        "system",
+    ),
     ("GET", "/v1/client/version", "system"),
     ("GET", "/v1/files/manifest", "storage"),
     ("GET", "/v1/files/tags", "storage"),
