@@ -75,12 +75,12 @@ async function run(act: Act, row: any) {
   } catch (e: any) { toast.err(e) }
 }
 function visible(acts: Act[] | undefined, row: any) { return (acts ?? []).filter((a) => !a.when || a.when(row)) }
-onMounted(load)
+onMounted(() => { if (props.res.custom !== 'zanshin') load() })
 </script>
 <template>
   <div class="card">
     <h2>{{ res.title }} <small v-if="isList">({{ rows.length }})</small></h2>
-    <div class="tools" v-if="isList">
+    <div class="tools" v-if="isList && res.custom !== 'zanshin'">
       <input class="in" v-model="q" placeholder="search" @keyup.enter="load()" />
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>
       <span style="margin-left:auto;display:flex;gap:8px">
@@ -89,7 +89,15 @@ onMounted(load)
       </span>
     </div>
     <p class="err" v-if="err">{{ err }}</p>
-    <template v-if="isList">
+    <template v-if="res.custom === 'zanshin'">
+      <p>Zanshin is Musubi's LiveOps companion and runs as a <b>separate service</b>: it is never started by this cluster and nothing here depends on it. Musubi exposes two integration points:</p>
+      <div class="grid" style="margin-top:14px">
+        <div><Kv k="Change webhook (Zanshin → Musubi)" v="POST /v1/server/liveops/changed" mono copy /><div class="note">Point Zanshin's flag / live-event change webhook here (server key). Cached LiveOps answers are dropped on every node and WASM modules receive <code>hook_liveops_changed</code>.</div></div>
+        <div><Kv k="Outbound webhooks (Musubi → Zanshin)" v="Settings → Webhooks" /><div class="note">Subscribe Zanshin to account, economy, match and fleet events to drive its own campaigns.</div></div>
+        <div><Kv k="This section" v="Musubi-native schedule" /><div class="note">Live events, flags, experiments, remote config, audiences, news, offers, tournaments and economy changesets on this page are Musubi's own primitives and work without Zanshin.</div></div>
+      </div>
+    </template>
+    <template v-else-if="isList">
       <DataTable :cols="cols" :rows="rows" pick @pick="pick">
         <template #actions="{ row }" v-if="res.actions || res.link">
           <span style="display:flex;gap:6px;justify-content:flex-end">

@@ -31,6 +31,10 @@ export const router = createRouter({
       { path: 'edge', component: () => import('./pages/servers/Edge.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.servers.find((x) => x.id === r.params.page) ?? catalog.servers[0] }) },
     ]},
+    { path: '/liveops', component: () => import('./pages/liveops/Index.vue'), children: [
+      { path: '', component: () => import('./pages/liveops/Timeline.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.liveops.find((x) => x.id === r.params.page) ?? catalog.liveops[1] }) },
+    ]},
     { path: '/:section/:page?', component: () => import('./pages/Section.vue') },
   ],
 })
