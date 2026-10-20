@@ -38313,3 +38313,342 @@ async fn player_files_revisions_promote_public_and_server_access() {
     let (_, v) = call(&app, "GET", "/v1/account/files", Some(&t1), None).await;
     assert_eq!(v["files"].as_array().unwrap().len(), 1, "{v}");
 }
+
+#[tokio::test]
+async fn donations_request_give_claim_with_audience_and_limits() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let tag = &uuid::Uuid::now_v7().simple().to_string()[20..];
+    let gold = format!("dgold{tag}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/currencies",
+        k,
+        Some(json!({"code": gold, "name": "Gold"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    for (id, amount) in [(format!("helper{tag}"), 5), (format!("asker{tag}"), 10)] {
+        let (st, v) = call_server(&app, "POST", "/v1/server/rewards/tables", k,
+            Some(json!({"id": id, "name": id, "kind": "guaranteed", "entries": [{"currency": gold, "amount": amount}]}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let (ta, a) = login(&app).await;
+    let (tb, b) = login(&app).await;
+    let (tc, _c) = login(&app).await;
+    let def = format!("potions{tag}");
+    let path = format!("/v1/server/donations/defs/{def}");
+    // validation
+    for (body, why) in [
+        (
+            json!({"count": 0, "max_count": 3, "duration_secs": 3600}),
+            "count",
+        ),
+        (
+            json!({"count": 3, "max_count": 2, "duration_secs": 3600}),
+            "max < count",
+        ),
+        (
+            json!({"count": 1, "max_count": 3, "duration_secs": 10}),
+            "duration",
+        ),
+        (
+            json!({"count": 1, "max_count": 3, "duration_secs": 3600, "user_contribution_max_count": 9}),
+            "user max",
+        ),
+        (
+            json!({"count": 1, "max_count": 3, "duration_secs": 3600, "audience": "guild"}),
+            "audience",
+        ),
+        (
+            json!({"count": 1, "max_count": 3, "duration_secs": 3600, "cost": {"nope": 1}}),
+            "currency",
+        ),
+        (
+            json!({"count": 1, "max_count": 3, "duration_secs": 3600, "cost": {gold.clone(): 0}}),
+            "cost 0",
+        ),
+        (
+            json!({"count": 1, "max_count": 3, "duration_secs": 3600, "recipient_reward": "missing"}),
+            "reward table",
+        ),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{why}: {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/donations/defs/Bad_Id",
+        k,
+        Some(json!({"count": 1, "max_count": 3, "duration_secs": 3600})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(&app, "PUT", &path, k, Some(json!({
+        "name": "Potions please", "cost": {gold.clone(): 2}, "count": 2, "max_count": 3, "duration_secs": 3600,
+        "user_contribution_max_count": 2, "recipient_reward": format!("asker{tag}"), "contributor_reward": format!("helper{tag}"),
+        "audience": "friends"
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["audience"], "friends");
+    assert_eq!(v["enabled"], true);
+    let (_, v) = call(&app, "GET", "/v1/donations/defs", Some(&ta), None).await;
+    assert!(
+        v["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == def),
+        "{v}"
+    );
+
+    // A cannot afford the cost → no request
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/donations",
+        Some(&ta),
+        Some(json!({"def_id": def})),
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "POST", "/v1/server/wallet/adjust", k,
+        Some(json!({"account_id": a, "currency": gold, "delta": 5, "reason": "test", "reference": format!("d{tag}")}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/donations",
+        Some(&ta),
+        Some(json!({"def_id": "nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, d) = call(
+        &app,
+        "POST",
+        "/v1/donations",
+        Some(&ta),
+        Some(json!({"def_id": def})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["status"], "active");
+    assert_eq!(d["count"], 0);
+    assert_eq!(d["target_count"], 2);
+    let did = d["id"].as_str().unwrap().to_string();
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&ta), None).await;
+    let bal = |w: &Value| {
+        w["balances"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|x| x["currency"] == gold)
+            .map(|x| x["balance"].as_i64().unwrap())
+            .unwrap_or(0)
+    };
+    assert_eq!(bal(&w), 3, "cost debited: {w}");
+    // one live request per definition
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/donations",
+        Some(&ta),
+        Some(json!({"def_id": def})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // B is not a friend yet → 403; own → 400; unknown → 404
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{did}/give"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{did}/give"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{}/give", uuid::Uuid::now_v7()),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // befriend A↔B
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&ta),
+        Some(json!({"ids": [b]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(&tb),
+        Some(json!({"ids": [a]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // B sees what A asks for
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/donations/accounts/{a}"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["donations"][0]["id"], did);
+    // B gives twice (user max 2) and is rewarded each time; third → 400
+    for n in 1..=2 {
+        let (st, v) = call(
+            &app,
+            "POST",
+            &format!("/v1/donations/{did}/give"),
+            Some(&tb),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["donation"]["count"], n);
+        assert_eq!(v["rewards"][0]["currency"], gold);
+        assert_eq!(v["rewards"][0]["amount"], 5);
+    }
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{did}/give"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&tb), None).await;
+    assert_eq!(bal(&w), 10, "{w}");
+    // A claims 2 × recipient reward; nothing more to claim
+    let (_, v) = call(&app, "GET", "/v1/donations", Some(&ta), None).await;
+    assert_eq!(v["donations"][0]["claimable"], 2, "{v}");
+    assert_eq!(v["donations"][0]["contributions"][0]["account_id"], b);
+    assert_eq!(v["donations"][0]["contributions"][0]["count"], 2);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{did}/claim"),
+        Some(&tb),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "not mine: {v}");
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{did}/claim"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["claimed"], 2);
+    assert_eq!(v["rewards"].as_array().unwrap().len(), 2);
+    assert_eq!(v["donation"]["claimable"], 0);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{did}/claim"),
+        Some(&ta),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (_, w) = call(&app, "GET", "/v1/wallet", Some(&ta), None).await;
+    assert_eq!(bal(&w), 23, "{w}");
+    // C (stranger) still refused on friends-only; switch the definition to anyone — live request keeps its snapshot
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"count": 2, "max_count": 3, "duration_secs": 3600, "audience": "anyone"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/donations/{did}/give"),
+        Some(&tc),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "snapshot keeps friends-only");
+    // ceiling: B maxed, so A's second request (cost 0 now) gets C's help under `anyone`
+    let (st, d2) = call(
+        &app,
+        "POST",
+        "/v1/donations",
+        Some(&ta),
+        Some(json!({"def_id": def})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "first request still open: {d2}"
+    );
+    // fill the first to its ceiling via another friend-less path is impossible → server view + sweep keep it
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{a}/donations"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["donations"][0]["count"], 2);
+    let (st, v) = call_server(&app, "POST", "/v1/server/donations/sweep", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // disable → no new requests; delete → 404
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"count": 1, "max_count": 1, "duration_secs": 3600, "enabled": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call(&app, "GET", "/v1/donations/defs", Some(&ta), None).await;
+    assert!(
+        !v["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == def),
+        "{v}"
+    );
+    let (st, v) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

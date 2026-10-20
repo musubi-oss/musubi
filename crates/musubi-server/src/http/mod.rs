@@ -23,6 +23,7 @@ pub mod countries_iso;
 pub mod crashes;
 mod dev;
 mod device_codes;
+mod donations;
 pub mod economy;
 pub mod economy_changesets;
 pub mod effects;
@@ -289,6 +290,7 @@ pub fn router(state: AppState) -> Router {
         .merge(bans::routes())
         .merge(group_pools::routes())
         .merge(challenges::routes())
+        .merge(donations::routes())
         .merge(account_policy::routes())
         .merge(items_lifecycle::routes())
         .merge(game_sessions::routes())

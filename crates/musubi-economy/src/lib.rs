@@ -24,6 +24,7 @@ pub use market::{
 };
 pub use orderbook::{Book, Fill, NewOrder, Order, Placed, Side};
 pub mod challenges;
+pub mod donations;
 pub mod group_inventory;
 pub mod progression;
 pub mod quest_pools;
