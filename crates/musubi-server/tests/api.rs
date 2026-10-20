@@ -43100,3 +43100,172 @@ async fn ua_attribution_first_last_touch_cohorts_and_audience() {
         .await;
     }
 }
+
+/// Analytics report snapshots (brainCloud report service parity): generate on demand, idempotent
+/// per (kind, date, period) unless replaced, list newest first, latest / by-date / by id, delete.
+#[tokio::test]
+async fn analytics_reports_generate_latest_by_date_and_list() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let base = "/v1/server/analytics/reports";
+    for body in [
+        json!({"kind": "monthly"}),
+        json!({"kind": "adhoc", "for_date": "2026/01/01"}),
+        json!({"kind": "adhoc", "period_days": 0}),
+        json!({"kind": "adhoc", "period_days": 366}),
+    ] {
+        let (st, v) = call_server(&app, "POST", base, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    // a date far in the past keeps this test's rows apart from the leader's own daily sweep
+    let date = format!(
+        "1999-01-{:02}",
+        (time::OffsetDateTime::now_utc().unix_timestamp_nanos() % 27 + 1) as u8
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        base,
+        k,
+        Some(json!({"kind": "adhoc", "for_date": date, "period_days": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["kind"], "adhoc");
+    assert_eq!(v["for_date"], date);
+    assert_eq!(v["period_days"], 3);
+    for key in [
+        "active_users",
+        "retention",
+        "revenue",
+        "events",
+        "attribution",
+    ] {
+        assert!(!v["body"][key].is_null(), "{key} missing in {v}");
+    }
+    let generated = v["generated_at"].as_str().unwrap().to_string();
+    // same key → same snapshot; replace → regenerated
+    let (st, v2) = call_server(
+        &app,
+        "POST",
+        base,
+        k,
+        Some(json!({"kind": "adhoc", "for_date": date, "period_days": 3})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v2["id"], id);
+    assert_eq!(v2["generated_at"], generated);
+    let (st, v3) = call_server(
+        &app,
+        "POST",
+        base,
+        k,
+        Some(json!({"kind": "adhoc", "for_date": date, "period_days": 3, "replace": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v3}");
+    assert_eq!(v3["id"], id);
+    assert!(v3["generated_at"].as_str().unwrap() >= generated.as_str());
+    // a second kind on the same date
+    let (st, w) = call_server(
+        &app,
+        "POST",
+        base,
+        k,
+        Some(json!({"kind": "weekly", "for_date": date})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+    assert_eq!(w["period_days"], 7);
+
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("{base}?before={date}&limit=50"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{l}");
+    let heads = l["reports"].as_array().unwrap();
+    assert!(heads.iter().any(|h| h["id"] == id), "{l}");
+    assert!(
+        heads.iter().all(|h| h.get("body").is_none()),
+        "headers only: {l}"
+    );
+    let (st, l) = call_server(
+        &app,
+        "GET",
+        &format!("{base}?kind=weekly&before={date}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        l["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["kind"] == "weekly"),
+        "{l}"
+    );
+    for q in ["kind=monthly", "limit=0", "before=soon"] {
+        let (st, _) = call_server(&app, "GET", &format!("{base}?{q}"), k, None).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{q}");
+    }
+    let (st, v) = call_server(&app, "GET", &format!("{base}/latest?kind=adhoc"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["body"].is_object());
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/by-date/{date}?kind=adhoc&period_days=3"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], id);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("{base}/by-date/{date}?kind=adhoc&period_days=4"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "GET", &format!("{base}/by-date/01-01-1999"), k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(&app, "GET", &format!("{base}/{id}"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["body"]["period_days"], 3);
+    let (st, _) = call_server(&app, "DELETE", &format!("{base}/{id}"), k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "DELETE", &format!("{base}/{id}"), k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let wid = w["id"].as_str().unwrap();
+    let _ = call_server(&app, "DELETE", &format!("{base}/{wid}"), k, None).await;
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=analytics.report_generated&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["payload"]["id"] == id || e["data"]["id"] == id),
+        "{ev}"
+    );
+    let (st, _) = call(&app, "GET", base, None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

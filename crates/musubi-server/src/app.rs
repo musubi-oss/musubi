@@ -1136,6 +1136,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                         Err(e) => tracing::warn!(error = %e, "subscription sweep failed"),
                     }
                     if n % 60 == 0 {
+                        match st.analytics.sweep_reports().await {
+                            Ok(k) if !k.is_empty() => {
+                                tracing::info!(kinds = ?k, "analytics reports generated")
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "analytics report sweep failed"),
+                        }
                         match crate::http::audiences::track_all(&st).await {
                             Ok(v) if !v.is_empty() => {
                                 tracing::info!(audiences = v.len(), "tracked audiences refreshed")

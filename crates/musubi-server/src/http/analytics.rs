@@ -27,6 +27,19 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/server/analytics/attribution", get(attribution_cohorts))
         .route(
+            "/v1/server/analytics/reports",
+            get(list_reports).post(generate_report),
+        )
+        .route("/v1/server/analytics/reports/latest", get(latest_report))
+        .route(
+            "/v1/server/analytics/reports/by-date/{date}",
+            get(report_by_date),
+        )
+        .route(
+            "/v1/server/analytics/reports/{id}",
+            get(get_report).delete(delete_report),
+        )
+        .route(
             "/v1/server/accounts/{id}/event_properties",
             get(account_event_props).delete(reset_event_props),
         )
@@ -537,4 +550,162 @@ async fn attribution_cohorts(
     Ok(Json(
         json!({ "group_by": group_by, "touch": touch, "groups": groups }),
     ))
+}
+
+fn parse_date(d: &str) -> Result<time::Date, ApiError> {
+    let fmt = time::macros::format_description!("[year]-[month]-[day]");
+    time::Date::parse(d, &fmt)
+        .map_err(|_| Error::InvalidArgument("date must be YYYY-MM-DD".into()).into())
+}
+
+fn period_for(kind: &str, period_days: Option<i64>) -> Result<i64, ApiError> {
+    let p = match (kind, period_days) {
+        ("daily", None) => 1,
+        ("weekly", None) => 7,
+        ("adhoc", None) => 1,
+        (_, Some(p)) if (1..=365).contains(&p) => p,
+        _ => {
+            return Err(Error::InvalidArgument("period_days must be 1..=365".into()).into());
+        }
+    };
+    Ok(p)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GenerateBody {
+    kind: Option<String>,
+    for_date: Option<String>,
+    period_days: Option<i64>,
+    replace: bool,
+}
+
+/// `POST /v1/server/analytics/reports {kind: daily|weekly|adhoc, for_date?, period_days?, replace}`
+/// — build (or return the existing) snapshot; the leader does `daily` for yesterday and `weekly`
+/// on Mondays by itself.
+async fn generate_report(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Json(b): Json<GenerateBody>,
+) -> Result<Json<Value>, ApiError> {
+    let kind = b.kind.unwrap_or_else(|| "adhoc".into());
+    if !["daily", "weekly", "adhoc"].contains(&kind.as_str()) {
+        return Err(Error::InvalidArgument("kind must be daily|weekly|adhoc".into()).into());
+    }
+    let for_date = match b.for_date.as_deref() {
+        Some(d) => parse_date(d)?,
+        None => time::OffsetDateTime::now_utc().date(),
+    };
+    let period = period_for(&kind, b.period_days)?;
+    let v = s
+        .analytics
+        .generate_report(&kind, for_date, period, b.replace)
+        .await?;
+    s.events
+        .emit(
+            "analytics.report_generated",
+            None,
+            json!({ "id": v["id"], "kind": kind, "for_date": for_date.to_string(), "period_days": period }),
+        )
+        .await;
+    Ok(Json(v))
+}
+
+#[derive(Deserialize, Default)]
+struct ReportsQ {
+    kind: Option<String>,
+    before: Option<String>,
+    limit: Option<i64>,
+}
+
+fn check_kind(kind: &Option<String>) -> Result<(), ApiError> {
+    if kind
+        .as_deref()
+        .is_some_and(|k| !["daily", "weekly", "adhoc"].contains(&k))
+    {
+        return Err(Error::InvalidArgument("kind must be daily|weekly|adhoc".into()).into());
+    }
+    Ok(())
+}
+
+/// `GET /v1/server/analytics/reports?kind&before&limit` — latest report headers (≤ 20 default).
+async fn list_reports(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Query(q): Query<ReportsQ>,
+) -> Result<Json<Value>, ApiError> {
+    check_kind(&q.kind)?;
+    let before = q.before.as_deref().map(parse_date).transpose()?;
+    let limit = q.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return Err(Error::InvalidArgument("limit must be 1..=100".into()).into());
+    }
+    let reports = s
+        .analytics
+        .reports(q.kind.as_deref(), before, limit)
+        .await?;
+    Ok(Json(json!({ "reports": reports })))
+}
+
+/// `GET /v1/server/analytics/reports/latest?kind` — the newest report with its body.
+async fn latest_report(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Query(q): Query<ReportsQ>,
+) -> Result<Json<Value>, ApiError> {
+    check_kind(&q.kind)?;
+    let heads = s.analytics.reports(q.kind.as_deref(), None, 1).await?;
+    let Some(h) = heads.first() else {
+        return Err(Error::NotFound("no report yet".into()).into());
+    };
+    let id = h["id"]
+        .as_str()
+        .and_then(|i| Uuid::parse_str(i).ok())
+        .unwrap_or_default();
+    match s.analytics.report(id).await? {
+        Some(v) => Ok(Json(v)),
+        None => Err(Error::NotFound("no report yet".into()).into()),
+    }
+}
+
+/// `GET /v1/server/analytics/reports/by-date/{YYYY-MM-DD}?kind&period_days` — the report covering
+/// that start date (defaults: `daily`, 1 day).
+async fn report_by_date(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(date): Path<String>,
+    Query(q): Query<GenerateBody>,
+) -> Result<Json<Value>, ApiError> {
+    let kind = q.kind.unwrap_or_else(|| "daily".into());
+    if !["daily", "weekly", "adhoc"].contains(&kind.as_str()) {
+        return Err(Error::InvalidArgument("kind must be daily|weekly|adhoc".into()).into());
+    }
+    let d = parse_date(&date)?;
+    let period = period_for(&kind, q.period_days)?;
+    match s.analytics.report_by(&kind, d, period).await? {
+        Some(v) => Ok(Json(v)),
+        None => Err(Error::NotFound(format!("no {kind} report for {date}")).into()),
+    }
+}
+
+async fn get_report(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    match s.analytics.report(id).await? {
+        Some(v) => Ok(Json(v)),
+        None => Err(Error::NotFound(format!("report {id}")).into()),
+    }
+}
+
+async fn delete_report(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    if !s.analytics.delete_report(id).await? {
+        return Err(Error::NotFound(format!("report {id}")).into());
+    }
+    Ok(Json(json!({ "deleted": true })))
 }

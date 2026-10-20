@@ -72,6 +72,19 @@ pub struct IngestReport {
 /// A stored / exported event.
 type AttributionRow = (Uuid, Value, OffsetDateTime, Value, OffsetDateTime, i32);
 
+type ReportRow = (Uuid, String, time::Date, i32, OffsetDateTime, Value);
+
+fn report_doc(r: &ReportRow, with_body: bool) -> Value {
+    let mut v = json!({
+        "id": r.0, "kind": r.1, "for_date": r.2.to_string(), "period_days": r.3,
+        "generated_at": r.4.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+    });
+    if with_body {
+        v["body"] = r.5.clone();
+    }
+    v
+}
+
 fn attribution_doc(r: &AttributionRow) -> Value {
     let rfc = |t: OffsetDateTime| {
         t.format(&time::format_description::well_known::Rfc3339)
@@ -687,6 +700,130 @@ impl Analytics {
             .into_iter()
             .map(|(k, n)| json!({ group_by: k, "accounts": n }))
             .collect())
+    }
+
+    /// Assemble one report: every KPI over `period_days` ending at `for_date`, plus the
+    /// first-touch attribution cohorts of that window. Idempotent per (kind, date, period):
+    /// an existing snapshot is returned untouched unless `replace`.
+    pub async fn generate_report(
+        &self,
+        kind: &str,
+        for_date: time::Date,
+        period_days: i64,
+        replace: bool,
+    ) -> Result<Value> {
+        if !replace {
+            if let Some(existing) = self.report_by(kind, for_date, period_days).await? {
+                return Ok(existing);
+            }
+        }
+        let since = OffsetDateTime::new_utc(for_date, time::Time::MIDNIGHT)
+            - Duration::from_secs(86_400 * (period_days as u64 - 1));
+        let body = json!({
+            "kind": kind, "for_date": for_date.to_string(), "period_days": period_days,
+            "active_users": self.active_users(period_days).await?,
+            "retention": self.retention(period_days).await?,
+            "revenue": self.revenue(period_days).await?,
+            "events": self.event_counts(period_days).await?,
+            "attribution": self.attribution_cohorts("campaign", "first", Some(since), 50).await?,
+        });
+        let row: ReportRow = sqlx::query_as(
+            "insert into musubi.analytics_reports (id, kind, for_date, period_days, body)
+             values ($1, $2, $3, $4, $5)
+             on conflict (kind, for_date, period_days) do update set body = excluded.body, generated_at = now()
+             returning id, kind, for_date, period_days, generated_at, body",
+        )
+        .bind(Uuid::now_v7())
+        .bind(kind)
+        .bind(for_date)
+        .bind(period_days as i32)
+        .bind(&body)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(report_doc(&row, true))
+    }
+
+    pub async fn report_by(
+        &self,
+        kind: &str,
+        for_date: time::Date,
+        period_days: i64,
+    ) -> Result<Option<Value>> {
+        let row: Option<ReportRow> = sqlx::query_as(
+            "select id, kind, for_date, period_days, generated_at, body from musubi.analytics_reports
+             where kind = $1 and for_date = $2 and period_days = $3",
+        )
+        .bind(kind)
+        .bind(for_date)
+        .bind(period_days as i32)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.as_ref().map(|r| report_doc(r, true)))
+    }
+
+    pub async fn report(&self, id: Uuid) -> Result<Option<Value>> {
+        let row: Option<ReportRow> = sqlx::query_as(
+            "select id, kind, for_date, period_days, generated_at, body from musubi.analytics_reports where id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(row.as_ref().map(|r| report_doc(r, true)))
+    }
+
+    /// Newest reports first (headers only), ≤ `limit`; `for_date <= before` when given.
+    pub async fn reports(
+        &self,
+        kind: Option<&str>,
+        before: Option<time::Date>,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let rows: Vec<ReportRow> = sqlx::query_as(
+            "select id, kind, for_date, period_days, generated_at, body from musubi.analytics_reports
+             where ($1::text is null or kind = $1) and ($2::date is null or for_date <= $2)
+             order by for_date desc, generated_at desc limit $3",
+        )
+        .bind(kind)
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.iter().map(|r| report_doc(r, false)).collect())
+    }
+
+    pub async fn delete_report(&self, id: Uuid) -> Result<bool> {
+        sqlx::query("delete from musubi.analytics_reports where id = $1")
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map(|r| r.rows_affected() > 0)
+            .map_err(Error::internal)
+    }
+
+    /// Leader sweep: yesterday's daily report and, on Mondays, last week's weekly report, each
+    /// generated once. Returns the kinds generated this pass.
+    pub async fn sweep_reports(&self) -> Result<Vec<String>> {
+        if !self.cfg.enabled {
+            return Ok(Vec::new());
+        }
+        let today = OffsetDateTime::now_utc().date();
+        let yesterday = today.previous_day().unwrap_or(today);
+        let mut out = Vec::new();
+        if self.report_by("daily", yesterday, 1).await?.is_none() {
+            self.generate_report("daily", yesterday, 1, false).await?;
+            out.push("daily".to_string());
+        }
+        if today.weekday() == time::Weekday::Monday
+            && self.report_by("weekly", yesterday, 7).await?.is_none()
+        {
+            self.generate_report("weekly", yesterday, 7, false).await?;
+            out.push("weekly".to_string());
+        }
+        Ok(out)
     }
 
     /// Copy of a server-side domain event (when `mirror_domain_events`).
