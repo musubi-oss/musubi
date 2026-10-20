@@ -39108,3 +39108,212 @@ async fn fleet_verify_image_checks_registry_manifest_with_token_auth() {
     assert!(v["spec"].get("image_digest").is_none(), "{v}");
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before);
 }
+
+#[tokio::test]
+async fn fleet_egress_accounting_per_server_and_rollup() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("egress"), "provider": "local", "buffer": 1, "max_servers": 1,
+            "port_start": 47600, "port_end": 47700,
+            "spec": {"command": ["sleep", "60"], "cost": {"hourly_per_server": 0.1, "currency": "USD", "egress_per_gb": 0.09}},
+            "policy": {"health": {"period_secs": 1, "failure_threshold": 2, "initial_delay_secs": 60}, "eviction": "never"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["spec"]["cost"]["egress_per_gb"], 0.09);
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
+    let (st, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    let sid = h["servers"][0]["id"].as_str().unwrap().to_string();
+
+    let sdk = |sid: Option<String>, body: Value| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::post("/v1/gameserver/egress").header("x-musubi-server-key", k);
+            if let Some(sid) = sid {
+                req = req.header("x-musubi-server-id", sid);
+            }
+            let res = app
+                .oneshot(
+                    req.header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let st = res.status();
+            let b = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                st,
+                serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
+            )
+        }
+    };
+    // before any report: zero card, unknown server 404
+    let (st, c) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}/egress"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["bytes_out"], 0);
+    assert_eq!(c["reports"], 0);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{}/egress", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // validation
+    assert_eq!(
+        sdk(None, json!({"bytes_out": 1})).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        sdk(Some(sid.clone()), json!({"bytes_out": -1})).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        sdk(Some(sid.clone()), json!({"bytes_in": 1})).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        sdk(
+            Some(uuid::Uuid::now_v7().to_string()),
+            json!({"bytes_out": 1})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    // first report: totals, no rate yet
+    let (st, c) = sdk(
+        Some(sid.clone()),
+        json!({"bytes_out": 1_000_000, "bytes_in": 500}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["bytes_out"], 1_000_000);
+    assert_eq!(c["bytes_in"], 500);
+    assert_eq!(c["rate_out_bps"], 0.0);
+    assert_eq!(c["reports"], 1);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // second report: cumulative counter grew → rate from the delta
+    let (st, c) = sdk(
+        Some(sid.clone()),
+        json!({"bytes_out": 3_000_000, "bytes_in": 500}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["bytes_out"], 3_000_000);
+    let rate = c["rate_out_bps"].as_f64().unwrap();
+    assert!(rate > 500_000.0 && rate < 2_000_000.0, "{c}");
+    assert_eq!(c["rate_in_bps"], 0.0);
+    assert_eq!(c["reports"], 2);
+    // process restarted (counter smaller than before): total stays monotonic
+    let (st, c) = sdk(Some(sid.clone()), json!({"bytes_out": 10, "bytes_in": 5})).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["bytes_out"], 3_000_010);
+    assert_eq!(c["bytes_in"], 505);
+    assert_eq!(
+        c["rate_out_bps"].as_f64().unwrap(),
+        rate,
+        "rate kept on reset"
+    );
+    // server card + fleet rollup with cost
+    let (st, c) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/{sid}/egress"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["bytes_out"], 3_000_010);
+    assert_eq!(c["reports"], 3);
+    let (st, r) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/egress"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["bytes_out"], 3_000_010);
+    assert_eq!(r["bytes_in"], 505);
+    assert_eq!(r["servers_reporting"], 1);
+    assert_eq!(r["live_servers_reporting"], 1, "{r}");
+    assert_eq!(r["live_rate_out_bps"].as_f64().unwrap(), rate);
+    assert_eq!(r["cost"]["configured"], true);
+    assert_eq!(r["cost"]["currency"], "USD");
+    let total = r["cost"]["total"].as_f64().unwrap();
+    assert!(
+        (total - 3_000_010.0 / 1073741824.0 * 0.09).abs() < 1e-9,
+        "{r}"
+    );
+    assert!(r["cost"]["projected_daily"].as_f64().unwrap() > 0.0);
+    assert_eq!(r["top"].as_array().unwrap().len(), 1);
+    assert_eq!(r["top"][0]["server_id"], sid);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{}/egress", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // fleet without egress price → cost not configured
+    let (st, f2) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({"name": unique("egress0"), "provider": "local", "max_servers": 1, "spec": {"command": ["sleep", "1"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f2}");
+    let (st, r) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{}/egress", f2["id"].as_str().unwrap()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["cost"]["configured"], false);
+    assert_eq!(r["servers_reporting"], 0);
+    assert_eq!(r["bytes_out"], 0);
+}

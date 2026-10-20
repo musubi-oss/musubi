@@ -4534,7 +4534,7 @@ Features only one report listed (after normalization). Each line: priority · co
 
 **P1 · accounts** — owner: musubi-account (`/v1/account`, `/v1/admin/accounts/*`)
 
-- ❌ **Hathora** · Egress accounting per process — Total + rate egress per process; billed per GB (cloud $0.12/GB 2024; $0.09/GB 2025 on-demand, $0 reserved) — *`rg egress` → none* — [source](https://blog.hathora.dev/changelogs-november-2023/)
+- ✅ **Hathora** · Egress accounting per process — Total + rate egress per process; billed per GB (cloud $0.12/GB 2024; $0.09/GB 2025 on-demand, $0 reserved) — *`POST /v1/gameserver/egress {bytes_out, bytes_in}` cumulative counters from the server → totals, rate between reports, monotonic across process restarts; `GET /v1/server/gameservers/{id}/egress`, fleet rollup `GET /v1/server/fleets/{id}/egress` with live rate, top servers and cost from `spec.cost.egress_per_gb` (total + projected daily)* — [source](https://blog.hathora.dev/changelogs-november-2023/)
 - ❌ **Hiro/Satori** · Deterministic client system startup order + custom client systems framework (Unity) — Client architecture — *no client framework* — [source](https://heroiclabs.com/docs/hiro/unity/getting-started/custom-systems/)
 - ❌ **PlayFab** · GetUserPublisherData / Internal / ReadOnly variants (shared across titles of a publisher) — Server API — *No publisher scope* — [source](https://learn.microsoft.com/gaming/playfab/features/config/titledata/using-publisher-data)
 - ❌ **PlayFab** · Publisher Data & User Publisher Data (read-only/internal variants) shared across titles in a studio — Server APIs only for writes — *No publisher/studio-level data layer across projects* — [source](https://learn.microsoft.com/gaming/playfab/features/config/titledata/using-publisher-data)

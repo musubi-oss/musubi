@@ -27,6 +27,7 @@ mod donations;
 pub mod economy;
 pub mod economy_changesets;
 pub mod effects;
+mod egress;
 pub mod entitlements;
 mod environments;
 pub(crate) mod error;
@@ -292,6 +293,7 @@ pub fn router(state: AppState) -> Router {
         .merge(group_pools::routes())
         .merge(challenges::routes())
         .merge(donations::routes())
+        .merge(egress::routes())
         .merge(vip::routes())
         .merge(account_policy::routes())
         .merge(items_lifecycle::routes())

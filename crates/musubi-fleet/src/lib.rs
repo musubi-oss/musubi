@@ -273,11 +273,16 @@ pub fn decode_log_archive(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
 pub struct CostSpec {
     pub hourly_per_server: f64,
     pub currency: String,
+    /// Price of one GiB of egress reported by the servers (`POST /v1/gameserver/egress`); feeds
+    /// `GET /v1/server/fleets/{id}/egress`.
+    #[serde(default)]
+    pub egress_per_gb: f64,
 }
 
 impl Default for CostSpec {
     fn default() -> Self {
         Self {
+            egress_per_gb: 0.0,
             hourly_per_server: 0.0,
             currency: "USD".into(),
         }
