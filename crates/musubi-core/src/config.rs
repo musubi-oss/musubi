@@ -46,6 +46,7 @@ pub struct Config {
     pub udp: UdpConfig,
     pub edge: EdgeConfig,
     pub builds: BuildsConfig,
+    pub worlds: WorldsConfig,
     pub mesh_net: MeshNetConfig,
     pub geoip: GeoIpConfig,
     pub zanshin: ZanshinConfig,
@@ -798,6 +799,22 @@ impl Default for EdgeConfig {
             idle_secs: 60,
             guard: EdgeGuardConfig::default(),
         }
+    }
+}
+
+/// Persistent worlds / server meshing. Off, a cluster serves everything else as before and
+/// pays nothing for worlds: no world registry recovery or failover loop, `/v1/server/worlds/*`
+/// answer 404, world commands over realtime are refused. On, only nodes with the `sim` role
+/// host cells and adopt worlds; other nodes still route world traffic to them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorldsConfig {
+    pub enabled: bool,
+}
+
+impl Default for WorldsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

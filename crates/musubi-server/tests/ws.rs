@@ -133,10 +133,16 @@ async fn build_state_cfg_with(
     ));
     fleets.spawn_log_writer();
     fanout.set_fleets(fleets.clone());
-    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new(
-        cluster.as_ref().unwrap().node_id().0,
-        Some(db.clone()),
-    ));
+    let worlds = Arc::new(
+        musubi_server::realtime::WorldRegistry::new(
+            cluster.as_ref().unwrap().node_id().0,
+            Some(db.clone()),
+        )
+        .with_modes(
+            cfg.worlds.enabled,
+            cfg.node.roles.contains(&musubi_core::config::Role::Sim),
+        ),
+    );
     worlds.set_region(region);
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());

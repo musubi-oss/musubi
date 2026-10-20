@@ -439,7 +439,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     }
     let worlds = Arc::new(
         crate::realtime::WorldRegistry::new(cluster.node_id().0, Some(db.clone()))
-            .with_group(&cfg.node.cluster_group),
+            .with_group(&cfg.node.cluster_group)
+            .with_modes(
+                cfg.worlds.enabled,
+                cfg.node.roles.contains(&musubi_core::config::Role::Sim),
+            ),
     );
     worlds.set_cluster(cluster.clone());
     // Admin kicks fan out to every node: each hub closes the account's local sockets.
@@ -469,124 +473,138 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
             }
         });
     }
-    let adopted = worlds.recover(&[cluster.node_id().0]).await?;
-    if !adopted.is_empty() {
-        tracing::info!(count = adopted.len(), "adopted orphaned worlds");
-    }
-    match worlds.recover_hosted(&fanout).await {
-        Ok(cells) if !cells.is_empty() => {
-            tracing::info!(?cells, "hosted cells handed back on boot")
+    if cfg.worlds.enabled {
+        let adopted = worlds.recover(&[cluster.node_id().0]).await?;
+        if !adopted.is_empty() {
+            tracing::info!(count = adopted.len(), "adopted orphaned worlds");
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "hosted cells not restored on boot"),
-    }
-    // World failover: adopt worlds whose home node died (one adopter at a time).
-    {
-        let (cluster, worlds, fanout) = (cluster.clone(), worlds.clone(), fanout.clone());
-        let lease = cluster.lease("world-failover", musubi_cluster::DEAD_AFTER);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
-            let mut leaves = cluster.subscribe();
-            let mut members = cluster.member_events();
-            let mut owed = false;
-            let mut soon_for: Vec<uuid::Uuid> = Vec::new();
-            let mut soon_left: u32 = 0;
-            loop {
-                wait_failover_round(&mut tick, &mut leaves, &mut members, owed).await;
-                owed = false;
-                // SWIM's verdict comes within seconds, the heartbeat check a few seconds later:
-                // poll until they agree instead of waiting for the next tick
-                await_dead_agreement(&cluster).await;
-                // cells of our worlds hosted on a dead node come back to us (no lease: each home
-                // node handles its own worlds)
-                // every stage is bounded and named: a hang here froze world failover cluster-wide
-                // once without a single log line to point at it
-                const STAGE: std::time::Duration = std::time::Duration::from_secs(30);
-                if tokio::time::timeout(STAGE, worlds.refresh_homes())
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("world failover: refresh_homes timed out");
-                }
-                match tokio::time::timeout(STAGE, worlds.reconcile_handed_back()).await {
-                    Err(_) => tracing::warn!("world failover: reconcile_handed_back timed out"),
-                    Ok(r) => match r {
-                        Ok(n) if n > 0 => {
-                            tracing::info!(entities = n, "handed-back cells reconciled")
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "hand-back reconciliation failed"),
-                    },
-                }
-                if let Some(dead) = dead_nodes(&cluster).await {
-                    tracing::info!(?dead, "world failover round");
-                    match tokio::time::timeout(STAGE, worlds.recover_cells(&dead, &fanout)).await {
-                        Ok(Ok(cells)) if !cells.is_empty() => {
-                            tracing::info!(?cells, ?dead, "re-homed cells of dead hosts")
-                        }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => tracing::warn!(error = %e, "cell failover failed"),
-                        Err(_) => tracing::warn!(?dead, "world failover: recover_cells timed out"),
+        match worlds.recover_hosted(&fanout).await {
+            Ok(cells) if !cells.is_empty() => {
+                tracing::info!(?cells, "hosted cells handed back on boot")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "hosted cells not restored on boot"),
+        }
+        // World failover: adopt worlds whose home node died (one adopter at a time).
+        {
+            let (cluster, worlds, fanout) = (cluster.clone(), worlds.clone(), fanout.clone());
+            let lease = cluster.lease("world-failover", musubi_cluster::DEAD_AFTER);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(musubi_cluster::DEAD_AFTER);
+                let mut leaves = cluster.subscribe();
+                let mut members = cluster.member_events();
+                let mut owed = false;
+                let mut soon_for: Vec<uuid::Uuid> = Vec::new();
+                let mut soon_left: u32 = 0;
+                loop {
+                    wait_failover_round(&mut tick, &mut leaves, &mut members, owed).await;
+                    owed = false;
+                    // SWIM's verdict comes within seconds, the heartbeat check a few seconds later:
+                    // poll until they agree instead of waiting for the next tick
+                    await_dead_agreement(&cluster).await;
+                    // cells of our worlds hosted on a dead node come back to us (no lease: each home
+                    // node handles its own worlds)
+                    // every stage is bounded and named: a hang here froze world failover cluster-wide
+                    // once without a single log line to point at it
+                    const STAGE: std::time::Duration = std::time::Duration::from_secs(30);
+                    if tokio::time::timeout(STAGE, worlds.refresh_homes())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("world failover: refresh_homes timed out");
                     }
-                }
-                if !await_lease(&lease).await {
-                    continue;
-                }
-                // every round, dead nodes or not: worlds created for this region elsewhere wait
-                // as unowned rows for a node here to adopt them
-                let dead = dead_nodes(&cluster).await.unwrap_or_default();
-                match tokio::time::timeout(STAGE, worlds.recover(&dead)).await {
-                    Ok(Ok(names)) if !names.is_empty() => {
-                        tracing::info!(
-                            ?names,
-                            ?dead,
-                            "adopted worlds (dead homes or pending placement)"
-                        );
-                        owed = false;
-                        // a world adopted from a dead home may have had cells on that same
-                        // node: re-home them now, not a whole round later (the stand saw the
-                        // mesh settle 15 s after the world for exactly this)
-                        if !dead.is_empty() {
-                            match tokio::time::timeout(STAGE, worlds.recover_cells(&dead, &fanout))
-                                .await
-                            {
-                                Ok(Ok(cells)) if !cells.is_empty() => {
-                                    tracing::info!(
-                                        ?cells,
-                                        ?dead,
-                                        "re-homed cells of adopted worlds"
-                                    )
-                                }
-                                Ok(Ok(_)) => {}
-                                Ok(Err(e)) => {
-                                    tracing::warn!(error = %e, "cell failover after adoption failed")
-                                }
-                                Err(_) => {
-                                    tracing::warn!(?dead, "world failover: recover_cells timed out")
-                                }
+                    match tokio::time::timeout(STAGE, worlds.reconcile_handed_back()).await {
+                        Err(_) => tracing::warn!("world failover: reconcile_handed_back timed out"),
+                        Ok(r) => match r {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(entities = n, "handed-back cells reconciled")
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "hand-back reconciliation failed"),
+                        },
+                    }
+                    if let Some(dead) = dead_nodes(&cluster).await {
+                        tracing::info!(?dead, "world failover round");
+                        match tokio::time::timeout(STAGE, worlds.recover_cells(&dead, &fanout))
+                            .await
+                        {
+                            Ok(Ok(cells)) if !cells.is_empty() => {
+                                tracing::info!(?cells, ?dead, "re-homed cells of dead hosts")
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => tracing::warn!(error = %e, "cell failover failed"),
+                            Err(_) => {
+                                tracing::warn!(?dead, "world failover: recover_cells timed out")
                             }
                         }
                     }
-                    Ok(Ok(_)) if dead.is_empty() => {}
-                    Ok(Ok(_)) => {
-                        // the dead node's leases may not have run out yet: retry soon a few
-                        // times, then fall back to the period — a node that owned nothing stays
-                        // dead for a long while and must not keep the round spinning every 2 s
-                        if dead != soon_for {
-                            soon_for = dead.clone();
-                            soon_left = 6;
-                        }
-                        owed = soon_left > 0;
-                        soon_left = soon_left.saturating_sub(1);
-                        tracing::info!(?dead, "world failover round: nothing to adopt")
+                    if !await_lease(&lease).await {
+                        continue;
                     }
-                    Ok(Err(e)) => tracing::warn!(error = %e, "world failover failed"),
-                    Err(_) => tracing::warn!(?dead, "world failover: recover timed out"),
+                    // every round, dead nodes or not: worlds created for this region elsewhere wait
+                    // as unowned rows for a node here to adopt them
+                    let dead = dead_nodes(&cluster).await.unwrap_or_default();
+                    match tokio::time::timeout(STAGE, worlds.recover(&dead)).await {
+                        Ok(Ok(names)) if !names.is_empty() => {
+                            tracing::info!(
+                                ?names,
+                                ?dead,
+                                "adopted worlds (dead homes or pending placement)"
+                            );
+                            owed = false;
+                            // a world adopted from a dead home may have had cells on that same
+                            // node: re-home them now, not a whole round later (the stand saw the
+                            // mesh settle 15 s after the world for exactly this)
+                            if !dead.is_empty() {
+                                match tokio::time::timeout(
+                                    STAGE,
+                                    worlds.recover_cells(&dead, &fanout),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(cells)) if !cells.is_empty() => {
+                                        tracing::info!(
+                                            ?cells,
+                                            ?dead,
+                                            "re-homed cells of adopted worlds"
+                                        )
+                                    }
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(error = %e, "cell failover after adoption failed")
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            ?dead,
+                                            "world failover: recover_cells timed out"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Ok(_)) if dead.is_empty() => {}
+                        Ok(Ok(_)) => {
+                            // the dead node's leases may not have run out yet: retry soon a few
+                            // times, then fall back to the period — a node that owned nothing stays
+                            // dead for a long while and must not keep the round spinning every 2 s
+                            if dead != soon_for {
+                                soon_for = dead.clone();
+                                soon_left = 6;
+                            }
+                            owed = soon_left > 0;
+                            soon_left = soon_left.saturating_sub(1);
+                            tracing::info!(?dead, "world failover round: nothing to adopt")
+                        }
+                        Ok(Err(e)) => tracing::warn!(error = %e, "world failover failed"),
+                        Err(_) => tracing::warn!(?dead, "world failover: recover timed out"),
+                    }
                 }
-            }
-        });
+            });
+        }
+        fanout.set_worlds(worlds.clone());
+    } else {
+        tracing::info!("worlds disabled ([worlds] enabled = false): no world recovery or failover on this node");
     }
-    fanout.set_worlds(worlds.clone());
     let liveops = cfg.zanshin.url.as_deref().map(|u| {
         let c = ZanshinClient::new(u, &cfg.zanshin.server_key);
         c.clone().spawn_flusher(std::time::Duration::from_secs(

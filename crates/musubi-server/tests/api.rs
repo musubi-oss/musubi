@@ -85,10 +85,16 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
             .unwrap();
     }
     fanout.set_fleets(fleets.clone());
-    let worlds = Arc::new(musubi_server::realtime::WorldRegistry::new(
-        cluster.as_ref().unwrap().node_id().0,
-        Some(db.clone()),
-    ));
+    let worlds = Arc::new(
+        musubi_server::realtime::WorldRegistry::new(
+            cluster.as_ref().unwrap().node_id().0,
+            Some(db.clone()),
+        )
+        .with_modes(
+            cfg.worlds.enabled,
+            cfg.node.roles.contains(&musubi_core::config::Role::Sim),
+        ),
+    );
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     let logins = Arc::new(musubi_server::logins::Social::new(cfg.social.clone()));
@@ -47688,4 +47694,78 @@ async fn build_artifacts_delta_uploads_chunks_manifest_and_gc() {
     let (st, _, _) = raw("GET", "/v1/server/builds/chunking".into(), vec![], vec![]).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn worlds_switch_disables_meshing_and_sim_role_gates_hosting() {
+    // [worlds] enabled = false: the world API is gone, realtime refuses world commands
+    let Some((app, state)) = app_and_state_with(|c| {
+        c.worlds.enabled = false;
+        c.database.max_connections = 8;
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    assert!(!state.worlds.enabled());
+    assert!(!state.worlds.hosting());
+    let (st, v) = call_server(&app, "GET", "/v1/server/worlds", k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("[worlds] enabled"),
+        "{v}"
+    );
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/worlds",
+        k,
+        Some(json!({"name": "w1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let err = state
+        .worlds
+        .register_sim("w1", musubi_core::NodeId::new().0, 4)
+        .unwrap_err();
+    assert!(matches!(err, musubi_core::Error::Unavailable(_)), "{err}");
+    assert!(state.worlds.recover(&[]).await.unwrap().is_empty());
+    // the rest of the API is untouched
+    let (st, _) = call_server(&app, "GET", "/v1/server/fleets", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+
+    drop((app, state));
+    // enabled on a node without the `sim` role: API served, but it hosts nothing itself
+    let Some((app, state)) = app_and_state_with(|c| {
+        c.database.max_connections = 8;
+        c.node.roles = vec![
+            musubi_core::config::Role::Api,
+            musubi_core::config::Role::Realtime,
+            musubi_core::config::Role::Edge,
+        ];
+    })
+    .await
+    else {
+        return;
+    };
+    assert!(state.worlds.enabled());
+    assert!(!state.worlds.hosting());
+    let (st, v) = call_server(&app, "GET", "/v1/server/worlds", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let err = state
+        .worlds
+        .register_sim("nope", musubi_core::NodeId::new().0, 4)
+        .unwrap_err();
+    assert!(err.to_string().contains("sim"), "{err}");
+    assert!(state.worlds.recover(&[]).await.unwrap().is_empty());
+    let (st, v) = call_server(&app, "GET", "/v1/node", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let roles: Vec<&str> = v["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.as_str())
+        .collect();
+    assert!(!roles.contains(&"sim"), "{v}");
 }

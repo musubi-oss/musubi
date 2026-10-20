@@ -306,7 +306,12 @@ pub fn router(state: AppState) -> Router {
         .merge(economy_changesets::routes())
         .merge(fleets::routes())
         .merge(workflows::routes())
-        .merge(worlds::routes())
+        .merge(
+            worlds::routes().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                worlds_gate,
+            )),
+        )
         .merge(integrations::routes())
         .merge(rtc::routes())
         .merge(economy::routes())
@@ -391,6 +396,22 @@ pub fn router(state: AppState) -> Router {
     };
     let router = if cors_on { router.layer(cors) } else { router };
     router.with_state(state)
+}
+
+/// `[worlds] enabled = false`: the world API is not served at all.
+async fn worlds_gate(
+    State(s): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if s.worlds.enabled() {
+        next.run(req).await
+    } else {
+        ApiError(musubi_core::Error::NotFound(
+            "worlds are disabled on this cluster ([worlds] enabled = false)".into(),
+        ))
+        .into_response()
+    }
 }
 
 /// `telemetry` role without `api`: this process is a dedicated telemetry backend.

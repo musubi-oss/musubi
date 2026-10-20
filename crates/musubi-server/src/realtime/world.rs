@@ -506,6 +506,10 @@ const ADOPT_ANNOUNCE_EVERY: u32 = 20;
 
 pub struct WorldRegistry {
     node_id: Uuid,
+    /// `[worlds] enabled`: off, every world operation is refused.
+    enabled: std::sync::atomic::AtomicBool,
+    /// This node has the `sim` role: it may home worlds, host cells and accept simulators.
+    hosting: std::sync::atomic::AtomicBool,
     /// `node.cluster_group`: worlds of other clusters sharing the database are invisible here.
     group: String,
     db: Option<PgPool>,
@@ -671,6 +675,8 @@ impl WorldRegistry {
     pub fn new(node_id: Uuid, db: Option<PgPool>) -> Self {
         Self {
             node_id,
+            enabled: std::sync::atomic::AtomicBool::new(true),
+            hosting: std::sync::atomic::AtomicBool::new(true),
             group: "default".into(),
             db,
             worlds: DashMap::new(),
@@ -705,6 +711,45 @@ impl WorldRegistry {
     pub fn with_group(mut self, group: &str) -> Self {
         self.group = group.to_string();
         self
+    }
+
+    /// `[worlds] enabled` and whether this node carries the `sim` role.
+    pub fn with_modes(self, enabled: bool, hosting: bool) -> Self {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.hosting
+            .store(hosting, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Homes worlds / hosts cells here only with the `sim` role.
+    pub fn hosting(&self) -> bool {
+        self.enabled() && self.hosting.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn check_enabled(&self) -> Result<()> {
+        if self.enabled() {
+            Ok(())
+        } else {
+            Err(Error::Unavailable(
+                "worlds are disabled on this cluster ([worlds] enabled = false)".into(),
+            ))
+        }
+    }
+
+    fn check_hosting(&self) -> Result<()> {
+        self.check_enabled()?;
+        if self.hosting() {
+            Ok(())
+        } else {
+            Err(Error::Unavailable(
+                "this node has no `sim` role: it routes world traffic but hosts no cells".into(),
+            ))
+        }
     }
 
     pub fn set_cluster(&self, cluster: Arc<musubi_cluster::Cluster>) {
@@ -849,6 +894,7 @@ impl WorldRegistry {
     /// This node takes `cell` of `name`: make sure a local shard of the world exists (config from
     /// `musubi.worlds`, defaults without a database); simulators lease the cell here as usual.
     pub async fn host_cell(&self, name: &str, cell: CellId) -> Result<Vec<CellId>> {
+        self.check_hosting()?;
         let home = self.home_of(name).await?;
         if !self.worlds.contains_key(name) {
             let (cfg, ctl) = match &self.db {
@@ -909,6 +955,9 @@ impl WorldRegistry {
     /// re-homed them) go back to their home, which merges our persisted shard from the database.
     /// Resuming them from memory would race the home's dead-host recovery into two live owners.
     pub async fn recover_hosted(&self, fanout: &Fanout) -> Result<Vec<(String, CellId)>> {
+        if !self.hosting() {
+            return Ok(Vec::new());
+        }
         let Some(c) = self.cluster.get() else {
             return Ok(vec![]);
         };
@@ -968,6 +1017,7 @@ impl WorldRegistry {
     /// node's shard) merges into our copy — the forced handovers over the bus are the fast path,
     /// this is the one that cannot drop entities.
     pub async fn adopt_cell_from(&self, name: &str, cell: CellId, prev: Uuid) -> Result<usize> {
+        self.check_hosting()?;
         let Some(db) = self.db.clone() else {
             return Ok(0);
         };
@@ -1605,6 +1655,9 @@ impl WorldRegistry {
     /// Adopt worlds whose home node is dead (or gone from the node table): claim the directory row
     /// atomically, rebuild the world from its config and the last snapshot. Returns adopted names.
     pub async fn recover(&self, dead_nodes: &[Uuid]) -> Result<Vec<String>> {
+        if !self.hosting() {
+            return Ok(Vec::new());
+        }
         let Some(db) = &self.db else {
             return Ok(vec![]);
         };
@@ -1976,6 +2029,9 @@ impl WorldRegistry {
     /// Run a client command on the home node; errors go back to the session as messages. An input
     /// for an entity that lives in a cell hosted elsewhere is forwarded over the bus.
     pub fn exec(&self, env: WorldCmdEnv, fanout: &Fanout) -> Option<ServerMessage> {
+        if let Err(e) = self.check_enabled() {
+            return Some(ServerMessage::error(&e));
+        }
         let r = match env.cmd {
             WorldCmd::Subscribe {
                 x,
@@ -2022,6 +2078,9 @@ impl WorldRegistry {
         dead_nodes: &[Uuid],
         fanout: &Fanout,
     ) -> Result<Vec<(String, CellId)>> {
+        if !self.hosting() {
+            return Ok(Vec::new());
+        }
         let orphaned: Vec<(String, CellId, Uuid)> = self
             .cell_hosts
             .iter()
@@ -2171,6 +2230,7 @@ impl WorldRegistry {
         ctl: ControllerConfig,
         region: &str,
     ) -> Result<Option<WorldInfo>> {
+        self.check_enabled()?;
         if name.is_empty() || name.len() > 64 {
             return Err(Error::InvalidArgument("world name 1..=64 chars".into()));
         }
@@ -2181,7 +2241,7 @@ impl WorldRegistry {
             return Err(Error::Conflict("world exists".into()));
         }
         if let Some(db) = &self.db {
-            let elsewhere = !region.is_empty() && region != self.region();
+            let elsewhere = !self.hosting() || (!region.is_empty() && region != self.region());
             let remote_alive: bool = if elsewhere {
                 sqlx::query_scalar(
                     "select exists(select 1 from musubi.nodes where region = $1 and heartbeat_at > now() - interval '10 seconds')",
@@ -2339,6 +2399,7 @@ impl WorldRegistry {
     // ----- simulator side -----
 
     pub fn lease(&self, name: &str, sim: Uuid, cells: &[CellId]) -> Result<Vec<CellId>> {
+        self.check_hosting()?;
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
@@ -2383,6 +2444,7 @@ impl WorldRegistry {
     }
 
     pub fn register_sim(&self, name: &str, sim: Uuid, capacity: u32) -> Result<Vec<SimInfo>> {
+        self.check_hosting()?;
         if capacity == 0 {
             return Err(Error::InvalidArgument("capacity >= 1".into()));
         }
