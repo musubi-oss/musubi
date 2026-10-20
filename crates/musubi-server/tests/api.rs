@@ -1958,8 +1958,9 @@ async fn fleet_docker_provider_runs_a_container() {
     let (started, _) = svc.reconcile_one(fid).await.unwrap();
     let all = svc.servers(fid, None).await.unwrap();
     let _ = (started, all); // another test binary's reconciler may have filled the buffer
-    let servers = svc.servers(fid, Some("starting")).await.unwrap();
-    assert_eq!(servers.len(), 1);
+                            // another test binary's reconciler may already have moved the row past `starting`
+    let servers = svc.servers(fid, None).await.unwrap();
+    assert_eq!(servers.len(), 1, "{servers:?}");
     // the row is written before `docker run` returns (possibly by another test binary's reconciler)
     let mut running = false;
     for _ in 0..40 {
@@ -36526,7 +36527,7 @@ async fn qa_clock_future_date_testing() {
         "PUT",
         &path,
         k,
-        Some(json!({"offset_secs": 86_400 * 8, "expires_in_secs": 1})),
+        Some(json!({"offset_secs": 86_400 * 8})),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{c}");
@@ -36539,7 +36540,17 @@ async fn qa_clock_future_date_testing() {
             .any(|x| x["title"] == title),
         "{feed}"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // a short-lived clock: wide enough that a slow runner cannot outlive it before we look
+    let (st, c) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"offset_secs": 86_400 * 8, "expires_in_secs": 2})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
     let (_, c) = call_server(&app, "GET", &path, k, None).await;
     assert_eq!(c["active"], false, "expired clock: {c}");
     let (_, t) = call(&app, "GET", "/v1/time", Some(&tok), None).await;
@@ -46877,21 +46888,52 @@ async fn telemetry_s3_sink_batches_dedicated_role_and_redirect() {
     assert!(v["ingest_url"].is_null(), "{v}");
 
     let ev = unique("s3ev").to_lowercase().replace(['.', ':', '-'], "_");
+    // the sampling policy is cluster state another test may be driving to 0% right now:
+    // pin our event as always-enabled (keeping whatever global rate is set) so rows are never sampled out
+    let pin = |app: Router, ev: String| async move {
+        let (_, cur) = call_server(&app, "GET", "/v1/server/analytics/sampling", k, None).await;
+        let mut always: Vec<Value> = cur["always_enabled"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !always.iter().any(|x| x == &json!(ev)) {
+            always.push(json!(ev));
+        }
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/server/analytics/sampling",
+            k,
+            Some(json!({"global_pct": cur["global_pct"].as_i64().unwrap_or(100), "always_enabled": always})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    };
+    pin(app.clone(), ev.clone()).await;
+    let pin = &pin;
     let send = |app: Router, tok: String, n: usize| {
         let ev = ev.clone();
         async move {
             let events: Vec<Value> = (0..n)
                 .map(|i| json!({"name": ev, "properties": {"i": i}}))
                 .collect();
-            let (st, v) = call(
-                &app,
-                "POST",
-                "/v1/telemetry/events",
-                Some(&tok),
-                Some(json!({"events": events})),
-            )
-            .await;
-            assert_eq!(st, StatusCode::OK, "{v}");
+            for attempt in 0..5 {
+                let (st, v) = call(
+                    &app,
+                    "POST",
+                    "/v1/telemetry/events",
+                    Some(&tok),
+                    Some(json!({"events": events.clone()})),
+                )
+                .await;
+                assert_eq!(st, StatusCode::OK, "{v}");
+                if v["accepted"] == n {
+                    return;
+                }
+                // a parallel test rewrote the policy between our pin and this ingest: pin again and retry
+                assert!(attempt < 4, "events kept being sampled out: {v}");
+                pin(app.clone(), ev.clone()).await;
+            }
         }
     };
     send(app.clone(), tok.clone(), 2).await;
@@ -47808,7 +47850,11 @@ async fn build_artifacts_delta_uploads_chunks_manifest_and_gc() {
     assert_eq!(st, StatusCode::OK);
     let del: Value = serde_json::from_slice(&b).unwrap();
     assert_eq!(del["removed"], true);
-    assert_eq!(del["chunks_freed"], missing.len(), "{del}");
+    // delete also sweeps orphans left by parallel test binaries, so at least ours are freed
+    assert!(
+        del["chunks_freed"].as_u64().unwrap() as usize >= missing.len(),
+        "{del}"
+    );
     let (st, _, b) = raw(
         "GET",
         format!("/v1/server/builds/{name}/1.0.1/download?token={token2}"),
