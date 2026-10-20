@@ -17,6 +17,11 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/telemetry/events", post(ingest))
         .route("/v1/telemetry/anonymous", post(ingest_anonymous))
+        .route("/v1/telemetry/sampling", get(client_sampling))
+        .route(
+            "/v1/server/analytics/sampling",
+            get(get_sampling).put(put_sampling),
+        )
         .route(
             "/v1/server/analytics/schemas",
             get(list_schemas).post(post_schema),
@@ -127,6 +132,54 @@ async fn put_schema(
             })
             .await?,
     ))
+}
+
+/// `GET /v1/telemetry/sampling` — what the client may skip sending: global keep rate, events
+/// that are always kept, and the effective per-event rates of registered schemas (`version`
+/// changes whenever the policy does — poll it, drop the local copy on change).
+async fn client_sampling(
+    State(s): State<AppState>,
+    Bearer(_me): Bearer,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let p = s.analytics.sampling().await?;
+    let schemas = s.analytics.schemas().await?;
+    let mut events: std::collections::BTreeMap<String, i32> = schemas
+        .values()
+        .filter(|sc| sc.enabled)
+        .map(|sc| (sc.name.clone(), p.effective_pct(&sc.name, sc.sampling_pct)))
+        .collect();
+    for n in &p.always_enabled {
+        events.insert(n.clone(), 100);
+    }
+    Ok(Json(json!({
+        "global_pct": p.global_pct, "always_enabled": p.always_enabled, "version": p.version,
+        "events": events,
+    })))
+}
+
+async fn get_sampling(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> std::result::Result<Json<crate::analytics::SamplingPolicy>, ApiError> {
+    Ok(Json((*s.analytics.sampling().await?).clone()))
+}
+
+/// `PUT /v1/server/analytics/sampling {global_pct, always_enabled[]}` — hot change; every node
+/// picks it up within 30 s, clients on their next `GET /v1/telemetry/sampling`.
+async fn put_sampling(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Json(b): Json<crate::analytics::SamplingPolicy>,
+) -> std::result::Result<Json<crate::analytics::SamplingPolicy>, ApiError> {
+    let p = s.analytics.save_sampling(&b).await?;
+    s.events
+        .emit(
+            "telemetry.sampling_changed",
+            None,
+            json!({ "global_pct": p.global_pct, "always_enabled": p.always_enabled, "version": p.version }),
+        )
+        .await;
+    Ok(Json((*p).clone()))
 }
 
 async fn post_schema(

@@ -40256,3 +40256,200 @@ async fn fleet_reserve_holds_server_out_of_allocation_and_scale_down() {
         assert!(gs.reserved_until.is_none());
     }
 }
+
+#[tokio::test]
+async fn telemetry_sampling_policy_global_rate_and_always_enabled() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (st, a) = call_server(
+        &app,
+        "POST",
+        "/v1/server/auth/custom",
+        k,
+        Some(json!({"id": unique("samp")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    let tok = a["access_token"].as_str().unwrap().to_string();
+    let ev = unique("samp.evt").replace('-', "_");
+    let keep = unique("samp.keep").replace('-', "_");
+    for n in [&ev, &keep] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            "/v1/server/analytics/schemas",
+            k,
+            Some(json!({"name": n, "sampling_pct": 100})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let batch = |name: &str| -> Value {
+        json!({"events": (0..200).map(|i| json!({"name": name, "session_id": format!("s{i}"), "properties": {}})).collect::<Vec<_>>()})
+    };
+    let reset = || async {
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            "/v1/server/analytics/sampling",
+            k,
+            Some(json!({"global_pct": 100, "always_enabled": []})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    };
+    reset().await;
+    // default: everything kept
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(batch(&ev)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["accepted"], 200);
+    assert_eq!(v["sampled_out"], 0);
+    // validation
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/analytics/sampling",
+        k,
+        Some(json!({"global_pct": 101})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/analytics/sampling",
+        k,
+        Some(json!({"global_pct": 50, "always_enabled": ["bad name!"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // global 50 % with one always-kept event
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/analytics/sampling",
+        k,
+        Some(json!({"global_pct": 50, "always_enabled": [keep, keep]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["global_pct"], 50);
+    assert_eq!(
+        v["always_enabled"].as_array().unwrap().len(),
+        1,
+        "deduplicated: {v}"
+    );
+    assert!(v["version"].as_i64().unwrap() > 0);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(batch(&ev)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let out = v["sampled_out"].as_u64().unwrap();
+    assert!((60..=140).contains(&out), "about half sampled out: {v}");
+    assert_eq!(v["accepted"].as_u64().unwrap() + out, 200);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(batch(&keep)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["sampled_out"], 0, "always_enabled is never sampled: {v}");
+    // deterministic: the same sessions are kept on a repeat
+    let (_, v2) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(batch(&ev)),
+    )
+    .await;
+    assert_eq!(v2["sampled_out"], out);
+    // the client sees the same policy and effective per-event rates
+    let (st, c) = call(&app, "GET", "/v1/telemetry/sampling", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["global_pct"], 50);
+    assert_eq!(c["events"][&ev], 50);
+    assert_eq!(c["events"][&keep], 100);
+    let (st, g) = call_server(&app, "GET", "/v1/server/analytics/sampling", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{g}");
+    assert_eq!(g["version"], c["version"]);
+    // schema 40 % × global 50 % = 20 %
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/analytics/schemas",
+        k,
+        Some(json!({"name": ev, "sampling_pct": 40})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, c) = call(&app, "GET", "/v1/telemetry/sampling", Some(&tok), None).await;
+    assert_eq!(c["events"][&ev], 20, "{c}");
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(batch(&ev)),
+    )
+    .await;
+    assert!(
+        (120..=180).contains(&v["sampled_out"].as_u64().unwrap()),
+        "{v}"
+    );
+    // global 0 drops everything but the always-kept names
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/analytics/sampling",
+        k,
+        Some(json!({"global_pct": 0, "always_enabled": [keep]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(batch(&ev)),
+    )
+    .await;
+    assert_eq!(v["sampled_out"], 200, "{v}");
+    let (_, v) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(batch(&keep)),
+    )
+    .await;
+    assert_eq!(v["accepted"], 200, "{v}");
+    reset().await;
+    for n in [&ev, &keep] {
+        let (st, _) = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/analytics/schemas/{n}"),
+            k,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+}

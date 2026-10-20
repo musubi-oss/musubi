@@ -754,6 +754,7 @@ player gives or a platform's age signal; `PUT /v1/server/accounts/{id}/age` does
 - **Log follow / download** — `…/servers/{sid}/logs/stream` (SSE: `tail` history then live lines) and `…/logs/download` (plain-text file).
 - **Session baggage** — per-session key/value in `social` / `game` / `service` scopes (friends, game servers, event stamping), Pragma-style limits.
 - **Reserved servers** — `POST /v1/gameserver/reserve {seconds}` / `…/gameservers/{id}/reserve|unreserve`: hold a ready server out of allocation and scale-down, timed or until cancelled.
+- **Telemetry sampling policy** — global keep rate × per-schema rate, `always_enabled` events, deterministic per session; clients fetch `GET /v1/telemetry/sampling` and skip what would be dropped.
 | `GET /v1/time` | Authoritative server clock `{now, now_ms, iso}` |
 trusted source and a child cannot raise its own bracket. Per bracket `[compliance]` lists the
 closed features — defaults: children lose `chat` (sending; reading stays), `friends` (requests),

@@ -90,6 +90,40 @@ pub struct Analytics {
     http: reqwest::Client,
     queue: Mutex<Vec<Row>>,
     schemas: Mutex<SchemaCache>,
+    sampling: Mutex<Option<(std::time::Instant, Arc<SamplingPolicy>)>>,
+}
+
+/// Title-wide sampling (Pragma `globalWeight` / `alwaysEnabledIds`): the effective keep rate of
+/// an event is `schema.sampling_pct × global_pct / 100` (unregistered events: `global_pct`),
+/// except names in `always_enabled`, which are always kept. Clients fetch the same policy
+/// (`GET /v1/telemetry/sampling`) and skip sending what the server would drop anyway.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SamplingPolicy {
+    pub global_pct: i32,
+    pub always_enabled: Vec<String>,
+    /// Unix seconds of the last change — poll cheaply / cache key.
+    pub version: i64,
+}
+
+impl Default for SamplingPolicy {
+    fn default() -> Self {
+        Self {
+            global_pct: 100,
+            always_enabled: Vec::new(),
+            version: 0,
+        }
+    }
+}
+
+impl SamplingPolicy {
+    /// Effective keep percentage for `name` given its schema rate (100 when unregistered).
+    pub fn effective_pct(&self, name: &str, schema_pct: i32) -> i32 {
+        if self.always_enabled.iter().any(|n| n == name) {
+            return 100;
+        }
+        (schema_pct.clamp(0, 100) * self.global_pct.clamp(0, 100)) / 100
+    }
 }
 
 fn valid_name(n: &str) -> bool {
@@ -119,6 +153,7 @@ impl Analytics {
                 .unwrap_or_default(),
             queue: Mutex::new(Vec::new()),
             schemas: Mutex::new(None),
+            sampling: Mutex::new(None),
         })
     }
 
@@ -135,6 +170,63 @@ impl Analytics {
                 me.flush().await;
             }
         });
+    }
+
+    pub fn invalidate_sampling(&self) {
+        *self.sampling.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Current sampling policy (cached 30 s per node).
+    pub async fn sampling(&self) -> Result<Arc<SamplingPolicy>> {
+        if let Some((at, p)) = &*self.sampling.lock().unwrap_or_else(|e| e.into_inner()) {
+            if at.elapsed() < Duration::from_secs(30) {
+                return Ok(p.clone());
+            }
+        }
+        let row: Option<(i32, Vec<String>, OffsetDateTime)> = sqlx::query_as(
+            "select global_pct, always_enabled, updated_at from musubi.telemetry_sampling where id = 1",
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let p = Arc::new(match row {
+            Some((global_pct, always_enabled, at)) => SamplingPolicy {
+                global_pct,
+                always_enabled,
+                version: at.unix_timestamp(),
+            },
+            None => SamplingPolicy::default(),
+        });
+        *self.sampling.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((std::time::Instant::now(), p.clone()));
+        Ok(p)
+    }
+
+    pub async fn save_sampling(&self, p: &SamplingPolicy) -> Result<Arc<SamplingPolicy>> {
+        if !(0..=100).contains(&p.global_pct) {
+            return Err(Error::InvalidArgument("global_pct: 0..=100".into()));
+        }
+        if p.always_enabled.len() > 256 || p.always_enabled.iter().any(|n| !valid_name(n)) {
+            return Err(Error::InvalidArgument(
+                "always_enabled: at most 256 valid event names".into(),
+            ));
+        }
+        let mut names = p.always_enabled.clone();
+        names.sort();
+        names.dedup();
+        sqlx::query(
+            "insert into musubi.telemetry_sampling (id, global_pct, always_enabled, updated_at)
+             values (1, $1, $2, now())
+             on conflict (id) do update set global_pct = excluded.global_pct,
+               always_enabled = excluded.always_enabled, updated_at = now()",
+        )
+        .bind(p.global_pct)
+        .bind(&names)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        self.invalidate_sampling();
+        self.sampling().await
     }
 
     pub fn invalidate_schemas(&self) {
@@ -235,6 +327,7 @@ impl Analytics {
             )));
         }
         let schemas = self.schemas().await?;
+        let sampling = self.sampling().await?;
         let now = OffsetDateTime::now_utc();
         let now_s = now.unix_timestamp();
         let mut report = IngestReport::default();
@@ -259,7 +352,7 @@ impl Analytics {
                 continue;
             }
             let schema = schemas.get(&e.name);
-            match schema {
+            let schema_pct = match schema {
                 None if !self.cfg.accept_unregistered => {
                     report.rejected.push(reject("unregistered event"));
                     continue;
@@ -277,21 +370,23 @@ impl Analytics {
                             .push(reject(&format!("missing property {missing}")));
                         continue;
                     }
-                    if s.sampling_pct < 100 {
-                        let key = e
-                            .session_id
-                            .clone()
-                            .or_else(|| e.device_id.clone())
-                            .or_else(|| device_id.clone())
-                            .or_else(|| account.map(|a| a.to_string()))
-                            .unwrap_or_else(|| Uuid::now_v7().to_string());
-                        if bucket(&format!("{}/{key}", e.name)) as i32 >= s.sampling_pct {
-                            report.sampled_out += 1;
-                            continue;
-                        }
-                    }
+                    s.sampling_pct
                 }
-                None => {}
+                None => 100,
+            };
+            let pct = sampling.effective_pct(&e.name, schema_pct);
+            if pct < 100 {
+                let key = e
+                    .session_id
+                    .clone()
+                    .or_else(|| e.device_id.clone())
+                    .or_else(|| device_id.clone())
+                    .or_else(|| account.map(|a| a.to_string()))
+                    .unwrap_or_else(|| Uuid::now_v7().to_string());
+                if bucket(&format!("{}/{key}", e.name)) as i32 >= pct {
+                    report.sampled_out += 1;
+                    continue;
+                }
             }
             let mut at = e.at.unwrap_or(now_s);
             if at > 1_000_000_000_000 {
