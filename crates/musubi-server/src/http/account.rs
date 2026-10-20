@@ -166,7 +166,7 @@ struct UsersQuery {
 /// `GET /v1/users?ids=a,b&usernames=x,y`
 async fn get_users(
     State(s): State<AppState>,
-    Bearer(_): Bearer,
+    Bearer(me): Bearer,
     Query(q): Query<UsersQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ids = q
@@ -189,7 +189,9 @@ async fn get_users(
         .map(String::from)
         .collect();
     let users: Vec<User> = s.accounts.get_users(&ids, &names).await?;
-    Ok(Json(json!({ "users": public_profiles(&s, users) })))
+    let mut cards = public_profiles(&s, users);
+    super::privacy::filter_profiles(&s, Some(me.account_id.0), &mut cards).await?;
+    Ok(Json(json!({ "users": cards })))
 }
 
 #[derive(Deserialize)]
@@ -206,11 +208,13 @@ fn search_limit() -> usize {
 /// `GET /v1/users/search?q=<username prefix>&limit=20` — case-insensitive prefix match.
 async fn search_users(
     State(s): State<AppState>,
-    Bearer(_): Bearer,
+    Bearer(me): Bearer,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let users: Vec<User> = s.accounts.search_users(&q.q, q.limit).await?;
-    Ok(Json(json!({ "users": public_profiles(&s, users) })))
+    let mut cards = public_profiles(&s, users);
+    super::privacy::filter_profiles(&s, Some(me.account_id.0), &mut cards).await?;
+    Ok(Json(json!({ "users": cards })))
 }
 
 #[derive(Deserialize)]

@@ -43724,3 +43724,301 @@ async fn inventory_inspect_links_public_view_revoke_and_expiry() {
     let (st, _) = call(&app, "GET", "/v1/inventory/shares", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Privacy toggles (LootLocker public/private profile parity): `friends`/`private` profiles
+/// collapse for strangers, open for mutual friends; inventory inspect links honour `inventory`.
+#[tokio::test]
+async fn account_privacy_profile_and_inventory_visibility() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let mut u = Vec::new();
+    for i in 0..3 {
+        let (_, r) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(json!({"id": unique(&format!("pv{i}"))})),
+        )
+        .await;
+        u.push((
+            r["account_id"].as_str().unwrap().to_string(),
+            r["access_token"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (owner, tok) = (&u[0].0, &u[0].1);
+    let (friend_id, friend) = (&u[1].0, &u[1].1);
+    let stranger = &u[2].1;
+    let (st, _) = call(
+        &app,
+        "PATCH",
+        "/v1/account",
+        Some(tok),
+        Some(json!({"display_name": "Owner O", "location": "DE"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // mutual friendship owner <-> friend
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(tok),
+        Some(json!({"ids": [friend_id]})),
+    )
+    .await;
+    assert!(st == StatusCode::OK || st == StatusCode::NO_CONTENT, "{st}");
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/friends",
+        Some(friend),
+        Some(json!({"ids": [owner]})),
+    )
+    .await;
+    assert!(st == StatusCode::OK || st == StatusCode::NO_CONTENT, "{st}");
+
+    let (st, v) = call(&app, "GET", "/v1/account/privacy", Some(tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["profile"], "public");
+    assert_eq!(v["inventory"], "public");
+    assert_eq!(v["show_online"], true);
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/account/privacy",
+        Some(tok),
+        Some(json!({"profile": "hidden"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/account/privacy",
+        Some(tok),
+        Some(json!({"profile": "friends", "show_online": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["profile"], "friends");
+    assert_eq!(v["inventory"], "public", "untouched field keeps its value");
+    assert_eq!(v["show_online"], false);
+
+    let card = |v: &Value| {
+        v["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == *owner)
+            .cloned()
+            .unwrap()
+    };
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users?ids={owner}"),
+        Some(stranger),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let c = card(&v);
+    assert_eq!(c["private"], true, "{c}");
+    assert!(
+        c.get("display_name").is_none() && c.get("location").is_none(),
+        "{c}"
+    );
+    assert!(c["username"].is_string());
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users?ids={owner}"),
+        Some(friend),
+        None,
+    )
+    .await;
+    let c = card(&v);
+    assert_eq!(
+        c["display_name"], "Owner O",
+        "friend sees the full card: {c}"
+    );
+    assert!(c.get("private").is_none());
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users?ids={owner}"),
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(card(&v)["display_name"], "Owner O");
+    let (st, v) = call(
+        &app,
+        "PUT",
+        "/v1/account/privacy",
+        Some(tok),
+        Some(json!({"profile": "private"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/users?ids={owner}"),
+        Some(friend),
+        None,
+    )
+    .await;
+    assert_eq!(card(&v)["private"], true, "private hides from friends too");
+
+    // inventory visibility on inspect links
+    let item = unique("pvitem");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/items",
+        k,
+        Some(json!({"id": item, "name": "Hat", "category": "cosmetic"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/inventory/grant",
+        k,
+        Some(json!({"account_id": owner, "item_id": item, "quantity": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, inv) = call(&app, "GET", "/v1/inventory", Some(tok), None).await;
+    let inv_id = inv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["item_id"] == item)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/inventory/{inv_id}/share"),
+        Some(tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let token = v["token"].as_str().unwrap().to_string();
+    let (st, _) = call(&app, "GET", &format!("/v1/inspect/{token}"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "public inventory: anonymous ok");
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/account/privacy",
+        Some(tok),
+        Some(json!({"inventory": "friends"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "GET", &format!("/v1/inspect/{token}"), None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "anonymous blocked");
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/inspect/{token}"),
+        Some(stranger),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "stranger blocked");
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/inspect/{token}"),
+        Some(friend),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "friend allowed");
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/inspect/{token}"),
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "owner allowed");
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/v1/account/privacy",
+        Some(tok),
+        Some(json!({"inventory": "private"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/inspect/{token}"),
+        Some(friend),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/inspect/{token}"),
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{owner}/privacy"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["profile"], "private");
+    assert_eq!(v["inventory"], "private");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{}/privacy", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=account.privacy_updated&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["account_id"] == *owner
+                || e["payload"]["profile"] == "private"
+                || e["data"]["profile"] == "private"),
+        "{ev}"
+    );
+    let (st, _) = call(&app, "GET", "/v1/account/privacy", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

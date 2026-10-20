@@ -6,6 +6,7 @@
 //! `properties.inspectable = false`.
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{Error, Result};
@@ -185,8 +186,19 @@ async fn my_shares(State(s): State<AppState>, Bearer(me): Bearer) -> Result<Json
 /// `GET /v1/inspect/{token}` — public, no session: the item as seen in a profile or market.
 async fn inspect(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // optional bearer: a friend of the owner may see a friends-only inventory
+    let viewer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .and_then(|t| s.auth.verify_access(t).ok())
+        .map(|a| a.account_id.0);
     if token.len() > 64 {
         return Err(Error::NotFound("inspect link".into()).into());
     }
@@ -207,6 +219,10 @@ async fn inspect(
     let (item_id, quantity, instance) = owned_entry(&s, owner, inv).await?;
     let item = s.economy.item(&item_id).await?;
     if !inspectable(&item) {
+        return Err(Error::NotFound("inspect link".into()).into());
+    }
+    let privacy = super::privacy::load(&s, owner).await?;
+    if !super::privacy::allowed(&s, owner, viewer, &privacy.inventory).await? {
         return Err(Error::NotFound("inspect link".into()).into());
     }
     let owner_row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(

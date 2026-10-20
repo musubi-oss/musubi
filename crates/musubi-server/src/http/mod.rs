@@ -67,6 +67,7 @@ mod parties;
 mod passkeys;
 pub mod placements;
 mod player_files;
+pub mod privacy;
 pub mod push;
 pub mod qa_clock;
 pub mod rating;
@@ -246,6 +247,7 @@ pub fn router(state: AppState) -> Router {
         .merge(referrals::router())
         .merge(data_rights::router())
         .merge(inspect::router())
+        .merge(privacy::router())
         .merge(session_vars::router())
         .merge(qa_clock::router())
         .merge(countries::router())
