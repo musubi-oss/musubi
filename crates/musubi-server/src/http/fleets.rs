@@ -35,6 +35,12 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/v1/server/fleets/{id}/allocate", post(allocate))
         .route("/v1/server/allocate", post(allocate_routed))
+        .route("/v1/server/aliases", get(list_aliases))
+        .route(
+            "/v1/server/aliases/{name}",
+            get(get_alias).put(put_alias).delete(delete_alias),
+        )
+        .route("/v1/server/aliases/{name}/allocate", post(allocate_alias))
         .route("/v1/server/fleets/{id}/servers", get(servers))
         .route(
             "/v1/server/fleets/{id}/servers/{sid}/logs",
@@ -307,10 +313,14 @@ async fn allocate_routed(
     if r.pool.is_empty() {
         return Err(Error::InvalidArgument("pool is required".into()).into());
     }
+    let pool = match r.pool.strip_prefix("alias:") {
+        Some(name) => resolve_alias(&s, name).await?,
+        None => r.pool.clone(),
+    };
     Ok(Json(
         s.fleets
             .allocate_routed_with(
-                &r.pool,
+                &pool,
                 &musubi_fleet::RouteHint {
                     region: r.region,
                     regions: r.regions,
@@ -1289,4 +1299,238 @@ async fn sdk_event(
         )
         .await;
     Ok(Json(json!({ "ok": true, "kind": kind, "event_id": id })))
+}
+
+// ---- fleet aliases (GameLift Alias parity) -------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct AliasBody {
+    description: String,
+    /// `simple` routes to `target` (a fleet name or pool), `terminal` rejects with `message`.
+    routing: String,
+    target: Option<String>,
+    message: String,
+    metadata: Value,
+}
+
+impl Default for AliasBody {
+    fn default() -> Self {
+        Self {
+            description: String::new(),
+            routing: "simple".into(),
+            target: None,
+            message: String::new(),
+            metadata: json!({}),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AliasRow {
+    name: String,
+    description: String,
+    routing: String,
+    target: Option<String>,
+    message: String,
+    metadata: Value,
+    created_at: time::OffsetDateTime,
+    updated_at: time::OffsetDateTime,
+}
+
+const ALIAS_COLS: &str =
+    "name, description, routing, target, message, metadata, created_at, updated_at";
+
+fn alias_json(r: &AliasRow) -> Value {
+    json!({
+        "name": r.name, "description": r.description, "routing": r.routing, "target": r.target,
+        "message": r.message, "metadata": r.metadata,
+        "created_at": r.created_at.unix_timestamp(), "updated_at": r.updated_at.unix_timestamp(),
+    })
+}
+
+fn valid_alias_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 64
+        && n.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'.'
+        })
+}
+
+async fn load_alias(s: &AppState, name: &str) -> Result<AliasRow, ApiError> {
+    let row: Option<AliasRow> = sqlx::query_as(&format!(
+        "select {ALIAS_COLS} from musubi.fleet_aliases where name = $1"
+    ))
+    .bind(name)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    row.ok_or_else(|| Error::NotFound(format!("fleet alias {name}")).into())
+}
+
+/// `alias:<name>` → the fleet or pool it points at; terminal aliases reject with their message.
+async fn resolve_alias(s: &AppState, name: &str) -> Result<String, ApiError> {
+    let a = load_alias(s, name).await?;
+    match (a.routing.as_str(), a.target) {
+        ("simple", Some(t)) if !t.is_empty() => Ok(t),
+        ("simple", _) => {
+            Err(Error::Conflict(format!("fleet alias {name} has no target yet")).into())
+        }
+        _ => Err(Error::Conflict(if a.message.is_empty() {
+            format!("fleet alias {name} is terminal")
+        } else {
+            a.message
+        })
+        .into()),
+    }
+}
+
+async fn list_aliases(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> Result<Json<Value>, ApiError> {
+    let rows: Vec<AliasRow> = sqlx::query_as(&format!(
+        "select {ALIAS_COLS} from musubi.fleet_aliases order by name limit 1000"
+    ))
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(
+        json!({ "aliases": rows.iter().map(alias_json).collect::<Vec<_>>() }),
+    ))
+}
+
+async fn get_alias(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let a = load_alias(&s, &name).await?;
+    let mut v = alias_json(&a);
+    if a.routing == "simple" {
+        if let Some(t) = &a.target {
+            let fleets = s.fleets.list().await?;
+            let hit: Vec<Value> = fleets
+                .iter()
+                .filter(|f| &f.name == t || &f.pool == t)
+                .map(|f| json!({ "id": f.id, "name": f.name, "region": f.region }))
+                .collect();
+            v["fleets"] = json!(hit);
+        }
+    }
+    Ok(Json(v))
+}
+
+/// `PUT /v1/server/aliases/{name} {description, routing: simple|terminal, target, message, metadata}`
+async fn put_alias(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+    Json(b): Json<AliasBody>,
+) -> Result<Json<Value>, ApiError> {
+    if !valid_alias_name(&name) {
+        return Err(Error::InvalidArgument("alias name: 1..=64 of [a-z0-9_.-]".into()).into());
+    }
+    if b.description.len() > 1024 || b.message.len() > 1024 {
+        return Err(Error::InvalidArgument("description / message ≤ 1024".into()).into());
+    }
+    if !b.metadata.is_object() {
+        return Err(Error::InvalidArgument("metadata must be an object".into()).into());
+    }
+    let target = b.target.filter(|t| !t.is_empty());
+    match b.routing.as_str() {
+        "simple" => {
+            let Some(t) = &target else {
+                return Err(Error::InvalidArgument(
+                    "simple alias needs target (fleet name or pool)".into(),
+                )
+                .into());
+            };
+            let fleets = s.fleets.list().await?;
+            if !fleets.iter().any(|f| &f.name == t || &f.pool == t) {
+                return Err(Error::NotFound(format!("fleet or pool {t}")).into());
+            }
+        }
+        "terminal" => {}
+        _ => return Err(Error::InvalidArgument("routing: simple | terminal".into()).into()),
+    }
+    let row: AliasRow = sqlx::query_as(&format!(
+        "insert into musubi.fleet_aliases (name, description, routing, target, message, metadata)
+         values ($1, $2, $3, $4, $5, $6)
+         on conflict (name) do update set description = excluded.description, routing = excluded.routing,
+             target = excluded.target, message = excluded.message, metadata = excluded.metadata, updated_at = now()
+         returning {ALIAS_COLS}"
+    ))
+    .bind(&name)
+    .bind(&b.description)
+    .bind(&b.routing)
+    .bind(&target)
+    .bind(&b.message)
+    .bind(&b.metadata)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    s.events
+        .emit(
+            "fleet.alias_updated",
+            None,
+            json!({ "name": name, "routing": row.routing, "target": row.target }),
+        )
+        .await;
+    Ok(Json(alias_json(&row)))
+}
+
+async fn delete_alias(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let n = sqlx::query("delete from musubi.fleet_aliases where name = $1")
+        .bind(&name)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+    if n == 0 {
+        return Err(Error::NotFound(format!("fleet alias {name}")).into());
+    }
+    s.events
+        .emit("fleet.alias_deleted", None, json!({ "name": name }))
+        .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /v1/server/aliases/{name}/allocate` — the routed allocation with the alias as pool.
+async fn allocate_alias(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(name): Path<String>,
+    Json(r): Json<RoutedAllocateReq>,
+) -> Result<Json<Allocation>, ApiError> {
+    let pool = resolve_alias(&s, &name).await?;
+    Ok(Json(
+        s.fleets
+            .allocate_routed_with(
+                &pool,
+                &musubi_fleet::RouteHint {
+                    region: r.region,
+                    regions: r.regions,
+                    pings: r.pings,
+                    max_ping_ms: r.max_ping_ms,
+                    client: r.client,
+                },
+                musubi_fleet::AllocateRequest {
+                    payload: r.payload,
+                    backfill: r.backfill,
+                    selector: r.selector,
+                    counter_actions: r.counter_actions,
+                    list_actions: r.list_actions,
+                    selectors: r.selectors,
+                    priorities: r.priorities,
+                    scheduling: r.scheduling,
+                },
+                std::time::Duration::from_secs(r.wait_secs.min(300)),
+            )
+            .await?,
+    ))
 }

@@ -40761,3 +40761,156 @@ async fn sweepstakes_enter_draw_cancel_and_sweep() {
     let (st, _) = call_server(&app, "GET", &path, k, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn fleet_aliases_route_allocations_and_retire_with_a_message() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("alfleet");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "local", "buffer": 0, "max_servers": 1,
+            "port_start": 47300, "port_end": 47310, "spec": {"command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let alias = unique("prod");
+    let path = format!("/v1/server/aliases/{alias}");
+    // validation
+    for (body, why) in [
+        (json!({"routing": "simple"}), "no target"),
+        (json!({"routing": "weird", "target": name}), "routing"),
+        (
+            json!({"routing": "simple", "target": name, "metadata": 3}),
+            "metadata",
+        ),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &path, k, Some(body)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{why}: {v}");
+    }
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"routing": "simple", "target": "no-such-fleet"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/server/aliases/Bad_Name",
+        k,
+        Some(json!({"routing": "simple", "target": name})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"routing": "simple", "target": name, "description": "live"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["routing"], "simple");
+    assert_eq!(v["target"], json!(name));
+    let (st, v) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["fleets"][0]["name"], json!(name), "{v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/aliases", k, None).await;
+    assert!(
+        v["aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["name"] == alias),
+        "{v}"
+    );
+    // routed through the alias: the fleet is empty (buffer 0), so allocation reports no server
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("{path}/allocate"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/allocate",
+        k,
+        Some(json!({"pool": format!("alias:{alias}")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/aliases/nope/allocate",
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/allocate",
+        k,
+        Some(json!({"pool": "alias:nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // retire: terminal with a message
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &path,
+        k,
+        Some(json!({"routing": "terminal", "message": "Update your game to 2.0"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["target"], Value::Null);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("{path}/allocate"),
+        k,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("Update your game to 2.0"),
+        "{v}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/allocate",
+        k,
+        Some(json!({"pool": format!("alias:{alias}")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    let (st, _) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call_server(&app, "DELETE", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(&app, "GET", &path, k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
