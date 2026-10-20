@@ -1,5 +1,6 @@
 //! Shared types for every Musubi crate: identifiers, errors, configuration.
 
+pub mod chunk;
 pub mod config;
 pub mod error;
 pub mod id;

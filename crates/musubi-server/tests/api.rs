@@ -37366,7 +37366,7 @@ async fn build_artifacts_store_fleet_reference_and_cost() {
     assert_eq!(a["size"], payload.len());
     assert_eq!(a["filename"], "server.zip");
     assert_eq!(a["mime"], "application/zip");
-    assert_eq!(a["storage"], "db");
+    assert_eq!(a["storage"], "chunks");
     let sha = a["sha256"].as_str().unwrap().to_string();
     assert_eq!(sha.len(), 64);
     let token = a["token"].as_str().unwrap().to_string();
@@ -47147,4 +47147,542 @@ async fn edge_flood_guard_strikes_blocks_and_operator_controls() {
     assert_eq!(v["guard"]["counters"]["blocks_issued"], 1, "{v}");
     let (st, _) = call(&app, "GET", "/v1/server/edge", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn build_artifacts_delta_uploads_chunks_manifest_and_gc() {
+    let dir = std::env::temp_dir().join(format!("musubi-builds-{}", musubi_core::NodeId::new().0));
+    let Some((app, _state)) = app_and_state_with(|c| {
+        c.builds.chunk_min_kb = 1;
+        c.builds.chunk_avg_kb = 4;
+        c.builds.chunk_max_kb = 16;
+        c.builds.cache_max_mb = 1;
+        c.node.data_dir = dir.to_string_lossy().to_string();
+    })
+    .await
+    else {
+        return;
+    };
+    let k = "defaultkey";
+    let raw = |method: &'static str,
+               path: String,
+               headers: Vec<(&'static str, String)>,
+               body: Vec<u8>| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder().method(method).uri(path);
+            for (h, v) in headers {
+                req = req.header(h, v);
+            }
+            let res = app
+                .oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let st = res.status();
+            let hs = res.headers().clone();
+            let bytes = axum::body::to_bytes(res.into_body(), 8 << 20)
+                .await
+                .unwrap();
+            (st, hs, bytes.to_vec())
+        }
+    };
+    let keyed = |ct: &'static str| {
+        vec![
+            ("x-musubi-server-key", k.to_string()),
+            ("content-type", ct.to_string()),
+        ]
+    };
+    let name = unique("mmo").to_lowercase();
+    let p = musubi_core::chunk::ChunkParams {
+        min: 1 << 10,
+        avg: 4 << 10,
+        max: 16 << 10,
+    };
+    // test data unique per run: chunk hashes are content-addressed and would otherwise collide
+    // with artifacts left by earlier runs on the same database
+    let mut seed = name.bytes().fold(0x9e37_79b9_7f4a_7c15u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    }) | 1;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect()
+    };
+    let v1 = noise(300 << 10);
+
+    // raw PUT: server chunks with [builds] params
+    let (st, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.0?filename=server.tar.gz"),
+        keyed("application/gzip"),
+        v1.clone(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let a1: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(a1["chunked"], true);
+    assert_eq!(a1["storage"], "chunks");
+    assert!(a1["delta"].is_null(), "first version has no baseline: {a1}");
+    let n1 = a1["chunks"].as_u64().unwrap();
+    assert!(n1 > 20 && n1 < 200, "{a1}");
+    assert_eq!(a1["chunks_stored"], n1);
+    assert_eq!(a1["chunks_reused"], 0);
+    let m1 = musubi_core::chunk::Manifest::of(&v1, &p);
+    assert_eq!(
+        m1.chunks.len() as u64,
+        n1,
+        "server used the configured params"
+    );
+    let token1 = a1["token"].as_str().unwrap().to_string();
+    assert!(a1["manifest_url"].as_str().unwrap().ends_with(&format!(
+        "/v1/server/builds/{name}/1.0.0/manifest?token={token1}"
+    )));
+
+    // download streams chunks back byte-exact
+    let (st, h, b) = raw(
+        "GET",
+        format!("/v1/server/builds/{name}/1.0.0/download?token={token1}"),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, v1);
+    assert_eq!(h["x-artifact-sha256"].to_str().unwrap(), m1.sha256);
+    assert_eq!(
+        h["content-length"].to_str().unwrap(),
+        (300 << 10).to_string()
+    );
+
+    // manifest for launchers: token or key, never anonymous
+    let (st, _, _) = raw(
+        "GET",
+        format!("/v1/server/builds/{name}/1.0.0/manifest"),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _, b) = raw(
+        "GET",
+        format!("/v1/server/builds/{name}/1.0.0/manifest?token={token1}"),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mf: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(mf["chunks"].as_array().unwrap().len() as u64, n1);
+    assert_eq!(mf["params"]["avg"], 4096);
+    assert_eq!(mf["sha256"], m1.sha256);
+    let chunk_url = mf["chunk_url"].as_str().unwrap().to_string();
+    assert!(chunk_url.contains("/chunks/{hash}?token="), "{chunk_url}");
+    let first = mf["chunks"][0].clone();
+    let path = chunk_url
+        .split_once("/v1/")
+        .map(|(_, r)| format!("/v1/{r}"))
+        .unwrap()
+        .replace("{hash}", first["hash"].as_str().unwrap());
+    let (st, h, b) = raw("GET", path.clone(), vec![], vec![]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b.len() as u64, first["size"].as_u64().unwrap());
+    assert_eq!(
+        h["x-chunk-sha256"].to_str().unwrap(),
+        first["hash"].as_str().unwrap()
+    );
+    assert_eq!(&v1[..b.len()], &b[..]);
+    // a hash the manifest does not list is not served under this token
+    let (st, _, _) = raw(
+        "GET",
+        path.replace(first["hash"].as_str().unwrap(), &"0".repeat(64)),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = raw(
+        "GET",
+        path.replace(first["hash"].as_str().unwrap(), "zzz"),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // disk cache populated on this node
+    let cached = std::fs::read_dir(dir.join("build_chunks"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert!(cached >= n1 as usize, "cache has {cached} of {n1}");
+
+    // v1.0.1: 300 bytes changed in the middle → delta upload sends only the touched chunks
+    let mut v2 = v1.clone();
+    let patch = noise(300);
+    v2[150_000..150_300].copy_from_slice(&patch);
+    let m2 = musubi_core::chunk::Manifest::of(&v2, &p);
+    let (st, _, b) = raw("POST", format!("/v1/server/builds/{name}/1.0.1/upload"), keyed("application/json"),
+        serde_json::to_vec(&json!({"manifest": m2, "filename": "server.tar.gz", "notes": "hotfix", "max_new_pct": 0.1})).unwrap()).await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "difference analysis gate: {}",
+        String::from_utf8_lossy(&b)
+    );
+    assert!(String::from_utf8_lossy(&b).contains("delta rejected"));
+    let (st, _, b) = raw("POST", format!("/v1/server/builds/{name}/1.0.1/upload"), keyed("application/json"),
+        serde_json::to_vec(&json!({"manifest": m2, "filename": "server.tar.gz", "notes": "hotfix", "max_new_pct": 25})).unwrap()).await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let open: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(open["state"], "pending");
+    assert_eq!(open["params_match"], true);
+    assert_eq!(open["previous"], "1.0.0");
+    let missing = open["missing"].as_array().unwrap().clone();
+    assert!(!missing.is_empty() && missing.len() <= 3, "{open}");
+    assert_eq!(open["missing_chunks"], missing.len());
+    assert!(open["delta"]["new_pct"].as_f64().unwrap() < 15.0, "{open}");
+    assert_eq!(
+        open["delta"]["reused_chunks"].as_u64().unwrap()
+            + open["delta"]["new_chunks"].as_u64().unwrap(),
+        m2.chunks.len() as u64
+    );
+    // pending shows in the list, not among artifacts
+    let (_, _, b) = raw(
+        "GET",
+        format!("/v1/server/builds?name={name}"),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    let l: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(l["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(l["pending_uploads"][0]["version"], "1.0.1");
+    // commit before chunks → 409 naming what is missing
+    let (st, _, b) = raw(
+        "POST",
+        format!("/v1/server/builds/{name}/1.0.1/commit"),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&b));
+    assert!(String::from_utf8_lossy(&b).contains("not uploaded yet"));
+    // wrong bytes / wrong size / unknown hash
+    let c0 = &missing[0];
+    let (h0, off0, sz0) = (
+        c0["hash"].as_str().unwrap().to_string(),
+        c0["offset"].as_u64().unwrap() as usize,
+        c0["size"].as_u64().unwrap() as usize,
+    );
+    let (st, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.1/chunks/{h0}"),
+        keyed("application/octet-stream"),
+        vec![1u8; sz0],
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&b)
+    );
+    assert!(String::from_utf8_lossy(&b).contains("do not hash"));
+    let (st, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.1/chunks/{h0}"),
+        keyed("application/octet-stream"),
+        v2[off0..off0 + sz0 - 1].to_vec(),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&b)
+    );
+    assert!(String::from_utf8_lossy(&b).contains("declares"));
+    let (st, _, _) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.1/chunks/{}", "a".repeat(64)),
+        keyed("application/octet-stream"),
+        vec![1u8; 10],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/9.9.9/chunks/{h0}"),
+        keyed("application/octet-stream"),
+        vec![1u8; 10],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    for c in &missing {
+        let (h, off, sz) = (
+            c["hash"].as_str().unwrap(),
+            c["offset"].as_u64().unwrap() as usize,
+            c["size"].as_u64().unwrap() as usize,
+        );
+        let (st, _, b) = raw(
+            "PUT",
+            format!("/v1/server/builds/{name}/1.0.1/chunks/{h}"),
+            keyed("application/octet-stream"),
+            v2[off..off + sz].to_vec(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let r: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(r["stored"], true);
+    }
+    // re-sending a chunk is acknowledged, not rewritten
+    let (st, _, b) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/1.0.1/chunks/{h0}"),
+        keyed("application/octet-stream"),
+        v2[off0..off0 + sz0].to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b).unwrap()["stored"],
+        false
+    );
+    let (st, _, b) = raw(
+        "POST",
+        format!("/v1/server/builds/{name}/1.0.1/commit"),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let a2: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(a2["sha256"], m2.sha256);
+    assert_eq!(a2["size"], v2.len());
+    assert_eq!(a2["notes"], "hotfix");
+    assert_eq!(a2["delta"]["from"], "1.0.0");
+    assert_eq!(a2["delta"]["new_chunks"], missing.len());
+    let token2 = a2["token"].as_str().unwrap().to_string();
+    let (st, _, b) = raw(
+        "GET",
+        format!("/v1/server/builds/{name}/1.0.1/download?token={token2}"),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, v2, "assembled from shared + new chunks");
+    let (st, _, _) = raw(
+        "POST",
+        format!("/v1/server/builds/{name}/1.0.1/commit"),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "pending upload consumed");
+
+    // launcher-side delta: a host holding 1.0.0 fetches only the new chunks for 1.0.1
+    let (st, _, b) = raw(
+        "POST",
+        format!("/v1/server/builds/{name}/1.0.1/delta?token={token2}"),
+        vec![("content-type", "application/json".into())],
+        serde_json::to_vec(&json!({"from": "1.0.0"})).unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let d: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(d["from_known"], true);
+    assert_eq!(d["missing_chunks"], missing.len());
+    assert!(d["missing_bytes"].as_u64().unwrap() < 64 << 10, "{d}");
+    let (st, _, b) = raw(
+        "POST",
+        format!("/v1/server/builds/{name}/1.0.1/delta?token={token2}"),
+        vec![("content-type", "application/json".into())],
+        serde_json::to_vec(&json!({"from": "0.0.1", "have": [h0]})).unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let d: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(d["from_known"], false);
+    assert_eq!(
+        d["missing_chunks"].as_u64().unwrap(),
+        m2.chunks.len() as u64 - 1
+    );
+    // chunk store dedups across versions
+    let (st, _, b) = raw(
+        "GET",
+        "/v1/server/builds/chunking".into(),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let c: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(c["params"]["min"], 1024);
+    assert!(c["store"]["chunks"].as_u64().unwrap() >= n1 + missing.len() as u64);
+    // other tests on the same database may be mid-delete; orphans is a count, not asserted zero
+    assert!(c["store"]["orphans"].is_number(), "{c}");
+    assert!(
+        c["artifacts"]["dedup_ratio"].as_f64().unwrap() > 1.0
+            || c["store"]["chunks"].as_u64().unwrap() > n1 + 3,
+        "{c}"
+    );
+    assert_eq!(c["cache"]["enabled"], true);
+
+    // fleet env gains the manifest URL
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": unique("fl"), "provider": "local", "buffer": 0, "max_servers": 1,
+            "spec": {"command": ["sleep", "60"], "artifact": format!("{name}@1.0.1")}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v["spec"]["env"]["MUSUBI_ARTIFACT_MANIFEST_URL"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/1.0.1/manifest?token={token2}")),
+        "{v}"
+    );
+    assert_eq!(v["spec"]["env"]["MUSUBI_ARTIFACT_SHA256"], m2.sha256);
+
+    // abandoned pending upload: cancel via DELETE frees its lone chunks
+    let v3 = noise(40 << 10);
+    let m3 = musubi_core::chunk::Manifest::of(&v3, &p);
+    let (st, _, b) = raw(
+        "POST",
+        format!("/v1/server/builds/{name}/2.0.0/upload"),
+        keyed("application/json"),
+        serde_json::to_vec(&json!({"manifest": m3})).unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let open3: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(open3["delta"]["reused_chunks"], 0);
+    assert_eq!(open3["delta"]["new_pct"], 100.0);
+    let c3 = &open3["missing"][0];
+    let (h3, off3, sz3) = (
+        c3["hash"].as_str().unwrap(),
+        c3["offset"].as_u64().unwrap() as usize,
+        c3["size"].as_u64().unwrap() as usize,
+    );
+    let (st, _, _) = raw(
+        "PUT",
+        format!("/v1/server/builds/{name}/2.0.0/chunks/{h3}"),
+        keyed("application/octet-stream"),
+        v3[off3..off3 + sz3].to_vec(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, b) = raw(
+        "POST",
+        "/v1/server/builds/gc".into(),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let g: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(g["chunks_freed"], 0, "pending upload keeps its chunk: {g}");
+    let (st, _, b) = raw(
+        "DELETE",
+        format!("/v1/server/builds/{name}/2.0.0"),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let del: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(del["pending_cancelled"], true);
+    assert_eq!(del["removed"], false);
+    assert_eq!(del["chunks_freed"], 1);
+    assert_eq!(del["bytes_freed"], sz3);
+
+    // bad manifests
+    for (body, msg) in [
+        (
+            json!({"manifest": {"params": p, "size": 10, "sha256": "ab", "chunks": []}}),
+            "no chunks",
+        ),
+        (
+            json!({"manifest": {"params": p, "size": 11, "sha256": m3.sha256, "chunks": m3.chunks}}),
+            "sum",
+        ),
+        (json!({"manifest": m3, "max_new_pct": 101}), "max_new_pct"),
+        (json!({"manifest": m3, "metadata": 5}), "metadata"),
+    ] {
+        let (st, _, b) = raw(
+            "POST",
+            format!("/v1/server/builds/{name}/3.0.0/upload"),
+            keyed("application/json"),
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "{msg}: {}",
+            String::from_utf8_lossy(&b)
+        );
+        assert!(
+            String::from_utf8_lossy(&b).contains(msg),
+            "{msg}: {}",
+            String::from_utf8_lossy(&b)
+        );
+    }
+
+    // deleting 1.0.0 keeps the chunks 1.0.1 shares and frees only the ones it replaced
+    let (st, _, b) = raw(
+        "DELETE",
+        format!("/v1/server/builds/{name}/1.0.0"),
+        keyed("application/json"),
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let del: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(del["removed"], true);
+    assert_eq!(del["chunks_freed"], missing.len(), "{del}");
+    let (st, _, b) = raw(
+        "GET",
+        format!("/v1/server/builds/{name}/1.0.1/download?token={token2}"),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b, v2);
+    // events
+    let (_, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=build.artifact_uploaded,build.upload_rejected,build.artifact_deleted&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    let kinds: Vec<&str> = ev["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+    for want in [
+        "build.artifact_uploaded",
+        "build.upload_rejected",
+        "build.artifact_deleted",
+    ] {
+        assert!(kinds.contains(&want), "{want} missing in {kinds:?}");
+    }
+    let (st, _, _) = raw("GET", "/v1/server/builds/chunking".into(), vec![], vec![]).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(&dir);
 }

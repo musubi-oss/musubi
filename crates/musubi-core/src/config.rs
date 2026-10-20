@@ -45,6 +45,7 @@ pub struct Config {
     pub webrtc: WebRtcConfig,
     pub udp: UdpConfig,
     pub edge: EdgeConfig,
+    pub builds: BuildsConfig,
     pub mesh_net: MeshNetConfig,
     pub geoip: GeoIpConfig,
     pub zanshin: ZanshinConfig,
@@ -796,6 +797,39 @@ impl Default for EdgeConfig {
             public_addr: None,
             idle_secs: 60,
             guard: EdgeGuardConfig::default(),
+        }
+    }
+}
+
+/// Build artifact store: content-defined chunking so a new version uploads and distributes
+/// only what changed, plus the per-node disk cache launchers on this host are served from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BuildsConfig {
+    /// Smallest chunk (KiB).
+    pub chunk_min_kb: usize,
+    /// Target chunk size (KiB, power of two).
+    pub chunk_avg_kb: usize,
+    /// Largest chunk (KiB).
+    pub chunk_max_kb: usize,
+    /// Keep a copy of every chunk this node serves under `node.data_dir/build_chunks`, so a
+    /// host launching many servers fetches each chunk from object storage once.
+    pub cache: bool,
+    /// Cache cap (MiB); oldest chunks are evicted past it.
+    pub cache_max_mb: u64,
+    /// Pending chunked uploads older than this are dropped by `POST /v1/server/builds/gc`.
+    pub upload_ttl_hours: u64,
+}
+
+impl Default for BuildsConfig {
+    fn default() -> Self {
+        Self {
+            chunk_min_kb: 256,
+            chunk_avg_kb: 1024,
+            chunk_max_kb: 4096,
+            cache: true,
+            cache_max_mb: 4096,
+            upload_ttl_hours: 24,
         }
     }
 }

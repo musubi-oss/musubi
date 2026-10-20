@@ -82,6 +82,36 @@ pub enum FleetCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum BuildCmd {
+    /// Upload a build artifact as a delta: chunk the file locally, send the manifest, transfer
+    /// only the chunks the cluster lacks, commit. `name@version` as fleets reference it.
+    Push {
+        /// `name@version`.
+        target: String,
+        /// Server binary / zip / tar.gz.
+        path: PathBuf,
+        /// Reject the upload when more than this percent of the file is new versus the previous
+        /// version (difference analysis gate).
+        #[arg(long)]
+        max_new_pct: Option<f64>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// Chunks uploaded concurrently.
+        #[arg(long, default_value_t = 4)]
+        parallel: usize,
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+    /// Artifacts of one build name (or all).
+    List {
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+}
+
 /// `musubi deploy` manifest: modules and fleets applied in order.
 #[derive(Subcommand)]
 pub enum IdlCmd {
@@ -211,6 +241,91 @@ impl Api {
             anyhow::bail!("{method} {path}: {st} {v}");
         }
         Ok(v)
+    }
+
+    /// Delta upload of a build artifact: manifest → missing chunks → commit. Chunking uses the
+    /// server's default parameters so chunks line up with what `PUT` of a raw body would store.
+    pub async fn build_push(
+        &self,
+        name: &str,
+        version: &str,
+        path: &Path,
+        max_new_pct: Option<f64>,
+        notes: Option<String>,
+        parallel: usize,
+    ) -> anyhow::Result<Value> {
+        use futures::StreamExt;
+        use musubi_core::chunk::{ChunkParams, Manifest};
+        let data =
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+        if data.is_empty() {
+            anyhow::bail!("{} is empty", path.display());
+        }
+        let filename = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{name}-{version}.bin"));
+        let manifest = Manifest::of(&data, &ChunkParams::default());
+        let base = format!("/v1/server/builds/{name}/{version}");
+        let opened = self
+            .call(
+                "POST",
+                &format!("{base}/upload"),
+                Body::Json(json!({
+                    "manifest": manifest, "filename": filename, "notes": notes,
+                    "max_new_pct": max_new_pct,
+                })),
+            )
+            .await?;
+        let missing: Vec<(String, usize, usize)> = opened["missing"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|c| {
+                        (
+                            c["hash"].as_str().unwrap_or_default().to_string(),
+                            c["offset"].as_u64().unwrap_or_default() as usize,
+                            c["size"].as_u64().unwrap_or_default() as usize,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let missing_bytes: usize = missing.iter().map(|m| m.2).sum();
+        eprintln!(
+            "{name}@{version}: {} bytes in {} chunks; uploading {} chunks / {} bytes ({} reused by the cluster)",
+            data.len(),
+            manifest.chunks.len(),
+            missing.len(),
+            missing_bytes,
+            manifest.chunks.len() - missing.len()
+        );
+        let data = std::sync::Arc::new(data);
+        let mut tasks = futures::stream::iter(missing.into_iter().map(|(hash, off, size)| {
+            let data = data.clone();
+            let path = format!("{base}/chunks/{hash}");
+            async move {
+                let bytes = data[off..off + size].to_vec();
+                self.call("PUT", &path, Body::Bytes(bytes))
+                    .await
+                    .map(|_| size)
+            }
+        }))
+        .buffer_unordered(parallel);
+        let mut sent = 0usize;
+        while let Some(r) = tasks.next().await {
+            sent += r?;
+        }
+        drop(tasks);
+        let mut committed = self
+            .call("POST", &format!("{base}/commit"), Body::None)
+            .await?;
+        committed["uploaded_bytes"] = json!(sent);
+        committed["uploaded_chunks"] = opened["missing_chunks"].clone();
+        if let Some(d) = opened.get("delta").filter(|d| !d.is_null()) {
+            committed["delta"] = d.clone();
+        }
+        Ok(committed)
     }
 
     pub async fn module_publish(&self, name: &str, bytes: Vec<u8>) -> anyhow::Result<Value> {
@@ -495,6 +610,40 @@ pub async fn fleet(cfg: &Config, cmd: FleetCmd) -> anyhow::Result<()> {
                 .await?
         }
         FleetCmd::List { api } => Api::from_args(cfg, &api).fleets().await?,
+    };
+    print(&out)
+}
+
+pub async fn build(cfg: &Config, cmd: BuildCmd) -> anyhow::Result<()> {
+    let out = match cmd {
+        BuildCmd::Push {
+            target,
+            path,
+            max_new_pct,
+            notes,
+            parallel,
+            api,
+        } => {
+            let (name, version) = target
+                .split_once('@')
+                .ok_or_else(|| anyhow::anyhow!("target must be name@version"))?;
+            Api::from_args(cfg, &api)
+                .build_push(
+                    name,
+                    version,
+                    &path,
+                    max_new_pct,
+                    notes,
+                    parallel.clamp(1, 16),
+                )
+                .await?
+        }
+        BuildCmd::List { name, api } => {
+            let q = name.map(|n| format!("?name={n}")).unwrap_or_default();
+            Api::from_args(cfg, &api)
+                .call("GET", &format!("/v1/server/builds{q}"), Body::None)
+                .await?
+        }
     };
     print(&out)
 }

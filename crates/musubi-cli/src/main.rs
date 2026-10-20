@@ -43,6 +43,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: deploy::FleetCmd,
     },
+    /// Upload build artifacts as deltas (only chunks the cluster lacks) and list them.
+    Build {
+        #[command(subcommand)]
+        cmd: deploy::BuildCmd,
+    },
     /// Attach storage collection contracts from a TOML/JSON file.
     Schema {
         #[command(subcommand)]
@@ -220,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Doctor => doctor::run(&cfg).await,
         Cmd::Module { cmd } => deploy::module(&cfg, cmd).await,
         Cmd::Fleet { cmd } => deploy::fleet(&cfg, cmd).await,
+        Cmd::Build { cmd } => deploy::build(&cfg, cmd).await,
         Cmd::Schema { cmd } => deploy::schema(&cfg, cmd).await,
         Cmd::Idl { cmd } => deploy::idl(&cfg, cmd).await,
         Cmd::Deploy { file, api } => deploy::deploy(&cfg, file, api).await,
