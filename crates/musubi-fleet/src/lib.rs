@@ -295,6 +295,11 @@ impl Default for CostSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FleetSpec {
+    /// Stable network identity: when set, every server gets `<short-id>.<fleet>.<dns_zone>` as
+    /// its `hostname` (Kubernetes: pod `hostname`/`subdomain` under a headless Service named
+    /// after the fleet; other providers: resolvable through `GET /v1/server/gameservers/by-name`).
+    #[serde(default)]
+    pub dns_zone: Option<String>,
     /// Build artifact `name@version` from the artifact store (`PUT /v1/server/builds/{name}/{version}`);
     /// resolved when the fleet/build is saved into `MUSUBI_ARTIFACT_URL|SHA256|FILENAME|SIZE` env.
     pub artifact: Option<String>,
@@ -1532,6 +1537,9 @@ pub struct GameServer {
     pub node_id: Option<Uuid>,
     pub address: String,
     pub port: i32,
+    /// Stable DNS-style name (`<short-id>.<fleet>.<dns_zone>`) when the fleet sets `spec.dns_zone`.
+    #[serde(default)]
+    pub hostname: Option<String>,
     pub pid: Option<i64>,
     pub labels: serde_json::Value,
     pub allocation: Option<serde_json::Value>,
@@ -2163,7 +2171,7 @@ fn push_server_filters(
     Ok(())
 }
 
-const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, g.ports, g.reserved_until, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
+const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, g.ports, g.reserved_until, g.hostname, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
 /// `canary_percent` of new servers (optionally only in `canary_regions`), `retired` is kept for rollback.
@@ -2631,11 +2639,26 @@ struct ServerRow {
     host_id: Option<Uuid>,
     ports: serde_json::Value,
     reserved_until: Option<OffsetDateTime>,
+    hostname: Option<String>,
+}
+
+/// `<first 8 hex of id>.<fleet name>.<dns_zone>` when the fleet sets `spec.dns_zone`.
+pub fn hostname_for(fleet: &Fleet, id: Uuid) -> Option<String> {
+    let zone = fleet.spec.dns_zone.as_deref()?.trim().trim_matches('.');
+    if zone.is_empty() {
+        return None;
+    }
+    let short = &id.simple().to_string()[..8];
+    Some(format!(
+        "{short}.{}.{zone}",
+        fleet.name.to_ascii_lowercase()
+    ))
 }
 
 fn row_to_server(r: ServerRow) -> GameServer {
     GameServer {
         reserved_until: r.reserved_until,
+        hostname: r.hostname,
         id: r.id,
         fleet_id: r.fleet_id,
         state: r.state,
@@ -2663,7 +2686,7 @@ fn row_to_server(r: ServerRow) -> GameServer {
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports, reserved_until";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports, reserved_until, hostname";
 
 impl FleetService {
     /// Base URL game servers use to reach this API (`MUSUBI_API`).
@@ -3483,7 +3506,7 @@ impl FleetService {
                 (since_health_f / h.period_secs.max(1) as f64).floor() as i64
             };
             out.push(serde_json::json!({
-                "id": s.id, "state": s.state, "status": status,
+                "id": s.id, "state": s.state, "status": status, "hostname": s.hostname,
                 "last_health_secs_ago": since_health, "missed_checks": missed,
                 "age_secs": since_created, "players": s.players, "build_version": s.build_version,
                 "reap_in_secs": match status {
@@ -4662,13 +4685,15 @@ impl FleetService {
         }
         let named = serde_json::Value::Object(named);
         let f = &with_build;
-        sqlx::query("insert into musubi.game_servers (id, fleet_id, state, node_id, port, build_version, ports) values ($1, $2, 'starting', $3, $4, $5, $6)")
+        let hostname = hostname_for(f, id);
+        sqlx::query("insert into musubi.game_servers (id, fleet_id, state, node_id, port, build_version, ports, hostname) values ($1, $2, 'starting', $3, $4, $5, $6, $7)")
             .bind(id)
             .bind(f.id)
             .bind(self.node_id)
             .bind(port)
             .bind(build.as_ref().map(|b| b.version.clone()))
             .bind(&named)
+            .bind(&hostname)
             .execute(&self.db)
             .await
             .map_err(Error::internal)?;
@@ -5652,6 +5677,7 @@ mod lifecycle_tests {
     ) -> GameServer {
         let now = OffsetDateTime::now_utc();
         GameServer {
+            hostname: None,
             reserved_until: None,
             id: Uuid::now_v7(),
             fleet_id: Uuid::nil(),
@@ -5762,6 +5788,7 @@ mod alloc_pick_tests {
 
     fn gs(labels: serde_json::Value, rooms: i64, slots_used: i32, host: &str) -> GameServer {
         GameServer {
+            hostname: None,
             reserved_until: None,
             id: Uuid::now_v7(),
             fleet_id: Uuid::nil(),

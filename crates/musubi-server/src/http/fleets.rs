@@ -37,6 +37,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/allocate", post(allocate_routed))
         .route("/v1/server/aliases", get(list_aliases))
         .route(
+            "/v1/server/gameservers/by-name/{hostname}",
+            get(server_by_name),
+        )
+        .route(
             "/v1/server/aliases/{name}",
             get(get_alias).put(put_alias).delete(delete_alias),
         )
@@ -1533,4 +1537,25 @@ async fn allocate_alias(
             )
             .await?,
     ))
+}
+
+/// `GET /v1/server/gameservers/by-name/{hostname}` — resolve a stable server name
+/// (`<short-id>.<fleet>.<dns_zone>`) to the live server card: address, ports, state.
+async fn server_by_name(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(hostname): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "select id from musubi.game_servers where hostname = $1 and state <> 'terminated'",
+    )
+    .bind(hostname.to_ascii_lowercase())
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let Some(id) = id else {
+        return Err(Error::NotFound(format!("game server {hostname}")).into());
+    };
+    let gs = s.fleets.server(id).await?;
+    Ok(Json(serde_json::to_value(gs).map_err(Error::internal)?))
 }

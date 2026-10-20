@@ -205,6 +205,11 @@ impl KubernetesProvider {
                     .collect();
                 container["ports"] = json!(ports);
                 let mut spec = json!({ "restartPolicy": "Never", "containers": [container] });
+                if req.fleet.spec.dns_zone.is_some() {
+                    // stable identity under a headless Service named after the fleet
+                    spec["hostname"] = json!(&req.server_id.simple().to_string()[..8]);
+                    spec["subdomain"] = json!(req.fleet.name.to_ascii_lowercase());
+                }
                 place(&req.fleet.spec.kubernetes, &mut spec);
                 json!({
                     "apiVersion": "v1",
@@ -216,6 +221,10 @@ impl KubernetesProvider {
             Mode::Agones => {
                 let k = &req.fleet.spec.kubernetes;
                 let mut tpl = json!({ "containers": [container] });
+                if req.fleet.spec.dns_zone.is_some() {
+                    tpl["hostname"] = json!(&req.server_id.simple().to_string()[..8]);
+                    tpl["subdomain"] = json!(req.fleet.name.to_ascii_lowercase());
+                }
                 place(k, &mut tpl);
                 json!({
                 "apiVersion": "agones.dev/v1",

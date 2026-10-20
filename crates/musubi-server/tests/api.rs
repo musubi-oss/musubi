@@ -41428,3 +41428,95 @@ async fn server_reputation_from_gameplay_stats_and_ratings() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn stable_server_hostnames_from_dns_zone() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let name = unique("Dns").to_lowercase();
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+        "name": name, "provider": "local", "buffer": 1, "max_servers": 1,
+        "port_start": 48000, "port_end": 48100, "spec": {"command": ["sleep", "60"], "dns_zone": "gs.example.internal."},
+        "policy": {"health": {"period_secs": 1, "failure_threshold": 2, "initial_delay_secs": 60}, "eviction": "never"}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = f["id"].as_str().unwrap().to_string();
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let svc =
+        musubi_fleet::FleetService::new(db.clone(), uuid::Uuid::now_v7(), "http://127.0.0.1:0", k);
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid).unwrap())
+        .await
+        .unwrap();
+    let (st, h) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid}/health"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{h}");
+    let sid = h["servers"][0]["id"].as_str().unwrap().to_string();
+    let hostname = h["servers"][0]["hostname"]
+        .as_str()
+        .expect("hostname")
+        .to_string();
+    assert_eq!(
+        hostname,
+        format!(
+            "{}.{}.gs.example.internal",
+            &sid.replace('-', "")[..8],
+            name
+        ),
+        "{h}"
+    );
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/by-name/{hostname}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], sid);
+    assert_eq!(v["hostname"], hostname);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers/by-name/{}", hostname.to_uppercase()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "case-insensitive: {v}");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/server/gameservers/by-name/nope.x.gs.example.internal",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, f2) = call_server(&app, "POST", "/v1/server/fleets", k, Some(json!({
+        "name": unique("nodns"), "provider": "local", "buffer": 1, "max_servers": 1,
+        "port_start": 48100, "port_end": 48200, "spec": {"command": ["sleep", "60"]},
+        "policy": {"health": {"period_secs": 1, "failure_threshold": 2, "initial_delay_secs": 60}, "eviction": "never"}
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{f2}");
+    let fid2 = f2["id"].as_str().unwrap().to_string();
+    svc.reconcile_one(uuid::Uuid::parse_str(&fid2).unwrap())
+        .await
+        .unwrap();
+    let (_, h2) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/fleets/{fid2}/health"),
+        k,
+        None,
+    )
+    .await;
+    assert!(h2["servers"][0]["hostname"].is_null(), "{h2}");
+}
