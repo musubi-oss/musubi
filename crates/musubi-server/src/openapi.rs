@@ -754,6 +754,27 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/server/effects", "economy"),
     ("POST", "/v1/server/effects/sweep", "economy"),
     ("GET", "/v1/effects/{key}", "economy"),
+    ("GET", "/v1/account/event_properties", "analytics"),
+    (
+        "GET",
+        "/v1/server/accounts/{id}/event_properties",
+        "analytics",
+    ),
+    (
+        "DELETE",
+        "/v1/server/accounts/{id}/event_properties",
+        "analytics",
+    ),
+    (
+        "GET",
+        "/v1/server/accounts/{id}/event_properties/{event}",
+        "analytics",
+    ),
+    (
+        "DELETE",
+        "/v1/server/accounts/{id}/event_properties/{event}",
+        "analytics",
+    ),
     ("GET", "/v1/server/tutorials", "progression"),
     ("PUT", "/v1/server/tutorials/{id}", "progression"),
     ("GET", "/v1/server/tutorials/{id}", "progression"),

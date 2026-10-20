@@ -18,6 +18,15 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/telemetry/events", post(ingest))
         .route("/v1/telemetry/anonymous", post(ingest_anonymous))
         .route("/v1/telemetry/sampling", get(client_sampling))
+        .route("/v1/account/event_properties", get(my_event_props))
+        .route(
+            "/v1/server/accounts/{id}/event_properties",
+            get(account_event_props).delete(reset_event_props),
+        )
+        .route(
+            "/v1/server/accounts/{id}/event_properties/{event}",
+            get(account_event_prop).delete(reset_event_prop),
+        )
         .route(
             "/v1/server/analytics/sampling",
             get(get_sampling).put(put_sampling),
@@ -326,3 +335,71 @@ async fn event_counts(
 
 #[allow(dead_code)]
 fn _unused(_: Result<()>) {}
+
+/// `GET /v1/account/event_properties` — the caller's computed per-event properties.
+async fn my_event_props(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(s.analytics.event_props(me.account_id.0, None).await?))
+}
+
+async fn account_exists(s: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let n: i64 = sqlx::query_scalar("select count(*) from musubi.accounts where id = $1")
+        .bind(id)
+        .fetch_one(&s.db)
+        .await
+        .map_err(Error::internal)?;
+    if n == 0 {
+        return Err(Error::NotFound(format!("account {id}")).into());
+    }
+    Ok(())
+}
+
+/// `GET /v1/server/accounts/{id}/event_properties` — all computed event properties of an account.
+async fn account_event_props(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    account_exists(&s, id).await?;
+    Ok(Json(s.analytics.event_props(id, None).await?))
+}
+
+/// `GET /v1/server/accounts/{id}/event_properties/{event}` — one event's aggregate (404 if never seen).
+async fn account_event_prop(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path((id, event)): Path<(Uuid, String)>,
+) -> Result<Json<Value>, ApiError> {
+    account_exists(&s, id).await?;
+    let mut v = s.analytics.event_props(id, Some(&event)).await?;
+    let Some(row) = v["events"].as_array_mut().and_then(|a| a.pop()) else {
+        return Err(Error::NotFound(format!("event {event} never seen for this account")).into());
+    };
+    Ok(Json(row))
+}
+
+/// `DELETE /v1/server/accounts/{id}/event_properties` — forget the aggregates (raw events stay).
+async fn reset_event_props(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    account_exists(&s, id).await?;
+    let n = s.analytics.reset_event_props(id, None).await?;
+    Ok(Json(json!({ "deleted": n })))
+}
+
+async fn reset_event_prop(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path((id, event)): Path<(Uuid, String)>,
+) -> Result<Json<Value>, ApiError> {
+    account_exists(&s, id).await?;
+    let n = s.analytics.reset_event_props(id, Some(&event)).await?;
+    if n == 0 {
+        return Err(Error::NotFound(format!("event {event} never seen for this account")).into());
+    }
+    Ok(Json(json!({ "deleted": n })))
+}

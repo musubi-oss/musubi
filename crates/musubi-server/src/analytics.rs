@@ -70,6 +70,20 @@ pub struct IngestReport {
 }
 
 /// A stored / exported event.
+type EventPropRow = (
+    String,
+    i64,
+    OffsetDateTime,
+    OffsetDateTime,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    f64,
+    Option<String>,
+    OffsetDateTime,
+);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Row {
     pub id: Uuid,
@@ -442,7 +456,145 @@ impl Analytics {
         .execute(&self.db)
         .await
         .map_err(Error::internal)?;
+        self.fold_event_props(rows).await
+    }
+
+    /// Fold a stored batch into `player_event_props`: one upsert per (account, event) pair with
+    /// the batch pre-aggregated, so a burst of the same event costs one row write.
+    async fn fold_event_props(&self, rows: &[Row]) -> Result<()> {
+        #[derive(Default)]
+        struct Agg {
+            count: i64,
+            first_at: i64,
+            last_at: i64,
+            v_first: Option<f64>,
+            v_high: Option<f64>,
+            v_low: Option<f64>,
+            v_last: Option<f64>,
+            v_sum: f64,
+            last_session: Option<String>,
+        }
+        let mut aggs: HashMap<(Uuid, String), Agg> = HashMap::new();
+        let mut order: Vec<(Uuid, String)> = Vec::new();
+        for r in rows {
+            let Some(acc) = r.account_id else { continue };
+            let key = (acc, r.name.clone());
+            let a = aggs.entry(key.clone()).or_insert_with(|| {
+                order.push(key);
+                Agg {
+                    first_at: r.at,
+                    last_at: r.at,
+                    ..Agg::default()
+                }
+            });
+            a.count += 1;
+            a.first_at = a.first_at.min(r.at);
+            if r.at >= a.last_at {
+                a.last_at = r.at;
+                if r.session_id.is_some() {
+                    a.last_session = r.session_id.clone();
+                }
+            }
+            if let Some(v) = r.properties.get("value").and_then(Value::as_f64) {
+                if v.is_finite() {
+                    a.v_first.get_or_insert(v);
+                    a.v_high = Some(a.v_high.map_or(v, |h| h.max(v)));
+                    a.v_low = Some(a.v_low.map_or(v, |l| l.min(v)));
+                    a.v_last = Some(v);
+                    a.v_sum += v;
+                }
+            }
+        }
+        if order.is_empty() {
+            return Ok(());
+        }
+        let ts = |t: i64| {
+            OffsetDateTime::from_unix_timestamp(t).unwrap_or_else(|_| OffsetDateTime::now_utc())
+        };
+        let get = |k: &(Uuid, String)| &aggs[k];
+        sqlx::query(
+            "insert into musubi.player_event_props
+                (account_id, event, count, seen_first, seen_last, value_first, value_high, value_low, value_last, value_sum, last_session_id, updated_at)
+             select * , now() from unnest($1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[], $5::timestamptz[], $6::float8[], $7::float8[], $8::float8[], $9::float8[], $10::float8[], $11::text[])
+             on conflict (account_id, event) do update set
+                count = musubi.player_event_props.count + excluded.count,
+                seen_first = least(musubi.player_event_props.seen_first, excluded.seen_first),
+                seen_last = greatest(musubi.player_event_props.seen_last, excluded.seen_last),
+                value_first = coalesce(musubi.player_event_props.value_first, excluded.value_first),
+                value_high = greatest(musubi.player_event_props.value_high, excluded.value_high),
+                value_low = least(musubi.player_event_props.value_low, excluded.value_low),
+                value_last = coalesce(excluded.value_last, musubi.player_event_props.value_last),
+                value_sum = musubi.player_event_props.value_sum + excluded.value_sum,
+                last_session_id = case when excluded.seen_last >= musubi.player_event_props.seen_last
+                    then coalesce(excluded.last_session_id, musubi.player_event_props.last_session_id)
+                    else musubi.player_event_props.last_session_id end,
+                updated_at = now()",
+        )
+        .bind(order.iter().map(|k| k.0).collect::<Vec<_>>())
+        .bind(order.iter().map(|k| k.1.clone()).collect::<Vec<_>>())
+        .bind(order.iter().map(|k| get(k).count).collect::<Vec<_>>())
+        .bind(order.iter().map(|k| ts(get(k).first_at)).collect::<Vec<_>>())
+        .bind(order.iter().map(|k| ts(get(k).last_at)).collect::<Vec<_>>())
+        .bind(order.iter().map(|k| get(k).v_first).collect::<Vec<Option<f64>>>())
+        .bind(order.iter().map(|k| get(k).v_high).collect::<Vec<Option<f64>>>())
+        .bind(order.iter().map(|k| get(k).v_low).collect::<Vec<Option<f64>>>())
+        .bind(order.iter().map(|k| get(k).v_last).collect::<Vec<Option<f64>>>())
+        .bind(order.iter().map(|k| get(k).v_sum).collect::<Vec<f64>>())
+        .bind(order.iter().map(|k| get(k).last_session.clone()).collect::<Vec<Option<String>>>())
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
         Ok(())
+    }
+
+    /// Computed per-event properties of one account (`<event>Count/SeenFirst/…` in Hiro terms),
+    /// newest activity first, plus the session that produced the most recent event overall.
+    pub async fn event_props(&self, account: Uuid, event: Option<&str>) -> Result<Value> {
+        let rows: Vec<EventPropRow> = sqlx::query_as(
+            "select event, count, seen_first, seen_last, value_first, value_high, value_low, value_last, value_sum, last_session_id, updated_at
+             from musubi.player_event_props
+             where account_id = $1 and ($2::text is null or event = $2)
+             order by seen_last desc, event",
+        )
+        .bind(account)
+        .bind(event)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        let rfc = |t: OffsetDateTime| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        };
+        let last_active_session_id = rows.first().and_then(|r| r.9.clone());
+        let events: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "event": r.0, "count": r.1,
+                    "seen_first": rfc(r.2), "seen_last": rfc(r.3),
+                    "value_first": r.4, "value_high": r.5, "value_low": r.6, "value_last": r.7,
+                    "value_sum": r.8, "last_session_id": r.9, "updated_at": rfc(r.10),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "account_id": account,
+            "last_active_session_id": last_active_session_id,
+            "events": events,
+        }))
+    }
+
+    /// Drop the aggregates of an account (all events or one); the raw events stay.
+    pub async fn reset_event_props(&self, account: Uuid, event: Option<&str>) -> Result<u64> {
+        sqlx::query(
+            "delete from musubi.player_event_props where account_id = $1 and ($2::text is null or event = $2)",
+        )
+        .bind(account)
+        .bind(event)
+        .execute(&self.db)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(Error::internal)
     }
 
     /// Copy of a server-side domain event (when `mirror_domain_events`).

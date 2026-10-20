@@ -42200,3 +42200,246 @@ async fn tutorial_sequences_step_tracking() {
     let (st, _) = call(&app, "GET", "/v1/tutorials", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Computed per-event properties (Hiro parity): every ingested telemetry event folds into one
+/// row per (account, event) with count / first & last seen / value aggregates / last session;
+/// audiences can segment on them, the server can reset them.
+#[tokio::test]
+async fn event_properties_fold_and_audience_rules() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("ep")})),
+    )
+    .await;
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let kill = format!("ep_kill_{}", unique("")).replace('-', "_");
+    let open = format!("ep_open_{}", unique("")).replace('-', "_");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/account/event_properties",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["events"].as_array().unwrap().is_empty());
+    assert!(v["last_active_session_id"].is_null());
+
+    let (st, rep) = call(&app, "POST", "/v1/telemetry/events", Some(&tok), Some(json!({
+        "events": [
+            {"name": kill, "at": now - 30, "properties": {"value": 10, "weapon": "ak"}, "session_id": "s1"},
+            {"name": open, "at": now - 20, "properties": {}, "session_id": "s1"},
+            {"name": kill, "at": now - 10, "properties": {"value": 25}, "session_id": "s2"}
+        ]
+    }))).await;
+    assert_eq!(st, StatusCode::OK, "{rep}");
+    assert_eq!(rep["accepted"], 3, "{rep}");
+
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/account/event_properties",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let evs = v["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 2, "{v}");
+    let k0 = evs.iter().find(|e| e["event"] == kill).unwrap();
+    assert_eq!(k0["count"], 2);
+    assert_eq!(k0["value_first"], 10.0);
+    assert_eq!(k0["value_high"], 25.0);
+    assert_eq!(k0["value_low"], 10.0);
+    assert_eq!(k0["value_last"], 25.0);
+    assert_eq!(k0["value_sum"], 35.0);
+    assert_eq!(k0["last_session_id"], "s2");
+    assert!(k0["seen_first"].as_str().unwrap() < k0["seen_last"].as_str().unwrap());
+    let o0 = evs.iter().find(|e| e["event"] == open).unwrap();
+    assert_eq!(o0["count"], 1);
+    assert!(o0["value_sum"] == 0.0 && o0["value_high"].is_null(), "{o0}");
+    assert_eq!(v["last_active_session_id"], "s2", "{v}");
+
+    // a later batch folds in: count grows, high/low keep extremes, last/sum move, session follows
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok),
+        Some(json!({
+            "events": [{"name": kill, "properties": {"value": 5}, "session_id": "s3"}]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{me}/event_properties/{kill}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 3);
+    assert_eq!(v["value_high"], 25.0);
+    assert_eq!(v["value_low"], 5.0);
+    assert_eq!(v["value_last"], 5.0);
+    assert_eq!(v["value_sum"], 40.0);
+    assert_eq!(v["last_session_id"], "s3");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{me}/event_properties/never_sent"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!(
+            "/v1/server/accounts/{}/event_properties",
+            uuid::Uuid::now_v7()
+        ),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // audience rules on the aggregates
+    let sfx = unique("").replace('-', "_");
+    for rules in [
+        json!({"events": [{"event": kill, "field": "weird"}]}),
+        json!({"events": [{"event": kill, "min": 5, "max": 1}]}),
+        json!({"events": [{"event": kill, "never": true, "min": 1}]}),
+        json!({"events": [{"event": kill, "seen_within_days": 0}]}),
+        json!({"events": [{"event": "bad name!"}]}),
+    ] {
+        let (st, v) = call_server(
+            &app,
+            "PUT",
+            &format!("/v1/server/audiences/bad_{sfx}"),
+            k,
+            Some(json!({"rules": rules})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{rules} {v}");
+    }
+    let killers = format!("killers_{sfx}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{killers}"),
+        k,
+        Some(json!({"rules": {"events": [
+            {"event": kill, "min": 3, "seen_within_days": 1},
+            {"event": kill, "field": "value_sum", "min": 40, "max": 40}
+        ]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["count"], 1, "{v}");
+    let quiet = format!("quiet_{sfx}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{quiet}"),
+        k,
+        Some(json!({"rules": {"events": [{"event": kill, "never": true}]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let whales = format!("whales_{sfx}");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{whales}"),
+        k,
+        Some(json!({"rules": {"events": [{"event": kill, "field": "value_high", "min": 100}]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/audiences/of/{me}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mine: Vec<&str> = v["audiences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a.as_str())
+        .collect();
+    assert!(mine.contains(&killers.as_str()), "{v}");
+    assert!(!mine.contains(&quiet.as_str()), "{v}");
+    assert!(!mine.contains(&whales.as_str()), "{v}");
+
+    // reset: one event, then all; raw events are untouched
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/accounts/{me}/event_properties/{open}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["deleted"], 1);
+    let (st, _) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/accounts/{me}/event_properties/{open}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "DELETE",
+        &format!("/v1/server/accounts/{me}/event_properties"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["deleted"], 1);
+    let (st, v) = call(
+        &app,
+        "GET",
+        "/v1/account/event_properties",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(v["events"].as_array().unwrap().is_empty(), "{v}");
+    let (st, _) = call(&app, "GET", "/v1/account/event_properties", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    for a in [&killers, &quiet, &whales] {
+        let _ = call_server(
+            &app,
+            "DELETE",
+            &format!("/v1/server/audiences/{a}"),
+            k,
+            None,
+        )
+        .await;
+    }
+}

@@ -59,14 +59,121 @@ pub struct Audience {
     /// Always in / never in, regardless of the other rules.
     pub include: Vec<Uuid>,
     pub exclude: Vec<Uuid>,
+    /// Telemetry-derived rules on `player_event_props` (count / value aggregates / recency).
+    pub events: Vec<EventRule>,
     /// Algebra: at least one of `any` holds, every one of `all` holds, `not` does not hold.
     pub any: Vec<Audience>,
     pub all: Vec<Audience>,
     pub not: Option<Box<Audience>>,
 }
 
+/// One telemetry-derived condition: the account's aggregate `field` of `event` lies in
+/// `[min, max]`, optionally only counting accounts whose last such event is within / older than
+/// `seen_within_days` / `not_seen_days`; `never: true` matches accounts that never sent the event.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct EventRule {
+    pub event: String,
+    /// `count` (default), `value_sum`, `value_high`, `value_low`, `value_last`, `value_first`.
+    pub field: Option<String>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub seen_within_days: Option<i64>,
+    pub not_seen_days: Option<i64>,
+    pub never: bool,
+}
+
+const EVENT_FIELDS: [&str; 6] = [
+    "count",
+    "value_sum",
+    "value_high",
+    "value_low",
+    "value_last",
+    "value_first",
+];
+
+impl EventRule {
+    fn validate(&self) -> Result<()> {
+        let ok_name = !self.event.is_empty()
+            && self.event.len() <= 128
+            && self
+                .event
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-');
+        if !ok_name {
+            return Err(Error::InvalidArgument(
+                "events[].event must be 1..=128 of [A-Za-z0-9_.-]".into(),
+            ));
+        }
+        let field = self.field.as_deref().unwrap_or("count");
+        if !EVENT_FIELDS.contains(&field) {
+            return Err(Error::InvalidArgument(format!(
+                "events[].field must be one of {}",
+                EVENT_FIELDS.join("|")
+            )));
+        }
+        if matches!((self.min, self.max), (Some(a), Some(b)) if a > b) {
+            return Err(Error::InvalidArgument("events[].min must be <= max".into()));
+        }
+        for d in [self.seen_within_days, self.not_seen_days]
+            .into_iter()
+            .flatten()
+        {
+            if !(1..=3650).contains(&d) {
+                return Err(Error::InvalidArgument(
+                    "events[] days must be 1..=3650".into(),
+                ));
+            }
+        }
+        if self.never
+            && (self.min.is_some()
+                || self.max.is_some()
+                || self.seen_within_days.is_some()
+                || self.not_seen_days.is_some())
+        {
+            return Err(Error::InvalidArgument(
+                "events[].never cannot be combined with bounds".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn push(&self, qb: &mut QueryBuilder<'_, Postgres>, now: OffsetDateTime) {
+        if self.never {
+            qb.push(" and not exists (select 1 from musubi.player_event_props e where e.account_id = a.id and e.event = ")
+                .push_bind(self.event.clone())
+                .push(")");
+            return;
+        }
+        let field = self.field.as_deref().unwrap_or("count");
+        qb.push(" and exists (select 1 from musubi.player_event_props e where e.account_id = a.id and e.event = ")
+            .push_bind(self.event.clone());
+        if let Some(min) = self.min {
+            qb.push(format!(" and e.{field} >= ")).push_bind(min);
+        }
+        if let Some(max) = self.max {
+            qb.push(format!(" and e.{field} <= ")).push_bind(max);
+        }
+        if let Some(d) = self.seen_within_days {
+            qb.push(" and e.seen_last >= ")
+                .push_bind(now - Duration::days(d));
+        }
+        if let Some(d) = self.not_seen_days {
+            qb.push(" and e.seen_last < ")
+                .push_bind(now - Duration::days(d));
+        }
+        qb.push(")");
+    }
+}
+
 impl Audience {
     fn validate(&self) -> Result<()> {
+        if self.events.len() > 16 {
+            return Err(Error::InvalidArgument("at most 16 event rules".into()));
+        }
+        for e in &self.events {
+            e.validate()?;
+        }
         if (self.min_level.is_some() || self.max_level.is_some()) && self.track.is_none() {
             return Err(Error::InvalidArgument(
                 "min_level/max_level need track".into(),
@@ -156,6 +263,7 @@ impl Audience {
             && self.max_account_age_days.is_none()
             && self.bucket_min.is_none()
             && self.bucket_max.is_none()
+            && self.events.is_empty()
             && self.any.is_empty()
             && self.all.is_empty()
             && self.not.is_none())
@@ -231,6 +339,9 @@ impl Audience {
                 .push_bind(self.bucket_min.unwrap_or(0))
                 .push(" and ")
                 .push_bind(self.bucket_max.unwrap_or(99));
+        }
+        for e in &self.events {
+            e.push(qb, now);
         }
         if !self.any.is_empty() {
             qb.push(" and (");
