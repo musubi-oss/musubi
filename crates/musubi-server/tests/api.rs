@@ -101,6 +101,7 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
         c
     });
     let compliance_cfg = cfg.compliance.clone();
+    let geoip = musubi_server::geoip::GeoIp::new(&cfg.geoip, &cfg.node.data_dir).unwrap();
     let state = AppState(Arc::new(AppStateInner {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
         dev: Arc::new(musubi_server::dev::DevTools::new()),
@@ -174,6 +175,7 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
         },
         banned: Arc::new(musubi_server::bans::Bans::default()),
         legal: Arc::new(musubi_server::legal::Legal::default()),
+        geoip,
         ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),
@@ -46100,4 +46102,532 @@ async fn cluster_mesh_net_allocates_addresses_publishes_keys_and_renders_peers()
         c.leave().await;
     }
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Minimal MaxMind DB (IPv4 tree, 24-bit records) with one City record for 203.0.113.0/24.
+fn tiny_mmdb(build_epoch: u64) -> Vec<u8> {
+    fn ctrl(t: u8, size: usize) -> Vec<u8> {
+        assert!(size < 29);
+        vec![(t << 5) | size as u8]
+    }
+    fn ext(t: u8, size: usize) -> Vec<u8> {
+        vec![size as u8, t - 7]
+    }
+    fn s(v: &str) -> Vec<u8> {
+        let mut b = ctrl(2, v.len());
+        b.extend(v.as_bytes());
+        b
+    }
+    fn map(entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+        let mut b = ctrl(7, entries.len());
+        for (k, v) in entries {
+            b.extend(s(k));
+            b.extend(v);
+        }
+        b
+    }
+    fn arr(items: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut b = ext(11, items.len());
+        for i in items {
+            b.extend(i);
+        }
+        b
+    }
+    fn dbl(v: f64) -> Vec<u8> {
+        let mut b = ctrl(3, 8);
+        b.extend(v.to_be_bytes());
+        b
+    }
+    fn u16v(v: u16) -> Vec<u8> {
+        let mut b = ctrl(5, 2);
+        b.extend(v.to_be_bytes());
+        b
+    }
+    fn u32v(v: u32) -> Vec<u8> {
+        let mut b = ctrl(6, 4);
+        b.extend(v.to_be_bytes());
+        b
+    }
+    fn u64v(v: u64) -> Vec<u8> {
+        let mut b = ext(9, 8);
+        b.extend(v.to_be_bytes());
+        b
+    }
+    let record = map(vec![
+        ("city", map(vec![("names", map(vec![("en", s("Berlin"))]))])),
+        (
+            "country",
+            map(vec![
+                ("iso_code", s("DE")),
+                ("names", map(vec![("en", s("Germany"))])),
+            ]),
+        ),
+        (
+            "location",
+            map(vec![
+                ("accuracy_radius", u16v(20)),
+                ("latitude", dbl(52.52)),
+                ("longitude", dbl(13.405)),
+                ("time_zone", s("Europe/Berlin")),
+            ]),
+        ),
+        ("subdivisions", arr(vec![map(vec![("iso_code", s("BE"))])])),
+    ]);
+    let prefix: u32 = u32::from(std::net::Ipv4Addr::new(203, 0, 113, 0));
+    let node_count: u32 = 24;
+    let data_ptr = node_count + 16;
+    let mut out = Vec::new();
+    for i in 0..node_count {
+        let bit = (prefix >> (31 - i)) & 1;
+        let next = if i == node_count - 1 { data_ptr } else { i + 1 };
+        let (left, right) = if bit == 0 {
+            (next, node_count)
+        } else {
+            (node_count, next)
+        };
+        out.extend(&left.to_be_bytes()[1..]);
+        out.extend(&right.to_be_bytes()[1..]);
+    }
+    out.extend([0u8; 16]);
+    out.extend(record);
+    out.extend(b"\xab\xcd\xefMaxMind.com");
+    out.extend(map(vec![
+        ("binary_format_major_version", u16v(2)),
+        ("binary_format_minor_version", u16v(0)),
+        ("build_epoch", u64v(build_epoch)),
+        ("database_type", s("GeoLite2-City")),
+        ("description", map(vec![("en", s("musubi test"))])),
+        ("ip_version", u16v(4)),
+        ("languages", arr(vec![s("en")])),
+        ("node_count", u32v(node_count)),
+        ("record_size", u16v(24)),
+    ]));
+    out
+}
+
+async fn call_from(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    ip: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let _gate = if gated_login(path) {
+        Some(LOGIN_GATE.read().await)
+    } else {
+        None
+    };
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-forwarded-for", ip)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(t) = token {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    let body = body.map(|b| b.to_string()).unwrap_or_default();
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn geoip_stamps_logins_feeds_audiences_configs_and_analytics() {
+    let Some(plain) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    let (st, v) = call_server(&plain, "GET", "/v1/server/geoip", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["enabled"], false);
+    let (st, _) = call_server(&plain, "POST", "/v1/server/geoip/update", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let dir = std::env::temp_dir().join(unique("musubi-geoip-"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mmdb = dir.join("GeoLite2-City.mmdb");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+    std::fs::write(&mmdb, tiny_mmdb(now - 86_400)).unwrap();
+    let data_dir = dir.to_string_lossy().to_string();
+    let Some((app, state)) = app_and_state_with(move |c| {
+        c.node.data_dir = data_dir;
+        c.geoip.enabled = true;
+        c.geoip.overrides = vec![musubi_core::config::GeoOverride {
+            cidr: "10.0.0.0/8".into(),
+            country: "fr".into(),
+            region: "IDF".into(),
+            city: "Paris".into(),
+            lat: Some(48.85),
+            lon: Some(2.35),
+        }];
+    })
+    .await
+    else {
+        return;
+    };
+
+    let (st, v) = call_server(&app, "GET", "/v1/server/geoip", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["loaded"], true, "{v}");
+    assert_eq!(v["database_type"], "GeoLite2-City");
+    assert_eq!(v["build_age_days"], 1);
+    assert_eq!(v["stale"], false);
+    assert_eq!(v["downloads"], false);
+    assert_eq!(v["overrides"], 1);
+    assert_eq!(v["update_due"], false);
+    assert!(v["path"].as_str().unwrap().ends_with("GeoLite2-City.mmdb"));
+
+    let (st, v) = call_server(&app, "GET", "/v1/server/geoip/lookup/203.0.113.9", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["found"], true, "{v}");
+    let l = &v["location"];
+    assert_eq!(l["country"], "DE");
+    assert_eq!(l["region"], "BE");
+    assert_eq!(l["city"], "Berlin");
+    assert_eq!(l["lat"], 52.52);
+    assert_eq!(l["lon"], 13.405);
+    assert_eq!(l["time_zone"], "Europe/Berlin");
+    assert_eq!(l["accuracy_km"], 20);
+    assert_eq!(l["source"], "mmdb");
+    let (_, v) = call_server(&app, "GET", "/v1/server/geoip/lookup/10.1.2.3", k, None).await;
+    assert_eq!(v["location"]["country"], "FR");
+    assert_eq!(v["location"]["city"], "Paris");
+    assert_eq!(v["location"]["source"], "override");
+    let (_, v) = call_server(&app, "GET", "/v1/server/geoip/lookup/8.8.8.8", k, None).await;
+    assert_eq!(v["found"], false, "{v}");
+    assert!(v["location"].is_null());
+    let (st, _) = call_server(&app, "GET", "/v1/server/geoip/lookup/garbage", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // no licence → no downloads; the failure is visible in the status
+    let (st, v) = call_server(&app, "POST", "/v1/server/geoip/update", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/geoip", k, None).await;
+    assert!(
+        v["last_error"].as_str().unwrap().contains("license_key"),
+        "{v}"
+    );
+    assert!(v["last_check"].is_string());
+    let (st, v) = call_server(&app, "POST", "/v1/server/geoip/reload", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["loaded"], true);
+    assert!(v["last_error"].is_null());
+
+    // logins stamp the last known location
+    let dev_a = unique("geo-a");
+    let (st, u) = call_from(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        "203.0.113.9",
+        Some(json!({"id": dev_a})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+    let tok_a = u["access_token"].as_str().unwrap().to_string();
+    let acc_a = u["account_id"].as_str().unwrap().to_string();
+    let geo_a = |app: Router, tok: String| async move {
+        for _ in 0..40 {
+            let (st, v) = call(&app, "GET", "/v1/account/geo", Some(&tok), None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            if v["known"] != false {
+                return v;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("location never stamped");
+    };
+    let v = geo_a(app.clone(), tok_a.clone()).await;
+    assert_eq!(v["country"], "DE", "{v}");
+    assert_eq!(v["region"], "BE");
+    assert_eq!(v["city"], "Berlin");
+    assert_eq!(v["lat"], 52.52);
+    assert_eq!(v["ip"], "203.0.113.9");
+    assert_eq!(v["source"], "mmdb");
+    assert_eq!(v["changes"], 0);
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{acc_a}/geo"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["country"], "DE");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{}/geo", uuid::Uuid::nil()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // same device from the office LAN: override wins, the move is counted
+    let (st, u) = call_from(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        "10.5.5.5",
+        Some(json!({"id": dev_a})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{u}");
+    assert_eq!(u["account_id"], acc_a);
+    let tok_a2 = u["access_token"].as_str().unwrap().to_string();
+    let mut v = Value::Null;
+    for _ in 0..40 {
+        v = geo_a(app.clone(), tok_a2.clone()).await;
+        if v["country"] == "FR" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(v["country"], "FR", "{v}");
+    assert_eq!(v["city"], "Paris");
+    assert_eq!(v["source"], "override");
+    assert_eq!(v["changes"], 1);
+
+    // unknown address: nothing stamped
+    let (_, u) = call_from(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        "8.8.8.8",
+        Some(json!({"id": unique("geo-b")})),
+    )
+    .await;
+    let tok_b = u["access_token"].as_str().unwrap().to_string();
+    let acc_b = u["account_id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let (st, v) = call(&app, "GET", "/v1/account/geo", Some(&tok_b), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["known"], false, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/accounts/{acc_b}/geo"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, u) = call_from(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        "203.0.113.77",
+        Some(json!({"id": unique("geo-c")})),
+    )
+    .await;
+    let tok_c = u["access_token"].as_str().unwrap().to_string();
+    let acc_c = u["account_id"].as_str().unwrap().to_string();
+    let v = geo_a(app.clone(), tok_c.clone()).await;
+    assert_eq!(v["country"], "DE", "{v}");
+
+    // audiences on the last known country
+    let sfx = unique("").to_lowercase().replace(['.', ':', '-'], "");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/bad_{sfx}"),
+        k,
+        Some(json!({"rules": {"countries": ["DEU"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let de = format!("in_de_{sfx}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{de}"),
+        k,
+        Some(json!({"rules": {"countries": ["de"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["count"].as_i64().unwrap() >= 1, "{v}");
+    let not_fr = format!("not_fr_{sfx}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/audiences/{not_fr}"),
+        k,
+        Some(json!({"rules": {"not_countries": ["FR"]}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let of = |acc: &str| {
+        let app = app.clone();
+        let p = format!("/v1/server/audiences/of/{acc}");
+        async move {
+            let (st, v) = call_server(&app, "GET", &p, k, None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v["audiences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["id"].as_str().or(a.as_str()).unwrap_or("").to_string())
+                .collect::<Vec<String>>()
+        }
+    };
+    let a_in = of(&acc_a).await;
+    let b_in = of(&acc_b).await;
+    let c_in = of(&acc_c).await;
+    assert!(c_in.contains(&de), "C is in Germany: {c_in:?}");
+    assert!(!a_in.contains(&de), "A moved to France: {a_in:?}");
+    assert!(!a_in.contains(&not_fr), "{a_in:?}");
+    assert!(
+        b_in.contains(&not_fr),
+        "unknown location passes not_countries: {b_in:?}"
+    );
+    assert!(c_in.contains(&not_fr), "{c_in:?}");
+
+    // remote config: GeoIP country when the client sends none, explicit country wins
+    let name = unique("cfg-geoip").to_lowercase();
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}"),
+        k,
+        Some(json!({"value": {"price": 10}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/server/configs/{name}/variants/de"),
+        k,
+        Some(json!({"selector": {"countries": ["DE"]}, "patch": {"price": 12}, "priority": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let price = |c: &Value| c["value"]["price"].as_i64().or(c["price"].as_i64());
+    let (st, c) = call_from(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}"),
+        Some(&tok_c),
+        "203.0.113.5",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(price(&c), Some(12), "German address → DE variant: {c}");
+    let (_, c) = call_from(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}"),
+        Some(&tok_c),
+        "8.8.8.8",
+        None,
+    )
+    .await;
+    assert_eq!(price(&c), Some(10), "unknown address → base: {c}");
+    let (_, c) = call_from(
+        &app,
+        "GET",
+        &format!("/v1/configs/{name}?country=US"),
+        Some(&tok_c),
+        "203.0.113.5",
+        None,
+    )
+    .await;
+    assert_eq!(price(&c), Some(10), "explicit country wins: {c}");
+
+    // analytics: events without a country get the request's
+    let ev = unique("geo_ev")
+        .to_lowercase()
+        .replace(['.', ':', '-'], "_");
+    let (st, v) = call_from(
+        &app,
+        "POST",
+        "/v1/telemetry/events",
+        Some(&tok_c),
+        "203.0.113.5",
+        Some(json!({"events": [
+            {"name": ev, "properties": {}},
+            {"name": ev, "properties": {}, "country": "US"}
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mut countries: Vec<Option<String>> = vec![];
+    for _ in 0..40 {
+        countries = sqlx::query_scalar(
+            "select country from musubi.analytics_events where account_id = $1 and name = $2 order by country",
+        )
+        .bind(uuid::Uuid::parse_str(&acc_c).unwrap())
+        .bind(&ev)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        if countries.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        countries,
+        vec![Some("DE".to_string()), Some("US".to_string())]
+    );
+
+    // cohorts
+    let (st, v) = call_server(&app, "GET", "/v1/server/analytics/geo?limit=5", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["total"].as_i64().unwrap() >= 2, "{v}");
+    let de_row = v["countries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["country"] == "DE")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(de_row["accounts"].as_i64().unwrap_or(0) >= 1, "{v}");
+    let (st, _) = call_server(
+        &app,
+        "GET",
+        "/v1/server/analytics/geo?since_days=0",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // a stale database is ignored, overrides still work
+    std::fs::write(&mmdb, tiny_mmdb(now - 400 * 86_400)).unwrap();
+    let (st, v) = call_server(&app, "POST", "/v1/server/geoip/reload", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["stale"], true, "{v}");
+    assert_eq!(v["build_age_days"], 400);
+    let (_, v) = call_server(&app, "GET", "/v1/server/geoip/lookup/203.0.113.9", k, None).await;
+    assert_eq!(v["found"], false, "stale db: {v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/geoip/lookup/10.1.2.3", k, None).await;
+    assert_eq!(v["found"], true);
+    std::fs::write(&mmdb, b"garbage").unwrap();
+    let (st, v) = call_server(&app, "POST", "/v1/server/geoip/reload", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    let (st, _) = call(&app, "GET", "/v1/server/geoip", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(dir);
 }

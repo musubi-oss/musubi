@@ -44,6 +44,7 @@ pub mod fleets;
 mod friend_codes;
 mod friends;
 pub mod game_sessions;
+pub mod geoip;
 pub mod group_challenges;
 mod group_pools;
 mod groups;
@@ -354,6 +355,7 @@ pub fn router(state: AppState) -> Router {
         .merge(oauth::routes())
         .merge(oauth_authz::routes())
         .merge(secrets::routes())
+        .merge(geoip::routes())
         .merge(environments::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

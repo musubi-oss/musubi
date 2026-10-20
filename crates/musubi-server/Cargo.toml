@@ -69,6 +69,9 @@ aes.workspace = true
 cbc.workspace = true
 crc32fast.workspace = true
 reqwest.workspace = true
+maxminddb.workspace = true
+tar.workspace = true
+flate2.workspace = true
 hex.workspace = true
 
 jsonwebtoken.workspace = true
@@ -91,6 +94,9 @@ musubi-proto.workspace = true
 jsonwebtoken.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
+maxminddb.workspace = true
+tar.workspace = true
+flate2.workspace = true
 str0m = "0.24"
 
 [target.'cfg(target_os = "linux")'.dependencies]

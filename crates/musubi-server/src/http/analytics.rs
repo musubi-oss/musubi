@@ -75,15 +75,53 @@ struct Batch {
     device_id: Option<String>,
 }
 
+/// Events the client sent without a country get the GeoIP country of the request.
+fn with_geo_country<E>(s: &AppState, ip: &str, events: Vec<E>) -> Vec<E>
+where
+    E: HasCountry,
+{
+    if !s.geoip.enabled() || events.iter().all(|e| e.country().is_some()) {
+        return events;
+    }
+    let Some(country) = s.geoip.country_of(ip) else {
+        return events;
+    };
+    events
+        .into_iter()
+        .map(|mut e| {
+            if e.country().is_none() {
+                e.set_country(country.clone());
+            }
+            e
+        })
+        .collect()
+}
+
+trait HasCountry {
+    fn country(&self) -> Option<&str>;
+    fn set_country(&mut self, c: String);
+}
+
+impl HasCountry for crate::analytics::Incoming {
+    fn country(&self) -> Option<&str> {
+        self.country.as_deref()
+    }
+    fn set_country(&mut self, c: String) {
+        self.country = Some(c);
+    }
+}
+
 /// `POST /v1/telemetry/events {events: [{name, at?, properties, session_id?, platform?, country?}]}`
 async fn ingest(
     State(s): State<AppState>,
     Bearer(me): Bearer,
+    crate::http::extract::ClientIp(ip): crate::http::extract::ClientIp,
     Json(b): Json<Batch>,
 ) -> std::result::Result<Json<Value>, ApiError> {
+    let events = with_geo_country(&s, &ip, b.events);
     let r = s
         .analytics
-        .ingest(b.events, Some(me.account_id), b.device_id, "client")
+        .ingest(events, Some(me.account_id), b.device_id, "client")
         .await?;
     Ok(Json(serde_json::to_value(r).map_err(Error::internal)?))
 }
@@ -93,6 +131,7 @@ async fn ingest(
 async fn ingest_anonymous(
     State(s): State<AppState>,
     headers: HeaderMap,
+    crate::http::extract::ClientIp(ip): crate::http::extract::ClientIp,
     Json(b): Json<Batch>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     let key = headers
@@ -107,9 +146,10 @@ async fn ingest_anonymous(
         .clone()
         .filter(|d| !d.is_empty() && d.len() <= 128)
         .ok_or_else(|| Error::InvalidArgument("device_id required".into()))?;
+    let events = with_geo_country(&s, &ip, b.events);
     let r = s
         .analytics
-        .ingest(b.events, None, Some(device), "client")
+        .ingest(events, None, Some(device), "client")
         .await?;
     Ok(Json(serde_json::to_value(r).map_err(Error::internal)?))
 }

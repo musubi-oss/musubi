@@ -20,6 +20,7 @@ pub mod fanout;
 pub mod fleet_metrics;
 pub mod fraud;
 pub mod game_sessions;
+pub mod geoip;
 pub mod grant_limits;
 pub mod hooks;
 pub mod http;

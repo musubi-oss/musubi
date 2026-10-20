@@ -162,6 +162,7 @@ async fn build_state_cfg_with(
         &cfg.runtime,
     ));
     let compliance_cfg = cfg.compliance.clone();
+    let geoip = musubi_server::geoip::GeoIp::new(&cfg.geoip, &cfg.node.data_dir).unwrap();
     let mut inner = AppStateInner {
         anticheat: Arc::new(musubi_server::anticheat::AntiCheat::new()),
         dev: Arc::new(musubi_server::dev::DevTools::new()),
@@ -229,6 +230,7 @@ async fn build_state_cfg_with(
         events: Arc::new(musubi_server::events::Events::new(db.clone())),
         banned: Arc::new(musubi_server::bans::Bans::default()),
         legal: Arc::new(musubi_server::legal::Legal::default()),
+        geoip,
         ban_rules: Arc::new(musubi_server::bans::BanRules::default()),
         age: Arc::new(musubi_server::compliance::AgeGate::new(compliance_cfg)),
         liveops_cache: Default::default(),

@@ -89,6 +89,7 @@ pub struct AppStateInner {
     pub events: Arc<crate::events::Events>,
     pub banned: Arc<crate::bans::Bans>,
     pub legal: Arc<crate::legal::Legal>,
+    pub geoip: Arc<crate::geoip::GeoIp>,
     pub ban_rules: Arc<crate::bans::BanRules>,
     pub age: Arc<crate::compliance::AgeGate>,
     pub anticheat: Arc<crate::anticheat::AntiCheat>,
@@ -715,6 +716,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     let analytics = crate::analytics::Analytics::new(db.clone(), cfg.analytics.clone());
     analytics.spawn_flusher();
     crate::http::matchmaker::spawn_drain(db.clone(), matchmaker.clone());
+    let geoip = crate::geoip::GeoIp::new(&cfg.geoip, &cfg.node.data_dir)?;
     let state = AppState(Arc::new(AppStateInner {
         blobs,
         audit: crate::audit::Sink::new(&db),
@@ -732,6 +734,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         },
         banned: Arc::new(crate::bans::Bans::default()),
         legal: Arc::new(crate::legal::Legal::default()),
+        geoip,
         ban_rules: Arc::new(crate::bans::BanRules::default()),
         age: Arc::new(crate::compliance::AgeGate::new(compliance_cfg)),
         anticheat: Arc::new(crate::anticheat::AntiCheat::new()),
@@ -867,6 +870,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     if let Some(c) = state.cluster.clone() {
         let lease = c.lease("entitlements", musubi_cluster::DEAD_AFTER);
         crate::http::entitlements::spawn_sweeper(state.clone(), move || lease.held());
+    }
+    if let Some(c) = state.cluster.clone() {
+        let lease = c.lease("geoip", musubi_cluster::DEAD_AFTER);
+        crate::geoip::spawn_updater(state.clone(), move || lease.held());
     }
     if let Some(c) = state.cluster.clone() {
         let ev = state.events.clone();

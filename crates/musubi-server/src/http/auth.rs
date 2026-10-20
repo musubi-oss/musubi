@@ -113,6 +113,9 @@ pub(super) async fn authenticated(
             if let Err(e) = crate::bans::note_login(&st.db, sid.0, acc, &ip).await {
                 tracing::warn!(error = %e, "device registry update failed");
             }
+            if let Err(e) = st.geoip.stamp_login(&st.db, acc, &ip).await {
+                tracing::warn!(error = %e, "geoip stamp failed");
+            }
             // a banned device that logged in through another provider is cut off right away
             let dev: Option<String> =
                 sqlx::query_scalar("select device_id from musubi.sessions where id = $1")

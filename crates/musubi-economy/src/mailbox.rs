@@ -63,6 +63,10 @@ pub struct Audience {
     pub events: Vec<EventRule>,
     /// UA attribution: the account's first (default) or last touch matches every listed value set.
     pub attribution: Option<AttributionRule>,
+    /// GeoIP: last known country (ISO 3166-1 alpha-2) at login is one of these.
+    pub countries: Vec<String>,
+    /// … and is none of these (accounts without a known location pass).
+    pub not_countries: Vec<String>,
     /// Algebra: at least one of `any` holds, every one of `all` holds, `not` does not hold.
     pub any: Vec<Audience>,
     pub all: Vec<Audience>,
@@ -241,6 +245,20 @@ impl Audience {
         for e in &self.events {
             e.validate()?;
         }
+        for (name, list) in [
+            ("countries", &self.countries),
+            ("not_countries", &self.not_countries),
+        ] {
+            if list.len() > 250
+                || list
+                    .iter()
+                    .any(|c| c.len() != 2 || !c.chars().all(|ch| ch.is_ascii_alphabetic()))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "{name}: <= 250 ISO 3166-1 alpha-2 codes"
+                )));
+            }
+        }
         if let Some(a) = &self.attribution {
             a.validate()?;
         }
@@ -335,6 +353,8 @@ impl Audience {
             && self.bucket_max.is_none()
             && self.events.is_empty()
             && self.attribution.is_none()
+            && self.countries.is_empty()
+            && self.not_countries.is_empty()
             && self.any.is_empty()
             && self.all.is_empty()
             && self.not.is_none())
@@ -413,6 +433,26 @@ impl Audience {
         }
         for e in &self.events {
             e.push(qb, now);
+        }
+        if !self.countries.is_empty() {
+            qb.push(" and exists (select 1 from musubi.account_geo g where g.account_id = a.id and g.country = any(")
+                .push_bind(
+                    self.countries
+                        .iter()
+                        .map(|c| c.to_ascii_uppercase())
+                        .collect::<Vec<_>>(),
+                )
+                .push("))");
+        }
+        if !self.not_countries.is_empty() {
+            qb.push(" and not exists (select 1 from musubi.account_geo g where g.account_id = a.id and g.country = any(")
+                .push_bind(
+                    self.not_countries
+                        .iter()
+                        .map(|c| c.to_ascii_uppercase())
+                        .collect::<Vec<_>>(),
+                )
+                .push("))");
         }
         if let Some(a) = &self.attribution {
             a.push(qb);

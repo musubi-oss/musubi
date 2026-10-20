@@ -41,6 +41,7 @@ pub struct Config {
     pub udp: UdpConfig,
     pub edge: EdgeConfig,
     pub mesh_net: MeshNetConfig,
+    pub geoip: GeoIpConfig,
     pub zanshin: ZanshinConfig,
     pub analytics: AnalyticsConfig,
     pub aurix: AurixConfig,
@@ -830,6 +831,61 @@ impl Default for MeshNetConfig {
             apply: "auto".into(),
             keepalive_secs: 25,
             bind_bus: false,
+        }
+    }
+}
+
+/// Player IP geolocation (`[geoip]`): a MaxMind GeoLite2/GeoIP2 `.mmdb` (City or Country) the
+/// leader downloads with the account's licence key and refreshes every `update_days`; every login
+/// stamps the account's last known country/region/city/coordinates, which feed audience rules
+/// (`countries`), remote-config `countries` selectors (when the client sent no
+/// `x-musubi-country`), analytics events without a country and latency-aware allocation. A
+/// database older than `stale_days` is ignored (lookups return nothing) until a fresh one lands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GeoIpConfig {
+    pub enabled: bool,
+    /// `.mmdb` path; empty = `<node.data_dir>/<edition>.mmdb`.
+    pub path: String,
+    /// `GeoLite2-City` (default), `GeoLite2-Country`, `GeoIP2-City`, …
+    pub edition: String,
+    /// MaxMind account id + licence key; empty = never download, only read `path`.
+    pub account_id: String,
+    pub license_key: String,
+    /// `{edition}` and `{license_key}` are substituted; default = MaxMind's permalink.
+    pub download_url: String,
+    /// Re-download when the file is older than this (MaxMind publishes twice a week).
+    pub update_days: u32,
+    /// Ignore a database whose build is older than this (0 = never stale).
+    pub stale_days: u32,
+    /// Networks resolved before the database — LAN / QA machines / CGNAT ranges mapped to a
+    /// location by hand (`{cidr, country, region, city, lat, lon}`).
+    pub overrides: Vec<GeoOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct GeoOverride {
+    pub cidr: String,
+    pub country: String,
+    pub region: String,
+    pub city: String,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+}
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: String::new(),
+            edition: "GeoLite2-City".into(),
+            account_id: String::new(),
+            license_key: String::new(),
+            download_url: "https://download.maxmind.com/app/geoip_download?edition_id={edition}&license_key={license_key}&suffix=tar.gz".into(),
+            update_days: 7,
+            stale_days: 35,
+            overrides: Vec::new(),
         }
     }
 }

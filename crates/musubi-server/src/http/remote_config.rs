@@ -51,6 +51,9 @@ pub struct Ctx {
     pub platform: Option<String>,
     pub version: Option<String>,
     pub country: Option<String>,
+    /// Request address (first `X-Forwarded-For` hop / `X-Real-IP`) for the GeoIP country fallback.
+    #[serde(skip)]
+    pub client_ip: Option<String>,
     /// Server-side preview only: resolve rollouts as this account would see them.
     pub account_id: Option<AccountId>,
     pub prefix: Option<String>,
@@ -70,11 +73,21 @@ pub fn ctx_from(mut q: Ctx, headers: &HeaderMap) -> Ctx {
     q.platform = q.platform.or_else(|| h("x-musubi-platform"));
     q.version = q.version.or_else(|| h("x-musubi-client-version"));
     q.country = q.country.or_else(|| h("x-musubi-country"));
+    q.client_ip = h("x-forwarded-for")
+        .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
+        .or_else(|| h("x-real-ip"));
     q
 }
 
 /// Resolve the country's groups so `countries: ["group:eu"]` selectors can match.
 pub async fn enrich(s: &AppState, mut ctx: Ctx) -> Ctx {
+    if ctx.country.is_none() {
+        // no `x-musubi-country`: the request address's country, when GeoIP knows it
+        ctx.country = ctx
+            .client_ip
+            .as_deref()
+            .and_then(|ip| s.geoip.country_of(ip));
+    }
     if ctx.country.is_some() {
         ctx.country_groups = crate::http::countries::groups_for(s, ctx.country.as_deref()).await;
     }
