@@ -37,7 +37,8 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-type Row = (
+/// One `config_sources` row (`COLS` order); a tuple struct because sqlx tuples stop at 16.
+struct Row(
     String,
     String,
     String,
@@ -54,9 +55,39 @@ type Row = (
     Option<OffsetDateTime>,
     i32,
     OffsetDateTime,
+    String,
+    Option<String>,
+    bool,
 );
 
-const COLS: &str = "name, url, format, key, note, interval_secs, enabled, headers, etag, last_hash, last_sync_at, last_status, last_error, last_changed_at, syncs, updated_at";
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for Row {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+        use sqlx::Row as _;
+        Ok(Row(
+            row.try_get(0)?,
+            row.try_get(1)?,
+            row.try_get(2)?,
+            row.try_get(3)?,
+            row.try_get(4)?,
+            row.try_get(5)?,
+            row.try_get(6)?,
+            row.try_get(7)?,
+            row.try_get(8)?,
+            row.try_get(9)?,
+            row.try_get(10)?,
+            row.try_get(11)?,
+            row.try_get(12)?,
+            row.try_get(13)?,
+            row.try_get(14)?,
+            row.try_get(15)?,
+            row.try_get(16)?,
+            row.try_get(17)?,
+            row.try_get(18)?,
+        ))
+    }
+}
+
+const COLS: &str = "name, url, format, key, note, interval_secs, enabled, headers, etag, last_hash, last_sync_at, last_status, last_error, last_changed_at, syncs, updated_at, target, content_table, prune";
 
 fn doc(r: &Row) -> Value {
     let header_names: Vec<&str> =
@@ -79,6 +110,7 @@ fn doc(r: &Row) -> Value {
         "last_status": r.11, "last_error": r.12,
         "last_changed_at": r.13.map(|t| t.unix_timestamp()),
         "syncs": r.14, "next_sync_at": next, "updated_at": r.15.unix_timestamp(),
+        "target": r.16, "table": r.17, "prune": r.18,
     })
 }
 
@@ -123,6 +155,13 @@ struct PutBody {
     interval_secs: Option<i32>,
     enabled: Option<bool>,
     headers: HashMap<String, String>,
+    /// `remote_config` (default) or `content`: rows of a content table (items, reward tables, …)
+    /// — one sheet per table, columns = table columns, dotted headers nest into JSON columns.
+    target: Option<String>,
+    /// Content table fed by this source (`target: content`).
+    table: Option<String>,
+    /// `target: content`: delete rows of the table that the sheet no longer lists.
+    prune: Option<bool>,
 }
 
 fn guess_format(url: &str) -> &'static str {
@@ -189,6 +228,37 @@ async fn put(
     if b.note.as_ref().is_some_and(|n| n.len() > 200) {
         return Err(Error::InvalidArgument("note exceeds 200 chars".into()).into());
     }
+    let target = b
+        .target
+        .map(|t| t.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "remote_config".into());
+    if target != "remote_config" && target != "content" {
+        return Err(
+            Error::InvalidArgument("target must be remote_config or content".into()).into(),
+        );
+    }
+    let table = b
+        .table
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    if target == "content" {
+        let Some(t) = &table else {
+            return Err(Error::InvalidArgument("target content needs table".into()).into());
+        };
+        if crate::http::content::section_of(t).is_none() {
+            return Err(
+                Error::InvalidArgument(format!("table {t:?} is not a content table")).into(),
+            );
+        }
+        if b.key.is_some() {
+            return Err(Error::InvalidArgument(
+                "key is for remote_config sources; content rows are keyed by the table's primary key".into(),
+            )
+            .into());
+        }
+    } else if table.is_some() || b.prune.is_some() {
+        return Err(Error::InvalidArgument("table/prune need target content".into()).into());
+    }
     let headers = Value::Object(
         b.headers
             .into_iter()
@@ -196,11 +266,11 @@ async fn put(
             .collect(),
     );
     let row: Row = sqlx::query_as(&format!(
-        "insert into musubi.config_sources (name, url, format, key, note, interval_secs, enabled, headers)
-         values ($1, $2, $3, $4, $5, $6, $7, $8)
+        "insert into musubi.config_sources (name, url, format, key, note, interval_secs, enabled, headers, target, content_table, prune)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          on conflict (name) do update set url = $2, format = $3, key = $4, note = $5,
              interval_secs = $6, enabled = $7, headers = $8, etag = null, last_hash = null,
-             updated_at = now()
+             target = $9, content_table = $10, prune = $11, updated_at = now()
          returning {COLS}"
     ))
     .bind(&name)
@@ -211,6 +281,9 @@ async fn put(
     .bind(interval)
     .bind(b.enabled.unwrap_or(true))
     .bind(&headers)
+    .bind(&target)
+    .bind(&table)
+    .bind(b.prune.unwrap_or(false))
     .fetch_one(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -218,7 +291,7 @@ async fn put(
         .emit(
             "config.source_set",
             None,
-            json!({ "name": name, "url": url, "format": format }),
+            json!({ "name": name, "url": url, "format": format, "target": target, "table": table }),
         )
         .await;
     Ok(Json(doc(&row)))
@@ -380,8 +453,10 @@ async fn sync_one(s: &AppState, r: &Row) -> Outcome {
             error: None,
         };
     }
+    let content = r.16 == "content";
     let parsed: std::result::Result<Value, String> = if r.2 == "csv" {
-        crate::http::remote_config::csv_to_value(&text, r.3.as_deref()).map_err(|e| e.to_string())
+        crate::http::remote_config::csv_to_value(&text, if content { None } else { r.3.as_deref() })
+            .map_err(|e| e.to_string())
     } else {
         serde_json::from_str(&text).map_err(|e| format!("json: {e}"))
     };
@@ -402,6 +477,64 @@ async fn sync_one(s: &AppState, r: &Row) -> Outcome {
     let note =
         r.4.clone()
             .unwrap_or_else(|| format!("source sync: {}", r.1));
+    if content {
+        let table = r.17.clone().unwrap_or_default();
+        let rows = match &value {
+            Value::Array(_) => value.clone(),
+            Value::Object(m) if m.get("tables").and_then(|t| t.get(&table)).is_some() => {
+                m["tables"][&table].clone()
+            }
+            _ => {
+                let e = format!("content source: expected an array of {table} rows");
+                record(s, name, "error", Some(&e), None, None, false).await;
+                return fail(e);
+            }
+        };
+        let bundle =
+            json!({ "format": crate::http::content::FORMAT, "tables": { table.clone(): rows } });
+        return match crate::http::content::run_import(
+            s,
+            &bundle,
+            false,
+            r.18,
+            &note,
+            &format!("source:{name}"),
+            None,
+        )
+        .await
+        {
+            Ok(res) => {
+                record(s, name, "ok", None, etag.as_deref(), Some(&hash), true).await;
+                let version = res.get("version").cloned().filter(|v| !v.is_null());
+                s.events
+                    .emit(
+                        "config.source_synced",
+                        None,
+                        json!({ "name": name, "target": "content", "table": table, "version": version,
+                                "changes": res["changes"], "diff": res["diff"], "hash": hash }),
+                    )
+                    .await;
+                Outcome {
+                    status: "ok",
+                    changed: res["changes"].as_bool().unwrap_or(false),
+                    version,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                let e = e.to_string();
+                record(s, name, "error", Some(&e), None, None, false).await;
+                s.events
+                    .emit(
+                        "config.source_failed",
+                        None,
+                        json!({ "name": name, "error": e }),
+                    )
+                    .await;
+                fail(e)
+            }
+        };
+    }
     match crate::http::configs::store(s, name, &value, Some(&note)).await {
         Ok(stored) => {
             record(s, name, "ok", None, etag.as_deref(), Some(&hash), true).await;

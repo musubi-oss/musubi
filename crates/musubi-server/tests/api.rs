@@ -44923,3 +44923,155 @@ async fn hero_classes_heroes_loadouts_and_privacy() {
     let (st, _) = call(&app, "GET", "/v1/heroes", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Config sources with `target: content`: validation, CSV sheet → items rows through the content
+/// import (typed cells, dotted headers), unchanged re-sync, JSON array source, events.
+#[tokio::test]
+async fn config_sources_feed_content_tables_from_sheets() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let (a, b) = (format!("csv-a-{sfx}"), format!("csv-b-{sfx}"));
+    let sheet = std::sync::Arc::new(std::sync::Mutex::new(format!(
+        "id,name,category,stackable,properties.rarity,properties.power\n{a},Sword,weapon,false,rare,12\n{b},Potion,consumable,true,common,1\n"
+    )));
+    let sheet2 = sheet.clone();
+    let jrow = format!("csv-j-{sfx}");
+    let jrow2 = jrow.clone();
+    let mock = axum::Router::new()
+        .route("/sheet", axum::routing::get(move || {
+            let s = sheet2.lock().unwrap().clone();
+            async move { ([(axum::http::header::CONTENT_TYPE, "text/csv")], s) }
+        }))
+        .route("/items.json", axum::routing::get(move || {
+            let id = jrow2.clone();
+            async move { axum::Json(json!([{"id": id, "name": "Json Ring", "category": "trinket", "properties": {"rarity": "epic"}}])) }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let name = format!("items_sheet_{sfx}");
+    let src = format!("/v1/server/configs/{name}/source");
+    for bad in [
+        json!({"url": format!("{base}/sheet"), "target": "nope"}),
+        json!({"url": format!("{base}/sheet"), "target": "content"}),
+        json!({"url": format!("{base}/sheet"), "target": "content", "table": "accounts"}),
+        json!({"url": format!("{base}/sheet"), "target": "content", "table": "items", "key": "id"}),
+        json!({"url": format!("{base}/sheet"), "table": "items"}),
+    ] {
+        let (st, v) = call_server(&app, "PUT", &src, k, Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (st, v) = call_server(&app, "PUT", &src, k, Some(json!({
+        "url": format!("{base}/sheet"), "format": "csv", "target": "content", "table": "items", "interval_secs": 60}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["target"], "content");
+    assert_eq!(v["table"], "items");
+    assert_eq!(v["prune"], false);
+    let (st, v) = call_server(&app, "POST", &format!("{src}/sync"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(v["changed"], true, "{v}");
+    assert!(v["version"].is_number(), "{v}");
+    let (st, bundle) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let row = |id: &str| {
+        bundle["tables"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(row(&a)["name"], "Sword");
+    assert_eq!(row(&a)["category"], "weapon");
+    assert_eq!(row(&a)["stackable"], false);
+    assert_eq!(row(&a)["properties"]["rarity"], "rare");
+    assert_eq!(row(&a)["properties"]["power"], 12);
+    assert_eq!(row(&b)["stackable"], true);
+    // same sheet → unchanged (hash)
+    let (st, v) = call_server(&app, "POST", &format!("{src}/sync"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "unchanged", "{v}");
+    // designer edits the sheet → diffed content version
+    *sheet.lock().unwrap() = format!(
+        "id,name,category,stackable,properties.rarity\n{a},Longsword,weapon,false,legendary\n{b},Potion,consumable,true,common\n"
+    );
+    let (st, v) = call_server(&app, "POST", &format!("{src}/sync"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["changed"], true, "{v}");
+    let (_, bundle) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    let row = |id: &str| {
+        bundle["tables"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(row(&a)["name"], "Longsword");
+    assert_eq!(row(&a)["properties"]["rarity"], "legendary");
+    // JSON array source into the same table
+    let name2 = format!("items_json_{sfx}");
+    let src2 = format!("/v1/server/configs/{name2}/source");
+    let (st, _) = call_server(
+        &app,
+        "PUT",
+        &src2,
+        k,
+        Some(json!({
+        "url": format!("{base}/items.json"), "target": "content", "table": "items"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call_server(&app, "POST", &format!("{src2}/sync"), k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "ok", "{v}");
+    let (_, bundle) = call_server(&app, "GET", "/v1/admin/content", k, None).await;
+    assert!(
+        bundle["tables"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == jrow && r["name"] == "Json Ring"),
+        "{bundle}"
+    );
+    let (st, ev) = call_server(
+        &app,
+        "GET",
+        "/v1/server/events?kinds=config.source_synced&limit=1000",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        ev["events"].as_array().unwrap().iter().any(|e| {
+            let p = if e.get("payload").is_some() {
+                &e["payload"]
+            } else {
+                &e["data"]
+            };
+            p["name"] == name && p["target"] == "content" && p["table"] == "items"
+        }),
+        "{ev}"
+    );
+    let (st, v) = call_server(&app, "GET", "/v1/server/config_sources", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        v["sources"]
+            .as_array()
+            .map(|a| a
+                .iter()
+                .any(|s| s["name"] == name && s["target"] == "content"))
+            .unwrap_or(v.to_string().contains(&name)),
+        "{v}"
+    );
+    for s in [&src, &src2] {
+        let (st, _) = call_server(&app, "DELETE", s, k, None).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+}
