@@ -27,6 +27,8 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
     cfg.database.url = url;
     cfg.database.max_connections = 3;
     cfg.market.anti_snipe_secs = 0;
+    // the chunk cache would land in ./data of the test's cwd; tests that want it set a temp dir
+    cfg.builds.cache = false;
     tweak(&mut cfg);
     let analytics_cfg = cfg.analytics.clone();
     let db = musubi_server::db::connect(&cfg.database).await.unwrap();
@@ -47156,6 +47158,7 @@ async fn build_artifacts_delta_uploads_chunks_manifest_and_gc() {
         c.builds.chunk_min_kb = 1;
         c.builds.chunk_avg_kb = 4;
         c.builds.chunk_max_kb = 16;
+        c.builds.cache = true;
         c.builds.cache_max_mb = 1;
         c.node.data_dir = dir.to_string_lossy().to_string();
     })
