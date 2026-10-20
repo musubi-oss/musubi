@@ -1,7 +1,8 @@
 //! Product analytics routes (see `crate::analytics`).
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::{Error, Result};
@@ -18,6 +19,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/telemetry/events", post(ingest))
         .route("/v1/telemetry/anonymous", post(ingest_anonymous))
         .route("/v1/telemetry/sampling", get(client_sampling))
+        .route("/v1/server/analytics/sinks", get(sinks))
+        .route("/v1/server/analytics/sinks/flush", post(flush_sinks))
         .route("/v1/account/event_properties", get(my_event_props))
         .route("/v1/telemetry/attribution", post(attribute))
         .route("/v1/account/attribution", get(my_attribution))
@@ -117,13 +120,16 @@ async fn ingest(
     Bearer(me): Bearer,
     crate::http::extract::ClientIp(ip): crate::http::extract::ClientIp,
     Json(b): Json<Batch>,
-) -> std::result::Result<Json<Value>, ApiError> {
+) -> std::result::Result<axum::response::Response, ApiError> {
+    if let Some(r) = redirect_ingest(&s, "/v1/telemetry/events") {
+        return Ok(r);
+    }
     let events = with_geo_country(&s, &ip, b.events);
     let r = s
         .analytics
         .ingest(events, Some(me.account_id), b.device_id, "client")
         .await?;
-    Ok(Json(serde_json::to_value(r).map_err(Error::internal)?))
+    Ok(Json(serde_json::to_value(r).map_err(Error::internal)?).into_response())
 }
 
 /// `POST /v1/telemetry/anonymous` with `X-Telemetry-Key` — pre-login events (installs,
@@ -133,7 +139,10 @@ async fn ingest_anonymous(
     headers: HeaderMap,
     crate::http::extract::ClientIp(ip): crate::http::extract::ClientIp,
     Json(b): Json<Batch>,
-) -> std::result::Result<Json<Value>, ApiError> {
+) -> std::result::Result<axum::response::Response, ApiError> {
+    if let Some(r) = redirect_ingest(&s, "/v1/telemetry/anonymous") {
+        return Ok(r);
+    }
     let key = headers
         .get("x-telemetry-key")
         .and_then(|v| v.to_str().ok())
@@ -151,7 +160,7 @@ async fn ingest_anonymous(
         .analytics
         .ingest(events, None, Some(device), "client")
         .await?;
-    Ok(Json(serde_json::to_value(r).map_err(Error::internal)?))
+    Ok(Json(serde_json::to_value(r).map_err(Error::internal)?).into_response())
 }
 
 async fn list_schemas(
@@ -220,10 +229,78 @@ async fn client_sampling(
     for n in &p.always_enabled {
         events.insert(n.clone(), 100);
     }
+    let ingest_url = s.analytics.cfg.ingest_url.trim().trim_end_matches('/');
     Ok(Json(json!({
         "global_pct": p.global_pct, "always_enabled": p.always_enabled, "version": p.version,
         "events": events,
+        "ingest_url": (!ingest_url.is_empty()).then(|| ingest_url.to_string()),
     })))
+}
+
+/// Configured sinks and, for `s3`, their buffers / last upload.
+async fn sinks(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let s3 = s.analytics.s3_sink_status();
+    let sinks: Vec<Value> = s
+        .analytics
+        .cfg
+        .sinks
+        .iter()
+        .map(|k| {
+            let mut v = json!({ "name": k.name, "kind": k.kind, "names": k.names });
+            if let Some(st) = s3.iter().find(|x| x["sink"] == k.name) {
+                v["s3"] = st.clone();
+            }
+            v
+        })
+        .collect();
+    Ok(Json(json!({
+        "sinks": sinks,
+        "flush_secs": s.analytics.cfg.flush_secs,
+        "ingest_url": s.analytics.cfg.ingest_url,
+        "redirect_ingest": s.analytics.cfg.redirect_ingest,
+        "telemetry_only": crate::http::telemetry_only(&s.cfg),
+    })))
+}
+
+/// Deliver queued rows to every sink and upload `s3` buffers regardless of thresholds.
+#[derive(Deserialize)]
+struct FlushQ {
+    /// `false` = deliver queued rows but let `s3` buffers wait for their thresholds.
+    force: Option<bool>,
+}
+
+async fn flush_sinks(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Query(q): Query<FlushQ>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let mut out = s.analytics.flush().await;
+    if q.force.unwrap_or(true) {
+        out.extend(s.analytics.flush_s3_now().await);
+    }
+    Ok(Json(json!({ "results": out })))
+}
+
+/// API nodes with `redirect_ingest` send clients to the dedicated telemetry backend.
+fn redirect_ingest(s: &AppState, path: &str) -> Option<axum::response::Response> {
+    let cfg = &s.analytics.cfg;
+    if !cfg.redirect_ingest
+        || cfg.ingest_url.trim().is_empty()
+        || crate::http::telemetry_only(&s.cfg)
+    {
+        return None;
+    }
+    let to = format!("{}{}", cfg.ingest_url.trim().trim_end_matches('/'), path);
+    Some(
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(axum::http::header::LOCATION, to)],
+        )
+            .into_response(),
+    )
 }
 
 async fn get_sampling(

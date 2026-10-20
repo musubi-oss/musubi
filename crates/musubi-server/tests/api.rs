@@ -197,6 +197,17 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
     state.matches.set_idl(state.idl.clone());
     state.anticheat.bind(&state);
     musubi_server::runtime_host::install(&state);
+    {
+        let st = state.clone();
+        state
+            .analytics
+            .set_store_resolver(Arc::new(move |name: String| {
+                let st = st.clone();
+                Box::pin(
+                    async move { musubi_server::http::storage_endpoints::store(&st, &name).await },
+                )
+            }));
+    }
     Some((musubi_server::http::router(state.clone()), state))
 }
 
@@ -46630,4 +46641,332 @@ async fn geoip_stamps_logins_feeds_audiences_configs_and_analytics() {
     let (st, _) = call(&app, "GET", "/v1/server/geoip", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn telemetry_s3_sink_batches_dedicated_role_and_redirect() {
+    let Some(app0) = app().await else {
+        return;
+    };
+    let k = "defaultkey";
+    // mock S3 (path-style PUT)
+    let objects: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(Default::default()));
+    let o1 = objects.clone();
+    let mock = axum::Router::new().route(
+        "/{bucket}/{*key}",
+        axum::routing::put(
+            move |axum::extract::Path((b, key)): axum::extract::Path<(String, String)>,
+                  body: axum::body::Bytes| {
+                let o = o1.clone();
+                async move {
+                    o.lock()
+                        .unwrap()
+                        .insert(format!("{b}/{key}"), body.to_vec());
+                    axum::http::StatusCode::OK
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let ep = unique("lake").to_lowercase();
+    let (st, v) = call_server(
+        &app0,
+        "PUT",
+        &format!("/v1/server/storage_endpoints/{ep}"),
+        k,
+        Some(
+            json!({"endpoint": base, "region": "us-east-1", "bucket": "lake",
+            "access_key": "AKIAEXAMPLE1234", "secret_key": "topsecret"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let ep2 = ep.clone();
+    let Some(app) = app_with(move |c| {
+        c.analytics.flush_secs = 3600;
+        c.analytics.ingest_url = "https://telemetry.example.net/".into();
+        c.analytics.sinks = vec![
+            musubi_core::config::AnalyticsSink {
+                kind: "s3".into(),
+                name: "lake".into(),
+                endpoint: Some(ep2),
+                batch_rows: 3,
+                batch_secs: 3600,
+                ..Default::default()
+            },
+            musubi_core::config::AnalyticsSink {
+                kind: "s3".into(),
+                name: "broken".into(),
+                endpoint: Some("no-such-endpoint".into()),
+                prefix: Some("/raw/".into()),
+                gzip: Some(false),
+                ..Default::default()
+            },
+        ];
+    })
+    .await
+    else {
+        return;
+    };
+    let (tok, acc) = login(&app).await;
+    let (st, v) = call(&app, "GET", "/v1/telemetry/sampling", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ingest_url"], "https://telemetry.example.net", "{v}");
+    let (_, v) = call(&app0, "GET", "/v1/telemetry/sampling", Some(&tok), None).await;
+    assert!(v["ingest_url"].is_null(), "{v}");
+
+    let ev = unique("s3ev").to_lowercase().replace(['.', ':', '-'], "_");
+    let send = |app: Router, tok: String, n: usize| {
+        let ev = ev.clone();
+        async move {
+            let events: Vec<Value> = (0..n)
+                .map(|i| json!({"name": ev, "properties": {"i": i}}))
+                .collect();
+            let (st, v) = call(
+                &app,
+                "POST",
+                "/v1/telemetry/events",
+                Some(&tok),
+                Some(json!({"events": events})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+        }
+    };
+    send(app.clone(), tok.clone(), 2).await;
+    // below batch_rows: buffered, nothing uploaded
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/analytics/sinks/flush?force=false",
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "GET", "/v1/server/analytics/sinks", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["telemetry_only"], false);
+    assert_eq!(v["ingest_url"], "https://telemetry.example.net/");
+    let lake = v["sinks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "lake")
+        .unwrap()
+        .clone();
+    assert_eq!(lake["kind"], "s3");
+    assert_eq!(lake["s3"]["batch_rows"], 3);
+    assert_eq!(lake["s3"]["batch_secs"], 3600);
+    assert_eq!(lake["s3"]["gzip"], true);
+    assert_eq!(lake["s3"]["prefix"], "events/lake/");
+    assert_eq!(lake["s3"]["buffered_rows"], 2, "{lake}");
+    assert_eq!(lake["s3"]["uploads"], 0);
+    assert!(objects.lock().unwrap().is_empty());
+    // third row crosses the threshold → one object with all three rows
+    send(app.clone(), tok.clone(), 1).await;
+    let (_, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/analytics/sinks/flush?force=false",
+        k,
+        None,
+    )
+    .await;
+    let lake_res = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["sink"] == "lake")
+        .unwrap()
+        .clone();
+    assert_eq!(lake_res["delivered"], 3, "{v}");
+    let broken_res = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["sink"] == "broken")
+        .unwrap()
+        .clone();
+    assert_eq!(broken_res["delivered"], 0, "below its own threshold: {v}");
+    let (_, v) = call_server(&app, "GET", "/v1/server/analytics/sinks", k, None).await;
+    let lake = v["sinks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "lake")
+        .unwrap()
+        .clone();
+    assert_eq!(lake["s3"]["uploads"], 1, "{lake}");
+    assert_eq!(lake["s3"]["uploaded_rows"], 3);
+    assert_eq!(lake["s3"]["buffered_rows"], 0);
+    assert!(lake["s3"]["last_error"].is_null());
+    let key = lake["s3"]["last_key"].as_str().unwrap().to_string();
+    assert!(key.starts_with("events/lake/"), "{key}");
+    assert!(key.ends_with("-3-") || key.contains("-3-"), "{key}");
+    assert!(key.ends_with(".ndjson.gz"), "{key}");
+    let stored = {
+        let o = objects.lock().unwrap();
+        assert_eq!(o.len(), 1, "{:?}", o.keys().collect::<Vec<_>>());
+        let (k2, body) = o.iter().next().unwrap();
+        assert_eq!(k2, &format!("lake/{key}"));
+        body.clone()
+    };
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(&stored[..])
+        .read_to_string(&mut text)
+        .unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["name"] == ev && l["account_id"] == acc),
+        "{text}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l["properties"]["i"].as_i64().unwrap())
+            .sum::<i64>(),
+        1
+    );
+    // the broken sink is still buffering (its own threshold is the default 10000)
+    let broken = v["sinks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "broken")
+        .unwrap()
+        .clone();
+    assert_eq!(broken["s3"]["buffered_rows"], 3, "{broken}");
+    assert_eq!(broken["s3"]["uploads"], 0);
+    assert_eq!(broken["s3"]["prefix"], "raw/");
+    assert_eq!(broken["s3"]["gzip"], false);
+    assert!(broken["s3"]["last_error"].is_null(), "{broken}");
+    // force uploads a partial batch; the broken sink fails and keeps its rows
+    send(app.clone(), tok.clone(), 1).await;
+    let (st, v) = call_server(&app, "POST", "/v1/server/analytics/sinks/flush", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let broken_res = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|r| r["sink"] == "broken")
+        .unwrap()
+        .clone();
+    assert!(
+        broken_res["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no-such-endpoint"),
+        "{v}"
+    );
+    let (_, v) = call_server(&app, "GET", "/v1/server/analytics/sinks", k, None).await;
+    let lake = v["sinks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "lake")
+        .unwrap()
+        .clone();
+    assert_eq!(lake["s3"]["uploads"], 2, "{lake}");
+    assert_eq!(lake["s3"]["uploaded_rows"], 4);
+    assert_eq!(objects.lock().unwrap().len(), 2);
+    let broken = v["sinks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "broken")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        broken["s3"]["buffered_rows"], 4,
+        "rows kept for the next batch: {broken}"
+    );
+    assert_eq!(broken["s3"]["uploads"], 0);
+    assert!(
+        broken["s3"]["last_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no-such-endpoint"),
+        "{broken}"
+    );
+
+    // API nodes can hand ingest off to the dedicated backend
+    let Some(app_r) = app_with(|c| {
+        c.analytics.ingest_url = "https://telemetry.example.net".into();
+        c.analytics.redirect_ingest = true;
+    })
+    .await
+    else {
+        return;
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/telemetry/events")
+        .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"events": [{"name": ev, "properties": {}}]}).to_string(),
+        ))
+        .unwrap();
+    let res = app_r.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        res.headers().get(header::LOCATION).unwrap(),
+        "https://telemetry.example.net/v1/telemetry/events"
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/telemetry/anonymous")
+        .header("x-telemetry-key", "whatever")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"events": [], "device_id": "d"}).to_string(),
+        ))
+        .unwrap();
+    let res = app_r.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        res.headers().get(header::LOCATION).unwrap(),
+        "https://telemetry.example.net/v1/telemetry/anonymous"
+    );
+
+    // a dedicated telemetry node serves only telemetry + health
+    let Some(app_t) = app_with(|c| {
+        c.node.roles = vec![musubi_core::config::Role::Telemetry];
+        c.analytics.ingest_url = "https://telemetry.example.net".into();
+        c.analytics.redirect_ingest = true; // ignored on the telemetry node itself
+    })
+    .await
+    else {
+        return;
+    };
+    let (st, _) = call(&app_t, "GET", "/healthz", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = call(&app_t, "GET", "/v1/countries", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    let (st, _) = call(&app_t, "GET", "/v1/account", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call(&app_t, "GET", "/v1/telemetry/sampling", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    send(app_t.clone(), tok.clone(), 1).await;
+    let (st, v) = call_server(&app_t, "GET", "/v1/server/analytics/sinks", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["telemetry_only"], true);
+    let (st, _) = call_server(&app_t, "GET", "/v1/server/fleets", k, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, _) = call(&app, "GET", "/v1/server/analytics/sinks", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
 }

@@ -871,6 +871,15 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         let lease = c.lease("entitlements", musubi_cluster::DEAD_AFTER);
         crate::http::entitlements::spawn_sweeper(state.clone(), move || lease.held());
     }
+    {
+        let st = state.clone();
+        state
+            .analytics
+            .set_store_resolver(Arc::new(move |name: String| {
+                let st = st.clone();
+                Box::pin(async move { crate::http::storage_endpoints::store(&st, &name).await })
+            }));
+    }
     if let Some(c) = state.cluster.clone() {
         let lease = c.lease("geoip", musubi_cluster::DEAD_AFTER);
         crate::geoip::spawn_updater(state.clone(), move || lease.held());

@@ -381,8 +381,42 @@ pub fn router(state: AppState) -> Router {
         ));
     // Only mount the CORS layer when origins are configured: tower-http answers every OPTIONS
     // request itself (200), which would shadow module routes' own OPTIONS/405 handling.
+    // dedicated telemetry node: everything but ingest/sampling + health/metrics is 404
+    let router = if telemetry_only(&state.cfg) {
+        router.layer(axum::middleware::from_fn(telemetry_gate))
+    } else {
+        router
+    };
     let router = if cors_on { router.layer(cors) } else { router };
     router.with_state(state)
+}
+
+/// `telemetry` role without `api`: this process is a dedicated telemetry backend.
+pub fn telemetry_only(cfg: &musubi_core::config::Config) -> bool {
+    use musubi_core::config::Role;
+    cfg.node.roles.contains(&Role::Telemetry) && !cfg.node.roles.contains(&Role::Api)
+}
+
+async fn telemetry_gate(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let p = req.uri().path();
+    let allowed = p.starts_with("/v1/telemetry/")
+        || matches!(
+            p,
+            "/healthz" | "/readyz" | "/metrics" | "/v1/node" | "/openapi.json"
+        )
+        || p == "/v1/server/analytics/sinks"
+        || p == "/v1/server/analytics/sinks/flush";
+    if allowed {
+        next.run(req).await
+    } else {
+        ApiError(musubi_core::Error::NotFound(
+            "dedicated telemetry node: only /v1/telemetry/* is served here".into(),
+        ))
+        .into_response()
+    }
 }
 
 /// CORS for browser / WebGL clients from `[http] cors_origins` (exact, `*.suffix` or `*`).

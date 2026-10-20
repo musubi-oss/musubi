@@ -13,16 +13,21 @@ pub enum Role {
     Sim,
     Orchestrator,
     Control,
+    /// Dedicated telemetry backend (Pragma `DedicatedTelemetryMode`): a node with this role and
+    /// without `api` serves only `/v1/telemetry/*` (+ health/metrics) and runs the sink
+    /// flushers, so event floods never share a process with the game API.
+    Telemetry,
 }
 
 impl Role {
-    pub const ALL: [Role; 6] = [
+    pub const ALL: [Role; 7] = [
         Role::Edge,
         Role::Api,
         Role::Realtime,
         Role::Sim,
         Role::Orchestrator,
         Role::Control,
+        Role::Telemetry,
     ];
 }
 
@@ -918,6 +923,12 @@ pub struct AnalyticsConfig {
     pub mirror_domain_events: bool,
     pub flush_secs: u64,
     pub sinks: Vec<AnalyticsSink>,
+    /// Base URL of the dedicated telemetry nodes (`https://telemetry.example.net`), published to
+    /// clients in `GET /v1/telemetry/sampling` as `ingest_url`; empty = events go to the API.
+    pub ingest_url: String,
+    /// With `ingest_url`: API nodes answer `POST /v1/telemetry/events|anonymous` with 307 to it
+    /// instead of ingesting themselves.
+    pub redirect_ingest: bool,
     /// Crash reports with one fingerprint from the same player/device inside this window fold
     /// into the earlier report (`duplicates`).
     pub crash_dedupe_secs: u64,
@@ -940,6 +951,8 @@ impl Default for AnalyticsConfig {
             mirror_domain_events: false,
             flush_secs: 10,
             sinks: Vec::new(),
+            ingest_url: String::new(),
+            redirect_ingest: false,
             crash_dedupe_secs: 60,
             crash_max_minidump_bytes: 4 * 1024 * 1024,
             crash_spike_per_hour: 50,
@@ -962,6 +975,16 @@ pub struct AnalyticsSink {
     pub headers: std::collections::HashMap<String, String>,
     /// Only these event names (empty = all).
     pub names: Vec<String>,
+    /// `s3`: name of a registered storage endpoint (`PUT /v1/server/storage_endpoints/{name}`).
+    pub endpoint: Option<String>,
+    /// `s3`: key prefix inside the endpoint, default `events/<sink name>/`.
+    pub prefix: Option<String>,
+    /// `s3`: upload once this many rows are buffered (Pragma `eventBatchSize`, default 10000)…
+    pub batch_rows: usize,
+    /// …or once the oldest buffered row is this old (`timeWindowPerBatchMillis`, default 60 s).
+    pub batch_secs: u64,
+    /// `s3`: gzip the NDJSON object (default true).
+    pub gzip: Option<bool>,
 }
 
 /// Zanshin LiveOps (flags, experiments, analytics). Unset `url` = disabled.

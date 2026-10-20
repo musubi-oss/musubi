@@ -769,6 +769,8 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ),
     ("GET", "/v1/server/analytics/attribution", "analytics"),
     ("GET", "/v1/server/analytics/geo", "analytics"),
+    ("GET", "/v1/server/analytics/sinks", "analytics"),
+    ("POST", "/v1/server/analytics/sinks/flush", "analytics"),
     ("GET", "/v1/account/geo", "account"),
     ("GET", "/v1/server/accounts/{id}/geo", "account"),
     ("GET", "/v1/server/geoip", "geoip"),

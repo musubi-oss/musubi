@@ -143,6 +143,30 @@ pub struct Analytics {
     queue: Mutex<Vec<Row>>,
     schemas: Mutex<SchemaCache>,
     sampling: Mutex<Option<(std::time::Instant, Arc<SamplingPolicy>)>>,
+    /// Opens a registered storage endpoint by name (installed by the app once it has a state).
+    store: std::sync::RwLock<Option<StoreResolver>>,
+    /// `s3` sinks buffer rows across flushes until `batch_rows` / `batch_secs`.
+    s3_buffers: Mutex<HashMap<String, S3Buffer>>,
+}
+
+pub type StoreResolver = Arc<
+    dyn Fn(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<crate::blobstore::S3Store>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+#[derive(Default)]
+struct S3Buffer {
+    lines: String,
+    rows: usize,
+    first: Option<std::time::Instant>,
+    uploads: u64,
+    uploaded_rows: u64,
+    last_key: Option<String>,
+    last_error: Option<String>,
 }
 
 /// Title-wide sampling (Pragma `globalWeight` / `alwaysEnabledIds`): the effective keep rate of
@@ -206,7 +230,149 @@ impl Analytics {
             queue: Mutex::new(Vec::new()),
             schemas: Mutex::new(None),
             sampling: Mutex::new(None),
+            store: std::sync::RwLock::new(None),
+            s3_buffers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// How `s3` sinks reach their storage endpoint (`storage_endpoints::store`).
+    pub fn set_store_resolver(&self, r: StoreResolver) {
+        *self.store.write().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    }
+
+    /// Buffer state of the `s3` sinks (for `GET /v1/server/analytics/sinks`).
+    pub fn s3_sink_status(&self) -> Vec<Value> {
+        let bufs = self.s3_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        self.cfg
+            .sinks
+            .iter()
+            .filter(|k| k.kind == "s3")
+            .map(|k| {
+                let b = bufs.get(&k.name);
+                json!({
+                    "sink": k.name, "endpoint": k.endpoint, "prefix": s3_prefix(k),
+                    "batch_rows": s3_batch_rows(k), "batch_secs": s3_batch_secs(k),
+                    "gzip": k.gzip.unwrap_or(true),
+                    "buffered_rows": b.map(|b| b.rows).unwrap_or(0),
+                    "buffered_bytes": b.map(|b| b.lines.len()).unwrap_or(0),
+                    "oldest_secs": b.and_then(|b| b.first).map(|t| t.elapsed().as_secs()),
+                    "uploads": b.map(|b| b.uploads).unwrap_or(0),
+                    "uploaded_rows": b.map(|b| b.uploaded_rows).unwrap_or(0),
+                    "last_key": b.and_then(|b| b.last_key.clone()),
+                    "last_error": b.and_then(|b| b.last_error.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// Upload every `s3` buffer now, regardless of thresholds (shutdown, operator request).
+    pub async fn flush_s3_now(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for sink in self.cfg.sinks.iter().filter(|k| k.kind == "s3") {
+            match self.s3_upload(sink, true).await {
+                Ok(n) => out.push(json!({ "sink": sink.name, "kind": "s3", "delivered": n })),
+                Err(e) => {
+                    out.push(json!({ "sink": sink.name, "kind": "s3", "error": e.to_string() }))
+                }
+            }
+        }
+        out
+    }
+
+    /// Append rows to the sink's buffer, then upload when `batch_rows` / `batch_secs` is hit.
+    async fn s3_deliver(&self, sink: &AnalyticsSink, rows: &[&Row]) -> Result<usize> {
+        {
+            let mut bufs = self.s3_buffers.lock().unwrap_or_else(|e| e.into_inner());
+            let b = bufs.entry(sink.name.clone()).or_default();
+            for r in rows {
+                b.lines
+                    .push_str(&serde_json::to_string(r).map_err(Error::internal)?);
+                b.lines.push('\n');
+                b.rows += 1;
+            }
+            if b.first.is_none() && b.rows > 0 {
+                b.first = Some(std::time::Instant::now());
+            }
+        }
+        self.s3_upload(sink, false).await
+    }
+
+    async fn s3_upload(&self, sink: &AnalyticsSink, force: bool) -> Result<usize> {
+        let (body, rows) = {
+            let mut bufs = self.s3_buffers.lock().unwrap_or_else(|e| e.into_inner());
+            let b = bufs.entry(sink.name.clone()).or_default();
+            let due = b.rows >= s3_batch_rows(sink)
+                || b.first
+                    .is_some_and(|t| t.elapsed().as_secs() >= s3_batch_secs(sink));
+            if b.rows == 0 || !(force || due) {
+                return Ok(0);
+            }
+            let body = std::mem::take(&mut b.lines);
+            let rows = std::mem::take(&mut b.rows);
+            b.first = None;
+            (body, rows)
+        };
+        let res = self.s3_put(sink, body.as_bytes(), rows).await;
+        let mut bufs = self.s3_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let b = bufs.entry(sink.name.clone()).or_default();
+        match res {
+            Ok(key) => {
+                b.uploads += 1;
+                b.uploaded_rows += rows as u64;
+                b.last_key = Some(key);
+                b.last_error = None;
+                Ok(rows)
+            }
+            Err(e) => {
+                // keep the rows: they go with the next batch
+                let mut again = body;
+                again.push_str(&b.lines);
+                b.lines = again;
+                b.rows += rows;
+                b.first = Some(std::time::Instant::now());
+                b.last_error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    async fn s3_put(&self, sink: &AnalyticsSink, ndjson: &[u8], rows: usize) -> Result<String> {
+        let endpoint = sink
+            .endpoint
+            .clone()
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| Error::InvalidArgument("s3 sink needs endpoint".into()))?;
+        let resolver = self
+            .store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| Error::Internal("s3 sink: no storage resolver".into()))?;
+        let store = resolver(endpoint).await?;
+        let gzip = sink.gzip.unwrap_or(true);
+        let now = OffsetDateTime::now_utc();
+        let key = format!(
+            "{}{:04}/{:02}/{:02}/{:02}/{}-{}-{}.ndjson{}",
+            s3_prefix(sink),
+            now.year(),
+            u8::from(now.month()),
+            now.day(),
+            now.hour(),
+            now.unix_timestamp_nanos() / 1_000_000,
+            rows,
+            Uuid::now_v7().simple(),
+            if gzip { ".gz" } else { "" }
+        );
+        let (bytes, mime) = if gzip {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(ndjson).map_err(Error::internal)?;
+            (enc.finish().map_err(Error::internal)?, "application/gzip")
+        } else {
+            (ndjson.to_vec(), "application/x-ndjson")
+        };
+        store.put(&key, bytes, mime).await?;
+        Ok(key)
     }
 
     /// Periodic sink flush (every `flush_secs`).
@@ -879,7 +1045,11 @@ impl Analytics {
                 .filter(|r| sink.names.is_empty() || sink.names.contains(&r.name))
                 .collect();
             let res = if rows.is_empty() {
-                Ok(0)
+                if sink.kind == "s3" {
+                    self.s3_upload(sink, false).await
+                } else {
+                    Ok(0)
+                }
             } else {
                 self.deliver(sink, &rows).await
             };
@@ -952,6 +1122,7 @@ impl Analytics {
                 }
                 Ok(rows.len())
             }
+            "s3" => self.s3_deliver(sink, rows).await,
             "webhook" => {
                 let url = sink
                     .url
@@ -1208,5 +1379,40 @@ impl Analytics {
             "days": days,
             "events": rows.iter().map(|(n, c, u)| json!({ "name": n, "count": c, "users": u })).collect::<Vec<_>>(),
         }))
+    }
+}
+
+fn s3_prefix(sink: &AnalyticsSink) -> String {
+    let p = sink.prefix.clone().unwrap_or_else(|| {
+        format!(
+            "events/{}",
+            if sink.name.is_empty() {
+                "events"
+            } else {
+                &sink.name
+            }
+        )
+    });
+    let p = p.trim_matches('/');
+    if p.is_empty() {
+        String::new()
+    } else {
+        format!("{p}/")
+    }
+}
+
+fn s3_batch_rows(sink: &AnalyticsSink) -> usize {
+    if sink.batch_rows == 0 {
+        10_000
+    } else {
+        sink.batch_rows
+    }
+}
+
+fn s3_batch_secs(sink: &AnalyticsSink) -> u64 {
+    if sink.batch_secs == 0 {
+        60
+    } else {
+        sink.batch_secs
     }
 }
