@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useSession } from './stores/session'
+import { catalog } from './catalog'
 
 export const sections = [
   { id: 'players', title: 'Players', sub: 'View, search and edit player accounts' },
@@ -21,7 +22,14 @@ export const router = createRouter({
     { path: '/players', component: () => import('./pages/players/Index.vue'), children: [
       { path: '', component: () => import('./pages/players/Accounts.vue') },
       { path: 'accounts/:id', component: () => import('./pages/players/Account.vue') },
-      { path: ':page', component: () => import('./pages/Generic.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.players.find((x) => x.id === r.params.page) ?? catalog.players[0] }) },
+    ]},
+    { path: '/servers', component: () => import('./pages/servers/Index.vue'), children: [
+      { path: '', component: () => import('./pages/Generic.vue'), props: () => ({ res: catalog.servers[0] }) },
+      { path: 'fleets/:id', component: () => import('./pages/servers/Fleet.vue') },
+      { path: 'servers/:id', component: () => import('./pages/servers/GameServer.vue') },
+      { path: 'edge', component: () => import('./pages/servers/Edge.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.servers.find((x) => x.id === r.params.page) ?? catalog.servers[0] }) },
     ]},
     { path: '/:section/:page?', component: () => import('./pages/Section.vue') },
   ],
