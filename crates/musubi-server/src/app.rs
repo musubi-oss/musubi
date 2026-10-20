@@ -1135,6 +1135,20 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "subscription sweep failed"),
                     }
+                    let dr_every = (st.cfg.compliance.data_rights_poll_minutes.max(1) as u64) * 12;
+                    if n % dr_every == 0 {
+                        match crate::http::data_rights::poll(&st).await {
+                            Ok((d, f, _)) if d + f > 0 => {
+                                tracing::info!(
+                                    done = d,
+                                    failed = f,
+                                    "data-rights requests processed"
+                                )
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "data-rights poll failed"),
+                        }
+                    }
                     if n % 60 == 0 {
                         match st.analytics.sweep_reports().await {
                             Ok(k) if !k.is_empty() => {

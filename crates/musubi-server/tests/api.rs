@@ -43269,3 +43269,258 @@ async fn analytics_reports_generate_latest_by_date_and_list() {
     let (st, _) = call(&app, "GET", base, None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// Asynchronous data-rights queue (Pragma parity): file export/erase, one open request per kind,
+/// the poll processes them (export downloadable, erase deletes), cancel while pending, operator
+/// views.
+#[tokio::test]
+async fn data_rights_queue_export_erase_and_poll() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let (_, u) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dr")})),
+    )
+    .await;
+    let me = u["account_id"].as_str().unwrap().to_string();
+    let tok = u["access_token"].as_str().unwrap().to_string();
+    let (st, v) = call(&app, "GET", "/v1/account/data_rights", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["requests"].as_array().unwrap().is_empty());
+    assert_eq!(v["poll_minutes"], 10);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/data_rights",
+        Some(&tok),
+        Some(json!({"kind": "forget"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // file an export without game data; a second open export → 409
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/data_rights",
+        Some(&tok),
+        Some(json!({"kind": "export", "include_game_data": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let first_exp_id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["status"], "pending");
+    assert_eq!(v["include_game_data"], false);
+    assert_eq!(v["downloadable"], false);
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/v1/account/data_rights",
+        Some(&tok),
+        Some(json!({"kind": "export"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // download before done → 409; cancel a pending one and refile
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/account/data_rights/{first_exp_id}/download"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/data_rights/{first_exp_id}/cancel"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "cancelled");
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/data_rights/{first_exp_id}/cancel"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, v) = call(
+        &app,
+        "POST",
+        "/v1/account/data_rights",
+        Some(&tok),
+        Some(json!({"kind": "export", "include_game_data": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let exp_id = v["id"].as_str().unwrap().to_string();
+    // another player cannot see or cancel it
+    let (_, o) = call(
+        &app,
+        "POST",
+        "/v1/auth/device",
+        None,
+        Some(json!({"id": unique("dr2")})),
+    )
+    .await;
+    let other = o["access_token"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/account/data_rights/{exp_id}"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/account/data_rights/{exp_id}/cancel"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // operator view + run
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/data_rights?status=pending&account_id={me}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["requests"].as_array().unwrap().len(), 1);
+    assert!(v["pending"].as_i64().unwrap() >= 1);
+    let (st, _) = call_server(&app, "GET", "/v1/server/data_rights?status=weird", k, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v) = call_server(&app, "POST", "/v1/server/data_rights/run", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["done"].as_i64().unwrap() >= 1, "{v}");
+    let (st, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/account/data_rights/{exp_id}"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "done");
+    assert_eq!(v["downloadable"], true);
+    assert!(v["expires_at"].is_string());
+    let (st, b) = call(
+        &app,
+        "GET",
+        &format!("/v1/account/data_rights/{exp_id}/download"),
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["account"]["id"], me, "{b}");
+    assert_eq!(b["game_data_omitted"], true);
+    assert!(b["tables"].as_object().unwrap().is_empty());
+    // done requests cannot be cancelled; a new export is allowed now
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/data_rights/{exp_id}/cancel"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/data_rights/{}/cancel", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // operator files an erasure on the player's behalf; poll deletes the account
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/data_rights",
+        k,
+        Some(json!({"kind": "erase"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call_server(
+        &app,
+        "POST",
+        "/v1/server/data_rights",
+        k,
+        Some(json!({"kind": "erase", "account_id": uuid::Uuid::now_v7()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/server/data_rights",
+        k,
+        Some(json!({"kind": "erase", "account_id": me})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let erase_id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["requested_by"], "server");
+    let (st, v) = call_server(&app, "POST", "/v1/server/data_rights/run", k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/data_rights/{erase_id}"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["downloadable"], false);
+    let (st, _) = call(&app, "GET", "/v1/account", Some(&tok), None).await;
+    assert!(
+        st == StatusCode::UNAUTHORIZED || st == StatusCode::NOT_FOUND,
+        "erased account must be gone: {st}"
+    );
+    let (st, ev) = call_server(&app, "GET",
+        "/v1/server/events?kinds=data_rights.requested,data_rights.completed,data_rights.cancelled&limit=1000", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    for kind in [
+        "data_rights.requested",
+        "data_rights.completed",
+        "data_rights.cancelled",
+    ] {
+        assert!(
+            ev["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| (e["code"] == kind || e["kind"] == kind)
+                    && [&exp_id, &first_exp_id, &erase_id]
+                        .iter()
+                        .any(|id| e["payload"]["request_id"] == **id
+                            || e["data"]["request_id"] == **id)),
+            "{kind} missing"
+        );
+    }
+    let (st, _) = call(&app, "GET", "/v1/account/data_rights", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

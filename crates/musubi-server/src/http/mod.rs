@@ -23,6 +23,7 @@ pub mod content;
 pub mod countries;
 pub mod countries_iso;
 pub mod crashes;
+pub mod data_rights;
 mod dev;
 mod developers;
 mod device_codes;
@@ -242,6 +243,7 @@ pub fn router(state: AppState) -> Router {
         .merge(effects::router())
         .merge(tutorials::router())
         .merge(referrals::router())
+        .merge(data_rights::router())
         .merge(session_vars::router())
         .merge(qa_clock::router())
         .merge(countries::router())

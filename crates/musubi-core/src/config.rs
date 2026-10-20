@@ -2058,6 +2058,10 @@ pub struct ComplianceConfig {
     pub teen_restrictions: Vec<String>,
     /// Lifetime of a parental-consent token.
     pub consent_ttl_secs: i64,
+    /// How often the leader processes queued data-rights (export / erase) requests.
+    pub data_rights_poll_minutes: u32,
+    /// Include game-data tables (storage, inventory, …) in queued exports by default.
+    pub data_rights_include_game_data: bool,
 }
 
 impl Default for ComplianceConfig {
@@ -2074,6 +2078,8 @@ impl Default for ComplianceConfig {
             consented_child_restrictions: vec!["purchases".into()],
             teen_restrictions: vec![],
             consent_ttl_secs: 7 * 24 * 3600,
+            data_rights_poll_minutes: 10,
+            data_rights_include_game_data: true,
         }
     }
 }
