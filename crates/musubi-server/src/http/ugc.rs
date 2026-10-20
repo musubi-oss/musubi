@@ -22,6 +22,7 @@ const KINDS: &[&str] = &[
     "mod",
     "skin",
     "blueprint",
+    "collection",
     "replay",
     "level",
     "other",
@@ -48,6 +49,16 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/v1/ugc/{id}/subscribe",
             post(subscribe).delete(unsubscribe),
+        )
+        .route("/v1/ugc/{id}/dependencies", get(dependencies))
+        .route(
+            "/v1/ugc/{id}/dependencies/{dep}",
+            post(link_dependency).delete(unlink_dependency),
+        )
+        .route("/v1/ugc/{id}/children", get(children))
+        .route(
+            "/v1/ugc/{id}/children/{child}",
+            post(link_child).delete(unlink_child),
         )
         .route("/v1/admin/ugc", get(queue))
         .route("/v1/admin/ugc/{id}", post(moderate))
@@ -233,6 +244,12 @@ struct BrowseQuery {
     q: Option<String>,
     #[serde(default)]
     owner_id: Option<Uuid>,
+    /// Only children of this collection (in collection order).
+    #[serde(default)]
+    child_of: Option<Uuid>,
+    /// Only items that declare this item as a dependency.
+    #[serde(default)]
+    depends_on: Option<Uuid>,
     /// `new` (default), `top` (rating), `downloads`.
     #[serde(default)]
     sort: Option<String>,
@@ -276,6 +293,8 @@ async fn browse(
            and ($2::text is null or $2 = any(tags))
            and ($3::text is null or title ilike $3)
            and ($4::uuid is null or owner_id = $4)
+           and ($7::uuid is null or id in (select child_id from musubi.ugc_links where parent_id = $7 and rel = 'child'))
+           and ($8::uuid is null or id in (select parent_id from musubi.ugc_links where child_id = $8 and rel = 'dependency'))
          order by {order} limit $5 offset $6"
     ))
     .bind(&q.kind)
@@ -284,6 +303,8 @@ async fn browse(
     .bind(q.owner_id)
     .bind(q.limit.clamp(1, 100))
     .bind(q.offset.max(0))
+    .bind(q.child_of)
+    .bind(q.depends_on)
     .fetch_all(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -769,7 +790,257 @@ async fn rate(
     ))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SubscribeQ {
+    /// Also subscribe to everything the item needs (transitively) and, for a collection, to
+    /// its children — one call installs a whole mod pack.
+    include_dependencies: bool,
+}
+
 async fn subscribe(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<Uuid>,
+    Query(q): Query<SubscribeQ>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(row) = fetch(&s, id).await? else {
+        return Err(Error::NotFound(format!("ugc item {id}")).into());
+    };
+    if !visible(&row, me.account_id) {
+        return Err(Error::NotFound(format!("ugc item {id}")).into());
+    }
+    let mut ids = vec![id];
+    if q.include_dependencies {
+        ids.extend(closure(&s, id, me.account_id, true).await?);
+    }
+    let n = sqlx::query(
+        "insert into musubi.ugc_subscriptions (account_id, item_id)
+         select $1, unnest($2::uuid[]) on conflict do nothing",
+    )
+    .bind(me.account_id.0)
+    .bind(&ids)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    s.events
+        .emit(
+            "ugc.subscribed",
+            Some(me.account_id),
+            json!({ "id": id, "with_dependencies": q.include_dependencies, "items": ids.len() }),
+        )
+        .await;
+    Ok(Json(
+        json!({ "subscribed": true, "items": ids, "added": n }),
+    ))
+}
+
+const MAX_LINKS: i64 = 64;
+const MAX_CLOSURE: usize = 256;
+
+/// Transitive dependencies (and, when `with_children`, collection children) visible to the
+/// viewer, breadth-first, without the root, capped at `MAX_CLOSURE`.
+async fn closure(
+    s: &AppState,
+    root: Uuid,
+    viewer: AccountId,
+    with_children: bool,
+) -> Result<Vec<Uuid>, Error> {
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut out = Vec::new();
+    let mut frontier = vec![root];
+    while !frontier.is_empty() && out.len() < MAX_CLOSURE {
+        let next: Vec<Uuid> = sqlx::query_scalar(
+            "select l.child_id from musubi.ugc_links l
+             join musubi.ugc_items i on i.id = l.child_id
+             where l.parent_id = any($1) and (l.rel = 'dependency' or ($2 and l.rel = 'child'))
+               and (i.owner_id = $3 or (i.status = 'approved' and i.visibility <> 'private'))
+             order by l.rel, l.position, l.created_at",
+        )
+        .bind(&frontier)
+        .bind(with_children)
+        .bind(viewer.0)
+        .fetch_all(&s.db)
+        .await
+        .map_err(Error::internal)?;
+        frontier.clear();
+        for id in next {
+            if seen.insert(id) {
+                out.push(id);
+                frontier.push(id);
+                if out.len() >= MAX_CLOSURE {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Owner adds a link: the target must exist and be visible to them, no self-links, at most
+/// `MAX_LINKS` per item and relation; collections (`kind = collection`) are the only items with
+/// children.
+async fn link(
+    s: &AppState,
+    me: AccountId,
+    parent: Uuid,
+    child: Uuid,
+    rel: &str,
+) -> Result<Json<Value>, ApiError> {
+    if parent == child {
+        return Err(Error::InvalidArgument("an item cannot link to itself".into()).into());
+    }
+    let row = owned(s, parent, me).await?;
+    if rel == "child" && row.get::<String, _>("kind") != "collection" {
+        return Err(
+            Error::InvalidArgument("only items of kind `collection` have children".into()).into(),
+        );
+    }
+    let Some(target) = fetch(s, child).await? else {
+        return Err(Error::NotFound(format!("ugc item {child}")).into());
+    };
+    if !visible(&target, me) {
+        return Err(Error::NotFound(format!("ugc item {child}")).into());
+    }
+    let n: i64 = sqlx::query_scalar(
+        "select count(*) from musubi.ugc_links where parent_id = $1 and rel = $2",
+    )
+    .bind(parent)
+    .bind(rel)
+    .fetch_one(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    if n >= MAX_LINKS {
+        return Err(
+            Error::ResourceExhausted(format!("at most {MAX_LINKS} {rel} links per item")).into(),
+        );
+    }
+    let added = sqlx::query(
+        "insert into musubi.ugc_links (parent_id, child_id, rel, position) values ($1, $2, $3, $4)
+         on conflict do nothing",
+    )
+    .bind(parent)
+    .bind(child)
+    .bind(rel)
+    .bind(n as i32)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    if added > 0 {
+        s.events
+            .emit(
+                "ugc.linked",
+                Some(me),
+                json!({ "id": parent, "target": child, "rel": rel }),
+            )
+            .await;
+    }
+    Ok(Json(
+        json!({ "id": parent, "target": child, "rel": rel, "added": added > 0 }),
+    ))
+}
+
+async fn unlink(
+    s: &AppState,
+    me: AccountId,
+    parent: Uuid,
+    child: Uuid,
+    rel: &str,
+) -> Result<Json<Value>, ApiError> {
+    owned(s, parent, me).await?;
+    let n = sqlx::query(
+        "delete from musubi.ugc_links where parent_id = $1 and child_id = $2 and rel = $3",
+    )
+    .bind(parent)
+    .bind(child)
+    .bind(rel)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    if n == 0 {
+        return Err(Error::NotFound("link".into()).into());
+    }
+    Ok(Json(
+        json!({ "id": parent, "target": child, "rel": rel, "removed": true }),
+    ))
+}
+
+async fn linked_items(
+    s: &AppState,
+    parent: Uuid,
+    rel: &str,
+    viewer: AccountId,
+) -> Result<Vec<Value>, Error> {
+    let rows = sqlx::query(&format!(
+        "select {} from musubi.ugc_items i join musubi.ugc_links l on l.child_id = i.id
+         where l.parent_id = $1 and l.rel = $2 order by l.position, l.created_at",
+        COLS.split(", ")
+            .map(|c| format!("i.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+    .bind(parent)
+    .bind(rel)
+    .fetch_all(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(rows
+        .iter()
+        .filter(|r| visible(r, viewer))
+        .map(item_json)
+        .collect())
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DepsQ {
+    /// Resolve transitively (what a client must install for the item to work).
+    recursive: bool,
+}
+
+/// `GET /v1/ugc/{id}/dependencies?recursive` — direct dependencies as item cards; with
+/// `recursive`, the full closure (ids, breadth-first) as `all`.
+async fn dependencies(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path(id): Path<Uuid>,
+    Query(q): Query<DepsQ>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(row) = fetch(&s, id).await? else {
+        return Err(Error::NotFound(format!("ugc item {id}")).into());
+    };
+    if !visible(&row, me.account_id) {
+        return Err(Error::NotFound(format!("ugc item {id}")).into());
+    }
+    let direct = linked_items(&s, id, "dependency", me.account_id).await?;
+    let mut v = json!({ "id": id, "dependencies": direct });
+    if q.recursive {
+        v["all"] = json!(closure(&s, id, me.account_id, false).await?);
+    }
+    Ok(Json(v))
+}
+
+async fn link_dependency(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((id, dep)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    link(&s, me.account_id, id, dep, "dependency").await
+}
+
+async fn unlink_dependency(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((id, dep)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    unlink(&s, me.account_id, id, dep, "dependency").await
+}
+
+/// `GET /v1/ugc/{id}/children` — a collection's items in order (Steam `GetCollectionDetails`).
+async fn children(
     State(s): State<AppState>,
     Bearer(me): Bearer,
     Path(id): Path<Uuid>,
@@ -780,18 +1051,26 @@ async fn subscribe(
     if !visible(&row, me.account_id) {
         return Err(Error::NotFound(format!("ugc item {id}")).into());
     }
-    sqlx::query(
-        "insert into musubi.ugc_subscriptions (account_id, item_id) values ($1, $2) on conflict do nothing",
-    )
-    .bind(me.account_id.0)
-    .bind(id)
-    .execute(&s.db)
-    .await
-    .map_err(Error::internal)?;
-    s.events
-        .emit("ugc.subscribed", Some(me.account_id), json!({ "id": id }))
-        .await;
-    Ok(Json(json!({ "subscribed": true })))
+    let items = linked_items(&s, id, "child", me.account_id).await?;
+    Ok(Json(
+        json!({ "id": id, "count": items.len(), "children": items }),
+    ))
+}
+
+async fn link_child(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((id, child)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    link(&s, me.account_id, id, child, "child").await
+}
+
+async fn unlink_child(
+    State(s): State<AppState>,
+    Bearer(me): Bearer,
+    Path((id, child)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    unlink(&s, me.account_id, id, child, "child").await
 }
 
 async fn unsubscribe(

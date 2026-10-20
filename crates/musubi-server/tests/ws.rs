@@ -20353,3 +20353,250 @@ async fn notification_broadcast_reaches_every_connected_player_in_batches() {
     .unwrap();
     assert_eq!(router.clone().oneshot(req).await.unwrap().status(), 404);
 }
+
+#[tokio::test]
+async fn ugc_dependencies_and_collections() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let (ta, _) = token(&router).await;
+    let (tb, _) = token(&router).await;
+    let mk = |t: &str, kind: &str, title: &str| {
+        let router = router.clone();
+        let (t, kind, title) = (t.to_string(), kind.to_string(), title.to_string());
+        async move {
+            let (st, r) = http_json(
+                &router,
+                "POST",
+                "/v1/ugc",
+                Some(&t),
+                false,
+                Some(json!({
+                    "kind": kind, "title": title, "url": "https://cdn.example/x.bin"
+                })),
+            )
+            .await;
+            assert_eq!(st, 200, "{r}");
+            let id = r["id"].as_str().unwrap().to_string();
+            let (st, r) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/ugc/{id}/submit"),
+                Some(&t),
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{r}");
+            let (st, r) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/admin/ugc/{id}"),
+                None,
+                true,
+                Some(json!({"status": "approved", "by": "mod"})),
+            )
+            .await;
+            assert_eq!(st, 200, "{r}");
+            id
+        }
+    };
+    let framework = mk(&tb, "mod", "Framework").await;
+    let lib = mk(&tb, "mod", "Lib").await;
+    let modx = mk(&ta, "mod", "Mod X").await;
+    let coll = mk(&ta, "collection", "Pack").await;
+    // dependencies: self / unknown / not owner / ok / transitive
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{modx}/dependencies/{modx}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{modx}/dependencies/{}", uuid::Uuid::now_v7()),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{modx}/dependencies/{framework}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{modx}/dependencies/{framework}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["added"], true);
+    let (_, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{modx}/dependencies/{framework}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(r["added"], false, "idempotent");
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{framework}/dependencies/{lib}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{modx}/dependencies?recursive=true"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["dependencies"].as_array().unwrap().len(), 1);
+    assert_eq!(r["dependencies"][0]["id"], framework);
+    assert_eq!(r["all"], json!([framework, lib]), "{r}");
+    // reverse lookup through browse
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc?kind=mod&depends_on={framework}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    let ids: Vec<&str> = l["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![modx.as_str()], "{l}");
+    // collections: only kind=collection has children; order kept; browse ?child_of
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{modx}/children/{lib}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 400);
+    for c in [&modx, &framework] {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/ugc/{coll}/children/{c}"),
+            Some(&ta),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+    }
+    let (st, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{coll}/children"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["count"], 2);
+    assert_eq!(r["children"][0]["id"], modx);
+    assert_eq!(r["children"][1]["id"], framework);
+    let (_, l) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc?child_of={coll}"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(l["items"].as_array().unwrap().len(), 2, "{l}");
+    // subscribing to the collection with dependencies pulls children + their dependencies
+    let (st, r) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/ugc/{coll}/subscribe?include_dependencies=true"),
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{r}");
+    let items = r["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4, "collection + 2 children + lib: {r}");
+    assert_eq!(r["added"], 4);
+    let (_, subs) = http_json(
+        &router,
+        "GET",
+        "/v1/ugc/subscriptions",
+        Some(&tb),
+        false,
+        None,
+    )
+    .await;
+    assert!(subs.to_string().contains(&lib), "{subs}");
+    // unlink
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/ugc/{coll}/children/{framework}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (st, _) = http_json(
+        &router,
+        "DELETE",
+        &format!("/v1/ugc/{coll}/children/{framework}"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(st, 404);
+    let (_, r) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/ugc/{coll}/children"),
+        Some(&ta),
+        false,
+        None,
+    )
+    .await;
+    assert_eq!(r["count"], 1);
+}
