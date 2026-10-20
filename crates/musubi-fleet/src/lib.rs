@@ -553,6 +553,94 @@ pub struct ScaleWebhook {
     pub headers: HashMap<String, String>,
 }
 
+/// In-process scaler (Agones `FleetAutoscaler` policy `Wasm`): the request the webhook scaler
+/// gets, plus `config`, is handed to export `function` of the loaded runtime module `module`; the
+/// answer `{scale, replicas}` (or `{response: {scale, replicas}}`) sets the desired server count.
+/// Runs inside the controller — no extra service, no network hop; a trap / bad answer keeps the
+/// local decision (and falls through the chain like a failing webhook).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ScaleWasm {
+    pub module: String,
+    /// Export to call; `scale` by default.
+    pub function: String,
+    /// Free-form object passed to the module as `config` on every call.
+    pub config: serde_json::Map<String, serde_json::Value>,
+    pub timeout_ms: u64,
+}
+
+impl Default for ScaleWasm {
+    fn default() -> Self {
+        Self {
+            module: String::new(),
+            function: "scale".into(),
+            config: serde_json::Map::new(),
+            timeout_ms: 2000,
+        }
+    }
+}
+
+impl ScaleWasm {
+    fn validate(&self, at: &str) -> Result<()> {
+        let name_ok = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 64
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        };
+        if !name_ok(&self.module) {
+            return Err(Error::InvalidArgument(format!(
+                "{at}.module must be 1..=64 chars of [A-Za-z0-9_.-]"
+            )));
+        }
+        if !name_ok(&self.function) {
+            return Err(Error::InvalidArgument(format!(
+                "{at}.function must be 1..=64 chars of [A-Za-z0-9_.-]"
+            )));
+        }
+        if !(100..=10_000).contains(&self.timeout_ms) {
+            return Err(Error::InvalidArgument(format!(
+                "{at}.timeout_ms must be in 100..=10000"
+            )));
+        }
+        if serde_json::to_vec(&self.config).map_or(true, |b| b.len() > 8192) {
+            return Err(Error::InvalidArgument(format!(
+                "{at}.config must serialise to <= 8 KiB"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// WASM runtime the `wasm` scaler calls into (implemented over the server's module runtime).
+pub trait ScaleHook: Send + Sync {
+    fn has(&self, module: &str, function: &str) -> bool;
+    fn call<'a>(
+        &'a self,
+        module: &'a str,
+        function: &'a str,
+        input: serde_json::Value,
+    ) -> BoxFut<'a, std::result::Result<serde_json::Value, String>>;
+}
+
+enum Scaler<'a> {
+    Webhook(&'a ScaleWebhook),
+    Wasm(&'a ScaleWasm),
+}
+
+/// `{scale, replicas}` or Agones' `{response: {scale, replicas}}` → desired replicas (`None` =
+/// the scaler declines and the local decision stands).
+fn parse_scale_answer(v: &serde_json::Value) -> std::result::Result<Option<i32>, String> {
+    let body = v.get("response").unwrap_or(v);
+    if body["scale"].as_bool() != Some(true) {
+        return Ok(None);
+    }
+    body["replicas"]
+        .as_i64()
+        .map(|r| Some(r as i32))
+        .ok_or_else(|| "scale without replicas".to_string())
+}
+
 fn one() -> u32 {
     1
 }
@@ -566,6 +654,8 @@ pub struct ScalePolicy {
     pub suspended: bool,
     pub rules: Vec<ScaleRule>,
     pub webhook: Option<ScaleWebhook>,
+    /// In-process WASM scaler, asked before `webhook`.
+    pub wasm: Option<ScaleWasm>,
     /// Also size the ready pool from allocation history: ready ≈ allocations/hour × `horizon_min`/60.
     pub forecast: bool,
     /// How far ahead the forecast must cover, in minutes.
@@ -635,6 +725,7 @@ pub struct ChainEntry {
     pub buffer: Option<i32>,
     pub target_utilization: Option<f64>,
     pub webhook: Option<ScaleWebhook>,
+    pub wasm: Option<ScaleWasm>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -892,6 +983,7 @@ impl Default for ScalePolicy {
             suspended: false,
             rules: Vec::new(),
             webhook: None,
+            wasm: None,
             forecast: false,
             horizon_min: 10,
             schedule: Vec::new(),
@@ -1081,9 +1173,13 @@ impl ScalePolicy {
                     "policy.chain[].id must be unique and 1..=64 chars".into(),
                 ));
             }
-            if e.buffer.is_none() && e.target_utilization.is_none() && e.webhook.is_none() {
+            if e.buffer.is_none()
+                && e.target_utilization.is_none()
+                && e.webhook.is_none()
+                && e.wasm.is_none()
+            {
                 return Err(Error::InvalidArgument(format!(
-                    "policy.chain[{}] needs buffer, target_utilization or webhook",
+                    "policy.chain[{}] needs buffer, target_utilization, webhook or wasm",
                     e.id
                 )));
             }
@@ -1114,6 +1210,9 @@ impl ScalePolicy {
                         e.id
                     )));
                 }
+            }
+            if let Some(w) = &e.wasm {
+                w.validate(&format!("policy.chain[{}].wasm", e.id))?;
             }
         }
         if self.overflow_labels.len() > 16
@@ -1200,6 +1299,9 @@ impl ScalePolicy {
                     "policy.webhook.url must be http(s)".into(),
                 ));
             }
+        }
+        if let Some(w) = &self.wasm {
+            w.validate("policy.wasm")?;
         }
         Ok(())
     }
@@ -2760,6 +2862,7 @@ type RuleState = HashMap<(Uuid, String), (Option<i64>, Option<i64>)>;
 pub struct FleetService {
     region_coords: Arc<HashMap<String, GeoPoint>>,
     log_archive: Option<Arc<dyn LogArchive>>,
+    scale_hook: Option<Arc<dyn ScaleHook>>,
     db: PgPool,
     node_id: Uuid,
     providers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn Provider>>>>,
@@ -2926,6 +3029,7 @@ impl FleetService {
         Self {
             region_coords: Arc::new(HashMap::new()),
             log_archive: None,
+            scale_hook: None,
             db,
             node_id,
             providers: Arc::new(std::sync::RwLock::new(providers)),
@@ -3114,6 +3218,42 @@ impl FleetService {
     pub fn with_log_archive(mut self, store: Arc<dyn LogArchive>) -> Self {
         self.log_archive = Some(store);
         self
+    }
+
+    /// WASM runtime behind `policy.wasm` / `policy.chain[].wasm` scalers.
+    pub fn with_scale_hook(mut self, hook: Arc<dyn ScaleHook>) -> Self {
+        self.scale_hook = Some(hook);
+        self
+    }
+
+    /// Reject a policy whose `wasm` scalers point at exports the runtime has not loaded — a typo
+    /// would otherwise only surface as a per-reconcile error note.
+    fn check_wasm_scalers(&self, policy: &ScalePolicy) -> Result<()> {
+        let all = policy
+            .chain
+            .iter()
+            .filter_map(|e| {
+                e.wasm
+                    .as_ref()
+                    .map(|w| (format!("policy.chain[{}].wasm", e.id), w))
+            })
+            .chain(policy.wasm.as_ref().map(|w| ("policy.wasm".to_string(), w)));
+        for (at, w) in all {
+            if !self.wasm_scaler_available(&w.module, &w.function) {
+                return Err(Error::InvalidArgument(format!(
+                    "{at}: module `{}` has no loaded export `{}`",
+                    w.module, w.function
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `true` when a `wasm` scaler can run: a runtime is attached and the export is loaded.
+    pub fn wasm_scaler_available(&self, module: &str, function: &str) -> bool {
+        self.scale_hook
+            .as_ref()
+            .is_some_and(|h| h.has(module, function))
     }
 
     pub fn has_log_archive(&self) -> bool {
@@ -3433,6 +3573,7 @@ impl FleetService {
             )));
         }
         validate_shape(c.min_servers, c.buffer, c.max_servers, &c.policy)?;
+        self.check_wasm_scalers(&c.policy)?;
         validate_ports(&c.spec)?;
         validate_kubernetes(&c.spec)?;
         validate_logs(&c.spec)?;
@@ -3515,6 +3656,7 @@ impl FleetService {
         let min = min_servers.unwrap_or(f.min_servers);
         let policy = policy.unwrap_or(f.policy);
         validate_shape(min, buffer, max, &policy)?;
+        self.check_wasm_scalers(&policy)?;
         sqlx::query(
             "update musubi.fleets set buffer = $2, max_servers = $3, min_servers = $4, policy = $5, updated_at = now() where id = $1",
         )
@@ -5524,10 +5666,26 @@ impl FleetService {
             }
             let mut target = (base + surge + counter_extra + rule_delta).max(0);
             let mut webhook_note: Option<String> = None;
-            let hooks: Vec<(&str, &ScaleWebhook)> = chain
+            let hooks: Vec<(&str, Scaler<'_>)> = chain
                 .iter()
-                .filter_map(|e| e.webhook.as_ref().map(|w| (e.id.as_str(), w)))
-                .chain(f.policy.webhook.as_ref().map(|w| ("fleet", w)))
+                .flat_map(|e| {
+                    e.wasm
+                        .as_ref()
+                        .map(|w| (e.id.as_str(), Scaler::Wasm(w)))
+                        .into_iter()
+                        .chain(
+                            e.webhook
+                                .as_ref()
+                                .map(|w| (e.id.as_str(), Scaler::Webhook(w))),
+                        )
+                })
+                .chain(f.policy.wasm.as_ref().map(|w| ("fleet", Scaler::Wasm(w))))
+                .chain(
+                    f.policy
+                        .webhook
+                        .as_ref()
+                        .map(|w| ("fleet", Scaler::Webhook(w))),
+                )
                 .collect();
             let busy = gauges.allocated + gauges.in_game;
             let mut errors: Vec<String> = Vec::new();
@@ -5537,19 +5695,23 @@ impl FleetService {
                 } else {
                     format!("{id}: ")
                 };
-                match self.ask_webhook(w, &f, &gauges, target).await {
+                let (kind, answer) = match w {
+                    Scaler::Webhook(w) => ("", self.ask_webhook(w, &f, &gauges, target).await),
+                    Scaler::Wasm(w) => ("wasm ", self.ask_wasm(w, &f, &gauges, target).await),
+                };
+                match answer {
                     Ok(Some(replicas)) => {
                         target = webhook_target(replicas, busy, f.max_servers);
-                        webhook_note = Some(format!("{tag}replicas {replicas}"));
+                        webhook_note = Some(format!("{tag}{kind}replicas {replicas}"));
                         break;
                     }
                     Ok(None) => {
-                        webhook_note = Some(format!("{tag}no scale"));
+                        webhook_note = Some(format!("{tag}{kind}no scale"));
                         break;
                     }
                     Err(e) => {
-                        tracing::warn!(fleet = %f.name, hook = id, error = %e, "scale webhook failed");
-                        errors.push(format!("{tag}error: {e}"));
+                        tracing::warn!(fleet = %f.name, hook = id, kind = kind.trim(), error = %e, "external scaler failed");
+                        errors.push(format!("{tag}{kind}error: {e}"));
                     }
                 }
             }
@@ -5789,14 +5951,40 @@ impl FleetService {
             return Err(format!("status {}", res.status()));
         }
         let v: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-        let body = v.get("response").unwrap_or(&v);
-        if body["scale"].as_bool() != Some(true) {
-            return Ok(None);
+        parse_scale_answer(&v)
+    }
+
+    async fn ask_wasm(
+        &self,
+        w: &ScaleWasm,
+        f: &Fleet,
+        g: &FleetGauges,
+        target: i32,
+    ) -> std::result::Result<Option<i32>, String> {
+        let hook = self
+            .scale_hook
+            .as_ref()
+            .ok_or_else(|| "no wasm runtime attached".to_string())?;
+        if !hook.has(&w.module, &w.function) {
+            return Err(format!(
+                "module {}: export {} not loaded",
+                w.module, w.function
+            ));
         }
-        body["replicas"]
-            .as_i64()
-            .map(|r| Some(r as i32))
-            .ok_or_else(|| "scale without replicas".to_string())
+        let input = serde_json::json!({
+            "fleet": { "id": f.id, "name": f.name, "region": f.region, "pool": f.pool,
+                "min_servers": f.min_servers, "max_servers": f.max_servers },
+            "status": g,
+            "target": target,
+            "config": w.config,
+        });
+        let v = tokio::time::timeout(
+            Duration::from_millis(w.timeout_ms.clamp(100, 10_000)),
+            hook.call(&w.module, &w.function, input),
+        )
+        .await
+        .map_err(|_| "timed out".to_string())??;
+        parse_scale_answer(&v)
     }
 
     /// `GET /v1/server/fleets/{id}/autoscaler` — the last decision (target breakdown, plan vs
@@ -6396,6 +6584,40 @@ mod autoscale_tests {
         assert!(p.validate(4).is_err(), "webhook scheme");
         p.webhook.as_mut().unwrap().url = "https://scaler.internal/review".into();
         assert!(p.validate(4).is_ok());
+        p.wasm = Some(ScaleWasm::default());
+        assert!(p.validate(4).is_err(), "wasm module required");
+        p.wasm = Some(ScaleWasm {
+            module: "scaler".into(),
+            function: "do scale".into(),
+            ..Default::default()
+        });
+        assert!(p.validate(4).is_err(), "wasm function name");
+        p.wasm = Some(ScaleWasm {
+            module: "scaler".into(),
+            timeout_ms: 50,
+            ..Default::default()
+        });
+        assert!(p.validate(4).is_err(), "wasm timeout");
+        p.wasm = Some(ScaleWasm {
+            module: "scaler".into(),
+            ..Default::default()
+        });
+        assert!(p.validate(4).is_ok());
+        p.chain.push(ChainEntry {
+            id: "w".into(),
+            wasm: p.wasm.clone(),
+            ..Default::default()
+        });
+        assert!(p.validate(4).is_ok());
+        assert_eq!(
+            parse_scale_answer(&serde_json::json!({"response": {"scale": true, "replicas": 7}})),
+            Ok(Some(7))
+        );
+        assert_eq!(
+            parse_scale_answer(&serde_json::json!({"scale": false})),
+            Ok(None)
+        );
+        assert!(parse_scale_answer(&serde_json::json!({"scale": true})).is_err());
     }
 }
 

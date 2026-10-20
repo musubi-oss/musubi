@@ -250,6 +250,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
     if let Some(b) = &blobs {
         fleets = fleets.with_log_archive(Arc::new(crate::blobstore::FleetLogArchive(b.clone())));
     }
+    fleets = fleets.with_scale_hook(Arc::new(crate::runtime_host::RuntimeScaleHook(
+        runtime.clone(),
+    )));
     if let Some(bin) = &cfg.fleet.firecracker.binary {
         match firecracker_settings(bin, &cfg.fleet.firecracker)
             .and_then(musubi_fleet::firecracker::FirecrackerProvider::new)

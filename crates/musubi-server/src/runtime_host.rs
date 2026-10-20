@@ -601,3 +601,34 @@ impl HostApi for ServerHost {
         self.handle.block_on(self.dispatch(ctx, request))
     }
 }
+
+/// `musubi_fleet::ScaleHook` over the module runtime: a fleet's `policy.wasm` scaler calls an
+/// export of a loaded module as the server, same JSON contract as the webhook scaler.
+pub struct RuntimeScaleHook(pub Arc<musubi_runtime::Runtime>);
+
+impl musubi_fleet::ScaleHook for RuntimeScaleHook {
+    fn has(&self, module: &str, function: &str) -> bool {
+        self.0.has_export(module, function)
+    }
+
+    fn call<'a>(
+        &'a self,
+        module: &'a str,
+        function: &'a str,
+        input: Value,
+    ) -> musubi_fleet::BoxFut<'a, std::result::Result<Value, String>> {
+        Box::pin(async move {
+            let ctx = CallContext {
+                server: true,
+                ..Default::default()
+            };
+            let payload = serde_json::to_vec(&input).map_err(|e| e.to_string())?;
+            let out = self
+                .0
+                .call_export(module, function, ctx, payload)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::from_slice(&out).map_err(|e| format!("non-JSON answer: {e}"))
+        })
+    }
+}

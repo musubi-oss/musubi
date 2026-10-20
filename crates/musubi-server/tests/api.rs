@@ -71,6 +71,9 @@ async fn app_and_state_with(tweak: impl FnOnce(&mut Config)) -> Option<(Router, 
             b.clone(),
         )));
     }
+    fleets = fleets.with_scale_hook(Arc::new(musubi_server::runtime_host::RuntimeScaleHook(
+        runtime.clone(),
+    )));
     let fleets = Arc::new(fleets);
     fleets.spawn_log_writer();
     if !cfg.fleet.ssh.hosts.is_empty() || !cfg.fleet.capacity.pools.is_empty() {
@@ -45561,4 +45564,166 @@ async fn operator_invites_accept_reject_rescind_and_members() {
     }
     let (st, _) = call(&app, "GET", inv, None, None).await;
     assert!(st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN);
+}
+
+fn scaler_wat(with_scale: bool) -> String {
+    let seg = |addr: u64, body: &str| {
+        (
+            format!(
+                "(data (i32.const {addr}) \"{}\")",
+                body.replace('"', "\\\"")
+            ),
+            (addr << 32) | body.len() as u64,
+        )
+    };
+    let (scale_data, scale_ret) = seg(1024, r#"{"response":{"scale":true,"replicas":4}}"#);
+    let (decline_data, decline_ret) = seg(1200, r#"{"scale":false}"#);
+    let (garbage_data, garbage_ret) = seg(1300, "nope");
+    let scale_fn = if with_scale {
+        format!(
+            "(func (export \"scale\") (param i32 i32 i32 i32) (result i64) i64.const {scale_ret})"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "alloc") (param $n i32) (result i32) (local $p i32)
+    global.get $heap local.set $p global.get $heap local.get $n i32.add global.set $heap local.get $p)
+  {scale_data} {decline_data} {garbage_data}
+  {scale_fn}
+  (func (export "decline") (param i32 i32 i32 i32) (result i64) i64.const {decline_ret})
+  (func (export "garbage") (param i32 i32 i32 i32) (result i64) i64.const {garbage_ret})
+  (func (export "trap") (param i32 i32 i32 i32) (result i64) unreachable))"#
+    )
+}
+
+/// Agones `FleetAutoscaler` policy `Wasm`: an in-process module decides the replica count with
+/// the webhook contract; bad answers fall through the chain and keep the local decision.
+#[tokio::test]
+async fn fleet_wasm_scaler_decides_replicas_in_process() {
+    let Some((app, state)) = app_and_state_with(|_| {}).await else {
+        return;
+    };
+    let k = "defaultkey";
+    state
+        .runtime
+        .load_bytes("scaler", scaler_wat(true).as_bytes())
+        .unwrap();
+    let name = unique("wasmfleet");
+    // policies pointing at nothing loaded are rejected up front
+    for bad in [
+        json!({"wasm": {"module": ""}}),
+        json!({"wasm": {"module": "scaler", "function": "not here"}}),
+        json!({"wasm": {"module": "scaler", "function": "absent"}}),
+        json!({"wasm": {"module": "missing"}}),
+        json!({"wasm": {"module": "scaler", "timeout_ms": 50}}),
+        json!({"chain": [{"id": "w", "wasm": {"module": "missing"}}]}),
+    ] {
+        let (st, v) = call_server(&app, "POST", "/v1/server/fleets", k,
+            Some(json!({"name": name, "provider": "local", "region": "eu-west", "buffer": 1, "max_servers": 4,
+                "spec": {"command": ["sleep", "60"]}, "policy": bad}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad} → {v}");
+    }
+    let (st, f) = call_server(&app, "POST", "/v1/server/fleets", k,
+        Some(json!({"name": name, "provider": "local", "region": "eu-west", "buffer": 1, "max_servers": 4,
+            "spec": {"command": ["sleep", "60"]},
+            "policy": {"wasm": {"module": "scaler", "config": {"floor": 2}}}}))).await;
+    assert!(st.is_success(), "{st} {f}");
+    assert_eq!(f["policy"]["wasm"]["function"], "scale", "{f}");
+    assert_eq!(f["policy"]["wasm"]["timeout_ms"], 2000);
+    assert_eq!(f["policy"]["wasm"]["config"]["floor"], 2);
+    let fid = f["id"].as_str().unwrap().to_string();
+    let scale = format!("/v1/server/fleets/{fid}/scale");
+    let reconcile = format!("/v1/server/fleets/{fid}/reconcile");
+    let status = format!("/v1/server/fleets/{fid}/autoscaler");
+    // the module asks for 4 replicas → target 4 instead of the buffer's 1
+    let (st, v) = call_server(&app, "POST", &reconcile, k, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["started"].as_i64().unwrap() >= 1, "{v}");
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["webhook"], "wasm replicas 4", "{v}");
+    assert_eq!(v["last"]["target"], 4);
+    // the module declines → local decision
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &scale,
+        k,
+        Some(json!({"policy": {"wasm": {"module": "scaler", "function": "decline"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _) = call_server(&app, "POST", &reconcile, k, None).await;
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["webhook"], "wasm no scale", "{v}");
+    assert_eq!(v["last"]["target"], 1);
+    // non-JSON answer and a trapping module are errors, the local decision stands
+    for func in ["garbage", "trap"] {
+        let (st, v) = call_server(
+            &app,
+            "POST",
+            &scale,
+            k,
+            Some(json!({"policy": {"wasm": {"module": "scaler", "function": func}}})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (_, _) = call_server(&app, "POST", &reconcile, k, None).await;
+        let (_, v) = call_server(&app, "GET", &status, k, None).await;
+        let note = v["last"]["webhook"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(note.starts_with("wasm error:"), "{func}: {v}");
+        assert_eq!(v["last"]["target"], 1, "{func}: {v}");
+    }
+    // chain: a failing entry falls through to the fleet-level module
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &scale,
+        k,
+        Some(json!({"policy": {
+            "chain": [{"id": "first", "wasm": {"module": "scaler", "function": "garbage"}}],
+            "wasm": {"module": "scaler"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _) = call_server(&app, "POST", &reconcile, k, None).await;
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    assert_eq!(v["last"]["webhook"], "wasm replicas 4", "{v}");
+    assert_eq!(v["last"]["target"], 4);
+    // the module is replaced by a build without `scale` → noted per reconcile, local decision
+    state
+        .runtime
+        .load_bytes("scaler", scaler_wat(false).as_bytes())
+        .unwrap();
+    let (_, _) = call_server(&app, "POST", &reconcile, k, None).await;
+    let (_, v) = call_server(&app, "GET", &status, k, None).await;
+    let note = v["last"]["webhook"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        note.contains("first: wasm error: nope") || note.contains("first: wasm error:"),
+        "{v}"
+    );
+    assert!(
+        note.contains("wasm error: module scaler: export scale not loaded"),
+        "{v}"
+    );
+    assert_eq!(v["last"]["target"], 1);
+    // and re-pointing the policy at the missing export is rejected
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &scale,
+        k,
+        Some(json!({"policy": {"wasm": {"module": "scaler"}}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
 }
