@@ -25758,6 +25758,47 @@ async fn fleet_counters_lists_selector_allocation_and_inventory() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // Hathora-style recent processes: region filter + 10 most recently started / stopped
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?region=eu-west&fleet={name}&recent=started"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+    assert!(v["servers"][0]["ready_at"].is_string(), "{v}");
+    assert!(v["servers"][0]["terminated_at"].is_null(), "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet={name}&recent=stopped"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 0, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet={name}&recent=paused"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "GET",
+        &format!("/v1/server/gameservers?fleet={name}&state=all&order=-terminated_at"),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
     let (st, v) = call_server(
         &app,
         "GET",

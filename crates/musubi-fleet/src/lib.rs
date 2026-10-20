@@ -1540,6 +1540,9 @@ pub struct GameServer {
     /// Stable DNS-style name (`<short-id>.<fleet>.<dns_zone>`) when the fleet sets `spec.dns_zone`.
     #[serde(default)]
     pub hostname: Option<String>,
+    /// Set when the server reached `terminated`.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub terminated_at: Option<OffsetDateTime>,
     pub pid: Option<i64>,
     pub labels: serde_json::Value,
     pub allocation: Option<serde_json::Value>,
@@ -1558,9 +1561,10 @@ pub struct GameServer {
     #[serde(default)]
     pub version: i64,
     /// When the server last became `ready` (idle TTL counts from here).
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub ready_at: Option<OffsetDateTime>,
     /// `reserved` servers: when the hold lapses back to `ready` (null = until cancelled).
-    #[serde(default)]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub reserved_until: Option<OffsetDateTime>,
     /// Named counters `{name: {count, capacity}}` (rooms, bots, …) the server reports; allocation
     /// selectors and `policy.counter_target` use them.
@@ -2050,6 +2054,9 @@ pub struct ServerSearch {
     pub order: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// `started` — most recently started (ready) servers, `stopped` — most recently
+    /// terminated; sets the state filter and order, default limit 10 (Hathora recent processes).
+    pub recent: Option<String>,
 }
 
 /// A server with its fleet's identity for inventory views.
@@ -2171,7 +2178,7 @@ fn push_server_filters(
     Ok(())
 }
 
-const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, g.ports, g.reserved_until, g.hostname, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
+const VIEW_SELECT: &str = "select g.id, g.fleet_id, g.state, g.node_id, g.address, g.port, g.pid, g.labels, g.allocation, g.last_health, g.created_at, g.build_version, g.players, g.capacity, g.version, g.ready_at, g.counters, g.lists, g.slots_used, g.host_id, g.ports, g.reserved_until, g.hostname, g.terminated_at, f.name as fleet, f.region, f.pool, f.provider from musubi.game_servers g join musubi.fleets f on f.id = g.fleet_id where true";
 
 /// A versioned build of a fleet: `active` is what new servers run, a `canary` takes
 /// `canary_percent` of new servers (optionally only in `canary_regions`), `retired` is kept for rollback.
@@ -2640,6 +2647,7 @@ struct ServerRow {
     ports: serde_json::Value,
     reserved_until: Option<OffsetDateTime>,
     hostname: Option<String>,
+    terminated_at: Option<OffsetDateTime>,
 }
 
 /// `<first 8 hex of id>.<fleet name>.<dns_zone>` when the fleet sets `spec.dns_zone`.
@@ -2659,6 +2667,7 @@ fn row_to_server(r: ServerRow) -> GameServer {
     GameServer {
         reserved_until: r.reserved_until,
         hostname: r.hostname,
+        terminated_at: r.terminated_at,
         id: r.id,
         fleet_id: r.fleet_id,
         state: r.state,
@@ -2686,7 +2695,7 @@ fn row_to_server(r: ServerRow) -> GameServer {
 const FLEET_COLS: &str =
     "id, name, provider, region, spec, buffer, max_servers, port_start, port_end, created_at, min_servers, policy, pool";
 const SERVER_COLS: &str =
-    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports, reserved_until, hostname";
+    "id, fleet_id, state, node_id, address, port, pid, labels, allocation, last_health, created_at, build_version, players, capacity, version, ready_at, counters, lists, slots_used, host_id, ports, reserved_until, hostname, terminated_at";
 
 impl FleetService {
     /// Base URL game servers use to reach this API (`MUSUBI_API`).
@@ -4070,8 +4079,31 @@ impl FleetService {
 
     /// Cross-fleet inventory: matching servers (page) and the total.
     pub async fn search_servers(&self, q: &ServerSearch) -> Result<(Vec<ServerView>, i64)> {
+        let mut q = q.clone();
+        match q.recent.as_deref() {
+            None => {}
+            Some("started") => {
+                q.state.get_or_insert_with(|| "all".into());
+                q.order.get_or_insert_with(|| "-ready_at".into());
+                q.limit.get_or_insert(10);
+            }
+            Some("stopped") => {
+                q.state.get_or_insert_with(|| "terminated".into());
+                q.order.get_or_insert_with(|| "-terminated_at".into());
+                q.limit.get_or_insert(10);
+            }
+            Some(other) => {
+                return Err(Error::InvalidArgument(format!(
+                    "bad recent {other:?} (started|stopped)"
+                )));
+            }
+        }
+        let q = &q;
         let mut qb = sqlx::QueryBuilder::new(VIEW_SELECT);
         push_server_filters(&mut qb, q)?;
+        if q.recent.as_deref() == Some("started") {
+            qb.push(" and g.ready_at is not null");
+        }
         let (col, dir) = match q.order.as_deref().unwrap_or("-created_at") {
             "created_at" => ("g.created_at", "asc"),
             "-created_at" | "age" => ("g.created_at", "desc"),
@@ -4080,6 +4112,10 @@ impl FleetService {
             "-last_health" => ("g.last_health", "desc"),
             "players" => ("g.players", "asc"),
             "-players" => ("g.players", "desc"),
+            "ready_at" => ("g.ready_at", "asc nulls last"),
+            "-ready_at" => ("g.ready_at", "desc nulls last"),
+            "terminated_at" => ("g.terminated_at", "asc nulls last"),
+            "-terminated_at" => ("g.terminated_at", "desc nulls last"),
             other => {
                 return Err(Error::InvalidArgument(format!("bad order {other:?}")));
             }
@@ -5678,6 +5714,7 @@ mod lifecycle_tests {
         let now = OffsetDateTime::now_utc();
         GameServer {
             hostname: None,
+            terminated_at: None,
             reserved_until: None,
             id: Uuid::now_v7(),
             fleet_id: Uuid::nil(),
@@ -5789,6 +5826,7 @@ mod alloc_pick_tests {
     fn gs(labels: serde_json::Value, rooms: i64, slots_used: i32, host: &str) -> GameServer {
         GameServer {
             hostname: None,
+            terminated_at: None,
             reserved_until: None,
             id: Uuid::now_v7(),
             fleet_id: Uuid::nil(),
