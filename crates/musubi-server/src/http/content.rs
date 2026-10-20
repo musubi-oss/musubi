@@ -387,6 +387,49 @@ async fn apply(tx: &mut Tx<'_>, bundle: &Value, prune: bool) -> Result<Map<Strin
             }
         }
     }
+    // Explicit deletes (`bundle.deletes = {table: [pk rows]}`): what a changeset removes without
+    // pruning everything else in the table — children first, like prune.
+    if let Some(dels) = bundle.get("deletes").and_then(Value::as_object) {
+        for name in dels.keys() {
+            if !all.contains(&name.as_str()) {
+                return Err(Error::InvalidArgument(format!(
+                    "unknown content table {name} in deletes"
+                )));
+            }
+        }
+        for t in all.iter().rev() {
+            let Some(rows_v) = dels.get(*t).and_then(Value::as_array) else {
+                continue;
+            };
+            let fetched;
+            let sh: &Shape = match shapes.get(t) {
+                Some(sh) => sh,
+                None => {
+                    fetched = shape(tx, t).await?;
+                    &fetched
+                }
+            };
+            let mut gone = Vec::new();
+            for r in rows_v {
+                if !sh.pk.iter().all(|c| r.get(c).is_some()) {
+                    return Err(Error::InvalidArgument(format!(
+                        "{t}: delete row needs primary key {:?}",
+                        sh.pk
+                    )));
+                }
+                delete(tx, t, sh, r).await?;
+                gone.push(r.clone());
+            }
+            let entry = diffs.entry(t.to_string()).or_insert_with(|| {
+                json!({ "added": 0, "changed": 0, "removed": 0, "kept": 0,
+                        "rows": {"added": [], "changed": [], "removed": []} })
+            });
+            entry["removed"] = json!(entry["removed"].as_u64().unwrap_or(0) + gone.len() as u64);
+            if let Some(arr) = entry["rows"]["removed"].as_array_mut() {
+                arr.extend(gone);
+            }
+        }
+    }
     Ok(diffs)
 }
 

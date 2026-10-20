@@ -205,13 +205,43 @@ async fn wanted(
 /// import with `prune` applies exactly the upserts and deletes.
 async fn bundle_of(s: &AppState, r: &Row) -> Result<Value, Error> {
     let mut tables = Map::new();
+    let mut deletes = Map::new();
     if let Some(t) = r.changes.as_object() {
-        for table in t.keys() {
-            let (w, _) = wanted(s, &r.changes, table).await?;
-            tables.insert(table.clone(), Value::Array(w));
+        for (table, ch) in t {
+            let (w, sh) = wanted(s, &r.changes, table).await?;
+            let Some(ch) = ch.as_object() else { continue };
+            // only the rows this changeset touches: concurrent edits to other rows are left alone
+            let touched: Vec<Value> = w
+                .into_iter()
+                .filter(|row| ch.contains_key(&content::key_of(row, &sh.pk)))
+                .collect();
+            tables.insert(table.clone(), Value::Array(touched));
+            let gone: Vec<Value> = ch
+                .iter()
+                .filter(|(_, v)| v.is_null())
+                .filter_map(|(key, _)| pk_row(key, &sh.pk))
+                .collect();
+            if !gone.is_empty() {
+                deletes.insert(table.clone(), Value::Array(gone));
+            }
         }
     }
-    Ok(json!({ "format": content::FORMAT, "sections": ["content"], "tables": tables }))
+    Ok(json!({
+        "format": content::FORMAT, "sections": ["content"], "tables": tables, "deletes": deletes,
+    }))
+}
+
+/// Inverse of `content::key_of`: `"a"|1` → `{pk0: "a", pk1: 1}`.
+fn pk_row(key: &str, pk: &[String]) -> Option<Value> {
+    let parts: Vec<&str> = key.split('|').collect();
+    if parts.len() != pk.len() {
+        return None;
+    }
+    let mut row = Map::new();
+    for (c, p) in pk.iter().zip(parts) {
+        row.insert(c.clone(), serde_json::from_str(p).ok()?);
+    }
+    Some(Value::Object(row))
 }
 
 fn image_ok(v: &Value) -> bool {
@@ -385,7 +415,7 @@ async fn do_publish(s: &AppState, r: &Row, by: &str) -> Result<Value, Error> {
     } else {
         format!("changeset {}: {}", r.name, r.note)
     };
-    let res = content::run_import(s, &bundle, false, true, &note, "changeset", None).await?;
+    let res = content::run_import(s, &bundle, false, false, &note, "changeset", None).await?;
     let version = res["version"].as_i64();
     sqlx::query(
         "update musubi.economy_changesets set state = 'published', published_version = $2,
@@ -666,7 +696,7 @@ async fn diff_route(
 ) -> Result<Json<Value>, ApiError> {
     let r = load(&s.db, parse(&id)?).await?;
     let bundle = bundle_of(&s, &r).await?;
-    let res = content::run_import(&s, &bundle, true, true, "", "changeset", None).await?;
+    let res = content::run_import(&s, &bundle, true, false, "", "changeset", None).await?;
     Ok(Json(
         json!({ "changeset": summary(&r), "diff": res["diff"], "changes": res["changes"] }),
     ))
