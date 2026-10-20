@@ -20,7 +20,8 @@ export async function api<T = any>(method: string, path: string, body?: unknown,
   if (opts.raw) return r as unknown as T
   const text = await r.text()
   let v: any = null
-  try { v = text ? JSON.parse(text) : null } catch { v = text }
+  const json = (r.headers.get('content-type') ?? '').includes('json')
+  try { v = text ? (json ? JSON.parse(text) : text) : null } catch { v = text }
   if (!r.ok) {
     const msg = (v && typeof v === 'object' && (v.message || v.error)) || r.statusText || `HTTP ${r.status}`
     throw new ApiError(r.status, (v && v.code) || String(r.status), msg, v)

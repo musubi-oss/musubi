@@ -40,6 +40,10 @@ export const router = createRouter({
       { path: 'worlds/:w', component: () => import('./pages/world/World.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.world.find((x) => x.id === r.params.page) ?? catalog.world[0] }) },
     ]},
+    { path: '/cluster', component: () => import('./pages/cluster/Index.vue'), children: [
+      { path: '', component: () => import('./pages/cluster/Overview.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
+    ]},
     { path: '/:section/:page?', component: () => import('./pages/Section.vue') },
   ],
 })

@@ -89,7 +89,7 @@ export const catalog: Record<string, Res[]> = {
     { id: 'netsim', title: 'Network simulator', list: '/v1/admin/dev/netsim', pageActions: [{ label: 'Configure', method: 'PUT', path: '/v1/admin/dev/netsim', body: { enabled: true, latency_ms: 80, jitter_ms: 20, loss_pct: 1 } }, { label: 'Reset', method: 'POST', path: '/v1/admin/dev/netsim/reset' }, { label: 'Disable', method: 'DELETE', path: '/v1/admin/dev/netsim', danger: true }] },
   ],
   cluster: [
-    { id: 'nodes', title: 'Nodes', list: '/v1/server/cluster/nodes', rowsKey: 'nodes', cols: ['name', 'roles', 'region', 'state', 'alive', 'heartbeat_at', 'version', 'wg_addr'] },
+    { id: 'nodes', title: 'Overview', list: '/v1/server/cluster/nodes', rowsKey: 'nodes', cols: ['name', 'roles', 'region', 'state', 'alive', 'heartbeat_at', 'version', 'wg_addr'] },
     { id: 'raft', title: 'Raft', list: '/v1/server/cluster/raft' },
     { id: 'mesh_net', title: 'Mesh network', list: '/v1/server/cluster/mesh_net', pageActions: [{ label: 'Refresh peers', method: 'POST', path: '/v1/server/cluster/mesh_net/refresh' }, { label: 'Rotate key', method: 'POST', path: '/v1/server/cluster/mesh_net/rotate', confirm: 'Rotate this node\'s WireGuard key?', danger: true }] },
     { id: 'geoip', title: 'GeoIP', list: '/v1/server/geoip', pageActions: [{ label: 'Update now', method: 'POST', path: '/v1/server/geoip/update' }, { label: 'Reload file', method: 'POST', path: '/v1/server/geoip/reload' }] },
