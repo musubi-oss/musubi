@@ -29,6 +29,7 @@ export const router = createRouter({
       { path: 'fleets/:id', component: () => import('./pages/servers/Fleet.vue') },
       { path: 'servers/:id', component: () => import('./pages/servers/GameServer.vue') },
       { path: 'edge', component: () => import('./pages/servers/Edge.vue') },
+      { path: 'builds', component: () => import('./pages/servers/Builds.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.servers.find((x) => x.id === r.params.page) ?? catalog.servers[0] }) },
     ]},
     { path: '/liveops', component: () => import('./pages/liveops/Index.vue'), children: [
@@ -51,6 +52,11 @@ export const router = createRouter({
     { path: '/cluster', component: () => import('./pages/cluster/Index.vue'), children: [
       { path: '', component: () => import('./pages/cluster/Overview.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
+    ]},
+    { path: '/social', component: () => import('./pages/social/Index.vue'), children: [
+      { path: '', component: () => import('./pages/Generic.vue'), props: () => ({ res: catalog.social[0] }) },
+      { path: 'matchmaker', component: () => import('./pages/social/Matchmaker.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.social.find((x) => x.id === r.params.page) ?? catalog.social[0] }) },
     ]},
     { path: '/economy', component: () => import('./pages/economy/Index.vue'), children: [
       { path: '', component: () => import('./pages/Generic.vue'), props: () => ({ res: catalog.economy[0] }) },

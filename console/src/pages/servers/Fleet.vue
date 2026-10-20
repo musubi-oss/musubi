@@ -12,6 +12,10 @@ const id = computed(() => String(route.params.id))
 const F = computed(() => `/v1/server/fleets/${id.value}`)
 const fleet = ref<any>(null); const err = ref(''); const x = ref<Record<string, any>>({})
 const tab = ref(String(route.query.tab ?? 'overview'))
+const metrics = ['ready_pct', 'ready', 'idle_ready', 'allocated_pct', 'allocated', 'players_pct', 'players', 'live', 'in_game', 'starting', 'capacity', 'queue', 'cpu_pct_avg', 'cpu_pct_max', 'age_secs', 'uptime_secs']
+const rules = ref<any[]>([]); const policy = ref<any>({}); const rulesDirty = ref(false)
+function syncPolicy() { const p = fleet.value?.policy ?? x.value.fleet?.policy ?? {}; policy.value = { suspended: false, rules: [], webhook: null, wasm: null, forecast: false, ...p }; rules.value = (policy.value.rules ?? []).map((r: any) => ({ ...r })); rulesDirty.value = false }
+async function saveRules() { await act(() => post(`${F.value}/scale`, { policy: { ...policy.value, rules: rules.value.map((r) => ({ ...r, threshold: Number(r.threshold), for_secs: Number(r.for_secs), step: Number(r.step), cooldown_secs: Number(r.cooldown_secs) })) } }), 'autoscaler rules saved'); rulesDirty.value = false }
 const tabs: [string, string][] = [['overview', 'overview'], ['servers', 'servers'], ['autoscaler', 'autoscaler'], ['rollout', 'rollout & builds'], ['health', 'health & alerts'], ['cost', 'cost & usage'], ['events', 'events & metrics'], ['spec', 'spec']]
 const dlg = ref<'' | 'scale' | 'allocate' | 'build' | 'rule' | 'spec'>(''); const form = ref<any>({})
 async function load() { err.value = ''; try { fleet.value = await get(F.value) } catch (e: any) { err.value = e.message } }
@@ -20,7 +24,7 @@ function loadTab(t: string, force = false) {
   const f = F.value
   if (t === 'overview') { fx('counters', `${f}/counters`, force); fx('demand', `${f}/demand`, force); fx('reputation', `${f}/reputation`, force); fx('installs', `${f}/installs`, force) }
   if (t === 'servers') fx('servers', `${f}/servers`, force)
-  if (t === 'autoscaler') { fx('autoscaler', `${f}/autoscaler`, force); fx('demand', `${f}/demand`, force) }
+  if (t === 'autoscaler') { fx('autoscaler', `${f}/autoscaler`, force); fx('demand', `${f}/demand`, force); syncPolicy() }
   if (t === 'rollout') { fx('rollout', `${f}/rollout`, force); fx('rollouts', `${f}/rollouts`, force); fx('builds', `${f}/builds`, force) }
   if (t === 'health') { fx('health', `${f}/health`, force); fx('alerts', `${f}/alerts`, force); fx('rules', `${f}/alerts/rules`, force) }
   if (t === 'cost') { fx('cost', `${f}/cost`, force); fx('usage', `${f}/usage`, force); fx('egress', `${f}/egress`, force) }
@@ -87,6 +91,11 @@ const pct = (a: number, b: number) => (b ? Math.round((a / b) * 100) : 0)
         <div><Kv k="Live / in game" :v="`${x.autoscaler.last.gauges?.live ?? 0} / ${x.autoscaler.last.gauges?.in_game ?? 0}`" /><Kv k="Allocated / capacity" :v="`${x.autoscaler.last.gauges?.allocated ?? 0} / ${x.autoscaler.last.gauges?.capacity ?? 0}`" /><Kv k="Players" :v="x.autoscaler.last.gauges?.players" /></div>
         <div><Kv k="CPU avg / max" :v="`${x.autoscaler.last.gauges?.cpu_pct_avg ?? '—'} / ${x.autoscaler.last.gauges?.cpu_pct_max ?? '—'}`" /><Kv k="Base + buffer" :v="`${x.autoscaler.last.base ?? 0} + ${x.autoscaler.last.buffer ?? 0}`" /><Kv k="Available" :v="x.autoscaler.last.available" /></div>
       </div>
+      <h3>Rules <small>({{ rules.length }} — evaluated top-down each cycle; first matching rule acts)</small> <button class="btn s p" style="margin-left:8px" @click="rules.push({ name: `rule-${rules.length + 1}`, metric: 'ready_pct', op: 'lt', threshold: 20, for_secs: 30, action: 'scale_up', step: 1, cooldown_secs: 60 })">Add rule</button> <button class="btn s" :disabled="!rulesDirty" @click="saveRules">Save rules</button></h3>
+      <table><thead><tr><th>Name</th><th>Metric</th><th style="width:70px">Op</th><th style="width:100px">Threshold</th><th style="width:90px">For (s)</th><th style="width:130px">Action</th><th style="width:80px">Step</th><th style="width:110px">Cooldown (s)</th><th style="width:80px"></th></tr></thead><tbody>
+        <tr v-for="(r, i) in rules" :key="i"><td><input class="in" style="min-width:0;width:100%" v-model="r.name" @input="rulesDirty = true" /></td><td><select class="sel" style="min-width:0;width:100%" v-model="r.metric" @change="rulesDirty = true"><option v-for="m in metrics" :key="m" :value="m">{{ m }}</option></select></td><td><select class="sel" style="min-width:0;width:100%" v-model="r.op" @change="rulesDirty = true"><option>gt</option><option>gte</option><option>lt</option><option>lte</option></select></td><td><input class="in" type="number" style="min-width:0;width:100%" v-model.number="r.threshold" @input="rulesDirty = true" /></td><td><input class="in" type="number" min="0" style="min-width:0;width:100%" v-model.number="r.for_secs" @input="rulesDirty = true" /></td><td><select class="sel" style="min-width:0;width:100%" v-model="r.action" @change="rulesDirty = true"><option value="scale_up">scale up</option><option value="scale_down">scale down</option></select></td><td><input class="in" type="number" min="1" style="min-width:0;width:100%" v-model.number="r.step" @input="rulesDirty = true" /></td><td><input class="in" type="number" min="0" style="min-width:0;width:100%" v-model.number="r.cooldown_secs" @input="rulesDirty = true" /></td><td><button class="btn s" @click="rules.splice(i, 1); rulesDirty = true">×</button></td></tr>
+        <tr v-if="!rules.length"><td colspan="9" class="empty">No rules — only min / buffer / max keep servers up</td></tr></tbody></table>
+      <div class="grid" style="margin-top:8px"><div><Kv k="Forecast"><label><input type="checkbox" v-model="policy.forecast" @change="rulesDirty = true" /> pre-scale from demand history</label></Kv></div><div><Kv k="Webhook scaler" :v="policy.webhook?.url ?? 'none'" mono /></div><div><Kv k="WASM scaler" :v="policy.wasm ? `${policy.wasm.module}.${policy.wasm.function}` : 'none'" /></div></div>
       <h3>Decision chain</h3><JsonView :value="x.autoscaler?.last?.chain ?? []" />
       <h3>Demand forecast</h3>
       <DataTable :cols="[{ key: 'slot' }, { key: 'expected' }, { key: 'observed' }]" :rows="list('demand', 'slots')" />
