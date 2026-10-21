@@ -118,6 +118,22 @@ pub(crate) struct QuicBus {
 /// A long-lived outgoing bus stream, written by one sender at a time.
 type LaneStream = Arc<tokio::sync::Mutex<quinn::SendStream>>;
 
+/// Transport settings for both ends of a bus connection. The windows are sized for one
+/// connection carrying every lane between two busy nodes (~60 MB/s on the stand): quinn's
+/// defaults (1.25 MB stream window, 8 MB connection window) made a 64-frame session batch wait
+/// 2.7 ms on flow control with 15 µs of work behind it.
+fn bus_transport() -> Result<Arc<quinn::TransportConfig>> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(60)).map_err(Error::internal)?,
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    transport.send_window(64 * 1024 * 1024);
+    Ok(Arc::new(transport))
+}
+
 #[derive(Clone)]
 pub struct Cluster {
     db: PgPool,
@@ -510,12 +526,7 @@ impl Cluster {
         let crypto =
             quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(Error::internal)?;
         let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(Duration::from_secs(60)).map_err(Error::internal)?,
-        ));
-        transport.keep_alive_interval(Some(Duration::from_secs(15)));
-        cfg.transport_config(Arc::new(transport));
+        cfg.transport_config(bus_transport()?);
         let endpoint = quinn::Endpoint::server(cfg, listen).map_err(Error::internal)?;
         let local = endpoint.local_addr().map_err(Error::internal)?;
         self.me.bus_addr = match advertise {
@@ -1223,7 +1234,8 @@ impl QuicBus {
         tls.alpn_protocols = vec![BUS_ALPN.to_vec()];
         let crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(Error::internal)?;
-        let cfg = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
+        cfg.transport_config(bus_transport()?);
         let connecting = self
             .endpoint
             .connect_with(cfg, addr, "localhost")

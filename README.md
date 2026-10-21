@@ -172,7 +172,13 @@ releases the window, a worker per stream parses and dispatches in order, `musubi
 the peer's inbound lag fell to 15.9 ms, fps stayed at 28.0 — and the measurement says the parse
 was never the cost (15 µs a frame). A 64-frame write still takes 2.7 ms, which with 15 µs of work
 behind it is flow control: the next suspect is the QUIC connection's receive and send windows for
-~60 MB/s on one connection. The bus frame
+~60 MB/s on one connection. Raised (16 MB per stream, 64 MB per connection, both ends, `bus_transport`): 28.4
+fps per client, p99 150 ms (the best of this series), 0 errors, the session lane's worst wait
+4.1 s (was 6.1 s) — but a write still costs 2.4 ms, and the peer's inbound bulk queue now lags
+224 ms on average (was 16 ms): the window let the home push replica and ghost deltas faster than
+the peer's single apply worker takes them under the world locks. The backlog has moved for the
+last time to where the work actually is — applying bulk deltas on the receiver — and that worker
+is the next thing to parallelize (per world). The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
