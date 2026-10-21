@@ -3327,10 +3327,14 @@ impl WorldRegistry {
                 }
             },
         };
+        // A hosted cell without a simulator lease still takes the entity: on one node an
+        // unleased cell holds its entities until a simulator leases it, and the same holds
+        // here. Refusing made the sender re-offer every tick (~60 ms) for as long as the
+        // simulator took to follow the offload redirect — the stand's largest handover loop.
         let owner = st.world.owner(cell);
-        if owner.is_none() && !forced {
-            fanout.world_handover_ack(name, id, from_node, false, false);
-            return false;
+        if owner.is_none() {
+            metrics::counter!("musubi_world_handover_recv_total", "path" => "unowned_cell")
+                .increment(1);
         }
         if entity.persistent {
             st.journal.push(WorldOp {

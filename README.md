@@ -71,8 +71,8 @@ is the tree as of `bebbbcf`, "after" has the three fixes described below the tab
 | 3 after | 2 000 | 4 × 4 000, 8 sims | json | **23.6** | **39 / 94 / 134 ms** | **25 / 100 ms** | 1.5 / 25 ms | **8 568 / 8 574** | 225 % |
 | 3, 2 nodes, players on home, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 24.0 | 35 / 87 / 196 ms | 25 / 100 ms | 2.3 / 25 ms | 2 099 / 6 055 | home 47 %, peer 22 % |
 | 3, 2 nodes, players split, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 13.8 | 35 / 198 / 706 ms | 10 / 50 ms | 2.0 / 10 ms | 2 096 / 5 554 | home 65 %, peer 33 % |
-| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 21.0 | 36 / 136 / 208 ms | 10 / 50 ms | 1.6 / 10 ms | 3 374 / 9 973 | home 81 %, peer 86 % |
-| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 17.1–25.0 | 35 / 192 / 258 ms | 10 / 50 ms | 1.4 / 10 ms | 3 013 / 12 960 | home 35 %, peer 48 % |
+| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 25.3 | 34 / 80 / 191 ms | 10 / 50 ms | 1.6 / 10 ms | 4 086 / 5 886 | home 122 %, peer 57 % |
+| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 17–25 (19.3) | 34 / 181 / 295 ms | 10 / 50 ms | 1.5 / 10 ms | 3 515 / 5 728 | home 73 %, peer 19 % |
 
 The two-node rows are the same stand with a second `sim`-role node on the same VM and
 `--controller '{"offload_above_cost": 800}'`: the home moves ~40 cells (of 4 × 25) to the peer,
@@ -113,11 +113,14 @@ to single entities (`hotrace` debug lines on both nodes, one entity in sixteen):
 handover shipped to the peer is acked while still in transit 264 times of 266 — the cross-node
 path itself works and takes ~60 ms; the ~6 400 "late" acks a run are the peer's acks to the
 forced migrations of offloaded cells (the home drops those entities as it ships them, so an ack
-finds nothing — benign); and the real remaining defect is a refusal: while a cell changes host
-the sender's cell directory says the peer hosts it and the peer's says it does not (`not_here`,
-~750 a run), the entity is re-shipped every ~60 ms until the directories agree or the timeout
-rolls it back. Next: re-resolve the target through the leader on a refusal, with a backoff,
-and lease-fence the receiver's check. The bench's "asked" column counts the forced migrations
+finds nothing — benign); and the largest loop was a refusal: the peer turned an entity away when
+the hosted target cell had no simulator lease yet (the bench simulator was still following the
+offload redirect), the sender re-offered it every tick (~60 ms) for as long as that took. A
+hosted cell without a lease now takes the entity and holds it, as an unleased cell on one node
+does (`unowned_cell` in the receiver's funnel: 11 500 of 16 600 arrivals in two runs) —
+completions went from ~3 000 to 3 500–4 100 of ~5 800 asked. What remains: `not_here` (~700 a
+run, sender's and receiver's cell directories disagree while a cell changes host; the sender
+waits the full timeout) — re-resolve through the leader on arrival, with a backoff on the sender. The bench's "asked" column counts the forced migrations
 too, so the completed/asked ratio understates the border handovers that complete. Separately,
 the session and bulk lanes of the home run 15–25 s behind under this load because every bus
 frame is a `serde_json::Value` serialized twice on send and decoded twice on receive — a raw
