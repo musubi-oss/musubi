@@ -1845,8 +1845,21 @@ impl Fanout {
                     let one = async move {
                         let waited = queued.elapsed();
                         let started = std::time::Instant::now();
-                        if let Err(e) = c.publish_prio(TOPIC, &w, priority).await {
-                            tracing::warn!(error = %e, "fanout publish failed");
+                        // serialize here, send the bytes: the two halves of a batch's cost are
+                        // measured apart (`musubi_fanout_batch_ms{lane,phase}`)
+                        match serde_json::value::to_raw_value(&w) {
+                            Ok(raw) => {
+                                let ser = started.elapsed();
+                                metrics::histogram!("musubi_fanout_batch_ms", "lane" => lane_name, "phase" => "serialize")
+                                    .record(ser.as_secs_f64() * 1000.0);
+                                let send_started = std::time::Instant::now();
+                                if let Err(e) = c.publish_prio(TOPIC, &raw, priority).await {
+                                    tracing::warn!(error = %e, "fanout publish failed");
+                                }
+                                metrics::histogram!("musubi_fanout_batch_ms", "lane" => lane_name, "phase" => "send")
+                                    .record(send_started.elapsed().as_secs_f64() * 1000.0);
+                            }
+                            Err(e) => tracing::warn!(error = %e, "fanout frame not serializable"),
                         }
                         Fanout::session_frames_sent(&inflight, &sids);
                         let took = started.elapsed();

@@ -156,7 +156,11 @@ average 7.3 s, i.e. the lanes queue behind each other on the one QUIC connection
 that do point somewhere: a 64-frame session batch takes 23 ms on average (136 ms worst) to
 serialize and push, the home sends ~59 MB/s to the peer over the run, and the peer applies what
 arrives with an 8.6 ms average lag — the cost is on the sender's batch path (JSON of a thousand
-deltas a tick plus the send into the peer's flow-control window), not at the receiver. The bus frame
+deltas a tick plus the send into the peer's flow-control window), not at the receiver. Split further (`musubi_fanout_batch_ms{lane,phase}`): serializing a
+session batch costs 0.26 ms, sending it 3.1 ms — twelve times more, and the bulk lane's sends
+added up to 48 s of a 40 s run (1.1 ms × 42 000 batches), so both lanes are simply saturated by
+the send call, which returns only when the peer has read the frame. That is the next fix: a send
+that does not wait for the peer per batch. The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
