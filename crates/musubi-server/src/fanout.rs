@@ -1512,7 +1512,15 @@ impl Fanout {
                                     },
                                 };
                                 let fresh = w.cell_host_of(&world, c).await.ok().flatten();
-                                if fresh == Some(w.node_id()) {
+                                // a forced shipment is the home releasing the cell to this node:
+                                // the assignment is authoritative, a directory that has not caught
+                                // up yet must not turn the entities away (non-persistent ones are
+                                // in no snapshot and would be lost — the stand saw it one run in two)
+                                if forced && fresh != Some(w.node_id()) {
+                                    metrics::counter!("musubi_world_handover_recv_total", "path" => "forced_take")
+                                        .increment(1);
+                                }
+                                if forced || fresh == Some(w.node_id()) {
                                     metrics::counter!("musubi_world_handover_recv_total", "path" => "here_after_fresh_lookup").increment(1);
                                     if let Err(e) = w.ensure_hosting(&world, c).await {
                                         tracing::warn!(world = %world, ?c, error = %e, "handover target cell not hosted");
