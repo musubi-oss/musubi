@@ -28,6 +28,8 @@ use crate::fanout::Fanout;
 pub const TICK_HZ: u64 = 30;
 /// Ticks between re-reads of the alive peer set that cell replicas are picked from.
 const PEER_REFRESH_TICKS: u64 = 30;
+/// Postgres-bus mode: how often `musubi.world_cell_hosts` is re-read against the cache.
+const CELL_HOST_RECONCILE_TICKS: u64 = 90;
 pub const MAX_SIM_EVENTS: usize = 4096;
 /// Persistent entities are snapshotted this often (ticks); 30 Hz → every 5 s.
 const SNAPSHOT_EVERY: u64 = 150;
@@ -870,6 +872,9 @@ impl WorldRegistry {
                 }
             }
         }
+        if self.cell_hosts_in_db() {
+            self.persist_cell_host(name, cell, host).await;
+        }
         match host {
             Some(h) => {
                 self.cell_hosts.insert((name.to_string(), cell), h);
@@ -882,6 +887,116 @@ impl WorldRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Postgres-bus mode (a cluster without the raft directory): `musubi.world_cell_hosts` is the
+    /// record a cell assignment is recovered from when its one-shot bus announcement is lost.
+    fn cell_hosts_in_db(&self) -> bool {
+        self.db.is_some() && self.cluster.get().is_some_and(|c| c.raft_id() == 0)
+    }
+
+    async fn persist_cell_host(&self, name: &str, cell: CellId, host: Option<Uuid>) {
+        let Some(db) = &self.db else { return };
+        let r = match host {
+            Some(h) => sqlx::query(
+                "insert into musubi.world_cell_hosts (name, x, y, level, node_id)
+                 values ($1, $2, $3, $4, $5)
+                 on conflict (name, x, y, level)
+                 do update set node_id = excluded.node_id, updated_at = now()",
+            )
+            .bind(name)
+            .bind(cell.x)
+            .bind(cell.y)
+            .bind(cell.level as i16)
+            .bind(h)
+            .execute(db)
+            .await,
+            None => sqlx::query(
+                "delete from musubi.world_cell_hosts where name = $1 and x = $2 and y = $3 and level = $4",
+            )
+            .bind(name)
+            .bind(cell.x)
+            .bind(cell.y)
+            .bind(cell.level as i16)
+            .execute(db)
+            .await,
+        };
+        if let Err(e) = r {
+            tracing::warn!(world = name, ?cell, error = %e, "cell host not persisted");
+        }
+    }
+
+    async fn cell_host_from_db(&self, name: &str, cell: CellId) -> Option<Uuid> {
+        let db = self.db.as_ref()?;
+        for probe in std::iter::once(cell).chain(cell.ancestors()) {
+            let r: Option<(Uuid,)> = sqlx::query_as(
+                "select node_id from musubi.world_cell_hosts where name = $1 and x = $2 and y = $3 and level = $4",
+            )
+            .bind(name)
+            .bind(probe.x)
+            .bind(probe.y)
+            .bind(probe.level as i16)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+            if let Some((h,)) = r {
+                return Some(h);
+            }
+        }
+        None
+    }
+
+    /// Postgres-bus mode: re-read `musubi.world_cell_hosts` for the worlds this node knows and
+    /// the cells assigned to it, and apply what the bus announcement would have. `pg_notify` is
+    /// fire-and-forget — a listener reconnect loses it — and a restarted process has no cache at
+    /// all; without this the cell stays unhosted and every lease for it is redirected to the home.
+    /// The cache is snapshotted before the read: an announcement that lands in between wins.
+    pub async fn reconcile_cell_hosts(&self, fanout: &Fanout) {
+        if !self.cell_hosts_in_db() {
+            return;
+        }
+        let Some(db) = &self.db else { return };
+        let mut known: Vec<String> = self.worlds.iter().map(|e| e.key().clone()).collect();
+        known.extend(self.cell_hosts.iter().map(|e| e.key().0.clone()));
+        known.sort();
+        known.dedup();
+        let before: HashMap<(String, CellId), Uuid> = self
+            .cell_hosts
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        let rows: Vec<(String, i32, i32, i16, Uuid)> = match sqlx::query_as(
+            "select name, x, y, level, node_id from musubi.world_cell_hosts
+             where node_id = $1 or name = any($2)",
+        )
+        .bind(self.node_id)
+        .bind(&known)
+        .fetch_all(db)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "cell hosts not reconciled");
+                return;
+            }
+        };
+        for (name, x, y, level, node) in rows {
+            let cell = CellId {
+                x,
+                y,
+                level: level as u8,
+                z: 0,
+            };
+            let key = (name.clone(), cell);
+            let seen = before.get(&key).copied();
+            if seen == Some(node) || self.cell_host_cached(&name, cell) != seen {
+                continue;
+            }
+            metrics::counter!("musubi_world_cell_hosts_reconciled_total").increment(1);
+            tracing::info!(world = %name, ?cell, %node, "cell assignment recovered from the database");
+            fanout.apply_cell_assign(name, cell, node);
+        }
     }
 
     /// `cell` now belongs to `node`: if this node still holds entities of it (the cell was moved
@@ -1001,10 +1116,17 @@ impl WorldRegistry {
     /// same asynchronously; a simulator redirected here can arrive first, and answering it with
     /// a redirect back to the home (which redirects here again) was an endless loop.
     pub async fn ensure_hosting(&self, name: &str, cell: CellId) -> Result<()> {
-        if let Some(w) = self.worlds.get(name) {
-            if self.hosts_cell(&w.lock(), name, cell) {
-                return Ok(());
+        let hosted = self
+            .worlds
+            .get(name)
+            .is_some_and(|w| self.hosts_cell(&w.lock(), name, cell));
+        if hosted {
+            // the shard may be up before its hosting finished enrolling (the assignment is
+            // cached first): a lease served here must be able to persist, so enrol now
+            if self.db.is_some() && !self.host_terms.contains_key(name) {
+                self.enroll_host(name).await?;
             }
+            return Ok(());
         }
         self.host_cell(name, cell).await.map(|_| ())
     }
@@ -1302,6 +1424,12 @@ impl WorldRegistry {
         }
         if let Some(h) = self.cell_hosts.get(&key) {
             return Ok(Some(*h));
+        }
+        if self.cell_hosts_in_db() {
+            if let Some(h) = self.cell_host_from_db(name, cell).await {
+                self.cell_hosts.insert(key, h);
+                return Ok(Some(h));
+            }
         }
         self.home_of(name).await
     }
@@ -1753,6 +1881,18 @@ impl WorldRegistry {
         let Some(c) = self.cluster.get() else {
             return vec![];
         };
+        if c.raft_id() == 0 {
+            // Postgres-bus mode: the rows are the record (written before any announcement);
+            // the local cache may not have seen an assignment yet and must not fence its host
+            let Some(db) = &self.db else { return vec![] };
+            return sqlx::query_scalar::<_, Uuid>(
+                "select distinct node_id from musubi.world_cell_hosts where name = $1",
+            )
+            .bind(name)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+        }
         // confirmed through the leader: the local copy may still list a host that just gave the
         // cell up, and keeping its rows means replaying them over fresher state later
         let mut out = Vec::new();
@@ -5246,6 +5386,9 @@ impl WorldRegistry {
                     + 1;
                 if t % PEER_REFRESH_TICKS == 1 {
                     self.refresh_peers().await;
+                }
+                if t % CELL_HOST_RECONCILE_TICKS == 7 {
+                    self.reconcile_cell_hosts(&fanout).await;
                 }
                 let _ = self.ticks.send(t);
             }

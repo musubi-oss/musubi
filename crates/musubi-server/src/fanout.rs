@@ -1249,6 +1249,44 @@ impl Fanout {
         )
     }
 
+    /// `node` hosts `cell` of `world` now (bus announcement, or the database reconcile standing
+    /// in for a lost one): the cache follows at once; the new host loads the cell and adopts the
+    /// previous host's shard, the previous host persists, ships its entities and drops the cell.
+    pub fn apply_cell_assign(&self, world: String, cell: musubi_mesh::CellId, node: uuid::Uuid) {
+        if let Some(w) = self.worlds.get().cloned() {
+            let prev = w.cell_host_cached(&world, cell);
+            w.note_cell_host(&world, cell, node);
+            if node == w.node_id() {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = w.host_cell(&world, cell).await {
+                        tracing::warn!(world = %world, ?cell, error = %e, "cell hosting failed");
+                        return;
+                    }
+                    if let Some(p) = prev.filter(|p| *p != w.node_id()) {
+                        if let Err(e) = w.adopt_cell_from(&world, cell, p).await {
+                            tracing::warn!(world = %world, ?cell, error = %e, "cell state not adopted");
+                        }
+                    }
+                    me.publish(Wire::WorldSubsRequest { world });
+                });
+            } else if prev == Some(w.node_id()) {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    // persist first: the new host merges our shard from the database
+                    if let Err(e) = w.snapshot_now(&world).await {
+                        tracing::warn!(world = %world, error = %e, "shard snapshot before release failed");
+                    }
+                    w.release_cell(&world, cell, node, &me);
+                    w.forget_adoptions(&world, cell);
+                    w.drop_idle_shard(&world);
+                });
+            } else {
+                w.forget_adoptions(&world, cell);
+            }
+        }
+    }
+
     fn apply(&self, m: &BusMessage) {
         if m.topic != TOPIC {
             return;
@@ -1516,11 +1554,20 @@ impl Fanout {
                                 // the assignment is authoritative, a directory that has not caught
                                 // up yet must not turn the entities away (non-persistent ones are
                                 // in no snapshot and would be lost — the stand saw it one run in two)
-                                if forced && fresh != Some(w.node_id()) {
+                                if forced
+                                    && fresh != Some(w.node_id())
+                                    && fresh.is_none_or(|h| h == from_node)
+                                {
                                     metrics::counter!("musubi_world_handover_recv_total", "path" => "forced_take")
                                         .increment(1);
                                 }
-                                if forced || fresh == Some(w.node_id()) {
+                                // …but only from the cell's previous host: a forced shipment
+                                // whose cell the record gives to a third node is misdirected
+                                // (taking it would make this node claim a cell it was never
+                                // assigned), so it is turned away and the sender retargets
+                                let forced_here = forced
+                                    && fresh.is_none_or(|h| h == w.node_id() || h == from_node);
+                                if forced_here || fresh == Some(w.node_id()) {
                                     metrics::counter!("musubi_world_handover_recv_total", "path" => "here_after_fresh_lookup").increment(1);
                                     if let Err(e) = w.ensure_hosting(&world, c).await {
                                         tracing::warn!(world = %world, ?c, error = %e, "handover target cell not hosted");
@@ -1669,38 +1716,7 @@ impl Fanout {
                 }
             }
             Wire::WorldCellAssign { world, cell, node } => {
-                if let Some(w) = self.worlds.get().cloned() {
-                    let prev = w.cell_host_cached(&world, cell);
-                    w.note_cell_host(&world, cell, node);
-                    if node == w.node_id() {
-                        let me = self.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = w.host_cell(&world, cell).await {
-                                tracing::warn!(world = %world, ?cell, error = %e, "cell hosting failed");
-                                return;
-                            }
-                            if let Some(p) = prev.filter(|p| *p != w.node_id()) {
-                                if let Err(e) = w.adopt_cell_from(&world, cell, p).await {
-                                    tracing::warn!(world = %world, ?cell, error = %e, "cell state not adopted");
-                                }
-                            }
-                            me.publish(Wire::WorldSubsRequest { world });
-                        });
-                    } else if prev == Some(w.node_id()) {
-                        let me = self.clone();
-                        tokio::spawn(async move {
-                            // persist first: the new host merges our shard from the database
-                            if let Err(e) = w.snapshot_now(&world).await {
-                                tracing::warn!(world = %world, error = %e, "shard snapshot before release failed");
-                            }
-                            w.release_cell(&world, cell, node, &me);
-                            w.forget_adoptions(&world, cell);
-                            w.drop_idle_shard(&world);
-                        });
-                    } else {
-                        w.forget_adoptions(&world, cell);
-                    }
-                }
+                self.apply_cell_assign(world, cell, node)
             }
             Wire::WorldCmd(env) => {
                 if let Some(w) = self.worlds.get().cloned() {

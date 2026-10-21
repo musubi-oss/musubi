@@ -16935,6 +16935,70 @@ async fn cloud_save_merges_on_conflict() {
 
 /// An entity hands over from B's cell to A's cell, then B dies before its journal recorded the
 /// departure. The home re-homes B's cell from B's shard snapshot — which still lists the entity —
+/// Postgres-bus mode: the `WorldCellAssign` announcement is one `pg_notify`, lost on a listener
+/// reconnect. The assignment row is written directly (no admin call, so no bus message at all):
+/// the assigned node must still start hosting the cell from the periodic reconcile, the home must
+/// learn the host on its next lookup, and a lease on the assigned node must be served there.
+#[tokio::test]
+async fn world_cell_assignment_survives_lost_bus_announcement() {
+    let group = format!("xlost-{}", uuid::Uuid::now_v7().simple());
+    let Some(state_home) = build_state(true, &group).await else {
+        return;
+    };
+    let Some(state_a) = build_state(false, &group).await else {
+        return;
+    };
+    let router_home = musubi_server::http::router(state_home.clone());
+    let router_a = musubi_server::http::router(state_a.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router_home,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": name, "config": {"cell_size": 100.0, "replicas": 0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let node_a = state_a.worlds.node_id();
+    let cell = musubi_mesh::CellId::root(1, 0);
+    sqlx::query(
+        "insert into musubi.world_cell_hosts (name, x, y, level, node_id) values ($1, 1, 0, 0, $2)",
+    )
+    .bind(&name)
+    .bind(node_a)
+    .execute(&state_home.db)
+    .await
+    .unwrap();
+    // the reconcile runs every 3 s of node ticks
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !state_a.worlds.hosts_cell_cached(&name, cell) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "assigned node never started hosting the cell without the bus announcement"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // the home's cache misses (it never saw an announcement either): the lookup reads the row
+    assert_eq!(
+        state_home.worlds.cell_host_of(&name, cell).await.unwrap(),
+        Some(node_a)
+    );
+    let sim_a = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router_a,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim_a, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+}
+
 /// and must end up with one copy (on A), not two.
 #[tokio::test]
 async fn world_adopted_cell_drops_handed_over_duplicates() {
@@ -16978,21 +17042,22 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
         .await;
         assert_eq!(st, 200, "{v}");
     }
-    // the lease path asks the directory, so wait for what it will see, not for the bus;
-    // a fresh raft group under a parallel test load can take seconds to elect a leader
-    for (cell, state) in [
-        (musubi_mesh::CellId::root(0, 0), &state_a),
-        (musubi_mesh::CellId::root(1, 0), &state_b),
+    // every node must know both assignments before entities move: a node that has not seen
+    // one yet would ship a border-crossing entity to the home instead of the cell's host
+    for (cell, host) in [
+        (musubi_mesh::CellId::root(0, 0), node_a),
+        (musubi_mesh::CellId::root(1, 0), node_b),
     ] {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while state.worlds.cell_host_of(&name, cell).await.ok().flatten()
-            != Some(state.worlds.node_id())
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cell {cell:?} not assigned to its node"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for state in [&state_home, &state_a, &state_b] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while state.worlds.cell_host_of(&name, cell).await.ok().flatten() != Some(host) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cell {cell:?} not known as {host}'s on node {}",
+                    state.worlds.node_id()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
         }
     }
     let sim_a = uuid::Uuid::now_v7();
