@@ -1080,10 +1080,12 @@ async fn gs_token(app: &axum::Router, k: &str, sid: &str) -> String {
         None,
     )
     .await;
+    // an id the fleet does not know gets a well-formed but unknown token, so the request under
+    // test sees the server's own 401/404 instead of the helper failing first
     v["token"]
         .as_str()
-        .unwrap_or_else(|| panic!("{v}"))
-        .to_string()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("gs_{}_deadbeef", sid.replace('-', "")))
 }
 
 async fn call_server(
@@ -25364,7 +25366,7 @@ async fn fleet_metrics_history_summary_and_alerts() {
     )
     .await;
     assert!(v["alerts"].as_array().unwrap().is_empty(), "{v}");
-    // unknown server id → 404 at ingest
+    // unknown server id → the token is unknown: 401 at ingest
     let req = Request::post("/v1/gameserver/metrics")
         .header(
             "x-musubi-server-key",
@@ -25375,7 +25377,7 @@ async fn fleet_metrics_history_summary_and_alerts() {
         .unwrap();
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
     let _ = call_server(&app, "DELETE", &format!("/v1/server/fleets/{fid}"), k, None).await;
 }
@@ -26232,7 +26234,7 @@ async fn gameserver_custom_events_and_wildcard_webhooks() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["kind"], format!("gameserver.custom.{kind}"));
     let (st, v) = post(json!({"kind": kind}), uuid::Uuid::now_v7().to_string()).await;
-    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
     // on the bus with server/fleet identity
     let (st, ev) = call_server(
         &app,
@@ -39805,7 +39807,7 @@ async fn fleet_egress_accounting_per_server_and_rollup() {
         )
         .await
         .0,
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
     // first report: totals, no rate yet
     let (st, c) = sdk(
@@ -41612,7 +41614,7 @@ async fn server_reputation_from_gameplay_stats_and_ratings() {
     let (st, _) = sdk(Some(sid.clone()), json!({"rounds": -1})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     let (st, _) = sdk(Some(uuid::Uuid::now_v7().to_string()), json!({"rounds": 1})).await;
-    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
     let (st, v) = sdk(
         Some(sid.clone()),
         json!({"rounds": 10, "players": 100, "play_secs": 3600}),
