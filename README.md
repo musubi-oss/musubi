@@ -122,8 +122,11 @@ completions went from ~3 000 to 3 500–4 100 of ~5 800 asked. A receiver whose 
 its own now asks the leader before turning the entity away (`here_after_fresh_lookup`: 353 of
 521 such arrivals in a run were in fact its cells; the 168 `not_here_confirmed` are refused at
 once instead of silently, so the sender re-targets on the next tick rather than after the
-timeout) — 3 750 of 5 801 asked completed in that run. The bench's "asked" column counts the forced migrations
-too, so the completed/asked ratio understates the border handovers that complete. The bus frame
+timeout) — 3 750 of 5 801 asked completed in that run. The bench's "asked" column used to count every
+`handover_request` event, and an entity the home re-offers on the next tick while its first
+request is open appeared again; it now counts distinct requests and reports the repeats as
+`handover_asks_repeated` (forced migrations of offloaded cells never were in it — they reach
+the simulator as `cell_released`). The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):

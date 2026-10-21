@@ -69,7 +69,10 @@ struct WorldTotals {
     err_stream: AtomicU64,
     stream_frames: AtomicU64,
     stream_reconnects: AtomicU64,
+    /// Distinct handover requests seen on the simulator streams (an entity asked again on a
+    /// later tick while its first request is still open counts in `handover_asks_repeated`).
     handover_acks: AtomicU64,
+    handover_asks_repeated: AtomicU64,
 }
 
 struct Arena {
@@ -578,6 +581,7 @@ async fn host_stream(
         ))
     };
     let mut frame_no = 0u64;
+    let mut pending_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut first = true;
     while !past(&deadline) {
         if !first {
@@ -669,9 +673,24 @@ async fn host_stream(
                 totals.sim_ticks.fetch_add(1, Ordering::Relaxed);
                 let mut out: Vec<String> = Vec::new();
                 for ev in v["events"].as_array().into_iter().flatten() {
-                    if ev["type"] == "handover_request" {
-                        totals.handover_acks.fetch_add(1, Ordering::Relaxed);
-                        out.push(json!({"op": "handover_ack", "entity": ev["entity"]}).to_string());
+                    let entity = ev["entity"].as_str().unwrap_or("").to_string();
+                    match ev["type"].as_str().unwrap_or("") {
+                        "handover_request" => {
+                            if pending_asks.insert(entity) {
+                                totals.handover_acks.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                totals
+                                    .handover_asks_repeated
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            out.push(
+                                json!({"op": "handover_ack", "entity": ev["entity"]}).to_string(),
+                            );
+                        }
+                        "handover_completed" | "handover_cancelled" | "handover_arrived" => {
+                            pending_asks.remove(&entity);
+                        }
+                        _ => {}
                     }
                 }
                 let mut i = 0u64;
@@ -1406,6 +1425,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "stream_frames_per_sim_per_sec": totals.stream_frames.load(Ordering::Relaxed) as f64 / secs / (o.sims.max(1) * arenas.len().max(1)) as f64,
             "stream_reconnects": totals.stream_reconnects.load(Ordering::Relaxed),
             "handover_acks": totals.handover_acks.load(Ordering::Relaxed),
+            "handover_asks_repeated": totals.handover_asks_repeated.load(Ordering::Relaxed),
             "handovers_completed": scrape_counter(&http, &url, &format!("bench-{run_id}"), "musubi_world_handovers_total").await,
             "fanout": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_fanout_duration_seconds").await,
         }) },
