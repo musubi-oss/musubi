@@ -188,6 +188,13 @@ fn tx_apply_local(st: &mut WorldState, tx: Uuid, ops: &[TxOp]) -> Vec<EntityId> 
 /// Ship an entity to the node hosting its new cell. When the neighbours already hold it as a
 /// ghost, only the components newer than the revision they have travel (`base_rev`); the
 /// receiver merges them onto its ghost. After a `resend_full` refusal the full state goes.
+/// One entity in sixteen gets a timeline in the log (`hotrace`): ship, arrival, ack, apply,
+/// expiry — with the sender's and receiver's clocks, to see where a cross-node handover
+/// spends its time.
+fn traced(id: EntityId) -> bool {
+    id.to_string().ends_with('0')
+}
+
 fn ship_handover(
     st: &mut WorldState,
     fanout: &Fanout,
@@ -208,6 +215,10 @@ fn ship_handover(
     let base: Option<u64> = None;
     if let Some(r) = base {
         std::sync::Arc::make_mut(&mut e.components).retain(|_, c| c.changed_rev > r);
+    }
+    if traced(id) {
+        let n = st.remote_transit.get(&id).map(|(_, n, _)| *n).unwrap_or(0);
+        tracing::debug!(world = name, %id, attempt = n, ms = musubi_cluster::unix_ms(), "hotrace: ship");
     }
     fanout.world_handover(name, e, node_id, inputs, false, base);
 }
@@ -3345,6 +3356,9 @@ impl WorldRegistry {
         }
         let durable = entity.persistent;
         tracing::debug!(world = name, %id, %from_node, forced, "handover: entity arrived");
+        if traced(id) {
+            tracing::debug!(world = name, %id, ms = musubi_cluster::unix_ms(), "hotrace: arrived, acking");
+        }
         st.world.restore(vec![entity]);
         if let Some(owner) = owner {
             let state = st.world.get(id).map(to_wire);
@@ -3385,6 +3399,9 @@ impl WorldRegistry {
             let gone = st.world.get(id).is_none();
             metrics::counter!("musubi_world_handover_acks_total", "path" => if gone { "late_gone" } else { "late_kept" }, "accepted" => accepted.to_string())
                 .increment(1);
+            if traced(id) {
+                tracing::debug!(world = name, %id, %acker, accepted, gone, in_remote_transit = st.remote_transit.contains_key(&id), ms = musubi_cluster::unix_ms(), "hotrace: ack late");
+            }
             metrics::counter!("musubi_world_handover_acks_total", "path" => "late", "accepted" => accepted.to_string())
                 .increment(1);
             // a late ack for a handover we already cancelled: if the receiver took the entity
@@ -3441,6 +3458,9 @@ impl WorldRegistry {
         };
         metrics::counter!("musubi_world_handover_acks_total", "path" => "in_transit", "accepted" => accepted.to_string())
             .increment(1);
+        if traced(id) {
+            tracing::debug!(world = name, %id, %acker, accepted, ms = musubi_cluster::unix_ms(), "hotrace: ack in transit");
+        }
         st.remote_transit.remove(&id);
         st.kept_after_cancel.remove(&id);
         if !accepted && resend_full {
@@ -4618,6 +4638,9 @@ impl WorldRegistry {
                         }
                         if n + 1 == REMOTE_HANDOVER_RETRIES {
                             tracing::warn!(world = %name, %entity, %host, tries = n + 1, "cross-node handover still unacknowledged; keeps retrying");
+                        }
+                        if traced(entity) {
+                            tracing::debug!(world = %name, %entity, attempt = n + 1, ms = musubi_cluster::unix_ms(), "hotrace: expired, re-shipping");
                         }
                         st.remote_transit.insert(entity, (host, n + 1, target));
                         if st.world.begin_remote_handover(entity, host) {

@@ -108,14 +108,20 @@ duplicates are 16 a run; a handover ships the full entity (a delta against a gho
 no longer held was refused one time in five); a world deleted on its home is dropped on every
 node (the peer kept the shards of 198 deleted bench and test worlds); the remote-handover
 timeout is 30 ticks (`remote_handover_timeout_ticks`), acks travel on the parallel lane, the
-control lane keeps 8 sends in flight with order restored on the receiver. What is left is
-measured too: of ~18 500 handovers shipped in two runs the peer accepted ~17 500, but only 3 331
-acks reached the sender within the 1 s timeout — 12 495 arrived after it, for entities the
-sender had already let go. The acks leave the peer promptly; the sender's inbound bus dispatch
-(one task, ~9 000 messages/s on this stand) is the suspect, and a send timestamp on the frame
-is the next measurement. Separately, the session and bulk lanes of the home run 15–25 s behind
-under this load because every bus frame is a `serde_json::Value` serialized twice on send and
-decoded twice on receive — a raw payload is the next bus change.
+control lane keeps 8 sends in flight with order restored on the receiver. What is left is measured too, down
+to single entities (`hotrace` debug lines on both nodes, one entity in sixteen): a border
+handover shipped to the peer is acked while still in transit 264 times of 266 — the cross-node
+path itself works and takes ~60 ms; the ~6 400 "late" acks a run are the peer's acks to the
+forced migrations of offloaded cells (the home drops those entities as it ships them, so an ack
+finds nothing — benign); and the real remaining defect is a refusal: while a cell changes host
+the sender's cell directory says the peer hosts it and the peer's says it does not (`not_here`,
+~750 a run), the entity is re-shipped every ~60 ms until the directories agree or the timeout
+rolls it back. Next: re-resolve the target through the leader on a refusal, with a backoff,
+and lease-fence the receiver's check. The bench's "asked" column counts the forced migrations
+too, so the completed/asked ratio understates the border handovers that complete. Separately,
+the session and bulk lanes of the home run 15–25 s behind under this load because every bus
+frame is a `serde_json::Value` serialized twice on send and decoded twice on receive — a raw
+payload is the next bus change.
 
 Read it as: the simulation step (`musubi_world_tick_duration_seconds`) is never the problem —
 1.5 ms mean with 4 000 entities and 8 simulators handing entities to each other 280 times a
