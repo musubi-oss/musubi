@@ -2413,12 +2413,36 @@ impl WorldRegistry {
         self.info(name).map(Some)
     }
 
-    pub async fn delete(&self, name: &str) -> Result<()> {
+    pub async fn delete(&self, name: &str, fanout: Option<&Fanout>) -> Result<()> {
         self.worlds
             .remove(name)
             .map(|_| ())
             .ok_or_else(|| Error::NotFound(format!("world {name}")))?;
         self.homes.remove(name);
+        // the shards hosting this world's cells on other nodes only learn of the deletion from
+        // us: the stand's peer kept the shards of every deleted bench world (198 of them),
+        // ticking and answering handovers for worlds the home no longer had
+        let cells: Vec<CellId> = self
+            .cell_hosts
+            .iter()
+            .filter(|e| e.key().0 == name)
+            .map(|e| e.key().1)
+            .collect();
+        self.cell_hosts.retain(|k, _| k.0 != name);
+        if let Some(c) = self.cluster.get() {
+            if c.raft_id() != 0 {
+                for cell in cells {
+                    let _ = c
+                        .directory_write(musubi_cluster::DirectoryOp::Delete {
+                            key: Self::cell_key(name, cell),
+                        })
+                        .await;
+                }
+            }
+        }
+        if let Some(f) = fanout {
+            f.world_deleted(name);
+        }
         if let Some(db) = &self.db {
             sqlx::query("delete from musubi.worlds where name = $1 and node_id = $2")
                 .bind(name)
@@ -2434,6 +2458,15 @@ impl WorldRegistry {
         }
         self.publish_home(name, None).await;
         Ok(())
+    }
+
+    /// The home deleted `name`: drop our shard of it and everything we remember about its cells.
+    pub fn forget_world(&self, name: &str) {
+        if self.worlds.remove(name).is_some() {
+            tracing::info!(world = name, "shard dropped: world deleted by its home");
+        }
+        self.homes.remove(name);
+        self.cell_hosts.retain(|k, _| k.0 != name);
     }
 
     pub fn info(&self, name: &str) -> Result<WorldInfo> {

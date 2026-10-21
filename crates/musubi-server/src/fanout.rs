@@ -209,6 +209,10 @@ enum Wire {
     },
     /// Several bulk messages (replica/ghost deltas) in one bus frame: the bulk lane drains its
     /// queue into one frame so one QUIC send carries a whole tick's worth of deltas.
+    /// The home deleted `world`: shards hosting its cells elsewhere go with it.
+    WorldDeleted {
+        world: String,
+    },
     WorldBatch(Vec<Wire>),
     /// A control-lane message with its place in the sender's order: the lane keeps several
     /// sends in flight (one at a time was ~110 msg/s on a loaded node, a third of the handovers
@@ -513,6 +517,12 @@ impl Fanout {
 
     pub fn world_cmd(&self, env: WorldCmdEnv) {
         self.publish(Wire::WorldCmd(env));
+    }
+
+    pub fn world_deleted(&self, world: &str) {
+        self.publish(Wire::WorldDeleted {
+            world: world.to_string(),
+        });
     }
 
     /// A burst of world commands (subscription replay) as a few batches, order kept.
@@ -1216,6 +1226,11 @@ impl Fanout {
             Wire::WorldSubsRequest { world } => {
                 if let Some(w) = self.worlds.get().cloned() {
                     w.replay_subs(&world, self);
+                }
+            }
+            Wire::WorldDeleted { world } => {
+                if let Some(w) = self.worlds.get() {
+                    w.forget_world(&world);
                 }
             }
             Wire::WorldCellAssign { world, cell, node } => {

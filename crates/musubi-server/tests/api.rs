@@ -3910,7 +3910,7 @@ async fn raft_leader_owns_leases_and_world_directory() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    wa.delete(&world).await.unwrap();
+    wa.delete(&world, None).await.unwrap();
     let t2 = Instant::now();
     loop {
         if b.directory_get(&format!("world:{world}")).await.is_none() {

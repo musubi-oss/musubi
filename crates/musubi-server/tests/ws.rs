@@ -4414,7 +4414,7 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
     let r3 = musubi_server::realtime::WorldRegistry::new(uuid::Uuid::now_v7(), Some(db.clone()))
         .with_group(&group);
     assert!(r3.recover(&[n1]).await.unwrap().is_empty());
-    r2.delete(&name).await.unwrap();
+    r2.delete(&name, None).await.unwrap();
     sqlx::query("delete from musubi.nodes where id = $1")
         .bind(n2)
         .execute(&db)
@@ -4803,7 +4803,7 @@ async fn world_journal_is_replayed_on_rehome() {
     );
     assert!(view.contains("\"name\":\"hp\",\"value\":5"), "{view}");
     assert!(view.contains("chest"), "{view}");
-    r2.delete(&name).await.unwrap();
+    r2.delete(&name, None).await.unwrap();
 }
 
 /// A session opened with `resumable=true` survives losing its socket: subscriptions and the
@@ -10125,7 +10125,7 @@ async fn world_fenced_host_cannot_persist() {
     assert_eq!(journal, 0);
     // the new home persists freely
     r2.snapshot_now(&name).await.unwrap();
-    r2.delete(&name).await.unwrap();
+    r2.delete(&name, None).await.unwrap();
 }
 
 #[tokio::test]
@@ -15612,7 +15612,7 @@ async fn world_history_and_verify() {
         .await
         .unwrap();
     assert!(rows >= 1);
-    r1.delete(&name).await.unwrap();
+    r1.delete(&name, None).await.unwrap();
 }
 
 /// Export → damage → restore brings the account's rows back exactly; merge keeps live rows;

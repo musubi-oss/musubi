@@ -408,7 +408,7 @@ async fn delete(
 ) -> Result<Json<Value>, Response> {
     ensure_home(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
-        s.worlds.delete(&w).await?;
+        s.worlds.delete(&w, Some(&s.fanout)).await?;
         s.events
             .emit("world.deleted", None, serde_json::json!({ "name": w }))
             .await;
