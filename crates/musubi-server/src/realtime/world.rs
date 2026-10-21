@@ -1074,6 +1074,15 @@ impl WorldRegistry {
         Ok(out)
     }
 
+    /// Whether this node hosts `cell` by the cached directory: an assigned host, or the home for
+    /// an unassigned cell.
+    pub fn hosts_cell_cached(&self, name: &str, cell: CellId) -> bool {
+        match self.cell_host_cached(name, cell) {
+            Some(h) => h == self.node_id,
+            None => self.worlds.get(name).is_some_and(|w| !w.lock().hosted_only),
+        }
+    }
+
     /// Cached host of `cell` (no directory lookup).
     pub fn cell_host_cached(&self, name: &str, cell: CellId) -> Option<Uuid> {
         self.cell_hosts.get(&(name.to_string(), cell)).map(|h| *h)

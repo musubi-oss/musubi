@@ -118,9 +118,11 @@ the hosted target cell had no simulator lease yet (the bench simulator was still
 offload redirect), the sender re-offered it every tick (~60 ms) for as long as that took. A
 hosted cell without a lease now takes the entity and holds it, as an unleased cell on one node
 does (`unowned_cell` in the receiver's funnel: 11 500 of 16 600 arrivals in two runs) —
-completions went from ~3 000 to 3 500–4 100 of ~5 800 asked. What remains: `not_here` (~700 a
-run, sender's and receiver's cell directories disagree while a cell changes host; the sender
-waits the full timeout) — re-resolve through the leader on arrival, with a backoff on the sender. The bench's "asked" column counts the forced migrations
+completions went from ~3 000 to 3 500–4 100 of ~5 800 asked. A receiver whose cached cell directory says the cell is not
+its own now asks the leader before turning the entity away (`here_after_fresh_lookup`: 353 of
+521 such arrivals in a run were in fact its cells; the 168 `not_here_confirmed` are refused at
+once instead of silently, so the sender re-targets on the next tick rather than after the
+timeout) — 3 750 of 5 801 asked completed in that run. The bench's "asked" column counts the forced migrations
 too, so the completed/asked ratio understates the border handovers that complete. Separately,
 the session and bulk lanes of the home run 15–25 s behind under this load because every bus
 frame is a `serde_json::Value` serialized twice on send and decoded twice on receive — a raw

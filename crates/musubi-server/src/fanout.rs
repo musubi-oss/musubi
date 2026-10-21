@@ -573,6 +573,32 @@ impl Fanout {
         self.publish(Wire::WorldCmd(env));
     }
 
+    /// Accept a handed-over entity and ack it once the journal is durable.
+    #[allow(clippy::too_many_arguments)]
+    fn take_handover(
+        &self,
+        w: Arc<WorldRegistry>,
+        world: String,
+        entity: musubi_mesh::Entity,
+        from_node: uuid::Uuid,
+        inputs: Vec<serde_json::Value>,
+        forced: bool,
+        base_rev: Option<u64>,
+    ) {
+        let id = entity.id;
+        if w.accept_handover(&world, entity, from_node, inputs, forced, base_rev, self) {
+            metrics::counter!("musubi_world_handover_recv_total", "path" => "accepted")
+                .increment(1);
+            let me = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = w.flush_journal(&world).await {
+                    tracing::warn!(world = %world, error = %e, "handover journal flush failed");
+                }
+                me.world_handover_ack(&world, id, from_node, true, false);
+            });
+        }
+    }
+
     pub fn world_deleted(&self, world: &str) {
         self.publish(Wire::WorldDeleted {
             world: world.to_string(),
@@ -1193,20 +1219,44 @@ impl Fanout {
                 base_rev,
             } => {
                 if let Some(w) = self.worlds.get().cloned() {
-                    let id = entity.id;
                     metrics::counter!("musubi_world_handover_recv_total", "path" => "received")
                         .increment(1);
-                    if w.accept_handover(&world, entity, from_node, inputs, forced, base_rev, self)
-                    {
-                        metrics::counter!("musubi_world_handover_recv_total", "path" => "accepted")
-                            .increment(1);
-                        let me = self.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = w.flush_journal(&world).await {
-                                tracing::warn!(world = %world, error = %e, "handover journal flush failed");
-                            }
-                            me.world_handover_ack(&world, id, from_node, true, false);
-                        });
+                    // the cached cell directory can lag the assignment the sender acted on
+                    // (a cell changing host): when it says the cell is not ours, ask the
+                    // leader before turning the entity away — a refusal here left the sender
+                    // waiting out the whole timeout
+                    match w.cell_of(&world, entity.pos) {
+                        Ok(c) if w.hosts_cell_cached(&world, c) => {
+                            self.take_handover(
+                                w, world, entity, from_node, inputs, forced, base_rev,
+                            );
+                        }
+                        _ => {
+                            let me = self.clone();
+                            tokio::spawn(async move {
+                                let Ok(c) = w.cell_of_any(&world, entity.pos).await else {
+                                    me.world_handover_ack(
+                                        &world, entity.id, from_node, false, false,
+                                    );
+                                    return;
+                                };
+                                let fresh = w.cell_host_of(&world, c).await.ok().flatten();
+                                if fresh == Some(w.node_id()) {
+                                    metrics::counter!("musubi_world_handover_recv_total", "path" => "here_after_fresh_lookup").increment(1);
+                                    if let Err(e) = w.ensure_hosting(&world, c).await {
+                                        tracing::warn!(world = %world, ?c, error = %e, "handover target cell not hosted");
+                                    }
+                                    me.take_handover(
+                                        w, world, entity, from_node, inputs, forced, base_rev,
+                                    );
+                                } else {
+                                    metrics::counter!("musubi_world_handover_recv_total", "path" => "not_here_confirmed").increment(1);
+                                    me.world_handover_ack(
+                                        &world, entity.id, from_node, false, false,
+                                    );
+                                }
+                            });
+                        }
                     }
                 }
             }
