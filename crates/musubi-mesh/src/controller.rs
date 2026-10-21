@@ -61,6 +61,12 @@ pub struct ControllerConfig {
     pub merge_cell_after_rounds: u32,
     /// How a free cell picks its simulator (plan 4.3 pluggable placement).
     pub strategy: Strategy,
+    /// Home-node cell offload: when the cells hosted on the home node cost more than this
+    /// (`cell_cost` summed) and another node with the `sim` role is alive, the hottest local cell
+    /// moves to the least-loaded peer, one per control round. 0 = never offload.
+    pub offload_above_cost: f64,
+    /// Control rounds to wait after an offload before the next one (state adoption settles).
+    pub offload_cooldown_rounds: u32,
     /// `custom` without a synchronous picker: ticks a free cell waits for an asynchronous
     /// hint (the embedder asks its hook once per control round) before falling back to
     /// adjacency.
@@ -105,6 +111,8 @@ impl Default for ControllerConfig {
             merge_cell_cost: 60.0,
             merge_cell_after_rounds: 30,
             strategy: Strategy::Adjacency,
+            offload_above_cost: 0.0,
+            offload_cooldown_rounds: 3,
             custom_wait_ticks: 60,
         }
     }

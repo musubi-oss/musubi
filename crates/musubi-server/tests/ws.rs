@@ -20757,3 +20757,110 @@ async fn world_global_entities_reach_far_subscribers() {
     assert_eq!(st, 200);
     assert_eq!(v["globals"], json!([]));
 }
+
+/// With `controller.offload_above_cost` set, the home node spreads cells over `sim`-role peers by
+/// itself: the hottest local cell moves to the least-loaded peer on a control round (the same
+/// path as the admin `cells/{x}/{y}/host` route), and the entity stays reachable there.
+#[tokio::test]
+async fn world_cells_offload_automatically() {
+    let group = format!("offload-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({
+            "name": name,
+            "config": {"cell_size": 100.0},
+            "controller": {"offload_above_cost": 0.5, "cost_entity": 1.0, "offload_cooldown_rounds": 0}
+        })),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let sim = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": sim, "cells": [{"x": 0, "y": 0}, {"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    for x in [10.0, 150.0, 160.0] {
+        let (st, e) = http_json(
+            &router1,
+            "POST",
+            &format!("/v1/server/worlds/{name}/spawn"),
+            None,
+            true,
+            Some(serde_json::json!({"sim": sim, "x": x, "y": 10.0, "components": {}, "persistent": false})),
+        )
+        .await;
+        assert_eq!(st, 200, "{e}");
+    }
+    // the hottest cell is (1,0) with two entities; the home hands it to the peer within a few
+    // control rounds (every 30 ticks) and from then on redirects views of it
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut moved = false;
+    while std::time::Instant::now() < deadline {
+        let (st, _) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        if st == 307 || st == 409 {
+            moved = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert!(moved, "home never offloaded cell (1,0)");
+    // the peer now hosts it with the entities adopted
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut owned = 0;
+    while std::time::Instant::now() < deadline {
+        let (st, view) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        if st == 200 {
+            owned = view["owned"].as_array().map(|a| a.len()).unwrap_or(0);
+            if owned == 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert_eq!(owned, 2, "entities not adopted by the new host");
+    // the cell with one entity stays home: the remaining cost is under the threshold's reach
+    let (st, view) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/view/0/0"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{view}");
+}

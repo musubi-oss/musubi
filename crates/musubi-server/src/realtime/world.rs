@@ -505,6 +505,11 @@ const ADOPT_ANNOUNCE_TICKS: u32 = 60;
 const ADOPT_ANNOUNCE_EVERY: u32 = 20;
 
 pub struct WorldRegistry {
+    /// Runtime the tick threads hand async work to (cell offload directory writes).
+    rt: std::sync::OnceLock<tokio::runtime::Handle>,
+    me: std::sync::OnceLock<std::sync::Weak<WorldRegistry>>,
+    /// Control rounds left before a world may offload another cell.
+    offload_cooldown: DashMap<String, u32>,
     node_id: Uuid,
     /// `[worlds] enabled`: off, every world operation is refused.
     enabled: std::sync::atomic::AtomicBool,
@@ -689,6 +694,9 @@ impl WorldRegistry {
             cell_hosts: DashMap::new(),
             mirrors: DashMap::new(),
             peers: std::sync::RwLock::new(Vec::new()),
+            rt: std::sync::OnceLock::new(),
+            me: std::sync::OnceLock::new(),
+            offload_cooldown: DashMap::new(),
             host_terms: DashMap::new(),
             adopted_from: DashSet::new(),
             adopted_pending: DashMap::new(),
@@ -4339,6 +4347,7 @@ impl WorldRegistry {
                     announce(st, a);
                 }
                 self.request_placement_hints(st, &name);
+                self.offload_cells(st, &name, fanout);
                 for (cell, sim, ephemeral) in st.controller.hibernate(&mut st.world) {
                     if let Some(sim) = sim {
                         push_event(
@@ -4589,6 +4598,8 @@ impl WorldRegistry {
         let period = Duration::from_millis(1000 / TICK_HZ);
         // the fan-out spawns onto the runtime; a plain thread has no runtime context of its own
         let rt = tokio::runtime::Handle::current();
+        let _ = self.rt.set(rt.clone());
+        let _ = self.me.set(Arc::downgrade(self));
         for w in self.worlds.iter() {
             let name = w.key().clone();
             if !self.ticking.lock().insert(name.clone()) {
@@ -4670,6 +4681,81 @@ impl WorldRegistry {
     /// cells should go — `{world, tick, cells, sims: [{id, capacity, cells, players, cost}]}` →
     /// `{placements: [{cell, sim}]}` — off the tick; the answers steer `pick` from the next
     /// control round on (anything outside the live candidates falls back to adjacency).
+    /// Home-node cell offload (the replication layer spread over nodes without an operator):
+    /// when the cells this home shard hosts cost more than `offload_above_cost` and a peer with
+    /// the `sim` role is alive, the hottest local cell without entities in transit is assigned to
+    /// the peer hosting the fewest cells of this world — the same path as
+    /// `POST /v1/admin/worlds/{w}/cells/{x}/{y}/host` (directory write, `WorldCellAssign` on the
+    /// bus, snapshot here, adoption there). One cell per control round, then a cooldown.
+    fn offload_cells(&self, st: &mut WorldState, name: &str, fanout: &Fanout) {
+        let threshold = st.controller.cfg.offload_above_cost;
+        if st.hosted_only || threshold <= 0.0 {
+            return;
+        }
+        if let Some(mut left) = self.offload_cooldown.get_mut(name) {
+            if *left > 0 {
+                *left -= 1;
+                return;
+            }
+        }
+        let peers: Vec<Uuid> = self.peers.read().map(|p| p.clone()).unwrap_or_default();
+        if peers.is_empty() {
+            return;
+        }
+        let Some(rt) = self.rt.get().cloned() else {
+            return;
+        };
+        let mut local: Vec<(f64, CellId)> = st
+            .world
+            .leased_cells()
+            .into_iter()
+            .map(|(c, _)| c)
+            .filter(|c| {
+                self.cell_host_cached(name, *c)
+                    .is_none_or(|h| h == self.node_id)
+            })
+            .map(|c| (st.controller.cell_cost(&st.world, c), c))
+            .collect();
+        let total: f64 = local.iter().map(|(cost, _)| cost).sum();
+        if total <= threshold || local.len() < 2 {
+            return;
+        }
+        local.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let Some((cost, cell)) = local
+            .into_iter()
+            .find(|(_, c)| !st.world.entities_of(*c).iter().any(|e| e.transit.is_some()))
+        else {
+            return;
+        };
+        // least-loaded peer: fewest cells of this world assigned to it in the directory cache
+        let target = peers
+            .iter()
+            .copied()
+            .min_by_key(|p| {
+                self.cell_hosts
+                    .iter()
+                    .filter(|e| e.key().0 == name && *e.value() == *p)
+                    .count()
+            })
+            .expect("peers non-empty");
+        self.offload_cooldown
+            .insert(name.to_string(), st.controller.cfg.offload_cooldown_rounds);
+        metrics::counter!("musubi_world_cells_offloaded_total", "world" => name.to_string())
+            .increment(1);
+        tracing::info!(world = %name, ?cell, cost, total, threshold, to = %target, "offloading cell to peer");
+        let Some(this) = self.me.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let (fanout, name) = (fanout.clone(), name.to_string());
+        rt.spawn(async move {
+            if let Err(e) = this.publish_cell_host(&name, cell, Some(target)).await {
+                tracing::warn!(world = %name, ?cell, error = %e, "cell offload: directory write failed");
+                return;
+            }
+            fanout.cell_assign(&name, cell, target);
+        });
+    }
+
     fn request_placement_hints(&self, st: &mut WorldState, name: &str) {
         if !matches!(st.controller.cfg.strategy, Strategy::Custom) {
             return;
