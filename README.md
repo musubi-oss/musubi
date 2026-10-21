@@ -150,7 +150,13 @@ so the gate is one second: the same run then holds 26.6 fps per client (p99 189 
 defers 424 deltas — only the ones that would have arrived useless — and the lane's worst wait is
 9.0 s instead of 11.5 s. Which says plainly that the remaining backlog is the session lane's own
 throughput (one send in flight, a thousand frames serialized per tick on the home), the next
-thing to take apart. The bus frame
+thing to take apart. First probe, measured and kept out of the code: four session lanes sharded
+by session id (order only matters per session) changed nothing — 25.7 fps, worst wait 12.3 s,
+average 7.3 s, i.e. the lanes queue behind each other on the one QUIC connection. The numbers
+that do point somewhere: a 64-frame session batch takes 23 ms on average (136 ms worst) to
+serialize and push, the home sends ~59 MB/s to the peer over the run, and the peer applies what
+arrives with an 8.6 ms average lag — the cost is on the sender's batch path (JSON of a thousand
+deltas a tick plus the send into the peer's flow-control window), not at the receiver. The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):

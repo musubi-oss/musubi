@@ -299,6 +299,8 @@ const TOPIC: &str = "realtime";
 /// runtime, and 512-message frames took 120–1 000 ms each and starved the sessions' sends (fps
 /// per client 24 → 18). 64 keeps a frame under ~20 ms; the real fix is a raw payload.
 const BULK_BATCH_MAX: usize = 64;
+/// One publish lane: a queue drained by its own task (see `Fanout::publish`).
+type Lane = OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>;
 /// `publish_many` chunk: 512 subscribe commands are ~200 KB on the wire, far under the QUIC cap.
 const PUBLISH_MANY_CHUNK: usize = 512;
 
@@ -446,15 +448,15 @@ pub struct Fanout {
     social: Arc<OnceLock<musubi_social::SocialService>>,
     /// Bus messages leave in the order they were published: one publisher task per node, fed by
     /// this queue (a task per message would let two inputs from one source overtake each other).
-    bus: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
-    bus_bulk: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    bus: Arc<Lane>,
+    bus_bulk: Arc<Lane>,
     /// Messages to sessions living on other nodes (world deltas above all): batched per drain so
     /// 1 000 remote players × 30 Hz is a few bus frames per tick, not 30 000 — and they no longer
     /// queue in front of handovers on the control lane.
-    bus_session: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    bus_session: Arc<Lane>,
     /// Player inputs for worlds homed elsewhere and inputs forwarded to the owning shard: one per
     /// player per input, batched — on the control lane they queued handovers 200 s behind them.
-    bus_input: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    bus_input: Arc<Lane>,
     /// Per sender: where its control-lane sequence stands and what arrived ahead of it.
     ordered: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, OrderState>>>,
     control_window: Arc<std::sync::Mutex<ControlWindow>>,
@@ -462,7 +464,7 @@ pub struct Fanout {
     /// the oldest waits. The world defers building the next delta for a session whose frame has
     /// waited longer than `SESSION_CONGESTED_AFTER` (`session_congested`).
     session_inflight: Arc<dashmap::DashMap<SessionId, (u32, std::time::Instant)>>,
-    bus_user: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    bus_user: Arc<Lane>,
 }
 
 impl Fanout {
@@ -1719,10 +1721,13 @@ impl Fanout {
         // messages queue 48 s behind chat in a single queue), and remote-session delivery (world
         // deltas to players on other nodes — batched; on the control lane 1 000 remote players ×
         // 30 Hz queued handovers behind 30 000 frames a second)
-        let (lane, concurrency, lane_name) = match w {
+        let (lane, concurrency, lane_name): (&Lane, usize, &'static str) = match &w {
             Wire::WorldGhosts { .. } | Wire::WorldRepl { .. } | Wire::WorldReplAck { .. } => {
                 (&self.bus_bulk, 1, "bulk")
             }
+            // one lane, not several sharded by session: four of them measured the same 7–12 s
+            // of wait on the stand — a 64-frame batch costs ~23 ms (136 max) to serialize and
+            // push through the shared QUIC connection, and the lanes only queue behind each other
             Wire::Session { .. } => (&self.bus_session, 1, "session"),
             // every player command: inputs, and the subscribe a client re-sends as its interest
             // moves (2 000 players: ~5 000/s on the stand, which on the control lane put the
