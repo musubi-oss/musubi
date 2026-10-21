@@ -3482,7 +3482,7 @@ async fn achievement_platform_ids_and_steam_sync() {
     let suffix = uuid::Uuid::now_v7().simple().to_string();
     let (ta, acc_a) = token(&router).await;
     let (tb, acc_b) = token(&router).await;
-    let steam_id = format!("7656119{}", &suffix[..10]);
+    let steam_id = format!("7656119{}", &suffix[suffix.len() - 10..]);
     sqlx::query(
         "insert into musubi.identities (id, account_id, provider, subject, verified) values ($1, $2, 'steam', $3, true)",
     )
@@ -3492,7 +3492,7 @@ async fn achievement_platform_ids_and_steam_sync() {
     .execute(&state.db)
     .await
     .unwrap();
-    let ach = format!("ach_{}", &suffix[..12]);
+    let ach = format!("ach_{}", &suffix[suffix.len() - 12..]);
     let (st, r) = http_json(&router, "POST", "/v1/server/achievements", None, true,
         Some(json!({"id": ach, "name": "Win twice", "target": 2, "platform_ids": {"steam": "ACH_WIN", "psn": "trophy_7"}}))).await;
     assert_eq!(st, 200, "{r}");
@@ -14201,9 +14201,9 @@ async fn dev_tools_fixtures_recording_replay_and_module_canary() {
     assert_eq!(st, 200, "{r}");
     let fx = format!("fx-{sfx}");
     let manifest = json!({"name": fx, "accounts": [
-        {"username": format!("alice-{}", &sfx[..8]), "display_name": "Alice", "inventory": [{"item_id": ore, "quantity": 3}],
+        {"username": format!("alice-{}", &sfx[sfx.len() - 8..]), "display_name": "Alice", "inventory": [{"item_id": ore, "quantity": 3}],
          "storage": [{"collection": "profile", "key": "main", "value": {"lvl": 3}}]},
-        {"username": format!("bob-{}", &sfx[..8])}
+        {"username": format!("bob-{}", &sfx[sfx.len() - 8..])}
     ]});
     let (st, a1) = http_json(
         &router,
@@ -14394,7 +14394,7 @@ async fn dev_tools_fixtures_recording_replay_and_module_canary() {
     assert!(d["deleted"].as_u64().unwrap() >= 1);
 
     // module canary: pinned account on v2, everyone else on v1; promote; rollback
-    let name = format!("ping{}", &sfx[..8]);
+    let name = format!("ping{}", &sfx[sfx.len() - 8..]);
     let res = router
         .clone()
         .oneshot(srv(
@@ -19514,7 +19514,10 @@ async fn world_custom_placement_follows_module_hook() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/v1/admin/runtime/modules/place{}", &sfx[..8]))
+                .uri(format!(
+                    "/v1/admin/runtime/modules/place{}",
+                    &sfx[sfx.len() - 8..]
+                ))
                 .header("x-musubi-server-key", k)
                 .header(header::CONTENT_TYPE, "application/wasm")
                 .body(Body::from(wat.into_bytes()))
@@ -19789,7 +19792,7 @@ async fn typed_match_state_syncs_snapshot_and_deltas() {
     };
     let f = "json";
     let sfx = uuid::Uuid::now_v7().simple().to_string();
-    let module = format!("sync{}", &sfx[..8]);
+    let module = format!("sync{}", &sfx[sfx.len() - 8..]);
     let reply = |off: usize, name: &str, json: &str| {
         format!(
             "  (data (i32.const {off}) \"{}\")\n  (func (export \"match_{module}_{name}\") (param i32 i32 i32 i32) (result i64)\n    i64.const {off} i64.const 32 i64.shl i64.const {} i64.or)\n",

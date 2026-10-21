@@ -14658,7 +14658,7 @@ async fn migrate_playfab_and_ugs_exports() {
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     let k = "defaultkey";
     let sfx = uuid::Uuid::now_v7().simple().to_string();
-    let pf = format!("PF{}", sfx[..14].to_ascii_uppercase());
+    let pf = format!("PF{}", sfx[sfx.len() - 14..].to_ascii_uppercase());
     let ug = format!("ugs-{sfx}");
     let dir = std::env::temp_dir().join(format!("musubi-pf-{sfx}"));
     std::fs::create_dir_all(&dir).unwrap();
@@ -14669,11 +14669,11 @@ async fn migrate_playfab_and_ugs_exports() {
             "InfoResultPayload": {
                 "PlayerProfile": {
                     "PlayerId": pf, "DisplayName": "Pf Hero",
-                    "LinkedAccounts": [{"Platform": "Steam", "PlatformUserId": format!("7656{}", &sfx[..10])}],
+                    "LinkedAccounts": [{"Platform": "Steam", "PlatformUserId": format!("7656{}", &sfx[sfx.len() - 10..])}],
                     "Statistics": [{"Name": "wins", "Value": 12}]
                 },
                 "AccountInfo": {
-                    "Username": format!("pf_{}", &sfx[..12]),
+                    "Username": format!("pf_{}", &sfx[sfx.len() - 12..]),
                     "PrivateInfo": {"Email": format!("{}@example.test", pf.to_ascii_lowercase())}
                 },
                 "UserData": {
@@ -14695,7 +14695,7 @@ async fn migrate_playfab_and_ugs_exports() {
         format!(
             "{}\n{}\n",
             json!({
-                "playerId": ug, "username": format!("ugs_{}", &sfx[..12]),
+                "playerId": ug, "username": format!("ugs_{}", &sfx[sfx.len() - 12..]),
                 "externalIds": [{"providerId": "google-play-games", "externalId": format!("g-{ug}")}],
                 "cloudSave": {"progress": {"value": {"level": 7}}},
                 "currencies": {"GEM": 20},
@@ -16117,8 +16117,8 @@ async fn idl_types_match_params_state_and_configs() {
     .await;
     let t = s["access_token"].as_str().unwrap();
     let sfx = uuid::Uuid::now_v7().simple().to_string();
-    let module = format!("tm{}", &sfx[..10]);
-    let cfg = format!("tuning_{}", &sfx[..10]);
+    let module = format!("tm{}", &sfx[sfx.len() - 10..]);
+    let cfg = format!("tuning_{}", &sfx[sfx.len() - 10..]);
     // a match module whose init state is {"round":"x"} (base64) and whose other parts keep it
     let reply = |off: usize, name: &str, json: &str| {
         format!(
@@ -16288,7 +16288,7 @@ version = 2
         "{l}"
     );
     // undeclared configs are free-form (version 1); names are checked
-    let free = format!("free_{}", &sfx[..10]);
+    let free = format!("free_{}", &sfx[sfx.len() - 10..]);
     let (st, c) = call_server(
         &app,
         "PUT",
@@ -19469,7 +19469,7 @@ async fn analytics_ingest_schemas_export_and_kpis() {
 async fn environments_registry_and_content_promotion() {
     let Some(app) = app().await else { return };
     let k = "defaultkey";
-    let env_name = format!("st{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+    let env_name = format!("st{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
     let target_env = env_name.clone();
     let Some(target) = app_with(move |c| c.node.environment = target_env).await else {
         return;
@@ -20648,7 +20648,7 @@ async fn redemption_codes_campaigns_keys_limits_and_history() {
         .collect();
     assert_eq!(codes.len(), 3);
     assert!(codes.iter().all(|c| c.starts_with("LNCH") && c.len() == 12));
-    let shared = format!("WELCOME{}", u.replace('-', "")[..6].to_uppercase());
+    let shared = format!("WELCOME{}", u.replace('-', "")[26..].to_uppercase());
     let (st, _) = srv(
         "POST",
         format!("/v1/server/codes/campaigns/{camp}/codes"),
@@ -29380,7 +29380,7 @@ async fn secrets_at_rest_status_and_reencrypt() {
     );
     assert!(!stored.contains("whsec"));
     // IdP client secret too; the API never returns it
-    let pname = format!("idp{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+    let pname = format!("idp{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
     let (st, v) = call_server(&app, "PUT", &format!("/v1/admin/auth/providers/{pname}"), k, Some(json!({
         "kind": "oauth2", "authorize_url": "https://idp.example/authorize", "token_url": "https://idp.example/token",
         "userinfo_url": "https://idp.example/me", "client_id": "cid", "redirect_urls": ["https://game.example/cb"], "client_secret": "css-very-secret", "enabled": false
@@ -34465,7 +34465,7 @@ async fn turn_based_matches_flow() {
     assert_eq!(r["result"]["score"], "1-0");
 
     // public open match: listing, join by code is for private; creator starts early; server API
-    let game = format!("go-{}", &uuid::Uuid::now_v7().simple().to_string()[..16]);
+    let game = format!("go-{}", &uuid::Uuid::now_v7().simple().to_string()[16..]);
     let (st, p) = call(
         &app,
         "POST",
@@ -35870,7 +35870,7 @@ async fn cors_allowlist_for_browser_clients() {
 async fn matchmaker_queue_controls_and_session_bulk_stop() {
     let Some(app) = app().await else { return };
     let k = "defaultkey";
-    let qn = format!("ctl-{}", &unique("q").to_ascii_lowercase()[..8]);
+    let qn = format!("ctl-{}", &unique("q").to_ascii_lowercase()[26..]);
     let (st, v) = call_server(
         &app,
         "PUT",
@@ -36779,7 +36779,7 @@ async fn countries_overrides_groups_and_config_selectors() {
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["total"], 1, "{v}");
 
-    let grp = format!("eu_{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+    let grp = format!("eu_{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
     let path = format!("/v1/server/country_groups/{grp}");
     for bad in [
         json!({"countries": []}),
@@ -41713,7 +41713,7 @@ async fn stable_server_hostnames_from_dns_zone() {
         hostname,
         format!(
             "{}.{}.gs.example.internal",
-            &sid.replace('-', "")[..8],
+            &sid.replace('-', "")[24..],
             name
         ),
         "{h}"
@@ -44238,7 +44238,7 @@ async fn content_tags_update_lookup_export_filter_and_drop() {
         format!("tagged-{sfx}"),
         format!("plain-{sfx}"),
     );
-    let tag = format!("feat-{}", &sfx[..10]);
+    let tag = format!("feat-{}", &sfx[sfx.len() - 10..]);
     let seed = json!({"format": 1, "tables": {
         "currencies": [{"code": cur, "name": "Tag Gold", "max_balance": 1000}],
         "items": [{"id": item, "name": "Sword", "category": "weapon"}, {"id": item2, "name": "Shield", "category": "armor"}],
