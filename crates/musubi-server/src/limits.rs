@@ -273,6 +273,19 @@ impl RateLimiter {
         self.daily("key_quota", &key, l.daily.unwrap_or(self.cfg.key_daily))
     }
 
+    /// Requests of one game server process on `/v1/gameserver/*`: the `[limits] key_*` defaults
+    /// per server id (0 = unlimited).
+    pub fn game_server(&self, id: uuid::Uuid) -> Result<()> {
+        let per_sec = self.cfg.key_per_second;
+        let burst = self.cfg.key_burst.max(per_sec);
+        let key = id.to_string();
+        if per_sec > 0 {
+            self.check("game_server", &key, per_sec as f64, burst as f64)
+                .map_err(|r| Self::limited("game_server", r))?;
+        }
+        self.daily("game_server_quota", &key, self.cfg.key_daily)
+    }
+
     /// A daily budget as a slow bucket: `daily` tokens that refill over 24 h, so a subject can
     /// spend its whole day's budget at once and then waits for it to come back gradually.
     /// Cluster-wide like every other bucket when `cluster_wide` is on.

@@ -14,10 +14,9 @@ use crate::app::AppState;
 use crate::game_sessions::{
     normalize_code, parse_id, NewSession, SearchSessions, Session, Template, UpdateSession,
 };
-use crate::http::extract::{Bearer, ServerKey};
+use crate::http::extract::{Bearer, GameServerAuth, ServerKey};
 use crate::http::ApiError;
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use musubi_core::{AccountId, Error};
@@ -68,15 +67,6 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/sessions/{id}/leave", post(leave))
         .route("/v1/sessions/{id}/invite", post(invite))
         .route("/v1/sessions/{id}/code", post(rotate_code))
-}
-
-fn self_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
-    let v = headers
-        .get("x-musubi-server-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Id".into()))?;
-    v.parse()
-        .map_err(|_| Error::InvalidArgument("bad server id".into()).into())
 }
 
 #[derive(Deserialize, Default)]
@@ -526,21 +516,19 @@ async fn delete_template(
 
 async fn sdk_session(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
 ) -> Result<Json<Value>, ApiError> {
-    let sess = s.game_sessions.by_server(self_id(&headers)?).await?;
+    let sess = s.game_sessions.by_server(sid).await?;
     let members = s.game_sessions.members(sess.id).await?;
     Ok(Json(json!({ "session": sess, "members": members })))
 }
 
 async fn sdk_update(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(u): Json<UpdateSession>,
 ) -> Result<Json<Session>, ApiError> {
-    let sess = s.game_sessions.by_server(self_id(&headers)?).await?;
+    let sess = s.game_sessions.by_server(sid).await?;
     let sess = s.game_sessions.update(sess.id, u).await?;
     s.events
         .emit(
@@ -561,11 +549,10 @@ struct AcceptReq {
 /// `left` tokens are 401 so the server can refuse the connection.
 async fn sdk_accept(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(r): Json<AcceptReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let sess = s.game_sessions.by_server(self_id(&headers)?).await?;
+    let sess = s.game_sessions.by_server(sid).await?;
     let m = s.game_sessions.accept(sess.id, &r.token).await?;
     s.events
         .emit(
@@ -586,11 +573,10 @@ struct LeftReq {
 
 async fn sdk_left(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(r): Json<LeftReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let sess = s.game_sessions.by_server(self_id(&headers)?).await?;
+    let sess = s.game_sessions.by_server(sid).await?;
     let left = s.game_sessions.leave(sess.id, r.account_id).await?;
     if left {
         s.events

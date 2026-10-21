@@ -2,7 +2,7 @@
 //! (server key + `X-Musubi-Server-Id`, Agones-like: ready / health / allocate / shutdown / label / connect).
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap};
+use axum::http::header;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::app::AppState;
-use crate::http::{ApiError, ServerKey};
+use crate::http::{ApiError, GameServerAuth, ServerKey};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -113,6 +113,7 @@ pub fn routes() -> Router<AppState> {
             get(server_get).delete(server_delete),
         )
         .route("/v1/gameserver", get(sdk_get))
+        .route("/v1/server/game_servers/{sid}/token", post(issue_token))
         .route("/v1/gameserver/ready", post(sdk_ready))
         .route("/v1/gameserver/health", post(sdk_health))
         .route("/v1/gameserver/allocate", post(sdk_allocate))
@@ -133,14 +134,6 @@ pub fn routes() -> Router<AppState> {
 
 fn parse(id: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(id).map_err(|_| Error::InvalidArgument("bad id".into()).into())
-}
-
-fn self_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
-    let v = headers
-        .get("x-musubi-server-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Id".into()))?;
-    parse(v)
 }
 
 async fn list(State(s): State<AppState>, ServerKey: ServerKey) -> Result<Json<Value>, ApiError> {
@@ -433,18 +426,16 @@ async fn server_delete(
 
 async fn sdk_get(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
 ) -> Result<Json<GameServer>, ApiError> {
-    Ok(Json(s.fleets.server(self_id(&headers)?).await?))
+    Ok(Json(s.fleets.server(sid).await?))
 }
 
 async fn sdk_ready(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
 ) -> Result<Json<GameServer>, ApiError> {
-    Ok(Json(s.fleets.sdk_ready(self_id(&headers)?).await?))
+    Ok(Json(s.fleets.sdk_ready(sid).await?))
 }
 
 /// `GET /v1/server/fleets/{id}/health` — per-server health status under the fleet's health
@@ -459,37 +450,33 @@ async fn health_report(
 
 async fn sdk_health(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
 ) -> Result<Json<Value>, ApiError> {
-    s.fleets.sdk_health(self_id(&headers)?).await?;
+    s.fleets.sdk_health(sid).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
 async fn sdk_allocate(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
 ) -> Result<Json<GameServer>, ApiError> {
-    Ok(Json(s.fleets.sdk_allocate(self_id(&headers)?).await?))
+    Ok(Json(s.fleets.sdk_allocate(sid).await?))
 }
 
 async fn sdk_shutdown(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
 ) -> Result<Json<Value>, ApiError> {
-    s.fleets.sdk_shutdown(self_id(&headers)?).await?;
+    s.fleets.sdk_shutdown(sid).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
 async fn sdk_label(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(labels): Json<Value>,
 ) -> Result<Json<GameServer>, ApiError> {
-    Ok(Json(s.fleets.sdk_labels(self_id(&headers)?, labels).await?))
+    Ok(Json(s.fleets.sdk_labels(sid, labels).await?))
 }
 
 #[derive(Deserialize, Default)]
@@ -503,16 +490,11 @@ struct ReserveReq {
 /// scale-down (Agones `Reserve`); `ready` / `allocate` cancel, the reconciler releases timed holds.
 async fn sdk_reserve(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     body: Option<Json<ReserveReq>>,
 ) -> Result<Json<GameServer>, ApiError> {
     let b = body.map(|Json(b)| b).unwrap_or_default();
-    Ok(Json(
-        s.fleets
-            .reserve(self_id(&headers)?, b.seconds, "server")
-            .await?,
-    ))
+    Ok(Json(s.fleets.reserve(sid, b.seconds, "server").await?))
 }
 
 /// `POST /v1/server/gameservers/{id}/reserve {seconds}` — an external matchmaker / server
@@ -546,14 +528,11 @@ struct PlayersReq {
 /// `POST /v1/gameserver/players {players, capacity?}` — occupancy for backfill allocations.
 async fn sdk_players(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(r): Json<PlayersReq>,
 ) -> Result<Json<GameServer>, ApiError> {
     Ok(Json(
-        s.fleets
-            .sdk_players(self_id(&headers)?, r.players, r.capacity)
-            .await?,
+        s.fleets.sdk_players(sid, r.players, r.capacity).await?,
     ))
 }
 
@@ -570,11 +549,10 @@ struct WatchQuery {
 /// when it changes (state, labels, allocation, players) or when the timeout passes.
 async fn sdk_watch(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Query(q): Query<WatchQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let id = self_id(&headers)?;
+    let id = sid;
     let budget = std::time::Duration::from_secs(q.timeout_secs.unwrap_or(30).clamp(1, 60));
     let gs = s.fleets.watch(id, q.since, budget).await?;
     let changed = q.since.is_none_or(|v| gs.version > v);
@@ -588,24 +566,18 @@ struct ConnectReq {
 
 async fn sdk_connect(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(r): Json<ConnectReq>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        s.fleets.sdk_connect(self_id(&headers)?, &r.token).await?,
-    ))
+    Ok(Json(s.fleets.sdk_connect(sid, &r.token).await?))
 }
 
 async fn sdk_release(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(r): Json<ConnectReq>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        s.fleets.sdk_release(self_id(&headers)?, &r.token).await?,
-    ))
+    Ok(Json(s.fleets.sdk_release(sid, &r.token).await?))
 }
 
 async fn builds(
@@ -1024,11 +996,9 @@ struct SdkLogsBody {
 /// log lines (any provider, including ones musubi does not run the process for).
 async fn sdk_logs(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(b): Json<SdkLogsBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let sid = self_id(&headers)?;
     if b.lines.len() > 1000 {
         return Err(Error::InvalidArgument("at most 1000 lines per call".into()).into());
     }
@@ -1168,23 +1138,19 @@ type ListActions = std::collections::HashMap<String, musubi_fleet::ListAction>;
 /// counters (rooms, bots, …); over capacity → 429, below zero → 400.
 async fn sdk_counters(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(a): Json<CounterActions>,
 ) -> Result<Json<GameServer>, ApiError> {
-    Ok(Json(
-        s.fleets.update_counters(self_id(&headers)?, &a).await?,
-    ))
+    Ok(Json(s.fleets.update_counters(sid, &a).await?))
 }
 
 /// `POST /v1/gameserver/lists {name: {add?, remove?, values?, capacity?}}`.
 async fn sdk_lists(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(a): Json<ListActions>,
 ) -> Result<Json<GameServer>, ApiError> {
-    Ok(Json(s.fleets.update_lists(self_id(&headers)?, &a).await?))
+    Ok(Json(s.fleets.update_lists(sid, &a).await?))
 }
 
 async fn op_counters(
@@ -1266,11 +1232,9 @@ struct SdkEvent {
 /// (webhooks filter with `gameserver.custom.*`) and into the fleet's lifecycle log.
 async fn sdk_event(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(e): Json<SdkEvent>,
 ) -> Result<Json<Value>, ApiError> {
-    let sid = self_id(&headers)?;
     if e.kind.is_empty()
         || e.kind.len() > 64
         || !e
@@ -1558,4 +1522,15 @@ async fn server_by_name(
     };
     let gs = s.fleets.server(id).await?;
     Ok(Json(serde_json::to_value(gs).map_err(Error::internal)?))
+}
+
+/// `POST /v1/server/game_servers/{sid}/token` — (re)issue the per-server SDK token; the previous
+/// one stops working. For processes started outside the fleet providers and for rotation.
+async fn issue_token(
+    State(s): State<AppState>,
+    ServerKey: ServerKey,
+    Path(sid): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let token = s.fleets.issue_server_token(sid).await?;
+    Ok(Json(json!({ "server_id": sid, "token": token })))
 }

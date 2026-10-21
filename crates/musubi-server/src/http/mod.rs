@@ -119,7 +119,7 @@ use tower_http::trace::TraceLayer;
 use crate::app::AppState;
 
 pub use error::ApiError;
-pub use extract::{Bearer, ClientIp, ServerKey};
+pub use extract::{Bearer, ClientIp, GameServerAuth, ServerKey};
 
 /// Several projects behind one listener: `x-musubi-project: <name>` picks one explicitly, else
 /// the `Host` header is matched against each project's `hosts` (exact or `*.suffix`), else the

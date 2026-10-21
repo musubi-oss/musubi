@@ -4,7 +4,6 @@
 //! server browser, the gameplay totals and a 0..100 score.
 
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
@@ -12,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::{ApiError, ServerKey};
+use super::{ApiError, GameServerAuth, ServerKey};
 use crate::app::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -40,15 +39,10 @@ struct Report {
 /// `X-Musubi-Server-Id` — the server adds what happened since its last report.
 async fn report(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     body: Option<Json<Report>>,
 ) -> Result<Json<Value>, ApiError> {
-    let id = headers
-        .get("x-musubi-server-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Id".into()))
-        .and_then(|v| Uuid::parse_str(v).map_err(|_| Error::InvalidArgument("bad id".into())))?;
+    let id = sid;
     let b = body.map(|b| b.0).unwrap_or_default();
     if [b.rounds, b.players, b.play_secs, b.kicks, b.crashes]
         .iter()

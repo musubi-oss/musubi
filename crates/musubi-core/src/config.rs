@@ -1138,6 +1138,9 @@ impl Default for LimitsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FleetConfig {
+    /// Accept the operator server key plus `X-Musubi-Server-Id` on `/v1/gameserver/*` (pre-0216
+    /// game servers). Off by default: processes authenticate with their own `gs_…` token.
+    pub legacy_server_key: bool,
     pub kubernetes: KubernetesConfig,
     pub firecracker: FirecrackerConfig,
     pub edgegap: EdgegapConfig,

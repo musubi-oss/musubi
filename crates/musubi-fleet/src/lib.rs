@@ -3019,6 +3019,57 @@ impl FleetService {
         !self.server_key.is_empty() && self.server_key == k
     }
 
+    /// Mint the credential a game server process authenticates with on `/v1/gameserver/*`:
+    /// `gs_<server id>_<random>`, scoped to that one server. Only its SHA-256 is stored, so the
+    /// plaintext exists in the process environment and nowhere else; issuing again rotates it.
+    pub async fn issue_server_token(&self, id: Uuid) -> Result<String> {
+        let token = format!(
+            "gs_{}_{}{}",
+            id.simple(),
+            Uuid::now_v7().simple(),
+            Uuid::now_v7().simple()
+        );
+        let n = sqlx::query(
+            "update musubi.game_servers set server_token_hash = $2, updated_at = now() where id = $1 and state <> 'terminated'",
+        )
+        .bind(id)
+        .bind(server_token_hash(&token))
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?
+        .rows_affected();
+        if n == 0 {
+            return Err(Error::NotFound(format!("server {id}")));
+        }
+        Ok(token)
+    }
+
+    /// Resolve a per-server token to the live server it belongs to.
+    pub async fn authenticate_server_token(&self, token: &str) -> Result<Uuid> {
+        let id = token
+            .strip_prefix("gs_")
+            .and_then(|r| r.split('_').next())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| Error::Unauthenticated("malformed game server token".into()))?;
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "select server_token_hash from musubi.game_servers where id = $1 and state <> 'terminated'",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        match row {
+            Some((Some(h),))
+                if constant_time_eq(h.as_bytes(), server_token_hash(token).as_bytes()) =>
+            {
+                Ok(id)
+            }
+            _ => Err(Error::Unauthenticated(
+                "unknown, rotated or terminated game server token".into(),
+            )),
+        }
+    }
+
     pub fn new(db: PgPool, node_id: Uuid, api_url: &str, server_key: &str) -> Self {
         let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
@@ -5212,6 +5263,7 @@ impl FleetService {
             .execute(&self.db)
             .await
             .map_err(Error::internal)?;
+        let server_token = self.issue_server_token(id).await?;
         self.record_event(
             f.id,
             Some(id),
@@ -5248,7 +5300,7 @@ impl FleetService {
                                 server_id: id,
                                 port,
                                 api_url: &self.api_url,
-                                server_key: &self.server_key,
+                                server_key: &server_token,
                             })
                             .await
                     }
@@ -6699,4 +6751,16 @@ mod ports_tests {
         let s = spec(vec![port("query", "tcp")]);
         assert_eq!(port_bindings(&s, 7000).len(), 2);
     }
+}
+
+fn server_token_hash(token: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

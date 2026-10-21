@@ -1070,6 +1070,22 @@ async fn call_raw(
     (status, v)
 }
 
+/// Per-server SDK token (what the fleet puts in `MUSUBI_SERVER_KEY`), issued with the operator key.
+async fn gs_token(app: &axum::Router, k: &str, sid: &str) -> String {
+    let (_, v) = call_server(
+        app,
+        "POST",
+        &format!("/v1/server/game_servers/{sid}/token"),
+        k,
+        None,
+    )
+    .await;
+    v["token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{v}"))
+        .to_string()
+}
+
 async fn call_server(
     app: &Router,
     method: &str,
@@ -1675,8 +1691,7 @@ async fn fleet_lifecycle_with_local_process_provider() {
     assert!(mine[0]["pid"].as_i64().is_some());
     // the game server reports ready through the SDK surface
     let req = Request::post("/v1/gameserver/ready")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .body(Body::empty())
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
@@ -1695,8 +1710,7 @@ async fn fleet_lifecycle_with_local_process_provider() {
     let tok = a["connect_token"].as_str().unwrap().to_string();
     // the game server validates the one-time connect token
     let req = Request::post("/v1/gameserver/connect")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({"token": tok}).to_string()))
         .unwrap();
@@ -1706,8 +1720,7 @@ async fn fleet_lifecycle_with_local_process_provider() {
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(v["payload"]["match"], "m1");
     let req = Request::post("/v1/gameserver/connect")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({"token": tok}).to_string()))
         .unwrap();
@@ -1717,8 +1730,7 @@ async fn fleet_lifecycle_with_local_process_provider() {
         "token is shared by the group"
     );
     let req = Request::post("/v1/gameserver/connect")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({"token": "wrong"}).to_string()))
         .unwrap();
@@ -10728,11 +10740,11 @@ async fn gameserver_watch_and_backfill() {
         let sid = sid.clone();
         let (method, path) = (method.to_string(), path.to_string());
         async move {
+            let tok = gs_token(&app, "defaultkey", &sid).await;
             let mut req = Request::builder()
                 .method(method.as_str())
                 .uri(path)
-                .header("x-musubi-server-key", "defaultkey")
-                .header("x-musubi-server-id", sid);
+                .header("x-musubi-server-key", tok);
             let req = match body {
                 Some(b) => req
                     .header(header::CONTENT_TYPE, "application/json")
@@ -17894,8 +17906,7 @@ async fn game_server_logs_capture_filters_and_sdk_push() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/gameserver/logs")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({"lines": [{"level": "error", "message": "crash imminent"}, {"message": "round started"}]}).to_string()))
         .unwrap();
@@ -18034,8 +18045,7 @@ async fn game_server_logs_capture_filters_and_sdk_push() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/gameserver/logs")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             json!({"lines": [{"message": "live-line-42"}]}).to_string(),
@@ -23502,11 +23512,11 @@ async fn game_sessions_crud_idempotency_codes_seats_and_templates() {
         let sid = sid.clone();
         let (method, path) = (method.to_string(), path.to_string());
         async move {
+            let tok = gs_token(&app, "defaultkey", &sid).await;
             let req = Request::builder()
                 .method(method.as_str())
                 .uri(path)
-                .header("x-musubi-server-key", "defaultkey")
-                .header("x-musubi-server-id", sid)
+                .header("x-musubi-server-key", tok)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
                 .unwrap();
@@ -25053,8 +25063,7 @@ async fn fleet_metrics_history_summary_and_alerts() {
         let path = path.to_string();
         async move {
             let req = Request::post(&path)
-                .header("x-musubi-server-key", k)
-                .header("x-musubi-server-id", &sid)
+                .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -25357,8 +25366,10 @@ async fn fleet_metrics_history_summary_and_alerts() {
     assert!(v["alerts"].as_array().unwrap().is_empty(), "{v}");
     // unknown server id → 404 at ingest
     let req = Request::post("/v1/gameserver/metrics")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", uuid::Uuid::now_v7().to_string())
+        .header(
+            "x-musubi-server-key",
+            format!("gs_{}_deadbeef", uuid::Uuid::now_v7().simple()),
+        )
         .header("content-type", "application/json")
         .body(Body::from("{}"))
         .unwrap();
@@ -25415,8 +25426,7 @@ async fn fleet_rollouts_rolling_update_events_and_auto_rollback() {
         let app = app.clone();
         async move {
             let req = Request::post("/v1/gameserver/ready")
-                .header("x-musubi-server-key", k)
-                .header("x-musubi-server-id", &sid)
+                .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
                 .body(Body::empty())
                 .unwrap();
             assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
@@ -25770,8 +25780,7 @@ async fn fleet_counters_lists_selector_allocation_and_inventory() {
         let path = path.to_string();
         async move {
             let req = Request::post(&path)
-                .header("x-musubi-server-key", k)
-                .header("x-musubi-server-id", &sid)
+                .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -26198,8 +26207,7 @@ async fn gameserver_custom_events_and_wildcard_webhooks() {
         let app = app.clone();
         async move {
             let req = Request::post("/v1/gameserver/events")
-                .header("x-musubi-server-key", k)
-                .header("x-musubi-server-id", &sid)
+                .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -27919,8 +27927,7 @@ async fn fleet_health_policy_report_and_reaping() {
         let path = path.to_string();
         async move {
             let req = Request::post(path)
-                .header("x-musubi-server-key", k)
-                .header("x-musubi-server-id", &sid)
+                .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
                 .body(Body::empty())
                 .unwrap();
             app.oneshot(req).await.unwrap().status()
@@ -28481,8 +28488,7 @@ async fn fleet_slots_per_server_packing_and_release() {
         let path = path.to_string();
         async move {
             let req = Request::post(path)
-                .header("x-musubi-server-key", k)
-                .header("x-musubi-server-id", &sid)
+                .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -31658,8 +31664,7 @@ async fn fleet_allocation_selectors_priorities_scheduling() {
         let path = path.to_string();
         async move {
             let req = Request::post(&path)
-                .header("x-musubi-server-key", k)
-                .header("x-musubi-server-id", &sid)
+                .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
@@ -31989,8 +31994,7 @@ async fn fleet_named_ports_and_protocols() {
     // the ports travel with the allocation
     let sid = servers[0]["id"].as_str().unwrap().to_string();
     let req = Request::post("/v1/gameserver/ready")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .header("content-type", "application/json")
         .body(Body::from("{}"))
         .unwrap();
@@ -33093,8 +33097,7 @@ async fn routed_allocation_by_pings_and_preference() {
             .unwrap_or_else(|| panic!("{l}"))
             .to_string();
         let req = Request::post("/v1/gameserver/ready")
-            .header("x-musubi-server-key", k)
-            .header("x-musubi-server-id", &sid)
+            .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
             .body(Body::empty())
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
@@ -33774,8 +33777,7 @@ async fn game_server_log_archives_to_object_storage() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/gameserver/logs")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", &sid)
+        .header("x-musubi-server-key", &gs_token(&app, k, &sid).await)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             json!({"lines": [{"level": "error", "message": "segfault"}, {"message": "bye"}]})
@@ -39739,10 +39741,11 @@ async fn fleet_egress_accounting_per_server_and_rollup() {
     let sdk = |sid: Option<String>, body: Value| {
         let app = app.clone();
         async move {
-            let mut req = Request::post("/v1/gameserver/egress").header("x-musubi-server-key", k);
-            if let Some(sid) = sid {
-                req = req.header("x-musubi-server-id", sid);
-            }
+            let tok = match sid {
+                Some(sid) => gs_token(&app, k, &sid).await,
+                None => "gs_not-a-server".to_string(),
+            };
+            let req = Request::post("/v1/gameserver/egress").header("x-musubi-server-key", tok);
             let res = app
                 .oneshot(
                     req.header("content-type", "application/json")
@@ -40549,8 +40552,10 @@ async fn fleet_reserve_holds_server_out_of_allocation_and_scale_down() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/gameserver/reserve")
-        .header("x-musubi-server-key", k)
-        .header("x-musubi-server-id", sid.to_string())
+        .header(
+            "x-musubi-server-key",
+            &gs_token(&app, k, &sid.to_string()).await,
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({"seconds": 600}).to_string()))
         .unwrap();
@@ -41567,11 +41572,12 @@ async fn server_reputation_from_gameplay_stats_and_ratings() {
     let sdk = |sid: Option<String>, body: Value| {
         let app = app.clone();
         async move {
-            let mut req =
-                Request::post("/v1/gameserver/gameplay_stats").header("x-musubi-server-key", k);
-            if let Some(sid) = sid {
-                req = req.header("x-musubi-server-id", sid);
-            }
+            let tok = match sid {
+                Some(sid) => gs_token(&app, k, &sid).await,
+                None => "gs_not-a-server".to_string(),
+            };
+            let req =
+                Request::post("/v1/gameserver/gameplay_stats").header("x-musubi-server-key", tok);
             let res = app
                 .oneshot(
                     req.header("content-type", "application/json")
@@ -47963,4 +47969,96 @@ async fn worlds_switch_disables_meshing_and_sim_role_gates_hosting() {
         .filter_map(|r| r.as_str())
         .collect();
     assert!(!roles.contains(&"sim"), "{v}");
+}
+
+#[tokio::test]
+async fn gameserver_tokens_are_per_server() {
+    let Some((app, state)) = app_and_state_with(|_| {}).await else {
+        return;
+    };
+    let k = "defaultkey";
+    let name = unique("gstok");
+    let (st, f) = call_server(
+        &app,
+        "POST",
+        "/v1/server/fleets",
+        k,
+        Some(json!({
+            "name": name, "provider": "local", "buffer": 2, "max_servers": 2,
+            "port_start": 47400, "port_end": 47500,
+            "spec": {"command": ["sleep", "60"]}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    let fid = uuid::Uuid::parse_str(f["id"].as_str().unwrap()).unwrap();
+    let svc = &state.fleets;
+    svc.reconcile_one(fid).await.unwrap();
+    svc.reconcile_one(fid).await.unwrap();
+    let servers = svc.servers(fid, None).await.unwrap();
+    assert!(servers.len() >= 2, "{servers:?}");
+    let (a, b) = (servers[0].id.to_string(), servers[1].id.to_string());
+    let call = |key: String, path: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::get(path)
+                .header("x-musubi-server-key", key)
+                .body(Body::empty())
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let st = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    // the operator key is not a game server credential any more
+    let (st, v) = call(k.to_string(), "/v1/gameserver").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("legacy_server_key"),
+        "{v}"
+    );
+    // a token identifies exactly its server
+    let ta = gs_token(&app, k, &a).await;
+    assert!(ta.starts_with("gs_"), "{ta}");
+    let (st, v) = call(ta.clone(), "/v1/gameserver").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["id"], a, "{v}");
+    let tb = gs_token(&app, k, &b).await;
+    let (_, v) = call(tb.clone(), "/v1/gameserver").await;
+    assert_eq!(v["id"], b, "{v}");
+    // forging another server's id into a token does not work
+    let forged = format!(
+        "gs_{}_{}",
+        servers[1].id.simple(),
+        ta.rsplit('_').next().unwrap()
+    );
+    let (st, _) = call(forged, "/v1/gameserver").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // the token does not open the operator surface
+    let (st, _) = call(ta.clone(), "/v1/server/fleets").await;
+    assert!(
+        st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN,
+        "{st}"
+    );
+    // rotation invalidates the previous token
+    let ta2 = gs_token(&app, k, &a).await;
+    assert_ne!(ta, ta2);
+    let (st, _) = call(ta, "/v1/gameserver").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _) = call(ta2, "/v1/gameserver").await;
+    assert_eq!(st, StatusCode::OK);
+    // unknown server
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        &format!("/v1/server/game_servers/{}/token", uuid::Uuid::now_v7()),
+        k,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
 }

@@ -81,6 +81,49 @@ impl FromRequestParts<AppState> for ServerKey {
     }
 }
 
+/// A game server process: `X-Musubi-Server-Key` carries the per-server token the fleet put in
+/// its `MUSUBI_SERVER_KEY` (`gs_<server id>_…`), which only identifies that one server — a leaked
+/// or rogue server cannot speak for another or reach `/v1/server/*`. With
+/// `[fleet].legacy_server_key = true` the operator key plus `X-Musubi-Server-Id` is still accepted.
+pub struct GameServerAuth(pub uuid::Uuid);
+
+impl FromRequestParts<AppState> for GameServerAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let key = parts
+            .headers
+            .get("x-musubi-server-key")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Key".into()))?;
+        if key.starts_with("gs_") {
+            let id = state.fleets.authenticate_server_token(key).await?;
+            state.limits.game_server(id)?;
+            return Ok(GameServerAuth(id));
+        }
+        if !state.cfg.fleet.legacy_server_key {
+            return Err(Error::Unauthenticated(
+                "game server endpoints take the per-server token from MUSUBI_SERVER_KEY (gs_…); set [fleet].legacy_server_key = true to accept the operator key with X-Musubi-Server-Id"
+                    .into(),
+            )
+            .into());
+        }
+        let caller = check_server_key(state, &parts.headers)?;
+        state.limits.key(&caller)?;
+        let id = parts
+            .headers
+            .get("x-musubi-server-id")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Id".into()))?;
+        let id = uuid::Uuid::parse_str(id)
+            .map_err(|_| Error::InvalidArgument("bad X-Musubi-Server-Id".into()))?;
+        Ok(GameServerAuth(id))
+    }
+}
+
 /// `X-Musubi-Server-Key`: the config key (constant-time compare, bootstrap admin) or a key issued
 /// through `/v1/admin/keys` with its role.
 pub fn check_server_key(

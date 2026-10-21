@@ -2,7 +2,6 @@
 //! history/summary and alert rules under `/v1/server/fleets/{id}/...`.
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
@@ -10,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::{ApiError, ServerKey};
+use super::{ApiError, GameServerAuth, ServerKey};
 use crate::app::AppState;
 use crate::fleet_metrics::{Rule, RuleInput, Sample, Transition};
 
@@ -29,14 +28,6 @@ pub fn routes() -> Router<AppState> {
             "/v1/server/fleets/{id}/alerts/rules/{name}",
             axum::routing::put(put_rule).delete(delete_rule),
         )
-}
-
-fn self_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
-    let v = headers
-        .get("x-musubi-server-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Id".into()))?;
-    Uuid::parse_str(v).map_err(|_| Error::InvalidArgument("bad X-Musubi-Server-Id".into()).into())
 }
 
 /// Turn alert transitions into `fleet.alert_fired|resolved` events (webhooks, LiveOps).
@@ -65,11 +56,9 @@ pub async fn emit(s: &AppState, ts: &[Transition]) {
 /// updates the server's occupancy when `players` is present. Returns alerts that changed state.
 async fn sdk_metrics(
     State(s): State<AppState>,
-    ServerKey: ServerKey,
-    headers: HeaderMap,
+    GameServerAuth(sid): GameServerAuth,
     Json(sample): Json<Sample>,
 ) -> Result<Json<Value>, ApiError> {
-    let sid = self_id(&headers)?;
     let gs = s.fleets.server(sid).await?;
     let ts = s.fleet_metrics.ingest(gs.fleet_id, sid, &sample).await?;
     if let Some(p) = sample.players {
