@@ -71,8 +71,8 @@ is the tree as of `bebbbcf`, "after" has the three fixes described below the tab
 | 3 after | 2 000 | 4 × 4 000, 8 sims | json | **23.6** | **39 / 94 / 134 ms** | **25 / 100 ms** | 1.5 / 25 ms | **8 568 / 8 574** | 225 % |
 | 3, 2 nodes, players on home, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 24.0 | 35 / 87 / 196 ms | 25 / 100 ms | 2.3 / 25 ms | 2 099 / 6 055 | home 47 %, peer 22 % |
 | 3, 2 nodes, players split, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 13.8 | 35 / 198 / 706 ms | 10 / 50 ms | 2.0 / 10 ms | 2 096 / 5 554 | home 65 %, peer 33 % |
-| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 25.3 | 34 / 80 / 191 ms | 10 / 50 ms | 1.6 / 10 ms | 4 086 / 5 886 | home 122 %, peer 57 % |
-| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 17–25 (19.3) | 34 / 181 / 295 ms | 10 / 50 ms | 1.5 / 10 ms | 3 515 / 5 728 | home 73 %, peer 19 % |
+| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 28.3 | 31 / 72 / 192 ms (max 0.44 s) | 10 / 50 ms | 1.6 / 10 ms | 3 269 / 7 249 | home 110 %, peer 26 % |
+| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 25.5 | 33 / 93 / 187 ms (max 0.75 s) | 10 / 50 ms | 1.5 / 10 ms | 3 524 / 6 476 | home 66 %, peer 12 % |
 
 The two-node rows are the same stand with a second `sim`-role node on the same VM and
 `--controller '{"offload_above_cost": 800}'`: the home moves ~40 cells (of 4 × 25) to the peer,
@@ -123,10 +123,14 @@ its own now asks the leader before turning the entity away (`here_after_fresh_lo
 521 such arrivals in a run were in fact its cells; the 168 `not_here_confirmed` are refused at
 once instead of silently, so the sender re-targets on the next tick rather than after the
 timeout) — 3 750 of 5 801 asked completed in that run. The bench's "asked" column counts the forced migrations
-too, so the completed/asked ratio understates the border handovers that complete. Separately,
-the session and bulk lanes of the home run 15–25 s behind under this load because every bus
-frame is a `serde_json::Value` serialized twice on send and decoded twice on receive — a raw
-payload is the next bus change.
+too, so the completed/asked ratio understates the border handovers that complete. The bus frame
+itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
+decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
+load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
+the bulk lane no longer falls behind, the session lane's worst wait went from 26 s to 10 s,
+inbound dispatch lag averages 3 ms, and the two rows above moved from 17–25 fps with
+multi-second stalls to 25.5 / 28.3 fps with a worst frame under a second — on two nodes sharing
+one VM with the bench process, so the absolute numbers say less than the trend.
 
 Read it as: the simulation step (`musubi_world_tick_duration_seconds`) is never the problem —
 1.5 ms mean with 4 000 entities and 8 simulators handing entities to each other 280 times a
