@@ -16978,7 +16978,23 @@ async fn world_adopted_cell_drops_handed_over_duplicates() {
         .await;
         assert_eq!(st, 200, "{v}");
     }
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    // the lease path asks the directory, so wait for what it will see, not for the bus;
+    // a fresh raft group under a parallel test load can take seconds to elect a leader
+    for (cell, state) in [
+        (musubi_mesh::CellId::root(0, 0), &state_a),
+        (musubi_mesh::CellId::root(1, 0), &state_b),
+    ] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while state.worlds.cell_host_of(&name, cell).await.ok().flatten()
+            != Some(state.worlds.node_id())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cell {cell:?} not assigned to its node"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
     let sim_a = uuid::Uuid::now_v7();
     let sim_b = uuid::Uuid::now_v7();
     let (st, l) = http_json(

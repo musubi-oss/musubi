@@ -1671,6 +1671,7 @@ impl Fanout {
             Wire::WorldCellAssign { world, cell, node } => {
                 if let Some(w) = self.worlds.get().cloned() {
                     let prev = w.cell_host_cached(&world, cell);
+                    w.note_cell_host(&world, cell, node);
                     if node == w.node_id() {
                         let me = self.clone();
                         tokio::spawn(async move {
@@ -1694,12 +1695,10 @@ impl Fanout {
                             }
                             w.release_cell(&world, cell, node, &me);
                             w.forget_adoptions(&world, cell);
-                            w.note_cell_host(&world, cell, node);
                             w.drop_idle_shard(&world);
                         });
                     } else {
                         w.forget_adoptions(&world, cell);
-                        w.note_cell_host(&world, cell, node);
                     }
                 }
             }
