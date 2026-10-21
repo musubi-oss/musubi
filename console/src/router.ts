@@ -65,8 +65,15 @@ export const router = createRouter({
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
     ]},
     { path: '/social', component: () => import('./pages/social/Index.vue'), children: [
-      { path: '', component: () => import('./pages/Generic.vue'), props: () => ({ res: catalog.social[0] }) },
+      { path: '', component: () => import('./pages/social/ChatFilters.vue') },
       { path: 'matchmaker', component: () => import('./pages/social/Matchmaker.vue') },
+      { path: 'chat_filters', component: () => import('./pages/social/ChatFilters.vue') },
+      { path: 'stats', component: () => import('./pages/social/Stats.vue') },
+      { path: 'rating', component: () => import('./pages/social/Rating.vue') },
+      { path: 'matches', component: () => import('./pages/social/Matches.vue') },
+      { path: 'mm_stats', redirect: '/social/matches' },
+      { path: 'mm_rejections', redirect: '/social/matches' },
+      { path: 'turns', redirect: '/social/matches' },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.social.find((x) => x.id === r.params.page) ?? catalog.social[0] }) },
     ]},
     { path: '/economy', component: () => import('./pages/economy/Index.vue'), children: [
