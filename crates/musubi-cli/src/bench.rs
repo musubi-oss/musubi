@@ -2,6 +2,7 @@
 //! Every client authenticates with a device id, then loops its scenario until the deadline;
 //! latencies are reported as p50/p95/p99/max with throughput and error counts.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +24,9 @@ pub struct Opts {
     /// `world` scenario: simulators per world over the WS stream (1 = one HTTP-`apply` simulator);
     /// cells are partitioned between them and entities drift across the borders (handovers).
     pub sims: usize,
+    /// `world` scenario: controller config JSON for the bench worlds (e.g.
+    /// `{"offload_above_cost": 500}` to let the home spread cells over other nodes).
+    pub controller: Option<Value>,
     pub radius: f64,
     /// Cap on deltas per second per world player (`None` = every tick).
     pub max_hz: Option<u32>,
@@ -84,13 +88,14 @@ async fn world_setup(
     name: &str,
     entities: usize,
     sims: usize,
+    controller: Option<&Value>,
 ) -> anyhow::Result<Arena> {
     let cell = 256.0;
     let side = ((entities.max(1) as f64).sqrt() * 20.0).max(cell);
     let r = http
         .post(format!("{url}/v1/server/worlds"))
         .header("x-musubi-server-key", KEY)
-        .json(&json!({"name": name, "config": {"cell_size": cell}}))
+        .json(&json!({"name": name, "config": {"cell_size": cell}, "controller": controller.cloned().unwrap_or(json!({}))}))
         .send()
         .await?;
     anyhow::ensure!(r.status().is_success(), "create world: {}", r.status());
@@ -435,44 +440,110 @@ async fn world_loop(p: Player) {
 }
 
 /// One of `sims` simulators of an arena over the WS stream (`/v1/server/worlds/{w}/stream`):
-/// leases its share of the grid, and on every `tick` frame moves a thirtieth of the entities it
-/// owns a few units along x (wrapping at the arena edge), so each entity crosses a cell border —
+/// leases its share of the grid and on every `tick` frame moves a thirtieth of the entities it
+/// owns a few units along x (bouncing at the arena edges), so each entity crosses a cell border —
 /// and, with several simulators, changes owner — every few seconds. Answers `handover_request`
-/// events with `handover_ack`, re-leases every half second, reconnects on drop.
+/// events with `handover_ack`, re-leases every half second, reconnects on drop. Cells the home
+/// node has handed to another node are followed: a `lease` answered with `redirect` (or refused
+/// because its cells sit on different nodes) is split per cell and each cell is leased on its
+/// host over a connection to that host, so one simulator keeps one stream per node it has cells on.
 async fn world_streamer(
     url: String,
     arena: Arc<Arena>,
     k: usize,
-    mut deadline: tokio::sync::watch::Receiver<Option<Instant>>,
+    deadline: tokio::sync::watch::Receiver<Option<Instant>>,
     totals: Arc<WorldTotals>,
 ) {
-    use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    use tokio_tungstenite::tungstenite::Message;
     let cell = 256.0;
     let sims = arena.sims.len();
-    let sim = arena.sims[k];
     let n = (arena.side / cell).ceil() as i64;
     let cells: Vec<Value> = (0..n)
         .flat_map(|x| (0..n).map(move |y| (x, y)))
         .filter(|&(x, y)| ((x + y) as usize) % sims == k)
         .map(|(x, y)| json!({"x": x, "y": y}))
         .collect();
-    let ws_base = url.replacen("http", "ws", 1);
+    // host base url → cells leased there; redirects move cells between hosts
+    let plan: Arc<tokio::sync::Mutex<HashMap<String, Vec<Value>>>> = Arc::new(
+        tokio::sync::Mutex::new(HashMap::from([(url.clone(), cells)])),
+    );
+    let dir: Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let past = |d: &tokio::sync::watch::Receiver<Option<Instant>>| {
         d.borrow().is_some_and(|t| Instant::now() >= t)
     };
+    while !past(&deadline) {
+        let hosts: Vec<String> = plan
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, c)| !c.is_empty())
+            .map(|(h, _)| h.clone())
+            .collect();
+        for h in hosts {
+            if running.get(&h).is_some_and(|j| !j.is_finished()) {
+                continue;
+            }
+            running.insert(
+                h.clone(),
+                tokio::spawn(host_stream(
+                    h,
+                    arena.clone(),
+                    k,
+                    plan.clone(),
+                    dir.clone(),
+                    deadline.clone(),
+                    totals.clone(),
+                )),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    for (_, j) in running {
+        j.abort();
+    }
+}
+
+/// One simulator's stream to one host: leases the cells planned for this host there, follows
+/// `redirect`s by moving cells to the other host's plan (the main loop opens a stream there).
+async fn host_stream(
+    base: String,
+    arena: Arc<Arena>,
+    k: usize,
+    plan: Arc<tokio::sync::Mutex<HashMap<String, Vec<Value>>>>,
+    dir: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    mut deadline: tokio::sync::watch::Receiver<Option<Instant>>,
+    totals: Arc<WorldTotals>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let sim = arena.sims[k];
+    let ws_base = base.replacen("http", "ws", 1);
+    let past = |d: &tokio::sync::watch::Receiver<Option<Instant>>| {
+        d.borrow().is_some_and(|t| Instant::now() >= t)
+    };
+    let host_of = |loc: &str| -> Option<String> {
+        let u = reqwest::Url::parse(loc).ok()?;
+        Some(format!(
+            "{}://{}:{}",
+            u.scheme(),
+            u.host_str()?,
+            u.port_or_known_default()?
+        ))
+    };
     let mut frame_no = 0u64;
     let mut first = true;
-    // direction per entity: bounce at the arena edges instead of wrapping (a wrap is a teleport
-    // into a cell this simulator does not own and is rightly refused)
-    let mut dir: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     while !past(&deadline) {
         if !first {
             totals.stream_reconnects.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         first = false;
+        let mine = plan.lock().await.get(&base).cloned().unwrap_or_default();
+        if mine.is_empty() {
+            return;
+        }
         let Ok(mut req) = format!("{ws_base}/v1/server/worlds/{}/stream?sim={sim}", arena.name)
             .into_client_request()
         else {
@@ -489,8 +560,21 @@ async fn world_streamer(
             totals.err_stream.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        let lease = json!({"op": "lease", "cells": cells}).to_string();
-        if ws.send(Message::Text(lease.clone())).await.is_err() {
+        // one lease per cell: a refused or redirected cell then names itself
+        let lease_all = |cells: &[Value]| -> Vec<String> {
+            cells
+                .iter()
+                .map(|c| json!({"op": "lease", "cells": [c]}).to_string())
+                .collect()
+        };
+        let mut failed = false;
+        for m in lease_all(&mine) {
+            if ws.send(Message::Text(m)).await.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
             continue;
         }
         let mut last_lease = Instant::now();
@@ -506,6 +590,34 @@ async fn world_streamer(
             }
             let Message::Text(t) = m else { continue };
             let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            if v["op"] == "lease" {
+                if let Some(loc) = v["redirect"].as_str() {
+                    // the cell(s) of this lease live elsewhere: move them to that host's plan
+                    if let Some(h) = host_of(loc) {
+                        let moved: Vec<Value> = v["cells"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_else(|| mine.clone());
+                        let mut p = plan.lock().await;
+                        if let Some(c) = p.get_mut(&base) {
+                            c.retain(|x| !moved.contains(x));
+                        }
+                        let e = p.entry(h).or_default();
+                        for c in moved {
+                            if !e.contains(&c) {
+                                e.push(c);
+                            }
+                        }
+                        drop(p);
+                        if plan.lock().await.get(&base).is_none_or(|c| c.is_empty()) {
+                            return;
+                        }
+                    }
+                } else if v["error"].is_string() {
+                    totals.moves_err.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
             if v["type"] == "tick" {
                 frame_no += 1;
                 totals.stream_frames.fetch_add(1, Ordering::Relaxed);
@@ -529,11 +641,15 @@ async fn world_streamer(
                         else {
                             continue;
                         };
-                        let d = dir.entry(id.to_string()).or_insert(6.0);
-                        if x + *d <= 0.0 || x + *d >= arena.side {
-                            *d = -*d;
+                        let mut d = {
+                            let mut g = dir.lock().unwrap();
+                            *g.entry(id.to_string()).or_insert(6.0)
+                        };
+                        if x + d <= 0.0 || x + d >= arena.side {
+                            d = -d;
+                            dir.lock().unwrap().insert(id.to_string(), d);
                         }
-                        let nx = (x + *d).clamp(0.0, arena.side - 0.001);
+                        let nx = (x + d).clamp(0.0, arena.side - 0.001);
                         out.push(
                             json!({"op": "apply", "entity": id, "x": nx, "y": y, "components": {"hp": (frame_no % 100) as i64}})
                                 .to_string(),
@@ -543,7 +659,11 @@ async fn world_streamer(
                 }
                 if last_lease.elapsed() >= Duration::from_millis(500) {
                     last_lease = Instant::now();
-                    out.push(lease.clone());
+                    let now = plan.lock().await.get(&base).cloned().unwrap_or_default();
+                    if now.is_empty() {
+                        return;
+                    }
+                    out.extend(lease_all(&now));
                 }
                 let mut failed = false;
                 for o in out {
@@ -1046,7 +1166,16 @@ async fn match_loop(
 }
 
 pub async fn run(o: Opts) -> anyhow::Result<()> {
-    let url = o.url.trim_end_matches('/').to_string();
+    // several nodes: setup, simulators and metrics talk to the first (the worlds' home), bot
+    // clients are spread over all of them round-robin
+    let urls: Vec<String> = o
+        .url
+        .split(',')
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    anyhow::ensure!(!urls.is_empty(), "--url is empty");
+    let url = urls[0].clone();
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(o.clients)
         .build()?;
@@ -1075,7 +1204,17 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let t = Instant::now();
         for i in 0..o.worlds.max(1) {
             let name = format!("bench-{run_id}-{i}");
-            let arena = Arc::new(world_setup(&http, &url, &name, o.entities, o.sims).await?);
+            let arena = Arc::new(
+                world_setup(
+                    &http,
+                    &url,
+                    &name,
+                    o.entities,
+                    o.sims,
+                    o.controller.as_ref(),
+                )
+                .await?,
+            );
             if o.sims > 1 {
                 for k in 0..o.sims {
                     sims.push(tokio::spawn(world_streamer(
@@ -1126,7 +1265,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     let mut tasks = sims;
     for (i, token) in tokens.into_iter().enumerate() {
         let sc = scenarios[i % scenarios.len()];
-        let (http, url, tx) = (http.clone(), url.clone(), tx.clone());
+        let (http, url, tx) = (http.clone(), urls[i % urls.len()].clone(), tx.clone());
         // ordinal among the clients of this scenario: chat rooms of 50, matches of `match_size`
         let j = i / scenarios.len();
         let room = format!("bench-{run_id}-{}", j / 50);

@@ -117,6 +117,8 @@ enum Cmd {
     /// Load-test a running server: device auth per client, then http | storage | ws | all loops;
     /// prints p50/p95/p99 latencies, throughput and errors.
     Bench {
+        /// Node URL; a comma-separated list = several nodes: setup, simulators and metrics use
+        /// the first, bot clients are spread over all of them round-robin.
         #[arg(long, default_value = "http://127.0.0.1:7350")]
         url: String,
         #[arg(long, default_value_t = 50)]
@@ -153,6 +155,10 @@ enum Cmd {
         /// them, entities drift across borders → handovers); 1 = a single HTTP simulator.
         #[arg(long, default_value_t = 1)]
         sims: usize,
+        /// `world` scenario: controller config JSON for the bench worlds, e.g.
+        /// `{"offload_above_cost": 500}` (home spreads cells over sim-role peers).
+        #[arg(long)]
+        controller: Option<String>,
         /// `match` scenario: players per relayed match (one creates, the rest join).
         #[arg(long, default_value_t = 8)]
         match_size: usize,
@@ -316,6 +322,7 @@ async fn main() -> anyhow::Result<()> {
             quic_addr,
             unreliable,
             sims,
+            controller,
             match_size,
             json,
         } => {
@@ -333,6 +340,10 @@ async fn main() -> anyhow::Result<()> {
                 quic_addr,
                 unreliable,
                 sims,
+                controller: controller
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?,
                 json,
                 match_size,
             })

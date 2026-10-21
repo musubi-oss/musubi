@@ -215,6 +215,9 @@ struct WorldState {
     subs: HashMap<SessionId, Uuid>,
     /// interest client id → delivery options
     sub_opts: HashMap<Uuid, SubOpts>,
+    /// session → its last subscribe (home shard only): replayed to a node that starts hosting a
+    /// cell after the player subscribed, so the new shard knows whom to send deltas to
+    sub_cmds: HashMap<SessionId, WorldCmd>,
     /// simulator → pending events (handover requests, inputs, …)
     sim_events: HashMap<Uuid, Vec<Value>>,
     /// Persistent-entity ops since the last journal flush (see `musubi.world_journal`).
@@ -455,6 +458,7 @@ fn replay(
     n
 }
 
+#[derive(Clone)]
 struct PendingInterest {
     sid: SessionId,
     pos: Pos,
@@ -462,6 +466,7 @@ struct PendingInterest {
     budget_bytes: Option<usize>,
     filter: std::collections::BTreeMap<String, Value>,
     every: u64,
+    max_hz: Option<u32>,
     unreliable: bool,
 }
 
@@ -941,6 +946,7 @@ impl WorldRegistry {
                     hibernated_since: HashMap::new(),
                     loading: std::collections::HashSet::new(),
                     sub_opts: HashMap::new(),
+                    sub_cmds: HashMap::new(),
                     hosted_only: true,
                     home_node: home,
                     remote_transit: HashMap::new(),
@@ -1822,6 +1828,7 @@ impl WorldRegistry {
                 hibernated_since: HashMap::new(),
                 loading: std::collections::HashSet::new(),
             sub_opts: HashMap::new(),
+                    sub_cmds: HashMap::new(),
                     hosted_only: false,
                     home_node: None,
                     remote_transit: HashMap::new(),
@@ -2030,6 +2037,32 @@ impl WorldRegistry {
     }
 
     /// This node keeps a shard of `name` (its home shard or an assigned cell's).
+    /// Re-publish every live subscription of a world this node is home of (`WorldCmd::Subscribe`
+    /// per session): a shard that came up on another node after the players subscribed applies
+    /// them and starts sending deltas for the cells it hosts.
+    pub fn replay_subs(&self, name: &str, fanout: &Fanout) {
+        let Some(w) = self.worlds.get(name) else {
+            return;
+        };
+        let cmds: Vec<WorldCmdEnv> = {
+            let st = w.lock();
+            if st.hosted_only {
+                return;
+            }
+            st.sub_cmds
+                .iter()
+                .map(|(sid, cmd)| WorldCmdEnv {
+                    world: name.to_string(),
+                    session_id: *sid,
+                    cmd: cmd.clone(),
+                })
+                .collect()
+        };
+        for env in cmds {
+            fanout.world_cmd(env);
+        }
+    }
+
     pub fn has_shard(&self, name: &str) -> bool {
         self.worlds.contains_key(name)
     }
@@ -2317,6 +2350,7 @@ impl WorldRegistry {
                 hibernated_since: HashMap::new(),
                 loading: std::collections::HashSet::new(),
                 sub_opts: HashMap::new(),
+                sub_cmds: HashMap::new(),
                 hosted_only: false,
                 home_node: None,
                 remote_transit: HashMap::new(),
@@ -3900,6 +3934,7 @@ impl WorldRegistry {
                 budget_bytes,
                 filter,
                 every,
+                max_hz,
                 unreliable,
             });
         Ok(())
@@ -3923,8 +3958,24 @@ impl WorldRegistry {
             budget_bytes,
             filter,
             every,
+            max_hz,
             unreliable,
         } = p;
+        if !st.hosted_only {
+            st.sub_cmds.insert(
+                sid,
+                WorldCmd::Subscribe {
+                    x: pos.x,
+                    y: pos.y,
+                    radius,
+                    max_hz,
+                    budget_bytes: budget_bytes.map(|b| b as _),
+                    filter: (!filter.is_empty())
+                        .then(|| Value::Object(filter.clone().into_iter().collect())),
+                    unreliable,
+                },
+            );
+        }
         let client = *st.subs.entry(sid).or_insert_with(Uuid::now_v7);
         st.sub_opts.entry(client).or_default().unreliable = unreliable;
         st.world
@@ -3968,6 +4019,7 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         if let Some(c) = st.subs.remove(&sid) {
+            st.sub_cmds.remove(&sid);
             st.sub_opts.remove(&c);
             st.world.unsubscribe(c);
         }
@@ -3982,6 +4034,7 @@ impl WorldRegistry {
             let mut st = w.lock();
             let st = &mut *st;
             if let Some(c) = st.subs.remove(&sid) {
+                st.sub_cmds.remove(&sid);
                 st.sub_opts.remove(&c);
                 st.world.unsubscribe(c);
             }
@@ -4748,11 +4801,21 @@ impl WorldRegistry {
         };
         let (fanout, name) = (fanout.clone(), name.to_string());
         rt.spawn(async move {
+            // the new host adopts the cell from the database: persist before announcing
+            if let Err(e) = this.snapshot_now(&name).await {
+                tracing::warn!(world = %name, ?cell, error = %e, "cell offload: shard snapshot failed");
+                return;
+            }
             if let Err(e) = this.publish_cell_host(&name, cell, Some(target)).await {
                 tracing::warn!(world = %name, ?cell, error = %e, "cell offload: directory write failed");
                 return;
             }
             fanout.cell_assign(&name, cell, target);
+            // the bus does not echo to the publisher: hand the cell over here as the bus handler
+            // does on any other previous host
+            this.release_cell(&name, cell, target, &fanout);
+            this.forget_adoptions(&name, cell);
+            this.note_cell_host(&name, cell, target);
         });
     }
 

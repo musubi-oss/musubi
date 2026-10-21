@@ -202,6 +202,11 @@ enum Wire {
         cell: musubi_mesh::CellId,
         node: uuid::Uuid,
     },
+    /// A node started hosting a cell of `world`: the home replays the live subscriptions
+    /// (`WorldCmd::Subscribe` per session) so the new shard knows whom to send deltas to.
+    WorldSubsRequest {
+        world: String,
+    },
     /// Several bulk messages (replica/ghost deltas) in one bus frame: the bulk lane drains its
     /// queue into one frame so one QUIC send carries a whole tick's worth of deltas.
     WorldBatch(Vec<Wire>),
@@ -1070,10 +1075,16 @@ impl Fanout {
                     w.accept_remote_co_locate(&world, entity, cell, by, ttl_ticks);
                 }
             }
+            Wire::WorldSubsRequest { world } => {
+                if let Some(w) = self.worlds.get().cloned() {
+                    w.replay_subs(&world, self);
+                }
+            }
             Wire::WorldCellAssign { world, cell, node } => {
                 if let Some(w) = self.worlds.get().cloned() {
                     let prev = w.cell_host_cached(&world, cell);
                     if node == w.node_id() {
+                        let me = self.clone();
                         tokio::spawn(async move {
                             if let Err(e) = w.host_cell(&world, cell).await {
                                 tracing::warn!(world = %world, ?cell, error = %e, "cell hosting failed");
@@ -1084,6 +1095,7 @@ impl Fanout {
                                     tracing::warn!(world = %world, ?cell, error = %e, "cell state not adopted");
                                 }
                             }
+                            me.publish(Wire::WorldSubsRequest { world });
                         });
                     } else if prev == Some(w.node_id()) {
                         let me = self.clone();
