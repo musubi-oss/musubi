@@ -401,13 +401,25 @@ impl Fanout {
             // world locks and can be slow under replication traffic, so a trivial forwarder drains
             // the ring into an unbounded queue and a worker applies from there — nothing is lost,
             // a burst only grows the queue for a moment
+            // two workers: control traffic (handovers, their acks, assignments) must not wait
+            // behind the delta batches — with one worker a peer's ack took seconds to be applied
+            // and the handover had long been rolled back
             let (q_tx, mut q_rx) =
                 tokio::sync::mpsc::unbounded_channel::<musubi_cluster::BusMessage>();
+            let (fast_tx, mut fast_rx) =
+                tokio::sync::mpsc::unbounded_channel::<musubi_cluster::BusMessage>();
+            let me_fast = f.clone();
+            tokio::spawn(async move {
+                while let Some(m) = fast_rx.recv().await {
+                    me_fast.apply(&m);
+                }
+            });
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
                         Ok(m) => {
-                            if q_tx.send(m).is_err() {
+                            let tx = if Fanout::is_bulk(&m) { &q_tx } else { &fast_tx };
+                            if tx.send(m).is_err() {
                                 break;
                             }
                         }
@@ -935,9 +947,41 @@ impl Fanout {
         self.publish(Wire::RelayedCmd(env));
     }
 
+    /// Bulk frame: deltas, ghosts, replicas, player commands and their batches; everything
+    /// else (handovers, acks, assignments, user events) is applied by the fast worker.
+    fn is_bulk(m: &BusMessage) -> bool {
+        fn tag(v: &serde_json::Value) -> Option<&str> {
+            v.as_object()
+                .and_then(|o| o.keys().next().map(|k| k.as_str()))
+        }
+        let mut t = tag(&m.payload);
+        if t == Some("WorldBatch") {
+            t = m.payload["WorldBatch"].get(0).and_then(tag);
+        }
+        if t == Some("Ordered") {
+            return false;
+        }
+        matches!(
+            t,
+            Some(
+                "Session"
+                    | "WorldGhosts"
+                    | "WorldRepl"
+                    | "WorldReplAck"
+                    | "WorldCmd"
+                    | "WorldInput"
+            )
+        )
+    }
+
     fn apply(&self, m: &BusMessage) {
         if m.topic != TOPIC {
             return;
+        }
+        if m.sent_ms > 0 {
+            let lag = musubi_cluster::unix_ms().saturating_sub(m.sent_ms);
+            let queue = if Fanout::is_bulk(m) { "bulk" } else { "fast" };
+            metrics::histogram!("musubi_bus_inbound_lag_ms", "queue" => queue).record(lag as f64);
         }
         match m.decode::<Wire>() {
             Ok(Wire::Ordered { epoch, seq, inner }) => {

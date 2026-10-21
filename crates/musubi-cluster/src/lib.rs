@@ -230,6 +230,17 @@ pub struct BusMessage {
     pub only: Vec<NodeId>,
     #[serde(default = "default_group")]
     pub group: String,
+    /// Sender's wall clock (unix ms) when the message was handed to the bus: the receiver
+    /// measures its own queueing from it (`musubi_bus_inbound_lag_ms`).
+    #[serde(default)]
+    pub sent_ms: u64,
+}
+
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Cluster {
@@ -874,6 +885,7 @@ impl Cluster {
             via_quic: false,
             only: Vec::new(),
             group: self.me.group.clone(),
+            sent_ms: unix_ms(),
         };
         let Some(bus) = &self.bus else {
             return self.notify(&msg).await;
