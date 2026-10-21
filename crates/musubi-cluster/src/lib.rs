@@ -737,6 +737,20 @@ impl Cluster {
                                     if recv.read_exact(&mut len[1..]).await.is_err() {
                                         return;
                                     }
+                                    // the reader only moves bytes off the stream (releasing
+                                    // the sender's flow-control window); a worker parses and
+                                    // dispatches the frames in the same order on another task
+                                    let (tx, mut rx) =
+                                        tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                                    let worker = c.clone();
+                                    tokio::spawn(async move {
+                                        while let Some(buf) = rx.recv().await {
+                                            let started = std::time::Instant::now();
+                                            worker.ingest_quic_frame(buf).await;
+                                            metrics::histogram!("musubi_bus_ingest_ms")
+                                                .record(started.elapsed().as_secs_f64() * 1000.0);
+                                        }
+                                    });
                                     loop {
                                         let n = u32::from_be_bytes(len) as usize;
                                         if n == 0 || n > MAX_QUIC_BUS_PAYLOAD {
@@ -747,7 +761,9 @@ impl Cluster {
                                         if recv.read_exact(&mut buf).await.is_err() {
                                             return;
                                         }
-                                        c.ingest_quic_frame(buf).await;
+                                        if tx.send(buf).is_err() {
+                                            return;
+                                        }
                                         if recv.read_exact(&mut len).await.is_err() {
                                             return;
                                         }

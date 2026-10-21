@@ -167,7 +167,12 @@ are still read. Measured on the same stand: 28.0 fps per client (p95 84 ms, p99 
 the bulk lane's backlog is gone (38 s worst wait → no slow sends at all), the session lane's is
 not (worst wait 6.6 s, a 64-frame batch still takes 2.5 ms to write) — and the peer's inbound lag
 rose from 8.6 to 23.5 ms: the wait moved to the receiver, which reads and parses each lane stream
-sequentially. That is the next place to look. The bus frame
+sequentially. Parsing was then taken off the stream reader (the reader only moves bytes and
+releases the window, a worker per stream parses and dispatches in order, `musubi_bus_ingest_ms`):
+the peer's inbound lag fell to 15.9 ms, fps stayed at 28.0 — and the measurement says the parse
+was never the cost (15 µs a frame). A 64-frame write still takes 2.7 ms, which with 15 µs of work
+behind it is flow control: the next suspect is the QUIC connection's receive and send windows for
+~60 MB/s on one connection. The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
