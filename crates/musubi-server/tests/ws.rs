@@ -144,6 +144,9 @@ async fn build_state_cfg_with(
         ),
     );
     worlds.set_region(region);
+    if let Some(c) = &cluster {
+        worlds.set_cluster(c.clone());
+    }
     fanout.set_worlds(worlds.clone());
     worlds.clone().spawn_ticker(fanout.clone());
     // production runs matchmaking::spawn_ticker; here a plain loop (no lease) so ready-checks
@@ -7235,6 +7238,264 @@ async fn simulator_stream_pushes_views_every_tick() {
     let r = reply(&mut ws, "nope").await;
     assert_eq!(r["id"], 3, "{r}");
     assert!(r["error"].as_str().unwrap().contains("unknown op"), "{r}");
+}
+
+/// Backend 7: a physical contact with a ghost across a cell border is an interaction the owner
+/// of the target applies; the same contact reported again for the same tick is dropped as a
+/// duplicate; a pair that keeps touching for CONTACT_COLOCATE_AFTER consecutive ticks is
+/// co-located (the target is pinned into the reporter's cell) so one simulator resolves it.
+#[tokio::test]
+async fn cross_border_contact_dedupes_and_colocates() {
+    let group = format!("xcon-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": name, "config": {"cell_size": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (sim1, sim2) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim1, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(json!({"sim": sim2, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, e) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim1, "x": 95.0, "y": 50.0, "components": {"crate": true}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let a = e["id"].as_str().unwrap().to_string();
+    let (st, e) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim2, "x": 105.0, "y": 50.0, "components": {"player": true}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{e}");
+    let b = e["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let contact = |tick: u64| {
+        json!({
+            "sim": sim2, "entity": a, "kind": "contact", "tick": tick,
+            "payload": {"other": b, "impulse": [1.0, 0.0, 0.0], "point": [100.0, 50.0]},
+        })
+    };
+    let mut colocated_at: Option<u64> = None;
+    for i in 0..10u64 {
+        let (st, r) = http_json(
+            &router2,
+            "POST",
+            &format!("/v1/server/worlds/{name}/interact"),
+            None,
+            true,
+            Some(contact(1000 + i)),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        assert_eq!(r["delivered"], "forwarded", "{r}");
+        if r["colocated"] == json!(true) {
+            colocated_at = Some(i);
+        }
+        if i == 0 {
+            // the other side of the border reports the same contact for the same tick
+            let (st, d) = http_json(
+                &router2,
+                "POST",
+                &format!("/v1/server/worlds/{name}/interact"),
+                None,
+                true,
+                Some(contact(1000)),
+            )
+            .await;
+            assert_eq!(st, 200, "{d}");
+            assert_eq!(d["delivered"], "dup", "{d}");
+        }
+    }
+    assert_eq!(
+        colocated_at,
+        Some(9),
+        "tenth consecutive contact co-locates"
+    );
+    let mut got: Vec<Value> = Vec::new();
+    for _ in 0..40 {
+        let (_, ev) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/events?sim={sim1}"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        got.extend(
+            ev["events"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e["type"] == "interaction"),
+        );
+        if got.len() >= 10 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // contacts reported after the pin took effect ride with the handover as buffered inputs
+    // instead of reaching the old owner, so the old owner sees a prefix — never a duplicate
+    assert!(!got.is_empty(), "{got:?}");
+    assert!(got
+        .iter()
+        .all(|e| e["kind"] == "contact" && e["payload"]["other"] == json!(b)));
+    let ticks: Vec<u64> = got.iter().map(|e| e["at_tick"].as_u64().unwrap()).collect();
+    let mut distinct = ticks.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        ticks.len(),
+        "duplicate contact delivered: {ticks:?}"
+    );
+    // the pin ships the crate through the regular cross-node handover into the reporter's cell;
+    // the simulators keep renewing their leases meanwhile, as real ones do every tick
+    let mut owned: Vec<String> = Vec::new();
+    for _ in 0..80 {
+        for (router, sim, cx) in [(&router1, sim1, 0), (&router2, sim2, 1)] {
+            let (st, v) = http_json(
+                router,
+                "POST",
+                &format!("/v1/server/worlds/{name}/lease"),
+                None,
+                true,
+                Some(json!({"sim": sim, "cells": [{"x": cx, "y": 0}]})),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, va) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/server/worlds/{name}/view/1/0"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        owned = va["owned"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|g| g["id"].as_str().map(str::to_string))
+            .collect();
+        if owned.contains(&a) {
+            break;
+        }
+    }
+    if !owned.contains(&a) {
+        let (_, d1) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/admin/worlds/{name}/entities"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, d2) = http_json(
+            &router2,
+            "GET",
+            &format!("/v1/admin/worlds/{name}/entities"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        let (_, ev) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}/events?sim={sim1}"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        panic!("the crate did not land in the reporter's cell 1,0: owned={owned:?}\nnode1={d1}\nnode2={d2}\nsim1 events={ev}");
+    }
 }
 
 /// A simulator hits an entity it does not own: locally (another cell on the same node) and from

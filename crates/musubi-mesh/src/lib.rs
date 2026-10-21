@@ -538,6 +538,9 @@ pub struct Interest {
     last_delta_tick: u64,
     #[serde(default)]
     last_view: Option<(Pos, f64)>,
+    /// The `inside` the last delta was computed with: a change of what the client looks into
+    /// changes visibility without any entity changing, so it forces a full scan like a move.
+    last_inside: Option<EntityId>,
     #[serde(default)]
     last_filter: BTreeMap<String, serde_json::Value>,
     /// Deltas go out every `every` ticks, on ticks where `(tick + phase) % every == 0`; the
@@ -2226,6 +2229,7 @@ impl World {
                 last_sent: HashMap::new(),
                 last_delta_tick: 0,
                 last_view: None,
+                last_inside: None,
                 last_filter: BTreeMap::new(),
                 every,
                 phase,
@@ -4001,6 +4005,7 @@ impl WorldView {
         // same view, same filter, every touched cell quiet since the last scan (a change in the
         // scan's own tick may have landed after it, hence strict): nothing can have changed
         if interest.last_view == Some((interest.pos, interest.radius))
+            && interest.last_inside == interest.inside
             && interest.last_filter == interest.filter
             && cells
                 .iter()
@@ -4028,6 +4033,7 @@ impl WorldView {
         // same view as the last scan and the change log reaches back to it: only entities that
         // changed since can differ from what the client knows, so only those are examined
         let fast = interest.last_view == Some((interest.pos, interest.radius))
+            && interest.last_inside == interest.inside
             && interest.last_filter == interest.filter
             && self.by_cell.log_covers(interest.last_delta_tick);
         let mut fast_gone: Vec<EntityId> = Vec::new();
@@ -4178,6 +4184,7 @@ impl WorldView {
         interest.last_delta_tick = tick;
         // a budget-deferred entity must be retried next tick even if nothing else changes
         interest.last_view = (!deferred).then_some((interest.pos, interest.radius));
+        interest.last_inside = interest.inside;
         if interest.last_filter != interest.filter {
             interest.last_filter = interest.filter.clone();
         }

@@ -271,6 +271,10 @@ struct WorldState {
     /// Per-target sequence of delivered interactions (this node is the single point of order
     /// for the entities it owns; the counter restarts when an entity changes owner).
     interaction_seq: HashMap<EntityId, u64>,
+    /// Cross-border contacts by pair: (last tick seen, consecutive-tick streak). Dedupes the
+    /// same contact reported from both sides of a cell border and drives co-location of a
+    /// pair that keeps touching across it.
+    contacts: HashMap<(EntityId, EntityId), (u64, u32)>,
     /// Spawns waiting for room in a full cell (`soft_cap`), per cell, in arrival order.
     admission: HashMap<CellId, CellQueue>,
 }
@@ -320,6 +324,13 @@ pub struct SpawnSpec {
 
 /// A simulator's interaction with an entity it may not own; `at_tick`/`at` let the owner check
 /// where the target really was when the actor acted (lag compensation).
+/// A cross-border contact pair is co-located after this many consecutive ticks of contact …
+const CONTACT_COLOCATE_AFTER: u32 = 10;
+/// … for this many ticks (the pin renews if they keep touching).
+const CONTACT_COLOCATE_TTL: u64 = 300;
+/// Contact pairs not seen for this long are forgotten.
+const CONTACT_WINDOW_TICKS: u64 = 60;
+
 #[derive(Debug, Clone)]
 pub struct InteractSpec {
     pub kind: String,
@@ -934,6 +945,20 @@ impl WorldRegistry {
     }
 
     /// Cell containing `pos` under this world's grid (needs a local copy of the world).
+    /// The cell a handed-over entity lands in: a pin this node holds for it, else the cell the
+    /// sender's transit named (a pin on the sender's side — a co-located body whose position
+    /// is still in another cell), else the cell its position is in.
+    pub fn handover_target_cell(&self, name: &str, e: &Entity) -> Result<CellId> {
+        let w = self.get(name)?;
+        let st = w.lock();
+        Ok(st
+            .world
+            .pinned_to(e.id)
+            .map(|(c, _)| c)
+            .or_else(|| e.transit.as_ref().map(|t| t.to_cell))
+            .unwrap_or_else(|| st.world.cell_of(e.pos)))
+    }
+
     pub fn cell_of(&self, name: &str, pos: Pos) -> Result<CellId> {
         let w = self.get(name)?;
         let st = w.lock();
@@ -1030,6 +1055,7 @@ impl WorldRegistry {
                     remote_transit: HashMap::new(),
                     kept_after_cancel: HashMap::new(),
                     interaction_seq: HashMap::new(),
+                    contacts: HashMap::new(),
                     admission: HashMap::new(),
                 }))
             });
@@ -1930,6 +1956,7 @@ impl WorldRegistry {
                     remote_transit: HashMap::new(),
  kept_after_cancel: HashMap::new(),
             interaction_seq: HashMap::new(),
+            contacts: HashMap::new(),
             admission: HashMap::new(),
                 })),
             );
@@ -2454,6 +2481,7 @@ impl WorldRegistry {
                 remote_transit: HashMap::new(),
                 kept_after_cancel: HashMap::new(),
                 interaction_seq: HashMap::new(),
+                contacts: HashMap::new(),
                 admission: HashMap::new(),
             })),
         );
@@ -3497,6 +3525,7 @@ impl WorldRegistry {
             .world
             .pinned_to(entity.id)
             .map(|(c, _)| c)
+            .or_else(|| entity.transit.as_ref().map(|t| t.to_cell))
             .unwrap_or_else(|| st.world.cell_of(entity.pos));
         // ours if assigned to us, or unassigned and we are the home
         let here = match self.cell_hosts.get(&(name.to_string(), cell)) {
@@ -4217,12 +4246,83 @@ impl WorldRegistry {
     ) -> Result<Value> {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
-        let mut st = w.lock();
-        let st = &mut *st;
+        let mut guard = w.lock();
+        let st = &mut *guard;
+        // `contact`: a physical contact with a ghost. The owner of the target applies the
+        // impulse (as any interaction); the same contact seen from both sides of the border is
+        // applied once; a pair that keeps touching across the border is co-located so one
+        // simulator resolves it from then on.
+        let mut colocate: Option<EntityId> = None;
+        if spec.kind == "contact" {
+            let other = spec.payload["other"]
+                .as_str()
+                .ok_or_else(|| Error::InvalidArgument("contact payload needs `other`".into()))
+                .and_then(parse_entity)?;
+            let tick = spec.at_tick.unwrap_or(st.world.tick);
+            let key = (id.min(other), id.max(other));
+            let now = st.world.tick;
+            if now % 30 == 0 {
+                st.contacts
+                    .retain(|_, (t, _)| now.saturating_sub(*t) <= CONTACT_WINDOW_TICKS);
+            }
+            let e = st.contacts.entry(key).or_insert((tick, 0));
+            if e.0 == tick && e.1 > 0 {
+                metrics::counter!("musubi_world_contacts_total", "path" => "dup").increment(1);
+                return Ok(json!({ "delivered": "dup", "tick": tick }));
+            }
+            e.1 = if tick.saturating_sub(e.0) <= 1 {
+                e.1 + 1
+            } else {
+                1
+            };
+            e.0 = tick;
+            let streak = e.1;
+            let across = match (st.world.get(id), st.world.get(other)) {
+                (Some(a), Some(b)) => a.cell != b.cell,
+                _ => true,
+            };
+            if across && streak >= CONTACT_COLOCATE_AFTER {
+                e.1 = 0;
+                colocate = Some(other);
+            }
+            metrics::counter!("musubi_world_contacts_total", "path" => "applied").increment(1);
+        }
         let ev = json!({
             "type": "interaction", "entity": id, "kind": spec.kind, "payload": spec.payload,
             "from_sim": sim, "at_tick": spec.at_tick, "at": spec.at, "tolerance": spec.tolerance,
         });
+        if let Some(other) = colocate {
+            drop(guard);
+            // the pair keeps touching across a border: pin the target into the reporter's cell
+            let pinned = self
+                .co_locate(
+                    name,
+                    sim,
+                    &other.to_string(),
+                    entity,
+                    CONTACT_COLOCATE_TTL,
+                    fanout,
+                )
+                .is_ok();
+            metrics::counter!("musubi_world_contacts_total", "path" => "colocated").increment(1);
+            let w = self.get(name)?;
+            let mut st = w.lock();
+            let st = &mut *st;
+            let mut r = self.deliver_interaction(name, st, id, ev, fanout)?;
+            r["colocated"] = json!(pinned);
+            return Ok(r);
+        }
+        self.deliver_interaction(name, st, id, ev, fanout)
+    }
+
+    fn deliver_interaction(
+        &self,
+        name: &str,
+        st: &mut WorldState,
+        id: EntityId,
+        ev: Value,
+        fanout: &Fanout,
+    ) -> Result<Value> {
         match st.world.route_input(id, ev.clone()) {
             Ok(Some(owner)) => {
                 let ev = stamp_interaction(st, id, ev);

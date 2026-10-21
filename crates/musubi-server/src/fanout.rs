@@ -1489,8 +1489,9 @@ impl Fanout {
                     // (a cell changing host): when it says the cell is not ours, ask the
                     // leader before turning the entity away — a refusal here left the sender
                     // waiting out the whole timeout
-                    match w.cell_of(&world, entity.pos) {
-                        Ok(c) if w.hosts_cell_cached(&world, c) => {
+                    let target = w.handover_target_cell(&world, &entity).ok();
+                    match target {
+                        Some(c) if w.hosts_cell_cached(&world, c) => {
                             self.take_handover(
                                 w, world, entity, from_node, inputs, forced, base_rev,
                             );
@@ -1498,11 +1499,17 @@ impl Fanout {
                         _ => {
                             let me = self.clone();
                             tokio::spawn(async move {
-                                let Ok(c) = w.cell_of_any(&world, entity.pos).await else {
-                                    me.world_handover_ack(
-                                        &world, entity.id, from_node, false, false,
-                                    );
-                                    return;
+                                let c = match target {
+                                    Some(c) => c,
+                                    None => match w.cell_of_any(&world, entity.pos).await {
+                                        Ok(c) => c,
+                                        Err(_) => {
+                                            me.world_handover_ack(
+                                                &world, entity.id, from_node, false, false,
+                                            );
+                                            return;
+                                        }
+                                    },
                                 };
                                 let fresh = w.cell_host_of(&world, c).await.ok().flatten();
                                 if fresh == Some(w.node_id()) {
