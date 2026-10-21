@@ -3310,6 +3310,8 @@ impl WorldRegistry {
             }
             for i in inputs {
                 fanout.world_input(name, id, i);
+                metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
+                    .increment(1);
             }
             push_event(
                 st,
@@ -3834,6 +3836,8 @@ impl WorldRegistry {
             .and_then(|e| e.transit.as_ref().map(|t| t.from));
         let (outcome, inputs) = st.world.handover_ack(sim, id).map_err(mesh_err)?;
         if let Some(from) = from {
+            metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
+                .increment(1);
             push_event(
                 st,
                 from,

@@ -149,6 +149,10 @@ enum Cmd {
         /// Subscribe with `unreliable_updates`: position deltas as sequenced unreliable frames.
         #[arg(long)]
         unreliable: bool,
+        /// `world` scenario: simulators per world over the WS stream (cells partitioned between
+        /// them, entities drift across borders → handovers); 1 = a single HTTP simulator.
+        #[arg(long, default_value_t = 1)]
+        sims: usize,
         /// `match` scenario: players per relayed match (one creates, the rest join).
         #[arg(long, default_value_t = 8)]
         match_size: usize,
@@ -311,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
             transport,
             quic_addr,
             unreliable,
+            sims,
             match_size,
             json,
         } => {
@@ -327,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
                 transport,
                 quic_addr,
                 unreliable,
+                sims,
                 json,
                 match_size,
             })

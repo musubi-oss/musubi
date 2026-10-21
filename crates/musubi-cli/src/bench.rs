@@ -20,6 +20,9 @@ pub struct Opts {
     /// `world` scenario: worlds to create, entities per world, client interest radius.
     pub worlds: usize,
     pub entities: usize,
+    /// `world` scenario: simulators per world over the WS stream (1 = one HTTP-`apply` simulator);
+    /// cells are partitioned between them and entities drift across the borders (handovers).
+    pub sims: usize,
     pub radius: f64,
     /// Cap on deltas per second per world player (`None` = every tick).
     pub max_hz: Option<u32>,
@@ -60,9 +63,14 @@ struct WorldTotals {
     err_connect: AtomicU64,
     err_subscribe: AtomicU64,
     err_stream: AtomicU64,
+    stream_frames: AtomicU64,
+    stream_reconnects: AtomicU64,
+    handover_acks: AtomicU64,
 }
 
 struct Arena {
+    /// one per simulator; `sim` is `sims[0]`
+    sims: Vec<uuid::Uuid>,
     name: String,
     sim: uuid::Uuid,
     side: f64,
@@ -75,6 +83,7 @@ async fn world_setup(
     url: &str,
     name: &str,
     entities: usize,
+    sims: usize,
 ) -> anyhow::Result<Arena> {
     let cell = 256.0;
     let side = ((entities.max(1) as f64).sqrt() * 20.0).max(cell);
@@ -85,21 +94,48 @@ async fn world_setup(
         .send()
         .await?;
     anyhow::ensure!(r.status().is_success(), "create world: {}", r.status());
-    let sim = uuid::Uuid::now_v7();
+    let sims: Vec<uuid::Uuid> = (0..sims.max(1)).map(|_| uuid::Uuid::now_v7()).collect();
     let n = (side / cell).ceil() as i64;
-    let cells: Vec<Value> = (0..n)
-        .flat_map(|x| (0..n).map(move |y| json!({"x": x, "y": y})))
+    let owner = |x: i64, y: i64| ((x + y) as usize) % sims.len();
+    let parts: Vec<Vec<Value>> = (0..sims.len())
+        .map(|k| {
+            (0..n)
+                .flat_map(|x| (0..n).map(move |y| (x, y)))
+                .filter(|&(x, y)| owner(x, y) == k)
+                .map(|(x, y)| json!({"x": x, "y": y}))
+                .collect()
+        })
         .collect();
-    let r = http
-        .post(format!("{url}/v1/server/worlds/{name}/lease"))
-        .header("x-musubi-server-key", KEY)
-        .json(&json!({"sim": sim, "cells": cells}))
-        .send()
-        .await?;
-    anyhow::ensure!(r.status().is_success(), "lease: {}", r.status());
+    let lease_all = |http: reqwest::Client| {
+        let parts = parts.clone();
+        let sims = sims.clone();
+        let url = url.to_string();
+        let name = name.to_string();
+        async move {
+            for (k, cells) in parts.iter().enumerate() {
+                if cells.is_empty() {
+                    continue;
+                }
+                let r = http
+                    .post(format!("{url}/v1/server/worlds/{name}/lease"))
+                    .header("x-musubi-server-key", KEY)
+                    .json(&json!({"sim": sims[k], "cells": cells}))
+                    .send()
+                    .await?;
+                anyhow::ensure!(r.status().is_success(), "lease: {}", r.status());
+            }
+            anyhow::Ok(())
+        }
+    };
+    lease_all(http.clone()).await?;
     let mut ids = Vec::with_capacity(entities);
     for i in 0..entities {
+        // thousands of serial spawns outlive `lease_ttl_ticks`: keep the lease alive meanwhile
+        if i > 0 && i % 200 == 0 {
+            lease_all(http.clone()).await?;
+        }
         let (x, y) = arena_point(side, i as u64);
+        let sim = sims[owner((x / cell) as i64, (y / cell) as i64)];
         let r = http
             .post(format!("{url}/v1/server/worlds/{name}/spawn"))
             .header("x-musubi-server-key", KEY)
@@ -112,7 +148,8 @@ async fn world_setup(
     }
     Ok(Arena {
         name: name.to_string(),
-        sim,
+        sim: sims[0],
+        sims,
         side,
         entities: ids,
     })
@@ -395,6 +432,149 @@ async fn world_loop(p: Player) {
         }
     }
     let _ = ws.close(None).await;
+}
+
+/// One of `sims` simulators of an arena over the WS stream (`/v1/server/worlds/{w}/stream`):
+/// leases its share of the grid, and on every `tick` frame moves a thirtieth of the entities it
+/// owns a few units along x (wrapping at the arena edge), so each entity crosses a cell border —
+/// and, with several simulators, changes owner — every few seconds. Answers `handover_request`
+/// events with `handover_ack`, re-leases every half second, reconnects on drop.
+async fn world_streamer(
+    url: String,
+    arena: Arc<Arena>,
+    k: usize,
+    mut deadline: tokio::sync::watch::Receiver<Option<Instant>>,
+    totals: Arc<WorldTotals>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let cell = 256.0;
+    let sims = arena.sims.len();
+    let sim = arena.sims[k];
+    let n = (arena.side / cell).ceil() as i64;
+    let cells: Vec<Value> = (0..n)
+        .flat_map(|x| (0..n).map(move |y| (x, y)))
+        .filter(|&(x, y)| ((x + y) as usize) % sims == k)
+        .map(|(x, y)| json!({"x": x, "y": y}))
+        .collect();
+    let ws_base = url.replacen("http", "ws", 1);
+    let past = |d: &tokio::sync::watch::Receiver<Option<Instant>>| {
+        d.borrow().is_some_and(|t| Instant::now() >= t)
+    };
+    let mut frame_no = 0u64;
+    let mut first = true;
+    // direction per entity: bounce at the arena edges instead of wrapping (a wrap is a teleport
+    // into a cell this simulator does not own and is rightly refused)
+    let mut dir: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    while !past(&deadline) {
+        if !first {
+            totals.stream_reconnects.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        first = false;
+        let Ok(mut req) = format!("{ws_base}/v1/server/worlds/{}/stream?sim={sim}", arena.name)
+            .into_client_request()
+        else {
+            return;
+        };
+        req.headers_mut()
+            .insert("x-musubi-server-key", KEY.parse().unwrap());
+        let Ok(Ok((mut ws, _))) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(req),
+        )
+        .await
+        else {
+            totals.err_stream.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let lease = json!({"op": "lease", "cells": cells}).to_string();
+        if ws.send(Message::Text(lease.clone())).await.is_err() {
+            continue;
+        }
+        let mut last_lease = Instant::now();
+        loop {
+            let m = tokio::select! {
+                m = ws.next() => m,
+                _ = deadline.changed() => { if past(&deadline) { return } continue }
+                _ = tokio::time::sleep(Duration::from_secs(3)) => break,
+            };
+            let Some(Ok(m)) = m else { break };
+            if past(&deadline) {
+                return;
+            }
+            let Message::Text(t) = m else { continue };
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            if v["type"] == "tick" {
+                frame_no += 1;
+                totals.stream_frames.fetch_add(1, Ordering::Relaxed);
+                totals.sim_ticks.fetch_add(1, Ordering::Relaxed);
+                let mut out: Vec<String> = Vec::new();
+                for ev in v["events"].as_array().into_iter().flatten() {
+                    if ev["type"] == "handover_request" {
+                        totals.handover_acks.fetch_add(1, Ordering::Relaxed);
+                        out.push(json!({"op": "handover_ack", "entity": ev["entity"]}).to_string());
+                    }
+                }
+                let mut i = 0u64;
+                for c in v["cells"].as_array().into_iter().flatten() {
+                    for e in c["owned"].as_array().into_iter().flatten() {
+                        i += 1;
+                        if (i + frame_no) % 30 != 0 {
+                            continue;
+                        }
+                        let (Some(id), Some(x), Some(y)) =
+                            (e["id"].as_str(), e["x"].as_f64(), e["y"].as_f64())
+                        else {
+                            continue;
+                        };
+                        let d = dir.entry(id.to_string()).or_insert(6.0);
+                        if x + *d <= 0.0 || x + *d >= arena.side {
+                            *d = -*d;
+                        }
+                        let nx = (x + *d).clamp(0.0, arena.side - 0.001);
+                        out.push(
+                            json!({"op": "apply", "entity": id, "x": nx, "y": y, "components": {"hp": (frame_no % 100) as i64}})
+                                .to_string(),
+                        );
+                        totals.moves_ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if last_lease.elapsed() >= Duration::from_millis(500) {
+                    last_lease = Instant::now();
+                    out.push(lease.clone());
+                }
+                let mut failed = false;
+                for o in out {
+                    if ws.send(Message::Text(o)).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    break;
+                }
+            } else if v["error"].is_string() {
+                totals.moves_err.fetch_add(1, Ordering::Relaxed);
+                if totals.moves_err.load(Ordering::Relaxed) <= 3 {
+                    eprintln!("sim stream error: {t}");
+                }
+            }
+        }
+    }
+}
+
+/// Sum of a counter over the bench worlds, from `/metrics`.
+async fn scrape_counter(http: &reqwest::Client, url: &str, prefix: &str, metric: &str) -> f64 {
+    let Ok(r) = http.get(format!("{url}/metrics")).send().await else {
+        return 0.0;
+    };
+    let Ok(body) = r.text().await else { return 0.0 };
+    body.lines()
+        .filter(|l| l.starts_with(metric) && l.contains(&format!("world=\"{prefix}")))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
 }
 
 /// World tick duration from `/metrics`: mean, p50 and p99 (ms) over the bench worlds, from the
@@ -895,14 +1075,26 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
         let t = Instant::now();
         for i in 0..o.worlds.max(1) {
             let name = format!("bench-{run_id}-{i}");
-            let arena = Arc::new(world_setup(&http, &url, &name, o.entities).await?);
-            sims.push(tokio::spawn(world_sim(
-                http.clone(),
-                url.clone(),
-                arena.clone(),
-                window_rx.clone(),
-                totals.clone(),
-            )));
+            let arena = Arc::new(world_setup(&http, &url, &name, o.entities, o.sims).await?);
+            if o.sims > 1 {
+                for k in 0..o.sims {
+                    sims.push(tokio::spawn(world_streamer(
+                        url.clone(),
+                        arena.clone(),
+                        k,
+                        window_rx.clone(),
+                        totals.clone(),
+                    )));
+                }
+            } else {
+                sims.push(tokio::spawn(world_sim(
+                    http.clone(),
+                    url.clone(),
+                    arena.clone(),
+                    window_rx.clone(),
+                    totals.clone(),
+                )));
+            }
             arenas.push(arena);
         }
         if !o.json {
@@ -1026,6 +1218,11 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             "client_err_subscribe": totals.err_subscribe.load(Ordering::Relaxed),
             "client_err_stream": totals.err_stream.load(Ordering::Relaxed),
             "tick": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_tick_duration_seconds").await,
+            "sims": o.sims.max(1),
+            "stream_frames_per_sim_per_sec": totals.stream_frames.load(Ordering::Relaxed) as f64 / secs / (o.sims.max(1) * arenas.len().max(1)) as f64,
+            "stream_reconnects": totals.stream_reconnects.load(Ordering::Relaxed),
+            "handover_acks": totals.handover_acks.load(Ordering::Relaxed),
+            "handovers_completed": scrape_counter(&http, &url, &format!("bench-{run_id}"), "musubi_world_handovers_total").await,
             "fanout": scrape_tick(&http, &url, &format!("bench-{run_id}"), "musubi_world_fanout_duration_seconds").await,
         }) },
         "auth": { "clients": o.clients, "total_ms": auth_ms, "per_client_ms": auth_ms / o.clients.max(1) as f64 },
