@@ -69,23 +69,32 @@ is the tree as of `bebbbcf`, "after" has the three fixes described below the tab
 | 2b | 1 000 | 4 × 2 000 | binary | 28.6 | 34 / 60 / 81 ms | 10 / 50 ms | 0.6 / 10 ms | 4 959 / 4 959 | 154 % |
 | 3 before | 2 000 | 4 × 4 000, 8 sims | json | 12.3 | 65 / 240 / 352 ms | 25 / 250 ms | 2.2 / 25 ms | 6 982 / 13 744 | 164 % |
 | 3 after | 2 000 | 4 × 4 000, 8 sims | json | **23.6** | **39 / 94 / 134 ms** | **25 / 100 ms** | 1.5 / 25 ms | **8 568 / 8 574** | 225 % |
-| 3, 2 nodes, players on home | 2 000 | 4 × 4 000, 8 sims | json | 24.0 | 35 / 87 / 196 ms | 25 / 100 ms | 2.3 / 25 ms | 2 099 / 6 055 | home 47 %, peer 22 % |
-| 3, 2 nodes, players split | 2 000 | 4 × 4 000, 8 sims | json | 13.8 | 35 / 198 / 706 ms | 10 / 50 ms | 2.0 / 10 ms | 2 096 / 5 554 | home 65 %, peer 33 % |
+| 3, 2 nodes, players on home, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 24.0 | 35 / 87 / 196 ms | 25 / 100 ms | 2.3 / 25 ms | 2 099 / 6 055 | home 47 %, peer 22 % |
+| 3, 2 nodes, players split, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 13.8 | 35 / 198 / 706 ms | 10 / 50 ms | 2.0 / 10 ms | 2 096 / 5 554 | home 65 %, peer 33 % |
+| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 23.1 | 34 / 88 / 202 ms | 5 / 50 ms | 1.5 / 10 ms | 1 604 / 11 016 | home 75 %, peer 84 % |
+| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 23.0 | 34 / 96 / 200 ms | 10 / 25 ms | 1.7 / 10 ms | 2 215 / 9 825 | home 32 %, peer 48 % |
 
 The two-node rows are the same stand with a second `sim`-role node on the same VM and
-`--controller '{"offload_above_cost": 800}'`: the home moved ~35 cells (of 4 × 25) to the peer,
-the bench simulators followed the lease redirects and the peer ticked and fanned out its cells
-(13 k frames in 30 s with players on the home, 46 k with players split over both nodes). It did
-**not** make the stand faster, and the numbers say why rather than hiding it: with every player
-connected to the home node, the peer's deltas travel back over the inter-node bus to the home's
-sessions, so the home's send path still does all the work (parity, 24 fps); with players spread
-over both nodes, deltas for home-hosted cells now cross the bus the other way for 1 000 sessions
-× 30 Hz, and that per-session bus traffic is the next ceiling (p99 706 ms, a 22 s backlog at
-worst). Handover completion also gets slower when the two leases are on different nodes (2 099
-done of ~6 000 asked within the 10-tick timeout vs all of them on one node). So: a world is
-hosted across nodes for real now, and the next thing to fix is cross-node delta delivery
-(batching per destination node per tick instead of one bus message per session) and cross-node
-handover latency — not the simulation.
+`--controller '{"offload_above_cost": 800}'`: the home moves ~40 cells (of 4 × 25) to the peer,
+the bench simulators follow the lease redirects and the peer ticks and fans out its cells
+(70–160 k frames in 30 s). The first two rows are kept as a warning: node 1 of that stand had no
+`node.bus_listen`, so every one of its inter-node messages went over the Postgres `NOTIFY`
+fallback (one round trip to the database each, 7 900 bytes max) — that, not the design, is the
+13.8 fps and the 22 s backlog with players split. Three things changed for the QUIC rows:
+messages to sessions on other nodes (`Wire::Session`, i.e. world deltas to remote players) get
+their own bus lane and are batched per drain like replica deltas (they used to go one message
+per session per tick on the control lane, in front of the handovers; batching is off on the
+Postgres fallback, where a batch would exceed the cap and be dropped whole); a node the
+directory names as a cell's host now takes the cell on the first request for it (`ensure_hosting`,
+with the cell resolved from `musubi.worlds` when the shard is not up yet, and a follower whose
+directory replica lags asks the leader) instead of redirecting back to the home — a simulator
+redirected during an offload used to bounce between the two nodes until "too many redirects";
+and the bench stand survives cells moving while it is still spawning (per-cell leases, a 409 on
+spawn re-leases on the new host). Result with players split over both nodes: 23 fps per client,
+same p99 as one node, the peer now does more of the work than the home (32 % vs 48 % of a core)
+and the home's send path is no longer the ceiling. Still honest: this is two nodes on one VM,
+and cross-node handovers complete slowly — 2 215 of 9 825 asked finished within the 10-tick
+timeout (vs all of them on one node); that is the next thing to fix.
 
 Read it as: the simulation step (`musubi_world_tick_duration_seconds`) is never the problem —
 1.5 ms mean with 4 000 entities and 8 simulators handing entities to each other 280 times a

@@ -235,6 +235,10 @@ pub struct Fanout {
     /// this queue (a task per message would let two inputs from one source overtake each other).
     bus: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
     bus_bulk: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    /// Messages to sessions living on other nodes (world deltas above all): batched per drain so
+    /// 1 000 remote players × 30 Hz is a few bus frames per tick, not 30 000 — and they no longer
+    /// queue in front of handovers on the control lane.
+    bus_session: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
     bus_user: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
 }
 
@@ -256,6 +260,7 @@ impl Fanout {
             fleets: Arc::new(OnceLock::new()),
             bus: Arc::new(OnceLock::new()),
             bus_bulk: Arc::new(OnceLock::new()),
+            bus_session: Arc::new(OnceLock::new()),
             bus_user: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
             social: Arc::new(OnceLock::new()),
@@ -1177,16 +1182,19 @@ impl Fanout {
         let Some(c) = self.cluster.clone() else {
             return;
         };
-        // three lanes, each its own queue, so one kind of traffic cannot starve another: bulk
+        // four lanes, each its own queue, so one kind of traffic cannot starve another: bulk
         // replication (ghost and replica deltas, their acks — ordered, one at a time), user
         // traffic (chat, presence, relayed match input — high volume, published with bounded
         // concurrency) and mesh/session control (handovers, acks, adoption/drop reconciliation,
         // matchmaking — ordered, must not wait behind the other two; the stand saw control
-        // messages queue 48 s behind chat in a single queue)
+        // messages queue 48 s behind chat in a single queue), and remote-session delivery (world
+        // deltas to players on other nodes — batched; on the control lane 1 000 remote players ×
+        // 30 Hz queued handovers behind 30 000 frames a second)
         let (lane, concurrency) = match w {
             Wire::WorldGhosts { .. } | Wire::WorldRepl { .. } | Wire::WorldReplAck { .. } => {
                 (&self.bus_bulk, 1)
             }
+            Wire::Session { .. } => (&self.bus_session, 1),
             Wire::Channel { .. }
             | Wire::Account { .. }
             | Wire::Presence { .. }
@@ -1196,7 +1204,13 @@ impl Fanout {
         };
         let tx = lane.get_or_init(|| {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(std::time::Instant, Wire)>();
-            let batch = matches!(w, Wire::WorldGhosts { .. } | Wire::WorldRepl { .. });
+            // batches only make sense on the QUIC bus: the Postgres NOTIFY fallback caps a
+            // message at 7 900 bytes, a batch of deltas is dropped whole there
+            let batch = c.bus_addr().is_some()
+                && matches!(
+                    w,
+                    Wire::WorldGhosts { .. } | Wire::WorldRepl { .. } | Wire::Session { .. }
+                );
             tokio::spawn(async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
                 // one "slow" warning per lane per second, not one per message

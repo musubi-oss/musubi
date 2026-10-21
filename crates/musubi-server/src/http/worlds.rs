@@ -71,6 +71,14 @@ async fn ensure_cells_home(
         host = Some(h);
     }
     match host {
+        Some(h) if h == s.worlds.node_id() => {
+            for c in cells {
+                if let Err(e) = s.worlds.ensure_hosting(world, *c).await {
+                    return Err(ApiError::from(e).into_response());
+                }
+            }
+            Ok(())
+        }
         Some(h) => redirect_to(s, world, h, uri).await,
         None => ensure_shard(s, world, uri).await,
     }
@@ -90,6 +98,13 @@ async fn ensure_cell_home(
         }
         Err(e) => return Err(ApiError::from(e).into_response()),
     };
+    if host == s.worlds.node_id() {
+        return s
+            .worlds
+            .ensure_hosting(world, cell)
+            .await
+            .map_err(|e| ApiError::from(e).into_response());
+    }
     redirect_to(s, world, host, uri).await
 }
 
@@ -477,14 +492,18 @@ async fn spawn(
     Path(w): Path<String>,
     Json(r): Json<SpawnReq>,
 ) -> Result<Response, Response> {
-    match s.worlds.cell_of(
-        &w,
-        Pos {
-            x: r.x,
-            y: r.y,
-            z: 0.0,
-        },
-    ) {
+    match s
+        .worlds
+        .cell_of_any(
+            &w,
+            Pos {
+                x: r.x,
+                y: r.y,
+                z: 0.0,
+            },
+        )
+        .await
+    {
         Ok(c) => ensure_cell_home(&s, &w, c, &uri).await?,
         Err(_) => ensure_home(&s, &w, &uri).await?,
     }
@@ -829,7 +848,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                     y: r.y,
                     z: 0.0,
                 };
-                let at_home = match s.worlds.cell_of(w, pos) {
+                let at_home = match s.worlds.cell_of_any(w, pos).await {
                     Ok(c) => ensure_cell_home(s, w, c, uri).await,
                     Err(_) => ensure_home(s, w, uri).await,
                 };

@@ -127,7 +127,26 @@ async fn world_setup(
                     .json(&json!({"sim": sims[k], "cells": cells}))
                     .send()
                     .await?;
-                anyhow::ensure!(r.status().is_success(), "lease: {}", r.status());
+                if r.status().is_success() {
+                    continue;
+                }
+                // once the home starts offloading cells mid-setup the group spans two hosts and
+                // the home refuses it ("lease them separately"): one request per cell, each
+                // following its own redirect
+                for c in cells {
+                    let r = http
+                        .post(format!("{url}/v1/server/worlds/{name}/lease"))
+                        .header("x-musubi-server-key", KEY)
+                        .json(&json!({"sim": sims[k], "cells": [c]}))
+                        .send()
+                        .await?;
+                    anyhow::ensure!(
+                        r.status().is_success(),
+                        "lease: {} {}",
+                        r.status(),
+                        r.text().await.unwrap_or_default()
+                    );
+                }
             }
             anyhow::Ok(())
         }
@@ -141,13 +160,39 @@ async fn world_setup(
         }
         let (x, y) = arena_point(side, i as u64);
         let sim = sims[owner((x / cell) as i64, (y / cell) as i64)];
-        let r = http
+        let body =
+            json!({"sim": sim, "x": x, "y": y, "components": {"hp": 100}, "persistent": false});
+        let mut r = http
             .post(format!("{url}/v1/server/worlds/{name}/spawn"))
             .header("x-musubi-server-key", KEY)
-            .json(&json!({"sim": sim, "x": x, "y": y, "components": {"hp": 100}, "persistent": false}))
+            .json(&body)
             .send()
             .await?;
-        anyhow::ensure!(r.status().is_success(), "spawn: {}", r.status());
+        if r.status() == reqwest::StatusCode::CONFLICT {
+            // the cell moved to another node while we were spawning (automatic offload): the
+            // redirect landed there, but our lease lives on the old host — lease there and retry
+            let host = format!("{}://{}", r.url().scheme(), r.url().authority());
+            let (cx, cy) = ((x / cell) as i64, (y / cell) as i64);
+            let l = http
+                .post(format!("{host}/v1/server/worlds/{name}/lease"))
+                .header("x-musubi-server-key", KEY)
+                .json(&json!({"sim": sim, "cells": [{"x": cx, "y": cy}]}))
+                .send()
+                .await?;
+            anyhow::ensure!(l.status().is_success(), "lease after move: {}", l.status());
+            r = http
+                .post(format!("{url}/v1/server/worlds/{name}/spawn"))
+                .header("x-musubi-server-key", KEY)
+                .json(&body)
+                .send()
+                .await?;
+        }
+        anyhow::ensure!(
+            r.status().is_success(),
+            "spawn: {} {}",
+            r.status(),
+            r.text().await.unwrap_or_default()
+        );
         let v: Value = r.json().await?;
         ids.push(v["id"].as_str().unwrap_or_default().to_string());
     }

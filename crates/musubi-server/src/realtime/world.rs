@@ -899,6 +899,30 @@ impl WorldRegistry {
         Ok(st.world.cell_of(pos))
     }
 
+    /// `cell_of` for a world this node may not hold a shard of: the grid comes from
+    /// `musubi.worlds` then. A simulator redirected here for a cell the directory assigned to this
+    /// node can arrive before (or without) the bus announcement; answering "not my world, go
+    /// home" sent it round in circles, resolving the cell lets `ensure_hosting` take the cell.
+    pub async fn cell_of_any(&self, name: &str, pos: Pos) -> Result<CellId> {
+        if let Ok(c) = self.cell_of(name, pos) {
+            return Ok(c);
+        }
+        let Some(db) = &self.db else {
+            return Err(Error::NotFound(format!("world {name}")));
+        };
+        let row: Option<(Value,)> = sqlx::query_as(
+            "select config from musubi.worlds where name = $1 and cluster_group = $2",
+        )
+        .bind(name)
+        .bind(&self.group)
+        .fetch_optional(db)
+        .await
+        .map_err(Error::internal)?;
+        let (c,) = row.ok_or_else(|| Error::NotFound(format!("world {name}")))?;
+        let cfg: WorldConfig = serde_json::from_value(c).map_err(Error::internal)?;
+        Ok(World::new(cfg).cell_of(pos))
+    }
+
     /// Remember another node's cell assignment (no directory write; the coordinator did that).
     pub fn note_cell_host(&self, name: &str, cell: CellId, node: Uuid) {
         self.cell_hosts.insert((name.to_string(), cell), node);
@@ -906,6 +930,19 @@ impl WorldRegistry {
 
     /// This node takes `cell` of `name`: make sure a local shard of the world exists (config from
     /// `musubi.worlds`, defaults without a database); simulators lease the cell here as usual.
+    /// The directory names this node as `cell`'s host: make sure the shard is up and the cell
+    /// hosted before serving a request for it. The bus announcement (`WorldCellAssign`) does the
+    /// same asynchronously; a simulator redirected here can arrive first, and answering it with
+    /// a redirect back to the home (which redirects here again) was an endless loop.
+    pub async fn ensure_hosting(&self, name: &str, cell: CellId) -> Result<()> {
+        if let Some(w) = self.worlds.get(name) {
+            if self.hosts_cell(&w.lock(), name, cell) {
+                return Ok(());
+            }
+        }
+        self.host_cell(name, cell).await.map(|_| ())
+    }
+
     pub async fn host_cell(&self, name: &str, cell: CellId) -> Result<Vec<CellId>> {
         self.check_hosting()?;
         let home = self.home_of(name).await?;
@@ -1158,6 +1195,15 @@ impl WorldRegistry {
                     if h.is_some() {
                         break;
                     }
+                }
+                if h.is_none() && !c.is_raft_leader() {
+                    // a follower's replica can lag the assignment the home just wrote: the home
+                    // redirects a simulator here, a stale "no host" sends it back to the home,
+                    // and so on until the client gives up ("too many redirects") — ask the leader
+                    h = c
+                        .directory_get_fresh(&Self::cell_key(name, cell))
+                        .await
+                        .and_then(|v| v["node_id"].as_str().and_then(|x| Uuid::parse_str(x).ok()));
                 }
                 return match h {
                     Some(h) => {
