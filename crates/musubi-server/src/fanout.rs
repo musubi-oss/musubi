@@ -225,6 +225,48 @@ enum Wire {
     },
 }
 
+impl Wire {
+    fn kind(&self) -> &'static str {
+        match self {
+            Wire::Account { .. } => "Account",
+            Wire::Channel { .. } => "Channel",
+            Wire::Presence { .. } => "Presence",
+            Wire::MmAdd { .. } => "MmAdd",
+            Wire::MmRemove { .. } => "MmRemove",
+            Wire::MmMatched { .. } => "MmMatched",
+            Wire::MmReadyCheck { .. } => "MmReadyCheck",
+            Wire::MmReady { .. } => "MmReady",
+            Wire::MmReadyExpired { .. } => "MmReadyExpired",
+            Wire::MmRelease { .. } => "MmRelease",
+            Wire::Session { .. } => "Session",
+            Wire::PartyCmd { .. } => "PartyCmd",
+            Wire::SessionGone { .. } => "SessionGone",
+            Wire::SessionSteal { .. } => "SessionSteal",
+            Wire::Online { .. } => "Online",
+            Wire::RelayedCmd { .. } => "RelayedCmd",
+            Wire::WorldCmd { .. } => "WorldCmd",
+            Wire::WorldGhosts { .. } => "WorldGhosts",
+            Wire::WorldRepl { .. } => "WorldRepl",
+            Wire::WorldReplAck { .. } => "WorldReplAck",
+            Wire::WorldHandover { .. } => "WorldHandover",
+            Wire::WorldHandoverAck { .. } => "WorldHandoverAck",
+            Wire::WorldAdopted { .. } => "WorldAdopted",
+            Wire::WorldDrop { .. } => "WorldDrop",
+            Wire::WorldTxPrepare { .. } => "WorldTxPrepare",
+            Wire::WorldTxVote { .. } => "WorldTxVote",
+            Wire::WorldTxCommit { .. } => "WorldTxCommit",
+            Wire::WorldTxAbort { .. } => "WorldTxAbort",
+            Wire::WorldInput { .. } => "WorldInput",
+            Wire::WorldCoLocate { .. } => "WorldCoLocate",
+            Wire::WorldCellAssign { .. } => "WorldCellAssign",
+            Wire::WorldSubsRequest { .. } => "WorldSubsRequest",
+            Wire::WorldDeleted { .. } => "WorldDeleted",
+            Wire::WorldBatch { .. } => "WorldBatch",
+            Wire::Ordered { .. } => "Ordered",
+        }
+    }
+}
+
 const TOPIC: &str = "realtime";
 /// Most messages folded into one bus frame. A lane sends one frame at a time, so this bounds its
 /// throughput — but a frame is serialized (twice: `BusMessage.payload` is a `Value`) on the
@@ -1343,11 +1385,10 @@ impl Fanout {
                 (&self.bus_bulk, 1, "bulk")
             }
             Wire::Session { .. } => (&self.bus_session, 1, "session"),
-            Wire::WorldInput { .. } => (&self.bus_input, 1, "input"),
-            Wire::WorldCmd(WorldCmdEnv {
-                cmd: WorldCmd::Input { .. },
-                ..
-            }) => (&self.bus_input, 1, "input"),
+            // every player command: inputs, and the subscribe a client re-sends as its interest
+            // moves (2 000 players: ~5 000/s on the stand, which on the control lane put the
+            // handovers a minute behind); one lane keeps a session's commands in order
+            Wire::WorldInput { .. } | Wire::WorldCmd(_) => (&self.bus_input, 1, "input"),
             // a handover ack is small, order-free (late and duplicate acks are handled) and
             // decides whether the handover completes in time: it must not queue behind the
             // handovers and commands of the serial control lane (50–100 s behind on the stand)
@@ -1359,6 +1400,8 @@ impl Fanout {
             | Wire::RelayedCmd { .. } => (&self.bus_user, 32, "user"),
             _ => (&self.bus, CONTROL_IN_FLIGHT, "control"),
         };
+        metrics::counter!("musubi_fanout_published_total", "lane" => lane_name, "kind" => w.kind())
+            .increment(1);
         // control before user before deltas on the shared QUIC connection (see `publish_prio`)
         let priority = match lane_name {
             "control" => 10,
@@ -1380,10 +1423,7 @@ impl Fanout {
                         | Wire::WorldRepl { .. }
                         | Wire::Session { .. }
                         | Wire::WorldInput { .. }
-                        | Wire::WorldCmd(WorldCmdEnv {
-                            cmd: WorldCmd::Input { .. },
-                            ..
-                        })
+                        | Wire::WorldCmd(_)
                 );
             tokio::spawn(async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));

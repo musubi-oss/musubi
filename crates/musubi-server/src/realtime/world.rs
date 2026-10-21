@@ -200,12 +200,12 @@ fn ship_handover(
     // a retry ships everything: the receiver consumed its ghost on the attempt whose ack never
     // came back (or never had one), and a delta it cannot build on costs a refusal round trip
     // on top — the stand saw 43 k such refusals in 30 s
-    let retry = st.remote_transit.get(&id).is_some_and(|(_, n, _)| *n > 1);
-    let base = if retry || st.full_resend.remove(&id) {
-        None
-    } else {
-        st.ghost_send.values().find_map(|g| g.sent_rev(id))
-    };
+    // Always the full entity. The delta path (only components newer than the ghost the
+    // neighbours hold) saved bytes, but `ghost_send` knows what was sent to neighbouring cells,
+    // not whether the receiving node still holds that ghost — on the stand one ship in five was
+    // refused ("no ghost to build on") and cost a round trip plus a re-send under the timeout.
+    st.full_resend.remove(&id);
+    let base: Option<u64> = None;
     if let Some(r) = base {
         std::sync::Arc::make_mut(&mut e.components).retain(|_, c| c.changed_rev > r);
     }
@@ -3375,7 +3375,7 @@ impl WorldRegistry {
         fanout: &Fanout,
     ) {
         let Some(w) = self.worlds.get(name) else {
-            metrics::counter!("musubi_world_handover_acks_total", "path" => "no_world", "accepted" => accepted.to_string())
+            metrics::counter!("musubi_world_handover_acks_total", "path" => "no_world", "accepted" => accepted.to_string(), "world" => name.to_string())
                 .increment(1);
             return;
         };
