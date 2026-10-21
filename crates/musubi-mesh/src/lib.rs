@@ -266,6 +266,9 @@ pub struct Transit {
     /// Entities attached to this one that travel in the same transaction.
     #[serde(default)]
     pub group: Vec<EntityId>,
+    /// The receiver is a shard on another node (`remote_handover_timeout_ticks` applies).
+    #[serde(default)]
+    pub remote: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +300,10 @@ pub struct WorldConfig {
     /// on the stream answers on its next frame, so under load 3 ticks (100 ms at 30 Hz) cancelled
     /// half of them; 10 is a third of a second.
     pub handover_timeout_ticks: u64,
+    /// Ticks a handover to a shard on another node may wait for its ack before it is rolled
+    /// back and re-sent: the ack crosses the node bus twice and the receiver's journal flush, so
+    /// it needs more than a simulator on a local stream. 30 (1 s at 30 Hz).
+    pub remote_handover_timeout_ticks: u64,
     /// Default per-client delta budget per tick (bytes, estimated); a subscription may lower it.
     pub client_budget_bytes: usize,
     /// Fewest ticks between two deltas to one client (1 = every tick). Raising it caps the
@@ -357,6 +364,7 @@ impl Default for WorldConfig {
             hysteresis: 24.0,
             lease_ttl_ticks: 60,
             handover_timeout_ticks: 10,
+            remote_handover_timeout_ticks: 30,
             client_budget_bytes: 16 * 1024,
             client_min_delta_ticks: 1,
             keyframe_ticks: 30,
@@ -1613,6 +1621,7 @@ impl World {
                         to_cell: target,
                         requested_tick: self.tick,
                         group: group.clone(),
+                        remote: false,
                     };
                     for m in &group {
                         if let Some(e) = self.entities.get_mut(m) {
@@ -1687,6 +1696,7 @@ impl World {
                         to_cell: target,
                         requested_tick: tick,
                         group: vec![],
+                        remote: false,
                     });
                 }
             }
@@ -1697,6 +1707,7 @@ impl World {
                 to_cell: target,
                 requested_tick: tick,
                 group,
+                remote: false,
             });
             e.handover_attempts += 1;
             out.push((id, target, host));
@@ -1724,6 +1735,7 @@ impl World {
                     to_cell,
                     requested_tick: tick,
                     group: vec![],
+                    remote: true,
                 });
             }
         }
@@ -1734,6 +1746,7 @@ impl World {
             to_cell,
             requested_tick: tick,
             group,
+            remote: true,
         });
         e.handover_attempts += 1;
         true
@@ -1889,6 +1902,7 @@ impl World {
     /// Roll back handovers that were not acked within `handover_timeout_ticks`.
     pub fn expire_handovers(&mut self) -> Vec<HandoverOutcome> {
         let timeout = self.cfg.handover_timeout_ticks;
+        let remote_timeout = self.cfg.remote_handover_timeout_ticks.max(timeout);
         let tick = self.tick;
         let mut out = Vec::new();
         let expired: Vec<EntityId> = self
@@ -1896,9 +1910,10 @@ impl World {
             .values()
             .filter(|e| {
                 e.attached_to.is_none()
-                    && e.transit
-                        .as_ref()
-                        .is_some_and(|t| tick.saturating_sub(t.requested_tick) > timeout)
+                    && e.transit.as_ref().is_some_and(|t| {
+                        let limit = if t.remote { remote_timeout } else { timeout };
+                        tick.saturating_sub(t.requested_tick) > limit
+                    })
             })
             .map(|e| e.id)
             .collect();

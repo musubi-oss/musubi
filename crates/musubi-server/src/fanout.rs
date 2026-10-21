@@ -210,6 +210,15 @@ enum Wire {
     /// Several bulk messages (replica/ghost deltas) in one bus frame: the bulk lane drains its
     /// queue into one frame so one QUIC send carries a whole tick's worth of deltas.
     WorldBatch(Vec<Wire>),
+    /// A control-lane message with its place in the sender's order: the lane keeps several
+    /// sends in flight (one at a time was ~110 msg/s on a loaded node, a third of the handovers
+    /// asked) and the receiver puts them back in sequence. `epoch` changes when the sender
+    /// restarts, so a fresh count is not taken for a late message.
+    Ordered {
+        epoch: u64,
+        seq: u64,
+        inner: Box<Wire>,
+    },
 }
 
 const TOPIC: &str = "realtime";
@@ -220,6 +229,21 @@ const TOPIC: &str = "realtime";
 const BULK_BATCH_MAX: usize = 64;
 /// `publish_many` chunk: 512 subscribe commands are ~200 KB on the wire, far under the QUIC cap.
 const PUBLISH_MANY_CHUNK: usize = 512;
+
+/// Control-lane sends in flight per peer set. Sends complete when the peer has read the frame,
+/// so this many frames overlap their ~9 ms each; order is restored on the receiver.
+const CONTROL_IN_FLIGHT: usize = 8;
+/// A control-lane gap older than this is given up on (the frame failed and comes back late over
+/// Postgres, or never): what arrived after it is dispatched.
+const ORDER_GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Default)]
+struct OrderState {
+    epoch: u64,
+    next: u64,
+    ahead: std::collections::BTreeMap<u64, Wire>,
+    ahead_since: Option<std::time::Instant>,
+}
 
 #[derive(Clone)]
 pub struct Fanout {
@@ -247,6 +271,8 @@ pub struct Fanout {
     /// Player inputs for worlds homed elsewhere and inputs forwarded to the owning shard: one per
     /// player per input, batched — on the control lane they queued handovers 200 s behind them.
     bus_input: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    /// Per sender: where its control-lane sequence stands and what arrived ahead of it.
+    ordered: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, OrderState>>>,
     bus_user: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
 }
 
@@ -270,6 +296,7 @@ impl Fanout {
             bus_bulk: Arc::new(OnceLock::new()),
             bus_session: Arc::new(OnceLock::new()),
             bus_input: Arc::new(OnceLock::new()),
+            ordered: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             bus_user: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
             social: Arc::new(OnceLock::new()),
@@ -372,6 +399,7 @@ impl Fanout {
 
     /// Forget every session a node reported: it died or left, so its accounts are offline there.
     pub fn purge_node(&self, node: uuid::Uuid) {
+        self.ordered.lock().unwrap().remove(&node);
         self.online_remote.retain(|_, per_node| {
             per_node.remove(&node);
             !per_node.is_empty()
@@ -860,8 +888,70 @@ impl Fanout {
             return;
         }
         match m.decode::<Wire>() {
+            Ok(Wire::Ordered { epoch, seq, inner }) => {
+                self.dispatch_ordered(m.origin.0, epoch, seq, *inner)
+            }
             Ok(w) => self.dispatch(w),
             Err(e) => tracing::warn!(error = %e, "bad fanout message"),
+        }
+    }
+
+    /// Put a sender's control-lane messages back in its order: dispatch what is next, hold
+    /// what arrived ahead, dispatch a late one (a Postgres redelivery) at once, and after
+    /// `ORDER_GAP_TIMEOUT` give up on a gap. Sends are only in flight concurrently within
+    /// `CONTROL_IN_FLIGHT`, so what is held is at most that many frames.
+    fn dispatch_ordered(&self, origin: uuid::Uuid, epoch: u64, seq: u64, w: Wire) {
+        let mut ready = Vec::new();
+        {
+            let mut all = self.ordered.lock().unwrap();
+            let st = all.entry(origin).or_default();
+            if st.epoch != epoch {
+                // the sender restarted (or this is the first message from it)
+                ready.extend(std::mem::take(&mut st.ahead).into_values());
+                st.epoch = epoch;
+                st.next = seq;
+                st.ahead_since = None;
+            }
+            if seq < st.next {
+                ready.push(w);
+            } else if seq == st.next {
+                ready.push(w);
+                st.next += 1;
+                while let Some(n) = st.ahead.remove(&st.next) {
+                    ready.push(n);
+                    st.next += 1;
+                }
+                st.ahead_since = if st.ahead.is_empty() {
+                    None
+                } else {
+                    Some(std::time::Instant::now())
+                };
+            } else {
+                st.ahead.insert(seq, w);
+                let since = *st.ahead_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > ORDER_GAP_TIMEOUT {
+                    // skip the gap: everything held goes out in order
+                    metrics::counter!("musubi_bus_order_gaps_total").increment(1);
+                    let mut held = std::mem::take(&mut st.ahead);
+                    let mut it = held.iter();
+                    if let Some((&first, _)) = it.next() {
+                        st.next = first;
+                    }
+                    while let Some(n) = held.remove(&st.next) {
+                        ready.push(n);
+                        st.next += 1;
+                    }
+                    st.ahead = held;
+                    st.ahead_since = if st.ahead.is_empty() {
+                        None
+                    } else {
+                        Some(std::time::Instant::now())
+                    };
+                }
+            }
+        }
+        for w in ready {
+            self.dispatch(w);
         }
     }
 
@@ -872,6 +962,8 @@ impl Fanout {
                     self.dispatch(w);
                 }
             }
+            // sequencing is applied in `apply`; one that reaches here (inside a batch) is plain
+            Wire::Ordered { inner, .. } => self.dispatch(*inner),
             Wire::Account { account_id, msg } => {
                 self.hub.send_to_account(account_id, msg);
             }
@@ -1006,8 +1098,12 @@ impl Fanout {
             } => {
                 if let Some(w) = self.worlds.get().cloned() {
                     let id = entity.id;
+                    metrics::counter!("musubi_world_handover_recv_total", "path" => "received")
+                        .increment(1);
                     if w.accept_handover(&world, entity, from_node, inputs, forced, base_rev, self)
                     {
+                        metrics::counter!("musubi_world_handover_recv_total", "path" => "accepted")
+                            .increment(1);
                         let me = self.clone();
                         tokio::spawn(async move {
                             if let Err(e) = w.flush_journal(&world).await {
@@ -1027,8 +1123,11 @@ impl Fanout {
                 resend_full,
             } => {
                 if let Some(w) = self.worlds.get() {
+                    metrics::counter!("musubi_world_handover_acks_total", "path" => "received", "accepted" => accepted.to_string()).increment(1);
                     if from_node == w.node_id() {
                         w.handover_acked(&world, entity, acker, accepted, resend_full, self);
+                    } else {
+                        metrics::counter!("musubi_world_handover_acks_total", "path" => "not_mine", "accepted" => accepted.to_string()).increment(1);
                     }
                 }
             }
@@ -1243,7 +1342,7 @@ impl Fanout {
             | Wire::Presence { .. }
             | Wire::Online { .. }
             | Wire::RelayedCmd { .. } => (&self.bus_user, 32, "user"),
-            _ => (&self.bus, 1, "control"),
+            _ => (&self.bus, CONTROL_IN_FLIGHT, "control"),
         };
         // control before user before deltas on the shared QUIC connection (see `publish_prio`)
         let priority = match lane_name {
@@ -1275,6 +1374,11 @@ impl Fanout {
                 let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
                 // one "slow" warning per lane per second, not one per message
                 let last_warn = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(1);
+                let mut seq: u64 = 0;
                 while let Some((queued, mut w)) = rx.recv().await {
                     if batch {
                         // everything already waiting goes out in the same frame: one QUIC send per
@@ -1295,6 +1399,15 @@ impl Fanout {
                     let Ok(permit) = sem.clone().acquire_owned().await else {
                         break;
                     };
+                    if lane_name == "control" {
+                        // several in flight: the receiver restores this order
+                        w = Wire::Ordered {
+                            epoch,
+                            seq,
+                            inner: Box::new(w),
+                        };
+                        seq += 1;
+                    }
                     let c = c.clone();
                     let last_warn = last_warn.clone();
                     let one = async move {

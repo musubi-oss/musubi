@@ -3219,10 +3219,13 @@ impl WorldRegistry {
             None => !st.hosted_only,
         };
         if !here {
+            metrics::counter!("musubi_world_handover_recv_total", "path" => "not_here")
+                .increment(1);
             return false;
         }
         let id = entity.id;
         if st.world.get(id).is_some() {
+            metrics::counter!("musubi_world_handover_recv_total", "path" => "have_it").increment(1);
             // we already hold this entity. Usually the ack was lost and this is the same transfer
             // again: answer again, keep our copy. But if our copy is itself on its way to the
             // sender (both sides restored or kept one and each ships it over the border at
@@ -3272,6 +3275,8 @@ impl WorldRegistry {
                     g
                 }
                 _ => {
+                    metrics::counter!("musubi_world_handover_recv_total", "path" => "no_ghost")
+                        .increment(1);
                     tracing::info!(world = name, %id, %from_node, base, "handover: no ghost to build on, asking for the full state");
                     fanout.world_handover_ack(name, id, from_node, false, true);
                     return false;
@@ -3337,11 +3342,18 @@ impl WorldRegistry {
         fanout: &Fanout,
     ) {
         let Some(w) = self.worlds.get(name) else {
+            metrics::counter!("musubi_world_handover_acks_total", "path" => "no_world", "accepted" => accepted.to_string())
+                .increment(1);
             return;
         };
         let mut st = w.lock();
         let st = &mut *st;
         let Some(t) = st.world.get(id).and_then(|e| e.transit.clone()) else {
+            let gone = st.world.get(id).is_none();
+            metrics::counter!("musubi_world_handover_acks_total", "path" => if gone { "late_gone" } else { "late_kept" }, "accepted" => accepted.to_string())
+                .increment(1);
+            metrics::counter!("musubi_world_handover_acks_total", "path" => "late", "accepted" => accepted.to_string())
+                .increment(1);
             // a late ack for a handover we already cancelled: if the receiver took the entity
             // and its cell is not ours, our copy is the stale one — drop it instead of keeping
             // two owners
@@ -3354,14 +3366,26 @@ impl WorldRegistry {
                     // only believed from the node the directory names as the cell's host: a
                     // late ack from a node that has since died (or lost the cell) must not make
                     // us drop the only live copy
-                    let elsewhere = acker != self.node_id
-                        && match self.cell_hosts.get(&(name.to_string(), cell)) {
-                            Some(h) => *h == acker,
-                            // an unassigned cell is the home's
-                            None => self.homes.get(name).is_some_and(|h| *h == acker),
-                        };
+                    // the node we are still shipping it to says it has it: that is the completion,
+                    // wherever our stale copy's position falls (an entity offered from inside the
+                    // border margin still sits in our cell, and judging by the cell alone left the
+                    // ack ignored and the entity re-shipped every timeout — 7 000 duplicate
+                    // deliveries a run on the stand)
+                    let shipping_there = st
+                        .remote_transit
+                        .get(&id)
+                        .is_some_and(|(h, _, _)| *h == acker);
+                    let elsewhere = shipping_there
+                        || (acker != self.node_id
+                            && match self.cell_hosts.get(&(name.to_string(), cell)) {
+                                Some(h) => *h == acker,
+                                // an unassigned cell is the home's
+                                None => self.homes.get(name).is_some_and(|h| *h == acker),
+                            });
                     if elsewhere {
                         tracing::info!(world = name, %id, "late handover ack: stale local copy dropped");
+                        metrics::counter!("musubi_world_handover_acks_total", "path" => "late_dropped", "accepted" => "true")
+                            .increment(1);
                         metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
                             .increment(1);
                         st.remote_transit.remove(&id);
@@ -3382,6 +3406,8 @@ impl WorldRegistry {
             }
             return;
         };
+        metrics::counter!("musubi_world_handover_acks_total", "path" => "in_transit", "accepted" => accepted.to_string())
+            .increment(1);
         st.remote_transit.remove(&id);
         st.kept_after_cancel.remove(&id);
         if !accepted && resend_full {
