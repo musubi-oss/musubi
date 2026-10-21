@@ -5,4 +5,3 @@
 .terraform/
 /data/
 console/node_modules/
-console/dist/assets/
