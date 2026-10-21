@@ -58,27 +58,43 @@ measure):
 process pretending to be 200 clients cannot drain ~1 M chat deliveries per second.
 
 World meshing, same box, **release** build, 30 s runs, 4 simulators per world over the stream
-(`--sims 4`, entities drifting across cell borders), players at 200 units radius, 30 Hz:
+(`--sims 4`, entities drifting across cell borders), players at 200 units radius, 30 Hz. "before"
+is the tree as of `bebbbcf`, "after" has the three fixes described below the table:
 
-| run | clients | worlds × entities | wire | frames/client/s | client delta p50 / p95 / p99 | node fan-out p50 / p99 | RL tick mean / p99 | handovers | node CPU |
+| run | clients | worlds × entities | wire | frames/client/s | client delta p50 / p95 / p99 | node fan-out p50 / p99 | RL tick mean / p99 | handovers done / asked | node CPU |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 200 | 2 × 500 | json | 29.8 | 34 / 43 / 61 ms | 2.5 / 25 ms | 0.23 / 2.5 ms | 359 | — |
-| 2 | 1 000 | 4 × 2 000 | json | 26.5 | 50 / 75 / 123 ms | 10 / 100 ms | 1.0 / 25 ms | 5 103 | — |
-| 2b | 1 000 | 4 × 2 000 | binary | 28.6 | 34 / 60 / 81 ms | 10 / 50 ms | 0.6 / 10 ms | 4 959 | 154 % (0.5 GB) |
-| 3 | 2 000 | 4 × 4 000, 8 sims | json | 12.3 | 65 / 240 / 352 ms | 25 / 250 ms | 2.2 / 25 ms | 6 982 of 13 744 requested | 164 % (1.0 GB) |
+| 1 | 200 | 2 × 500 | json | 29.8 | 34 / 43 / 61 ms | 2.5 / 25 ms | 0.23 / 2.5 ms | 359 / 359 | — |
+| 2 before | 1 000 | 4 × 2 000 | json | 26.5 | 50 / 75 / 123 ms | 10 / 100 ms | 1.0 / 25 ms | 5 103 / 5 188 | 154 % |
+| 2 after | 1 000 | 4 × 2 000 | json | **29.0** | **33 / 53 / 71 ms** | **5 / 50 ms** | 0.48 / 10 ms | 4 818 / 4 818 | 128 % |
+| 2b | 1 000 | 4 × 2 000 | binary | 28.6 | 34 / 60 / 81 ms | 10 / 50 ms | 0.6 / 10 ms | 4 959 / 4 959 | 154 % |
+| 3 before | 2 000 | 4 × 4 000, 8 sims | json | 12.3 | 65 / 240 / 352 ms | 25 / 250 ms | 2.2 / 25 ms | 6 982 / 13 744 | 164 % |
+| 3 after | 2 000 | 4 × 4 000, 8 sims | json | **23.6** | **39 / 94 / 134 ms** | **25 / 100 ms** | 1.5 / 25 ms | **8 568 / 8 574** | 225 % |
 
 Read it as: the simulation step (`musubi_world_tick_duration_seconds`) is never the problem —
-2 ms mean with 4 000 entities and 8 simulators handing entities to each other 230 times a
-second. What falls over first is the **fan-out**: per-player delta build and send runs on each
-world's single thread, so run 3 collapses to 12 frames/s per player with the node using only 1.6
-of the 8 cores (the bench process itself takes another 0.8). The binary wire cuts bytes 3.6× (59 →
-16.5 MB/s at run 2) and trims fan-out p99 in half, but does not move the ceiling: that is the
-sequential fan-out and the one-home-node replication layer, which are the next two items of work.
-Also visible in run 3: half the handover requests did not complete within the timeout under that
-load (the counter is `musubi_world_handovers_total`; the bench's `handover_acks` are what its
-simulators answered). The 0.1–1.5 % `sim_moves_err` in the stream runs are `apply`s a simulator
-sent one tick after it lost the entity to a neighbour (`not authoritative`) — expected and
-harmless; the new owner carries on from the acked state.
+1.5 ms mean with 4 000 entities and 8 simulators handing entities to each other 280 times a
+second. What fell over first was the **fan-out**, and `MUSUBI_TICK_TRACE=1` showed where: of a
+40–110 ms fan-out per tick, almost all of it was `World::snapshot()` — the per-tick copy of the
+world that the delta build reads — deep-cloning 4 000 entities' component maps (JSON values) on
+the world's single thread, with the other cores idle (run 3 before: 1.6 of 8 cores). Three fixes:
+
+- entity components live behind an `Arc` with copy-on-write (`Arc::make_mut` on the entities
+  that change in a tick), so the snapshot is 4 000 reference bumps instead of a deep copy;
+- the per-client delta scan runs in parallel chunks on the rayon pool once a world has more
+  than `PAR_DELTAS_MIN` (128) subscribers (small worlds stay sequential: the scheduling cost
+  exceeded the gain there);
+- `handover_timeout_ticks` default 3 → 10: a simulator on the stream answers on its next frame,
+  and 100 ms cancelled half of the handovers under load (run 3 before: 6 982 of 13 744 asked —
+  the rest were rolled back and re-requested); at 10 ticks every handover completes.
+
+Also fixed on the way: a session whose outbound queue was full used to spill its message onto
+the cluster bus (whose Postgres `NOTIFY` lane caps payloads at 7 900 bytes — the log filled with
+`bus message realtime exceeds 7900 bytes` under load); it is now dropped locally and counted in
+`musubi_session_dropped_total{reason="queue_full"}`. The binary wire cuts bytes 3.6× (59 → 16.5
+MB/s at run 2) and is the right default for games; it does not change the fan-out ceiling. What
+remains at 2 000 players is the one-home-node replication layer per world — the next item.
+The 0.1–0.5 % `sim_moves_err` in the stream runs are `apply`s a simulator sent one tick after it
+lost the entity to a neighbour (`not authoritative`) — expected and harmless; the new owner
+carries on from the acked state.
 
 Two things made the realtime rows what they are. The request state used to be a flat struct of
 ~50 reference-counted fields cloned by every middleware layer; behind one `Arc`,

@@ -203,7 +203,7 @@ fn ship_handover(
         st.ghost_send.values().find_map(|g| g.sent_rev(id))
     };
     if let Some(r) = base {
-        e.components.retain(|_, c| c.changed_rev > r);
+        std::sync::Arc::make_mut(&mut e.components).retain(|_, c| c.changed_rev > r);
     }
     fanout.world_handover(name, e, node_id, inputs, false, base);
 }
@@ -3164,7 +3164,8 @@ impl WorldRegistry {
             None => entity,
             Some(base) => match st.remote_ghosts.values_mut().find_map(|c| c.take(id)) {
                 Some(mut g) if g.rev >= base => {
-                    g.components.extend(entity.components);
+                    std::sync::Arc::make_mut(&mut g.components)
+                        .extend((*entity.components).clone());
                     g.pos = entity.pos;
                     g.cell = entity.cell;
                     g.rev = entity.rev;

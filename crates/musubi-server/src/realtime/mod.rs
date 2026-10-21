@@ -19,7 +19,7 @@ pub mod webtransport;
 pub mod world;
 
 pub use authoritative::MatchRegistry;
-pub use hub::{Hub, Resumed};
+pub use hub::{Hub, Resumed, SessionSendError};
 pub use party::PartyRegistry;
 pub use relayed::RelayedRegistry;
 pub use session::{resume_or_reject, serve, ConnectParams};

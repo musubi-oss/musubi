@@ -241,7 +241,7 @@ impl GhostCache {
                 id: u.id,
                 pos: u.pos,
                 cell: u.cell,
-                components: BTreeMap::new(),
+                components: Default::default(),
                 persistent: u.persistent,
                 global: false,
                 transit: None,
@@ -259,8 +259,11 @@ impl GhostCache {
             e.changed_tick = u.changed_tick;
             e.persistent = u.persistent;
             e.attached_to = u.attached_to;
-            for (k, c) in u.components {
-                e.components.insert(k, c);
+            if !u.components.is_empty() {
+                let comps = std::sync::Arc::make_mut(&mut e.components);
+                for (k, c) in u.components {
+                    comps.insert(k, c);
+                }
             }
         }
         true

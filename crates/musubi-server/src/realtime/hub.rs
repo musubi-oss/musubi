@@ -37,6 +37,13 @@ struct Member {
     /// Room messages are written to history only for senders who joined with `persistence`.
     persistent: bool,
 }
+/// Why `Hub::try_send_session` could not deliver: the session lives here but its outbound queue
+/// is full (the message is dropped — a slow consumer must never spill onto the cluster bus), or
+/// it is not on this node (closed, or the caller should forward it over the bus).
+pub enum SessionSendError {
+    Full,
+    NotHere(Box<ServerMessage>),
+}
 
 /// Process-local registry of live realtime sessions.
 #[derive(Default)]
@@ -532,15 +539,17 @@ impl Hub {
         &self,
         session_id: SessionId,
         msg: ServerMessage,
-    ) -> Result<(), ServerMessage> {
+    ) -> Result<(), SessionSendError> {
         match self.sessions.get(&session_id) {
             Some(h) => h.tx.try_send(msg).map_err(|e| {
                 if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
                     queue_full(&h);
+                    SessionSendError::Full
+                } else {
+                    SessionSendError::NotHere(Box::new(e.into_inner()))
                 }
-                e.into_inner()
             }),
-            None => Err(msg),
+            None => Err(SessionSendError::NotHere(Box::new(msg))),
         }
     }
 

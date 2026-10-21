@@ -221,7 +221,9 @@ pub struct Entity {
     pub id: EntityId,
     pub pos: Pos,
     pub cell: CellId,
-    pub components: BTreeMap<String, Component>,
+    /// Shared between the live world and its per-tick `WorldView` snapshot: cloning an entity is
+    /// an `Arc` bump, writers take `Arc::make_mut` (copy-on-write for the entities that changed).
+    pub components: std::sync::Arc<BTreeMap<String, Component>>,
     /// Survives everyone leaving and cluster restarts (persistent entity streaming).
     pub persistent: bool,
     /// Always relevant: delivered to every subscriber of the world whatever their interest
@@ -271,6 +273,9 @@ pub struct Lease {
     pub sim: SimId,
     pub expires_tick: u64,
 }
+/// `WorldView::deltas_all` goes parallel from this many clients, in chunks of this size.
+pub const PAR_DELTAS_MIN: usize = 128;
+pub const PAR_DELTAS_CHUNK: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -288,6 +293,9 @@ pub struct WorldConfig {
     /// Extra distance past the border before a handover starts (prevents flapping).
     pub hysteresis: f64,
     pub lease_ttl_ticks: u64,
+    /// Ticks the new owner has to `handover_ack` before the handover is rolled back. A simulator
+    /// on the stream answers on its next frame, so under load 3 ticks (100 ms at 30 Hz) cancelled
+    /// half of them; 10 is a third of a second.
     pub handover_timeout_ticks: u64,
     /// Default per-client delta budget per tick (bytes, estimated); a subscription may lower it.
     pub client_budget_bytes: usize,
@@ -348,7 +356,7 @@ impl Default for WorldConfig {
             ghost_margin: 48.0,
             hysteresis: 24.0,
             lease_ttl_ticks: 60,
-            handover_timeout_ticks: 3,
+            handover_timeout_ticks: 10,
             client_budget_bytes: 16 * 1024,
             client_min_delta_ticks: 1,
             keyframe_ticks: 30,
@@ -1190,10 +1198,12 @@ impl World {
             id,
             pos,
             cell,
-            components: components
-                .into_iter()
-                .map(|(k, v)| (k, Component::new(v, 1, 1)))
-                .collect(),
+            components: std::sync::Arc::new(
+                components
+                    .into_iter()
+                    .map(|(k, v)| (k, Component::new(v, 1, 1)))
+                    .collect(),
+            ),
             persistent,
             global: false,
             transit: None,
@@ -1424,9 +1434,9 @@ impl World {
             e.rev += 1;
         }
         let rev = e.rev;
+        let comps = std::sync::Arc::make_mut(&mut e.components);
         for (k, v) in components {
-            let c = e
-                .components
+            let c = comps
                 .entry(k)
                 .or_insert(Component::new(serde_json::Value::Null, 0, 0));
             if c.value != v {
@@ -2062,6 +2072,70 @@ fn estimate_refs(v: &[ComponentRef]) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    /// Above `PAR_DELTAS_MIN` clients the per-client scan runs in parallel chunks; every client
+    /// must get exactly the delta the sequential scan would have produced.
+    #[test]
+    fn parallel_deltas_match_sequential() {
+        let mut w = World::new(WorldConfig::default());
+        let sim = Uuid::now_v7();
+        for x in 0..3 {
+            for y in 0..3 {
+                w.grant_lease(
+                    CellId {
+                        x,
+                        y,
+                        level: 0,
+                        z: 0,
+                    },
+                    sim,
+                );
+            }
+        }
+        let side = 3.0 * w.cfg.cell_size;
+        let pt = |seed: u64| {
+            let h = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            Pos {
+                x: (h >> 11) as f64 / (1u64 << 53) as f64 * side,
+                y: (h.rotate_left(29) >> 11) as f64 / (1u64 << 53) as f64 * side,
+                z: 0.0,
+            }
+        };
+        for i in 0..400u64 {
+            let mut c = BTreeMap::new();
+            c.insert("hp".to_string(), serde_json::json!(i));
+            w.spawn(pt(i), c, false);
+        }
+        let n = PAR_DELTAS_MIN * 2 + 44;
+        for i in 0..n as u64 {
+            w.subscribe(Uuid::from_u128(i as u128 + 1), pt(1000 + i), 200.0);
+        }
+        assert!(w.interests.len() >= PAR_DELTAS_MIN);
+        let view = w.snapshot();
+        let mut par = w.interests.clone();
+        let mut seq = w.interests.clone();
+        let mut got: Vec<(ClientId, Delta)> = view.deltas_all(&mut par);
+        let mut want: Vec<(ClientId, Delta)> = Vec::new();
+        for (c, i) in seq.iter_mut() {
+            if let Some(d) = view.delta_with(i) {
+                if d != Delta::default() {
+                    want.push((*c, d));
+                }
+            }
+        }
+        got.sort_by_key(|(c, _)| *c);
+        want.sort_by_key(|(c, _)| *c);
+        assert_eq!(got.len(), want.len());
+        assert!(got.len() > PAR_DELTAS_MIN);
+        for ((gc, gd), (wc, wd)) in got.iter().zip(&want) {
+            assert_eq!(gc, wc);
+            assert_eq!(gd, wd, "client {gc}");
+        }
+        // the per-client bookkeeping (what each client now knows) is identical too
+        for (c, i) in &par {
+            assert_eq!(i.known.len(), seq[c].known.len(), "client {c}");
+        }
+    }
     use super::*;
 
     fn quad_world() -> World {
@@ -3476,21 +3550,37 @@ impl WorldView {
             .fold(1.0, f64::min)
     }
 
-    /// Deltas for every client in `interests` (their state is updated in place). Sequential on
-    /// purpose: a world's tick runs on its own thread, and fanning 500 sub-millisecond jobs a
-    /// tick into a shared pool cost more in scheduling than it saved.
+    /// Deltas for every client in `interests` (their state is updated in place). Small worlds
+    /// stay sequential (fanning a few hundred sub-millisecond jobs into a pool cost more in
+    /// scheduling than it saved); past `PAR_DELTAS_MIN` clients the scan is split into chunks of
+    /// `PAR_DELTAS_CHUNK` on the rayon pool — at 500 players and 4 000 entities one world's
+    /// deltas took 40–100 ms a tick on its single thread while the other cores idled.
     pub fn deltas_all(
         &self,
         interests: &mut HashMap<ClientId, Interest>,
     ) -> Vec<(ClientId, Delta)> {
-        interests
-            .iter_mut()
-            .filter_map(|(client, interest)| {
-                if interest.every > 1 && (self.tick + interest.phase) % interest.every != 0 {
-                    return None;
-                }
-                let d = self.delta_with(interest)?;
-                (d != Delta::default()).then_some((*client, d))
+        let one = |client: &ClientId, interest: &mut Interest| -> Option<(ClientId, Delta)> {
+            if interest.every > 1 && (self.tick + interest.phase) % interest.every != 0 {
+                return None;
+            }
+            let d = self.delta_with(interest)?;
+            (d != Delta::default()).then_some((*client, d))
+        };
+        if interests.len() < PAR_DELTAS_MIN {
+            return interests
+                .iter_mut()
+                .filter_map(|(c, i)| one(c, i))
+                .collect();
+        }
+        use rayon::prelude::*;
+        let mut items: Vec<(&ClientId, &mut Interest)> = interests.iter_mut().collect();
+        items
+            .par_chunks_mut(PAR_DELTAS_CHUNK)
+            .flat_map_iter(|chunk| {
+                chunk
+                    .iter_mut()
+                    .filter_map(|(c, i)| one(c, i))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }

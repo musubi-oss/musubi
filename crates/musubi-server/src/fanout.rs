@@ -402,8 +402,18 @@ impl Fanout {
 
     /// Deliver to one session wherever it lives: locally if we have it, otherwise via the bus.
     pub fn session(&self, session_id: SessionId, msg: ServerMessage) {
-        if let Err(msg) = self.hub.try_send_session(session_id, msg) {
-            self.publish(Wire::Session { session_id, msg });
+        match self.hub.try_send_session(session_id, msg) {
+            Ok(()) => {}
+            Err(crate::realtime::SessionSendError::Full) => {
+                metrics::counter!("musubi_session_dropped_total", "reason" => "queue_full")
+                    .increment(1);
+            }
+            Err(crate::realtime::SessionSendError::NotHere(msg)) => {
+                self.publish(Wire::Session {
+                    session_id,
+                    msg: *msg,
+                });
+            }
         }
     }
 
