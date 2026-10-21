@@ -207,6 +207,21 @@ enum Wire {
     WorldSubsRequest {
         world: String,
     },
+    /// A hierarchy/filter query over every shard of a split world: each cell host answers
+    /// for the entities it holds with `WorldQueryReply`; the asker merges (see
+    /// `WorldRegistry::query`).
+    WorldQuery {
+        world: String,
+        req: uuid::Uuid,
+        from: uuid::Uuid,
+        kind: crate::realtime::world::QueryKind,
+    },
+    WorldQueryReply {
+        world: String,
+        req: uuid::Uuid,
+        node: uuid::Uuid,
+        entities: Vec<serde_json::Value>,
+    },
     /// Several bulk messages (replica/ghost deltas) in one bus frame: the bulk lane drains its
     /// queue into one frame so one QUIC send carries a whole tick's worth of deltas.
     /// The home deleted `world`: shards hosting its cells elsewhere go with it.
@@ -260,6 +275,8 @@ impl Wire {
             Wire::WorldCoLocate { .. } => "WorldCoLocate",
             Wire::WorldCellAssign { .. } => "WorldCellAssign",
             Wire::WorldSubsRequest { .. } => "WorldSubsRequest",
+            Wire::WorldQuery { .. } => "WorldQuery",
+            Wire::WorldQueryReply { .. } => "WorldQueryReply",
             Wire::WorldDeleted { .. } => "WorldDeleted",
             Wire::WorldBatch { .. } => "WorldBatch",
             Wire::Ordered { .. } => "Ordered",
@@ -599,6 +616,36 @@ impl Fanout {
                 me.world_handover_ack(&world, id, from_node, true, false);
             });
         }
+    }
+
+    pub fn world_query(
+        &self,
+        world: &str,
+        req: uuid::Uuid,
+        from: uuid::Uuid,
+        kind: crate::realtime::world::QueryKind,
+    ) {
+        self.publish(Wire::WorldQuery {
+            world: world.to_string(),
+            req,
+            from,
+            kind,
+        });
+    }
+
+    pub fn world_query_reply(
+        &self,
+        world: &str,
+        req: uuid::Uuid,
+        node: uuid::Uuid,
+        entities: Vec<serde_json::Value>,
+    ) {
+        self.publish(Wire::WorldQueryReply {
+            world: world.to_string(),
+            req,
+            node,
+            entities,
+        });
     }
 
     pub fn world_deleted(&self, world: &str) {
@@ -1366,6 +1413,26 @@ impl Fanout {
                     w.replay_subs(&world, self);
                 }
             }
+            Wire::WorldQuery {
+                world,
+                req,
+                from,
+                kind,
+            } => {
+                if let Some(w) = self.worlds.get() {
+                    w.answer_query(&world, req, from, &kind, self);
+                }
+            }
+            Wire::WorldQueryReply {
+                req,
+                node,
+                entities,
+                ..
+            } => {
+                if let Some(w) = self.worlds.get() {
+                    w.accept_query_reply(req, node, entities);
+                }
+            }
             Wire::WorldDeleted { world } => {
                 if let Some(w) = self.worlds.get() {
                     w.forget_world(&world);
@@ -1488,7 +1555,9 @@ impl Fanout {
             // a handover ack is small, order-free (late and duplicate acks are handled) and
             // decides whether the handover completes in time: it must not queue behind the
             // handovers and commands of the serial control lane (50–100 s behind on the stand)
-            Wire::WorldHandoverAck { .. } => (&self.bus_user, 32, "user"),
+            Wire::WorldHandoverAck { .. } | Wire::WorldQueryReply { .. } => {
+                (&self.bus_user, 32, "user")
+            }
             Wire::Channel { .. }
             | Wire::Account { .. }
             | Wire::Presence { .. }

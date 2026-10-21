@@ -479,6 +479,18 @@ fn replay(
     n
 }
 
+/// What a hierarchy query asks for (`WorldRegistry::query`, `GET …/entities*`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueryKind {
+    Entity { id: EntityId },
+    Children { id: EntityId, depth: usize },
+    Find { q: musubi_mesh::EntityQuery },
+}
+
+/// How long a cross-shard query waits for the other cell hosts.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Clone)]
 struct PendingInterest {
     sid: SessionId,
@@ -568,6 +580,8 @@ pub struct WorldRegistry {
     runtime: std::sync::OnceLock<Arc<musubi_runtime::Runtime>>,
     /// (world, cell) → host node, cached from the directory.
     cell_hosts: DashMap<(String, CellId), Uuid>,
+    /// Open cross-shard queries: req → where the shard answers are collected.
+    queries: DashMap<Uuid, tokio::sync::mpsc::UnboundedSender<(Uuid, Vec<Value>)>>,
     /// Fencing term this node holds per world (`musubi.world_hosts`); absent = may not persist.
     host_terms: DashMap<String, i64>,
     /// Standby mirrors of cells hosted elsewhere: this node is one of their replicas.
@@ -721,6 +735,7 @@ impl WorldRegistry {
             shard_home: DashMap::new(),
             interest: DashMap::new(),
             cell_hosts: DashMap::new(),
+            queries: DashMap::new(),
             mirrors: DashMap::new(),
             peers: std::sync::RwLock::new(Vec::new()),
             rt: std::sync::OnceLock::new(),
@@ -2599,71 +2614,197 @@ impl WorldRegistry {
         }))
     }
 
-    fn entity_json(st: &WorldState, e: &musubi_mesh::Entity) -> Value {
+    fn entity_json(e: &musubi_mesh::Entity, remote_to: Option<Uuid>) -> Value {
         json!({
             "id": e.id, "cell": e.cell, "pos": e.pos, "persistent": e.persistent,
             "global": e.global, "attached_to": e.attached_to, "contained": e.contained,
-            "rev": e.rev, "transit": e.transit,
-            "remote_to": st.remote_transit.get(&e.id).map(|(h, _, _)| *h),
+            "rev": e.rev, "transit": e.transit, "remote_to": remote_to,
             "components": e.components.iter().map(|(k, c)| (k.clone(), c.value.clone())).collect::<serde_json::Map<_, _>>(),
         })
     }
 
-    /// One entity on this shard with its place in the hierarchy (`None` = not on this shard).
-    pub fn local_entity(&self, name: &str, entity: &str) -> Result<Option<Value>> {
-        let id = parse_entity(entity)?;
-        let w = self.get(name)?;
+    /// Answer `kind` against one mesh (a live shard or cold cells loaded into a scratch mesh):
+    /// `Entity` → zero or one record `{entity, path_to_root, children, contents, capacity}`,
+    /// `Children`/`Find` → one record per entity.
+    fn answer_in(
+        world: &musubi_mesh::World,
+        kind: &QueryKind,
+        remote_to: &HashMap<EntityId, Uuid>,
+    ) -> Vec<Value> {
+        let ej = |e: &musubi_mesh::Entity| Self::entity_json(e, remote_to.get(&e.id).copied());
+        match kind {
+            QueryKind::Entity { id } => {
+                let Some(e) = world.get(*id) else {
+                    return Vec::new();
+                };
+                let children: Vec<Value> = world
+                    .children_of(*id, 1)
+                    .into_iter()
+                    .filter_map(|(c, _)| world.get(c))
+                    .map(ej)
+                    .collect();
+                vec![json!({
+                    "entity": ej(e),
+                    "path_to_root": world.path_to_root(*id),
+                    "children": children,
+                    "contents": world.contents(*id),
+                    "capacity": world.container_capacity(*id),
+                })]
+            }
+            QueryKind::Children { id, depth } => world
+                .children_of(*id, *depth)
+                .into_iter()
+                .filter_map(|(c, d)| world.get(c).map(|e| (e, d)))
+                .map(|(e, d)| {
+                    let mut v = ej(e);
+                    v["depth"] = json!(d);
+                    v
+                })
+                .collect(),
+            QueryKind::Find { q } => world.find(q).into_iter().map(ej).collect(),
+        }
+    }
+
+    /// What this shard knows (`None` = no shard of the world here).
+    fn local_answer(&self, name: &str, kind: &QueryKind) -> Option<Vec<Value>> {
+        let w = self.worlds.get(name)?;
         let st = w.lock();
-        let Some(e) = st.world.get(id) else {
-            return Ok(None);
-        };
-        let children: Vec<Value> = st
-            .world
-            .children_of(id, 1)
-            .into_iter()
-            .filter_map(|(c, _)| st.world.get(c))
-            .map(|c| Self::entity_json(&st, c))
+        let remote: HashMap<EntityId, Uuid> = st
+            .remote_transit
+            .iter()
+            .map(|(id, (h, _, _))| (*id, *h))
             .collect();
-        Ok(Some(json!({
+        Some(Self::answer_in(&st.world, kind, &remote))
+    }
+
+    /// Persistent entities of hibernated cells, answered from the database through a scratch
+    /// mesh with the world's own config (so cells match); empty without a database.
+    async fn cold_answer(&self, name: &str, kind: &QueryKind) -> Result<Vec<Value>> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let cfg = match self.worlds.get(name) {
+            Some(w) => w.lock().world.cfg.clone(),
+            None => musubi_mesh::WorldConfig::default(),
+        };
+        let rows: Vec<(Value,)> =
+            sqlx::query_as("select entities from musubi.world_cold_cells where name = $1")
+                .bind(name)
+                .fetch_all(db)
+                .await
+                .map_err(Error::internal)?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut scratch = musubi_mesh::World::new(cfg);
+        for (v,) in rows {
+            let ents: Vec<Entity> = serde_json::from_value(v)?;
+            scratch.restore(ents);
+        }
+        Ok(Self::answer_in(&scratch, kind, &HashMap::new()))
+    }
+
+    /// A shard was asked (`WorldQuery`): answer with what it holds, unless it is the asker.
+    pub fn answer_query(
+        &self,
+        name: &str,
+        req: Uuid,
+        from: Uuid,
+        kind: &QueryKind,
+        fanout: &Fanout,
+    ) {
+        if from == self.node_id {
+            return;
+        }
+        if let Some(ents) = self.local_answer(name, kind) {
+            fanout.world_query_reply(name, req, self.node_id, ents);
+        }
+    }
+
+    pub fn accept_query_reply(&self, req: Uuid, node: Uuid, entities: Vec<Value>) {
+        if let Some(tx) = self.queries.get(&req) {
+            let _ = tx.send((node, entities));
+        }
+    }
+
+    /// Nodes other than this one that host cells of `name` (the shards a query must reach).
+    fn other_shard_nodes(&self, name: &str) -> std::collections::HashSet<Uuid> {
+        self.cell_hosts
+            .iter()
+            .filter(|e| e.key().0 == name)
+            .map(|e| *e.value())
+            .filter(|n| *n != self.node_id)
+            .collect()
+    }
+
+    /// Hierarchy / filter query over the whole world: this shard, every other cell host (asked
+    /// over the bus, `QUERY_TIMEOUT` to answer — a shard that stays silent is reported in
+    /// `shards_missing`), and the cold cells in the database. Records are merged by entity id,
+    /// live shards win over cold rows; `Find.limit` applies to the merged set.
+    pub async fn query(&self, name: &str, kind: QueryKind, fanout: &Fanout) -> Result<Value> {
+        let mut records: Vec<Value> = Vec::new();
+        let mut asked = 0usize;
+        let mut missing: Vec<Uuid> = Vec::new();
+        let local = self.local_answer(name, &kind);
+        if local.is_none() && !self.homes.contains_key(name) && !self.is_split(name) {
+            return Err(Error::NotFound("world".into()));
+        }
+        records.extend(local.unwrap_or_default());
+        let others = self.other_shard_nodes(name);
+        if !others.is_empty() {
+            let req = Uuid::now_v7();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            self.queries.insert(req, tx);
+            fanout.world_query(name, req, self.node_id, kind.clone());
+            let mut pending = others;
+            asked = pending.len();
+            let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+            while !pending.is_empty() {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some((node, ents))) => {
+                        if pending.remove(&node) {
+                            records.extend(ents);
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            self.queries.remove(&req);
+            missing = pending.into_iter().collect();
+            metrics::counter!("musubi_world_query_shards_total", "outcome" => "answered")
+                .increment((asked - missing.len()) as u64);
+            metrics::counter!("musubi_world_query_shards_total", "outcome" => "missing")
+                .increment(missing.len() as u64);
+        }
+        let cold = self.cold_answer(name, &kind).await?;
+        let id_of = |v: &Value| -> Option<Uuid> {
+            let s = match &kind {
+                QueryKind::Entity { .. } => v["entity"]["id"].as_str(),
+                _ => v["id"].as_str(),
+            }?;
+            s.parse().ok()
+        };
+        let mut seen: std::collections::HashSet<Uuid> = records.iter().filter_map(id_of).collect();
+        for v in cold {
+            if let Some(id) = id_of(&v) {
+                if seen.insert(id) {
+                    records.push(v);
+                }
+            }
+        }
+        records.sort_by_key(id_of);
+        if let QueryKind::Find { q } = &kind {
+            if q.limit > 0 {
+                records.truncate(q.limit);
+            }
+        }
+        Ok(json!({
             "world": name,
             "node_id": self.node_id,
-            "tick": st.world.tick,
-            "entity": Self::entity_json(&st, e),
-            "path_to_root": st.world.path_to_root(id),
-            "children": children,
-            "contents": st.world.contents(id),
-            "capacity": st.world.container_capacity(id),
-        })))
-    }
-
-    /// Entities under `entity` on this shard down to `depth` levels (`0` = all), with depth.
-    pub fn local_children(&self, name: &str, entity: &str, depth: usize) -> Result<Vec<Value>> {
-        let id = parse_entity(entity)?;
-        let w = self.get(name)?;
-        let st = w.lock();
-        Ok(st
-            .world
-            .children_of(id, depth)
-            .into_iter()
-            .filter_map(|(c, d)| st.world.get(c).map(|e| (e, d)))
-            .map(|(e, d)| {
-                let mut v = Self::entity_json(&st, e);
-                v["depth"] = json!(d);
-                v
-            })
-            .collect())
-    }
-
-    /// Entities on this shard matching `q` (see `musubi_mesh::EntityQuery`).
-    pub fn local_find(&self, name: &str, q: &musubi_mesh::EntityQuery) -> Result<Vec<Value>> {
-        let w = self.get(name)?;
-        let st = w.lock();
-        Ok(st
-            .world
-            .find(q)
-            .into_iter()
-            .map(|e| Self::entity_json(&st, e))
-            .collect())
+            "shards_asked": asked,
+            "shards_missing": missing,
+            "records": records,
+        }))
     }
 
     pub fn register_sim(&self, name: &str, sim: Uuid, capacity: u32) -> Result<Vec<SimInfo>> {

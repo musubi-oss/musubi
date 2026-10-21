@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
-use crate::realtime::world::{InteractSpec, SpawnOutcome, SpawnSpec};
+use crate::realtime::world::{InteractSpec, QueryKind, SpawnOutcome, SpawnSpec};
 
 /// Simulator calls must hit the world's home node: redirect (307, same method+body) when the home
 /// advertises an HTTP address, otherwise explain which node to talk to.
@@ -687,10 +687,24 @@ async fn entity_get(
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
-        match s.worlds.local_entity(&w, &id)? {
-            Some(v) => Ok(Json(v)),
-            None => Err(Error::NotFound("entity".into()).into()),
+        let id = parse_id(&id)?;
+        let mut v = s
+            .worlds
+            .query(&w, QueryKind::Entity { id }, &s.fanout)
+            .await?;
+        let mut records = match v["records"].take() {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        if records.is_empty() {
+            return Err(Error::NotFound("entity".into()).into());
         }
+        if let Value::Object(m) = records.remove(0) {
+            for (k, val) in m {
+                v[k] = val;
+            }
+        }
+        Ok(Json(v))
     }
     .await;
     r.map_err(IntoResponse::into_response)
@@ -705,10 +719,16 @@ async fn entity_children(
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
-        let children = s.worlds.local_children(&w, &id, q.depth)?;
-        Ok(Json(
-            json!({"world": w, "entity": id, "depth": q.depth, "children": children}),
-        ))
+        let id = parse_id(&id)?;
+        let mut v = s
+            .worlds
+            .query(&w, QueryKind::Children { id, depth: q.depth }, &s.fanout)
+            .await?;
+        let children = v["records"].take();
+        v["entity"] = json!(id);
+        v["depth"] = json!(q.depth);
+        v["children"] = children;
+        Ok(Json(v))
     }
     .await;
     r.map_err(IntoResponse::into_response)
@@ -746,10 +766,14 @@ async fn entities_find(
             under: q.under.as_deref().map(parse_id).transpose()?,
             limit: q.limit,
         };
-        let entities = s.worlds.local_find(&w, &query)?;
-        Ok(Json(
-            json!({"world": w, "count": entities.len(), "entities": entities}),
-        ))
+        let mut v = s
+            .worlds
+            .query(&w, QueryKind::Find { q: query }, &s.fanout)
+            .await?;
+        let entities = v["records"].take();
+        v["count"] = json!(entities.as_array().map_or(0, Vec::len));
+        v["entities"] = entities;
+        Ok(Json(v))
     }
     .await;
     r.map_err(IntoResponse::into_response)

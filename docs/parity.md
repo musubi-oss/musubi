@@ -151,7 +151,7 @@ Pragma Engine и AccelByte добавлены по их публичным фи�
 ввода и групповой передачей (транспорт + пассажиры), backoff после таймаута Ack, интерес
 (grid + per-client), co-locate, interact через RL, lag-compensation (`rewind`), split/merge по cost, quadtree-ячейки (split горячего листа на 4 / merge остывших с гистерезисом, пины дизайнера), стратегии размещения ячеек (adjacency / points_of_interest / player_density / custom picker),
 soft-cap очередь, hysteresis, time dilation, размещение по регионам, fencing персистенции по term,
-восстановление после падения хоста, provenance при сборке шардов, attach/detach в протоколе, контейнеры (`contained`: сущность внутри корня — позиция корня, `container.capacity`, скрыта до `container.open` или `inside` в подписке) и запросы по иерархии (`GET …/entities/{id}` с путём до корня и детьми, `/children?depth`, `/entities?component&equals&under&…`) — пока в пределах одного шарда.
+восстановление после падения хоста, provenance при сборке шардов, attach/detach в протоколе, контейнеры (`contained`: сущность внутри корня — позиция корня, `container.capacity`, скрыта до `container.open` или `inside` в подписке) и запросы по иерархии (`GET …/entities/{id}` с путём до корня и детьми, `/children?depth`, `/entities?component&equals&under&…`) — по всем шардам мира (fan-in по шине, 1 с) плюс холодные ячейки из БД.
 
 Чего нет для «мир сквозной, всё реплицируется между серверами»:
 

@@ -10218,6 +10218,225 @@ async fn world_containers_follow_root_hide_and_query() {
 }
 
 #[tokio::test]
+async fn world_hierarchy_query_spans_shards_and_cold_cells() {
+    let group = format!("xquery-{}", uuid::Uuid::now_v7().simple());
+    let Some((_a1, router1)) = start_with(true, &group).await else {
+        return;
+    };
+    let Some((_a2, router2)) = start_with(false, &group).await else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router1,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": name, "config": {
+            "cell_size": 100.0, "hibernate_after_ticks": 3, "unload_after_ticks": 3,
+        }})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let probe = format!("p{}", uuid::Uuid::now_v7().simple());
+    let (st, p) = http_json(
+        &router2,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(serde_json::json!({"name": probe})),
+    )
+    .await;
+    assert_eq!(st, 200, "{p}");
+    let (_, cw) = http_json(
+        &router2,
+        "GET",
+        "/v1/admin/cluster/worlds",
+        None,
+        true,
+        None,
+    )
+    .await;
+    let node2 = cw["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == probe)
+        .and_then(|w| w["node_id"].as_str())
+        .unwrap_or_else(|| panic!("probe world missing: {cw}"))
+        .to_string();
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/admin/worlds/{name}/cells/1/0/host"),
+        None,
+        true,
+        Some(serde_json::json!({"node_id": node2})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let s1 = uuid::Uuid::now_v7();
+    let s2 = uuid::Uuid::now_v7();
+    let (st, l) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": s1, "cells": [{"x": 0, "y": 0}]})),
+    )
+    .await;
+    assert_eq!(st, 200, "{l}");
+    let (st, l) = http_json(
+        &router2,
+        "POST",
+        &format!("/v1/server/worlds/{name}/lease"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": s2, "cells": [{"x": 1, "y": 0}]})),
+    )
+    .await;
+    assert!(st == 200 || st == 409, "{l}");
+    let spawn = |router: axum::Router, sim: uuid::Uuid, x: f64, comps: Value| {
+        let name = name.clone();
+        async move {
+            let (st, e) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{name}/spawn"),
+                None,
+                true,
+                Some(serde_json::json!({"sim": sim, "x": x, "y": 50.0, "components": comps, "persistent": true})),
+            )
+            .await;
+            assert_eq!(st, 200, "{e}");
+            e["id"].as_str().unwrap().to_string()
+        }
+    };
+    let chest = spawn(
+        router1.clone(),
+        s1,
+        10.0,
+        serde_json::json!({"container": {"capacity": 4}, "kind": "chest"}),
+    )
+    .await;
+    let coin = spawn(
+        router1.clone(),
+        s1,
+        20.0,
+        serde_json::json!({"kind": "coin"}),
+    )
+    .await;
+    let ore = spawn(
+        router2.clone(),
+        s2,
+        150.0,
+        serde_json::json!({"kind": "ore"}),
+    )
+    .await;
+    let (st, v) = http_json(
+        &router1,
+        "POST",
+        &format!("/v1/server/worlds/{name}/attach"),
+        None,
+        true,
+        Some(serde_json::json!({"sim": s1, "entity": coin, "root": chest, "contained": true})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    // the home node answers for its own shard, the other cell host and nothing is missing
+    let (st, v) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/entities?persistent=true"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["shards_asked"], serde_json::json!(1), "{v}");
+    assert_eq!(v["shards_missing"], serde_json::json!([]), "{v}");
+    let mut ids: Vec<String> = v["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    let mut want = vec![chest.clone(), coin.clone(), ore.clone()];
+    want.sort();
+    assert_eq!(ids, want, "{v}");
+    // and the other shard's entity is reachable by id from the home node
+    let (st, v) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/entities/{ore}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(
+        v["entity"]["components"]["kind"],
+        serde_json::json!("ore"),
+        "{v}"
+    );
+    // nobody watches cell 0,0 on the home: it hibernates and unloads to the database …
+    let mut info = Value::Null;
+    let mut unloaded = false;
+    for _ in 0..200 {
+        let (st, i) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/server/worlds/{name}"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(st, 200, "{i}");
+        info = i;
+        if info["cold_cells"].as_array().is_some_and(|c| !c.is_empty()) && info["entities"] == 0 {
+            unloaded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(unloaded, "cell never unloaded: {info}");
+    // … and the hierarchy is still answered from the cold rows: the coin is inside the chest
+    let (st, v) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/entities/{coin}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["entity"]["contained"], serde_json::json!(true), "{v}");
+    assert_eq!(v["path_to_root"], serde_json::json!([coin, chest]), "{v}");
+    let (st, v) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/server/worlds/{name}/entities?component=kind&equals=chest"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["count"], serde_json::json!(1), "{v}");
+    assert_eq!(v["entities"][0]["id"], serde_json::json!(chest), "{v}");
+}
+
+#[tokio::test]
 async fn world_fenced_host_cannot_persist() {
     let Some(url) = std::env::var("MUSUBI_TEST_DATABASE_URL").ok() else {
         return;
