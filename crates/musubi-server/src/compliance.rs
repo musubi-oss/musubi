@@ -201,7 +201,7 @@ impl AgeGate {
             loop {
                 match rx.recv().await {
                     Ok(m) if m.topic == AGE_TOPIC && m.origin != self_id => {
-                        if let Ok(a) = serde_json::from_value::<AgeMsg>(m.payload) {
+                        if let Ok(a) = m.decode::<AgeMsg>() {
                             me.apply(a.id, a.info);
                         }
                     }

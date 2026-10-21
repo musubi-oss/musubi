@@ -126,7 +126,7 @@ pub fn start_liveops_sync(state: &AppState, cluster: &Arc<musubi_cluster::Cluste
         loop {
             match rx.recv().await {
                 Ok(m) if m.topic == LIVEOPS_CHANGED_TOPIC && m.origin != self_id => {
-                    liveops_changed(&st, m.payload, false).await;
+                    liveops_changed(&st, m.payload_value(), false).await;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}

@@ -3542,12 +3542,12 @@ async fn quic_bus_delivers_large_messages_and_keeps_postgres_fallback() {
         .unwrap();
     let m = next(&mut rb, &big).await;
     assert_eq!(m.origin, a.node_id());
-    assert_eq!(m.payload["data"].as_str().unwrap().len(), 50_000);
+    assert_eq!(m.payload_value()["data"].as_str().unwrap().len(), 50_000);
     // small messages reach QUIC peers once and legacy (Postgres-only) peers via NOTIFY
     let small = unique("small");
     a.publish(&small, &json!({"n": 1})).await.unwrap();
-    assert_eq!(next(&mut rb, &small).await.payload["n"], 1);
-    assert_eq!(next(&mut rc, &small).await.payload["n"], 1);
+    assert_eq!(next(&mut rb, &small).await.payload_value()["n"], 1);
+    assert_eq!(next(&mut rc, &small).await.payload_value()["n"], 1);
     // b → a over QUIC, c → a over Postgres
     let t1 = unique("ba");
     b.publish(&t1, &json!({"from": "b"})).await.unwrap();
@@ -3646,7 +3646,7 @@ async fn swim_detects_dead_bus_peer_within_seconds() {
     })
     .await
     .unwrap();
-    assert_eq!(m.payload["ok"], true);
+    assert_eq!(m.payload_value()["ok"], true);
     a.stop().await;
     b.stop().await;
     c.stop().await;

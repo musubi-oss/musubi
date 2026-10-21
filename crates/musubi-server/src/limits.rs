@@ -199,10 +199,7 @@ impl RateLimiter {
             loop {
                 match rx.recv().await {
                     Ok(m) if m.topic == USAGE_TOPIC && m.origin != self_id => {
-                        if let Ok(u) = serde_json::from_value::<
-                            std::collections::HashMap<String, u64>,
-                        >(m.payload)
-                        {
+                        if let Ok(u) = m.decode::<std::collections::HashMap<String, u64>>() {
                             me.apply_remote(&u);
                         }
                     }

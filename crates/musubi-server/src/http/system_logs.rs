@@ -161,7 +161,7 @@ async fn logs(
         if m.topic != REPLY_TOPIC {
             continue;
         }
-        let Ok(r) = serde_json::from_value::<Reply>(m.payload) else {
+        let Ok(r) = m.decode::<Reply>() else {
             continue;
         };
         if r.id != req.id {
@@ -216,7 +216,7 @@ pub fn start_sync(s: AppState) {
         loop {
             match rx.recv().await {
                 Ok(m) if m.topic == REQUEST_TOPIC && m.origin.0 != me => {
-                    let Ok(r) = serde_json::from_value::<Request>(m.payload) else {
+                    let Ok(r) = m.decode::<Request>() else {
                         continue;
                     };
                     if r.target.is_some_and(|t| t != me) {

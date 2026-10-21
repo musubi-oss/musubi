@@ -379,11 +379,13 @@ impl Fanout {
                         },
                         b = leaves.recv() => match b {
                             Ok(b) if b.topic == musubi_cluster::LEAVE_TOPIC => {
-                                let id = b
-                                    .payload
-                                    .as_str()
-                                    .and_then(|s| s.parse::<uuid::Uuid>().ok())
-                                    .or_else(|| serde_json::from_value(b.payload.clone()).ok());
+                                let id = serde_json::from_str::<uuid::Uuid>(b.payload.get())
+                                    .ok()
+                                    .or_else(|| {
+                                        b.payload_value()
+                                            .as_str()
+                                            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                                    });
                                 match id {
                                     Some(id) => me.purge_node(id),
                                     None => me.purge_node(b.origin.0),
@@ -976,13 +978,13 @@ impl Fanout {
     /// Bulk frame: deltas, ghosts, replicas, player commands and their batches; everything
     /// else (handovers, acks, assignments, user events) is applied by the fast worker.
     fn is_bulk(m: &BusMessage) -> bool {
-        fn tag(v: &serde_json::Value) -> Option<&str> {
-            v.as_object()
-                .and_then(|o| o.keys().next().map(|k| k.as_str()))
-        }
-        let mut t = tag(&m.payload);
+        let text = m.payload.get();
+        let mut t = musubi_cluster::first_key(text);
         if t == Some("WorldBatch") {
-            t = m.payload["WorldBatch"].get(0).and_then(tag);
+            // the batch's first item decides: `{"WorldBatch":[{"Session":...`
+            t = text
+                .find('[')
+                .and_then(|i| musubi_cluster::first_key(&text[i + 1..]));
         }
         if t == Some("Ordered") {
             return false;

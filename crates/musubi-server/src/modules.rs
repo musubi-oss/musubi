@@ -176,7 +176,7 @@ pub fn start_sync(s: AppState) {
         loop {
             match rx.recv().await {
                 Ok(m) if m.topic == RELOAD_TOPIC && m.origin != me => {
-                    let Ok(r) = serde_json::from_value::<Reload>(m.payload) else {
+                    let Ok(r) = m.decode::<Reload>() else {
                         continue;
                     };
                     if r.deleted {

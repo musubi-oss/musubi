@@ -199,7 +199,7 @@ impl Legal {
             loop {
                 match rx.recv().await {
                     Ok(m) if m.topic == TOPIC && m.origin != self_id => {
-                        if let Ok(b) = serde_json::from_value::<Msg>(m.payload) {
+                        if let Ok(b) = m.decode::<Msg>() {
                             me.apply(b.account.map(AccountId), &db).await;
                         }
                     }

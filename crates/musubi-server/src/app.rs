@@ -458,7 +458,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
                             && m.origin != cluster.node_id() =>
                     {
                         if let Some(id) = m
-                            .payload
+                            .payload_value()
                             .get("account_id")
                             .and_then(|v| v.as_str())
                             .and_then(|v| uuid::Uuid::parse_str(v).ok())

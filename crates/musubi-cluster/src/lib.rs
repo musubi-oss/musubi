@@ -221,7 +221,10 @@ pub struct MemberEvent {
 pub struct BusMessage {
     pub origin: NodeId,
     pub topic: String,
-    pub payload: serde_json::Value,
+    /// The message body as it was serialized by the sender: carried through untouched (one
+    /// serialization on send, one parse on receive — as a `Value` a frame of 64 deltas was
+    /// serialized twice and decoded twice, and the bus lanes ran 15–25 s behind on the stand).
+    pub payload: Box<serde_json::value::RawValue>,
     /// Set on the Postgres copy of a message that QUIC-capable peers already received directly.
     #[serde(default)]
     pub via_quic: bool,
@@ -234,6 +237,16 @@ pub struct BusMessage {
     /// measures its own queueing from it (`musubi_bus_inbound_lag_ms`).
     #[serde(default)]
     pub sent_ms: u64,
+}
+
+/// First object key of a JSON text: `{"Tag": ...}` → `Tag`. For `{"WorldBatch":[{"Tag":...` the
+/// caller asks again on the text after the first `[`.
+pub fn first_key(text: &str) -> Option<&str> {
+    let t = text.trim_start();
+    let t = t.strip_prefix('{')?.trim_start();
+    let t = t.strip_prefix('"')?;
+    let end = t.find('"')?;
+    Some(&t[..end])
 }
 
 pub fn unix_ms() -> u64 {
@@ -769,11 +782,11 @@ impl Cluster {
 
     async fn note_leave(&self, msg: &BusMessage) {
         if msg.topic == LEAVE_TOPIC {
-            if let Ok(id) = serde_json::from_value::<Uuid>(msg.payload.clone()) {
+            if let Ok(id) = serde_json::from_str::<Uuid>(msg.payload.get()) {
                 self.set_state(id, swim::State::Dead).await;
             }
         } else if msg.topic == ELECT_TOPIC {
-            if let Ok(id) = serde_json::from_value::<Uuid>(msg.payload.clone()) {
+            if let Ok(id) = serde_json::from_str::<Uuid>(msg.payload.get()) {
                 if id == self.me.id.0 {
                     if let Some(r) = self.raft_state() {
                         if let Err(e) = r.raft.trigger().elect().await {
@@ -881,7 +894,7 @@ impl Cluster {
         let mut msg = BusMessage {
             origin: self.me.id,
             topic: topic.to_string(),
-            payload: serde_json::to_value(payload)?,
+            payload: serde_json::value::to_raw_value(payload)?,
             via_quic: false,
             only: Vec::new(),
             group: self.me.group.clone(),
@@ -1068,7 +1081,17 @@ impl Cluster {
 
 impl BusMessage {
     pub fn decode<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_value(self.payload.clone()).map_err(Into::into)
+        serde_json::from_str(self.payload.get()).map_err(Into::into)
+    }
+
+    /// The payload parsed into a tree (for the small control messages that inspect it).
+    pub fn payload_value(&self) -> serde_json::Value {
+        serde_json::from_str(self.payload.get()).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// First key of an object payload (an externally tagged enum's variant), without parsing.
+    pub fn payload_tag(&self) -> Option<&str> {
+        first_key(self.payload.get())
     }
 }
 

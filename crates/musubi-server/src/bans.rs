@@ -173,7 +173,7 @@ impl Bans {
             loop {
                 match rx.recv().await {
                     Ok(m) if m.topic == BAN_TOPIC && m.origin != self_id => {
-                        if let Ok(b) = serde_json::from_value::<BanMsg>(m.payload) {
+                        if let Ok(b) = m.decode::<BanMsg>() {
                             me.apply(b.id, b.info);
                         }
                     }
@@ -429,7 +429,7 @@ impl BanRules {
             loop {
                 match rx.recv().await {
                     Ok(m) if m.topic == RULE_TOPIC && m.origin != self_id => {
-                        if let Ok(b) = serde_json::from_value::<RuleMsg>(m.payload) {
+                        if let Ok(b) = m.decode::<RuleMsg>() {
                             me.apply(b.id, b.rule);
                         }
                     }

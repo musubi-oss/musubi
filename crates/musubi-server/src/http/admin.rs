@@ -913,7 +913,7 @@ pub fn start_drain_listener(s: AppState) {
         loop {
             match rx.recv().await {
                 Ok(m) if m.topic == DRAIN_TOPIC => {
-                    if serde_json::from_value::<Uuid>(m.payload).ok() == Some(me) {
+                    if m.decode::<Uuid>().ok() == Some(me) {
                         tracing::warn!("drain requested through the admin api");
                         s.shutdown.notify_one();
                     }

@@ -233,7 +233,7 @@ pub fn start_sync(s: AppState) {
         loop {
             match rx.recv().await {
                 Ok(m) if m.topic == TOPIC && m.origin != me => {
-                    if let Ok(b) = serde_json::from_value::<Broadcast>(m.payload) {
+                    if let Ok(b) = m.decode::<Broadcast>() {
                         run_local(&s, b);
                     }
                 }
