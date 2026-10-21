@@ -1860,15 +1860,30 @@ impl World {
         sim: SimId,
         id: EntityId,
     ) -> Result<(HandoverOutcome, Vec<serde_json::Value>), MeshError> {
-        let t = self
-            .entities
-            .get(&id)
-            .ok_or(MeshError::NoEntity)?
-            .transit
-            .clone()
-            .ok_or(MeshError::NotAuthoritative(
-                "no handover in progress".into(),
-            ))?;
+        let e = self.entities.get(&id).ok_or(MeshError::NoEntity)?;
+        let t = match e.transit.clone() {
+            Some(t) => t,
+            None => {
+                // the ack outran our timeout: the request was cancelled, but the entity still
+                // stands in a cell this simulator owns, so the answer is still the right one —
+                // take it instead of asking again next tick
+                let (target, _) = self.target_cell(id, e.pos);
+                if target == e.cell || self.owner(target) != Some(sim) {
+                    return Err(MeshError::NotAuthoritative(
+                        "no handover in progress".into(),
+                    ));
+                }
+                let from = self.owner(e.cell).unwrap_or(sim);
+                Transit {
+                    from,
+                    to: sim,
+                    to_cell: target,
+                    requested_tick: self.tick,
+                    group: self.attached(id),
+                    remote: false,
+                }
+            }
+        };
         if t.to != sim {
             return Err(MeshError::NotAuthoritative(format!(
                 "handover target is {}",
@@ -2742,6 +2757,17 @@ mod tests {
         }
         assert!(matches!(w.advance()[0], HandoverOutcome::Cancelled { .. }));
         assert_eq!(w.owner(w.get(a).unwrap().cell), Some(s2));
+        // the ack that outran the timeout is still the right answer: the entity stands in
+        // s1's cell, so it completes the cancelled request instead of waiting for a re-ask
+        let (o, _) = w.handover_ack(s1, a).expect("late ack still valid");
+        assert_eq!(o, HandoverOutcome::Completed { entity: a, to: s1 });
+        assert_eq!(w.owner(w.get(a).unwrap().cell), Some(s1));
+        assert!(w.get(a).unwrap().transit.is_none());
+        assert!(w.handover_ack(s1, a).is_err(), "nothing left to ack");
+        assert!(
+            w.handover_ack(s2, a).is_err(),
+            "s2 does not own the cell the entity stands in"
+        );
     }
 
     #[test]

@@ -126,7 +126,14 @@ timeout) — 3 750 of 5 801 asked completed in that run. The bench's "asked" col
 `handover_request` event, and an entity the home re-offers on the next tick while its first
 request is open appeared again; it now counts distinct requests and reports the repeats as
 `handover_asks_repeated` (forced migrations of offloaded cells never were in it — they reach
-the simulator as `cell_released`). The bus frame
+the simulator as `cell_released`). Counting how a request ends
+(`musubi_world_handover_ended_total{path}`) showed the real inflation: ~15 000 local requests
+per run expired after `handover_timeout_ticks` because the simulator's ack took longer than
+10 ticks on this shared VM, and the entity was asked again next tick while the late ack was
+thrown away. A late ack is now accepted when the entity still stands in a cell the acking
+simulator owns — distinct requests per run 10 771 → 4 202 with 3 245 completed (77 %, was
+32 %), local expiries 15 257 → 7 465, and each expiry is closed by the ack instead of a
+re-ask. The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):

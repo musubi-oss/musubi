@@ -4597,10 +4597,15 @@ impl WorldRegistry {
                             json!({"type": "handover_started", "entity": entity, "to": to, "group": group}),
                         );
                     }
-                    HandoverOutcome::Completed { .. } => {}
+                    HandoverOutcome::Completed { .. } => {
+                        metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
+                            .increment(1);
+                    }
                     HandoverOutcome::Cancelled { entity, .. }
                         if st.remote_transit.contains_key(&entity) =>
                     {
+                        metrics::counter!("musubi_world_handover_ended_total", "path" => "remote_reship")
+                            .increment(1);
                         // no ack from the other node yet: ship it again (the receiver re-acks if it
                         // already has it). Never give up: the entity sits in a cell another node
                         // hosts, and a copy kept alive here would become a second owner once the
@@ -4678,6 +4683,8 @@ impl WorldRegistry {
                         }
                     }
                     HandoverOutcome::Cancelled { entity, reason } => {
+                        metrics::counter!("musubi_world_handover_ended_total", "path" => "cancelled_local")
+                            .increment(1);
                         st.remote_transit.remove(&entity);
                         let sims: Vec<Uuid> = st.sim_events.keys().copied().collect();
                         for s in sims {
