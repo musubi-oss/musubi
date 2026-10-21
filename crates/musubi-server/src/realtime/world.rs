@@ -3681,6 +3681,8 @@ impl WorldRegistry {
                             .increment(1);
                         metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
                             .increment(1);
+                        metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
+                            .increment(1);
                         st.remote_transit.remove(&id);
                         st.world.forget_for_clients(id);
                         st.world.despawn(id);
@@ -3713,6 +3715,8 @@ impl WorldRegistry {
             // a cross-node handover completes here, not in the simulator's ack path
             metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
                 .increment(1);
+            metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
+                .increment(1);
             let inputs = st.world.take_buffered_inputs(id);
             let persistent = st.world.get(id).is_some_and(|e| e.persistent);
             tracing::debug!(world = name, %id, to = %t.to, "handover: entity left");
@@ -3731,6 +3735,8 @@ impl WorldRegistry {
             for i in inputs {
                 fanout.world_input(name, id, i);
                 metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
+                    .increment(1);
+                metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
                     .increment(1);
             }
             push_event(
@@ -4257,6 +4263,8 @@ impl WorldRegistry {
         let (outcome, inputs) = st.world.handover_ack(sim, id).map_err(mesh_err)?;
         if let Some(from) = from {
             metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
+                .increment(1);
+            metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
                 .increment(1);
             push_event(
                 st,

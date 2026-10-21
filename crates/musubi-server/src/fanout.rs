@@ -222,6 +222,14 @@ enum Wire {
         node: uuid::Uuid,
         entities: Vec<serde_json::Value>,
     },
+    /// A receiver is missing control-lane frames `from..=until` of `to`'s `epoch`: the sender
+    /// re-publishes them from its retained window (`CONTROL_WINDOW` frames).
+    OrderNack {
+        to: uuid::Uuid,
+        epoch: u64,
+        from: u64,
+        until: u64,
+    },
     /// Several bulk messages (replica/ghost deltas) in one bus frame: the bulk lane drains its
     /// queue into one frame so one QUIC send carries a whole tick's worth of deltas.
     /// The home deleted `world`: shards hosting its cells elsewhere go with it.
@@ -277,6 +285,7 @@ impl Wire {
             Wire::WorldSubsRequest { .. } => "WorldSubsRequest",
             Wire::WorldQuery { .. } => "WorldQuery",
             Wire::WorldQueryReply { .. } => "WorldQueryReply",
+            Wire::OrderNack { .. } => "OrderNack",
             Wire::WorldDeleted { .. } => "WorldDeleted",
             Wire::WorldBatch { .. } => "WorldBatch",
             Wire::Ordered { .. } => "Ordered",
@@ -300,12 +309,117 @@ const CONTROL_IN_FLIGHT: usize = 8;
 /// Postgres, or never): what arrived after it is dispatched.
 const ORDER_GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// A gap open this long is asked for (`OrderNack`) — before the give-up above, and only when
+/// a later frame keeps arriving (the check runs on arrival, there is no timer).
+const ORDER_NACK_AFTER: std::time::Duration = std::time::Duration::from_millis(50);
+/// One nack per gap per this interval.
+const ORDER_NACK_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+/// Control-lane frames a sender keeps for replay.
+const CONTROL_WINDOW: usize = 256;
+/// Given-up sequence numbers remembered per sender (a late frame among them is still new).
+const ORDER_SKIPPED_KEEP: u64 = 4096;
+
 #[derive(Default)]
 struct OrderState {
     epoch: u64,
     next: u64,
     ahead: std::collections::BTreeMap<u64, Wire>,
     ahead_since: Option<std::time::Instant>,
+    /// Sequence numbers skipped after `ORDER_GAP_TIMEOUT`: one of them arriving late (a replay,
+    /// a Postgres redelivery) is still new; any other frame below `next` was already dispatched.
+    skipped: std::collections::BTreeSet<u64>,
+    /// `next` the last nack asked for, and when.
+    nacked: Option<(u64, std::time::Instant)>,
+}
+
+/// What one control-lane frame does to a sender's order.
+#[derive(Default)]
+struct Accepted {
+    ready: Vec<Wire>,
+    /// Frames `from..=until` to ask the sender for.
+    nack: Option<(u64, u64)>,
+    /// The frame was already dispatched (a replay the gap no longer needs).
+    dup: bool,
+}
+
+impl OrderState {
+    fn accept(&mut self, epoch: u64, seq: u64, w: Wire, now: std::time::Instant) -> Accepted {
+        let mut out = Accepted::default();
+        if self.epoch != epoch {
+            // the sender restarted (or this is the first message from it)
+            out.ready
+                .extend(std::mem::take(&mut self.ahead).into_values());
+            self.epoch = epoch;
+            self.next = seq;
+            self.ahead_since = None;
+            self.skipped.clear();
+            self.nacked = None;
+        }
+        if seq < self.next {
+            if self.skipped.remove(&seq) {
+                out.ready.push(w);
+            } else {
+                out.dup = true;
+            }
+        } else if seq == self.next {
+            out.ready.push(w);
+            self.next += 1;
+            while let Some(n) = self.ahead.remove(&self.next) {
+                out.ready.push(n);
+                self.next += 1;
+            }
+            self.ahead_since = if self.ahead.is_empty() {
+                None
+            } else {
+                Some(now)
+            };
+            if self.ahead.is_empty() {
+                self.nacked = None;
+            }
+        } else {
+            self.ahead.insert(seq, w);
+            let since = *self.ahead_since.get_or_insert(now);
+            let open = now.saturating_duration_since(since);
+            let first = *self.ahead.keys().next().unwrap_or(&seq);
+            if open > ORDER_GAP_TIMEOUT {
+                // skip the gap: everything held goes out in order; what was skipped stays known
+                metrics::counter!("musubi_bus_order_gaps_total").increment(1);
+                for s in self.next..first {
+                    self.skipped.insert(s);
+                }
+                let mut held = std::mem::take(&mut self.ahead);
+                self.next = first;
+                while let Some(n) = held.remove(&self.next) {
+                    out.ready.push(n);
+                    self.next += 1;
+                }
+                self.ahead = held;
+                self.ahead_since = if self.ahead.is_empty() {
+                    None
+                } else {
+                    Some(now)
+                };
+                self.nacked = None;
+            } else if open >= ORDER_NACK_AFTER
+                && self.nacked.is_none_or(|(n, t)| {
+                    n != self.next || now.saturating_duration_since(t) >= ORDER_NACK_EVERY
+                })
+            {
+                out.nack = Some((self.next, first - 1));
+                self.nacked = Some((self.next, now));
+            }
+        }
+        let floor = self.next.saturating_sub(ORDER_SKIPPED_KEEP);
+        self.skipped = self.skipped.split_off(&floor);
+        out
+    }
+}
+
+/// The control-lane frames this node sent last (serialized as they went out), for `OrderNack`.
+#[derive(Default)]
+struct ControlWindow {
+    epoch: u64,
+    frames: std::collections::VecDeque<(u64, Box<serde_json::value::RawValue>)>,
 }
 
 #[derive(Clone)]
@@ -336,6 +450,7 @@ pub struct Fanout {
     bus_input: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
     /// Per sender: where its control-lane sequence stands and what arrived ahead of it.
     ordered: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, OrderState>>>,
+    control_window: Arc<std::sync::Mutex<ControlWindow>>,
     bus_user: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
 }
 
@@ -360,6 +475,7 @@ impl Fanout {
             bus_session: Arc::new(OnceLock::new()),
             bus_input: Arc::new(OnceLock::new()),
             ordered: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            control_window: Arc::new(std::sync::Mutex::new(ControlWindow::default())),
             bus_user: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
             social: Arc::new(OnceLock::new()),
@@ -1068,62 +1184,71 @@ impl Fanout {
     }
 
     /// Put a sender's control-lane messages back in its order: dispatch what is next, hold
-    /// what arrived ahead, dispatch a late one (a Postgres redelivery) at once, and after
-    /// `ORDER_GAP_TIMEOUT` give up on a gap. Sends are only in flight concurrently within
-    /// `CONTROL_IN_FLIGHT`, so what is held is at most that many frames.
+    /// what arrived ahead, ask the sender for a gap open `ORDER_NACK_AFTER` (`OrderNack`, it
+    /// replays from its window), drop replays already dispatched, and after `ORDER_GAP_TIMEOUT`
+    /// give up on a gap (a frame of it arriving later is still dispatched). Sends are only in
+    /// flight concurrently within `CONTROL_IN_FLIGHT`, so what is held is at most that many frames.
     fn dispatch_ordered(&self, origin: uuid::Uuid, epoch: u64, seq: u64, w: Wire) {
-        let mut ready = Vec::new();
-        {
+        let acc = {
             let mut all = self.ordered.lock().unwrap();
-            let st = all.entry(origin).or_default();
-            if st.epoch != epoch {
-                // the sender restarted (or this is the first message from it)
-                ready.extend(std::mem::take(&mut st.ahead).into_values());
-                st.epoch = epoch;
-                st.next = seq;
-                st.ahead_since = None;
-            }
-            if seq < st.next {
-                ready.push(w);
-            } else if seq == st.next {
-                ready.push(w);
-                st.next += 1;
-                while let Some(n) = st.ahead.remove(&st.next) {
-                    ready.push(n);
-                    st.next += 1;
-                }
-                st.ahead_since = if st.ahead.is_empty() {
-                    None
-                } else {
-                    Some(std::time::Instant::now())
-                };
-            } else {
-                st.ahead.insert(seq, w);
-                let since = *st.ahead_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() > ORDER_GAP_TIMEOUT {
-                    // skip the gap: everything held goes out in order
-                    metrics::counter!("musubi_bus_order_gaps_total").increment(1);
-                    let mut held = std::mem::take(&mut st.ahead);
-                    let mut it = held.iter();
-                    if let Some((&first, _)) = it.next() {
-                        st.next = first;
-                    }
-                    while let Some(n) = held.remove(&st.next) {
-                        ready.push(n);
-                        st.next += 1;
-                    }
-                    st.ahead = held;
-                    st.ahead_since = if st.ahead.is_empty() {
-                        None
-                    } else {
-                        Some(std::time::Instant::now())
-                    };
-                }
-            }
+            all.entry(origin)
+                .or_default()
+                .accept(epoch, seq, w, std::time::Instant::now())
+        };
+        if acc.dup {
+            metrics::counter!("musubi_bus_order_dups_total").increment(1);
         }
-        for w in ready {
+        if let Some((from, until)) = acc.nack {
+            metrics::counter!("musubi_bus_order_nacks_total").increment(1);
+            self.publish(Wire::OrderNack {
+                to: origin,
+                epoch,
+                from,
+                until,
+            });
+        }
+        for w in acc.ready {
             self.dispatch(w);
         }
+    }
+
+    /// Another node misses control frames of ours: re-publish them from the window (they carry
+    /// their original sequence numbers, every other receiver drops them as duplicates).
+    fn replay_control(&self, to: uuid::Uuid, epoch: u64, from: u64, until: u64) {
+        let Some(c) = self.cluster.clone() else {
+            return;
+        };
+        if to != c.node_id().0 {
+            return;
+        }
+        let frames: Vec<Box<serde_json::value::RawValue>> = {
+            let win = self.control_window.lock().unwrap();
+            if win.epoch != epoch {
+                return;
+            }
+            win.frames
+                .iter()
+                .filter(|(s, _)| *s >= from && *s <= until)
+                .map(|(_, r)| r.clone())
+                .collect()
+        };
+        let missing = (until + 1)
+            .saturating_sub(from)
+            .saturating_sub(frames.len() as u64);
+        metrics::counter!("musubi_bus_order_replayed_total", "outcome" => "replayed")
+            .increment(frames.len() as u64);
+        metrics::counter!("musubi_bus_order_replayed_total", "outcome" => "gone")
+            .increment(missing);
+        if frames.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for r in frames {
+                if let Err(e) = c.publish_prio(TOPIC, &r, 10).await {
+                    tracing::warn!(error = %e, "control replay failed");
+                }
+            }
+        });
     }
 
     fn dispatch(&self, w: Wire) {
@@ -1135,6 +1260,12 @@ impl Fanout {
             }
             // sequencing is applied in `apply`; one that reaches here (inside a batch) is plain
             Wire::Ordered { inner, .. } => self.dispatch(*inner),
+            Wire::OrderNack {
+                to,
+                epoch,
+                from,
+                until,
+            } => self.replay_control(to, epoch, from, until),
             Wire::Account { account_id, msg } => {
                 self.hub.send_to_account(account_id, msg);
             }
@@ -1555,9 +1686,9 @@ impl Fanout {
             // a handover ack is small, order-free (late and duplicate acks are handled) and
             // decides whether the handover completes in time: it must not queue behind the
             // handovers and commands of the serial control lane (50–100 s behind on the stand)
-            Wire::WorldHandoverAck { .. } | Wire::WorldQueryReply { .. } => {
-                (&self.bus_user, 32, "user")
-            }
+            Wire::WorldHandoverAck { .. }
+            | Wire::WorldQueryReply { .. }
+            | Wire::OrderNack { .. } => (&self.bus_user, 32, "user"),
             Wire::Channel { .. }
             | Wire::Account { .. }
             | Wire::Presence { .. }
@@ -1590,6 +1721,7 @@ impl Fanout {
                         | Wire::WorldInput { .. }
                         | Wire::WorldCmd(_)
                 );
+            let window = self.control_window.clone();
             tokio::spawn(async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
                 // one "slow" warning per lane per second, not one per message
@@ -1626,6 +1758,14 @@ impl Fanout {
                             seq,
                             inner: Box::new(w),
                         };
+                        if let Ok(raw) = serde_json::value::to_raw_value(&w) {
+                            let mut win = window.lock().unwrap();
+                            win.epoch = epoch;
+                            win.frames.push_back((seq, raw));
+                            while win.frames.len() > CONTROL_WINDOW {
+                                win.frames.pop_front();
+                            }
+                        }
                         seq += 1;
                     }
                     let c = c.clone();
@@ -1671,5 +1811,89 @@ impl Fanout {
             tx
         });
         let _ = tx.send((std::time::Instant::now(), w));
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn w(n: u64) -> Wire {
+        Wire::WorldDeleted {
+            world: n.to_string(),
+        }
+    }
+
+    fn names(v: &[Wire]) -> Vec<u64> {
+        v.iter()
+            .map(|x| match x {
+                Wire::WorldDeleted { world } => world.parse().unwrap(),
+                _ => u64::MAX,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frames_ahead_wait_for_the_gap_and_a_nack_asks_for_it() {
+        let mut st = OrderState::default();
+        let t0 = Instant::now();
+        let a = st.accept(1, 0, w(0), t0);
+        assert_eq!(names(&a.ready), vec![0]);
+        // 1 is lost; 2 and 3 arrive ahead
+        let a = st.accept(1, 2, w(2), t0 + Duration::from_millis(10));
+        assert!(a.ready.is_empty() && a.nack.is_none(), "too early to ask");
+        let a = st.accept(1, 3, w(3), t0 + Duration::from_millis(60));
+        assert!(a.ready.is_empty());
+        assert_eq!(a.nack, Some((1, 1)), "ask for the one frame missing");
+        let a = st.accept(1, 4, w(4), t0 + Duration::from_millis(100));
+        assert_eq!(a.nack, None, "one nack per gap per interval");
+        let a = st.accept(1, 5, w(5), t0 + Duration::from_millis(270));
+        assert_eq!(a.nack, Some((1, 1)), "asked again after the interval");
+        // the replay arrives: everything held goes out in order
+        let a = st.accept(1, 1, w(1), t0 + Duration::from_millis(300));
+        assert_eq!(names(&a.ready), vec![1, 2, 3, 4, 5]);
+        assert!(!a.dup);
+        // a second copy of the replay is a duplicate
+        let a = st.accept(1, 1, w(1), t0 + Duration::from_millis(310));
+        assert!(a.ready.is_empty() && a.dup);
+    }
+
+    #[test]
+    fn a_given_up_gap_still_accepts_its_late_frame_once() {
+        let mut st = OrderState::default();
+        let t0 = Instant::now();
+        st.accept(7, 0, w(0), t0);
+        let a = st.accept(7, 2, w(2), t0 + Duration::from_millis(1));
+        assert!(a.ready.is_empty());
+        let a = st.accept(7, 3, w(3), t0 + Duration::from_millis(600));
+        assert_eq!(names(&a.ready), vec![2, 3], "gap skipped after the timeout");
+        let a = st.accept(7, 1, w(1), t0 + Duration::from_millis(700));
+        assert_eq!(
+            names(&a.ready),
+            vec![1],
+            "the late frame is new, not a duplicate"
+        );
+        assert!(!a.dup);
+        let a = st.accept(7, 1, w(1), t0 + Duration::from_millis(800));
+        assert!(a.dup, "but only once");
+        let a = st.accept(7, 4, w(4), t0 + Duration::from_millis(900));
+        assert_eq!(names(&a.ready), vec![4]);
+    }
+
+    #[test]
+    fn a_new_epoch_resets_the_sequence() {
+        let mut st = OrderState::default();
+        let t0 = Instant::now();
+        st.accept(1, 10, w(10), t0);
+        st.accept(1, 12, w(12), t0);
+        let a = st.accept(2, 0, w(0), t0 + Duration::from_millis(5));
+        assert_eq!(
+            names(&a.ready),
+            vec![12, 0],
+            "held frames flush, then the new epoch starts"
+        );
+        let a = st.accept(2, 1, w(1), t0 + Duration::from_millis(6));
+        assert_eq!(names(&a.ready), vec![1]);
     }
 }

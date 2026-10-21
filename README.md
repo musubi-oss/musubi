@@ -108,7 +108,7 @@ duplicates are 16 a run; a handover ships the full entity (a delta against a gho
 no longer held was refused one time in five); a world deleted on its home is dropped on every
 node (the peer kept the shards of 198 deleted bench and test worlds); the remote-handover
 timeout is 30 ticks (`remote_handover_timeout_ticks`), acks travel on the parallel lane, the
-control lane keeps 8 sends in flight with order restored on the receiver. What is left is measured too, down
+control lane keeps 8 sends in flight with order restored on the receiver — and a gap is no longer just waited out: a receiver missing frames for 50 ms asks the sender (`OrderNack`, once per 200 ms per gap), the sender replays them from the last 256 control frames it kept, replays other receivers already have are dropped as duplicates, and only a gap still open after 500 ms is skipped (a frame of it arriving later is still dispatched, once) — `musubi_bus_order_{nacks,replayed,dups,gaps}_total`. What is left is measured too, down
 to single entities (`hotrace` debug lines on both nodes, one entity in sixteen): a border
 handover shipped to the peer is acked while still in transit 264 times of 266 — the cross-node
 path itself works and takes ~60 ms; the ~6 400 "late" acks a run are the peer's acks to the
@@ -133,7 +133,11 @@ per run expired after `handover_timeout_ticks` because the simulator's ack took 
 thrown away. A late ack is now accepted when the entity still stands in a cell the acking
 simulator owns — distinct requests per run 10 771 → 4 202 with 3 245 completed (77 %, was
 32 %), local expiries 15 257 → 7 465, and each expiry is closed by the ack instead of a
-re-ask. The bus frame
+re-ask. The control lane's gap replay (`OrderNack`, above) was then put on the same stand: a
+players-split run showed no gaps and no nacks on either node and two duplicate frames dropped on
+the peer — the QUIC bus loses nothing on one VM, so the replay is exercised by its unit tests and
+is there for the Postgres fallback, reconnects and lossy links (26.7 fps per client, p99 171 ms,
+3 630 of 5 723 asked handovers completed, 0 errors on that run). The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
