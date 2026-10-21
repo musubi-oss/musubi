@@ -167,6 +167,12 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/worlds/{w}/detach", post(detach))
         .route("/v1/server/worlds/{w}/apply", post(apply))
         .route("/v1/server/worlds/{w}/view/{x}/{y}", get(view))
+        .route("/v1/server/worlds/{w}/entities", get(entities_find))
+        .route("/v1/server/worlds/{w}/entities/{id}", get(entity_get))
+        .route(
+            "/v1/server/worlds/{w}/entities/{id}/children",
+            get(entity_children),
+        )
         .route("/v1/server/worlds/{w}/events", get(events))
         .route("/v1/server/worlds/{w}/stream", get(stream))
         .route("/v1/server/worlds/{w}/handover/ack", post(handover_ack))
@@ -271,6 +277,10 @@ struct AttachReq {
     sim: Uuid,
     entity: String,
     root: String,
+    /// Put the entity inside `root` (takes and follows its position, counts against
+    /// `container.capacity`, hidden until the container is open or a client looks inside).
+    #[serde(default)]
+    contained: bool,
 }
 
 #[derive(Deserialize)]
@@ -575,7 +585,8 @@ async fn attach(
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
-        s.worlds.attach(&w, r.sim, &r.entity, &r.root)?;
+        s.worlds
+            .attach(&w, r.sim, &r.entity, &r.root, r.contained)?;
         Ok(Json(json!({ "ok": true })))
     }
     .await;
@@ -634,6 +645,113 @@ async fn view(
     };
     ensure_cell_home(&s, &w, cell, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async { Ok(Json(s.worlds.view(&w, cell)?)) }.await;
+    r.map_err(IntoResponse::into_response)
+}
+
+#[derive(Deserialize, Default)]
+struct DepthQuery {
+    #[serde(default)]
+    depth: usize,
+}
+
+/// Query string of `GET /entities`: every given field must match (see `EntityQuery`).
+#[derive(Deserialize, Default)]
+struct FindQuery {
+    component: Option<String>,
+    /// JSON text the component must equal (`"ore"`, `3`, `{"a":1}`); a bare word is a string.
+    equals: Option<String>,
+    cell_x: Option<i32>,
+    cell_y: Option<i32>,
+    #[serde(default)]
+    level: u8,
+    #[serde(default)]
+    z: i32,
+    persistent: Option<bool>,
+    contained: Option<bool>,
+    root: Option<String>,
+    under: Option<String>,
+    #[serde(default)]
+    limit: usize,
+}
+
+fn parse_id(s: &str) -> Result<musubi_mesh::EntityId, ApiError> {
+    s.parse::<musubi_mesh::EntityId>()
+        .map_err(|_| ApiError::from(Error::InvalidArgument(format!("bad entity id {s}"))))
+}
+
+async fn entity_get(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path((w, id)): Path<(String, String)>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        match s.worlds.local_entity(&w, &id)? {
+            Some(v) => Ok(Json(v)),
+            None => Err(Error::NotFound("entity".into()).into()),
+        }
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
+}
+
+async fn entity_children(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path((w, id)): Path<(String, String)>,
+    Query(q): Query<DepthQuery>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        let children = s.worlds.local_children(&w, &id, q.depth)?;
+        Ok(Json(
+            json!({"world": w, "entity": id, "depth": q.depth, "children": children}),
+        ))
+    }
+    .await;
+    r.map_err(IntoResponse::into_response)
+}
+
+async fn entities_find(
+    State(s): State<AppState>,
+    uri: OriginalUri,
+    ServerKey: ServerKey,
+    Path(w): Path<String>,
+    Query(q): Query<FindQuery>,
+) -> Result<Json<Value>, Response> {
+    ensure_shard(&s, &w, &uri).await?;
+    let r: Result<Json<Value>, ApiError> = async {
+        let equals = q
+            .equals
+            .as_deref()
+            .map(|t| serde_json::from_str(t).unwrap_or_else(|_| Value::String(t.to_string())));
+        let cell = match (q.cell_x, q.cell_y) {
+            (Some(x), Some(y)) => Some(CellId {
+                x,
+                y,
+                level: q.level,
+                z: q.z,
+            }),
+            _ => None,
+        };
+        let query = musubi_mesh::EntityQuery {
+            component: q.component.clone(),
+            equals,
+            cell,
+            persistent: q.persistent,
+            contained: q.contained,
+            root: q.root.as_deref().map(parse_id).transpose()?,
+            under: q.under.as_deref().map(parse_id).transpose()?,
+            limit: q.limit,
+        };
+        let entities = s.worlds.local_find(&w, &query)?;
+        Ok(Json(
+            json!({"world": w, "count": entities.len(), "entities": entities}),
+        ))
+    }
+    .await;
     r.map_err(IntoResponse::into_response)
 }
 
@@ -888,7 +1006,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             }
             "attach" => {
                 let r: AttachReq = serde_json::from_value(cmd).map_err(bad)?;
-                s.worlds.attach(w, sim, &r.entity, &r.root)?;
+                s.worlds.attach(w, sim, &r.entity, &r.root, r.contained)?;
                 reply["ok"] = json!(true);
                 Ok(reply)
             }

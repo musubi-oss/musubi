@@ -2423,6 +2423,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -2655,6 +2656,7 @@ async fn shard_controller_assigns_cells_and_recovers_orphans() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -2895,6 +2897,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -2950,6 +2953,7 @@ async fn cross_node_world_subscription_and_sim_redirect() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -3124,6 +3128,7 @@ async fn zanshin_and_aurix_integrations() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -7041,6 +7046,7 @@ async fn world_interest_across_nodes() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -8738,6 +8744,7 @@ async fn world_unreliable_position_updates() {
             filter: None,
             max_hz: None,
             unreliable_updates: true,
+            inside: None,
         },
     )
     .await;
@@ -10026,6 +10033,188 @@ async fn world_attached_entities_hand_over_with_their_root() {
     )
     .await;
     assert_eq!(st, 400, "already detached");
+}
+
+#[tokio::test]
+async fn world_containers_follow_root_hide_and_query() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let k = "defaultkey";
+    let world = format!("w{}", uuid::Uuid::now_v7().simple());
+    let post = |path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::post(&path)
+                .header("x-musubi-server-key", k)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let get = |path: String| {
+        let router = router.clone();
+        async move {
+            let req = Request::get(&path)
+                .header("x-musubi-server-key", k)
+                .body(Body::empty())
+                .unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let st = res.status().as_u16();
+            let v: Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap_or(Value::Null);
+            (st, v)
+        }
+    };
+    let (st, _) = post(
+        "/v1/server/worlds".into(),
+        json!({"name": world, "config": {"cell_size": 100.0}}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/lease"),
+        json!({"sim": sim, "cells": [{"x": 0, "y": 0}]}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let spawn = |x: f64, components: Value| {
+        let world = world.clone();
+        async move {
+            let (st, v) = post(
+                format!("/v1/server/worlds/{world}/spawn"),
+                json!({"sim": sim, "x": x, "y": 50.0, "persistent": true, "components": components}),
+            )
+            .await;
+            assert_eq!(st, 200, "{v}");
+            v["entity"]["id"]
+                .as_str()
+                .or(v["id"].as_str())
+                .unwrap()
+                .to_string()
+        }
+    };
+    let chest = spawn(10.0, json!({"container": {"capacity": 1}})).await;
+    let coin = spawn(60.0, json!({"kind": "coin"})).await;
+    let gem = spawn(61.0, json!({"kind": "gem"})).await;
+    let (st, v) = post(
+        format!("/v1/server/worlds/{world}/attach"),
+        json!({"sim": sim, "entity": coin, "root": chest, "contained": true}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = post(
+        format!("/v1/server/worlds/{world}/attach"),
+        json!({"sim": sim, "entity": gem, "root": chest, "contained": true}),
+    )
+    .await;
+    assert_eq!(st, 400, "capacity 1 is full: {v}");
+    // the coin took the chest's position and follows it
+    let (st, v) = get(format!("/v1/server/worlds/{world}/entities/{coin}")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["entity"]["contained"], json!(true));
+    assert_eq!(v["entity"]["pos"]["x"], json!(10.0));
+    assert_eq!(v["path_to_root"], json!([coin, chest]));
+    let (st, _) = post(
+        format!("/v1/server/worlds/{world}/apply"),
+        json!({"sim": sim, "entity": chest, "x": 30.0, "y": 50.0}),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let (_, v) = get(format!("/v1/server/worlds/{world}/entities/{coin}")).await;
+    assert_eq!(v["entity"]["pos"]["x"], json!(30.0), "{v}");
+    let (st, v) = get(format!("/v1/server/worlds/{world}/entities/{chest}")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["contents"], json!([coin]));
+    assert_eq!(v["capacity"], json!(1));
+    assert_eq!(v["children"].as_array().unwrap().len(), 1);
+    let (st, v) = get(format!(
+        "/v1/server/worlds/{world}/entities/{chest}/children?depth=1"
+    ))
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["children"][0]["id"], json!(coin));
+    assert_eq!(v["children"][0]["depth"], json!(1));
+    let (st, v) = get(format!(
+        "/v1/server/worlds/{world}/entities?component=kind&equals=gem"
+    ))
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["count"], json!(1));
+    assert_eq!(v["entities"][0]["id"], json!(gem));
+    let (_, v) = get(format!("/v1/server/worlds/{world}/entities?under={chest}")).await;
+    assert_eq!(v["count"], json!(1), "{v}");
+    let (_, v) = get(format!(
+        "/v1/server/worlds/{world}/entities?contained=false&limit=5"
+    ))
+    .await;
+    assert_eq!(v["count"], json!(2), "{v}");
+    let (st, _) = get(format!(
+        "/v1/server/worlds/{world}/entities/{}",
+        uuid::Uuid::now_v7()
+    ))
+    .await;
+    assert_eq!(st, 404);
+    // a client at the chest sees the chest (and the gem lying next to it) but not what is
+    // inside until it looks inside
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let f = "json";
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, f).await;
+    let subscribe = |inside: Option<String>| ClientMessage::WorldSubscribe {
+        world: world.clone(),
+        x: 30.0,
+        y: 50.0,
+        radius: 40.0,
+        budget_bytes: None,
+        filter: None,
+        max_hz: None,
+        unreliable_updates: false,
+        inside,
+    };
+    send(&mut c, f, None, subscribe(None)).await;
+    let chest_id: uuid::Uuid = chest.parse().unwrap();
+    let coin_id: uuid::Uuid = coin.parse().unwrap();
+    let gem_id: uuid::Uuid = gem.parse().unwrap();
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { spawned, .. } => {
+            let mut ids: Vec<uuid::Uuid> = spawned.iter().map(|e| e.id).collect();
+            ids.sort();
+            let mut want = vec![chest_id, gem_id];
+            want.sort();
+            assert_eq!(ids, want, "closed chest hides the coin");
+        }
+        m => panic!("{m:?}"),
+    }
+    send(&mut c, f, None, subscribe(Some(chest.clone()))).await;
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { spawned, .. } => {
+            assert_eq!(
+                spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+                vec![coin_id]
+            );
+        }
+        m => panic!("{m:?}"),
+    }
+    send(&mut c, f, None, subscribe(None)).await;
+    match recv(&mut c).await.msg {
+        ServerMessage::WorldDelta { despawned, .. } => {
+            assert_eq!(despawned, vec![coin_id], "stopped looking inside");
+        }
+        m => panic!("{m:?}"),
+    }
 }
 
 #[tokio::test]
@@ -18810,6 +18999,7 @@ async fn world_custom_placement_follows_module_hook() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -18845,6 +19035,7 @@ async fn world_custom_placement_follows_module_hook() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;
@@ -20679,6 +20870,7 @@ async fn world_global_entities_reach_far_subscribers() {
             filter: None,
             max_hz: None,
             unreliable_updates: false,
+            inside: None,
         },
     )
     .await;

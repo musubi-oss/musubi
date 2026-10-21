@@ -390,6 +390,8 @@ pub enum WorldMutation {
     Attach {
         id: Uuid,
         root: Uuid,
+        #[serde(default)]
+        contained: bool,
     },
     Detach {
         id: Uuid,
@@ -454,9 +456,13 @@ fn replay(
                     let _ = world.force_apply(*id, *pos, comps(components));
                 }
             }
-            WorldMutation::Attach { id, root } => {
+            WorldMutation::Attach {
+                id,
+                root,
+                contained,
+            } => {
                 if src.get(id).is_none_or(|s| *s == node) {
-                    let _ = world.attach(*id, *root);
+                    let _ = world.attach_with(*id, *root, *contained);
                 }
             }
             WorldMutation::Detach { id } => {
@@ -483,6 +489,7 @@ struct PendingInterest {
     every: u64,
     max_hz: Option<u32>,
     unreliable: bool,
+    inside: Option<musubi_mesh::EntityId>,
 }
 
 /// Per-client delivery options kept outside the mesh `Interest`.
@@ -591,6 +598,8 @@ pub enum WorldCmd {
         filter: Option<Value>,
         #[serde(default)]
         unreliable: bool,
+        #[serde(default)]
+        inside: Option<String>,
     },
     Unsubscribe,
     Input {
@@ -2152,6 +2161,7 @@ impl WorldRegistry {
                 budget_bytes,
                 filter,
                 unreliable,
+                inside,
             } => self.subscribe(
                 &env.world,
                 env.session_id,
@@ -2161,6 +2171,7 @@ impl WorldRegistry {
                 filter,
                 max_hz,
                 unreliable,
+                inside,
             ),
             WorldCmd::Unsubscribe => self.unsubscribe(&env.world, env.session_id),
             WorldCmd::Input { entity, input } => {
@@ -2588,6 +2599,73 @@ impl WorldRegistry {
         }))
     }
 
+    fn entity_json(st: &WorldState, e: &musubi_mesh::Entity) -> Value {
+        json!({
+            "id": e.id, "cell": e.cell, "pos": e.pos, "persistent": e.persistent,
+            "global": e.global, "attached_to": e.attached_to, "contained": e.contained,
+            "rev": e.rev, "transit": e.transit,
+            "remote_to": st.remote_transit.get(&e.id).map(|(h, _, _)| *h),
+            "components": e.components.iter().map(|(k, c)| (k.clone(), c.value.clone())).collect::<serde_json::Map<_, _>>(),
+        })
+    }
+
+    /// One entity on this shard with its place in the hierarchy (`None` = not on this shard).
+    pub fn local_entity(&self, name: &str, entity: &str) -> Result<Option<Value>> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let st = w.lock();
+        let Some(e) = st.world.get(id) else {
+            return Ok(None);
+        };
+        let children: Vec<Value> = st
+            .world
+            .children_of(id, 1)
+            .into_iter()
+            .filter_map(|(c, _)| st.world.get(c))
+            .map(|c| Self::entity_json(&st, c))
+            .collect();
+        Ok(Some(json!({
+            "world": name,
+            "node_id": self.node_id,
+            "tick": st.world.tick,
+            "entity": Self::entity_json(&st, e),
+            "path_to_root": st.world.path_to_root(id),
+            "children": children,
+            "contents": st.world.contents(id),
+            "capacity": st.world.container_capacity(id),
+        })))
+    }
+
+    /// Entities under `entity` on this shard down to `depth` levels (`0` = all), with depth.
+    pub fn local_children(&self, name: &str, entity: &str, depth: usize) -> Result<Vec<Value>> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let st = w.lock();
+        Ok(st
+            .world
+            .children_of(id, depth)
+            .into_iter()
+            .filter_map(|(c, d)| st.world.get(c).map(|e| (e, d)))
+            .map(|(e, d)| {
+                let mut v = Self::entity_json(&st, e);
+                v["depth"] = json!(d);
+                v
+            })
+            .collect())
+    }
+
+    /// Entities on this shard matching `q` (see `musubi_mesh::EntityQuery`).
+    pub fn local_find(&self, name: &str, q: &musubi_mesh::EntityQuery) -> Result<Vec<Value>> {
+        let w = self.get(name)?;
+        let st = w.lock();
+        Ok(st
+            .world
+            .find(q)
+            .into_iter()
+            .map(|e| Self::entity_json(&st, e))
+            .collect())
+    }
+
     pub fn register_sim(&self, name: &str, sim: Uuid, capacity: u32) -> Result<Vec<SimInfo>> {
         self.check_hosting()?;
         if capacity == 0 {
@@ -2921,7 +2999,14 @@ impl WorldRegistry {
     }
 
     /// `entity` rides with `root` from now on (plan 4.5): both must be owned by `sim`.
-    pub fn attach(&self, name: &str, sim: Uuid, entity: &str, root: &str) -> Result<()> {
+    pub fn attach(
+        &self,
+        name: &str,
+        sim: Uuid,
+        entity: &str,
+        root: &str,
+        contained: bool,
+    ) -> Result<()> {
         let id = parse_entity(entity)?;
         let root = parse_entity(root)?;
         let w = self.get(name)?;
@@ -2938,7 +3023,7 @@ impl WorldRegistry {
             }
         }
         st.world
-            .attach(id, root)
+            .attach_with(id, root, contained)
             .map_err(|e| Error::InvalidArgument(e.to_string()))?;
         if st.world.get(id).is_some_and(|e| e.persistent) {
             st.journal.push(WorldOp {
@@ -2947,7 +3032,11 @@ impl WorldRegistry {
                     by: "sim".into(),
                     sim: Some(sim),
                 }),
-                op: WorldMutation::Attach { id, root },
+                op: WorldMutation::Attach {
+                    id,
+                    root,
+                    contained,
+                },
             });
         }
         Ok(())
@@ -4050,10 +4139,12 @@ impl WorldRegistry {
         filter: Option<Value>,
         max_hz: Option<u32>,
         unreliable: bool,
+        inside: Option<String>,
     ) -> Result<()> {
         if !(0.0..=100_000.0).contains(&radius) {
             return Err(Error::InvalidArgument("radius 0..=100000".into()));
         }
+        let inside = inside.map(|i| parse_entity(&i)).transpose()?;
         let filter: std::collections::BTreeMap<String, Value> = match filter {
             None | Some(Value::Null) => Default::default(),
             Some(Value::Object(m)) => m.into_iter().collect(),
@@ -4083,6 +4174,7 @@ impl WorldRegistry {
                 every,
                 max_hz,
                 unreliable,
+                inside,
             });
         Ok(())
     }
@@ -4107,6 +4199,7 @@ impl WorldRegistry {
             every,
             max_hz,
             unreliable,
+            inside,
         } = p;
         if !st.hosted_only {
             st.sub_cmds.insert(
@@ -4120,6 +4213,7 @@ impl WorldRegistry {
                     filter: (!filter.is_empty())
                         .then(|| Value::Object(filter.clone().into_iter().collect())),
                     unreliable,
+                    inside: inside.map(|i| i.to_string()),
                 },
             );
         }
@@ -4127,6 +4221,7 @@ impl WorldRegistry {
         st.sub_opts.entry(client).or_default().unreliable = unreliable;
         st.world
             .subscribe_with(client, pos, radius, budget_bytes, filter, every);
+        st.world.look_inside(client, inside);
         let hosted_only = st.hosted_only;
         for c in st.world.cells_in_radius(pos, radius) {
             // only cells this shard is responsible for get a simulator from here

@@ -288,6 +288,10 @@ pub enum ClientMessage {
         /// Spawns, despawns and component changes are always reliable.
         #[serde(default)]
         unreliable_updates: bool,
+        /// Container whose contents this client wants to see even while it is closed (its own
+        /// inventory, the chest it is browsing); omit/null to stop looking inside.
+        #[serde(default)]
+        inside: Option<String>,
     },
     WorldUnsubscribe {
         world: String,

@@ -235,6 +235,11 @@ pub struct Entity {
     /// never hands over on its own and moves cells together with the root (plan 4.5).
     #[serde(default)]
     pub attached_to: Option<EntityId>,
+    /// Inside its root (item in a chest, cargo in a hold): its position is the root's, it is
+    /// hidden from interest unless the root is an open container or the client looks inside,
+    /// and it is reachable through the hierarchy queries rather than the spatial scan.
+    #[serde(default)]
+    pub contained: bool,
     /// Handover attempts since the last success; drives the backoff after an Ack timeout.
     #[serde(default)]
     pub handover_attempts: u32,
@@ -392,6 +397,49 @@ pub struct SimView {
     pub ghosts: Vec<Entity>,
 }
 
+/// A contained entity shows up for a client that looks inside its container (`inside`) or when
+/// the container itself is open (`container.open == true`).
+fn contents_visible(entities: &HashMap<EntityId, Entity>, e: &Entity, interest: &Interest) -> bool {
+    let Some(root) = e.attached_to else {
+        return true;
+    };
+    if interest.inside == Some(root) {
+        return true;
+    }
+    entities.get(&root).is_some_and(|r| {
+        r.components
+            .get("container")
+            .and_then(|c| c.value.get("open"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+    })
+}
+
+/// Filter for `World::find`: every `Some` field must match.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EntityQuery {
+    /// Component the entity must carry …
+    #[serde(default)]
+    pub component: Option<String>,
+    /// … and, if set, the value it must equal.
+    #[serde(default)]
+    pub equals: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cell: Option<CellId>,
+    #[serde(default)]
+    pub persistent: Option<bool>,
+    #[serde(default)]
+    pub contained: Option<bool>,
+    /// Direct children of this entity only.
+    #[serde(default)]
+    pub root: Option<EntityId>,
+    /// Anywhere below this entity in the hierarchy.
+    #[serde(default)]
+    pub under: Option<EntityId>,
+    #[serde(default)]
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum HandoverOutcome {
     Started {
@@ -477,6 +525,10 @@ pub struct Interest {
     /// Fine filter: every listed component must equal the given value (empty = all entities).
     #[serde(default)]
     filter: BTreeMap<String, serde_json::Value>,
+    /// Container whose contents this client sees regardless of `container.open` (its own
+    /// inventory, the chest it is browsing).
+    #[serde(default)]
+    inside: Option<EntityId>,
     /// entity → tick of the last delta that carried it (priority grows with age).
     #[serde(default)]
     last_sent: HashMap<EntityId, u64>,
@@ -1216,6 +1268,7 @@ impl World {
             global: false,
             transit: None,
             attached_to: None,
+            contained: false,
             handover_attempts: 0,
             handover_retry_tick: 0,
             decay_ticks: None,
@@ -1436,6 +1489,15 @@ impl World {
         }
         if let Some(p) = pos {
             self.record_pos(id, p);
+            for c in self.attached(id) {
+                if let Some(ce) = self.entities.get_mut(&c) {
+                    if ce.contained && ce.pos != p {
+                        ce.pos = p;
+                        ce.changed_tick = tick;
+                        self.by_cell.mark(ce.cell, c, tick);
+                    }
+                }
+            }
         }
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
         if !components.is_empty() {
@@ -1753,6 +1815,87 @@ impl World {
     }
 
     /// Entities attached (directly or through other parts) to `root`, root excluded.
+    /// The client sees the contents of `container` whatever its `container.open` says (its own
+    /// inventory, the chest it is browsing); `None` closes it again.
+    pub fn look_inside(&mut self, client: ClientId, container: Option<EntityId>) -> bool {
+        match self.interests.get_mut(&client) {
+            Some(i) => {
+                i.inside = container;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `id`, its root, the root's root … up to the top of the hierarchy.
+    pub fn path_to_root(&self, id: EntityId) -> Vec<EntityId> {
+        let mut out = vec![id];
+        let mut cur = id;
+        while let Some(r) = self.entities.get(&cur).and_then(|e| e.attached_to) {
+            if out.contains(&r) {
+                break;
+            }
+            out.push(r);
+            cur = r;
+        }
+        out
+    }
+
+    /// Entities attached under `root` down to `depth` levels (`0` = unlimited), with their depth.
+    pub fn children_of(&self, root: EntityId, depth: usize) -> Vec<(EntityId, usize)> {
+        let mut out = Vec::new();
+        let mut frontier = vec![(root, 0usize)];
+        while let Some((r, d)) = frontier.pop() {
+            if depth != 0 && d >= depth {
+                continue;
+            }
+            let mut kids: Vec<EntityId> = self
+                .children
+                .get(&r)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            kids.sort();
+            for c in kids {
+                if out.iter().any(|(x, _)| *x == c) {
+                    continue;
+                }
+                out.push((c, d + 1));
+                frontier.push((c, d + 1));
+            }
+        }
+        out
+    }
+
+    /// Entities matching every set field of `q`, sorted by id, at most `q.limit` (`0` = all).
+    pub fn find(&self, q: &EntityQuery) -> Vec<&Entity> {
+        let under: Option<HashSet<EntityId>> = q
+            .under
+            .map(|r| self.children_of(r, 0).into_iter().map(|(c, _)| c).collect());
+        let mut v: Vec<&Entity> = self
+            .entities
+            .values()
+            .filter(|e| {
+                q.cell.is_none_or(|c| e.cell == c)
+                    && q.persistent.is_none_or(|p| e.persistent == p)
+                    && q.contained.is_none_or(|c| e.contained == c)
+                    && q.root.is_none_or(|r| e.attached_to == Some(r))
+                    && under.as_ref().is_none_or(|u| u.contains(&e.id))
+                    && q.component.as_ref().is_none_or(|k| {
+                        e.components
+                            .get(k)
+                            .is_some_and(|c| q.equals.as_ref().is_none_or(|want| &c.value == want))
+                    })
+            })
+            .collect();
+        v.sort_by_key(|e| e.id);
+        if q.limit > 0 {
+            v.truncate(q.limit);
+        }
+        v
+    }
+
     pub fn attached(&self, root: EntityId) -> Vec<EntityId> {
         let mut out = Vec::new();
         let mut frontier = vec![root];
@@ -1781,6 +1924,65 @@ impl World {
     /// Make `id` travel with `root` (vehicle, construction): it moves to the root's cell now and
     /// in every later handover. Cycles and attaching while in transit are refused.
     pub fn attach(&mut self, id: EntityId, root: EntityId) -> Result<(), MeshError> {
+        self.attach_with(id, root, false)
+    }
+
+    /// Capacity of `root` as a container (`container.capacity`), `None` = unlimited.
+    pub fn container_capacity(&self, root: EntityId) -> Option<u64> {
+        self.entities
+            .get(&root)?
+            .components
+            .get("container")?
+            .value
+            .get("capacity")?
+            .as_u64()
+    }
+
+    /// Entities directly inside `root` (contained children, not passengers).
+    pub fn contents(&self, root: EntityId) -> Vec<EntityId> {
+        let mut v: Vec<EntityId> = self
+            .children
+            .get(&root)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|c| self.entities.get(c).is_some_and(|e| e.contained))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `contained = true` puts the entity inside `root`: it takes the root's position (and
+    /// follows it), counts against `container.capacity`, and is hidden from interest unless
+    /// the root is open or the client looks inside.
+    pub fn attach_with(
+        &mut self,
+        id: EntityId,
+        root: EntityId,
+        contained: bool,
+    ) -> Result<(), MeshError> {
+        if contained {
+            let already = self
+                .entities
+                .get(&id)
+                .is_some_and(|e| e.contained && e.attached_to == Some(root));
+            if !already {
+                if let Some(cap) = self.container_capacity(root) {
+                    if self.contents(root).len() as u64 >= cap {
+                        return Err(MeshError::NotAuthoritative("container full".into()));
+                    }
+                }
+            }
+        }
+        self.attach_inner(id, root, contained)
+    }
+
+    fn attach_inner(
+        &mut self,
+        id: EntityId,
+        root: EntityId,
+        contained: bool,
+    ) -> Result<(), MeshError> {
         if id == root || !self.entities.contains_key(&id) {
             return Err(MeshError::NoEntity);
         }
@@ -1791,12 +1993,28 @@ impl World {
         if self.attached(id).contains(&root) {
             return Err(MeshError::NotAuthoritative("attachment cycle".into()));
         }
-        let (cell, tick) = (r.cell, self.tick);
+        let (cell, tick, root_pos) = (r.cell, self.tick, r.pos);
         let (prev, cell_now) = {
             let e = self.entities.get_mut(&id).unwrap();
             e.touched_tick = tick;
+            e.changed_tick = tick;
+            e.contained = contained;
+            if contained {
+                e.pos = root_pos;
+            }
             (e.attached_to.replace(root), e.cell)
         };
+        if contained {
+            self.record_pos(id, root_pos);
+            for c in self.attached(id) {
+                if let Some(ce) = self.entities.get_mut(&c) {
+                    if ce.contained {
+                        ce.pos = root_pos;
+                        ce.changed_tick = tick;
+                    }
+                }
+            }
+        }
         self.unindex_child(prev, id);
         self.children.entry(root).or_default().push(id);
         if cell_now != cell {
@@ -1807,8 +2025,13 @@ impl World {
 
     /// `id` travels on its own again (its cell is re-evaluated by the next `detect_handovers`).
     pub fn detach(&mut self, id: EntityId) -> bool {
+        let tick = self.tick;
         let prev = match self.entities.get_mut(&id) {
-            Some(e) if e.attached_to.is_some() => e.attached_to.take(),
+            Some(e) if e.attached_to.is_some() => {
+                e.contained = false;
+                e.changed_tick = tick;
+                e.attached_to.take()
+            }
             _ => return false,
         };
         self.unindex_child(prev, id);
@@ -1999,6 +2222,7 @@ impl World {
                 known: HashMap::new(),
                 budget_bytes,
                 filter,
+                inside: None,
                 last_sent: HashMap::new(),
                 last_delta_tick: 0,
                 last_view: None,
@@ -2768,6 +2992,146 @@ mod tests {
             w.handover_ack(s2, a).is_err(),
             "s2 does not own the cell the entity stands in"
         );
+    }
+
+    fn one_cell_world() -> (World, Uuid, Uuid) {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..Default::default()
+        });
+        let s1 = Uuid::now_v7();
+        w.grant_lease(
+            CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+                z: 0,
+            },
+            s1,
+        );
+        let c = Uuid::now_v7();
+        w.subscribe(
+            c,
+            Pos {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            60.0,
+        );
+        (w, s1, c)
+    }
+
+    fn p(x: f64) -> Pos {
+        Pos { x, y: 0.0, z: 0.0 }
+    }
+
+    #[test]
+    fn container_contents_follow_root_and_hide_until_open() {
+        let (mut w, s1, c) = one_cell_world();
+        let chest = w.spawn(
+            p(10.0),
+            comps(serde_json::json!({"container": {"capacity": 2}})),
+            true,
+        );
+        let coin = w.spawn(p(50.0), comps(serde_json::json!({"kind": "coin"})), true);
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(d.spawned.len(), 2, "both visible before containment");
+        w.attach_with(coin, chest, true).unwrap();
+        assert_eq!(
+            w.get(coin).unwrap().pos,
+            p(10.0),
+            "takes the root's position"
+        );
+        assert!(w.get(coin).unwrap().contained);
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(
+            d.despawned,
+            vec![coin],
+            "contents of a closed chest leave the client's view"
+        );
+        w.apply(s1, chest, Some(p(20.0)), BTreeMap::new()).unwrap();
+        assert_eq!(w.get(coin).unwrap().pos, p(20.0), "follows the root");
+        assert!(w.delta_for(c).unwrap().spawned.is_empty());
+        w.look_inside(c, Some(chest));
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(
+            d.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![coin]
+        );
+        w.look_inside(c, None);
+        assert_eq!(w.delta_for(c).unwrap().despawned, vec![coin]);
+        w.apply(
+            s1,
+            chest,
+            None,
+            comps(serde_json::json!({"container": {"capacity": 2, "open": true}})),
+        )
+        .unwrap();
+        let d = w.delta_for(c).unwrap();
+        assert_eq!(
+            d.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![coin],
+            "open chest shows its contents"
+        );
+        assert!(w.detach(coin));
+        assert!(!w.get(coin).unwrap().contained);
+        assert_eq!(w.contents(chest), Vec::<EntityId>::new());
+    }
+
+    #[test]
+    fn container_capacity_and_queries() {
+        let (mut w, _s1, _c) = one_cell_world();
+        let hold = w.spawn(
+            p(10.0),
+            comps(serde_json::json!({"container": {"capacity": 2}})),
+            true,
+        );
+        let bag = w.spawn(p(10.0), comps(serde_json::json!({"container": {}})), true);
+        let a = w.spawn(p(1.0), comps(serde_json::json!({"kind": "ore"})), true);
+        let b = w.spawn(p(2.0), comps(serde_json::json!({"kind": "ore"})), false);
+        let d = w.spawn(p(3.0), comps(serde_json::json!({"kind": "gem"})), true);
+        w.attach_with(bag, hold, true).unwrap();
+        w.attach_with(a, bag, true).unwrap();
+        w.attach_with(b, hold, true).unwrap();
+        assert!(w.attach_with(d, hold, true).is_err(), "hold holds two");
+        w.attach_with(b, hold, true)
+            .expect("re-attaching what is inside is idempotent");
+        assert_eq!(w.path_to_root(a), vec![a, bag, hold]);
+        let mut direct: Vec<EntityId> =
+            w.children_of(hold, 1).into_iter().map(|(c, _)| c).collect();
+        direct.sort();
+        let mut want = vec![bag, b];
+        want.sort();
+        assert_eq!(direct, want);
+        assert_eq!(w.children_of(hold, 0).len(), 3, "bag, a, b");
+        let ore = w.find(&EntityQuery {
+            component: Some("kind".into()),
+            equals: Some(serde_json::json!("ore")),
+            ..Default::default()
+        });
+        assert_eq!(ore.len(), 2);
+        let under = w.find(&EntityQuery {
+            under: Some(hold),
+            persistent: Some(true),
+            ..Default::default()
+        });
+        let mut want = vec![bag, a];
+        want.sort();
+        assert_eq!(under.iter().map(|e| e.id).collect::<Vec<_>>(), want);
+        let roots = w.find(&EntityQuery {
+            root: Some(hold),
+            limit: 1,
+            ..Default::default()
+        });
+        assert_eq!(roots.len(), 1);
+        assert!(w
+            .find(&EntityQuery {
+                contained: Some(false),
+                ..Default::default()
+            })
+            .iter()
+            .all(|e| e.id == hold || e.id == d));
     }
 
     #[test]
@@ -3708,6 +4072,7 @@ impl WorldView {
                 e.pos.dist(&interest.pos)
             };
             let visible = (e.global || dist <= interest.radius)
+                && (!e.contained || contents_visible(&self.entities, e, interest))
                 && interest
                     .filter
                     .iter()

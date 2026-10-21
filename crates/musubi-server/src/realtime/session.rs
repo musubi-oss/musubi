@@ -914,6 +914,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             filter,
             max_hz,
             unreliable_updates,
+            inside,
         } => {
             world_dispatch(
                 ctx,
@@ -926,6 +927,7 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
                     budget_bytes,
                     filter,
                     unreliable: unreliable_updates,
+                    inside,
                 },
             )
             .await

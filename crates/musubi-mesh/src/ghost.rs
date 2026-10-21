@@ -244,6 +244,7 @@ impl GhostCache {
                 components: Default::default(),
                 persistent: u.persistent,
                 global: false,
+                contained: false,
                 transit: None,
                 attached_to: None,
                 handover_attempts: 0,
