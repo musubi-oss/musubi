@@ -22,6 +22,17 @@ export const router = createRouter({
     { path: '/players', component: () => import('./pages/players/Index.vue'), children: [
       { path: '', component: () => import('./pages/players/Accounts.vue') },
       { path: 'accounts/:id', component: () => import('./pages/players/Account.vue') },
+      { path: 'reports', component: () => import('./pages/players/Moderation.vue') },
+      { path: 'chat_reports', redirect: '/players/reports' },
+      { path: 'bans', redirect: '/players/reports' },
+      { path: 'ban_rules', redirect: '/players/reports' },
+      { path: 'access', component: () => import('./pages/players/Access.vue') },
+      { path: 'allowlist', redirect: '/players/access' },
+      { path: 'denials', redirect: '/players/access' },
+      { path: 'login_queue', redirect: '/players/access' },
+      { path: 'auth_providers', component: () => import('./pages/players/Providers.vue') },
+      { path: 'data_rights', component: () => import('./pages/players/DataRights.vue') },
+      { path: 'crashes', component: () => import('./pages/players/Crashes.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.players.find((x) => x.id === r.params.page) ?? catalog.players[0] }) },
     ]},
     { path: '/servers', component: () => import('./pages/servers/Index.vue'), children: [

@@ -15,7 +15,7 @@ async function showManifest(a: any) { sel.value = a; try { manifest.value = awai
 async function act(fn: () => Promise<any>, ok: string) { try { await fn(); toast.show(ok); load() } catch (x: any) { toast.err(x) } }
 </script>
 <template>
-  <div class="crumb"><span>Builds &amp; artifacts</span><span class="id">{{ groups.length }} builds · {{ arts.length }} versions<template v-if="chunking"> · dedup {{ chunking.dedup_ratio ?? chunking.ratio ?? '—' }}× · {{ chunking.orphans ?? 0 }} orphan chunks</template></span>
+  <div class="crumb"><span>Builds &amp; artifacts</span><span class="id">{{ groups.length }} builds · {{ arts.length }} versions<template v-if="chunking"> · dedup {{ chunking.artifacts?.dedup_ratio ?? chunking.dedup_ratio ?? '—' }}× · {{ chunking.chunks?.orphans ?? chunking.orphans ?? 0 }} orphan chunks</template></span>
     <span style="margin-left:auto;display:flex;gap:8px"><button class="btn s" @click="act(() => post('/v1/server/builds/gc'), 'chunk gc done')">GC chunks</button></span></div>
   <p class="err" v-if="err">{{ err }}</p>
   <div class="card">
