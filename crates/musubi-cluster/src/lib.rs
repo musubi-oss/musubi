@@ -854,6 +854,19 @@ impl Cluster {
     /// over a direct stream; the Postgres copy is only sent for peers without one (flagged
     /// `via_quic` so bus peers drop it) and, targeted, for peers whose QUIC delivery failed.
     pub async fn publish<T: Serialize>(&self, topic: &str, payload: &T) -> Result<()> {
+        self.publish_prio(topic, payload, 0).await
+    }
+
+    /// `publish` with a QUIC stream priority: all lanes of a peer share one connection and its
+    /// flow control, and a send completes when the peer has read the frame — so a small control
+    /// message (handover, ack) queued behind megabytes of deltas took 60–120 s on the stand.
+    /// Higher goes first; deltas use 0.
+    pub async fn publish_prio<T: Serialize>(
+        &self,
+        topic: &str,
+        payload: &T,
+        priority: i32,
+    ) -> Result<()> {
         let mut msg = BusMessage {
             origin: self.me.id,
             topic: topic.to_string(),
@@ -883,7 +896,8 @@ impl Cluster {
             }
             let (bus, bytes) = (bus.clone(), bytes.clone());
             set.spawn(async move {
-                let r = tokio::time::timeout(QUIC_SEND_TIMEOUT, bus.send(&p, &bytes)).await;
+                let r =
+                    tokio::time::timeout(QUIC_SEND_TIMEOUT, bus.send(&p, &bytes, priority)).await;
                 let ok = matches!(r, Ok(Ok(())));
                 // a peer that already failed to connect (backoff) or that SWIM holds suspect is
                 // almost surely down: the first failure got its Postgres copy, repeating that for
@@ -1148,9 +1162,10 @@ impl QuicBus {
         Ok(conn)
     }
 
-    async fn send(&self, peer: &NodeInfo, bytes: &[u8]) -> Result<()> {
+    async fn send(&self, peer: &NodeInfo, bytes: &[u8], priority: i32) -> Result<()> {
         let conn = self.connection(peer).await?;
         let mut stream = conn.open_uni().await.map_err(Error::internal)?;
+        let _ = stream.set_priority(priority);
         stream.write_all(bytes).await.map_err(Error::internal)?;
         stream.finish().map_err(Error::internal)?;
         let _ = stream.stopped().await;

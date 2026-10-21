@@ -213,8 +213,13 @@ enum Wire {
 }
 
 const TOPIC: &str = "realtime";
-/// Most bulk deltas folded into one bus frame.
+/// Most messages folded into one bus frame. A lane sends one frame at a time, so this bounds its
+/// throughput — but a frame is serialized (twice: `BusMessage.payload` is a `Value`) on the
+/// runtime, and 512-message frames took 120–1 000 ms each and starved the sessions' sends (fps
+/// per client 24 → 18). 64 keeps a frame under ~20 ms; the real fix is a raw payload.
 const BULK_BATCH_MAX: usize = 64;
+/// `publish_many` chunk: 512 subscribe commands are ~200 KB on the wire, far under the QUIC cap.
+const PUBLISH_MANY_CHUNK: usize = 512;
 
 #[derive(Clone)]
 pub struct Fanout {
@@ -239,6 +244,9 @@ pub struct Fanout {
     /// 1 000 remote players × 30 Hz is a few bus frames per tick, not 30 000 — and they no longer
     /// queue in front of handovers on the control lane.
     bus_session: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
+    /// Player inputs for worlds homed elsewhere and inputs forwarded to the owning shard: one per
+    /// player per input, batched — on the control lane they queued handovers 200 s behind them.
+    bus_input: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
     bus_user: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
 }
 
@@ -261,6 +269,7 @@ impl Fanout {
             bus: Arc::new(OnceLock::new()),
             bus_bulk: Arc::new(OnceLock::new()),
             bus_session: Arc::new(OnceLock::new()),
+            bus_input: Arc::new(OnceLock::new()),
             bus_user: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
             social: Arc::new(OnceLock::new()),
@@ -476,6 +485,31 @@ impl Fanout {
 
     pub fn world_cmd(&self, env: WorldCmdEnv) {
         self.publish(Wire::WorldCmd(env));
+    }
+
+    /// A burst of world commands (subscription replay) as a few batches, order kept.
+    pub fn world_cmds(&self, envs: Vec<WorldCmdEnv>) {
+        self.publish_many(envs.into_iter().map(Wire::WorldCmd).collect());
+    }
+
+    /// Publish a burst as a few `WorldBatch` messages (order kept) instead of one message each.
+    /// Only on the QUIC bus: a batch would blow the Postgres NOTIFY cap and be dropped whole.
+    fn publish_many(&self, items: Vec<Wire>) {
+        let quic = self
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.bus_addr().is_some());
+        if !quic {
+            for w in items {
+                self.publish(w);
+            }
+            return;
+        }
+        let mut items = items.into_iter().peekable();
+        while items.peek().is_some() {
+            let chunk: Vec<Wire> = items.by_ref().take(PUBLISH_MANY_CHUNK).collect();
+            self.publish(Wire::WorldBatch(chunk));
+        }
     }
 
     /// Publish the border entities of a locally hosted cell as ghosts for neighbour-cell hosts.
@@ -1182,7 +1216,7 @@ impl Fanout {
         let Some(c) = self.cluster.clone() else {
             return;
         };
-        // four lanes, each its own queue, so one kind of traffic cannot starve another: bulk
+        // five lanes, each its own queue, so one kind of traffic cannot starve another: bulk
         // replication (ghost and replica deltas, their acks — ordered, one at a time), user
         // traffic (chat, presence, relayed match input — high volume, published with bounded
         // concurrency) and mesh/session control (handovers, acks, adoption/drop reconciliation,
@@ -1190,26 +1224,52 @@ impl Fanout {
         // messages queue 48 s behind chat in a single queue), and remote-session delivery (world
         // deltas to players on other nodes — batched; on the control lane 1 000 remote players ×
         // 30 Hz queued handovers behind 30 000 frames a second)
-        let (lane, concurrency) = match w {
+        let (lane, concurrency, lane_name) = match w {
             Wire::WorldGhosts { .. } | Wire::WorldRepl { .. } | Wire::WorldReplAck { .. } => {
-                (&self.bus_bulk, 1)
+                (&self.bus_bulk, 1, "bulk")
             }
-            Wire::Session { .. } => (&self.bus_session, 1),
+            Wire::Session { .. } => (&self.bus_session, 1, "session"),
+            Wire::WorldInput { .. } => (&self.bus_input, 1, "input"),
+            Wire::WorldCmd(WorldCmdEnv {
+                cmd: WorldCmd::Input { .. },
+                ..
+            }) => (&self.bus_input, 1, "input"),
+            // a handover ack is small, order-free (late and duplicate acks are handled) and
+            // decides whether the handover completes in time: it must not queue behind the
+            // handovers and commands of the serial control lane (50–100 s behind on the stand)
+            Wire::WorldHandoverAck { .. } => (&self.bus_user, 32, "user"),
             Wire::Channel { .. }
             | Wire::Account { .. }
             | Wire::Presence { .. }
             | Wire::Online { .. }
-            | Wire::RelayedCmd { .. } => (&self.bus_user, 32),
-            _ => (&self.bus, 1),
+            | Wire::RelayedCmd { .. } => (&self.bus_user, 32, "user"),
+            _ => (&self.bus, 1, "control"),
+        };
+        // control before user before deltas on the shared QUIC connection (see `publish_prio`)
+        let priority = match lane_name {
+            "control" => 10,
+            "user" => 5,
+            _ => 0,
         };
         let tx = lane.get_or_init(|| {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(std::time::Instant, Wire)>();
-            // batches only make sense on the QUIC bus: the Postgres NOTIFY fallback caps a
-            // message at 7 900 bytes, a batch of deltas is dropped whole there
+            // the high-volume lanes batch what queued while the previous send was in flight;
+            // the control lane does not: batched (even 16 handovers a frame) it moved the
+            // stand's players-split fps from 25 to 19 without completing more handovers, and
+            // its bursts (subscription replays) are batched at the source instead. Only on the
+            // QUIC bus: the Postgres NOTIFY fallback caps a message at 7 900 bytes, a batch of
+            // deltas is dropped whole there
             let batch = c.bus_addr().is_some()
                 && matches!(
                     w,
-                    Wire::WorldGhosts { .. } | Wire::WorldRepl { .. } | Wire::Session { .. }
+                    Wire::WorldGhosts { .. }
+                        | Wire::WorldRepl { .. }
+                        | Wire::Session { .. }
+                        | Wire::WorldInput { .. }
+                        | Wire::WorldCmd(WorldCmdEnv {
+                            cmd: WorldCmd::Input { .. },
+                            ..
+                        })
                 );
             tokio::spawn(async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
@@ -1240,7 +1300,7 @@ impl Fanout {
                     let one = async move {
                         let waited = queued.elapsed();
                         let started = std::time::Instant::now();
-                        if let Err(e) = c.publish(TOPIC, &w).await {
+                        if let Err(e) = c.publish_prio(TOPIC, &w, priority).await {
                             tracing::warn!(error = %e, "fanout publish failed");
                         }
                         let took = started.elapsed();
@@ -1259,6 +1319,7 @@ impl Fanout {
                                 .and_then(|v| v.as_object().and_then(|o| o.keys().next().cloned()))
                                 .unwrap_or_default();
                             tracing::warn!(
+                                lane = lane_name,
                                 kind,
                                 waited_ms = waited.as_millis() as u64,
                                 publish_ms = took.as_millis() as u64,

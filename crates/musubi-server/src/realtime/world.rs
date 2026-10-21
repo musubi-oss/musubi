@@ -197,7 +197,11 @@ fn ship_handover(
     inputs: Vec<Value>,
 ) {
     let id = e.id;
-    let base = if st.full_resend.remove(&id) {
+    // a retry ships everything: the receiver consumed its ghost on the attempt whose ack never
+    // came back (or never had one), and a delta it cannot build on costs a refusal round trip
+    // on top — the stand saw 43 k such refusals in 30 s
+    let retry = st.remote_transit.get(&id).is_some_and(|(_, n, _)| *n > 1);
+    let base = if retry || st.full_resend.remove(&id) {
         None
     } else {
         st.ghost_send.values().find_map(|g| g.sent_rev(id))
@@ -2104,9 +2108,9 @@ impl WorldRegistry {
                 })
                 .collect()
         };
-        for env in cmds {
-            fanout.world_cmd(env);
-        }
+        // one bus message, not one per player: with 2 000 subscribers a replay per offloaded
+        // cell on the control lane put the handovers seconds behind it
+        fanout.world_cmds(cmds);
     }
 
     pub fn has_shard(&self, name: &str) -> bool {
@@ -3358,6 +3362,8 @@ impl WorldRegistry {
                         };
                     if elsewhere {
                         tracing::info!(world = name, %id, "late handover ack: stale local copy dropped");
+                        metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
+                            .increment(1);
                         st.remote_transit.remove(&id);
                         st.world.forget_for_clients(id);
                         st.world.despawn(id);
@@ -3382,6 +3388,9 @@ impl WorldRegistry {
             st.full_resend.insert(id);
         }
         if accepted {
+            // a cross-node handover completes here, not in the simulator's ack path
+            metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
+                .increment(1);
             let inputs = st.world.take_buffered_inputs(id);
             let persistent = st.world.get(id).is_some_and(|e| e.persistent);
             tracing::debug!(world = name, %id, to = %t.to, "handover: entity left");

@@ -71,8 +71,8 @@ is the tree as of `bebbbcf`, "after" has the three fixes described below the tab
 | 3 after | 2 000 | 4 × 4 000, 8 sims | json | **23.6** | **39 / 94 / 134 ms** | **25 / 100 ms** | 1.5 / 25 ms | **8 568 / 8 574** | 225 % |
 | 3, 2 nodes, players on home, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 24.0 | 35 / 87 / 196 ms | 25 / 100 ms | 2.3 / 25 ms | 2 099 / 6 055 | home 47 %, peer 22 % |
 | 3, 2 nodes, players split, Postgres bus | 2 000 | 4 × 4 000, 8 sims | json | 13.8 | 35 / 198 / 706 ms | 10 / 50 ms | 2.0 / 10 ms | 2 096 / 5 554 | home 65 %, peer 33 % |
-| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 23.1 | 34 / 88 / 202 ms | 5 / 50 ms | 1.5 / 10 ms | 1 604 / 11 016 | home 75 %, peer 84 % |
-| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 23.0 | 34 / 96 / 200 ms | 10 / 25 ms | 1.7 / 10 ms | 2 215 / 9 825 | home 32 %, peer 48 % |
+| 3, 2 nodes, players on home, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 19.6 | 35 / 195 / 218 ms | 5 / 50 ms | 1.4 / 10 ms | 1 879 / 9 952 | home 76 %, peer 88 % |
+| 3, 2 nodes, players split, QUIC bus | 2 000 | 4 × 4 000, 8 sims | json | 25.0 | 33 / 82 / 198 ms | 5 / 25 ms | 1.5 / 10 ms | 2 380 / 9 623 | home 29 %, peer 53 % |
 
 The two-node rows are the same stand with a second `sim`-role node on the same VM and
 `--controller '{"offload_above_cost": 800}'`: the home moves ~40 cells (of 4 × 25) to the peer,
@@ -92,9 +92,19 @@ redirected during an offload used to bounce between the two nodes until "too man
 and the bench stand survives cells moving while it is still spawning (per-cell leases, a 409 on
 spawn re-leases on the new host). Result with players split over both nodes: 23 fps per client,
 same p99 as one node, the peer now does more of the work than the home (32 % vs 48 % of a core)
-and the home's send path is no longer the ceiling. Still honest: this is two nodes on one VM,
-and cross-node handovers complete slowly — 2 215 of 9 825 asked finished within the 10-tick
-timeout (vs all of them on one node); that is the next thing to fix.
+and the home's send path is no longer the ceiling (fps per client moves ±3 between runs of the
+same build; the rows are single runs). Still honest: this is two nodes on one VM, and
+cross-node handovers are the open problem — ~2 400 of ~9 700 asked complete within the run (one
+node: all of them; the counter now includes completions acked from another node, it used to
+count only the simulator's ack path). The cause is measured, not fixed: the control lane of the
+bus (handovers, cell assignments, commands) sends one message at a time and a send to a peer
+costs ~9 ms on this loaded box, i.e. ~110 msg/s against ~330 handovers/s asked — the lane runs
+50–100 s behind and the sender re-ships what it believes lost. Batching that lane (64 or 16 a
+frame) cleared it but cost 5–6 fps per client for everyone, QUIC stream priority for it changed
+nothing, so both are off; what remains is pipelining the lane with per-sender sequence numbers.
+Handover acks already travel on the parallel lane, retries ship the full entity (the receiver's
+ghost is gone by then) and subscription replays go out as one frame, which removed the 40 k
+"no ghost" refusals and 55 k duplicate deliveries a run.
 
 Read it as: the simulation step (`musubi_world_tick_duration_seconds`) is never the problem —
 1.5 ms mean with 4 000 entities and 8 simulators handing entities to each other 280 times a
