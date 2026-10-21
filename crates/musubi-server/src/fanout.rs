@@ -563,11 +563,38 @@ impl Fanout {
                     me_fast.apply(&m);
                 }
             });
+            let me_world = f.clone();
             tokio::spawn(async move {
+                // bulk deltas are applied per world on their own worker (order within a world
+                // kept): one worker for every world took the peer's inbound bulk lag to 224 ms
+                // on the stand once the sender stopped waiting on it
+                let mut per_world: std::collections::HashMap<
+                    String,
+                    tokio::sync::mpsc::UnboundedSender<musubi_cluster::BusMessage>,
+                > = std::collections::HashMap::new();
                 loop {
                     match rx.recv().await {
                         Ok(m) => {
-                            let tx = if Fanout::is_bulk(&m) { &q_tx } else { &fast_tx };
+                            let tx = if Fanout::is_bulk(&m) {
+                                match Fanout::bulk_world(&m) {
+                                    Some(world) => per_world.entry(world).or_insert_with(|| {
+                                        let (tx, mut wrx) = tokio::sync::mpsc::unbounded_channel::<
+                                            musubi_cluster::BusMessage,
+                                        >(
+                                        );
+                                        let me = me_world.clone();
+                                        tokio::spawn(async move {
+                                            while let Some(m) = wrx.recv().await {
+                                                me.apply(&m);
+                                            }
+                                        });
+                                        tx
+                                    }),
+                                    None => &q_tx,
+                                }
+                            } else {
+                                &fast_tx
+                            };
                             if tx.send(m).is_err() {
                                 break;
                             }
@@ -1187,6 +1214,16 @@ impl Fanout {
 
     /// Bulk frame: deltas, ghosts, replicas, player commands and their batches; everything
     /// else (handovers, acks, assignments, user events) is applied by the fast worker.
+    /// The world a bulk frame belongs to, read off the raw payload (`{"WorldGhosts":{"world":"…"`
+    /// or the batch's first item) without parsing it.
+    fn bulk_world(m: &BusMessage) -> Option<String> {
+        let text = m.payload.get();
+        let i = text.find("\"world\":\"")? + "\"world\":\"".len();
+        let rest = &text[i..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    }
+
     fn is_bulk(m: &BusMessage) -> bool {
         let text = m.payload.get();
         let mut t = musubi_cluster::first_key(text);

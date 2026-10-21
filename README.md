@@ -178,7 +178,11 @@ fps per client, p99 150 ms (the best of this series), 0 errors, the session lane
 224 ms on average (was 16 ms): the window let the home push replica and ghost deltas faster than
 the peer's single apply worker takes them under the world locks. The backlog has moved for the
 last time to where the work actually is — applying bulk deltas on the receiver — and that worker
-is the next thing to parallelize (per world). The bus frame
+was then split per world (one apply worker per world, order within a world kept): the peer's
+inbound bulk lag halved, 224 → 109 ms average, with fps and p99 inside the run-to-run spread
+(26.9 fps, p99 191 ms, 0 errors; 28.4 / 150 the run before — the stand's variance between runs is
+about that wide, so only the lag figure is a result). What remains on the receiver is the per-world
+lock the delta is applied under, and that is a world-tick question, not a transport one. The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
