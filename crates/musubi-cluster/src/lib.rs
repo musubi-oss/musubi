@@ -108,7 +108,15 @@ pub(crate) struct QuicBus {
     pub(crate) conns: Mutex<HashMap<Uuid, quinn::Connection>>,
     /// peers whose last connect failed: skipped (fast fail → postgres fallback) for CONNECT_BACKOFF
     conn_backoff: Mutex<HashMap<Uuid, std::time::Instant>>,
+    /// One long-lived uni stream per (peer, priority): frames go out length-prefixed on it in
+    /// order, and a send returns once the bytes are in the stream (flow control is the only
+    /// wait) instead of after the peer has read them — one round trip per frame serialized the
+    /// bus lanes (3 ms a session batch on the stand, 48 s of sends in a 40 s run on bulk).
+    lane_streams: Mutex<HashMap<(Uuid, i32), LaneStream>>,
 }
+
+/// A long-lived outgoing bus stream, written by one sender at a time.
+type LaneStream = Arc<tokio::sync::Mutex<quinn::SendStream>>;
 
 #[derive(Clone)]
 pub struct Cluster {
@@ -520,6 +528,7 @@ impl Cluster {
             endpoint,
             conns: Mutex::new(HashMap::new()),
             conn_backoff: Mutex::new(HashMap::new()),
+            lane_streams: Mutex::new(HashMap::new()),
         }));
         Ok(self)
     }
@@ -705,19 +714,43 @@ impl Cluster {
                             while let Ok(mut recv) = conn_uni.accept_uni().await {
                                 let c = c_uni.clone();
                                 tokio::spawn(async move {
-                                    let Ok(buf) = recv.read_to_end(MAX_QUIC_BUS_PAYLOAD).await
-                                    else {
+                                    // a lane stream carries length-prefixed frames for the
+                                    // life of the connection; a legacy peer opens one stream per
+                                    // frame and starts with the JSON itself
+                                    let mut first = [0u8; 1];
+                                    if recv.read_exact(&mut first).await.is_err() {
                                         return;
-                                    };
-                                    match serde_json::from_slice::<BusMessage>(&buf) {
-                                        Ok(msg) if msg.origin != c.me.id => {
-                                            metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "rx", "ok" => "true").increment(1);
-                                            metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "rx").increment(buf.len() as u64);
-                                            c.note_leave(&msg).await;
-                                            let _ = c.bus_tx.send(msg);
+                                    }
+                                    if first[0] == b'{' {
+                                        let Ok(rest) = recv.read_to_end(MAX_QUIC_BUS_PAYLOAD).await
+                                        else {
+                                            return;
+                                        };
+                                        let mut buf = Vec::with_capacity(rest.len() + 1);
+                                        buf.push(first[0]);
+                                        buf.extend_from_slice(&rest);
+                                        c.ingest_quic_frame(buf).await;
+                                        return;
+                                    }
+                                    let mut len = [0u8; 4];
+                                    len[0] = first[0];
+                                    if recv.read_exact(&mut len[1..]).await.is_err() {
+                                        return;
+                                    }
+                                    loop {
+                                        let n = u32::from_be_bytes(len) as usize;
+                                        if n == 0 || n > MAX_QUIC_BUS_PAYLOAD {
+                                            tracing::warn!(len = n, "bad quic bus frame length");
+                                            return;
                                         }
-                                        Ok(_) => {}
-                                        Err(e) => tracing::warn!(error = %e, "bad quic bus frame"),
+                                        let mut buf = vec![0u8; n];
+                                        if recv.read_exact(&mut buf).await.is_err() {
+                                            return;
+                                        }
+                                        c.ingest_quic_frame(buf).await;
+                                        if recv.read_exact(&mut len).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 });
                             }
@@ -778,6 +811,20 @@ impl Cluster {
             return msg.only.contains(&self.me.id);
         }
         !(msg.via_quic && self.bus.is_some())
+    }
+
+    async fn ingest_quic_frame(&self, buf: Vec<u8>) {
+        match serde_json::from_slice::<BusMessage>(&buf) {
+            Ok(msg) if msg.origin != self.me.id => {
+                metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "rx", "ok" => "true").increment(1);
+                metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "rx")
+                    .increment(buf.len() as u64);
+                self.note_leave(&msg).await;
+                let _ = self.bus_tx.send(msg);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "bad quic bus frame"),
+        }
     }
 
     async fn note_leave(&self, msg: &BusMessage) {
@@ -1198,12 +1245,34 @@ impl QuicBus {
     }
 
     async fn send(&self, peer: &NodeInfo, bytes: &[u8], priority: i32) -> Result<()> {
-        let conn = self.connection(peer).await?;
-        let mut stream = conn.open_uni().await.map_err(Error::internal)?;
-        let _ = stream.set_priority(priority);
-        stream.write_all(bytes).await.map_err(Error::internal)?;
-        stream.finish().map_err(Error::internal)?;
-        let _ = stream.stopped().await;
+        let key = (peer.id.0, priority);
+        let stream = {
+            let existing = self.lane_streams.lock().await.get(&key).cloned();
+            match existing {
+                Some(s) => s,
+                None => {
+                    let conn = self.connection(peer).await?;
+                    let st = conn.open_uni().await.map_err(Error::internal)?;
+                    let _ = st.set_priority(priority);
+                    let st = Arc::new(tokio::sync::Mutex::new(st));
+                    self.lane_streams.lock().await.insert(key, st.clone());
+                    st
+                }
+            }
+        };
+        let mut st = stream.lock().await;
+        let len = u32::try_from(bytes.len()).map_err(Error::internal)?;
+        let r = async {
+            st.write_all(&len.to_be_bytes()).await?;
+            st.write_all(bytes).await
+        }
+        .await;
+        drop(st);
+        if let Err(e) = r {
+            // the stream (and its connection) is gone: the next send opens a fresh one
+            self.lane_streams.lock().await.remove(&key);
+            return Err(Error::internal(e));
+        }
         Ok(())
     }
 }
