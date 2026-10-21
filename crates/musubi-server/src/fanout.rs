@@ -316,6 +316,13 @@ const ORDER_NACK_AFTER: std::time::Duration = std::time::Duration::from_millis(5
 const ORDER_NACK_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
 /// Control-lane frames a sender keeps for replay.
 const CONTROL_WINDOW: usize = 256;
+/// A remote session's frame waiting on the session lane this long marks the session congested:
+/// the world stops building new deltas for it until it went out. One second, not a few ticks:
+/// gating at 100 ms on the stand bounded the lane's wait (11.5 s → 4.8 s worst) but deferred
+/// 465 000 deltas a run and cost every remote player a fifth of their frame rate (26.7 → 21.3
+/// fps) — the lane's own send throughput is the ceiling there, not the queue. At one second only
+/// frames that would arrive useless anyway are held back.
+const SESSION_CONGESTED_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 /// Given-up sequence numbers remembered per sender (a late frame among them is still new).
 const ORDER_SKIPPED_KEEP: u64 = 4096;
 
@@ -451,6 +458,10 @@ pub struct Fanout {
     /// Per sender: where its control-lane sequence stands and what arrived ahead of it.
     ordered: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, OrderState>>>,
     control_window: Arc<std::sync::Mutex<ControlWindow>>,
+    /// Remote sessions with frames still waiting on the session lane: how many, and since when
+    /// the oldest waits. The world defers building the next delta for a session whose frame has
+    /// waited longer than `SESSION_CONGESTED_AFTER` (`session_congested`).
+    session_inflight: Arc<dashmap::DashMap<SessionId, (u32, std::time::Instant)>>,
     bus_user: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<(std::time::Instant, Wire)>>>,
 }
 
@@ -476,6 +487,7 @@ impl Fanout {
             bus_input: Arc::new(OnceLock::new()),
             ordered: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             control_window: Arc::new(std::sync::Mutex::new(ControlWindow::default())),
+            session_inflight: Arc::new(dashmap::DashMap::new()),
             bus_user: Arc::new(OnceLock::new()),
             worlds: Arc::new(OnceLock::new()),
             social: Arc::new(OnceLock::new()),
@@ -649,10 +661,43 @@ impl Fanout {
                     .increment(1);
             }
             Err(crate::realtime::SessionSendError::NotHere(msg)) => {
+                self.session_inflight
+                    .entry(session_id)
+                    .or_insert_with(|| (0, std::time::Instant::now()))
+                    .0 += 1;
                 self.publish(Wire::Session {
                     session_id,
                     msg: *msg,
                 });
+            }
+        }
+    }
+
+    /// A remote session has a frame that has waited on the session lane longer than
+    /// `SESSION_CONGESTED_AFTER`: building another delta for it now would only lengthen the
+    /// queue (the stand saw 7–10 s of session-lane wait); the world skips it this tick and the
+    /// client's interest accumulates the change instead. A frame merely waiting for the next
+    /// batch does not count — deferring on that halved the remote players' frame rate.
+    pub fn session_congested(&self, session_id: SessionId) -> bool {
+        self.session_inflight
+            .get(&session_id)
+            .is_some_and(|e| e.0 > 0 && e.1.elapsed() > SESSION_CONGESTED_AFTER)
+    }
+
+    fn session_frames_sent(
+        inflight: &dashmap::DashMap<SessionId, (u32, std::time::Instant)>,
+        sids: &[SessionId],
+    ) {
+        for sid in sids {
+            if let Some(mut e) = inflight.get_mut(sid) {
+                e.0 = e.0.saturating_sub(1);
+                if e.0 == 0 {
+                    drop(e);
+                    inflight.remove_if(sid, |_, v| v.0 == 0);
+                } else {
+                    // the next-oldest frame was queued after this one went in; a tick is close
+                    e.1 = std::time::Instant::now();
+                }
             }
         }
     }
@@ -1722,6 +1767,7 @@ impl Fanout {
                         | Wire::WorldCmd(_)
                 );
             let window = self.control_window.clone();
+            let inflight = self.session_inflight.clone();
             tokio::spawn(async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
                 // one "slow" warning per lane per second, not one per message
@@ -1732,13 +1778,18 @@ impl Fanout {
                     .unwrap_or(1);
                 let mut seq: u64 = 0;
                 while let Some((queued, mut w)) = rx.recv().await {
+                    metrics::gauge!("musubi_fanout_queue_depth", "lane" => lane_name).decrement(1.0);
                     if batch {
                         // everything already waiting goes out in the same frame: one QUIC send per
                         // peer instead of one per cell per tick
                         let mut items = vec![w];
                         while items.len() < BULK_BATCH_MAX {
                             match rx.try_recv() {
-                                Ok((_, next)) => items.push(next),
+                                Ok((_, next)) => {
+                                    metrics::gauge!("musubi_fanout_queue_depth", "lane" => lane_name)
+                                        .decrement(1.0);
+                                    items.push(next)
+                                }
                                 Err(_) => break,
                             }
                         }
@@ -1748,6 +1799,21 @@ impl Fanout {
                             Wire::WorldBatch(items)
                         };
                     }
+                    let sids: Vec<SessionId> = if lane_name == "session" {
+                        match &w {
+                            Wire::Session { session_id, .. } => vec![*session_id],
+                            Wire::WorldBatch(items) => items
+                                .iter()
+                                .filter_map(|i| match i {
+                                    Wire::Session { session_id, .. } => Some(*session_id),
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     let Ok(permit) = sem.clone().acquire_owned().await else {
                         break;
                     };
@@ -1770,12 +1836,14 @@ impl Fanout {
                     }
                     let c = c.clone();
                     let last_warn = last_warn.clone();
+                    let inflight = inflight.clone();
                     let one = async move {
                         let waited = queued.elapsed();
                         let started = std::time::Instant::now();
                         if let Err(e) = c.publish_prio(TOPIC, &w, priority).await {
                             tracing::warn!(error = %e, "fanout publish failed");
                         }
+                        Fanout::session_frames_sent(&inflight, &sids);
                         let took = started.elapsed();
                         let slow = waited.as_millis() > 1000 || took.as_millis() > 1000;
                         let report = slow && {
@@ -1810,6 +1878,7 @@ impl Fanout {
             });
             tx
         });
+        metrics::gauge!("musubi_fanout_queue_depth", "lane" => lane_name).increment(1.0);
         let _ = tx.send((std::time::Instant::now(), w));
     }
 }

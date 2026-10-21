@@ -11,7 +11,9 @@ use std::time::Duration;
 use dashmap::{DashMap, DashSet};
 use musubi_core::{Error, Result, SessionId};
 use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo, Strategy};
-use musubi_mesh::{CellId, Delta, Entity, EntityId, HandoverOutcome, Pos, World, WorldConfig};
+use musubi_mesh::{
+    CellId, ClientId, Delta, Entity, EntityId, HandoverOutcome, Interest, Pos, World, WorldConfig,
+};
 use musubi_proto::realtime::{WorldComponent, WorldEntity};
 use musubi_proto::ServerMessage;
 use musubi_runtime::CallContext;
@@ -4958,6 +4960,26 @@ impl WorldRegistry {
             let view = st.world.snapshot();
             let mut interests = st.world.take_interests();
             drop(guard);
+            // a remote session whose last frame is still waiting on the session lane gets no
+            // new delta this tick: its interest keeps the change and the next delta carries it
+            // (building one anyway only grew the lane queue — 7–10 s of wait on the stand)
+            let congested: Vec<ClientId> = interests
+                .keys()
+                .filter(|c| {
+                    by_client
+                        .get(c)
+                        .is_some_and(|sid| fanout.session_congested(*sid))
+                })
+                .copied()
+                .collect();
+            let deferred: Vec<(ClientId, Interest)> = congested
+                .iter()
+                .filter_map(|c| interests.remove_entry(c))
+                .collect();
+            if !deferred.is_empty() {
+                metrics::counter!("musubi_world_deltas_deferred_total")
+                    .increment(deferred.len() as u64);
+            }
             let pending: Vec<(SessionId, f64, Delta)> = view
                 .deltas_all(&mut interests)
                 .into_iter()
@@ -4967,6 +4989,7 @@ impl WorldRegistry {
                     Some((sid, scale, d))
                 })
                 .collect();
+            interests.extend(deferred);
             let keyframe = tick % view.cfg.keyframe_ticks.max(1) == 0;
             let mut msgs: Vec<(SessionId, ServerMessage)> = Vec::with_capacity(pending.len());
             {

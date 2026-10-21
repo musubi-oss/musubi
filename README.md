@@ -137,7 +137,20 @@ re-ask. The control lane's gap replay (`OrderNack`, above) was then put on the s
 players-split run showed no gaps and no nacks on either node and two duplicate frames dropped on
 the peer — the QUIC bus loses nothing on one VM, so the replay is exercised by its unit tests and
 is there for the Postgres fallback, reconnects and lossy links (26.7 fps per client, p99 171 ms,
-3 630 of 5 723 asked handovers completed, 0 errors on that run). The bus frame
+3 630 of 5 723 asked handovers completed, 0 errors on that run). Backpressure for the
+remote players' deltas sits at the producer, not in the queue: a frame to a session on another
+node cannot be dropped once built (the world has already marked the client as knowing it —
+spawns and positions would never be resent), so instead the home skips building a new delta for a
+session whose previous frame has waited on the session lane longer than `SESSION_CONGESTED_AFTER`
+and the client's interest keeps the change for the next one (`musubi_world_deltas_deferred_total`,
+`musubi_fanout_queue_depth{lane}`). Measured honestly: gating at 100 ms bounded the lane (worst
+wait 11.5 s → 4.8 s) but deferred 465 000 deltas a run and cost every remote player a fifth of
+their frame rate (26.7 → 21.3 fps) — the lane's send throughput is the ceiling, not the queue —
+so the gate is one second: the same run then holds 26.6 fps per client (p99 189 ms, 0 errors),
+defers 424 deltas — only the ones that would have arrived useless — and the lane's worst wait is
+9.0 s instead of 11.5 s. Which says plainly that the remaining backlog is the session lane's own
+throughput (one send in flight, a thousand frames serialized per tick on the home), the next
+thing to take apart. The bus frame
 itself was the fps ceiling: every message was a `serde_json::Value` — serialized twice on send,
 decoded twice on receive — and the home's session and bulk lanes ran 15–25 s behind under this
 load. The payload is now carried as the sender's bytes (`RawValue`, one serialization per hop):
