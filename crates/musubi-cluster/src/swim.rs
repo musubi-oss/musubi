@@ -42,6 +42,8 @@ pub(crate) struct Member {
     pub state: State,
     pub incarnation: u64,
     pub since: Instant,
+    /// Suspect timeouts vetoed by a fresh Postgres heartbeat in this suspicion (at most one).
+    pub vetoes: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +114,7 @@ impl Cluster {
                     state: u.state,
                     incarnation: u.incarnation,
                     since: Instant::now(),
+                    vetoes: 0,
                 });
                 if fresh {
                     let _ = self.member_tx.send(crate::MemberEvent {
@@ -156,6 +159,7 @@ impl Cluster {
             state: State::Alive,
             incarnation: 0,
             since: Instant::now(),
+            vetoes: 0,
         });
         if fresh {
             let _ = self.member_tx.send(crate::MemberEvent {
@@ -246,7 +250,10 @@ impl Cluster {
             let mut m = self.members.write().await;
             for (id, e) in m.iter_mut() {
                 if e.state == State::Suspect && e.since.elapsed() > SUSPECT_TIMEOUT {
-                    if db_alive.contains(id) {
+                    // once: a bus partition with a live heartbeat (network died, process did
+                    // not) is still a failure and must be declared within seconds
+                    if e.vetoes == 0 && db_alive.contains(id) {
+                        e.vetoes += 1;
                         tracing::warn!(node = %id, "swim: suspect timed out but its postgres heartbeat is fresh; kept suspect");
                         metrics::counter!("musubi_swim_death_vetoed_total").increment(1);
                         e.since = Instant::now();
