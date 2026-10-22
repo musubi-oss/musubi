@@ -21731,23 +21731,20 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
         .unwrap();
         reply(&mut ws, "spawn").await;
     }
-    // the first frame that shows the cell is full and carries both entities
+    // frames are full exactly until the first entity has been delivered (a frame may land
+    // between the two spawns); applied like a simulator would, they add up to both entities
     let t0 = std::time::Instant::now();
+    let mut have: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     let ids: Vec<String> = loop {
         let c = cell(&mut ws).await;
-        let owned = c["owned"].as_array().cloned().unwrap_or_default();
-        if owned.len() == 2 {
-            assert_eq!(c["full"], true, "{c}");
-            assert_eq!(c["gone"], json!([]), "{c}");
-            break owned
-                .iter()
-                .map(|e| e["id"].as_str().unwrap().to_string())
-                .collect();
+        assert_eq!(c["full"], json!(have.is_empty()), "{c}");
+        assert_eq!(c["gone"], json!([]), "{c}");
+        for e in c["owned"].as_array().into_iter().flatten() {
+            have.insert(e["id"].as_str().unwrap().to_string(), e.clone());
         }
-        assert!(
-            owned.is_empty() || c["full"] == true,
-            "a partial first view: {c}"
-        );
+        if have.len() == 2 {
+            break have.keys().cloned().collect();
+        }
         assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{c}");
     };
     // a quiet tick sends nothing for the cell
