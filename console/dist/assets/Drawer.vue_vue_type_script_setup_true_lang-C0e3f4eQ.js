@@ -1,1 +1,0 @@
-import{d as n,c as l,F as i,a as e,t as c,L as d,i as m}from"./index-y6whVZw-.js";const p={class:"drawer"},f=n({__name:"Drawer",props:{title:{}},emits:["close"],setup(s,{emit:a}){const o=a;return(r,t)=>(m(),l(i,null,[e("div",{class:"drawer-bg",onClick:t[0]||(t[0]=u=>o("close"))}),e("div",p,[e("h2",null,c(s.title),1),d(r.$slots,"default")])],64))}});export{f as _};

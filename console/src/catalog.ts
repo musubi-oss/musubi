@@ -90,7 +90,7 @@ export const catalog: Record<string, Res[]> = {
   ],
   cluster: [
     { id: 'nodes', title: 'Overview', list: '/v1/server/cluster/nodes', rowsKey: 'nodes', cols: ['name', 'roles', 'region', 'state', 'alive', 'heartbeat_at', 'version', 'wg_addr'] },
-    { id: 'raft', title: 'Raft', list: '/v1/server/cluster/raft' },
+    { id: 'matches', title: 'Matches', list: '/v1/admin/cluster/matches', rowsKey: 'matches', custom: 'matches' },
     { id: 'mesh_net', title: 'Mesh network', list: '/v1/server/cluster/mesh_net', pageActions: [{ label: 'Refresh peers', method: 'POST', path: '/v1/server/cluster/mesh_net/refresh' }, { label: 'Rotate key', method: 'POST', path: '/v1/server/cluster/mesh_net/rotate', confirm: 'Rotate this node\'s WireGuard key?', danger: true }] },
     { id: 'geoip', title: 'GeoIP', list: '/v1/server/geoip', pageActions: [{ label: 'Update now', method: 'POST', path: '/v1/server/geoip/update' }, { label: 'Reload file', method: 'POST', path: '/v1/server/geoip/reload' }] },
     { id: 'sinks', title: 'Telemetry sinks', list: '/v1/server/analytics/sinks', rowsKey: 'sinks', pageActions: [{ label: 'Flush', method: 'POST', path: '/v1/server/analytics/sinks/flush' }, { label: 'Force flush', method: 'POST', path: '/v1/server/analytics/sinks/flush?force=true', confirm: 'Upload partial batches now?' }], cols: ['name', 'kind', 'buffered', 'uploads', 'last_error'] },

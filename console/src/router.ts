@@ -10,7 +10,7 @@ export const sections = [
   { id: 'content', title: 'Content', sub: 'Content bundles, config sources, schemas' },
   { id: 'social', title: 'Social', sub: 'Groups, chat, leaderboards, matchmaking' },
   { id: 'world', title: 'World', sub: 'Persistent worlds, cells and simulators' },
-  { id: 'cluster', title: 'Cluster', sub: 'Nodes, mesh, telemetry, storage' },
+  { id: 'cluster', title: 'Cluster', sub: 'Nodes, Raft, bus, placement, mesh, telemetry' },
   { id: 'settings', title: 'Settings', sub: 'Operators, keys, projects, audit' },
 ]
 
@@ -64,6 +64,7 @@ export const router = createRouter({
     { path: '/cluster', component: () => import('./pages/cluster/Index.vue'), children: [
       { path: 'logs', component: () => import('./pages/cluster/Logs.vue') },
       { path: 'loadtests', component: () => import('./pages/cluster/LoadTests.vue') },
+      { path: 'matches', component: () => import('./pages/cluster/Matches.vue') },
       { path: '', component: () => import('./pages/cluster/Overview.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
     ]},
