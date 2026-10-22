@@ -199,6 +199,18 @@ fn tx_apply_local(st: &mut WorldState, tx: Uuid, ops: &[TxOp]) -> Vec<EntityId> 
 /// One entity in sixteen gets a timeline in the log (`hotrace`): ship, arrival, ack, apply,
 /// expiry — with the sender's and receiver's clocks, to see where a cross-node handover
 /// spends its time.
+/// One step of an entity's handover into the post-mortem journal (`realtime::hojournal`).
+fn hoj(
+    name: &str,
+    id: EntityId,
+    tick: u64,
+    event: &'static str,
+    path: &'static str,
+    detail: String,
+) {
+    super::hojournal::record(name, id, tick, event, path, detail);
+}
+
 fn traced(id: EntityId) -> bool {
     id.to_string().ends_with('0')
 }
@@ -736,6 +748,7 @@ fn mesh_err(e: musubi_mesh::MeshError) -> Error {
 
 impl WorldRegistry {
     pub fn new(node_id: Uuid, db: Option<PgPool>) -> Self {
+        super::hojournal::init(node_id);
         Self {
             node_id,
             enabled: std::sync::atomic::AtomicBool::new(true),
@@ -1013,6 +1026,14 @@ impl WorldRegistry {
         for mut e in owned {
             let id = e.id;
             tracing::debug!(world = name, %id, %node, "release: entity shipped");
+            hoj(
+                name,
+                id,
+                st.world.tick,
+                "shipped",
+                "forced",
+                format!("cell {cell:?} to node {node}"),
+            );
             let inputs = st.world.take_buffered_inputs(id);
             st.world.forget_for_clients(id);
             // Keep our copy in transit: the new host's ack despawns it and the tick re-ships
@@ -3817,11 +3838,27 @@ impl WorldRegistry {
         if !here {
             metrics::counter!("musubi_world_handover_recv_total", "path" => "not_here")
                 .increment(1);
+            hoj(
+                name,
+                entity.id,
+                st.world.tick,
+                "received",
+                "not_here",
+                format!("cell {cell:?} from {from_node}"),
+            );
             return false;
         }
         let id = entity.id;
         if st.world.get(id).is_some() {
             metrics::counter!("musubi_world_handover_recv_total", "path" => "have_it").increment(1);
+            hoj(
+                name,
+                id,
+                st.world.tick,
+                "received",
+                "have_it",
+                format!("from {from_node}"),
+            );
             // we already hold this entity. Usually the ack was lost and this is the same transfer
             // again: answer again, keep our copy. But if our copy is itself on its way to the
             // sender (both sides restored or kept one and each ships it over the border at
@@ -3834,6 +3871,14 @@ impl WorldRegistry {
                 .is_some_and(|(h, _, _)| *h == from_node);
             if outgoing && self.node_id > from_node {
                 tracing::info!(world = name, %id, %from_node, "handover collision: declined, our copy is on its way there");
+                hoj(
+                    name,
+                    id,
+                    st.world.tick,
+                    "received",
+                    "collision_declined",
+                    format!("from {from_node}"),
+                );
                 fanout.world_handover_ack(name, id, from_node, false, false);
                 return false;
             }
@@ -3841,12 +3886,36 @@ impl WorldRegistry {
                 st.remote_transit.remove(&id);
                 st.world.cancel_handover(id);
                 tracing::info!(world = name, %id, %from_node, "handover collision: kept our copy, theirs is dropped");
+                hoj(
+                    name,
+                    id,
+                    st.world.tick,
+                    "received",
+                    "collision_kept",
+                    format!("from {from_node}"),
+                );
             } else if self.provisional.remove(&(name.to_string(), id)).is_some() {
                 // our copy was restored from a dead host's shard; the sender owned the entity
                 // live and has now handed it to us — ours is the live one from here on
                 tracing::info!(world = name, %id, %from_node, "handover delivered onto our restored copy: it is live now");
+                hoj(
+                    name,
+                    id,
+                    st.world.tick,
+                    "received",
+                    "onto_restored",
+                    format!("from {from_node}"),
+                );
             } else {
                 tracing::warn!(world = name, %id, %from_node, "handover re-acked (duplicate delivery)");
+                hoj(
+                    name,
+                    id,
+                    st.world.tick,
+                    "received",
+                    "duplicate",
+                    format!("from {from_node}"),
+                );
             }
             fanout.world_handover_ack(name, id, from_node, true, false);
             return false;
@@ -3874,6 +3943,14 @@ impl WorldRegistry {
                     metrics::counter!("musubi_world_handover_recv_total", "path" => "no_ghost")
                         .increment(1);
                     tracing::info!(world = name, %id, %from_node, base, "handover: no ghost to build on, asking for the full state");
+                    hoj(
+                        name,
+                        id,
+                        st.world.tick,
+                        "received",
+                        "no_ghost",
+                        format!("from {from_node}"),
+                    );
                     fanout.world_handover_ack(name, id, from_node, false, true);
                     return false;
                 }
@@ -3888,6 +3965,14 @@ impl WorldRegistry {
             metrics::counter!("musubi_world_handover_recv_total", "path" => "unowned_cell")
                 .increment(1);
         }
+        hoj(
+            name,
+            id,
+            st.world.tick,
+            "received",
+            "accepted",
+            format!("cell {cell:?} from {from_node} owner {owner:?}"),
+        );
         if entity.persistent {
             st.journal.push(WorldOp {
                 tick: st.world.tick,
@@ -3947,6 +4032,14 @@ impl WorldRegistry {
         let Some(w) = self.worlds.get(name) else {
             metrics::counter!("musubi_world_handover_acks_total", "path" => "no_world", "accepted" => accepted.to_string(), "world" => name.to_string())
                 .increment(1);
+            hoj(
+                name,
+                id,
+                0,
+                "ack",
+                "no_world",
+                format!("from {acker} accepted {accepted}"),
+            );
             return;
         };
         let mut st = w.lock();
@@ -3955,6 +4048,14 @@ impl WorldRegistry {
             let gone = st.world.get(id).is_none();
             metrics::counter!("musubi_world_handover_acks_total", "path" => if gone { "late_gone" } else { "late_kept" }, "accepted" => accepted.to_string())
                 .increment(1);
+            hoj(
+                name,
+                id,
+                st.world.tick,
+                "ack",
+                if gone { "late_gone" } else { "late_kept" },
+                format!("from {acker} accepted {accepted}"),
+            );
             if traced(id) {
                 tracing::debug!(world = name, %id, %acker, accepted, gone, in_remote_transit = st.remote_transit.contains_key(&id), ms = musubi_cluster::unix_ms(), "hotrace: ack late");
             }
@@ -3990,6 +4091,14 @@ impl WorldRegistry {
                             });
                     if elsewhere {
                         tracing::info!(world = name, %id, "late handover ack: stale local copy dropped");
+                        hoj(
+                            name,
+                            id,
+                            st.world.tick,
+                            "ended",
+                            "late_dropped",
+                            format!("acker {acker} hosts {cell:?}"),
+                        );
                         metrics::counter!("musubi_world_handover_acks_total", "path" => "late_dropped", "accepted" => "true")
                             .increment(1);
                         metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
@@ -4016,6 +4125,20 @@ impl WorldRegistry {
         };
         metrics::counter!("musubi_world_handover_acks_total", "path" => "in_transit", "accepted" => accepted.to_string())
             .increment(1);
+        hoj(
+            name,
+            id,
+            st.world.tick,
+            "ack",
+            if accepted {
+                "accepted"
+            } else if resend_full {
+                "refused_resend_full"
+            } else {
+                "refused"
+            },
+            format!("from {acker} to {}", t.to),
+        );
         if traced(id) {
             tracing::debug!(world = name, %id, %acker, accepted, ms = musubi_cluster::unix_ms(), "hotrace: ack in transit");
         }
@@ -4033,6 +4156,14 @@ impl WorldRegistry {
             let inputs = st.world.take_buffered_inputs(id);
             let persistent = st.world.get(id).is_some_and(|e| e.persistent);
             tracing::debug!(world = name, %id, to = %t.to, "handover: entity left");
+            hoj(
+                name,
+                id,
+                st.world.tick,
+                "ended",
+                "completed",
+                format!("left for {} on {acker}", t.to),
+            );
             st.world.forget_for_clients(id);
             st.world.despawn(id);
             if persistent {
@@ -4651,6 +4782,14 @@ impl WorldRegistry {
         if let Some((from, asked)) = from {
             metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
                 .increment(1);
+            hoj(
+                name,
+                id,
+                st.world.tick,
+                "ended",
+                "completed",
+                format!("sim {sim} acked, from {from}, asked at tick {asked}"),
+            );
             // how long the simulator's answer took: the handover timeout should sit above this
             metrics::histogram!("musubi_world_handover_ack_latency_ticks")
                 .record(st.world.tick.saturating_sub(asked) as f64);
@@ -5215,6 +5354,14 @@ impl WorldRegistry {
                         to,
                         group,
                     } => {
+                        hoj(
+                            &name,
+                            entity,
+                            st.world.tick,
+                            "started",
+                            "local",
+                            format!("{from} -> {to}, group {}", group.len()),
+                        );
                         let full = st.world.get(entity).map(to_wire);
                         let parts: Vec<_> = group
                             .iter()
@@ -5231,15 +5378,34 @@ impl WorldRegistry {
                             json!({"type": "handover_started", "entity": entity, "to": to, "group": group}),
                         );
                     }
-                    HandoverOutcome::Completed { .. } => {
+                    HandoverOutcome::Completed { entity, to } => {
                         metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
                             .increment(1);
+                        hoj(
+                            &name,
+                            entity,
+                            st.world.tick,
+                            "ended",
+                            "completed",
+                            format!("to {to}"),
+                        );
                     }
                     HandoverOutcome::Cancelled { entity, .. }
                         if st.remote_transit.contains_key(&entity) =>
                     {
                         metrics::counter!("musubi_world_handover_ended_total", "path" => "remote_reship")
                             .increment(1);
+                        hoj(
+                            &name,
+                            entity,
+                            st.world.tick,
+                            "ended",
+                            "remote_reship",
+                            format!(
+                                "no ack in time, transit {:?}",
+                                st.remote_transit.get(&entity)
+                            ),
+                        );
                         // no ack from the other node yet: ship it again (the receiver re-acks if it
                         // already has it). Never give up: the entity sits in a cell another node
                         // hosts, and a copy kept alive here would become a second owner once the
@@ -5319,6 +5485,14 @@ impl WorldRegistry {
                     HandoverOutcome::Cancelled { entity, reason } => {
                         metrics::counter!("musubi_world_handover_ended_total", "path" => "cancelled_local")
                             .increment(1);
+                        hoj(
+                            &name,
+                            entity,
+                            st.world.tick,
+                            "ended",
+                            "cancelled_local",
+                            reason.clone(),
+                        );
                         st.remote_transit.remove(&entity);
                         let sims: Vec<Uuid> = st.sim_events.keys().copied().collect();
                         for s in sims {
@@ -5537,6 +5711,13 @@ impl WorldRegistry {
                 }
                 if t % CELL_HOST_RECONCILE_TICKS == 7 {
                     self.reconcile_cell_hosts(&fanout).await;
+                }
+                if t % TICK_HZ == 3 {
+                    if let Some(db) = &self.db {
+                        if let Err(e) = super::hojournal::flush(db).await {
+                            tracing::warn!(error = %e, "handover journal flush failed");
+                        }
+                    }
                 }
                 let _ = self.ticks.send(t);
             }

@@ -919,6 +919,17 @@ impl Fanout {
         forced: bool,
         base_rev: Option<u64>,
     ) {
+        crate::realtime::hojournal::record(
+            world,
+            entity.id,
+            0,
+            "shipped",
+            if forced { "forced_sent" } else { "remote" },
+            format!(
+                "from {from_node}, base_rev {base_rev:?}, cell {:?}",
+                entity.transit.as_ref().map(|t| t.to_cell)
+            ),
+        );
         self.publish(Wire::WorldHandover {
             world: world.to_string(),
             entity,
@@ -1523,6 +1534,14 @@ impl Fanout {
                 if let Some(w) = self.worlds.get().cloned() {
                     metrics::counter!("musubi_world_handover_recv_total", "path" => "received")
                         .increment(1);
+                    crate::realtime::hojournal::record(
+                        &world,
+                        entity.id,
+                        0,
+                        "received",
+                        "received",
+                        format!("from {from_node}, forced {forced}"),
+                    );
                     // the cached cell directory can lag the assignment the sender acted on
                     // (a cell changing host): when it says the cell is not ours, ask the
                     // leader before turning the entity away — a refusal here left the sender
@@ -1560,6 +1579,14 @@ impl Fanout {
                                 {
                                     metrics::counter!("musubi_world_handover_recv_total", "path" => "forced_take")
                                         .increment(1);
+                                    crate::realtime::hojournal::record(
+                                        &world,
+                                        entity.id,
+                                        0,
+                                        "received",
+                                        "forced_take",
+                                        format!("cell {c:?}, directory {fresh:?}"),
+                                    );
                                 }
                                 // …but only from the cell's previous host: a forced shipment
                                 // whose cell the record gives to a third node is misdirected
@@ -1569,6 +1596,14 @@ impl Fanout {
                                     && fresh.is_none_or(|h| h == w.node_id() || h == from_node);
                                 if forced_here || fresh == Some(w.node_id()) {
                                     metrics::counter!("musubi_world_handover_recv_total", "path" => "here_after_fresh_lookup").increment(1);
+                                    crate::realtime::hojournal::record(
+                                        &world,
+                                        entity.id,
+                                        0,
+                                        "received",
+                                        "here_after_fresh_lookup",
+                                        format!("cell {c:?}"),
+                                    );
                                     // a forced shipment is fire-and-forget on the sender (the
                                     // entity is already gone there), so hosting that is not up
                                     // yet — a transient database error while the shard loads,
@@ -1586,12 +1621,30 @@ impl Fanout {
                                         if !forced || attempt >= 50 {
                                             if forced {
                                                 metrics::counter!("musubi_world_handover_recv_total", "path" => "forced_lost").increment(1);
+                                                crate::realtime::hojournal::record(
+                                                    &world,
+                                                    entity.id,
+                                                    0,
+                                                    "ended",
+                                                    "forced_lost",
+                                                    format!("cell {c:?} never came up here"),
+                                                );
                                                 tracing::error!(world = %world, ?c, id = %entity.id, "forced shipment dropped: cell never came up here");
                                             }
                                             break;
                                         }
                                         attempt += 1;
                                         metrics::counter!("musubi_world_handover_recv_total", "path" => "forced_retry").increment(1);
+                                        if attempt == 1 {
+                                            crate::realtime::hojournal::record(
+                                                &world,
+                                                entity.id,
+                                                0,
+                                                "received",
+                                                "forced_retry",
+                                                format!("cell {c:?} not hosted yet"),
+                                            );
+                                        }
                                         tokio::time::sleep(std::time::Duration::from_millis(100))
                                             .await;
                                     }
@@ -1600,6 +1653,14 @@ impl Fanout {
                                     );
                                 } else {
                                     metrics::counter!("musubi_world_handover_recv_total", "path" => "not_here_confirmed").increment(1);
+                                    crate::realtime::hojournal::record(
+                                        &world,
+                                        entity.id,
+                                        0,
+                                        "received",
+                                        "not_here_confirmed",
+                                        format!("cell {c:?}, directory {fresh:?}"),
+                                    );
                                     me.world_handover_ack(
                                         &world, entity.id, from_node, false, false,
                                     );
@@ -1623,6 +1684,14 @@ impl Fanout {
                         w.handover_acked(&world, entity, acker, accepted, resend_full, self);
                     } else {
                         metrics::counter!("musubi_world_handover_acks_total", "path" => "not_mine", "accepted" => accepted.to_string()).increment(1);
+                        crate::realtime::hojournal::record(
+                            &world,
+                            entity,
+                            0,
+                            "ack",
+                            "not_mine",
+                            format!("from {acker} for {from_node}, accepted {accepted}"),
+                        );
                     }
                 }
             }

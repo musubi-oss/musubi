@@ -151,6 +151,15 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
         cfg.world_history_days,
     )
     .await?;
+    let handover_cutoff_ms =
+        musubi_cluster::unix_ms() as i64 - cfg.world_history_days as i64 * 86_400_000;
+    let handover_journal = purge(
+        db,
+        "musubi.handover_journal",
+        &format!("at < {handover_cutoff_ms}"),
+        cfg.world_history_days,
+    )
+    .await?;
     let replays = purge(
         db,
         "musubi.match_recordings",
@@ -175,6 +184,6 @@ pub async fn run(db: &PgPool, cfg: &RetentionConfig) -> Result<Value> {
     Ok(json!({
         "events": events, "crash_reports": crash_reports, "server_logs": server_logs, "session_baggage": session_baggage, "fleet_events": fleet_events, "matchmaker_log": mm_log, "analytics_events": analytics_events, "webhook_deliveries": deliveries, "audit_log": audit, "game_sessions": game_sessions,
         "notifications": notifications, "chat_messages": chat, "sessions": sessions, "idempotency": idempotency, "storage_objects": storage, "resumable_sessions": resumable,
-        "match_journal": match_journal, "world_journal": world_journal, "world_history": world_history, "replays": replays,
+        "match_journal": match_journal, "world_journal": world_journal, "world_history": world_history, "handover_journal": handover_journal, "replays": replays,
     }))
 }

@@ -266,6 +266,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("DELETE", "/v1/admin/runtime/timers/{id}", "admin"),
     ("POST", "/v1/admin/worlds/{w}/cells/{x}/{y}/host", "admin"),
     ("GET", "/v1/admin/worlds/{w}/entities", "admin"),
+    ("GET", "/v1/admin/worlds/{w}/handovers", "admin"),
     ("GET", "/v1/admin/worlds/{w}/at", "admin"),
     ("GET", "/v1/admin/worlds/{w}/history", "admin"),
     ("POST", "/v1/admin/worlds/{w}/verify", "admin"),

@@ -21633,6 +21633,17 @@ async fn world_cells_offload_automatically() {
             .await;
             dump.push_str(&format!("\n{who} view {cell}: {st} {v}"));
         }
+        // and every step each entity took: the handover journal of both nodes
+        let (st, j) = http_json(
+            &router1,
+            "GET",
+            &format!("/v1/admin/worlds/{name}/handovers"),
+            None,
+            true,
+            None,
+        )
+        .await;
+        dump.push_str(&format!("\nhandover journal: {st} {j}"));
         panic!("entities not adopted by the new host: owned={owned}{dump}");
     }
     // the cell with one entity stays home: the remaining cost is under the threshold's reach
@@ -21646,6 +21657,37 @@ async fn world_cells_offload_automatically() {
     )
     .await;
     assert_eq!(st, 200, "{view}");
+    // the trail of the move is in the handover journal: the forced shipment of each entity and
+    // its completion (both nodes record into this process's ring; the endpoint serves it)
+    let (st, j) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/admin/worlds/{name}/handovers"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{j}");
+    let steps = j["steps"].as_array().cloned().unwrap_or_default();
+    let has = |ev: &str, path: &str| steps.iter().any(|s| s["event"] == ev && s["path"] == path);
+    assert!(has("shipped", "forced"), "{j}");
+    assert!(has("received", "accepted"), "{j}");
+    assert!(has("ended", "completed"), "{j}");
+    let one = steps[0]["entity"].as_str().unwrap().to_string();
+    let (st, j) = http_json(
+        &router1,
+        "GET",
+        &format!("/v1/admin/worlds/{name}/handovers?entity={one}&limit=3"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{j}");
+    let steps = j["steps"].as_array().cloned().unwrap_or_default();
+    assert!(!steps.is_empty() && steps.len() <= 3, "{j}");
+    assert!(steps.iter().all(|s| s["entity"] == one), "{j}");
 }
 
 /// `stream?delta=1`: the first frame of a cell is full, later frames carry only what changed

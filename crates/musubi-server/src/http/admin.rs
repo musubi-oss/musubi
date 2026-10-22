@@ -64,6 +64,7 @@ pub fn routes() -> Router<AppState> {
             post(world_cell_host),
         )
         .route("/v1/admin/worlds/{w}/entities", get(world_entities))
+        .route("/v1/admin/worlds/{w}/handovers", get(world_handovers))
         .route("/v1/admin/worlds/{w}/at", get(world_at))
         .route("/v1/admin/worlds/{w}/history", get(world_history))
         .route("/v1/admin/worlds/{w}/verify", post(world_verify))
@@ -1173,6 +1174,44 @@ async fn world_entities(
     Path(w): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(s.worlds.local_entities(&w)?))
+}
+
+#[derive(Deserialize)]
+struct HandoversQuery {
+    entity: Option<Uuid>,
+    #[serde(default = "default_handovers_limit")]
+    limit: usize,
+}
+
+fn default_handovers_limit() -> usize {
+    500
+}
+
+/// Post-mortem trail of a world's handovers (every node's durable steps plus this node's
+/// unflushed tail), oldest first: where an entity went, what the receiver did, the ack, the
+/// re-shipment, the end. `?entity=` narrows to one entity.
+async fn world_handovers(
+    _k: ServerKey,
+    State(s): State<AppState>,
+    Path(w): Path<String>,
+    Query(q): Query<HandoversQuery>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::realtime::hojournal;
+    let limit = q.limit.clamp(1, 10_000);
+    let mut steps = hojournal::load(&s.db, &w, q.entity, limit as i64).await?;
+    let fresh = hojournal::recent(&w, q.entity, limit);
+    let node = fresh.first().map(|st| st.node);
+    // the durable rows of this node end where its flushed tail ends; anything newer in memory
+    // is not in Postgres yet
+    let flushed_to = steps
+        .iter()
+        .filter(|st| Some(st.node) == node)
+        .map(|st| st.ms)
+        .max()
+        .unwrap_or(i64::MIN);
+    steps.extend(fresh.into_iter().filter(|st| st.ms > flushed_to));
+    steps.sort_by_key(|st| st.ms);
+    Ok(Json(json!({"steps": steps})))
 }
 
 #[derive(Deserialize)]
