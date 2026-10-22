@@ -11,7 +11,9 @@ use std::time::Duration;
 use dashmap::{DashMap, DashSet};
 use musubi_core::{Error, Result, SessionId};
 use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo, Strategy};
-use musubi_mesh::SimEvent;
+use musubi_mesh::{
+    CellFrame, CoLocateResult, Delivered, HandoverAckResult, InteractResult, RewindResult, SimEvent,
+};
 use musubi_mesh::{
     CellId, ClientId, Delta, Entity, EntityId, HandoverOutcome, Interest, Pos, World, WorldConfig,
 };
@@ -3232,7 +3234,7 @@ impl WorldRegistry {
         with: &str,
         ttl_ticks: u64,
         fanout: &Fanout,
-    ) -> Result<Value> {
+    ) -> Result<CoLocateResult> {
         let a = parse_entity(entity)?;
         let b = parse_entity(with)?;
         let w = self.get(name)?;
@@ -3270,9 +3272,14 @@ impl WorldRegistry {
             fanout.world_co_locate(name, b, cell, sim, ttl_ticks);
             let followers =
                 self.co_locate_followers(st, name, sim, b, b_cell, cell, ttl_ticks, fanout);
-            return Ok(
-                json!({"pinned": b, "with": a, "cell": cell, "until_tick": until, "forwarded": true, "followers": followers}),
-            );
+            return Ok(CoLocateResult {
+                pinned: b,
+                with: a,
+                cell,
+                until_tick: until,
+                forwarded: true,
+                followers,
+            });
         }
         let until = st.world.pin(b, cell, ttl_ticks);
         let followers = self.co_locate_followers(st, name, sim, b, b_cell, cell, ttl_ticks, fanout);
@@ -3289,9 +3296,14 @@ impl WorldRegistry {
                 },
             );
         }
-        Ok(
-            json!({"pinned": b, "with": a, "cell": cell, "until_tick": until, "followers": followers}),
-        )
+        Ok(CoLocateResult {
+            pinned: b,
+            with: a,
+            cell,
+            until_tick: until,
+            forwarded: false,
+            followers,
+        })
     }
 
     /// Bodies pinned next to `b` because they were touching it (A–B–C over two borders) move
@@ -3372,7 +3384,7 @@ impl WorldRegistry {
         tick: u64,
         at: Option<Pos>,
         tolerance: f64,
-    ) -> Result<Value> {
+    ) -> Result<RewindResult> {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let st = w.lock();
@@ -3631,17 +3643,21 @@ impl WorldRegistry {
         Ok(())
     }
 
-    pub fn view(&self, name: &str, cell: CellId) -> Result<Value> {
+    pub fn view(&self, name: &str, cell: CellId) -> Result<CellFrame<WorldEntity>> {
         let w = self.get(name)?;
         let st = w.lock();
         let v = self.cell_view(&st, name, cell)?;
-        Ok(json!({
-            "tick": st.world.tick,
-            "owner": st.world.owner(cell),
-            "owned": v.owned.iter().map(to_wire).collect::<Vec<_>>(),
-            "ghosts": v.ghosts.iter().map(to_wire).collect::<Vec<_>>(),
-            "globals": st.world.globals(),
-        }))
+        Ok(CellFrame {
+            cell,
+            tick: st.world.tick,
+            owner: st.world.owner(cell),
+            full: None,
+            owned: v.owned.iter().map(to_wire).collect(),
+            ghosts: v.ghosts.iter().map(to_wire).collect(),
+            gone: None,
+            globals: st.world.globals(),
+            time_scale: None,
+        })
     }
 
     /// `view` as a delta against what this simulator stream was last sent for the cell:
@@ -3649,7 +3665,12 @@ impl WorldRegistry {
     /// `gone` the ids that left the view, `full: true` when nothing was known (first frame of a
     /// cell). A full frame of a 500-entity cell is ~100 KB of JSON thirty times a second per
     /// simulator; the stand's bots spent 70 % of a core parsing it.
-    pub fn view_delta(&self, name: &str, cell: CellId, known: &mut SimKnown) -> Result<Value> {
+    pub fn view_delta(
+        &self,
+        name: &str,
+        cell: CellId,
+        known: &mut SimKnown,
+    ) -> Result<CellFrame<WorldEntity>> {
         let w = self.get(name)?;
         let st = w.lock();
         let v = self.cell_view(&st, name, cell)?;
@@ -3686,15 +3707,17 @@ impl WorldRegistry {
             .increment((owned.len() + ghosts.len()) as u64);
         metrics::counter!("musubi_world_sim_frame_entities_total", "mode" => "full")
             .increment((v.owned.len() + v.ghosts.len()) as u64);
-        Ok(json!({
-            "tick": st.world.tick,
-            "owner": st.world.owner(cell),
-            "full": full,
-            "owned": owned,
-            "ghosts": ghosts,
-            "gone": gone,
-            "globals": st.world.globals(),
-        }))
+        Ok(CellFrame {
+            cell,
+            tick: st.world.tick,
+            owner: st.world.owner(cell),
+            full: Some(full),
+            owned,
+            ghosts,
+            gone: Some(gone),
+            globals: st.world.globals(),
+            time_scale: None,
+        })
     }
 
     fn cell_view(&self, st: &WorldState, name: &str, cell: CellId) -> Result<musubi_mesh::SimView> {
@@ -4717,7 +4740,7 @@ impl WorldRegistry {
         entity: &str,
         spec: InteractSpec,
         fanout: &Fanout,
-    ) -> Result<Value> {
+    ) -> Result<InteractResult> {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let mut guard = w.lock();
@@ -4746,7 +4769,13 @@ impl WorldRegistry {
             let e = st.contacts.entry(key).or_insert((tick, 0));
             if e.0 == tick && e.1 > 0 {
                 metrics::counter!("musubi_world_contacts_total", "path" => "dup").increment(1);
-                return Ok(json!({ "delivered": "dup", "tick": tick }));
+                return Ok(InteractResult {
+                    delivered: Delivered::Dup,
+                    seq: None,
+                    tick: Some(tick),
+                    colocated: None,
+                    followers: None,
+                });
             }
             e.1 = if tick.saturating_sub(e.0) <= 1 {
                 e.1 + 1
@@ -4789,12 +4818,10 @@ impl WorldRegistry {
             let mut st = w.lock();
             let st = &mut *st;
             let mut r = self.deliver_interaction(name, st, id, ev, fanout)?;
-            r["colocated"] = json!(pinned.is_some());
+            r.colocated = Some(pinned.is_some());
             // bodies that were pinned next to the moved one and came along (see `co_locate`)
-            if let Some(f) = pinned.as_ref().and_then(|p| p.get("followers")) {
-                if f.as_array().is_some_and(|a| !a.is_empty()) {
-                    r["followers"] = f.clone();
-                }
+            if let Some(p) = pinned.as_ref().filter(|p| !p.followers.is_empty()) {
+                r.followers = Some(p.followers.clone());
             }
             return Ok(r);
         }
@@ -4808,18 +4835,25 @@ impl WorldRegistry {
         id: EntityId,
         ev: Value,
         fanout: &Fanout,
-    ) -> Result<Value> {
+    ) -> Result<InteractResult> {
+        let plain = |delivered: Delivered, seq: Option<u64>| InteractResult {
+            delivered,
+            seq,
+            tick: None,
+            colocated: None,
+            followers: None,
+        };
         match st.world.route_input(id, ev.clone()) {
             Ok(Some(owner)) => {
                 let ev = stamp_interaction(st, id, ev);
-                let seq = ev["seq"].clone();
+                let seq = ev["seq"].as_u64();
                 push_event(st, owner, ev);
-                Ok(json!({ "delivered": "owner", "seq": seq }))
+                Ok(plain(Delivered::Owner, seq))
             }
-            Ok(None) => Ok(json!({ "delivered": "in_transit" })),
+            Ok(None) => Ok(plain(Delivered::InTransit, None)),
             Err(musubi_mesh::MeshError::NoEntity) if self.is_split(name) => {
                 fanout.world_input(name, id, ev);
-                Ok(json!({ "delivered": "forwarded" }))
+                Ok(plain(Delivered::Forwarded, None))
             }
             Err(e) => Err(mesh_err(e)),
         }
@@ -4839,7 +4873,7 @@ impl WorldRegistry {
         Ok(std::mem::take(st.sim_events.entry(sim).or_default()))
     }
 
-    pub fn handover_ack(&self, name: &str, sim: Uuid, entity: &str) -> Result<Value> {
+    pub fn handover_ack(&self, name: &str, sim: Uuid, entity: &str) -> Result<HandoverAckResult> {
         let id = parse_entity(entity)?;
         let w = self.get(name)?;
         let mut st = w.lock();
@@ -4875,7 +4909,10 @@ impl WorldRegistry {
                 },
             );
         }
-        Ok(json!({ "outcome": outcome, "buffered_inputs": inputs }))
+        Ok(HandoverAckResult {
+            outcome,
+            buffered_inputs: inputs,
+        })
     }
 
     // ----- client side -----
@@ -6020,7 +6057,7 @@ fn stamp_interaction(st: &mut WorldState, id: EntityId, mut ev: Value) -> Value 
     if let Some(t) = ev["at_tick"].as_u64() {
         let at = serde_json::from_value::<Option<Pos>>(ev["at"].clone()).unwrap_or(None);
         let tol = ev["tolerance"].as_f64().unwrap_or(1.0);
-        ev["rewind"] = rewind_json(&st.world, id, t, at, tol);
+        ev["rewind"] = json!(rewind_json(&st.world, id, t, at, tol));
     }
     let seq = st.interaction_seq.entry(id).or_insert(0);
     *seq += 1;
@@ -6060,14 +6097,19 @@ fn spawn_entity(
 }
 
 /// `{tick, pos, hit, history_from}`: where `id` was at `tick` and whether `at` matches it.
-fn rewind_json(world: &World, id: EntityId, tick: u64, at: Option<Pos>, tolerance: f64) -> Value {
-    let pos = world.position_at(id, tick);
-    json!({
-        "tick": tick,
-        "pos": pos,
-        "hit": at.and_then(|a| world.was_at(id, tick, a, tolerance)),
-        "history_from": world.history_from(id),
-    })
+fn rewind_json(
+    world: &World,
+    id: EntityId,
+    tick: u64,
+    at: Option<Pos>,
+    tolerance: f64,
+) -> RewindResult {
+    RewindResult {
+        tick,
+        pos: world.position_at(id, tick),
+        hit: at.and_then(|a| world.was_at(id, tick, a, tolerance)),
+        history_from: world.history_from(id),
+    }
 }
 
 /// Plan 4.9: entities whose `decay_ticks` ran out leave the world; persistent ones are

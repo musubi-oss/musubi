@@ -15,7 +15,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
 use musubi_mesh::controller::ControllerConfig;
-use musubi_mesh::{CellId, Pos, SimCommand, SimCommandFrame, WorldConfig};
+use musubi_mesh::{CellFrame, CellId, Pos, SimCommand, SimCommandFrame, WorldConfig};
+use musubi_proto::realtime::WorldEntity;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -651,7 +652,8 @@ async fn view(
         z: q.z,
     };
     ensure_cell_home(&s, &w, cell, &uri).await?;
-    let r: Result<Json<Value>, ApiError> = async { Ok(Json(s.worlds.view(&w, cell)?)) }.await;
+    let r: Result<Json<Value>, ApiError> =
+        async { Ok(Json(json!(s.worlds.view(&w, cell)?))) }.await;
     r.map_err(IntoResponse::into_response)
 }
 
@@ -808,7 +810,7 @@ async fn handover_ack(
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> =
-        async { Ok(Json(s.worlds.handover_ack(&w, r.sim, &r.entity)?)) }.await;
+        async { Ok(Json(json!(s.worlds.handover_ack(&w, r.sim, &r.entity)?))) }.await;
     r.map_err(IntoResponse::into_response)
 }
 
@@ -821,8 +823,12 @@ async fn interact(
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let (sim, entity, spec) = r.spec();
-    let r: Result<Json<Value>, ApiError> =
-        async { Ok(Json(s.worlds.interact(&w, sim, &entity, spec, &s.fanout)?)) }.await;
+    let r: Result<Json<Value>, ApiError> = async {
+        Ok(Json(json!(s
+            .worlds
+            .interact(&w, sim, &entity, spec, &s.fanout)?)))
+    }
+    .await;
     r.map_err(IntoResponse::into_response)
 }
 
@@ -837,14 +843,14 @@ async fn colocate(
 ) -> Result<Json<Value>, Response> {
     ensure_shard(&s, &w, &uri).await?;
     let r: Result<Json<Value>, ApiError> = async {
-        Ok(Json(s.worlds.co_locate(
+        Ok(Json(json!(s.worlds.co_locate(
             &w,
             r.sim,
             &r.entity,
             &r.with,
             r.ttl_ticks,
             &s.fanout,
-        )?))
+        )?)))
     }
     .await;
     r.map_err(IntoResponse::into_response)
@@ -865,13 +871,13 @@ async fn rewind(
         _ => None,
     };
     let r: Result<Json<Value>, ApiError> = async {
-        Ok(Json(s.worlds.rewind(
+        Ok(Json(json!(s.worlds.rewind(
             &w,
             &r.entity,
             r.tick,
             at,
             r.tolerance.unwrap_or(1.0),
-        )?))
+        )?)))
     }
     .await;
     r.map_err(IntoResponse::into_response)
@@ -975,18 +981,15 @@ fn tick_frame(
     if let Some(k) = known.as_deref_mut() {
         k.retain(|c, _| cells.contains(c));
     }
-    let mut views = Vec::with_capacity(cells.len());
+    let mut views: Vec<CellFrame<WorldEntity>> = Vec::with_capacity(cells.len());
     for c in &cells {
         let mut v = match known.as_deref_mut() {
             Some(k) => s.worlds.view_delta(w, *c, k.entry(*c).or_default())?,
             None => s.worlds.view(w, *c)?,
         };
-        if let Some(o) = v.as_object_mut() {
-            o.insert("cell".into(), json!(c));
-            let scale = s.worlds.time_scale(w, *c)?;
-            if scale < 1.0 {
-                o.insert("time_scale".into(), json!(scale));
-            }
+        let scale = s.worlds.time_scale(w, *c)?;
+        if scale < 1.0 {
+            v.time_scale = Some(scale);
         }
         views.push(v);
     }
@@ -1135,7 +1138,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                     at,
                     tolerance,
                 };
-                reply["result"] = s.worlds.interact(w, sim, &entity, spec, &s.fanout)?;
+                reply["result"] = json!(s.worlds.interact(w, sim, &entity, spec, &s.fanout)?);
                 Ok(reply)
             }
             SimCommand::Colocate {
@@ -1143,9 +1146,9 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                 with,
                 ttl_ticks,
             } => {
-                reply["result"] = s
+                reply["result"] = json!(s
                     .worlds
-                    .co_locate(w, sim, &entity, &with, ttl_ticks, &s.fanout)?;
+                    .co_locate(w, sim, &entity, &with, ttl_ticks, &s.fanout)?);
                 Ok(reply)
             }
             SimCommand::Rewind {
@@ -1160,12 +1163,13 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                     _ => None,
                 };
                 reply["result"] =
-                    s.worlds
-                        .rewind(w, &entity, tick, at, tolerance.unwrap_or(1.0))?;
+                    json!(s
+                        .worlds
+                        .rewind(w, &entity, tick, at, tolerance.unwrap_or(1.0))?);
                 Ok(reply)
             }
             SimCommand::HandoverAck { entity } => {
-                reply["result"] = s.worlds.handover_ack(w, sim, &entity)?;
+                reply["result"] = json!(s.worlds.handover_ack(w, sim, &entity)?);
                 Ok(reply)
             }
         }

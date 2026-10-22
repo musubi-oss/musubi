@@ -11,8 +11,12 @@
 pub mod controller;
 pub mod sim_command;
 pub mod sim_event;
+pub mod sim_frame;
 pub use sim_command::{SimCommand, SimCommandFrame};
 pub use sim_event::SimEvent;
+pub use sim_frame::{
+    CellFrame, CoLocateResult, Delivered, HandoverAckResult, InteractResult, RewindResult, SimFrame,
+};
 pub mod ghost;
 pub use ghost::{GhostCache, GhostDelta, GhostSendState, GhostUpsert};
 

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use musubi_mesh::{CellId, SimCommand, SimEvent};
+use musubi_mesh::{CellFrame, CellId, SimCommand, SimEvent};
 use musubi_proto::realtime::WorldEntity;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -440,9 +440,10 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
             if v["type"] == "tick" {
                 let mut seen: Vec<CellId> = Vec::new();
                 for cv in v["cells"].as_array().cloned().unwrap_or_default() {
-                    let Ok(c) = serde_json::from_value::<CellId>(cv["cell"].clone()) else {
+                    let Ok(cf) = serde_json::from_value::<CellFrame<WorldEntity>>(cv) else {
                         continue;
                     };
+                    let c = cf.cell;
                     seen.push(c);
                     let fresh = !views.contains_key(&c);
                     let view = views.entry(c).or_insert_with(|| View {
@@ -451,7 +452,7 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
                         owned: Vec::new(),
                         ghosts: Vec::new(),
                     });
-                    apply_delta(view, &cv);
+                    apply_delta(view, &cf);
                     if fresh {
                         logic.on_cell_assigned(c);
                     }
@@ -531,18 +532,16 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
 }
 
 /// Folds one cell frame (full or delta) into a locally kept [`View`].
-fn apply_delta(view: &mut View, cv: &Value) {
-    if cv["full"].as_bool().unwrap_or(false) {
+fn apply_delta(view: &mut View, cf: &CellFrame<WorldEntity>) {
+    if cf.full.unwrap_or(false) {
         view.owned.clear();
         view.ghosts.clear();
     }
-    if let Some(t) = cv["tick"].as_u64() {
-        view.tick = t;
-    }
-    view.owner = cv["owner"].as_str().and_then(|s| s.parse().ok());
-    let owned: Vec<WorldEntity> = serde_json::from_value(cv["owned"].clone()).unwrap_or_default();
-    let ghosts: Vec<WorldEntity> = serde_json::from_value(cv["ghosts"].clone()).unwrap_or_default();
-    let gone: Vec<Uuid> = serde_json::from_value(cv["gone"].clone()).unwrap_or_default();
+    view.tick = cf.tick;
+    view.owner = cf.owner;
+    let owned = cf.owned.clone();
+    let ghosts = cf.ghosts.clone();
+    let gone: Vec<Uuid> = cf.gone.clone().unwrap_or_default();
     for e in owned {
         view.ghosts.retain(|g| g.id != e.id);
         match view.owned.iter_mut().find(|o| o.id == e.id) {

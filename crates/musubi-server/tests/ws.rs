@@ -4409,7 +4409,7 @@ async fn world_snapshots_persist_and_recover_on_another_node() {
         z: 0,
     };
     let view = r2.view(&name, cell).unwrap();
-    let s = view.to_string();
+    let s = serde_json::json!(view).to_string();
     assert!(s.contains(&keep.id.to_string()), "{s}");
     assert!(s.contains("\"hp\""), "{s}");
     // n2 is a live node now, so a third registry has nothing left to claim
@@ -4801,6 +4801,7 @@ async fn world_journal_is_replayed_on_rehome() {
                 z: 0,
             },
         )
+        .map(|v| serde_json::json!(v))
         .unwrap()
         .to_string();
     assert!(
