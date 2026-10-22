@@ -231,10 +231,27 @@ impl Cluster {
     /// indirectly, and suspect it if nobody can reach it.
     pub(crate) async fn probe_round(&self, n: usize) {
         let Some(bus) = &self.bus else { return };
+        // the second, independent signal: a node still writing its Postgres heartbeat is not
+        // dead, however unreachable the bus finds it — on a starved box probes time out while
+        // the process lives, and a false death verdict starts a failover against a live leader
+        let db_alive: std::collections::HashSet<uuid::Uuid> = self
+            .peers
+            .read()
+            .await
+            .iter()
+            .filter(|p| p.alive)
+            .map(|p| p.id.0)
+            .collect();
         {
             let mut m = self.members.write().await;
             for (id, e) in m.iter_mut() {
                 if e.state == State::Suspect && e.since.elapsed() > SUSPECT_TIMEOUT {
+                    if db_alive.contains(id) {
+                        tracing::warn!(node = %id, "swim: suspect timed out but its postgres heartbeat is fresh; kept suspect");
+                        metrics::counter!("musubi_swim_death_vetoed_total").increment(1);
+                        e.since = Instant::now();
+                        continue;
+                    }
                     tracing::warn!(node = %id, "swim: suspect timed out, declared dead");
                     let _ = self.member_tx.send(crate::MemberEvent {
                         id: *id,
