@@ -177,7 +177,7 @@ Wire: `WorldEntity{id: Uuid, x, y, components: [{name, value: JSON, version}]}`;
 
 ## 5. Rollback matches — `UMusubiMatch`
 
-* `match_input{match_id, tick, seq, input}` → `match_input_ack{tick, seq, applied}`;
+* `match_input{match_id, tick, seq, op_code, data}` → `match_input_ack{tick, seq, applied}`;
   `match_tick_hash{tick, hash}` every `params.rollback.hash_every` ticks (FNV-1a 64 of the
   authoritative state); `match_state` (keyframe) / `match_state_delta`.
 * Client keeps `FMusubiInputRing` (default 64 ticks): inputs stamped with the predicted tick,
@@ -344,7 +344,9 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    state, ghosts as kinematics, interact/colocate — shipped as `MusubiServer` (generated sim
    wire + golden vectors, stream, subsystem); cell → level streaming and the rewind ring are
    project hooks for now (see README).
-5. Rollback matches (input ring, tick hash, desync recovery) + prediction buffer.
+5. Rollback matches (input ring, tick hash, desync recovery) — shipped as `UMusubiMatch` over
+   `UMusubiMatches` (+ RFC 6902 patching of the synced state); the world prediction buffer
+   waits for a project that needs it.
 6. Iris bridge (tier B) + Mass sink.
 7. QUIC transport (`quiche` static libs: Win64, Linux, Mac; consoles later), `transport` switch.
 8. CI compile matrix 5.3/5.7/5.8 + node-in-the-loop tests + docs (`docs/parity.md` L146/L192

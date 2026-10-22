@@ -82,7 +82,16 @@ Musubi simulator (the engine owns physics, Musubi owns authority and meshing):
 - Not yet: cell → level-streaming, Chaos deterministic-mode assertions, `rewind` driven snapshots
   (`rewind` is exposed as a command only), QUIC.
 
-Rollback matches and the Iris bridge are the next phases (§5, §7).
+**Rollback matches** (`UMusubiMatch`, §5) over `UMusubiMatches`: `Attach(matchId, tickRate)` (0 = measured
+from the `match_tick_hash` cadence), `SendInput(opcode, bytes)` stamps the predicted tick (server tick
+estimate + `ceil(rtt/2 / tick_ms) + 1`) and keeps it in a ring until the `match_input_ack` with its `seq`;
+`applied == false` → `LateInputs` + `OnInputRejected`. `HashTick` hook (FNV-1a 64 helper with the node's
+constants — hash the same bytes your handler hashes) is compared with every `match_tick_hash`; mismatch →
+`OnDesync`, and with `DesyncPolicy = Rejoin` the match is left and re-joined for a fresh keyframe (there is no
+"send keyframe" message). The synced state is mirrored from `match_state` and patched by `match_state_delta`
+(RFC 6902: `MusubiJsonPatch`), readable as JSON or by pointer from Blueprint.
+
+The Iris bridge and QUIC are the next phases (§6–§7).
 
 ## Status / caveats
 
