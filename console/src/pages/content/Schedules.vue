@@ -22,11 +22,11 @@ const pg1 = usePager(() => sources)
     <p class="err" v-for="(p, i) in problems" :key="i">{{ typeof p === 'string' ? p : JSON.stringify(p) }}</p>
     <table><thead><tr><th>Id</th><th>Module · function</th><th style="width:140px">Cron</th><th style="width:140px">Last run</th><th style="width:140px">Next run</th><th style="width:100px">Last result</th><th style="width:90px"></th></tr></thead><tbody>
       <tr v-for="s in pg2.rows" :key="s.id ?? s.name"><td class="m">{{ s.id ?? s.name }}</td><td class="dim">{{ s.module }} · {{ s.function ?? s.fn }}</td><td class="m">{{ s.cron }}</td><td class="dim">{{ ts(s.last_run_at ?? s.last_run) }}</td><td class="dim">{{ ts(s.next_run_at ?? s.next_run) }}</td><td :class="{ bad: s.last_error }">{{ s.last_error ? 'error' : s.last_run_at ? 'ok' : '—' }}</td><td><button class="btn s" @click="act(() => post(`/v1/admin/runtime/schedules/${encodeURIComponent(s.id ?? s.name)}/run`), 'triggered')">Run now</button></td></tr>
-      <tr v-if="!schedules.length"><td colspan="7" class="empty">No schedules — modules declare them with <code>schedule("name", "cron", fn)</code></td></tr></tbody></table><Pager :p="pg2" />
+      <tr v-if="!pg2.total"><td colspan="7" class="empty">No schedules — modules declare them with <code>schedule("name", "cron", fn)</code></td></tr></tbody></table><Pager :p="pg2" />
     <h3>External config sources <small>(remote configs pulled from git / HTTP / S3)</small></h3>
     <table><thead><tr><th>Config</th><th>Source</th><th style="width:140px">Last sync</th><th style="width:100px">Status</th><th style="width:150px"></th></tr></thead><tbody>
       <tr v-for="s in pg1.rows" :key="s.name"><td class="m">{{ s.name }}</td><td class="m dim">{{ s.kind ?? '' }} {{ s.url ?? s.path ?? '' }}{{ s.ref ? ` @ ${s.ref}` : '' }}</td><td class="dim">{{ ts(s.last_sync_at ?? s.synced_at) }}</td><td :class="{ bad: s.last_error }">{{ s.last_error ? 'error' : 'ok' }}</td><td><button class="btn s" @click="act(() => post(`/v1/server/configs/${encodeURIComponent(s.name)}/source/sync`), 'synced')">Sync</button> <button class="btn s" @click="ask('Detach source? The config keeps its last value.') && act(() => api('DELETE', `/v1/server/configs/${encodeURIComponent(s.name)}/source`), 'detached')">Detach</button></td></tr>
-      <tr v-if="!sources.length"><td colspan="5" class="empty">No external sources — attach one from a remote config's page</td></tr></tbody></table><Pager :p="pg1" />
+      <tr v-if="!pg1.total"><td colspan="5" class="empty">No external sources — attach one from a remote config's page</td></tr></tbody></table><Pager :p="pg1" />
     <details v-if="schedules.length"><summary class="dim">Raw</summary><JsonView :value="schedules" /></details>
   </div>
 </template>

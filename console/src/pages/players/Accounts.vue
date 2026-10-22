@@ -1,10 +1,11 @@
 <script setup lang="ts">
+import { useQueryRef } from '../../composables/query'
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { get, qs } from '../../api/client'
 import DataTable from '../../components/DataTable.vue'
 const router = useRouter()
-const q = ref(''); const identity = ref(''); const deleted = ref(false); const rows = ref<any[]>([]); const err = ref(''); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
+const q = useQueryRef('q'); const identity = useQueryRef('identity'); const deleted = ref(false); const rows = ref<any[]>([]); const err = ref(''); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
 async function load(c: string | null = null) {
   err.value = ''
   try { const d = await get('/v1/admin/accounts' + qs({ q: q.value, identity: identity.value, include_deleted: deleted.value || undefined, cursor: c, limit: 50 })); rows.value = d.accounts ?? d.items ?? []; cursor.value = d.next_cursor ?? d.cursor ?? null }

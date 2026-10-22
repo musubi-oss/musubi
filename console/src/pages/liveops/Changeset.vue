@@ -65,7 +65,7 @@ const pg1 = usePager(() => changes)
       <template v-if="tab === 'changes'">
         <table><thead><tr><th style="width:180px">Table</th><th style="width:90px">Op</th><th style="width:240px">Key</th><th>Row</th><th style="width:60px" v-if="editable"></th></tr></thead><tbody>
           <tr v-for="(ch, i) in pg1.rows" :key="i"><td class="m">{{ ch.table }}</td><td :class="{ bad: (ch.op ?? 'upsert') === 'delete' }">{{ ch.op ?? 'upsert' }}</td><td class="m">{{ keyOf(ch) }}</td><td class="m dim" style="white-space:pre-wrap">{{ JSON.stringify(ch.row ?? {}).slice(0, 300) }}</td><td v-if="editable"><button class="btn s" @click="act(() => api('DELETE', `${C}/changes/${ch.table}/${encodeURIComponent(keyOf(ch))}`), 'unstaged')">×</button></td></tr>
-          <tr v-if="!changes.length"><td colspan="5" class="empty">Nothing staged — add rows to upsert or delete, then submit</td></tr></tbody></table><Pager :p="pg1" />
+          <tr v-if="!pg1.total"><td colspan="5" class="empty">Nothing staged — add rows to upsert or delete, then submit</td></tr></tbody></table><Pager :p="pg1" />
         <div v-if="c.counts" class="dim" style="margin-top:8px">{{ Object.entries(c.counts).map(([t, v]: [string, any]) => `${t}: +${v.upserts ?? 0} −${v.deletes ?? 0}`).join(' · ') }}</div>
       </template>
       <template v-else-if="tab === 'diff'"><p class="note" v-if="diff && diff.changes === false">No difference against the live tables (already published or empty).</p><JsonView :value="diff?.diff ?? diff ?? { note: 'no diff available' }" /></template>

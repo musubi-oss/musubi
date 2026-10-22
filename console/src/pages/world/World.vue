@@ -163,11 +163,11 @@ const pg1 = usePager(() => list('history', 'ops'))
             <td><span v-for="(s, i) in t.steps" :key="i" class="hstep" :class="{ bad: !okPaths.has(s.path) }" :title="s.detail">{{ s.event }}<small>/{{ s.path }}</small></span><span v-if="t.open" class="dim" style="font-size:12px">…</span></td>
             <td class="dim">{{ t.ms }} ms</td><td class="dim">{{ fmtMs(t.last.ms) }}</td>
           </tr>
-          <tr v-if="!trails.length"><td colspan="5" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table><Pager :p="pg3" />
+          <tr v-if="!pg3.total"><td colspan="5" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table><Pager :p="pg3" />
       </template>
       <table v-else><thead><tr><th style="width:110px">Time</th><th style="width:80px">Tick</th><th style="width:130px">Entity</th><th style="width:90px">Event</th><th style="width:130px">Path</th><th style="width:110px">Node</th><th>Detail</th></tr></thead><tbody>
         <tr v-for="(s, i) in pg2.rows" :key="i"><td class="dim">{{ fmtMs(s.ms) }}</td><td class="dim">{{ s.tick }}</td><td class="m">…{{ s.entity.slice(-12) }}</td><td>{{ s.event }}</td><td :class="okPaths.has(s.path) ? '' : 'bad'">{{ s.path }}</td><td class="m dim">{{ simName(s.node) }}</td><td class="dim" style="word-break:break-all">{{ s.detail }}</td></tr>
-        <tr v-if="!steps.length"><td colspan="7" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table><Pager :p="pg2" />
+        <tr v-if="!pg2.total"><td colspan="7" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table><Pager :p="pg2" />
     </template>
 
     <template v-else-if="tab === 'journal'">

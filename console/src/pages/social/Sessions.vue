@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useQueryObj } from '../../composables/query'
 import { usePager } from '../../composables/pager'
 import Pager from '../../components/Pager.vue'
 // Game sessions (lobbies/rooms backed by a match or a fleet server) across the cluster: search,
@@ -9,7 +10,7 @@ import DataTable from '../../components/DataTable.vue'
 import JsonView from '../../components/JsonView.vue'
 import Drawer from '../../components/Drawer.vue'
 import { toast } from '../../stores/toast'
-const x = ref<Record<string, any>>({}); const err = ref(''); const q = ref<any>({ kind: '', name: '' }); const dlg = ref(''); const form = ref<any>({}); const sel = ref<Set<string>>(new Set())
+const x = ref<Record<string, any>>({}); const err = ref(''); const q = useQueryObj(ref<any>({ kind: '', name: '' }), ['kind', 'name']); const dlg = ref(''); const form = ref<any>({}); const sel = ref<Set<string>>(new Set())
 async function load() { err.value = ''; try { const [s, t] = await Promise.all([post('/v1/server/sessions/search', { ...(q.value.kind ? { kind: q.value.kind } : {}), ...(q.value.name ? { name: q.value.name } : {}), limit: 200 }), get('/v1/server/session_templates').catch(() => ({ templates: [] }))]); x.value.s = s; x.value.t = t } catch (e: any) { err.value = e.message } }
 onMounted(load)
 const ask = (m: string) => window.confirm(m)

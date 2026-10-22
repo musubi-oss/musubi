@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useQueryRef } from '../../composables/query'
 import { usePager } from '../../composables/pager'
 import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
@@ -7,7 +8,7 @@ import Kv from '../../components/Kv.vue'
 import JsonView from '../../components/JsonView.vue'
 import { toast } from '../../stores/toast'
 const ask = (m: string) => window.confirm(m)
-const groups = ref<any[]>([]); const total = ref(0); const err = ref(''); const status = ref('open'); const q = ref(''); const sel = ref<any>(null); const sample = ref<any>(null); const notes = ref('')
+const groups = ref<any[]>([]); const total = ref(0); const err = ref(''); const status = useQueryRef('status', 'open'); const q = useQueryRef('q'); const sel = ref<any>(null); const sample = ref<any>(null); const notes = ref('')
 async function load() { err.value = ''; try { const r = await get('/v1/server/crashes' + qs({ status: status.value === 'all' ? undefined : status.value, q: q.value || undefined, limit: 200 })); groups.value = r.groups ?? []; total.value = r.total ?? groups.value.length } catch (x: any) { err.value = x.message } }
 onMounted(load)
 const view = computed(() => groups.value.filter((g) => !q.value || JSON.stringify(g).toLowerCase().includes(q.value.toLowerCase())))
@@ -25,7 +26,7 @@ const pg1 = usePager(() => view)
     <div class="card">
       <table><thead><tr><th>Title</th><th style="width:70px">Kind</th><th style="width:70px">Count</th><th style="width:120px">Versions</th><th style="width:130px">Last seen</th><th style="width:90px">Status</th></tr></thead><tbody>
         <tr v-for="g in pg1.rows" :key="g.fingerprint" class="row" :class="{ on: sel?.fingerprint === g.fingerprint }" @click="pick(g)"><td>{{ g.title }}<div class="dim m" style="font-size:11px">{{ g.fingerprint }}{{ g.assignee ? ` · ${g.assignee}` : '' }}</div></td><td class="dim">{{ g.kind }}</td><td>{{ g.count }}</td><td class="dim">{{ g.first_version === g.last_version ? g.last_version : `${g.first_version} → ${g.last_version}` }}</td><td class="dim">{{ ts(g.last_seen) }}</td><td :class="{ dim: g.status !== 'open' }">{{ g.status }}{{ g.resolved_in_version ? ` in ${g.resolved_in_version}` : '' }}</td></tr>
-        <tr v-if="!view.length"><td colspan="6" class="empty">No crash groups</td></tr></tbody></table><Pager :p="pg1" />
+        <tr v-if="!pg1.total"><td colspan="6" class="empty">No crash groups</td></tr></tbody></table><Pager :p="pg1" />
     </div>
     <div class="card" v-if="sel">
       <h3 style="margin-top:0">{{ sel.title }}</h3>

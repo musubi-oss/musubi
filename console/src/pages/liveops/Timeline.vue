@@ -1,11 +1,12 @@
 <script setup lang="ts">
+import { useQueryRef } from '../../composables/query'
 import { usePager } from '../../composables/pager'
 import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { get, qs } from '../../api/client'
 const router = useRouter()
-const days = ref(7); const back = ref(1); const kinds = ref<string[]>([]); const label = ref(''); const d = ref<any>(null); const err = ref(''); const state = ref('all')
+const days = ref(7); const back = ref(1); const kinds = ref<string[]>([]); const label = useQueryRef('label'); const d = ref<any>(null); const err = ref(''); const state = useQueryRef('state', 'all')
 const allKinds = ['live_event', 'flag', 'experiment', 'news', 'offer', 'tournament', 'changeset']
 async function load() {
   err.value = ''
@@ -45,6 +46,6 @@ const pg1 = usePager(() => rows)
         <td>{{ e.kind.replace('_', ' ') }}</td><td>{{ e.name || e.id }}</td>
         <td :class="{ ok: e.state === 'active', dim: e.state !== 'active' }">{{ e.state }}</td><td class="dim">{{ (e.labels ?? []).join(', ') || '—' }}</td>
       </tr>
-      <tr v-if="!rows.length"><td colspan="7" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
+      <tr v-if="!pg1.total"><td colspan="7" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
   </div>
 </template>

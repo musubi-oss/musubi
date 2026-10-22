@@ -43,7 +43,7 @@ const pg1 = usePager(() => shown)
           <td class="m">{{ r.name }}</td><td class="dim">{{ nodes[r.node_id] ?? r.node_id ?? 'pending adoption' }}</td><td :class="r.local ? 'ok' : 'dim'">{{ r.local ? 'homed here' : 'remote' }}</td><td class="dim">{{ ts(r.created_at) }}</td>
           <td @click.stop><button class="btn s d" @click="del(r.name)">Delete</button></td>
         </tr>
-        <tr v-if="!shown.length"><td colspan="5" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
+        <tr v-if="!pg1.total"><td colspan="5" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
     </template>
   </div>
   <Drawer v-if="creating" title="Create world" @close="creating = false"><div class="form">

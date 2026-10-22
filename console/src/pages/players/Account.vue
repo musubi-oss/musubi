@@ -169,7 +169,7 @@ const pg1 = usePager(() => list('timeline', 'items'))
       <div class="tools"><button class="btn p" @click="openDlg('note')">Add note</button></div>
       <table><thead><tr><th style="width:170px">At</th><th style="width:160px">Author</th><th>Note</th><th style="width:60px"></th></tr></thead><tbody>
         <tr v-for="n in pg2.rows" :key="n.id"><td class="dim">{{ ts(n.created_at) }}</td><td>{{ n.author ?? n.actor }}</td><td style="white-space:pre-wrap">{{ n.text ?? n.body }}</td><td><button class="btn s d" @click="act(() => api('DELETE', `${A}/notes/${n.id}`), 'note deleted')">Delete</button></td></tr>
-        <tr v-if="!list('notes').length"><td colspan="4" class="empty">No Data</td></tr></tbody></table><Pager :p="pg2" />
+        <tr v-if="!pg2.total"><td colspan="4" class="empty">No Data</td></tr></tbody></table><Pager :p="pg2" />
     </template>
 
     <template v-else-if="tab === 'timeline'">

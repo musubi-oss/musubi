@@ -33,7 +33,7 @@ const pg1 = usePager(() => provs)
     <p class="note">Each provider is a login button in the client: clients call <code>/v1/auth/{name}</code>. Secrets are stored sealed and never shown again.</p>
     <table><thead><tr><th>Name</th><th style="width:110px">Kind</th><th>Issuer / authorize URL</th><th style="width:90px">Signup</th><th style="width:90px">Secret</th><th style="width:80px">Enabled</th><th style="width:170px"></th></tr></thead><tbody>
       <tr v-for="x in pg1.rows" :key="x.name"><td class="m row" @click="edit(x)">{{ x.name }}<span class="dim" v-if="x.display_name"> — {{ x.display_name }}</span></td><td>{{ x.kind }}</td><td class="m dim">{{ x.issuer || x.authorize_url || '—' }}</td><td class="dim">{{ x.allow_signup ? 'allowed' : 'link only' }}</td><td class="dim">{{ x.has_client_secret ? 'set' : '—' }}</td><td :class="x.enabled ? 'ok' : 'dim'">{{ x.enabled ? 'yes' : 'no' }}</td><td><button class="btn s" @click="edit(x)">Edit</button> <button class="btn s" @click="runTest(x.name)">Test</button> <button class="btn s" @click="ask(`Delete provider ${x.name}? Players linked through it cannot log in with it any more.`) && del(x.name)">×</button></td></tr>
-      <tr v-if="!provs.length"><td colspan="7" class="empty">No providers — device / email login only</td></tr></tbody></table><Pager :p="pg1" />
+      <tr v-if="!pg1.total"><td colspan="7" class="empty">No providers — device / email login only</td></tr></tbody></table><Pager :p="pg1" />
     <pre class="pre" v-if="test && !dlg" style="margin-top:10px;max-height:200px">{{ JSON.stringify(test, null, 2) }}</pre>
   </div>
   <Drawer v-if="dlg" :title="isNew ? 'New identity provider' : `Provider ${p.name}`" @close="dlg = false"><div class="form">

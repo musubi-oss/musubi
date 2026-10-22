@@ -35,7 +35,7 @@ const pg1 = usePager(() => turns.value.filter((t: any) => tf.value === 'all' || 
       <div style="display:grid;grid-template-columns:3fr 2fr;gap:12px">
         <table><thead><tr><th style="width:140px">Formed</th><th>Queue</th><th style="width:90px">Region</th><th style="width:80px">Players</th><th style="width:90px">Quality</th><th style="width:110px">MMR gap</th><th style="width:110px">Avg wait</th></tr></thead><tbody>
           <tr v-for="m in pg3.rows" :key="m.token" class="row" :class="{ on: sel?.token === m.token }" @click="pickMatch(m)"><td class="dim">{{ ts(m.created_at) }}</td><td class="m">{{ m.queue }}</td><td class="dim">{{ m.region }}</td><td>{{ (m.accounts ?? []).length }}</td><td><div class="bar" style="width:60px;display:inline-block;vertical-align:middle"><i :style="{ width: Math.round((m.quality ?? 0) * 100) + '%' }"></i></div> {{ ((m.quality ?? 0) * 100).toFixed(0) }}%</td><td class="dim">{{ m.team_mmr_gap ?? '—' }}</td><td class="dim">{{ avg(m.wait_ms) }} ms</td></tr>
-          <tr v-if="!matches.length"><td colspan="7" class="empty">No matches formed recently</td></tr></tbody></table><Pager :p="pg3" />
+          <tr v-if="!pg3.total"><td colspan="7" class="empty">No matches formed recently</td></tr></tbody></table><Pager :p="pg3" />
         <div v-if="sel"><h3 style="margin-top:0">Match {{ short(sel.token) }}</h3><Kv k="Players"><div v-for="a in sel.accounts" :key="a" class="m row" @click="router.push(`/players/accounts/${a}`)">{{ a }}</div></Kv><Kv k="Tickets" :v="(sel.tickets ?? []).map(short).join(', ')" mono /><Kv k="Wait per ticket" :v="(sel.wait_ms ?? []).map((w: number) => w + ' ms').join(' · ')" /><h3>Ticket trace</h3><JsonView :value="trace ?? {}" /></div>
         <div class="dim" v-else style="display:flex;align-items:center;justify-content:center">Select a match for players and the matcher's trace</div>
       </div>
@@ -43,7 +43,7 @@ const pg1 = usePager(() => turns.value.filter((t: any) => tf.value === 'all' || 
     <template v-else-if="tab === 'rejections'">
       <table><thead><tr><th style="width:140px">At</th><th>Ticket</th><th>Queue</th><th>Reason</th></tr></thead><tbody>
         <tr v-for="(r, i) in pg2.rows" :key="i"><td class="dim">{{ ts(r.at) }}</td><td class="m">{{ r.ticket_id }}</td><td class="m">{{ r.queue }}</td><td>{{ r.reason }}</td></tr>
-        <tr v-if="!rej.length"><td colspan="4" class="empty">No rejected tickets — every ticket satisfied its queue rules</td></tr></tbody></table><Pager :p="pg2" />
+        <tr v-if="!pg2.total"><td colspan="4" class="empty">No rejected tickets — every ticket satisfied its queue rules</td></tr></tbody></table><Pager :p="pg2" />
     </template>
     <template v-else-if="tab === 'stats'">
       <div class="grid" v-if="stats"><div><Kv k="Open matches" :v="stats.open_matches ?? 0" /><Kv k="Paused queues" :v="(stats.paused ?? []).join(', ') || 'none'" /></div><div><Kv k="Draining queues" :v="(stats.draining ?? []).join(', ') || 'none'" /><Kv k="Waiting tickets" :v="Object.values(stats.waiting ?? {}).reduce((a: number, b: any) => a + Number(b), 0)" /></div><div><Kv k="Per queue" :v="Object.entries(stats.waiting ?? {}).map(([q, n]) => `${q}: ${n}`).join(' · ') || '—'" /></div></div>
@@ -54,7 +54,7 @@ const pg1 = usePager(() => turns.value.filter((t: any) => tf.value === 'all' || 
       <table><thead><tr><th>Game</th><th>Match</th><th style="width:90px">Players</th><th style="width:140px">State</th><th style="width:70px">Turn</th><th style="width:140px">Deadline</th><th style="width:140px">Created</th><th style="width:130px"></th></tr></thead><tbody>
         <tr v-for="t in pg1.rows" :key="t.id"><td class="m">{{ t.game }}</td><td class="m dim">{{ short(t.id) }}</td><td>{{ (t.players ?? []).length }} / {{ t.max_players }}</td><td :class="{ dim: !!t.finished_at }">{{ turnState(t) }}{{ t.result ? ` · ${typeof t.result === 'string' ? t.result : JSON.stringify(t.result)}` : '' }}</td><td>{{ (t.moves ?? []).length }}</td><td class="dim">{{ ts(t.deadline_at) }}</td><td class="dim">{{ ts(t.created_at) }}</td>
           <td><button class="btn s" v-if="!t.finished_at" @click="ask('Finish this match without a winner?') && act(() => post(`/v1/server/turns/${t.id}/finish`, { winner_seat: null }), 'finished')">Finish</button> <button class="btn s" @click="ask('Delete match?') && act(() => api('DELETE', `/v1/server/turns/${t.id}`), 'deleted')">×</button></td></tr>
-        <tr v-if="!turns.length"><td colspan="8" class="empty">No turn-based matches</td></tr></tbody></table><Pager :p="pg1" />
+        <tr v-if="!pg1.total"><td colspan="8" class="empty">No turn-based matches</td></tr></tbody></table><Pager :p="pg1" />
     </template>
   </div>
 </template>

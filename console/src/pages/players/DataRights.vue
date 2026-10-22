@@ -26,7 +26,7 @@ const pg1 = usePager(() => view)
     <table><thead><tr><th style="width:80px">Kind</th><th>Account</th><th style="width:90px">Status</th><th style="width:140px">Requested</th><th style="width:140px">Completed</th><th style="width:110px">By</th><th>Error</th><th style="width:150px"></th></tr></thead><tbody>
       <tr v-for="r in pg1.rows" :key="r.id"><td>{{ r.kind }}{{ r.include_game_data === false ? ' (no game data)' : '' }}</td><td class="m row" @click="router.push(`/players/accounts/${r.account_id}`)">{{ r.account_id }}</td><td :class="{ bad: r.status === 'failed', ok: r.status === 'running' }">{{ r.status }}</td><td class="dim">{{ ts(r.requested_at) }}</td><td class="dim">{{ ts(r.completed_at) }}{{ r.expires_at ? ` · expires ${ts(r.expires_at)}` : '' }}</td><td class="dim">{{ r.requested_by }}</td><td class="bad">{{ r.error ?? '' }}</td>
         <td><button class="btn s" v-if="r.downloadable" @click="download(r)">Download</button> <button class="btn s" v-if="!['done', 'failed', 'cancelled'].includes(r.status)" @click="ask('Cancel this request?') && act(() => post(`/v1/server/data_rights/${r.id}/cancel`), 'cancelled')">Cancel</button></td></tr>
-      <tr v-if="!view.length"><td colspan="8" class="empty">No requests</td></tr></tbody></table><Pager :p="pg1" />
+      <tr v-if="!pg1.total"><td colspan="8" class="empty">No requests</td></tr></tbody></table><Pager :p="pg1" />
   </div>
   <Drawer v-if="dlg" title="New data-rights request" @close="dlg = false"><div class="form">
     <div class="f"><label>Account id</label><input class="in m" v-model="form.account_id" /></div>

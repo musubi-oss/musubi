@@ -49,3 +49,4 @@ table.loading tbody{opacity:.45;transition:opacity .2s}
 .nav .keys{margin-left:auto;align-self:center;color:var(--fg3);font-size:11px;font-family:var(--mono);cursor:help}
 .tools .n{color:var(--fg3);font-size:12px}
 kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-bottom-width:2px;border-radius:4px;padding:0 5px;color:var(--fg2)}
+.side .nf{min-width:0;width:100%;margin-bottom:8px;padding:5px 9px;font-size:12px}

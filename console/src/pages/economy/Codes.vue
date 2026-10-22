@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useQueryRef } from '../../composables/query'
 // Redeem-code campaigns: a campaign names the reward (reward table or platform key group), its
 // limits and audience; codes are generated in batches or added as shared codes; redemptions
 // are listed per campaign; a single code can be revoked.
@@ -9,7 +10,7 @@ import DataTable from '../../components/DataTable.vue'
 import JsonView from '../../components/JsonView.vue'
 import Drawer from '../../components/Drawer.vue'
 import { toast } from '../../stores/toast'
-const x = ref<Record<string, any>>({}); const err = ref(''); const dlg = ref<'' | 'campaign' | 'generate' | 'shared'>(''); const form = ref<any>({}); const q = ref(''); const cur = ref<any>(null); const unused = ref(''); const batch = ref('')
+const x = ref<Record<string, any>>({}); const err = ref(''); const dlg = ref<'' | 'campaign' | 'generate' | 'shared'>(''); const form = ref<any>({}); const q = useQueryRef('q'); const cur = ref<any>(null); const unused = ref(''); const batch = ref('')
 async function load() { err.value = ''; try { x.value.c = await get('/v1/server/codes/campaigns') } catch (e: any) { err.value = e.message } }
 onMounted(load)
 const ask = (m: string) => window.confirm(m)

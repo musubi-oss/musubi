@@ -21,6 +21,6 @@ const pg1 = usePager(() => fields)
     <h3>Custom profile fields <small>(validated on <code>PUT /v1/account</code>)</small> <button class="btn s p" style="margin-left:8px" @click="fields.push({ name: '', kind: 'string', required: false, max_len: 64, public: false })">Add field</button></h3>
     <table><thead><tr><th>Name</th><th style="width:120px">Type</th><th style="width:110px">Max length</th><th style="width:90px">Required</th><th style="width:140px">Visible to others</th><th style="width:60px"></th></tr></thead><tbody>
       <tr v-for="(f, i) in pg1.rows" :key="i"><td><input class="in m" v-model="f.name" placeholder="clan_tag" /></td><td><select class="sel" v-model="f.kind"><option>string</option><option>int</option><option>bool</option><option>url</option><option>enum</option></select></td><td><input class="in" type="number" min="0" v-model.number="f.max_len" :disabled="f.kind !== 'string' && f.kind !== 'url'" /></td><td><input type="checkbox" v-model="f.required" /></td><td><input type="checkbox" v-model="f.public" /></td><td><button class="btn s" @click="fields.splice(i, 1)">×</button></td></tr>
-      <tr v-if="!fields.length"><td colspan="6" class="empty">No custom fields — profiles have username, display name, avatar, language, timezone, metadata</td></tr></tbody></table><Pager :p="pg1" />
+      <tr v-if="!pg1.total"><td colspan="6" class="empty">No custom fields — profiles have username, display name, avatar, language, timezone, metadata</td></tr></tbody></table><Pager :p="pg1" />
   </div>
 </template>

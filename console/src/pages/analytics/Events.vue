@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useQueryObj } from '../../composables/query'
 // Raw event explorer and the schemas that validate events on ingest.
 import { ref, onMounted } from 'vue'
 import { api, get, post, put, qs } from '../../api/client'
@@ -6,7 +7,7 @@ import DataTable from '../../components/DataTable.vue'
 import JsonView from '../../components/JsonView.vue'
 import Drawer from '../../components/Drawer.vue'
 import { toast } from '../../stores/toast'
-const x = ref<Record<string, any>>({}); const err = ref(''); const f = ref<any>({ name: '', account_id: '', platform: '', limit: 200 }); const dlg = ref(''); const form = ref<any>({})
+const x = ref<Record<string, any>>({}); const err = ref(''); const f = useQueryObj(ref<any>({ name: '', account_id: '', platform: '', limit: 200 }), ['name', 'account_id', 'platform']); const dlg = ref(''); const form = ref<any>({})
 async function load() { err.value = ''; try { const [e, s] = await Promise.all([get('/v1/server/analytics/events' + qs({ name: f.value.name || undefined, account_id: f.value.account_id || undefined, platform: f.value.platform || undefined, limit: f.value.limit })), get('/v1/server/analytics/schemas').catch(() => ({ schemas: [] }))]); x.value.e = e; x.value.s = s } catch (e: any) { err.value = e.message } }
 onMounted(load)
 const ask = (m: string) => window.confirm(m)
