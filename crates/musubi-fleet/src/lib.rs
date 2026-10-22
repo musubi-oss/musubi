@@ -3748,6 +3748,20 @@ impl FleetService {
         Ok(rows.into_iter().map(row_to_server).collect())
     }
 
+    /// Every non-terminated server of a fleet: what the reconciler needs. Terminated rows stay
+    /// for history and retention, and a fleet accumulates them — reading them every cycle made
+    /// `ServerRow` decoding ~5 % of an idle node.
+    pub async fn live_servers(&self, fleet_id: Uuid) -> Result<Vec<GameServer>> {
+        let rows = sqlx::query_as::<_, ServerRow>(&format!(
+            "select {SERVER_COLS} from musubi.game_servers where fleet_id = $1 and state <> 'terminated' order by created_at"
+        ))
+        .bind(fleet_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        Ok(rows.into_iter().map(row_to_server).collect())
+    }
+
     pub async fn server(&self, id: Uuid) -> Result<GameServer> {
         sqlx::query_as::<_, ServerRow>(&format!(
             "select {SERVER_COLS} from musubi.game_servers where id = $1"
@@ -5622,7 +5636,7 @@ impl FleetService {
                 tracing::warn!(fleet = %f.id, error = %e, "reservation expiry failed");
             }
             let provider = self.provider_of(&f.provider);
-            let servers = self.servers(f.id, None).await?;
+            let servers = self.live_servers(f.id).await?;
             let now = OffsetDateTime::now_utc();
             for s in servers.iter().filter(|s| s.state != "terminated") {
                 let mine = s.node_id == Some(self.node_id);
@@ -5654,7 +5668,7 @@ impl FleetService {
                     reaped += 1;
                 }
             }
-            let servers = self.servers(f.id, None).await?;
+            let servers = self.live_servers(f.id).await?;
             let surge = match self.advance_rollout(&f, &servers).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -5662,7 +5676,7 @@ impl FleetService {
                     0
                 }
             };
-            let servers = self.servers(f.id, None).await?;
+            let servers = self.live_servers(f.id).await?;
             let live = servers.iter().filter(|s| s.state != "terminated").count() as i32;
             let available = servers
                 .iter()
