@@ -21611,7 +21611,27 @@ async fn world_cells_offload_automatically() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
-    assert_eq!(owned, 2, "entities not adopted by the new host");
+    if owned != 2 {
+        // the flake is rare and CI-only: say where the entities ended up, not just how many
+        let mut dump = String::new();
+        for (router, who, cell) in [
+            (&router2, "peer", "1/0"),
+            (&router1, "home", "1/0"),
+            (&router1, "home", "0/0"),
+        ] {
+            let (st, v) = http_json(
+                router,
+                "GET",
+                &format!("/v1/server/worlds/{name}/view/{cell}"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            dump.push_str(&format!("\n{who} view {cell}: {st} {v}"));
+        }
+        panic!("entities not adopted by the new host: owned={owned}{dump}");
+    }
     // the cell with one entity stays home: the remaining cost is under the threshold's reach
     let (st, view) = http_json(
         &router1,
