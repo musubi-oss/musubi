@@ -3,7 +3,7 @@
   "Version": 1,
   "VersionName": "0.1.0",
   "FriendlyName": "Musubi",
-  "Description": "Client for the Musubi game backend: auth, realtime socket (matches, parties, chat, presence), server meshing deltas, LiveOps flags, voice tokens.",
+  "Description": "Client for the Musubi game backend: auth, typed realtime socket, facades (presence, storage, rpc, notifications, chat, matchmaker, parties, matches, streams), seamless-world view (MusubiWorld).",
   "Category": "Networking",
   "CreatedBy": "musubi-oss",
   "CreatedByURL": "https://github.com/musubi-oss/musubi",
@@ -11,6 +11,7 @@
   "EngineVersion": "5.3.0",
   "CanContainContent": false,
   "Modules": [
-    { "Name": "Musubi", "Type": "Runtime", "LoadingPhase": "Default" }
+    { "Name": "Musubi", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "MusubiWorld", "Type": "Runtime", "LoadingPhase": "Default" }
   ]
 }

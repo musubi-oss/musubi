@@ -48,12 +48,6 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Musubi|Match")
     void SendMatchData(const FString& MatchId, int64 OpCode, const TArray<uint8>& Data, bool bReliable = true);
 
-    UFUNCTION(BlueprintCallable, Category = "Musubi|World")
-    void SubscribeWorld(const FString& World, double X, double Y, double Radius);
-
-    UFUNCTION(BlueprintCallable, Category = "Musubi|World")
-    void SendWorldInput(const FString& World, const FString& EntityId, const FString& InputJson);
-
     /** Voice (Aurix) token for a party or a match; result arrives on OnVoiceGrant. */
     UFUNCTION(BlueprintCallable, Category = "Musubi|Voice")
     void RequestVoiceToken(const FString& PartyId, const FString& MatchId, const FString& DisplayName);

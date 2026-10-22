@@ -338,7 +338,8 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    rollback yet), streams — shipped as `UMusubiFacade` subsystems with C++ delegates and
    Blueprint wrappers; Blueprint latent nodes and the editor settings page are deferred to 8.
 3. World view: subscription driver, registry, actor/ISM sinks, interpolation, time scale,
-   bandwidth guard; demo map with the 10k meshbench world.
+   bandwidth guard — shipped as module `MusubiWorld`; the Mass sink moves to 6, the demo map
+   (editor content) to 8.
 4. Server module: sim loop over the stream, cell → level streaming, authority component,
    handover with physics state, ghosts as kinematics, interact/colocate, rewind ring.
 5. Rollback matches (input ring, tick hash, desync recovery) + prediction buffer.

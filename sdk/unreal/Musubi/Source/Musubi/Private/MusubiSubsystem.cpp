@@ -105,33 +105,6 @@ void UMusubiSubsystem::SendMatchData(const FString& MatchId, int64 OpCode, const
     Rt->Send(M);
 }
 
-void UMusubiSubsystem::SubscribeWorld(const FString& World, double X, double Y, double Radius)
-{
-    if (!Rt.IsValid()) return;
-    FMusubiClientMessage M;
-    M.Tag = EMusubiClientMessageTag::WorldSubscribe;
-    FMusubiClientMessageWorldSubscribe Body;
-    Body.world = World;
-    Body.x = X;
-    Body.y = Y;
-    Body.radius = Radius;
-    M.WorldSubscribe = MoveTemp(Body);
-    Rt->Send(M);
-}
-
-void UMusubiSubsystem::SendWorldInput(const FString& World, const FString& EntityId, const FString& InputJson)
-{
-    if (!Rt.IsValid()) return;
-    FMusubiClientMessage M;
-    M.Tag = EMusubiClientMessageTag::WorldInput;
-    FMusubiClientMessageWorldInput Body;
-    Body.world = World;
-    Body.entity = EntityId;
-    Body.input = FMusubiJson::FromText(InputJson);
-    M.WorldInput = MoveTemp(Body);
-    Rt->Send(M);
-}
-
 void UMusubiSubsystem::RequestVoiceToken(const FString& PartyId, const FString& MatchId, const FString& DisplayName)
 {
     if (!Http.IsValid()) return;

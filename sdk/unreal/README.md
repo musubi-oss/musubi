@@ -35,16 +35,44 @@ on reconnect). Each keeps a client-side cache, exposes C++ delegates and a Bluep
 | `UMusubiMatches` | `match_create/join/leave/data_send/host_transfer` → `match`, `match_data`, `match_presence`, `match_host` | joined matches with members, host, frame counters; rejoins with the original args (token / spectator / delay) |
 | `UMusubiStreams` | `stream_data` | per-stream watchers and frame counters |
 
-Worlds (`world_subscribe/unsubscribe/input` → `world_delta`) and rollback matches are the next phases
-(`docs/gdk-unreal.md` §4, §5); until then `UMusubiSubsystem` keeps the thin world wrappers.
+**World view** (module `MusubiWorld`, `docs/gdk-unreal.md` §4) — `UMusubiWorldComponent` on the local pawn
+or camera owner:
+
+- *Interest driver*: `world_subscribe` from the owner's position, re-sent after moving `radius × 0.25`
+  (or `ResubscribeDistance`) or every 5 s; `radius = max(ViewDistance, 2 × CellSize)`, budget, component
+  filter, `max_hz` (default `min(fps, 30)`), `inside` via `OpenContainer/CloseContainer`.
+- *Registry*: `TMap<FMusubiUuid, FMusubiEntityRecord>`; a delta applies despawned → spawned → updated;
+  a spawn for a known id is a re-sync; an update for an unknown id waits `UnknownUpdateGraceTicks` for
+  its spawn; sequenced (unreliable) frames apply only when newer than everything applied and never
+  spawn/despawn; a component with `version <= known` is ignored (handover re-sends).
+- *Interpolation*: a playback clock in authoritative ticks runs `DeltaTime × TickHz × time_scale`
+  (`TickHz` measured from the deltas), renders `InterpolationDelayTicks` behind, extrapolates at most
+  one tick; `OnTimeScaleChanged` for a dilation indicator. Position = wire `x, y` (cm) + height from
+  the `z` component, yaw from the `yaw` component or the movement direction.
+- *Sinks*: `UMusubiEntityMapping` asset (first matching rule: `component [== value] → actor class |
+  instanced mesh | none`). Actors are pooled per class (`PoolSize`) and carry a `UMusubiEntityComponent`
+  (components as JSON, `OnComponentChanged`, `OnEntityReady`, `OnEntityDespawned`); instanced entities go
+  to one `UInstancedStaticMeshComponent` per mesh with a free-list of slots and one
+  `BatchUpdateInstancesTransforms` per frame.
+- *Reconnect*: the node starts a fresh interest, so the registry is marked stale and whatever the
+  keyframe does not mention within `ReconnectOrphanGraceSec` is despawned. *Bandwidth guard*: radius
+  shrinks ×0.8 while late/lost frames stay above `GuardLateFramesPerSec` for 3 s, grows back ×1.1/s.
+- `SetLocalEntity(id)` + `SendInput(json)` for the player's own entity (prediction/reconcile buffer
+  comes with rollback matches, §5). `OnStats` once a second: entities, actors, instances, deltas/s,
+  sequenced/s, late/s, tick rate, time scale, radius.
+
+Rollback matches, the server module and the Iris bridge are the next phases (§5–§7).
 
 ## Status / caveats
 
-- Not yet: Blueprint latent (`K2_`) twins of the request calls, the editor settings page, world view,
-  server module, Iris bridge, QUIC.
+- Not yet: Blueprint latent (`K2_`) twins of the request calls, the editor settings page, the Mass
+  sink, a demo map (needs the editor; the 10k meshbench world is the intended content), server module,
+  Iris bridge, QUIC.
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
   Core/Json). The facades reference engine types the shim does not model (UObject, HTTP, WebSockets)
-  and have **not been compiled by UBT yet** — the 5.3/5.7/5.8 compile matrix is phase 8. Engine APIs
-  they use were checked against the 5.3.2 / 5.7.4 / 5.8.4 sources (`FSubsystemCollectionBase::
-  InitializeDependency<T>()`, `IWebSocket`, `FHttpModule`, `FTSTicker`), but a build error report is
+  and have **not been compiled by UBT yet** — the 5.3/5.7/5.8 compile matrix is phase 8; the same goes
+  for `MusubiWorld`. Engine APIs they use were checked against the 5.3.2 / 5.7.4 / 5.8.4 sources
+  (`FSubsystemCollectionBase::InitializeDependency<T>()`, `IWebSocket`, `FHttpModule`, `FTSTicker`,
+  `UInstancedStaticMeshComponent::AddInstance/UpdateInstanceTransform/BatchUpdateInstancesTransforms`,
+  `UWorld::SpawnActor`; `TArray` shrink arguments kept to the 5.3 form), but a build error report is
   still the most useful issue you can file.
