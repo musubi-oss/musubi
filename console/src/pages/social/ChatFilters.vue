@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { api, get, put } from '../../api/client'
 import Drawer from '../../components/Drawer.vue'
@@ -13,6 +15,7 @@ async function del(x: any) { try { await api('DELETE', `/v1/admin/chat/filters/$
 function matches(x: any, text: string) { if (!text) return false; try { return x.kind === 'regex' ? new RegExp(x.pattern, 'i').test(text) : text.toLowerCase().split(/\W+/).includes(String(x.pattern).toLowerCase()) } catch { return false } }
 const hits = computed(() => filters.value.filter((x) => x.enabled !== false && matches(x, sample.value)))
 const preview = computed(() => { let t = sample.value; for (const x of hits.value) { if (x.action === 'block') return '⟂ message blocked'; try { t = x.kind === 'regex' ? t.replace(new RegExp(x.pattern, 'gi'), x.replacement ?? '***') : t.replace(new RegExp(`\\b${x.pattern}\\b`, 'gi'), x.replacement ?? '***') } catch {} } return t })
+const pg1 = usePager(() => filters)
 </script>
 <template>
   <div class="crumb"><span>Chat filters</span><span class="id">{{ filters.filter((x) => x.enabled !== false).length }} active of {{ filters.length }}</span><span style="margin-left:auto"><button class="btn s p" @click="edit(null)">Add filter</button></span></div>
@@ -20,8 +23,8 @@ const preview = computed(() => { let t = sample.value; for (const x of hits.valu
   <div class="card">
     <p class="note">Filters run on every chat message in order: <b>mask</b> replaces the match, <b>block</b> drops the message, <b>flag</b> delivers it but opens a chat report for moderators.</p>
     <table><thead><tr><th style="width:80px">Kind</th><th>Pattern</th><th style="width:90px">Action</th><th style="width:120px">Replacement</th><th>Note</th><th style="width:80px">Enabled</th><th style="width:110px"></th></tr></thead><tbody>
-      <tr v-for="x in filters" :key="x.id" :class="{ on: hits.includes(x) }"><td>{{ x.kind }}</td><td class="m row" @click="edit(x)">{{ x.pattern }}</td><td :class="{ bad: x.action === 'block' }">{{ x.action }}</td><td class="m dim">{{ x.action === 'mask' ? (x.replacement ?? '***') : '' }}</td><td class="dim">{{ x.note }}</td><td :class="x.enabled === false ? 'dim' : 'ok'">{{ x.enabled === false ? 'no' : 'yes' }}</td><td><button class="btn s" @click="edit(x)">Edit</button> <button class="btn s" @click="ask('Delete filter?') && del(x)">×</button></td></tr>
-      <tr v-if="!filters.length"><td colspan="7" class="empty">No filters — chat is unfiltered</td></tr></tbody></table>
+      <tr v-for="x in pg1.rows" :key="x.id" :class="{ on: hits.includes(x) }"><td>{{ x.kind }}</td><td class="m row" @click="edit(x)">{{ x.pattern }}</td><td :class="{ bad: x.action === 'block' }">{{ x.action }}</td><td class="m dim">{{ x.action === 'mask' ? (x.replacement ?? '***') : '' }}</td><td class="dim">{{ x.note }}</td><td :class="x.enabled === false ? 'dim' : 'ok'">{{ x.enabled === false ? 'no' : 'yes' }}</td><td><button class="btn s" @click="edit(x)">Edit</button> <button class="btn s" @click="ask('Delete filter?') && del(x)">×</button></td></tr>
+      <tr v-if="!filters.length"><td colspan="7" class="empty">No filters — chat is unfiltered</td></tr></tbody></table><Pager :p="pg1" />
     <h3>Try a message <small>(evaluated locally with the same patterns)</small></h3>
     <input class="in" v-model="sample" placeholder="type a message to see which filters fire" />
     <p class="dim" style="margin-top:6px" v-if="sample">{{ hits.length ? `${hits.length} filter(s) fire → ` : 'no filter fires → ' }}<span class="m">{{ preview }}</span></p>

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { api, get, post, put } from '../../api/client'
 import Drawer from '../../components/Drawer.vue'
@@ -15,6 +17,7 @@ async function update() { try { await post('/v1/server/stats/update', { ...upd.v
 async function del(x: any) { try { await api('DELETE', `/v1/server/stats/defs/${encodeURIComponent(x.id)}`); toast.show('deleted'); load() } catch (e: any) { toast.err(e) } }
 async function top(x: any) { board.value = null; try { board.value = await get(`/v1/server/leaderboards/${encodeURIComponent(x.id)}?limit=20`) } catch { board.value = await get(`/v1/server/stats/${encodeURIComponent(x.id)}/top?limit=20`).catch((e) => ({ error: e.message })) } }
 const kinds = [['int', 'int — counter / score'], ['float', 'float'], ['max', 'max — keeps the highest value'], ['min', 'min — keeps the lowest'], ['avgrate', 'avgrate — rolling average per window'], ['set', 'set — last written value']]
+const pg1 = usePager(() => view)
 </script>
 <template>
   <div class="crumb"><span>Stats &amp; leaderboards</span><span class="id">{{ defs.length }} definitions</span>
@@ -23,9 +26,9 @@ const kinds = [['int', 'int — counter / score'], ['float', 'float'], ['max', '
   <div class="card">
     <p class="note">A stat definition is also a leaderboard: every stat ranks players unless private. Cycles create periodic boards (daily / weekly / seasonal) that reset and archive.</p>
     <table><thead><tr><th>Id / name</th><th style="width:90px">Kind</th><th style="width:90px">Scope</th><th style="width:90px">Visibility</th><th style="width:150px">Rules</th><th style="width:140px">Cycles</th><th style="width:170px"></th></tr></thead><tbody>
-      <tr v-for="x in view" :key="x.id"><td class="row" @click="edit(x)"><span class="m">{{ x.id }}</span><span class="dim" v-if="x.name"> — {{ x.name }}</span></td><td>{{ x.kind }}{{ x.kind === 'avgrate' && x.window_secs ? ` / ${x.window_secs}s` : '' }}</td><td class="dim">{{ x.global ? 'global' : 'per player' }}</td><td :class="{ dim: x.visibility !== 'public' }">{{ x.visibility }}</td><td class="dim">{{ [x.increment_only ? 'increment only' : null, x.client_writable ? 'client writes' : null, x.min_value != null || x.max_value != null ? `${x.min_value ?? '−∞'}…${x.max_value ?? '∞'}` : null, x.max_change != null ? `Δ≤${x.max_change}` : null].filter(Boolean).join(' · ') || '—' }}</td><td class="dim">{{ (x.cycles ?? []).map((c: any) => typeof c === 'string' ? c : c.name ?? c.period).join(', ') || '—' }}</td>
+      <tr v-for="x in pg1.rows" :key="x.id"><td class="row" @click="edit(x)"><span class="m">{{ x.id }}</span><span class="dim" v-if="x.name"> — {{ x.name }}</span></td><td>{{ x.kind }}{{ x.kind === 'avgrate' && x.window_secs ? ` / ${x.window_secs}s` : '' }}</td><td class="dim">{{ x.global ? 'global' : 'per player' }}</td><td :class="{ dim: x.visibility !== 'public' }">{{ x.visibility }}</td><td class="dim">{{ [x.increment_only ? 'increment only' : null, x.client_writable ? 'client writes' : null, x.min_value != null || x.max_value != null ? `${x.min_value ?? '−∞'}…${x.max_value ?? '∞'}` : null, x.max_change != null ? `Δ≤${x.max_change}` : null].filter(Boolean).join(' · ') || '—' }}</td><td class="dim">{{ (x.cycles ?? []).map((c: any) => typeof c === 'string' ? c : c.name ?? c.period).join(', ') || '—' }}</td>
         <td><button class="btn s" @click="edit(x)">Edit</button> <button class="btn s" v-if="x.visibility !== 'private'" @click="top(x)">Top 20</button> <button class="btn s" @click="ask(`Delete stat ${x.id} and its leaderboard?`) && del(x)">×</button></td></tr>
-      <tr v-if="!view.length"><td colspan="7" class="empty">No stat definitions</td></tr></tbody></table>
+      <tr v-if="!view.length"><td colspan="7" class="empty">No stat definitions</td></tr></tbody></table><Pager :p="pg1" />
     <template v-if="board"><h3>Leaderboard</h3><JsonView :value="board" /></template>
   </div>
   <Drawer v-if="dlg === 'edit'" :title="isNew ? 'New stat' : `Stat ${d.id}`" @close="dlg = ''"><div class="form">

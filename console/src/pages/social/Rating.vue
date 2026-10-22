@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, onMounted } from 'vue'
 import { api, get, post, put } from '../../api/client'
 import Drawer from '../../components/Drawer.vue'
@@ -12,6 +14,7 @@ async function save() { try { const { id, created_at: _c, updated_at: _u, season
 async function act(fn: () => Promise<any>, ok: string) { try { await fn(); toast.show(ok); dlg.value = ''; load() } catch (x: any) { toast.err(x) } }
 const days = (s: any) => s ? `${Math.round(s / 86400)} d` : 'off'
 const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 16) : '—'
+const pg1 = usePager(() => queues)
 </script>
 <template>
   <div class="crumb"><span>Rating queues</span><span class="id">{{ queues.length }} · skill ratings per matchmaking queue</span><span style="margin-left:auto"><button class="btn s p" @click="edit(null)">New rating queue</button></span></div>
@@ -19,9 +22,9 @@ const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 16) : '—'
   <div class="card">
     <p class="note">Match results reported for a queue update each player's rating with the chosen system; placement games use a larger K, inactive players decay, seasons soft-reset towards the initial rating.</p>
     <table><thead><tr><th>Queue</th><th style="width:100px">System</th><th style="width:70px">Season</th><th>Parameters</th><th style="width:170px">Decay</th><th style="width:140px">Updated</th><th style="width:230px"></th></tr></thead><tbody>
-      <tr v-for="x in queues" :key="x.id"><td class="m row" @click="edit(x)">{{ x.id }}</td><td>{{ x.system }}</td><td>{{ x.season }}</td><td class="dim">{{ x.system === 'elo' ? `K ${x.params?.elo_k}` : x.system === 'glicko2' ? `τ ${x.params?.glicko_tau}` : `β ${x.params?.openskill_beta ?? '—'}` }} · placement {{ x.params?.placement_games ?? 0 }} games ×{{ x.params?.placement_k_mult ?? 1 }} · carry {{ x.params?.season_carry ?? 0 }}</td><td class="dim">{{ x.params?.decay_after_secs ? `after ${days(x.params.decay_after_secs)}, −${x.params.decay_points} every ${days(x.params.decay_every_secs)}${x.params.decay_floor != null ? ` to ${x.params.decay_floor}` : ''}` : 'off' }}</td><td class="dim">{{ ts(x.updated_at) }}</td>
+      <tr v-for="x in pg1.rows" :key="x.id"><td class="m row" @click="edit(x)">{{ x.id }}</td><td>{{ x.system }}</td><td>{{ x.season }}</td><td class="dim">{{ x.system === 'elo' ? `K ${x.params?.elo_k}` : x.system === 'glicko2' ? `τ ${x.params?.glicko_tau}` : `β ${x.params?.openskill_beta ?? '—'}` }} · placement {{ x.params?.placement_games ?? 0 }} games ×{{ x.params?.placement_k_mult ?? 1 }} · carry {{ x.params?.season_carry ?? 0 }}</td><td class="dim">{{ x.params?.decay_after_secs ? `after ${days(x.params.decay_after_secs)}, −${x.params.decay_points} every ${days(x.params.decay_every_secs)}${x.params.decay_floor != null ? ` to ${x.params.decay_floor}` : ''}` : 'off' }}</td><td class="dim">{{ ts(x.updated_at) }}</td>
         <td><button class="btn s" @click="edit(x)">Edit</button> <button class="btn s" @click="sel = x; dlg = 'season'; soft = true">New season</button> <button class="btn s" @click="act(() => post(`/v1/server/rating/queues/${encodeURIComponent(x.id)}/decay`), 'decay applied')">Decay now</button> <button class="btn s" @click="ask(`Delete rating queue ${x.id} and every rating in it?`) && act(() => api('DELETE', `/v1/server/rating/queues/${encodeURIComponent(x.id)}`), 'deleted')">×</button></td></tr>
-      <tr v-if="!queues.length"><td colspan="7" class="empty">No rating queues</td></tr></tbody></table>
+      <tr v-if="!queues.length"><td colspan="7" class="empty">No rating queues</td></tr></tbody></table><Pager :p="pg1" />
   </div>
   <Drawer v-if="dlg === 'edit'" :title="isNew ? 'New rating queue' : `Rating ${q.id}`" @close="dlg = ''"><div class="form">
     <div class="f"><label>Queue id (matches the matchmaking queue name)</label><input class="in m" v-model="q.id" :disabled="!isNew" /></div>

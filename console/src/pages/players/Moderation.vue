@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { api, get, post, qs } from '../../api/client'
@@ -26,6 +28,9 @@ async function submitDecision() { const b: any = { status: 'resolved', decision:
 function decideChat(r: any) { sel.value = r; form.value = { action: 'mute', duration_h: 1, note: '' }; dlg.value = 'chat' }
 const ts = (v: any) => !v ? '—' : (typeof v === 'number' ? new Date(v * 1000) : new Date(v)).toISOString().replace('T', ' ').slice(0, 16)
 const short = (s: any) => s ? String(s).slice(0, 8) + '…' : '—'
+const pg3 = usePager(() => reports)
+const pg2 = usePager(() => chat)
+const pg1 = usePager(() => bans)
 </script>
 <template>
   <div class="crumb"><span>Moderation</span><span class="id">reports · chat reports · bans · automatic rules</span>
@@ -36,21 +41,21 @@ const short = (s: any) => s ? String(s).slice(0, 8) + '…' : '—'
     <template v-if="tab === 'reports'">
       <div style="display:flex;gap:8px;margin-bottom:10px"><select class="sel" v-model="rf.status" @change="load()"><option value="open">open</option><option value="resolved">resolved</option><option value="dismissed">dismissed</option><option value="">any status</option></select><input class="in" v-model="rf.category" placeholder="category (spam, cheating, …)" @keyup.enter="load()" style="width:220px" /><button class="btn s" @click="load()">Apply</button></div>
       <table><thead><tr><th style="width:140px">Created</th><th>Target</th><th>Reporter</th><th style="width:110px">Category</th><th>Details</th><th style="width:90px">Status</th><th>Decision</th><th style="width:120px"></th></tr></thead><tbody>
-        <tr v-for="r in reports" :key="r.id"><td class="dim">{{ ts(r.created_at) }}</td><td class="m row" @click="router.push(`/players/accounts/${r.target_id}?tab=bans`)">{{ short(r.target_id) }}</td><td class="m dim row" @click="router.push(`/players/accounts/${r.reporter_id}`)">{{ short(r.reporter_id) }}</td><td>{{ r.category }}</td><td class="dim">{{ r.details || (Object.keys(r.evidence ?? {}).length ? 'evidence attached' : '') }}</td><td :class="{ ok: r.status === 'open' }">{{ r.status }}</td><td class="dim">{{ r.decision ?? '' }}{{ r.decided_by ? ` · ${r.decided_by}` : '' }}</td>
+        <tr v-for="r in pg3.rows" :key="r.id"><td class="dim">{{ ts(r.created_at) }}</td><td class="m row" @click="router.push(`/players/accounts/${r.target_id}?tab=bans`)">{{ short(r.target_id) }}</td><td class="m dim row" @click="router.push(`/players/accounts/${r.reporter_id}`)">{{ short(r.reporter_id) }}</td><td>{{ r.category }}</td><td class="dim">{{ r.details || (Object.keys(r.evidence ?? {}).length ? 'evidence attached' : '') }}</td><td :class="{ ok: r.status === 'open' }">{{ r.status }}</td><td class="dim">{{ r.decision ?? '' }}{{ r.decided_by ? ` · ${r.decided_by}` : '' }}</td>
           <td><template v-if="r.status === 'open'"><button class="btn s p" @click="decide(r)">Decide</button> <button class="btn s" @click="act(() => post(`/v1/admin/reports/${r.id}`, { status: 'dismissed', decision: 'no evidence' }), 'dismissed')">Dismiss</button></template></td></tr>
-        <tr v-if="!reports.length"><td colspan="8" class="empty">No reports match</td></tr></tbody></table>
+        <tr v-if="!reports.length"><td colspan="8" class="empty">No reports match</td></tr></tbody></table><Pager :p="pg3" />
       <div class="row" style="margin-top:8px" v-if="cursor"><button class="btn s" @click="load(true)">Load more</button></div>
     </template>
     <template v-else-if="tab === 'chat'">
       <table><thead><tr><th style="width:140px">Created</th><th>Channel</th><th>Target</th><th>Reporter</th><th style="width:100px">Reason</th><th style="width:90px">Status</th><th>Context</th><th style="width:100px"></th></tr></thead><tbody>
-        <tr v-for="r in chat" :key="r.id"><td class="dim">{{ ts(r.created_at) }}</td><td class="m dim">{{ short(r.channel_id) }}</td><td class="m row" @click="router.push(`/players/accounts/${r.target_id}`)">{{ short(r.target_id) }}</td><td class="m dim">{{ short(r.reporter_id) }}</td><td>{{ r.reason }}</td><td :class="{ ok: (r.status ?? 'open') === 'open' }">{{ r.status ?? 'open' }}</td><td class="dim" style="white-space:pre-wrap">{{ (r.context ?? []).slice(-3).map((m: any) => `${short(m.sender_id ?? m.account_id)}: ${m.content ?? m.text ?? ''}`).join('\n') }}</td><td><button class="btn s p" v-if="(r.status ?? 'open') === 'open'" @click="decideChat(r)">Decide</button></td></tr>
-        <tr v-if="!chat.length"><td colspan="8" class="empty">No chat reports</td></tr></tbody></table>
+        <tr v-for="r in pg2.rows" :key="r.id"><td class="dim">{{ ts(r.created_at) }}</td><td class="m dim">{{ short(r.channel_id) }}</td><td class="m row" @click="router.push(`/players/accounts/${r.target_id}`)">{{ short(r.target_id) }}</td><td class="m dim">{{ short(r.reporter_id) }}</td><td>{{ r.reason }}</td><td :class="{ ok: (r.status ?? 'open') === 'open' }">{{ r.status ?? 'open' }}</td><td class="dim" style="white-space:pre-wrap">{{ (r.context ?? []).slice(-3).map((m: any) => `${short(m.sender_id ?? m.account_id)}: ${m.content ?? m.text ?? ''}`).join('\n') }}</td><td><button class="btn s p" v-if="(r.status ?? 'open') === 'open'" @click="decideChat(r)">Decide</button></td></tr>
+        <tr v-if="!chat.length"><td colspan="8" class="empty">No chat reports</td></tr></tbody></table><Pager :p="pg2" />
     </template>
     <template v-else-if="tab === 'bans'">
       <div style="display:flex;gap:8px;margin-bottom:10px"><input class="in" v-model="bf.q" placeholder="username / account id" @keyup.enter="load()" style="width:240px" /><select class="sel" v-model="bf.shadow" @change="load()"><option value="all">all bans</option><option value="shadow">shadow only</option><option value="hard">hard only</option></select><span class="dim" style="align-self:center">{{ bansTotal }} total</span></div>
       <table><thead><tr><th>Player</th><th style="width:110px">Kind</th><th>Reason</th><th style="width:140px">Until</th><th style="width:120px">By</th><th style="width:140px">Created</th><th style="width:80px"></th></tr></thead><tbody>
-        <tr v-for="b in bans" :key="b.account_id + b.created_at"><td class="row" @click="router.push(`/players/accounts/${b.account_id}?tab=bans`)">{{ b.username ?? short(b.account_id) }}</td><td :class="{ dim: !b.shadow }">{{ b.shadow ? 'shadow' : 'hard' }}{{ (b.features ?? []).length ? ` · ${b.features.join(', ')}` : '' }}</td><td class="dim">{{ b.reason_code ? b.reason_code + ' — ' : '' }}{{ b.reason ?? b.message ?? '' }}</td><td class="dim">{{ b.until ? ts(b.until) : 'permanent' }}</td><td class="dim">{{ b.actor }}</td><td class="dim">{{ ts(b.created_at) }}</td><td><button class="btn s" @click="ask('Lift this ban?') && act(() => post(`/v1/admin/accounts/${b.account_id}/unban`), 'unbanned')">Unban</button></td></tr>
-        <tr v-if="!bans.length"><td colspan="7" class="empty">No bans</td></tr></tbody></table>
+        <tr v-for="b in pg1.rows" :key="b.account_id + b.created_at"><td class="row" @click="router.push(`/players/accounts/${b.account_id}?tab=bans`)">{{ b.username ?? short(b.account_id) }}</td><td :class="{ dim: !b.shadow }">{{ b.shadow ? 'shadow' : 'hard' }}{{ (b.features ?? []).length ? ` · ${b.features.join(', ')}` : '' }}</td><td class="dim">{{ b.reason_code ? b.reason_code + ' — ' : '' }}{{ b.reason ?? b.message ?? '' }}</td><td class="dim">{{ b.until ? ts(b.until) : 'permanent' }}</td><td class="dim">{{ b.actor }}</td><td class="dim">{{ ts(b.created_at) }}</td><td><button class="btn s" @click="ask('Lift this ban?') && act(() => post(`/v1/admin/accounts/${b.account_id}/unban`), 'unbanned')">Unban</button></td></tr>
+        <tr v-if="!bans.length"><td colspan="7" class="empty">No bans</td></tr></tbody></table><Pager :p="pg1" />
     </template>
     <template v-else>
       <p class="note">Rules act automatically when a player crosses a threshold inside the window: ban, shadow-ban or mute, for the given duration.</p>

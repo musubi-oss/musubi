@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { api, get, qs } from '../../api/client'
 import Kv from '../../components/Kv.vue'
@@ -13,6 +15,7 @@ async function pick(g: any) { sel.value = g; notes.value = g.notes ?? ''; sample
 async function patch(g: any, b: any, ok: string) { try { await api('PATCH', `/v1/server/crashes/${g.fingerprint}`, b); toast.show(ok); load() } catch (x: any) { toast.err(x) } }
 async function del(g: any) { try { await api('DELETE', `/v1/server/crashes/${g.fingerprint}`); toast.show('deleted'); sel.value = null; load() } catch (x: any) { toast.err(x) } }
 const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 16) : '—'
+const pg1 = usePager(() => view)
 </script>
 <template>
   <div class="crumb"><span>Crash reports</span><span class="id">{{ total }} groups · grouped by stack fingerprint</span>
@@ -21,8 +24,8 @@ const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 16) : '—'
   <div style="display:grid;grid-template-columns:3fr 2fr;gap:12px">
     <div class="card">
       <table><thead><tr><th>Title</th><th style="width:70px">Kind</th><th style="width:70px">Count</th><th style="width:120px">Versions</th><th style="width:130px">Last seen</th><th style="width:90px">Status</th></tr></thead><tbody>
-        <tr v-for="g in view" :key="g.fingerprint" class="row" :class="{ on: sel?.fingerprint === g.fingerprint }" @click="pick(g)"><td>{{ g.title }}<div class="dim m" style="font-size:11px">{{ g.fingerprint }}{{ g.assignee ? ` · ${g.assignee}` : '' }}</div></td><td class="dim">{{ g.kind }}</td><td>{{ g.count }}</td><td class="dim">{{ g.first_version === g.last_version ? g.last_version : `${g.first_version} → ${g.last_version}` }}</td><td class="dim">{{ ts(g.last_seen) }}</td><td :class="{ dim: g.status !== 'open' }">{{ g.status }}{{ g.resolved_in_version ? ` in ${g.resolved_in_version}` : '' }}</td></tr>
-        <tr v-if="!view.length"><td colspan="6" class="empty">No crash groups</td></tr></tbody></table>
+        <tr v-for="g in pg1.rows" :key="g.fingerprint" class="row" :class="{ on: sel?.fingerprint === g.fingerprint }" @click="pick(g)"><td>{{ g.title }}<div class="dim m" style="font-size:11px">{{ g.fingerprint }}{{ g.assignee ? ` · ${g.assignee}` : '' }}</div></td><td class="dim">{{ g.kind }}</td><td>{{ g.count }}</td><td class="dim">{{ g.first_version === g.last_version ? g.last_version : `${g.first_version} → ${g.last_version}` }}</td><td class="dim">{{ ts(g.last_seen) }}</td><td :class="{ dim: g.status !== 'open' }">{{ g.status }}{{ g.resolved_in_version ? ` in ${g.resolved_in_version}` : '' }}</td></tr>
+        <tr v-if="!view.length"><td colspan="6" class="empty">No crash groups</td></tr></tbody></table><Pager :p="pg1" />
     </div>
     <div class="card" v-if="sel">
       <h3 style="margin-top:0">{{ sel.title }}</h3>

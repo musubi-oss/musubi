@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, onMounted, onUnmounted } from 'vue'
 import { api, get, post } from '../../api/client'
 import Kv from '../../components/Kv.vue'
@@ -16,6 +18,7 @@ const ts = (v: any) => v ? new Date(v * 1000).toISOString().replace('T', ' ').sl
 const pct = (r: any) => r.report?.errors?.rate_pct
 const lat = (r: any, k: string) => r.report?.[k]?.p95 ?? r.report?.latency?.[k]?.p95
 const start = () => act(() => post('/v1/admin/dev/loadtests', { ...f.value, url: f.value.url || null, bots: Number(f.value.bots), ramp_secs: Number(f.value.ramp_secs), duration_secs: Number(f.value.duration_secs), rate_hz: Number(f.value.rate_hz), match_size: Number(f.value.match_size), payload_bytes: Number(f.value.payload_bytes) }), 'load test started')
+const pg1 = usePager(() => runs)
 </script>
 <template>
   <div class="crumb"><span>Load tests</span><span class="id">{{ runs.length }} runs{{ active ? ` · running: ${active.name ?? active.id}` : '' }}</span><span style="margin-left:auto;display:flex;gap:8px"><button class="btn s" v-if="active" @click="act(() => post(`/v1/admin/dev/loadtests/${active.id}/stop`), 'stopping')">Stop running</button><button class="btn s p" :disabled="!!active" @click="dlg = 'new'">New run</button></span></div>
@@ -23,9 +26,9 @@ const start = () => act(() => post('/v1/admin/dev/loadtests', { ...f.value, url:
   <div class="card">
     <p class="note">Bots are spawned by this node against itself (or <i>url</i>): they log in, then run the scenario at <i>rate</i> — ping (realtime echo), chat (channel messages), match (matchmaking tickets → match), rpc (server RPC), custom (module hook). Reports keep connect / request latency percentiles and error rates; compare two runs to catch regressions in CI.</p>
     <table><thead><tr><th>Name</th><th style="width:80px">Scenario</th><th style="width:70px">Bots</th><th style="width:90px">Duration</th><th style="width:110px">Connect p95</th><th style="width:110px">Request p95</th><th style="width:90px">Errors</th><th style="width:140px">Started</th><th style="width:150px"></th></tr></thead><tbody>
-      <tr v-for="r in runs" :key="r.id" :class="{ on: sel?.id === r.id }"><td class="row" @click="sel = r; cmp = null; dlg = 'report'">{{ r.name }}<div class="dim m" style="font-size:11px">{{ r.node }}</div></td><td class="dim">{{ r.scenario ?? r.report?.scenario ?? '—' }}</td><td>{{ r.report?.bots?.requested ?? r.bots ?? '—' }}<span class="dim" v-if="r.report?.bots?.failed"> ({{ r.report.bots.failed }} failed)</span></td><td class="dim">{{ r.report?.duration_secs ?? '…' }} s</td><td class="dim">{{ lat(r, 'connect') != null ? lat(r, 'connect') + ' ms' : '—' }}</td><td class="dim">{{ lat(r, 'request') != null ? lat(r, 'request') + ' ms' : '—' }}</td><td :class="{ bad: pct(r) > 1 }">{{ pct(r) != null ? pct(r) + '%' : (r.finished_at ? '0%' : 'running') }}</td><td class="dim">{{ ts(r.created_at) }}</td>
+      <tr v-for="r in pg1.rows" :key="r.id" :class="{ on: sel?.id === r.id }"><td class="row" @click="sel = r; cmp = null; dlg = 'report'">{{ r.name }}<div class="dim m" style="font-size:11px">{{ r.node }}</div></td><td class="dim">{{ r.scenario ?? r.report?.scenario ?? '—' }}</td><td>{{ r.report?.bots?.requested ?? r.bots ?? '—' }}<span class="dim" v-if="r.report?.bots?.failed"> ({{ r.report.bots.failed }} failed)</span></td><td class="dim">{{ r.report?.duration_secs ?? '…' }} s</td><td class="dim">{{ lat(r, 'connect') != null ? lat(r, 'connect') + ' ms' : '—' }}</td><td class="dim">{{ lat(r, 'request') != null ? lat(r, 'request') + ' ms' : '—' }}</td><td :class="{ bad: pct(r) > 1 }">{{ pct(r) != null ? pct(r) + '%' : (r.finished_at ? '0%' : 'running') }}</td><td class="dim">{{ ts(r.created_at) }}</td>
         <td><button class="btn s" @click="sel = r; cmp = null; dlg = 'report'">Report</button> <button class="btn s" v-if="!r.finished_at" @click="act(() => post(`/v1/admin/dev/loadtests/${r.id}/stop`), 'stopping')">Stop</button> <button class="btn s" @click="ask('Delete this run?') && act(() => api('DELETE', `/v1/admin/dev/loadtests/${r.id}`), 'deleted')">×</button></td></tr>
-      <tr v-if="!runs.length"><td colspan="9" class="empty">No runs yet</td></tr></tbody></table>
+      <tr v-if="!runs.length"><td colspan="9" class="empty">No runs yet</td></tr></tbody></table><Pager :p="pg1" />
   </div>
   <Drawer v-if="dlg === 'new'" title="Start a load test" @close="dlg = ''"><div class="form">
     <div class="f" style="display:flex;gap:8px"><div style="flex:1"><label>Name</label><input class="in" v-model="f.name" /></div><div><label>Scenario</label><select class="sel" v-model="f.scenario"><option value="ping">ping</option><option value="chat">chat</option><option value="match">match</option><option value="rpc">rpc</option><option value="custom">custom</option></select></div></div>

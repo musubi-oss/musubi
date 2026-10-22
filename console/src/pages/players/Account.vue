@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, onMounted, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, get, post, qs } from '../../api/client'
@@ -54,6 +56,8 @@ async function exportJson() {
   try { const r: Response = await api('GET', `${A.value}/export`, undefined, { raw: true }); const b = await r.blob(); const u = URL.createObjectURL(b); const el = document.createElement('a'); el.href = u; el.download = `${id.value}.json`; el.click(); toast.show('exported') } catch (e: any) { toast.err(e) }
 }
 const list = (k: string, sub?: string) => { const v = x.value[k]; if (!v || v.error) return []; const a = sub ? v[sub] : Array.isArray(v) ? v : Object.values(v).find(Array.isArray); return Array.isArray(a) ? a : [] }
+const pg2 = usePager(() => list('notes'))
+const pg1 = usePager(() => list('timeline', 'items'))
 </script>
 <template>
   <div class="crumb"><router-link to="/players">Accounts</router-link> › <span>{{ acct?.account?.display_name || acct?.account?.username || id }}</span><span class="id">{{ id }}</span>
@@ -164,14 +168,14 @@ const list = (k: string, sub?: string) => { const v = x.value[k]; if (!v || v.er
     <template v-else-if="tab === 'notes'">
       <div class="tools"><button class="btn p" @click="openDlg('note')">Add note</button></div>
       <table><thead><tr><th style="width:170px">At</th><th style="width:160px">Author</th><th>Note</th><th style="width:60px"></th></tr></thead><tbody>
-        <tr v-for="n in list('notes')" :key="n.id"><td class="dim">{{ ts(n.created_at) }}</td><td>{{ n.author ?? n.actor }}</td><td style="white-space:pre-wrap">{{ n.text ?? n.body }}</td><td><button class="btn s d" @click="act(() => api('DELETE', `${A}/notes/${n.id}`), 'note deleted')">Delete</button></td></tr>
-        <tr v-if="!list('notes').length"><td colspan="4" class="empty">No Data</td></tr></tbody></table>
+        <tr v-for="n in pg2.rows" :key="n.id"><td class="dim">{{ ts(n.created_at) }}</td><td>{{ n.author ?? n.actor }}</td><td style="white-space:pre-wrap">{{ n.text ?? n.body }}</td><td><button class="btn s d" @click="act(() => api('DELETE', `${A}/notes/${n.id}`), 'note deleted')">Delete</button></td></tr>
+        <tr v-if="!list('notes').length"><td colspan="4" class="empty">No Data</td></tr></tbody></table><Pager :p="pg2" />
     </template>
 
     <template v-else-if="tab === 'timeline'">
       <table><thead><tr><th style="width:170px">At</th><th style="width:220px">Kind</th><th style="width:90px">Source</th><th>Summary</th></tr></thead><tbody>
-        <tr v-for="(it, i) in list('timeline', 'items')" :key="i"><td class="dim">{{ ts(it.at) }}</td><td class="m">{{ it.kind }}</td><td class="dim">{{ it.source }}</td><td class="m dim" style="white-space:pre-wrap;word-break:break-all">{{ it.summary }}</td></tr>
-        <tr v-if="!list('timeline', 'items').length"><td colspan="4" class="empty">No Data</td></tr></tbody></table>
+        <tr v-for="(it, i) in pg1.rows" :key="i"><td class="dim">{{ ts(it.at) }}</td><td class="m">{{ it.kind }}</td><td class="dim">{{ it.source }}</td><td class="m dim" style="white-space:pre-wrap;word-break:break-all">{{ it.summary }}</td></tr>
+        <tr v-if="!list('timeline', 'items').length"><td colspan="4" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
     </template>
   </div>
 

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, onMounted } from 'vue'
 import { api, get, post } from '../../api/client'
 import Kv from '../../components/Kv.vue'
@@ -18,6 +20,7 @@ async function act(fn: () => Promise<any>, ok: string) { try { await fn(); toast
 async function invite() { try { made.value = await post('/v1/admin/operators/invites', { email: form.value.email, role: form.value.role, expires_in_hours: form.value.hours || undefined }); toast.show('invite created'); load() } catch (e: any) { toast.err(e) } }
 const ts = (v: any) => v ? String(typeof v === 'number' ? new Date(v * 1000).toISOString() : v).replace('T', ' ').slice(0, 16) : '—'
 const inviteState = (i: any) => i.decided_at ? (i.accepted ? 'accepted' : 'declined') : i.expired ? 'expired' : 'pending'
+const pg1 = usePager(() => jwt.value?.keys ?? [])
 </script>
 <template>
   <div class="crumb"><span>Operators &amp; access</span><span style="margin-left:auto;display:flex;gap:8px"><button class="btn s p" @click="dlg = 'invite'; made = null; form = { email: '', role: 'support', hours: 72 }">Invite operator</button></span></div>
@@ -29,7 +32,7 @@ const inviteState = (i: any) => i.decided_at ? (i.accepted ? 'accepted' : 'decli
     <div class="card"><h3>Player JWT signing keys <small>({{ jwt?.keys?.length ?? 0 }})</small> <button class="btn s" style="margin-left:8px" @click="ask('Rotate: a new key becomes active, the old one keeps verifying until retired.') && act(() => post('/v1/admin/jwt/rotate'), 'rotated')">Rotate</button></h3>
       <template v-if="jwt"><Kv k="Active kid" :v="jwt.active" mono />
         <table><thead><tr><th>kid</th><th>Created</th><th>Retired</th><th></th></tr></thead><tbody>
-          <tr v-for="k in jwt.keys" :key="k.kid"><td class="m" :class="{ ok: k.kid === jwt.active }">{{ k.kid }}{{ k.kid === jwt.active ? ' · active' : '' }}</td><td class="dim">{{ ts(k.created_at) }}</td><td class="dim">{{ ts(k.retired_at) }}</td><td><button class="btn s d" v-if="k.kid !== jwt.active && !k.retired_at" @click="ask(`Retire ${k.kid}? Tokens signed with it stop verifying.`) && act(() => api('DELETE', `/v1/admin/jwt/keys/${k.kid}`), 'retired')">Retire</button></td></tr></tbody></table></template></div>
+          <tr v-for="k in pg1.rows" :key="k.kid"><td class="m" :class="{ ok: k.kid === jwt.active }">{{ k.kid }}{{ k.kid === jwt.active ? ' · active' : '' }}</td><td class="dim">{{ ts(k.created_at) }}</td><td class="dim">{{ ts(k.retired_at) }}</td><td><button class="btn s d" v-if="k.kid !== jwt.active && !k.retired_at" @click="ask(`Retire ${k.kid}? Tokens signed with it stop verifying.`) && act(() => api('DELETE', `/v1/admin/jwt/keys/${k.kid}`), 'retired')">Retire</button></td></tr></tbody></table><Pager :p="pg1" /></template></div>
   </div>
   <div class="card" style="margin-top:12px"><h3>Operators <small>({{ ops.length }})</small></h3>
     <DataTable :cols="[{ key: 'email', fmt: (r) => r.email ?? r.subject ?? r.id }, { key: 'name', fmt: (r) => r.name ?? '' }, { key: 'role' }, { key: 'source', fmt: (r) => r.source ?? r.provider ?? '', dim: true }, { key: 'last_login_at', fmt: (r) => ts(r.last_login_at ?? r.last_seen_at), dim: true }, { key: 'created_at', fmt: (r) => ts(r.created_at), dim: true }]" :rows="ops">

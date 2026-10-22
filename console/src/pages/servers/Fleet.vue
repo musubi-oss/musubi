@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, get, post } from '../../api/client'
@@ -45,6 +47,7 @@ function openDlg(k: typeof dlg.value) {
     : JSON.stringify(fleet.value?.spec ?? {}, null, 2)
 }
 const pct = (a: number, b: number) => (b ? Math.round((a / b) * 100) : 0)
+const pg1 = usePager(() => list('events', 'events'))
 </script>
 <template>
   <div class="crumb"><router-link to="/servers">Fleets</router-link> › <span>{{ fleet?.name || id }}</span><span class="id">{{ id }}</span>
@@ -156,8 +159,8 @@ const pct = (a: number, b: number) => (b ? Math.round((a / b) * 100) : 0)
       <DataTable :cols="[{ key: 'id', mono: true }, { key: 'cpu_pct' }, { key: 'mem_bytes' }, { key: 'tick_ms' }, { key: 'tick_p99_ms' }, { key: 'players' }, { key: 'at', fmt: (r) => ts(r.at), dim: true }]" :rows="list('metrics', 'servers')" />
       <h3>Events <small>({{ list('events', 'events').length }})</small></h3>
       <table><thead><tr><th style="width:170px">At</th><th style="width:220px">Kind</th><th>Payload</th></tr></thead><tbody>
-        <tr v-for="(e, i) in list('events', 'events')" :key="i"><td class="dim">{{ ts(e.at ?? e.created_at) }}</td><td class="m">{{ e.kind }}</td><td class="m dim" style="word-break:break-all">{{ JSON.stringify(e.payload ?? e.data ?? {}) }}</td></tr>
-        <tr v-if="!list('events', 'events').length"><td colspan="3" class="empty">No Data</td></tr></tbody></table>
+        <tr v-for="(e, i) in pg1.rows" :key="i"><td class="dim">{{ ts(e.at ?? e.created_at) }}</td><td class="m">{{ e.kind }}</td><td class="m dim" style="word-break:break-all">{{ JSON.stringify(e.payload ?? e.data ?? {}) }}</td></tr>
+        <tr v-if="!list('events', 'events').length"><td colspan="3" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
     </template>
 
     <template v-else-if="tab === 'spec'"><JsonView :value="fleet.spec" /></template>

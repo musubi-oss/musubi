@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, onMounted } from 'vue'
 import { api, get, post, put } from '../../api/client'
 import Drawer from '../../components/Drawer.vue'
@@ -22,6 +24,7 @@ async function save() {
 async function runTest(name: string) { try { test.value = await post(`/v1/admin/auth/providers/${encodeURIComponent(name)}/test`); toast.show(test.value?.ok === false ? 'test failed' : 'test ok') } catch (x: any) { toast.err(x) } }
 async function del(name: string) { try { await api('DELETE', `/v1/admin/auth/providers/${encodeURIComponent(name)}`); toast.show('deleted'); load() } catch (x: any) { toast.err(x) } }
 const kinds = [['oidc', 'OpenID Connect (discovery by issuer)'], ['oauth2', 'OAuth 2 (explicit endpoints)'], ['steam', 'Steam'], ['epic', 'Epic'], ['xbox', 'Xbox Live'], ['psn', 'PlayStation Network'], ['nintendo', 'Nintendo'], ['apple', 'Apple'], ['google', 'Google'], ['discord', 'Discord'], ['facebook', 'Facebook'], ['gamecenter', 'Game Center']]
+const pg1 = usePager(() => provs)
 </script>
 <template>
   <div class="crumb"><span>Identity providers</span><span class="id">{{ provs.filter((x) => x.enabled).length }} enabled of {{ provs.length }} · {{ open }} open login flows</span><span style="margin-left:auto"><button class="btn s p" @click="edit(null)">Add provider</button></span></div>
@@ -29,8 +32,8 @@ const kinds = [['oidc', 'OpenID Connect (discovery by issuer)'], ['oauth2', 'OAu
   <div class="card">
     <p class="note">Each provider is a login button in the client: clients call <code>/v1/auth/{name}</code>. Secrets are stored sealed and never shown again.</p>
     <table><thead><tr><th>Name</th><th style="width:110px">Kind</th><th>Issuer / authorize URL</th><th style="width:90px">Signup</th><th style="width:90px">Secret</th><th style="width:80px">Enabled</th><th style="width:170px"></th></tr></thead><tbody>
-      <tr v-for="x in provs" :key="x.name"><td class="m row" @click="edit(x)">{{ x.name }}<span class="dim" v-if="x.display_name"> — {{ x.display_name }}</span></td><td>{{ x.kind }}</td><td class="m dim">{{ x.issuer || x.authorize_url || '—' }}</td><td class="dim">{{ x.allow_signup ? 'allowed' : 'link only' }}</td><td class="dim">{{ x.has_client_secret ? 'set' : '—' }}</td><td :class="x.enabled ? 'ok' : 'dim'">{{ x.enabled ? 'yes' : 'no' }}</td><td><button class="btn s" @click="edit(x)">Edit</button> <button class="btn s" @click="runTest(x.name)">Test</button> <button class="btn s" @click="ask(`Delete provider ${x.name}? Players linked through it cannot log in with it any more.`) && del(x.name)">×</button></td></tr>
-      <tr v-if="!provs.length"><td colspan="7" class="empty">No providers — device / email login only</td></tr></tbody></table>
+      <tr v-for="x in pg1.rows" :key="x.name"><td class="m row" @click="edit(x)">{{ x.name }}<span class="dim" v-if="x.display_name"> — {{ x.display_name }}</span></td><td>{{ x.kind }}</td><td class="m dim">{{ x.issuer || x.authorize_url || '—' }}</td><td class="dim">{{ x.allow_signup ? 'allowed' : 'link only' }}</td><td class="dim">{{ x.has_client_secret ? 'set' : '—' }}</td><td :class="x.enabled ? 'ok' : 'dim'">{{ x.enabled ? 'yes' : 'no' }}</td><td><button class="btn s" @click="edit(x)">Edit</button> <button class="btn s" @click="runTest(x.name)">Test</button> <button class="btn s" @click="ask(`Delete provider ${x.name}? Players linked through it cannot log in with it any more.`) && del(x.name)">×</button></td></tr>
+      <tr v-if="!provs.length"><td colspan="7" class="empty">No providers — device / email login only</td></tr></tbody></table><Pager :p="pg1" />
     <pre class="pre" v-if="test && !dlg" style="margin-top:10px;max-height:200px">{{ JSON.stringify(test, null, 2) }}</pre>
   </div>
   <Drawer v-if="dlg" :title="isNew ? 'New identity provider' : `Provider ${p.name}`" @close="dlg = false"><div class="form">

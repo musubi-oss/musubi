@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 // Game sessions (lobbies/rooms backed by a match or a fleet server) across the cluster: search,
 // inspect members, stop one or many; session templates players create their own from.
 import { ref, onMounted } from 'vue'
@@ -17,6 +19,7 @@ async function open(r: any) { x.value.cur = r; x.value.members = await get(`/v1/
 function toggle(id: string) { const s = new Set(sel.value); s.has(id) ? s.delete(id) : s.add(id); sel.value = s }
 async function stopSel(dry: boolean) { const r = await act(() => post('/v1/server/sessions/stop', { ids: [...sel.value], reason: 'console', dry_run: dry }), dry ? 'dry run done' : 'stopped'); if (r) x.value.stop = r; if (!dry) sel.value = new Set() }
 function openTemplate(t?: any) { dlg.value = 'tpl'; form.value = { id: t?.id ?? '', text: JSON.stringify(t ? { ...t, id: undefined } : { name: '', kind: 'custom', max_players: 4, join_policy: 'open', properties: {}, data: {} }, null, 2) } }
+const pg1 = usePager(() => x.value.s?.sessions ?? [])
 </script>
 <template>
   <div class="crumb"><span>Game sessions</span><span style="margin-left:auto;display:flex;gap:8px"><button class="btn s" :disabled="!sel.size" @click="stopSel(true)">Dry-run stop ({{ sel.size }})</button><button class="btn s d" :disabled="!sel.size" @click="ask(`Stop ${sel.size} sessions?`) && stopSel(false)">Stop selected</button></span></div>
@@ -24,8 +27,8 @@ function openTemplate(t?: any) { dlg.value = 'tpl'; form.value = { id: t?.id ?? 
   <div class="card">
     <div class="tools"><input class="in" v-model="q.name" placeholder="name" @keyup.enter="load" /><input class="in" v-model="q.kind" placeholder="kind" style="max-width:140px" @keyup.enter="load" /><button class="btn" @click="load">Search</button><span class="dim">{{ (x.s?.sessions ?? []).length }} sessions · {{ (x.s?.sessions ?? []).reduce((a: number, s: any) => a + (s.max_players - s.free_slots), 0) }} players seated</span></div>
     <table><thead><tr><th style="width:30px"></th><th>Name</th><th>Kind</th><th>Players</th><th>Join</th><th>Backing</th><th>Owner</th><th>Created</th></tr></thead><tbody>
-      <tr v-for="s in x.s?.sessions ?? []" :key="s.id" class="row" @click="open(s)"><td @click.stop><input type="checkbox" :checked="sel.has(s.id)" @change="toggle(s.id)" /></td><td>{{ s.name }}<div class="dim m" style="font-size:11px">{{ s.id }}</div></td><td>{{ s.kind }}</td><td>{{ s.max_players - s.free_slots }} / {{ s.max_players }}</td><td>{{ s.join_policy }}</td><td class="dim">{{ s.match_id ? 'match …' + s.match_id.slice(-8) : s.fleet_id ? 'fleet …' + s.fleet_id.slice(-8) : 'none' }}</td><td class="m dim">…{{ (s.owner_id ?? '').slice(-8) }}</td><td class="dim">{{ ts(s.created_at) }}</td></tr>
-      <tr v-if="!(x.s?.sessions ?? []).length"><td colspan="8" class="empty">No sessions match</td></tr></tbody></table>
+      <tr v-for="s in pg1.rows" :key="s.id" class="row" @click="open(s)"><td @click.stop><input type="checkbox" :checked="sel.has(s.id)" @change="toggle(s.id)" /></td><td>{{ s.name }}<div class="dim m" style="font-size:11px">{{ s.id }}</div></td><td>{{ s.kind }}</td><td>{{ s.max_players - s.free_slots }} / {{ s.max_players }}</td><td>{{ s.join_policy }}</td><td class="dim">{{ s.match_id ? 'match …' + s.match_id.slice(-8) : s.fleet_id ? 'fleet …' + s.fleet_id.slice(-8) : 'none' }}</td><td class="m dim">…{{ (s.owner_id ?? '').slice(-8) }}</td><td class="dim">{{ ts(s.created_at) }}</td></tr>
+      <tr v-if="!(x.s?.sessions ?? []).length"><td colspan="8" class="empty">No sessions match</td></tr></tbody></table><Pager :p="pg1" />
     <JsonView v-if="x.stop" :value="x.stop" />
   </div>
   <div class="card">

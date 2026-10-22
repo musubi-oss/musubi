@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { useRoute } from 'vue-router'
 import { ref, computed, onMounted } from 'vue'
 import { api, get, post, put } from '../../api/client'
@@ -20,6 +22,8 @@ const savePool = () => act(() => { const b = { ...x.value, goals: x.value.goals.
 async function runPreview(p: any) { try { preview.value = await get(`/v1/server/quests/pools/${encodeURIComponent(p.id)}/preview/${encodeURIComponent(acc.value)}`) } catch (e: any) { toast.err(e) } }
 const objs = (a: any) => (a.objectives ?? []).map((o: any) => `${o.event} ×${o.target ?? o.count}`).join(', ')
 const ts = (v: any) => v ? new Date(typeof v === 'number' ? v * 1000 : v).toISOString().replace('T', ' ').slice(0, 16) : '—'
+const pg2 = usePager(() => vq)
+const pg1 = usePager(() => vp)
 </script>
 <template>
   <div class="crumb"><span>Quests</span><span class="id">{{ quests.length }} quests · {{ pools.length }} pools</span>
@@ -30,15 +34,15 @@ const ts = (v: any) => v ? new Date(typeof v === 'number' ? v * 1000 : v).toISOS
     <template v-if="tab === 'quests'">
       <p class="note">A quest completes when every objective reaches its target from gameplay events (<code>POST /v1/quests/event</code> or server hooks); rewards are a reward table.</p>
       <table><thead><tr><th>Id / name</th><th style="width:80px">Kind</th><th>Objectives</th><th>Rewards</th><th style="width:110px">Reroll</th><th style="width:80px">Enabled</th><th style="width:100px"></th></tr></thead><tbody>
-        <tr v-for="a in vq" :key="a.id"><td class="row" @click="editQuest(a)"><span class="m">{{ a.id }}</span><span class="dim" v-if="a.name"> — {{ a.name }}</span></td><td>{{ a.kind }}</td><td class="dim">{{ objs(a) }}</td><td class="m dim">{{ a.rewards }}</td><td class="dim">{{ a.rerollable ? `${a.rerolls_per_period ?? 1}/period` : 'no' }}</td><td :class="a.enabled ? 'ok' : 'dim'">{{ a.enabled ? 'yes' : 'no' }}</td><td><button class="btn s" @click="editQuest(a)">Edit</button> <button class="btn s" @click="ask(`Delete quest ${a.id}?`) && act(() => api('DELETE', `/v1/server/quests/${encodeURIComponent(a.id)}`), 'deleted')">×</button></td></tr>
-        <tr v-if="!vq.length"><td colspan="7" class="empty">No quests</td></tr></tbody></table>
+        <tr v-for="a in pg2.rows" :key="a.id"><td class="row" @click="editQuest(a)"><span class="m">{{ a.id }}</span><span class="dim" v-if="a.name"> — {{ a.name }}</span></td><td>{{ a.kind }}</td><td class="dim">{{ objs(a) }}</td><td class="m dim">{{ a.rewards }}</td><td class="dim">{{ a.rerollable ? `${a.rerolls_per_period ?? 1}/period` : 'no' }}</td><td :class="a.enabled ? 'ok' : 'dim'">{{ a.enabled ? 'yes' : 'no' }}</td><td><button class="btn s" @click="editQuest(a)">Edit</button> <button class="btn s" @click="ask(`Delete quest ${a.id}?`) && act(() => api('DELETE', `/v1/server/quests/${encodeURIComponent(a.id)}`), 'deleted')">×</button></td></tr>
+        <tr v-if="!vq.length"><td colspan="7" class="empty">No quests</td></tr></tbody></table><Pager :p="pg2" />
     </template>
     <template v-else>
       <p class="note">A pool hands each player <i>size</i> goals drawn by weight every rotation; accelerate skips the wait for one player, retire ends the pool.</p>
       <table><thead><tr><th>Id / name</th><th style="width:70px">Goals</th><th style="width:120px">Rotation</th><th style="width:60px">Gen</th><th style="width:140px">Ends</th><th style="width:80px">Enabled</th><th style="width:230px"></th></tr></thead><tbody>
-        <tr v-for="p in vp" :key="p.id"><td class="row" @click="editPool(p)"><span class="m">{{ p.id }}</span><span class="dim" v-if="p.name"> — {{ p.name }}</span></td><td>{{ (p.goals ?? []).length }}</td><td class="dim">{{ p.size ?? '?' }} per {{ p.rotation ?? 'period' }}</td><td class="dim">{{ p.generation }}</td><td class="dim">{{ ts(p.ends_at) }}</td><td :class="p.enabled ? 'ok' : 'dim'">{{ p.enabled ? 'yes' : 'no' }}</td>
+        <tr v-for="p in pg1.rows" :key="p.id"><td class="row" @click="editPool(p)"><span class="m">{{ p.id }}</span><span class="dim" v-if="p.name"> — {{ p.name }}</span></td><td>{{ (p.goals ?? []).length }}</td><td class="dim">{{ p.size ?? '?' }} per {{ p.rotation ?? 'period' }}</td><td class="dim">{{ p.generation }}</td><td class="dim">{{ ts(p.ends_at) }}</td><td :class="p.enabled ? 'ok' : 'dim'">{{ p.enabled ? 'yes' : 'no' }}</td>
           <td><button class="btn s" @click="editPool(p)">Edit</button> <button class="btn s" @click="x = p; preview = null; dlg = 'preview'">Preview</button> <button class="btn s" @click="ask(`Retire pool ${p.id}?`) && act(() => post(`/v1/server/quests/pools/${encodeURIComponent(p.id)}/retire`), 'retired')">Retire</button> <button class="btn s" @click="ask('Delete pool?') && act(() => api('DELETE', `/v1/server/quests/pools/${encodeURIComponent(p.id)}`), 'deleted')">×</button></td></tr>
-        <tr v-if="!vp.length"><td colspan="7" class="empty">No pools</td></tr></tbody></table>
+        <tr v-if="!vp.length"><td colspan="7" class="empty">No pools</td></tr></tbody></table><Pager :p="pg1" />
     </template>
   </div>
   <Drawer v-if="dlg === 'quest'" :title="isNew ? 'New quest' : `Quest ${x.id}`" @close="dlg = ''"><div class="form">

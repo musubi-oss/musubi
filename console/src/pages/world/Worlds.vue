@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { get, post, api } from '../../api/client'
@@ -22,6 +24,7 @@ const sim = computed(() => s.node?.roles?.includes('sim'))
 function ts(v: any) { return v ? new Date(v * (v < 1e12 ? 1000 : 1)).toISOString().replace('T', ' ').slice(0, 19) : '—' }
 async function create() { try { await post('/v1/server/worlds', { name: form.value.name, config: JSON.parse(form.value.config) }); toast.show('world created'); creating.value = false; load() } catch (e: any) { toast.err(e) } }
 async function del(w: string) { if (!window.confirm(`Delete world ${w}? Its journal and snapshots are removed.`)) return; try { await api('DELETE', `/v1/server/worlds/${w}`); toast.show('deleted'); load() } catch (e: any) { toast.err(e) } }
+const pg1 = usePager(() => shown)
 </script>
 <template>
   <div class="stats">
@@ -36,11 +39,11 @@ async function del(w: string) { if (!window.confirm(`Delete world ${w}? Its jour
     <template v-else>
       <div class="tools"><input class="in" v-model="q" placeholder="filter by name" /><button class="btn" @click="load">Refresh</button><button class="btn p" style="margin-left:auto" @click="creating = true">Create world</button></div>
       <table><thead><tr><th>Name</th><th style="width:220px">Home node</th><th style="width:120px">Here</th><th style="width:170px">Created</th><th style="width:80px"></th></tr></thead><tbody>
-        <tr v-for="r in shown" :key="r.name" class="row" @click="router.push(`/world/worlds/${r.name}`)">
+        <tr v-for="r in pg1.rows" :key="r.name" class="row" @click="router.push(`/world/worlds/${r.name}`)">
           <td class="m">{{ r.name }}</td><td class="dim">{{ nodes[r.node_id] ?? r.node_id ?? 'pending adoption' }}</td><td :class="r.local ? 'ok' : 'dim'">{{ r.local ? 'homed here' : 'remote' }}</td><td class="dim">{{ ts(r.created_at) }}</td>
           <td @click.stop><button class="btn s d" @click="del(r.name)">Delete</button></td>
         </tr>
-        <tr v-if="!shown.length"><td colspan="5" class="empty">No Data</td></tr></tbody></table>
+        <tr v-if="!shown.length"><td colspan="5" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
     </template>
   </div>
   <Drawer v-if="creating" title="Create world" @close="creating = false"><div class="form">

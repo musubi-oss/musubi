@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, get, post, qs } from '../../api/client'
@@ -82,6 +84,9 @@ const trails = computed(() => {
 const hoStats = computed(() => ({ entities: trails.value.length, open: trails.value.filter((t) => t.open).length, bad: trails.value.filter((t) => t.bad).length }))
 const fmtMs = (ms: number) => new Date(ms).toISOString().slice(11, 23)
 function openDlg(k: typeof dlg.value) { dlg.value = k; form.value = k === 'host' ? { x: 0, y: 0 } : k === 'rewind' ? { tick: Math.max(0, (world.value?.tick ?? 0) - 100) } : { kind: 'npc', x: 0, y: 0, persistent: true, data: '{}' } }
+const pg3 = usePager(() => trails)
+const pg2 = usePager(() => steps)
+const pg1 = usePager(() => list('history', 'ops'))
 </script>
 <template>
   <div class="crumb"><router-link to="/world">Worlds</router-link> › <span class="m">{{ w }}</span>
@@ -153,23 +158,23 @@ function openDlg(k: typeof dlg.value) { dlg.value = k; form.value = k === 'host'
       <p class="note">Every step of a change of owner, oldest first, from every node's durable journal plus this node's unflushed tail: <code>started</code> (the cell border crossing), <code>shipped</code> (remote / forced on offload), <code>received</code> (what the receiver did), <code>ack</code> (the new simulator), <code>ended</code>. Anything but the happy path is marked.</p>
       <template v-if="hoGroup">
         <table><thead><tr><th style="width:230px">Entity</th><th style="width:90px">Ticks</th><th>Trail</th><th style="width:110px">Took</th><th style="width:130px">Last step</th></tr></thead><tbody>
-          <tr v-for="t in trails" :key="t.entity + t.first.ms" class="row" @click="hoEntity = t.entity; hoGroup = false; loadTab('handovers')">
+          <tr v-for="t in pg3.rows" :key="t.entity + t.first.ms" class="row" @click="hoEntity = t.entity; hoGroup = false; loadTab('handovers')">
             <td class="m">…{{ t.entity.slice(-12) }}</td><td class="dim">{{ t.first.tick }}<span v-if="t.last.tick !== t.first.tick"> → {{ t.last.tick }}</span></td>
             <td><span v-for="(s, i) in t.steps" :key="i" class="hstep" :class="{ bad: !okPaths.has(s.path) }" :title="s.detail">{{ s.event }}<small>/{{ s.path }}</small></span><span v-if="t.open" class="dim" style="font-size:12px">…</span></td>
             <td class="dim">{{ t.ms }} ms</td><td class="dim">{{ fmtMs(t.last.ms) }}</td>
           </tr>
-          <tr v-if="!trails.length"><td colspan="5" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table>
+          <tr v-if="!trails.length"><td colspan="5" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table><Pager :p="pg3" />
       </template>
       <table v-else><thead><tr><th style="width:110px">Time</th><th style="width:80px">Tick</th><th style="width:130px">Entity</th><th style="width:90px">Event</th><th style="width:130px">Path</th><th style="width:110px">Node</th><th>Detail</th></tr></thead><tbody>
-        <tr v-for="(s, i) in steps" :key="i"><td class="dim">{{ fmtMs(s.ms) }}</td><td class="dim">{{ s.tick }}</td><td class="m">…{{ s.entity.slice(-12) }}</td><td>{{ s.event }}</td><td :class="okPaths.has(s.path) ? '' : 'bad'">{{ s.path }}</td><td class="m dim">{{ simName(s.node) }}</td><td class="dim" style="word-break:break-all">{{ s.detail }}</td></tr>
-        <tr v-if="!steps.length"><td colspan="7" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table>
+        <tr v-for="(s, i) in pg2.rows" :key="i"><td class="dim">{{ fmtMs(s.ms) }}</td><td class="dim">{{ s.tick }}</td><td class="m">…{{ s.entity.slice(-12) }}</td><td>{{ s.event }}</td><td :class="okPaths.has(s.path) ? '' : 'bad'">{{ s.path }}</td><td class="m dim">{{ simName(s.node) }}</td><td class="dim" style="word-break:break-all">{{ s.detail }}</td></tr>
+        <tr v-if="!steps.length"><td colspan="7" class="empty">No handovers recorded{{ hoEntity ? ' for this entity' : '' }}</td></tr></tbody></table><Pager :p="pg2" />
     </template>
 
     <template v-else-if="tab === 'journal'">
       <div class="tools"><input class="in" type="number" v-model.number="jFrom" placeholder="from tick" /><button class="btn" @click="loadTab('journal')">Load</button><span class="dim" v-if="x.history">{{ x.history.total }} ops · ticks {{ x.history.from_tick }} → {{ x.history.to_tick === 18446744073709551615 ? 'now' : x.history.to_tick }}</span></div>
       <table><thead><tr><th style="width:90px">Tick</th><th style="width:140px">Op</th><th style="width:220px">Entity</th><th>Payload</th></tr></thead><tbody>
-        <tr v-for="(o, i) in list('history', 'ops')" :key="i"><td class="dim">{{ o.tick }}</td><td>{{ o.op ?? o.kind }}</td><td class="m">{{ o.id ?? o.entity ?? '—' }}</td><td class="m dim" style="word-break:break-all">{{ JSON.stringify(o.data ?? o.payload ?? o) }}</td></tr>
-        <tr v-if="!list('history', 'ops').length"><td colspan="4" class="empty">No journal ops in range</td></tr></tbody></table>
+        <tr v-for="(o, i) in pg1.rows" :key="i"><td class="dim">{{ o.tick }}</td><td>{{ o.op ?? o.kind }}</td><td class="m">{{ o.id ?? o.entity ?? '—' }}</td><td class="m dim" style="word-break:break-all">{{ JSON.stringify(o.data ?? o.payload ?? o) }}</td></tr>
+        <tr v-if="!list('history', 'ops').length"><td colspan="4" class="empty">No journal ops in range</td></tr></tbody></table><Pager :p="pg1" />
     </template>
 
     <template v-else-if="tab === 'at'">

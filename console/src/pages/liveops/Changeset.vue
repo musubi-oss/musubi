@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, get, post, put } from '../../api/client'
@@ -34,6 +36,7 @@ async function stage() { await act(() => put(`${C.value}/changes`, { changes: [{
 const keyOf = (ch: any) => ch.key ?? ch.row?.id ?? ch.row?.code ?? ch.row?.name ?? ch.row?.key ?? '?'
 async function loadPreview() { tab.value = 'preview'; if (!preview.value) preview.value = await get(`${C.value}/preview`).catch((x) => ({ error: x.message })) }
 const ts = (v: any) => v ? new Date(v * 1000).toISOString().replace('T', ' ').slice(0, 16) : '—'
+const pg1 = usePager(() => changes)
 </script>
 <template>
   <div class="crumb"><router-link to="/liveops/changesets">Scheduled changesets</router-link> › <span>{{ isNew ? 'new changeset' : c?.name || id }}</span><span class="id" v-if="!isNew">{{ c?.state }}</span>
@@ -61,8 +64,8 @@ const ts = (v: any) => v ? new Date(v * 1000).toISOString().replace('T', ' ').sl
       <div class="tabs" style="margin-top:12px"><a :class="{ on: tab === 'changes' }" @click="tab = 'changes'">Changes ({{ changes.length }})</a><a :class="{ on: tab === 'diff' }" @click="tab = 'diff'">Diff vs live</a><a :class="{ on: tab === 'preview' }" @click="loadPreview">Preview</a></div>
       <template v-if="tab === 'changes'">
         <table><thead><tr><th style="width:180px">Table</th><th style="width:90px">Op</th><th style="width:240px">Key</th><th>Row</th><th style="width:60px" v-if="editable"></th></tr></thead><tbody>
-          <tr v-for="(ch, i) in changes" :key="i"><td class="m">{{ ch.table }}</td><td :class="{ bad: (ch.op ?? 'upsert') === 'delete' }">{{ ch.op ?? 'upsert' }}</td><td class="m">{{ keyOf(ch) }}</td><td class="m dim" style="white-space:pre-wrap">{{ JSON.stringify(ch.row ?? {}).slice(0, 300) }}</td><td v-if="editable"><button class="btn s" @click="act(() => api('DELETE', `${C}/changes/${ch.table}/${encodeURIComponent(keyOf(ch))}`), 'unstaged')">×</button></td></tr>
-          <tr v-if="!changes.length"><td colspan="5" class="empty">Nothing staged — add rows to upsert or delete, then submit</td></tr></tbody></table>
+          <tr v-for="(ch, i) in pg1.rows" :key="i"><td class="m">{{ ch.table }}</td><td :class="{ bad: (ch.op ?? 'upsert') === 'delete' }">{{ ch.op ?? 'upsert' }}</td><td class="m">{{ keyOf(ch) }}</td><td class="m dim" style="white-space:pre-wrap">{{ JSON.stringify(ch.row ?? {}).slice(0, 300) }}</td><td v-if="editable"><button class="btn s" @click="act(() => api('DELETE', `${C}/changes/${ch.table}/${encodeURIComponent(keyOf(ch))}`), 'unstaged')">×</button></td></tr>
+          <tr v-if="!changes.length"><td colspan="5" class="empty">Nothing staged — add rows to upsert or delete, then submit</td></tr></tbody></table><Pager :p="pg1" />
         <div v-if="c.counts" class="dim" style="margin-top:8px">{{ Object.entries(c.counts).map(([t, v]: [string, any]) => `${t}: +${v.upserts ?? 0} −${v.deletes ?? 0}`).join(' · ') }}</div>
       </template>
       <template v-else-if="tab === 'diff'"><p class="note" v-if="diff && diff.changes === false">No difference against the live tables (already published or empty).</p><JsonView :value="diff?.diff ?? diff ?? { note: 'no diff available' }" /></template>

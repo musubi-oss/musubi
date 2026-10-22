@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { api, get, post } from '../../api/client'
 import Kv from '../../components/Kv.vue'
@@ -13,6 +15,7 @@ const mb = (n: any) => n == null ? '—' : n > 1048576 ? (n / 1048576).toFixed(1
 const ts = (v: any) => v ? new Date(v * 1000).toISOString().replace('T', ' ').slice(0, 16) : '—'
 async function showManifest(a: any) { sel.value = a; try { manifest.value = await api('GET', `/v1/server/builds/${encodeURIComponent(a.name)}/${encodeURIComponent(a.version)}/manifest`) } catch (x: any) { toast.err(x) } }
 async function act(fn: () => Promise<any>, ok: string) { try { await fn(); toast.show(ok); load() } catch (x: any) { toast.err(x) } }
+const pg1 = usePager(() => pending)
 </script>
 <template>
   <div class="crumb"><span>Builds &amp; artifacts</span><span class="id">{{ groups.length }} builds · {{ arts.length }} versions<template v-if="chunking"> · dedup {{ chunking.artifacts?.dedup_ratio ?? chunking.dedup_ratio ?? '—' }}× · {{ chunking.chunks?.orphans ?? chunking.orphans ?? 0 }} orphan chunks</template></span>
@@ -28,7 +31,7 @@ async function act(fn: () => Promise<any>, ok: string) { try { await fn(); toast
     </template>
     <p class="empty" v-if="!groups.length">No artifacts uploaded</p>
     <template v-if="pending.length"><h3>Pending uploads <small>({{ pending.length }} — delta sessions awaiting chunks / commit)</small></h3>
-      <table><thead><tr><th>Build</th><th>Version</th><th>Size</th><th>Started</th><th></th></tr></thead><tbody><tr v-for="p in pending" :key="p.name + p.version"><td class="m">{{ p.name }}</td><td class="m">{{ p.version }}</td><td>{{ mb(p.size) }}</td><td class="dim">{{ ts(p.started_at) }}</td><td><button class="btn s" @click="ask('Cancel this upload and free its chunks?') && act(() => api('DELETE', `/v1/server/builds/${encodeURIComponent(p.name)}/${encodeURIComponent(p.version)}`), 'upload cancelled')">Cancel</button></td></tr></tbody></table></template>
+      <table><thead><tr><th>Build</th><th>Version</th><th>Size</th><th>Started</th><th></th></tr></thead><tbody><tr v-for="p in pg1.rows" :key="p.name + p.version"><td class="m">{{ p.name }}</td><td class="m">{{ p.version }}</td><td>{{ mb(p.size) }}</td><td class="dim">{{ ts(p.started_at) }}</td><td><button class="btn s" @click="ask('Cancel this upload and free its chunks?') && act(() => api('DELETE', `/v1/server/builds/${encodeURIComponent(p.name)}/${encodeURIComponent(p.version)}`), 'upload cancelled')">Cancel</button></td></tr></tbody></table><Pager :p="pg1" /></template>
     <template v-if="manifest && sel"><h3>Manifest — {{ sel.name }} {{ sel.version }} <small>({{ (manifest.chunks ?? []).length }} chunks)</small></h3>
       <div class="grid"><div><Kv k="File" :v="`${manifest.filename ?? sel.filename} · ${mb(manifest.size ?? sel.size)}`" /></div><div><Kv k="sha256" :v="manifest.sha256 ?? sel.sha256" mono /></div><div><Kv k="Chunk sizes" :v="`min ${mb(manifest.chunk_min ?? manifest.min)} · avg ${mb(manifest.chunk_avg ?? manifest.avg)} · max ${mb(manifest.chunk_max ?? manifest.max)}`" /></div></div>
       <JsonView :value="{ ...manifest, chunks: (manifest.chunks ?? []).slice(0, 20).concat((manifest.chunks ?? []).length > 20 ? [`… ${(manifest.chunks ?? []).length - 20} more`] : []) }" /></template>

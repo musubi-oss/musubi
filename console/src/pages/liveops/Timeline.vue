@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { usePager } from '../../composables/pager'
+import Pager from '../../components/Pager.vue'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { get, qs } from '../../api/client'
@@ -18,6 +20,7 @@ const rows = computed(() => (d.value?.entries ?? []).filter((e: any) => state.va
 const pathOf: Record<string, string> = { live_event: 'live_events', flag: 'flags', experiment: 'experiments', news: 'news', offer: 'offers', tournament: 'tournaments', changeset: 'changesets' }
 function open(e: any) { const p = pathOf[e.kind]; if (p && e.id) router.push(`/liveops/${p}`) }
 function toggle(k: string) { kinds.value = kinds.value.includes(k) ? kinds.value.filter((x) => x !== k) : [...kinds.value, k]; load() }
+const pg1 = usePager(() => rows)
 </script>
 <template>
   <div class="stats" v-if="d">
@@ -37,11 +40,11 @@ function toggle(k: string) { kinds.value = kinds.value.includes(k) ? kinds.value
     <h3 style="margin-top:0" v-if="d?.summary?.active_now?.length">Active now</h3>
     <div v-if="d?.summary?.active_now?.length" style="margin-bottom:14px"><span v-for="a in d.summary.active_now" :key="a.id" class="pill" style="margin:0 6px 6px 0">{{ a.kind.replace('_', ' ') }} · {{ a.name || a.id }}</span></div>
     <table><thead><tr><th style="width:150px">Starts</th><th style="width:150px">Ends</th><th style="width:80px">Length</th><th style="width:110px">Kind</th><th>Name</th><th style="width:90px">State</th><th>Labels</th></tr></thead><tbody>
-      <tr v-for="(e, i) in rows" :key="e.id + i" class="row" @click="open(e)">
+      <tr v-for="(e, i) in pg1.rows" :key="e.id + i" class="row" @click="open(e)">
         <td class="dim">{{ ts(e.starts_at) }}</td><td class="dim">{{ e.ends_at ? ts(e.ends_at) : 'open' }}</td><td class="dim">{{ dur(e.starts_at, e.ends_at) }}</td>
         <td>{{ e.kind.replace('_', ' ') }}</td><td>{{ e.name || e.id }}</td>
         <td :class="{ ok: e.state === 'active', dim: e.state !== 'active' }">{{ e.state }}</td><td class="dim">{{ (e.labels ?? []).join(', ') || '—' }}</td>
       </tr>
-      <tr v-if="!rows.length"><td colspan="7" class="empty">No Data</td></tr></tbody></table>
+      <tr v-if="!rows.length"><td colspan="7" class="empty">No Data</td></tr></tbody></table><Pager :p="pg1" />
   </div>
 </template>
