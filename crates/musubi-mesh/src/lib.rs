@@ -525,12 +525,30 @@ pub fn entity_ref(e: &Entity, pos: Pos) -> EntityRef {
     }
 }
 
+/// What a client holds of one entity. `delta_with` touches thousands of these per client per
+/// tick, so everything it needs lives in one map entry (three maps was a quarter of the scan).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct Known {
+    /// Quantized position last sent (pos is always sent on move).
+    pos: Pos,
+    /// Component revision the client has; only later changes are sent.
+    rev: u64,
+    /// Tick of the last delta that carried it (priority grows with age).
+    sent: u64,
+    /// Number of the last full scan (`Interest::scans`) that saw it; a full scan despawns
+    /// what it did not see. A scan counter, not the tick: several scans can share a tick.
+    seen: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Interest {
     pos: Pos,
     radius: f64,
-    /// entity → last component versions the client received (pos is always sent on move).
-    known: IdMap<(Pos, u64)>,
+    /// entity → what the client has of it: one probe per visible entity per tick.
+    known: IdMap<Known>,
+    /// Full scans so far; stamps `Known::seen`.
+    #[serde(default)]
+    scans: u64,
     /// Per-tick byte budget override (`None` = world default).
     #[serde(default)]
     budget_bytes: Option<usize>,
@@ -541,9 +559,6 @@ pub struct Interest {
     /// inventory, the chest it is browsing).
     #[serde(default)]
     inside: Option<EntityId>,
-    /// entity → tick of the last delta that carried it (priority grows with age).
-    #[serde(default)]
-    last_sent: IdMap<u64>,
     /// Tick of the last full scan, and the view/filter it was made with: while the view is
     /// unchanged and no touched cell changed since, the scan is skipped outright.
     #[serde(default)]
@@ -2235,10 +2250,10 @@ impl World {
                 pos,
                 radius,
                 known: IdMap::default(),
+                scans: 0,
                 budget_bytes,
                 filter,
                 inside: None,
-                last_sent: IdMap::default(),
                 last_delta_tick: 0,
                 last_view: None,
                 last_inside: None,
@@ -4049,7 +4064,8 @@ impl WorldView {
             return Some(Delta::default());
         }
         let budget = interest.budget_bytes.unwrap_or(default_budget);
-        let mut seen = IdSet::with_capacity_and_hasher(64, Default::default());
+        let scan_no = interest.scans.wrapping_add(1);
+        interest.scans = scan_no;
         struct Cand {
             prio: f64,
             bytes: usize,
@@ -4119,32 +4135,34 @@ impl WorldView {
                 }
                 continue;
             }
-            seen.insert(e.id);
+            let known = interest.known.get_mut(&e.id).map(|k| {
+                k.seen = scan_no;
+                *k
+            });
             // delivered after its last change (a change in the same tick as the delivery may
             // have landed after it, so that tick is compared the slow way): nothing to compare
-            if interest.known.contains_key(&e.id)
-                && interest
-                    .last_sent
-                    .get(&e.id)
-                    .is_some_and(|sent| e.changed_tick < *sent)
-            {
+            if known.is_some_and(|k| e.changed_tick < k.sent) {
                 continue;
             }
             let qpos = quantize(e.pos, quantum);
-            let (spawn, update, bytes) = match interest.known.get(&e.id) {
+            let (spawn, update, bytes) = match known {
                 None => {
                     let s = entity_ref(e, qpos);
                     let bytes = estimate_refs(&s.components) + 64;
                     (Some(s), None, bytes)
                 }
-                Some((pos, known_rev)) => {
+                Some(Known {
+                    pos,
+                    rev: known_rev,
+                    ..
+                }) => {
                     let changed: Vec<ComponentRef> = e
                         .components
                         .iter()
-                        .filter(|(_, c)| c.changed_rev > *known_rev)
+                        .filter(|(_, c)| c.changed_rev > known_rev)
                         .map(|(k, c)| component_ref(k, c))
                         .collect();
-                    if *pos == qpos && changed.is_empty() {
+                    if pos == qpos && changed.is_empty() {
                         continue;
                     }
                     let bytes = estimate_refs(&changed) + 56;
@@ -4157,7 +4175,7 @@ impl WorldView {
                     (None, Some(u), bytes)
                 }
             };
-            let age = tick.saturating_sub(interest.last_sent.get(&e.id).copied().unwrap_or(0));
+            let age = tick.saturating_sub(known.map_or(0, |k| k.sent));
             let relevance = 1.0 / (1.0 + dist / interest.radius.max(f64::EPSILON));
             cands.push(Cand {
                 prio: relevance * (1.0 + age as f64),
@@ -4190,23 +4208,32 @@ impl WorldView {
             if let Some(u) = c.update {
                 d.updated.push(u);
             }
-            interest.known.insert(c.id, (c.pos, c.rev));
-            interest.last_sent.insert(c.id, tick);
+            interest.known.insert(
+                c.id,
+                Known {
+                    pos: c.pos,
+                    rev: c.rev,
+                    sent: tick,
+                    seen: scan_no,
+                },
+            );
         }
         let gone: Vec<EntityId> = if fast {
+            for id in &fast_gone {
+                interest.known.remove(id);
+            }
             fast_gone
         } else {
-            interest
-                .known
-                .keys()
-                .filter(|id| !seen.contains(id))
-                .copied()
-                .collect()
+            let mut gone = Vec::new();
+            interest.known.retain(|id, k| {
+                let keep = k.seen == scan_no;
+                if !keep {
+                    gone.push(*id);
+                }
+                keep
+            });
+            gone
         };
-        for id in &gone {
-            interest.known.remove(id);
-            interest.last_sent.remove(id);
-        }
         d.despawned = gone;
         d.spawned.sort_by_key(|e| e.id);
         d.updated.sort_by_key(|u| u.id);
