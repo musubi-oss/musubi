@@ -61,10 +61,13 @@ public:
     /** Full C++ API. */
     TSharedPtr<FMusubiClient> Client() const { return Http; }
     TSharedPtr<FMusubiSocket> Socket() const { return Rt; }
+    /** Socket tuning used by the next ConnectSocket(); seeded from UMusubiSettings. */
+    FMusubiSocket::FConfig& SocketConfig() { return SockCfg; }
 
 private:
     TSharedPtr<FMusubiClient> Http;
     TSharedPtr<FMusubiSocket> Rt;
+    FMusubiSocket::FConfig SockCfg;
     FTSTicker::FDelegateHandle TickHandle;
     FString PendingStatus;
 };

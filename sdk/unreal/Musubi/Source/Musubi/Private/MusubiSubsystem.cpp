@@ -1,4 +1,5 @@
 #include "MusubiSubsystem.h"
+#include "MusubiSettings.h"
 #include "MusubiModule.h"
 #include "Containers/Ticker.h"
 #include "Serialization/JsonReader.h"
@@ -31,6 +32,13 @@ void UMusubiSubsystem::Initialize(FSubsystemCollectionBase& Collection)
         if (Weak.IsValid() && Weak->Rt.IsValid()) Weak->Rt->Tick(Dt);
         return Weak.IsValid();
     }));
+    // Project Settings → Plugins → Musubi: socket tuning and, when set, the node address.
+    if (const UMusubiSettings* S = GetDefault<UMusubiSettings>())
+    {
+        SockCfg = S->SocketConfig();
+        const FString Api = S->EffectiveApiBase();
+        if (!Api.IsEmpty()) Configure(Api);
+    }
 }
 
 void UMusubiSubsystem::Deinitialize()
@@ -78,7 +86,7 @@ void UMusubiSubsystem::ConnectSocket(const FString& Status)
 {
     if (!Http.IsValid() || !Http->HasSession()) { UE_LOG(LogMusubi, Error, TEXT("authenticate first")); return; }
     PendingStatus = Status;
-    Rt->Connect(Http->BaseUrl(), Http->Session().AccessToken);
+    Rt->Connect(Http->BaseUrl(), Http->Session().AccessToken, SockCfg);
 }
 
 void UMusubiSubsystem::DisconnectSocket()

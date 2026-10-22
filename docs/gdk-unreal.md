@@ -61,7 +61,7 @@ Consequences:
 | `MusubiWorld` | Runtime, `Default` | Musubi, Engine | `UMusubiWorldComponent`, `UMusubiEntityComponent`, actor/ISM sinks, interpolation, interest driver |
 | `MusubiMass` | Runtime, `Default` | Musubi, MusubiWorld, MassEntity, MassCommon (plugin dep `MassGameplay`) | `UMusubiMassSinkComponent`, `FMusubiEntityFragment`, `FMusubiEntityTag` |
 | `MusubiIris` | Runtime, `Default`, only when `MUSUBI_UE_IRIS` | Musubi, IrisCore, NetCore | `UMusubiReplicationBridge`, `UMusubiNetObjectFactory` (tier B only) |
-| `MusubiEditor` | Editor | Musubi, UnrealEd, Settings | project settings page, world-id picker, "connect to local node" button, validation of `DefaultGame.ini` keys |
+| `MusubiEditor` | Editor | Musubi, UnrealEd, Settings | world-id picker, "connect to local node" button, validation of `DefaultGame.ini` keys (the settings page itself is `UMusubiSettings : UDeveloperSettings` in `Musubi`, no editor module needed) |
 | `MusubiServer` | Runtime, server-only (`Target.Type == Server || WITH_SERVER_CODE`) | Musubi, Engine, PhysicsCore, Chaos | section 6 |
 
 Settings (`UMusubiSettings : UDeveloperSettings`, `DefaultGame.ini` `[/Script/Musubi.MusubiSettings]`):
@@ -369,7 +369,9 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    session/refresh. Replaces today's 1 072-line scaffold.
 2. Facades: presence, storage, rpc, notifications, chat, matchmaker, parties, matches (no
    rollback yet), streams — shipped as `UMusubiFacade` subsystems with C++ delegates and
-   Blueprint wrappers; Blueprint latent nodes and the editor settings page are deferred to 8.
+   Blueprint wrappers; Blueprint latent nodes are deferred to 8. Settings page done: `UMusubiSettings`
+   (Project Settings → Plugins → Musubi: node address, encoding, transport, QUIC port, resume, timeouts;
+   `-MusubiApi=` overrides), seeded into `UMusubiSubsystem` at Initialize.
 3. World view: subscription driver, registry, actor/ISM sinks, interpolation, time scale,
    bandwidth guard — shipped as module `MusubiWorld`; the Mass sink moves to 6, the demo map
    (editor content) to 8.
