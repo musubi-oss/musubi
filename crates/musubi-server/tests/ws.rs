@@ -2442,7 +2442,7 @@ async fn world_meshing_sim_api_and_client_deltas() {
         ServerMessage::WorldDelta { spawned, .. } => {
             assert_eq!(spawned.len(), 1);
             assert_eq!(spawned[0].id, eid);
-            assert_eq!(spawned[0].components[0].name, "hp");
+            assert_eq!(&*spawned[0].components[0].name, "hp");
         }
         m => panic!("{m:?}"),
     }
@@ -9082,7 +9082,7 @@ async fn world_unreliable_position_updates() {
         ServerMessage::WorldDelta {
             updated, sequenced, ..
         } => {
-            assert_eq!(updated[0].components[0].name, "hp");
+            assert_eq!(&*updated[0].components[0].name, "hp");
             assert!(!sequenced);
         }
         m => panic!("{m:?}"),
@@ -21464,7 +21464,7 @@ async fn world_global_entities_reach_far_subscribers() {
     match recv(&mut c).await.msg {
         ServerMessage::WorldDelta { spawned, .. } => {
             assert_eq!(spawned.iter().map(|e| e.id).collect::<Vec<_>>(), vec![boss]);
-            assert_eq!(spawned[0].components[0].name, "hp");
+            assert_eq!(&*spawned[0].components[0].name, "hp");
         }
         m => panic!("{m:?}"),
     }

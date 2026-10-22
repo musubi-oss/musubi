@@ -137,6 +137,21 @@ impl Encoding {
         }
     }
 
+    /// `encode` into a buffer pre-sized from the previous frame of the same stream: a delta
+    /// frame grows to tens of kilobytes and a growing `Vec` copies itself at every doubling.
+    pub fn encode_sized<T: Serialize>(self, v: &T, cap: usize) -> Result<Bytes, ProtoError> {
+        let mut buf = Vec::with_capacity(cap);
+        match self {
+            Encoding::Json => {
+                serde_json::to_writer(&mut buf, v).map_err(|e| ProtoError(e.to_string()))?
+            }
+            Encoding::Postcard => {
+                buf = postcard::to_extend(v, buf).map_err(|e| ProtoError(e.to_string()))?
+            }
+        }
+        Ok(Bytes::from(buf))
+    }
+
     pub fn decode<T: DeserializeOwned>(self, b: &[u8]) -> Result<T, ProtoError> {
         match self {
             Encoding::Json => serde_json::from_slice(b).map_err(|e| ProtoError(e.to_string())),

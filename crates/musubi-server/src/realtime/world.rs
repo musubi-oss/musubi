@@ -688,7 +688,7 @@ pub fn to_wire(e: &Entity) -> WorldEntity {
             .components
             .iter()
             .map(|(k, c)| WorldComponent {
-                name: k.clone(),
+                name: k.as_str().into(),
                 value: musubi_proto::JsonText(c.json()),
                 version: c.version,
             })
@@ -705,7 +705,7 @@ fn ref_to_wire(e: musubi_mesh::EntityRef) -> WorldEntity {
             .components
             .into_iter()
             .map(|c| WorldComponent {
-                name: c.name.to_string(),
+                name: c.name,
                 value: musubi_proto::JsonText(c.json),
                 version: c.version,
             })

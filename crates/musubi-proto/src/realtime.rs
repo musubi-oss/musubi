@@ -665,7 +665,7 @@ pub struct WorldEntity {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldComponent {
-    pub name: String,
+    pub name: std::sync::Arc<str>,
     pub value: crate::JsonText,
     pub version: u64,
 }

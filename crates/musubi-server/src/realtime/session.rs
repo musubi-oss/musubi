@@ -370,6 +370,7 @@ async fn run_loop_inner(
         lz4: false,
     };
     let mut match_seq: HashMap<String, u64> = HashMap::new();
+    let mut last_len = 0usize;
     loop {
         tokio::select! {
             out = rx.recv() => {
@@ -379,6 +380,7 @@ async fn run_loop_inner(
                 let mut next = Some(first);
                 let mut batch: Vec<Frame> = Vec::new();
                 while let Some(mut msg) = next.take().or_else(|| rx.try_recv().ok()) {
+                    let hint = std::mem::take(&mut last_len);
                     if let ServerMessage::MatchData { match_id, reliable, channel, seq, .. } = &mut msg {
                         if *reliable {
                             channel.get_or_insert(WireChannel::ReliableOrdered);
@@ -394,7 +396,8 @@ async fn run_loop_inner(
                         ServerMessage::MatchData { reliable: false, .. }
                             | ServerMessage::WorldDelta { sequenced: true, .. }
                     );
-                    let frame = wire.frame(&Envelope { cid: None, msg })?;
+                    let (frame, len) = wire.frame_sized(&Envelope { cid: None, msg }, hint)?;
+                    last_len = len.max(hint);
                     if unreliable {
                         if !batch.is_empty() {
                             conn.send_many(std::mem::take(&mut batch)).await?;
@@ -483,7 +486,20 @@ struct Wire {
 
 impl Wire {
     fn frame<T: serde::Serialize>(&self, v: &T) -> Result<Frame, musubi_proto::ProtoError> {
-        let bytes = self.encoding.encode(v)?;
+        self.frame_sized(v, 0).map(|(f, _)| f)
+    }
+
+    fn frame_sized<T: serde::Serialize>(
+        &self,
+        v: &T,
+        cap: usize,
+    ) -> Result<(Frame, usize), musubi_proto::ProtoError> {
+        let bytes = self.encoding.encode_sized(v, cap)?;
+        let len = bytes.len();
+        self.wrap(bytes).map(|f| (f, len))
+    }
+
+    fn wrap(&self, bytes: bytes::Bytes) -> Result<Frame, musubi_proto::ProtoError> {
         Ok(match (self.encoding, self.lz4) {
             (Encoding::Postcard, true) => Frame::Binary(musubi_proto::lz4_wrap(bytes)),
             _ => Frame::encoded(self.encoding, bytes),
