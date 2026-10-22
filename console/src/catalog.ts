@@ -109,5 +109,12 @@ export const catalog: Record<string, Res[]> = {
     { id: 'audit', title: 'Audit log', list: '/v1/admin/audit', rowsKey: 'entries', cols: ['at', 'actor', 'method', 'path', 'status', 'duration_ms', 'ip'] },
     { id: 'sso', title: 'SSO', list: '/v1/admin/sso' },
     { id: 'config', title: 'Node config', list: '/v1/admin/config' },
+    { id: 'environments', title: 'Environments', list: '/v1/admin/environments', rowsKey: 'environments', custom: 'environments' },
+    { id: 'oauth', title: 'OAuth clients', list: '/v1/admin/oauth/clients', rowsKey: 'clients', custom: 'oauth' },
+    { id: 'legal', title: 'Legal documents', list: '/v1/admin/legal', rowsKey: 'documents', custom: 'legal' },
+    { id: 'sanctions', title: 'Sanctions & appeals', list: '/v1/admin/sanctions', rowsKey: 'sanctions', custom: 'sanctions' },
+    { id: 'deletions', title: 'Deletions', list: '/v1/admin/deletions', rowsKey: 'deletions', custom: 'deletions' },
+    { id: 'secrets', title: 'Secrets & sweeps', list: '/v1/admin/secrets/status', custom: 'secrets' },
+    { id: 'devtools', title: 'Developer tools', list: '/v1/admin/dev/recording', custom: 'devtools' },
   ],
 }

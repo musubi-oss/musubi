@@ -11,7 +11,7 @@ export const sections = [
   { id: 'social', title: 'Social', sub: 'Groups, chat, leaderboards, matchmaking' },
   { id: 'world', title: 'World', sub: 'Persistent worlds, cells and simulators' },
   { id: 'cluster', title: 'Cluster', sub: 'Nodes, Raft, bus, placement, mesh, telemetry' },
-  { id: 'settings', title: 'Settings', sub: 'Operators, keys, projects, audit' },
+  { id: 'settings', title: 'Settings', sub: 'Operators, keys, environments, legal, sanctions, audit' },
 ]
 
 export const router = createRouter({
@@ -116,6 +116,13 @@ export const router = createRouter({
       { path: '', component: () => import('./pages/settings/Keys.vue') },
       { path: 'keys', component: () => import('./pages/settings/Keys.vue') },
       { path: 'audit', component: () => import('./pages/settings/Audit.vue') },
+      { path: 'environments', component: () => import('./pages/settings/Environments.vue') },
+      { path: 'oauth', component: () => import('./pages/settings/OAuthClients.vue') },
+      { path: 'legal', component: () => import('./pages/settings/Legal.vue') },
+      { path: 'sanctions', component: () => import('./pages/settings/Sanctions.vue') },
+      { path: 'deletions', component: () => import('./pages/settings/Deletions.vue') },
+      { path: 'secrets', component: () => import('./pages/settings/Secrets.vue') },
+      { path: 'devtools', component: () => import('./pages/settings/DevTools.vue') },
       { path: 'operators', component: () => import('./pages/settings/Access.vue') },
       { path: 'invites', redirect: '/settings/operators' },
       { path: 'jwt_keys', redirect: '/settings/operators' },
