@@ -16,10 +16,34 @@ struct Args {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg = Config::load(args.config.as_deref())?;
-    musubi_server::init_tracing(&cfg);
-    musubi_server::run(cfg).await
+    // Worker pools sized to the cores this process may actually use (affinity mask, cgroup
+    // quota), not the machine's count: a node pinned to 6 of 8 cores used to run 8 runtime
+    // workers plus an 8-thread rayon pool on top of its per-world tick threads and the tick
+    // threads missed their 33 ms deadlines (stand: 25 ticks/s instead of 30).
+    let workers = cfg
+        .node
+        .worker_threads
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        });
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("musubi-par-{i}"))
+        .build_global()
+        .ok();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        musubi_server::init_tracing(&cfg);
+        tracing::info!(workers, "worker pools sized");
+        musubi_server::run(cfg).await
+    })
 }

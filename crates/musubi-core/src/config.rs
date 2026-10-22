@@ -119,6 +119,10 @@ pub struct NodeConfig {
     /// Let the server start with the built-in `server_key` / JWT secret. `musubi dev` sets it;
     /// deployments must set their own secrets instead (see `Config::validate`).
     pub allow_insecure_defaults: bool,
+    /// Threads for the runtime and the parallel fan-out pool; default = the cores this
+    /// process may use (affinity mask / cgroup quota), not the machine's count.
+    #[serde(default)]
+    pub worker_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +210,7 @@ impl Default for NodeConfig {
             environment: "dev".into(),
             drain_timeout_secs: 20,
             allow_insecure_defaults: false,
+            worker_threads: None,
             data_dir: "./data".into(),
         }
     }
