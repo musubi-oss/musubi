@@ -91,13 +91,21 @@ constants — hash the same bytes your handler hashes) is compared with every `m
 "send keyframe" message). The synced state is mirrored from `match_state` and patched by `match_state_delta`
 (RFC 6902: `MusubiJsonPatch`), readable as JSON or by pointer from Blueprint.
 
-The Iris bridge and QUIC are the next phases (§6–§7).
+## Iris bridge — module `MusubiIris` (tier B: UE 5.5–5.8)
+
+Compiles to an empty stub on 5.3/5.4 (`MUSUBI_WITH_IRIS=0`, gate = engine version; 5.7 UBT's `SetupIrisSupport()` is unconditional, there is no per-target Iris switch). On 5.5+:
+
+- `UMusubiReplicationBridge : UObjectReplicationBridge` — Iris keeps owning dirty tracking and descriptors. The bridge tracks objects that carry a `UMusubiAuthorityComponent` from `CacheNetRefHandleCreationInfo` (the one hook both 5.7 and 5.8 call when an object starts replicating), and in `PreSendUpdate` serializes their replicated `UPROPERTY`s (plus replicated components, `Comp.Prop` keys) to JSON, hash-gated (FNV-1a 64), into the entity component `iris` — the simulator subsystem ships it as `apply` on the next `tick_done`. Ghosts are never mirrored back. Detach from Iris = `RequestDespawn` for owned entities: 5.7 via the `DetachInstance` override, 5.8 via `GetRootObjectDetachedDelegate / GetSubObjectDetachedDelegate` (the virtual was removed). `OnProtocolMismatchReported` has the 5.8 `ClientCDOStateBytes` signature behind `ENGINE_MINOR_VERSION >= 8`.
+- `UMusubiNetObjectFactory : UNetObjectFactory`, registered as `MusubiEntity` at module startup (`PostConfigInit`). Creation header = class path + entity uuid + actor flag; remote instantiation spawns the class deferred, `PostInstantiation` binds the authority component as a ghost (`Bind(sim, uuid, cell, owned=false)`) and finishes spawning; `DetachedFromReplication` destroys the actor unless Iris says `DoNotDestroy`.
+
+Not done here: Mass sink (entities → Mass fragments) and QUIC (§7 of the design doc).
+
 
 ## Status / caveats
 
 - Not yet: Blueprint latent (`K2_`) twins of the request calls, the editor settings page, the Mass
   sink, a demo map (needs the editor; the 10k meshbench world is the intended content), server module,
-  Iris bridge, QUIC.
+  Mass sink, QUIC.
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
   Core/Json). The facades reference engine types the shim does not model (UObject, HTTP, WebSockets)
   and have **not been compiled by UBT yet** — the 5.3/5.7/5.8 compile matrix is phase 8; the same goes

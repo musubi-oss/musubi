@@ -275,6 +275,15 @@ receive `world_delta` through Iris' own apply path) without hand-written mapping
   classic `UNetDriver` path is untouched — Musubi never replaces the engine's NetDriver;
   listen-server/P2P projects keep working, Musubi is the authority layer beside it.
 
+### 7.x Implementation notes (phase 6, checked against 5.7.4 / 5.8.4 headers)
+
+- Begin-replication hook: there is no `OnBeginReplication` virtual on `UObjectReplicationBridge`; `CacheNetRefHandleCreationInfo(FNetRefHandle)` is called once per object before its creation header is built in both versions — used as the tracking entry.
+- Detach: `DetachInstance(FNetRefHandle)` is virtual in 5.7 (`ObjectReplicationBridge.h:338`) and **removed** in 5.8; 5.8 exposes `GetRootObjectDetachedDelegate(Bridge)` / `GetSubObjectDetachedDelegate(Bridge)` (`FOnRootObjectDetached(FNetRefHandle, UObject*, EDetachReason)`), which 5.7 does not have. Split on `ENGINE_MINOR_VERSION >= 8`.
+- `OnProtocolMismatchReported(Handle, ConnectionId)` gains `const TArray<uint8>& ClientCDOStateBytes` in 5.8.
+- Factory (5.7 `NetObjectFactory.h`): `CreateAndFillHeader`, `SerializeHeader(FCreationHeaderContext{Handle, Bridge, Factory, FNetSerializationContext& Serialization})`, `CreateAndDeserializeHeader` (PURE_VIRTUAL), `InstantiateReplicatedObjectFromHeader → FInstantiateResult{Instance, Template}`, `PostInstantiation(FPostInstantiationContext{Instance, Header})`, `DetachedFromReplication(FDestroyedContext{DestroyedInstance, RootObject, DestroyReason, DestroyFlags})` (PURE_VIRTUAL); `DestroyReplicatedObject` is `final`. Header bits via `UE::Net::WriteString/WriteBytes` (`NetBitStreamUtil.h`). Registration: `FNetObjectFactoryRegistry::RegisterFactory(UClass*, FName)`.
+- UBT: `ModuleRules.SetupIrisSupport(Target)` adds `IrisCore` + `UE_WITH_IRIS=1` unconditionally; `TargetRules` has no `bUseIris`, so `MusubiIris.Build.cs` gates only on `Target.Version.MinorVersion >= 5`.
+- Still open: Mass sink; UBT compile of this module is part of the phase 8 matrix (shim cannot cover Iris).
+
 ## 8. Transport
 
 | | WebSocket (`IWebSocket`) | QUIC (node `quic.listen`, UDP 7351) | WebTransport |

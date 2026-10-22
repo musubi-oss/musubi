@@ -1,18 +1,39 @@
 {
-  "FileVersion": 3,
-  "Version": 1,
-  "VersionName": "0.1.0",
-  "FriendlyName": "Musubi",
-  "Description": "Client for the Musubi game backend: auth, typed realtime socket, facades (presence, storage, rpc, notifications, chat, matchmaker, parties, matches, streams), seamless-world view (MusubiWorld).",
-  "Category": "Networking",
-  "CreatedBy": "musubi-oss",
-  "CreatedByURL": "https://github.com/musubi-oss/musubi",
-  "DocsURL": "https://github.com/musubi-oss/musubi/tree/main/sdk/unreal",
-  "EngineVersion": "5.3.0",
-  "CanContainContent": false,
-  "Modules": [
-    { "Name": "Musubi", "Type": "Runtime", "LoadingPhase": "Default" },
-    { "Name": "MusubiWorld", "Type": "Runtime", "LoadingPhase": "Default" },
-    { "Name": "MusubiServer", "Type": "Runtime", "LoadingPhase": "Default", "TargetAllowList": [ "Server", "Editor" ] }
-  ]
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Musubi",
+	"Description": "Client for the Musubi game backend: auth, typed realtime socket, facades (presence, storage, rpc, notifications, chat, matchmaker, parties, matches, streams), seamless-world view (MusubiWorld).",
+	"Category": "Networking",
+	"CreatedBy": "musubi-oss",
+	"CreatedByURL": "https://github.com/musubi-oss/musubi",
+	"DocsURL": "https://github.com/musubi-oss/musubi/tree/main/sdk/unreal",
+	"EngineVersion": "5.3.0",
+	"CanContainContent": false,
+	"Modules": [
+		{
+			"Name": "Musubi",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MusubiWorld",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MusubiServer",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"TargetAllowList": [
+				"Server",
+				"Editor"
+			]
+		},
+		{
+			"Name": "MusubiIris",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
 }
