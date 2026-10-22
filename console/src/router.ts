@@ -70,6 +70,8 @@ export const router = createRouter({
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.cluster.find((x) => x.id === r.params.page) ?? catalog.cluster[0] }) },
     ]},
     { path: '/social', component: () => import('./pages/social/Index.vue'), children: [
+      { path: 'sessions', component: () => import('./pages/social/Sessions.vue') },
+      { path: 'tournaments', component: () => import('./pages/social/Tournaments.vue') },
       { path: '', component: () => import('./pages/social/ChatFilters.vue') },
       { path: 'matchmaker', component: () => import('./pages/social/Matchmaker.vue') },
       { path: 'chat_filters', component: () => import('./pages/social/ChatFilters.vue') },
