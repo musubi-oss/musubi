@@ -56,6 +56,8 @@ jobs:
       - run: sdk/unreal/tools/syntax-check.sh
       - run: sdk/unreal/tools/wire-test.sh
       - run: sdk/unreal/tools/sim-wire-test.sh
+      # QUIC transport: the C-ABI static library the MusubiQuic module links must build.
+      - run: sdk/unreal/tools/build-quic-ffi.sh
   bench:
     # criterion micro-benches (plan 6.2): the base commit (PR base / previous push) is benched on the
     # same runner right before HEAD, so the comparison never crosses machines; >5% slower fails

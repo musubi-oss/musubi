@@ -80,7 +80,7 @@ Musubi simulator (the engine owns physics, Musubi owns authority and meshing):
   `SetComponent*` marks dirty for the next `apply`; `Interact`, `RequestDespawn`). Project hook
   `SpawnEntityActor` picks the actor class per entity; otherwise the settings' classes.
 - Not yet: cell → level-streaming, Chaos deterministic-mode assertions, `rewind` driven snapshots
-  (`rewind` is exposed as a command only), QUIC.
+  (`rewind` is exposed as a command only).
 
 **Rollback matches** (`UMusubiMatch`, §5) over `UMusubiMatches`: `Attach(matchId, tickRate)` (0 = measured
 from the `match_tick_hash` cadence), `SendInput(opcode, bytes)` stamps the predicted tick (server tick
@@ -98,14 +98,29 @@ Compiles to an empty stub on 5.3/5.4 (`MUSUBI_WITH_IRIS=0`, gate = engine versio
 - `UMusubiReplicationBridge : UObjectReplicationBridge` — Iris keeps owning dirty tracking and descriptors. The bridge tracks objects that carry a `UMusubiAuthorityComponent` from `CacheNetRefHandleCreationInfo` (the one hook both 5.7 and 5.8 call when an object starts replicating), and in `PreSendUpdate` serializes their replicated `UPROPERTY`s (plus replicated components, `Comp.Prop` keys) to JSON, hash-gated (FNV-1a 64), into the entity component `iris` — the simulator subsystem ships it as `apply` on the next `tick_done`. Ghosts are never mirrored back. Detach from Iris = `RequestDespawn` for owned entities: 5.7 via the `DetachInstance` override, 5.8 via `GetRootObjectDetachedDelegate / GetSubObjectDetachedDelegate` (the virtual was removed). `OnProtocolMismatchReported` has the 5.8 `ClientCDOStateBytes` signature behind `ENGINE_MINOR_VERSION >= 8`.
 - `UMusubiNetObjectFactory : UNetObjectFactory`, registered as `MusubiEntity` at module startup (`PostConfigInit`). Creation header = class path + entity uuid + actor flag; remote instantiation spawns the class deferred, `PostInstantiation` binds the authority component as a ghost (`Bind(sim, uuid, cell, owned=false)`) and finishes spawning; `DetachedFromReplication` destroys the actor unless Iris says `DoNotDestroy`.
 
-Not done here: Mass sink (entities → Mass fragments) and QUIC (§7 of the design doc).
+Not done here: Mass sink (entities → Mass fragments).
+
+**Transport** (`MusubiTransport.h`, §8): `FMusubiSocket` runs over an `IMusubiTransport`. `FMusubiWsTransport`
+(engine `IWebSocket`, token/format/resume in the `/ws` query) ships in the core module; the `MusubiQuic` module
+registers `FMusubiQuicTransport` on top of `crates/musubi-quic-ffi` — a Rust static library (quinn + rustls, the
+node's own QUIC stack) with a five-call C ABI (`musubi_quic.h`: `mq_connect / mq_send / mq_poll / mq_max_datagram /
+mq_close`), built per platform by `tools/build-quic-ffi.sh` into `Source/ThirdParty/MusubiQuicFfi/lib/<Platform>/`.
+No library for the platform → the module compiles to a stub and the plugin stays WebSocket-only.
+
+- Wire: ALPN `musubi-rt/1`; the first bidi stream carries the `hello` text frame (`{token, format, resumable,
+  resume}`) and then envelopes framed `[type u8][len u32 BE][body]`; binary frames sent with `bUnreliable` travel as
+  datagrams `[type u8][body]` when they fit. Layout is pinned to the node by `musubi-quic-ffi/tests/parity.rs`.
+- `FConfig::Transport = Auto` picks QUIC when registered and falls back to WebSocket if QUIC fails before its first
+  handshake; `QuicPort` is the node's `quic.listen` UDP port (0 = API port), `bQuicInsecure` (or an `http://` base)
+  accepts self-signed dev certificates. `bResumable` (default on) makes reconnects resume the parked session.
+- The ffi owns one tokio thread per connection; the transport polls it from the game thread (≤ 512 events/tick).
 
 
 ## Status / caveats
 
 - Not yet: Blueprint latent (`K2_`) twins of the request calls, the editor settings page, the Mass
-  sink, a demo map (needs the editor; the 10k meshbench world is the intended content), server module,
-  Mass sink, QUIC.
+  sink, a demo map (needs the editor; the 10k meshbench world is the intended content), live WS→QUIC
+  migration (Auto only decides at connect time), console platform builds of `musubi-quic-ffi`.
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
   Core/Json). The facades reference engine types the shim does not model (UObject, HTTP, WebSockets)
   and have **not been compiled by UBT yet** — the 5.3/5.7/5.8 compile matrix is phase 8; the same goes

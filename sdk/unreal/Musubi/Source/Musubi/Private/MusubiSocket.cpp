@@ -1,31 +1,33 @@
 #include "MusubiSocket.h"
 #include "MusubiModule.h"
-#include "WebSocketsModule.h"
-#include "GenericPlatform/GenericPlatformHttp.h"
 
 FMusubiSocket::FMusubiSocket() = default;
 
 FMusubiSocket::~FMusubiSocket()
 {
-	if (Ws.IsValid())
+	if (Transport)
 	{
-		Ws->OnConnected().RemoveAll(this);
-		Ws->OnConnectionError().RemoveAll(this);
-		Ws->OnClosed().RemoveAll(this);
-		Ws->OnMessage().RemoveAll(this);
-		Ws->OnRawMessage().RemoveAll(this);
-		if (Ws->IsConnected()) Ws->Close();
+		Transport->OnConnected.RemoveAll(this);
+		Transport->OnError.RemoveAll(this);
+		Transport->OnClosed.RemoveAll(this);
+		Transport->OnText.RemoveAll(this);
+		Transport->OnBinary.RemoveAll(this);
+		Transport.Reset();
 	}
+}
+
+EMusubiTransport FMusubiSocket::GetTransportKind() const
+{
+	return Transport ? Transport->Kind() : EMusubiTransport::WebSocket;
 }
 
 FString FMusubiSocket::SocketUrl(const FString& BaseUrl, const FString& AccessToken, EMusubiEncoding Encoding)
 {
-	FString Url = BaseUrl;
-	Url.RemoveFromEnd(TEXT("/"));
-	if (Url.StartsWith(TEXT("https://"))) Url = TEXT("wss://") + Url.Mid(8);
-	else if (Url.StartsWith(TEXT("http://"))) Url = TEXT("ws://") + Url.Mid(7);
-	return FString::Printf(TEXT("%s/ws?token=%s&format=%s"), *Url, *FGenericPlatformHttp::UrlEncode(AccessToken),
-		Encoding == EMusubiEncoding::Postcard ? TEXT("binary") : TEXT("json"));
+	FMusubiTransportArgs Args;
+	Args.BaseUrl = BaseUrl;
+	Args.AccessToken = AccessToken;
+	Args.Encoding = Encoding;
+	return FMusubiWsTransport::SocketUrl(Args);
 }
 
 void FMusubiSocket::Connect(const FString& BaseUrl, const FString& AccessToken, const FConfig& InConfig)
@@ -34,6 +36,9 @@ void FMusubiSocket::Connect(const FString& BaseUrl, const FString& AccessToken, 
 	Base = BaseUrl;
 	Token = AccessToken;
 	bUserClosed = false;
+	bEverConnected = false;
+	bQuicFailed = false;
+	Session.Reset();
 	Backoff = Config.BackoffMinSec;
 	Open();
 }
@@ -45,34 +50,53 @@ void FMusubiSocket::SetAccessToken(const FString& AccessToken)
 
 void FMusubiSocket::Open()
 {
-	if (Ws.IsValid())
+	if (Transport)
 	{
-		Ws->OnConnected().RemoveAll(this);
-		Ws->OnConnectionError().RemoveAll(this);
-		Ws->OnClosed().RemoveAll(this);
-		Ws->OnMessage().RemoveAll(this);
-		Ws->OnRawMessage().RemoveAll(this);
-		Ws.Reset();
+		Transport->OnConnected.RemoveAll(this);
+		Transport->OnError.RemoveAll(this);
+		Transport->OnClosed.RemoveAll(this);
+		Transport->OnText.RemoveAll(this);
+		Transport->OnBinary.RemoveAll(this);
+		Transport.Reset();
 	}
-	BinaryAccum.Reset();
-	FWebSocketsModule& Module = FModuleManager::LoadModuleChecked<FWebSocketsModule>(TEXT("WebSockets"));
-	Ws = Module.CreateWebSocket(SocketUrl(Base, Token, Config.Encoding), TEXT(""));
-	Ws->OnConnected().AddRaw(this, &FMusubiSocket::HandleConnected);
-	Ws->OnConnectionError().AddRaw(this, &FMusubiSocket::HandleError);
-	Ws->OnClosed().AddRaw(this, &FMusubiSocket::HandleClosed);
-	Ws->OnMessage().AddRaw(this, &FMusubiSocket::HandleText);
-	Ws->OnRawMessage().AddRaw(this, &FMusubiSocket::HandleBinary);
+	EMusubiTransport Kind = FMusubiTransportRegistry::Resolve(Config.Transport);
+	if (Kind == EMusubiTransport::Quic && Config.Transport == EMusubiTransport::Auto && bQuicFailed)
+		Kind = EMusubiTransport::WebSocket;
+	Transport = FMusubiTransportRegistry::Create(Kind);
+	if (!Transport)
+	{
+		UE_LOG(LogMusubi, Error, TEXT("transport %d not available (is the MusubiQuic module enabled?)"), (int32)Kind);
+		FailAllPending(TEXT("transport unavailable"));
+		SetState(EMusubiSocketState::Closed);
+		return;
+	}
+	Transport->OnConnected.AddRaw(this, &FMusubiSocket::HandleConnected);
+	Transport->OnError.AddRaw(this, &FMusubiSocket::HandleError);
+	Transport->OnClosed.AddRaw(this, &FMusubiSocket::HandleClosed);
+	Transport->OnText.AddRaw(this, &FMusubiSocket::HandleText);
+	Transport->OnBinary.AddRaw(this, &FMusubiSocket::HandleBinary);
 	SetState(bEverConnected ? EMusubiSocketState::Reconnecting : EMusubiSocketState::Connecting);
-	Ws->Connect();
+
+	FMusubiTransportArgs Args;
+	Args.BaseUrl = Base;
+	Args.AccessToken = Token;
+	Args.Encoding = Config.Encoding;
+	Args.bResumable = Config.bResumable;
+	// resume only across a reconnect of the same socket; a fresh Connect() starts a new session
+	if (bEverConnected && Session.IsSet() && !Session->resume_token.IsEmpty()) Args.Resume = Session->resume_token;
+	Args.QuicPort = Config.QuicPort;
+	Args.bInsecure = Config.bQuicInsecure;
+	Args.MaxFrameBytes = Config.MaxFrameBytes;
+	Transport->Connect(Args);
 }
 
 void FMusubiSocket::Close(int32 Code, const FString& Reason)
 {
 	bUserClosed = true;
 	ReconnectAt = 0.0;
-	if (Ws.IsValid() && Ws->IsConnected())
+	if (Transport && Transport->IsConnected())
 	{
-		Ws->Close(Code, Reason);
+		Transport->Close(Code, Reason);
 	}
 	else
 	{
@@ -104,7 +128,17 @@ void FMusubiSocket::HandleConnected()
 
 void FMusubiSocket::HandleError(const FString& Error)
 {
-	UE_LOG(LogMusubi, Warning, TEXT("socket error: %s"), *Error);
+	UE_LOG(LogMusubi, Warning, TEXT("socket error (%s): %s"),
+		GetTransportKind() == EMusubiTransport::Quic ? TEXT("quic") : TEXT("ws"), *Error);
+	if (!bEverConnected && Config.Transport == EMusubiTransport::Auto && GetTransportKind() == EMusubiTransport::Quic && !bQuicFailed)
+	{
+		// Auto: QUIC never handshook (UDP blocked, wrong port, cert) → retry at once over WebSocket.
+		bQuicFailed = true;
+		UE_LOG(LogMusubi, Log, TEXT("quic unavailable, falling back to websocket"));
+		ReconnectAt = Now;
+		SetState(EMusubiSocketState::Reconnecting);
+		return;
+	}
 	FailAllPending(Error);
 	if (!bUserClosed && Config.bAutoReconnect) ScheduleReconnect();
 	else SetState(EMusubiSocketState::Closed);
@@ -141,22 +175,12 @@ void FMusubiSocket::HandleText(const FString& Text)
 	Dispatch(Env);
 }
 
-void FMusubiSocket::HandleBinary(const void* Data, SIZE_T Size, SIZE_T BytesRemaining)
+void FMusubiSocket::HandleBinary(const uint8* Data, int32 Size)
 {
-	if (BinaryAccum.Num() + (int64)Size + (int64)BytesRemaining > Config.MaxFrameBytes)
-	{
-		Stats.DecodeErrors++;
-		BinaryAccum.Reset();
-		UE_LOG(LogMusubi, Warning, TEXT("binary frame over MaxFrameBytes, dropped"));
-		return;
-	}
-	BinaryAccum.Append((const uint8*)Data, (int32)Size);
-	if (BytesRemaining > 0) return;
 	Stats.FramesIn++;
-	Stats.BytesIn += BinaryAccum.Num();
+	Stats.BytesIn += Size;
 	FMusubiServerEnvelope Env;
-	const bool bOk = Env.FromPostcard(BinaryAccum.GetData(), BinaryAccum.Num());
-	BinaryAccum.Reset();
+	const bool bOk = Env.FromPostcard(Data, Size);
 	if (!bOk)
 	{
 		Stats.DecodeErrors++;
@@ -203,19 +227,19 @@ void FMusubiSocket::Dispatch(const FMusubiServerEnvelope& Env)
 
 bool FMusubiSocket::Transmit(const FMusubiClientEnvelope& Env)
 {
-	if (!IsConnected() || !Ws.IsValid()) return false;
+	if (!IsConnected() || !Transport) return false;
 	if (Config.Encoding == EMusubiEncoding::Postcard)
 	{
 		TArray<uint8> Bytes = Env.ToPostcard();
 		if (Bytes.Num() == 0) return false;
 		Stats.BytesOut += Bytes.Num();
-		Ws->Send(Bytes.GetData(), Bytes.Num(), true);
+		if (!Transport->SendBinary(Bytes.GetData(), Bytes.Num(), false)) return false;
 	}
 	else
 	{
 		const FString Text = Env.ToJsonText();
 		Stats.BytesOut += Text.Len();
-		Ws->Send(Text);
+		if (!Transport->SendText(Text)) return false;
 	}
 	Stats.FramesOut++;
 	return true;
@@ -284,6 +308,7 @@ void FMusubiSocket::FailAllPending(const FString& Why)
 void FMusubiSocket::Tick(double DeltaSeconds)
 {
 	Now += DeltaSeconds;
+	if (Transport) Transport->Tick(DeltaSeconds);
 
 	if (State == EMusubiSocketState::Reconnecting && ReconnectAt > 0.0 && Now >= ReconnectAt)
 	{

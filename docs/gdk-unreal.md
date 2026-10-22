@@ -286,15 +286,28 @@ receive `world_delta` through Iris' own apply path) without hand-written mapping
 
 ## 8. Transport
 
-| | WebSocket (`IWebSocket`) | QUIC (node `quic.listen`, UDP 7351) | WebTransport |
+| | WebSocket (`IWebSocket`) | QUIC (`MusubiQuic`, node `quic.listen`) | WebTransport |
 |---|---|---|---|
-| Availability | all platforms | desktop/console via `MusubiQuic` (vendored `quiche`, static lib per platform) | browser-only (not for UE) |
-| Reliable stream | yes (text/binary) | yes (bidi stream) | — |
-| Unreliable sequenced (`WorldDelta.sequenced`, `world_input`) | no (sent reliable) | datagrams | — |
-| Handshake | `?token=` query | `transport` message on WS carries a one-shot ticket, QUIC connects with it; WS stays as fallback until the first QUIC frame | — |
+| Availability | all platforms | Win64 / Linux / Mac via `crates/musubi-quic-ffi` (Rust static lib: quinn + rustls — the node's own stack; `tools/build-quic-ffi.sh`) | browser-only (not for UE) |
+| Reliable stream | yes (text/binary) | yes (first bidi stream) | — |
+| Unreliable sequenced (`WorldDelta.sequenced`, `world_input`) | no (sent reliable) | datagrams `[type][body]` when they fit `mq_max_datagram`, else the stream (node does the same) | — |
+| Handshake | `/ws?token=&format=&resumable=&resume=` | first text frame on the stream is the `hello` JSON `{token, format, resumable, resume}` (node `realtime/quic.rs handle`, 5 s timeout), then envelopes exactly as on WS | — |
 
-* `Transport=auto`: start WS, probe QUIC in parallel (3 s), migrate when the first datagram
-  round-trips; a QUIC path loss (3 missed pings) falls back to WS and re-subscribes.
+Implemented (phase 7): `IMusubiTransport` seam under `FMusubiSocket` (`MusubiTransport.h`); `FMusubiWsTransport` in
+the core module, `FMusubiQuicTransport` registered by `MusubiQuic` at startup (`FMusubiTransportRegistry`), so the core
+has no link-time dependency on the native library. Frame layout is locked to the node by
+`crates/musubi-quic-ffi/tests/parity.rs` (ALPN `musubi-rt/1`, stream `[type u8][len u32 BE][body]`, datagram
+`[type u8][body]`). The ffi runs one tokio thread per connection and is polled from the game thread (`mq_poll`,
+≤ 512 events per tick) — no cross-thread UObject access.
+
+* `FConfig::Transport`: `Auto` (default) = QUIC when `MusubiQuic` is loaded and has a library for the platform,
+  otherwise WebSocket; if QUIC fails before its first handshake (UDP blocked, wrong port, cert) the socket retries at
+  once over WebSocket and stays there for its lifetime. `QuicPort` = the node's `quic.listen` port (QUIC is a
+  separate UDP listener, there is no discovery endpoint); `bQuicInsecure` or an `http://` base accepts the node's
+  self-signed dev certificate. The `transport` message is introspection (`{transport, channels, …}`) and the lz4
+  switch — it is not a migration ticket; a live WS→QUIC migration with parallel probing is not implemented.
+* Reconnects of a resumable session (`FConfig::bResumable`, default on) pass `session.resume_token` as `resume`
+  (WS query / QUIC hello) and the node re-attaches the parked session instead of rebuilding it.
 * Binary format is the default on QUIC, optional on WS (`Format`).
 * Compression: none (node already sends deltas); frames above 64 KiB are logged as a
   misconfiguration (budget too high).
@@ -357,6 +370,6 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    `UMusubiMatches` (+ RFC 6902 patching of the synced state); the world prediction buffer
    waits for a project that needs it.
 6. Iris bridge (tier B) + Mass sink.
-7. QUIC transport (`quiche` static libs: Win64, Linux, Mac; consoles later), `transport` switch.
+7. QUIC transport — done: `musubi-quic-ffi` (Rust static lib) + `MusubiQuic`, `IMusubiTransport` seam, Auto with WS fallback. Consoles (platform ffi builds) and live WS→QUIC migration later.
 8. CI compile matrix 5.3/5.7/5.8 + node-in-the-loop tests + docs (`docs/parity.md` L146/L192
    updated: SDK/GDK no longer "after").

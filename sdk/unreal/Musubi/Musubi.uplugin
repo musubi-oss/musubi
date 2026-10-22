@@ -34,6 +34,11 @@
 			"Name": "MusubiIris",
 			"Type": "Runtime",
 			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "MusubiQuic",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
 		}
 	]
 }

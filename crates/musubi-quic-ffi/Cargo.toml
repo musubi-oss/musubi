@@ -1,0 +1,21 @@
+[package]
+name = "musubi-quic-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C ABI QUIC client for the Musubi realtime protocol (linked into the Unreal plugin's MusubiQuic module)"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+musubi-transport.workspace = true
+rcgen.workspace = true

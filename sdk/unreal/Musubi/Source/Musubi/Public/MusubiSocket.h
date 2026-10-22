@@ -1,5 +1,5 @@
-// Realtime socket: typed `Envelope{cid, msg}` frames over `/ws?token=&format=json|binary`
-// (IWebSocket). Every ClientMessage variant goes out through `Send`/`Request`; every
+// Realtime socket: typed `Envelope{cid, msg}` frames over an IMusubiTransport (WebSocket `/ws`
+// in this module, QUIC via the optional `MusubiQuic` module). Every ClientMessage variant goes out through `Send`/`Request`; every
 // ServerMessage variant arrives on `OnMessage` (and `OnTag(tag)` for one-tag listeners).
 // Requests carry a correlation id; the first reply with the same cid resolves them (an
 // `error` body resolves with bOk = false; no reply within ReplyTimeout → bOk = false, Timeout).
@@ -7,7 +7,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "IWebSocket.h"
+#include "MusubiTransport.h"
 #include "MusubiEnvelope.h"
 
 enum class EMusubiSocketState : uint8
@@ -54,6 +54,14 @@ public:
 		bool bAutoReconnect = true;
 		/** Frames larger than this are refused before decode. */
 		int32 MaxFrameBytes = 4 * 1024 * 1024;
+		/** Auto = QUIC when `MusubiQuic` is loaded (falls back to WebSocket if the QUIC connect fails), else WebSocket. */
+		EMusubiTransport Transport = EMusubiTransport::Auto;
+		/** QUIC UDP port (the node's `quic.listen`); 0 = same port as the API base. */
+		int32 QuicPort = 0;
+		/** QUIC: accept self-signed node certificates (development). */
+		bool bQuicInsecure = false;
+		/** Ask the node for a resume token; reconnects then resume the parked session instead of rebuilding it. */
+		bool bResumable = true;
 	};
 
 	FMusubiSocket();
@@ -87,6 +95,9 @@ public:
 	/** Per-tag listeners: `OnTag(EMusubiServerMessageTag::WorldDelta).AddRaw(...)`. */
 	FMusubiServerMessageEvent& OnTag(EMusubiServerMessageTag Tag) { return TagEvents.FindOrAdd(Tag); }
 
+	/** Transport actually in use (Auto resolved); WebSocket when not connected yet. */
+	EMusubiTransport GetTransportKind() const;
+
 	static FString SocketUrl(const FString& BaseUrl, const FString& AccessToken, EMusubiEncoding Encoding);
 
 private:
@@ -102,7 +113,7 @@ private:
 	void HandleError(const FString& Error);
 	void HandleClosed(int32 Code, const FString& Reason, bool bWasClean);
 	void HandleText(const FString& Text);
-	void HandleBinary(const void* Data, SIZE_T Size, SIZE_T BytesRemaining);
+	void HandleBinary(const uint8* Data, int32 Size);
 	void Dispatch(const FMusubiServerEnvelope& Env);
 	void FailAllPending(const FString& Why);
 	void FailPending(FPending&& P, const FString& Why, EMusubiCodeTag Code);
@@ -112,13 +123,14 @@ private:
 	FConfig Config;
 	FString Base;
 	FString Token;
-	TSharedPtr<IWebSocket> Ws;
+	TUniquePtr<IMusubiTransport> Transport;
+	/** Auto: QUIC failed before the first handshake — stay on WebSocket for this socket's lifetime. */
+	bool bQuicFailed = false;
 	EMusubiSocketState State = EMusubiSocketState::Closed;
 	TMap<FString, FPending> Pending;
 	TMap<EMusubiServerMessageTag, FMusubiServerMessageEvent> TagEvents;
 	TOptional<FMusubiServerMessageSession> Session;
 	FMusubiSocketStats Stats;
-	TArray<uint8> BinaryAccum;
 	uint64 NextCid = 1;
 	double Now = 0.0;
 	double NextPingAt = 0.0;

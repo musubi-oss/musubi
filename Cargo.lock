@@ -3050,6 +3050,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "musubi-quic-ffi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "musubi-transport",
+ "quinn",
+ "rcgen 0.13.2",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "musubi-runtime"
 version = "0.1.0"
 dependencies = [
