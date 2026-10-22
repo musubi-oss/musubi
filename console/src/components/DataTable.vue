@@ -11,7 +11,10 @@ const SIZES = [25, 50, 100, 500]
 const stored = Number(localStorage.getItem('dt.size') || 0)
 const size = ref(props.pageSize || stored || 50)
 const page = ref(0)
-const sortKey = ref(''); const sortDir = ref<1 | -1>(1)
+// Newest first by default when the table has a creation/time column; a header click overrides.
+const defaultKey = () => props.cols.find((c) => c.sort !== false && /^(created_at|created|at|ts|time|started_at|received_at|updated_at)$/.test(c.key))?.key ?? ''
+const sortKey = ref(defaultKey()); const sortDir = ref<1 | -1>(-1)
+watch(() => props.cols.map((c) => c.key).join(), () => { if (!props.cols.some((c) => c.key === sortKey.value)) { sortKey.value = defaultKey(); sortDir.value = -1 } })
 function at(row: any, key: string) { return key.split('.').reduce((o, k) => (o == null ? o : o[k]), row) }
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d/
 function tsMs(c: Col, v: unknown): number | null {

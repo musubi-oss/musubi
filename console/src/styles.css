@@ -51,3 +51,4 @@ table.loading tbody{opacity:.45;transition:opacity .2s}
 kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-bottom-width:2px;border-radius:4px;padding:0 5px;color:var(--fg2)}
 .side .nf{min-width:0;width:100%;margin-bottom:8px;padding:5px 9px;font-size:12px}
 .prog{position:fixed;left:0;top:0;height:2px;width:100%;z-index:40;background:linear-gradient(90deg,transparent,var(--blue2),transparent);background-size:40% 100%;opacity:0;transition:opacity .2s}.prog.on{opacity:1;animation:prog 1s linear infinite}@keyframes prog{from{background-position:-40% 0}to{background-position:140% 0}}
+.crumb .id{cursor:copy}.crumb .id:hover{color:var(--fg2)}

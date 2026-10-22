@@ -15,7 +15,9 @@ function key(e: KeyboardEvent) {
   if (e.key === '/') { const el = document.querySelector<HTMLInputElement>('.page input.in[placeholder*="search" i], .page input.in[placeholder*="filter" i], .page input.in'); if (el) { e.preventDefault(); el.focus(); el.select() } }
   if (e.key === 'r') { const b = [...document.querySelectorAll<HTMLButtonElement>('.page button.btn')].find((x) => /^refresh$/i.test(x.textContent?.trim() ?? '')); if (b && !document.querySelector('.drawer')) { e.preventDefault(); b.click() } }
 }
-onMounted(() => window.addEventListener('keydown', key)); onBeforeUnmount(() => window.removeEventListener('keydown', key))
+// Any `.crumb .id` (entity ids in page headers) copies itself on click.
+function click(e: MouseEvent) { const el = (e.target as HTMLElement)?.closest?.('.crumb .id'); if (el?.textContent) { navigator.clipboard?.writeText(el.textContent.trim()); toast.show('copied') } }
+onMounted(() => { window.addEventListener('keydown', key); window.addEventListener('click', click) }); onBeforeUnmount(() => { window.removeEventListener('keydown', key); window.removeEventListener('click', click) })
 </script>
 <template>
   <div class="top">
