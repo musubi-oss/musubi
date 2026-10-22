@@ -122,6 +122,12 @@ No library for the platform → the module compiles to a stub and the plugin sta
 - The ffi owns one tokio thread per connection; the transport polls it from the game thread (≤ 512 events/tick).
 
 
+**Latent Blueprint nodes** (`UMusubiAsyncAction`): every facade request that takes a callback also exists as an
+async node with `On Done` / `On Failed` pins carrying the same `FMusubiCallResult` — Join Room / Direct / Group,
+Send Chat Text / JSON, Subscribe Storage, Refresh Inbox, Follow Accounts, Matchmaker Enqueue, Create / Join Party,
+Create / Join Match (by id or token), Call RPC. The node holds itself alive via `RegisterWithGameInstance` until
+the reply; a missing facade or game instance fails locally with `unavailable`.
+
 **Settings**: Project Settings → Plugins → Musubi (`UMusubiSettings`, `[/Script/Musubi.MusubiSettings]` in
 `DefaultGame.ini`): node address, wire encoding, transport (Auto/WebSocket/QUIC), QUIC port, insecure dev TLS,
 resumable sessions, reply timeout, ping, backoff, inflight and frame limits. `UMusubiSubsystem` reads it at
@@ -130,7 +136,7 @@ on the command line and a runtime `Configure()` override the address.
 
 ## Status / caveats
 
-- Not yet: Blueprint latent (`K2_`) twins of the request calls, a demo map (needs the editor; the 10k meshbench world is the intended content), live WS→QUIC
+- Not yet: a demo map (needs the editor; the 10k meshbench world is the intended content), live WS→QUIC
   migration (Auto only decides at connect time), console platform builds of `musubi-quic-ffi`.
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
   Core/Json). The facades reference engine types the shim does not model (UObject, HTTP, WebSockets)

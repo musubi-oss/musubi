@@ -369,7 +369,8 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    session/refresh. Replaces today's 1 072-line scaffold.
 2. Facades: presence, storage, rpc, notifications, chat, matchmaker, parties, matches (no
    rollback yet), streams — shipped as `UMusubiFacade` subsystems with C++ delegates and
-   Blueprint wrappers; Blueprint latent nodes are deferred to 8. Settings page done: `UMusubiSettings`
+   Blueprint wrappers; latent nodes done (`UMusubiAsyncAction`, one `UBlueprintAsyncActionBase` factory per
+   request, same on 5.3–5.8). Settings page done: `UMusubiSettings`
    (Project Settings → Plugins → Musubi: node address, encoding, transport, QUIC port, resume, timeouts;
    `-MusubiApi=` overrides), seeded into `UMusubiSubsystem` at Initialize.
 3. World view: subscription driver, registry, actor/ISM sinks, interpolation, time scale,
