@@ -1975,9 +1975,10 @@ async fn fleet_docker_provider_runs_a_container() {
                             // another test binary's reconciler may already have moved the row past `starting`
     let servers = svc.servers(fid, None).await.unwrap();
     assert_eq!(servers.len(), 1, "{servers:?}");
-    // the row is written before `docker run` returns (possibly by another test binary's reconciler)
+    // the row is written before `docker run` returns (possibly by another test binary's reconciler);
+    // on a cold runner `docker run` also pulls the image, so allow 30 s
     let mut running = false;
-    for _ in 0..40 {
+    for _ in 0..120 {
         let out = tokio::process::Command::new("docker")
             .args([
                 "ps",
