@@ -1,5 +1,6 @@
 #include "MusubiSubsystem.h"
 #include "MusubiModule.h"
+#include "Containers/Ticker.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -8,15 +9,33 @@ void UMusubiSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     Super::Initialize(Collection);
     Rt = MakeShared<FMusubiSocket>();
     TWeakObjectPtr<UMusubiSubsystem> Weak(this);
-    Rt->OnConnected.AddLambda([Weak]() { if (Weak.IsValid()) Weak->OnSocketConnected.Broadcast(); });
+    Rt->OnStateChanged.AddLambda([Weak](EMusubiSocketState S)
+    {
+        if (!Weak.IsValid() || S != EMusubiSocketState::Open) return;
+        if (!Weak->PendingStatus.IsEmpty())
+        {
+            FMusubiClientMessage M;
+            M.Tag = EMusubiClientMessageTag::StatusUpdate;
+            FMusubiClientMessageStatusUpdate Body;
+            Body.status = Weak->PendingStatus;
+            M.StatusUpdate = MoveTemp(Body);
+            Weak->Rt->Send(M);
+        }
+        Weak->OnSocketConnected.Broadcast();
+    });
     Rt->OnClosed.AddLambda([Weak](int32 Code, const FString& Reason) { if (Weak.IsValid()) Weak->OnSocketClosed.Broadcast(Code, Reason); });
-    Rt->OnMatchData.AddLambda([Weak](const FMusubiMatchData& D) { if (Weak.IsValid()) Weak->OnMatchData.Broadcast(D); });
-    Rt->OnWorldDelta.AddLambda([Weak](const FMusubiWorldDelta& D) { if (Weak.IsValid()) Weak->OnWorldDelta.Broadcast(D); });
-    Rt->OnMatchmakerMatched.AddLambda([Weak](const FMusubiMatchmakerMatched& M) { if (Weak.IsValid()) Weak->OnMatchmakerMatched.Broadcast(M); });
+    // Token may have been refreshed while the socket was down.
+    Rt->OnResubscribe.AddLambda([Weak]() { if (Weak.IsValid() && Weak->Http.IsValid()) Weak->Rt->SetAccessToken(Weak->Http->Session().AccessToken); });
+    TickHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak](float Dt)
+    {
+        if (Weak.IsValid() && Weak->Rt.IsValid()) Weak->Rt->Tick(Dt);
+        return Weak.IsValid();
+    }));
 }
 
 void UMusubiSubsystem::Deinitialize()
 {
+    FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
     if (Rt.IsValid()) Rt->Close();
     Rt.Reset();
     Http.Reset();
@@ -58,7 +77,8 @@ FMusubiSession UMusubiSubsystem::GetSession() const
 void UMusubiSubsystem::ConnectSocket(const FString& Status)
 {
     if (!Http.IsValid() || !Http->HasSession()) { UE_LOG(LogMusubi, Error, TEXT("authenticate first")); return; }
-    Rt->Connect(FMusubiClient::WebSocketUrl(Http->BaseUrl(), Http->Session().AccessToken, Status));
+    PendingStatus = Status;
+    Rt->Connect(Http->BaseUrl(), Http->Session().AccessToken);
 }
 
 void UMusubiSubsystem::DisconnectSocket()
@@ -73,21 +93,43 @@ bool UMusubiSubsystem::IsSocketConnected() const
 
 void UMusubiSubsystem::SendMatchData(const FString& MatchId, int64 OpCode, const TArray<uint8>& Data, bool bReliable)
 {
-    if (Rt.IsValid()) Rt->MatchDataSend(MatchId, OpCode, Data, bReliable);
+    if (!Rt.IsValid()) return;
+    FMusubiClientMessage M;
+    M.Tag = EMusubiClientMessageTag::MatchDataSend;
+    FMusubiClientMessageMatchDataSend Body;
+    Body.match_id = MatchId;
+    Body.op_code = OpCode;
+    Body.data = Data;
+    Body.reliable = bReliable;
+    M.MatchDataSend = MoveTemp(Body);
+    Rt->Send(M);
 }
 
 void UMusubiSubsystem::SubscribeWorld(const FString& World, double X, double Y, double Radius)
 {
-    if (Rt.IsValid()) Rt->WorldSubscribe(World, X, Y, Radius);
+    if (!Rt.IsValid()) return;
+    FMusubiClientMessage M;
+    M.Tag = EMusubiClientMessageTag::WorldSubscribe;
+    FMusubiClientMessageWorldSubscribe Body;
+    Body.world = World;
+    Body.x = X;
+    Body.y = Y;
+    Body.radius = Radius;
+    M.WorldSubscribe = MoveTemp(Body);
+    Rt->Send(M);
 }
 
 void UMusubiSubsystem::SendWorldInput(const FString& World, const FString& EntityId, const FString& InputJson)
 {
     if (!Rt.IsValid()) return;
-    TSharedPtr<FJsonObject> Input;
-    TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(InputJson);
-    FJsonSerializer::Deserialize(R, Input);
-    Rt->WorldInput(World, EntityId, Input);
+    FMusubiClientMessage M;
+    M.Tag = EMusubiClientMessageTag::WorldInput;
+    FMusubiClientMessageWorldInput Body;
+    Body.world = World;
+    Body.entity = EntityId;
+    Body.input = FMusubiJson::FromText(InputJson);
+    M.WorldInput = MoveTemp(Body);
+    Rt->Send(M);
 }
 
 void UMusubiSubsystem::RequestVoiceToken(const FString& PartyId, const FString& MatchId, const FString& DisplayName)

@@ -50,6 +50,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Unreal wire layer: generated C++ must match the Rust protocol, and the codecs must
+      # reproduce Rust's JSON/postcard bytes (UE-free shim build, see sdk/unreal/tools).
+      - run: cargo run -p musubi-unreal-gen -- --check
+      - run: sdk/unreal/tools/syntax-check.sh
+      - run: sdk/unreal/tools/wire-test.sh
   bench:
     # criterion micro-benches (plan 6.2): the base commit (PR base / previous push) is benched on the
     # same runner right before HEAD, so the comparison never crosses machines; >5% slower fails

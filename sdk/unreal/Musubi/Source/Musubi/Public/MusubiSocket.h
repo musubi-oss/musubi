@@ -1,74 +1,130 @@
+// Realtime socket: typed `Envelope{cid, msg}` frames over `/ws?token=&format=json|binary`
+// (IWebSocket). Every ClientMessage variant goes out through `Send`/`Request`; every
+// ServerMessage variant arrives on `OnMessage` (and `OnTag(tag)` for one-tag listeners).
+// Requests carry a correlation id; the first reply with the same cid resolves them (an
+// `error` body resolves with bOk = false; no reply within ReplyTimeout → bOk = false, Timeout).
+// Reconnects with exponential backoff and replays the subscription state (`Resubscribe`).
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Dom/JsonObject.h"
 #include "IWebSocket.h"
-#include "MusubiTypes.h"
+#include "MusubiEnvelope.h"
 
-DECLARE_DELEGATE_TwoParams(FMusubiReply, bool /*bOk*/, TSharedPtr<FJsonObject> /*Msg: the inner message object*/);
-DECLARE_MULTICAST_DELEGATE(FMusubiSocketConnected);
-DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiSocketClosed, int32 /*Code*/, const FString& /*Reason*/);
-DECLARE_MULTICAST_DELEGATE_OneParam(FMusubiMatchDataEvent, const FMusubiMatchData&);
-DECLARE_MULTICAST_DELEGATE_OneParam(FMusubiWorldDeltaEvent, const FMusubiWorldDelta&);
-DECLARE_MULTICAST_DELEGATE_OneParam(FMusubiMatchmakerMatchedEvent, const FMusubiMatchmakerMatched&);
-/** Any server message: tag (snake_case, e.g. "channel_message") + body. Fired for every message. */
-DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiRawEvent, const FString& /*Tag*/, TSharedPtr<FJsonObject> /*Body*/);
+enum class EMusubiSocketState : uint8
+{
+	Closed,
+	Connecting,
+	Open,
+	Reconnecting,
+};
 
-/**
- * Realtime socket: JSON envelope `{cid, msg: {"<tag>": {...}}}` over `/ws?token=&format=json`.
- * Requests carry a correlation id; the first reply with the same `cid` resolves the request
- * (an `error` body resolves it with bOk = false). Events without `cid` fan out to delegates.
- */
+struct MUSUBI_API FMusubiSocketStats
+{
+	uint64 FramesIn = 0;
+	uint64 FramesOut = 0;
+	uint64 BytesIn = 0;
+	uint64 BytesOut = 0;
+	uint64 DecodeErrors = 0;
+	uint64 Timeouts = 0;
+	uint32 Reconnects = 0;
+	/** Last `rtt` round trip in milliseconds (EWMA, α = 0.2). */
+	double RttMs = 0.0;
+};
+
+/** Reply to a request: bOk = false when the node answered `error`, the request timed out, or the socket dropped. */
+DECLARE_DELEGATE_TwoParams(FMusubiReply, bool /*bOk*/, const FMusubiServerEnvelope& /*Reply; Msg.Tag == Error when !bOk*/);
+DECLARE_MULTICAST_DELEGATE_OneParam(FMusubiServerMessageEvent, const FMusubiServerEnvelope&);
+DECLARE_MULTICAST_DELEGATE_OneParam(FMusubiSocketStateEvent, EMusubiSocketState);
+DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiSocketClosedEvent, int32 /*Code*/, const FString& /*Reason*/);
+/** Fired after a reconnect handshake; the owner re-sends subscriptions (worlds, channels, follows). */
+DECLARE_MULTICAST_DELEGATE(FMusubiResubscribeEvent);
+
 class MUSUBI_API FMusubiSocket : public TSharedFromThis<FMusubiSocket>
 {
 public:
-    FMusubiSocket();
-    ~FMusubiSocket();
+	struct FConfig
+	{
+		EMusubiEncoding Encoding = EMusubiEncoding::Json;
+		double ReplyTimeoutSec = 8.0;
+		double PingIntervalSec = 15.0;
+		double BackoffMinSec = 0.25;
+		double BackoffMaxSec = 8.0;
+		int32 MaxInflight = 64;
+		/** Reconnect automatically after an unexpected close. */
+		bool bAutoReconnect = true;
+		/** Frames larger than this are refused before decode. */
+		int32 MaxFrameBytes = 4 * 1024 * 1024;
+	};
 
-    void Connect(const FString& WsUrl);
-    void Close();
-    bool IsConnected() const;
+	FMusubiSocket();
+	~FMusubiSocket();
 
-    /** Send `{tag: body}` and route the correlated reply to OnReply. Returns the cid. */
-    FString Request(const FString& Tag, const TSharedPtr<FJsonObject>& Body, FMusubiReply OnReply);
-    /** Fire-and-forget (no correlation id). */
-    void Send(const FString& Tag, const TSharedPtr<FJsonObject>& Body);
+	/** `BaseUrl` is the http(s) API base; the socket URL and `?format=` are derived. */
+	void Connect(const FString& BaseUrl, const FString& AccessToken, const FConfig& InConfig = FConfig());
+	/** Replace the access token used by the next (re)connect, e.g. after a refresh. */
+	void SetAccessToken(const FString& AccessToken);
+	void Close(int32 Code = 1000, const FString& Reason = TEXT("client closed"));
+	bool IsConnected() const { return State == EMusubiSocketState::Open; }
+	EMusubiSocketState GetState() const { return State; }
+	const FMusubiSocketStats& GetStats() const { return Stats; }
+	const FConfig& GetConfig() const { return Config; }
+	/** Session id / resume token from the node's `session` message. */
+	const TOptional<FMusubiServerMessageSession>& GetSession() const { return Session; }
 
-    // ---- convenience wrappers (bodies follow crates/musubi-proto/src/realtime.rs) ----
-    void Ping(FMusubiReply OnReply);
-    void StatusUpdate(const FString& Status);
-    void StatusFollow(const TArray<FString>& AccountIds, FMusubiReply OnReply);
-    void ChannelJoin(const FString& Target, int32 Type, bool bPersistence, bool bHidden, FMusubiReply OnReply);
-    void ChannelMessageSend(const FString& ChannelId, const TSharedPtr<FJsonObject>& Content, FMusubiReply OnReply);
-    void MatchmakerAdd(const FString& Query, int32 MinCount, int32 MaxCount, const TMap<FString, FString>& StringProps, const TMap<FString, double>& NumericProps, FMusubiReply OnReply);
-    void MatchmakerRemove(const FString& Ticket, FMusubiReply OnReply);
-    void MatchCreate(const FString& Name, FMusubiReply OnReply);
-    void MatchJoin(const FString& MatchId, const FString& Token, FMusubiReply OnReply);
-    void MatchLeave(const FString& MatchId);
-    void MatchDataSend(const FString& MatchId, int64 OpCode, const TArray<uint8>& Data, bool bReliable);
-    void PartyCreate(bool bOpen, int32 MaxSize, FMusubiReply OnReply);
-    void PartyJoin(const FString& PartyId, FMusubiReply OnReply);
-    void PartyLeave(const FString& PartyId);
-    void WorldSubscribe(const FString& World, double X, double Y, double Radius);
-    void WorldUnsubscribe(const FString& World);
-    void WorldInput(const FString& World, const FString& EntityId, const TSharedPtr<FJsonObject>& Input);
+	/** Fire-and-forget (no cid). Returns false when not connected (frame dropped and counted). */
+	bool Send(const FMusubiClientMessage& Msg);
+	/** Correlated request; returns the cid (empty when not connected — OnReply fires immediately with bOk = false). */
+	FString Request(const FMusubiClientMessage& Msg, FMusubiReply OnReply);
 
-    FMusubiSocketConnected OnConnected;
-    FMusubiSocketClosed OnClosed;
-    FMusubiMatchDataEvent OnMatchData;
-    FMusubiWorldDeltaEvent OnWorldDelta;
-    FMusubiMatchmakerMatchedEvent OnMatchmakerMatched;
-    FMusubiRawEvent OnMessage;
+	/** Pump timers (reply timeouts, pings, reconnect). Called by the subsystem each frame. */
+	void Tick(double DeltaSeconds);
 
-    static FMusubiPresence ParsePresence(const TSharedPtr<FJsonObject>& O);
-    static FMusubiWorldEntity ParseEntity(const TSharedPtr<FJsonObject>& O);
+	FMusubiServerMessageEvent OnMessage;
+	FMusubiSocketStateEvent OnStateChanged;
+	FMusubiSocketClosedEvent OnClosed;
+	FMusubiResubscribeEvent OnResubscribe;
+
+	/** Per-tag listeners: `OnTag(EMusubiServerMessageTag::WorldDelta).AddRaw(...)`. */
+	FMusubiServerMessageEvent& OnTag(EMusubiServerMessageTag Tag) { return TagEvents.FindOrAdd(Tag); }
+
+	static FString SocketUrl(const FString& BaseUrl, const FString& AccessToken, EMusubiEncoding Encoding);
 
 private:
-    void HandleText(const FString& Text);
-    void Dispatch(const FString& Tag, const TSharedPtr<FJsonObject>& Body);
-    FString Envelope(const FString& Cid, const FString& Tag, const TSharedPtr<FJsonObject>& Body) const;
+	struct FPending
+	{
+		FMusubiReply OnReply;
+		double Deadline = 0.0;
+	};
 
-    TSharedPtr<IWebSocket> Ws;
-    TMap<FString, FMusubiReply> Pending;
-    uint64 NextCid = 1;
+	void Open();
+	void SetState(EMusubiSocketState NewState);
+	void HandleConnected();
+	void HandleError(const FString& Error);
+	void HandleClosed(int32 Code, const FString& Reason, bool bWasClean);
+	void HandleText(const FString& Text);
+	void HandleBinary(const void* Data, SIZE_T Size, SIZE_T BytesRemaining);
+	void Dispatch(const FMusubiServerEnvelope& Env);
+	void FailAllPending(const FString& Why);
+	void FailPending(FPending&& P, const FString& Why, EMusubiCodeTag Code);
+	bool Transmit(const FMusubiClientEnvelope& Env);
+	void ScheduleReconnect();
+
+	FConfig Config;
+	FString Base;
+	FString Token;
+	TSharedPtr<IWebSocket> Ws;
+	EMusubiSocketState State = EMusubiSocketState::Closed;
+	TMap<FString, FPending> Pending;
+	TMap<EMusubiServerMessageTag, FMusubiServerMessageEvent> TagEvents;
+	TOptional<FMusubiServerMessageSession> Session;
+	FMusubiSocketStats Stats;
+	TArray<uint8> BinaryAccum;
+	uint64 NextCid = 1;
+	double Now = 0.0;
+	double NextPingAt = 0.0;
+	double ReconnectAt = 0.0;
+	double Backoff = 0.0;
+	double LastRttSentAt = 0.0;
+	bool bUserClosed = false;
+	bool bEverConnected = false;
 };

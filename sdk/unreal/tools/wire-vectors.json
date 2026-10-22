@@ -1,0 +1,98 @@
+[
+  {
+    "name": "ping",
+    "kind": "client",
+    "json": "{\"cid\":null,\"msg\":\"ping\"}",
+    "postcard": "0000"
+  },
+  {
+    "name": "status_update",
+    "kind": "client",
+    "json": "{\"cid\":\"1\",\"msg\":{\"status_update\":{\"status\":\"afk\",\"rich\":null,\"appear_offline\":null}}}",
+    "postcard": "01013101010361666b046e756c6c00"
+  },
+  {
+    "name": "channel_join",
+    "kind": "client",
+    "json": "{\"cid\":\"2\",\"msg\":{\"channel_join\":{\"target\":\"global\",\"kind\":2,\"persistence\":true,\"hidden\":false}}}",
+    "postcard": "0101320706676c6f62616c040100"
+  },
+  {
+    "name": "channel_join_defaults",
+    "kind": "client",
+    "json": "{\"cid\":null,\"msg\":{\"channel_join\":{\"target\":\"dm\",\"kind\":3,\"persistence\":false,\"hidden\":false}}}",
+    "postcard": "000702646d060000"
+  },
+  {
+    "name": "matchmaker_add",
+    "kind": "client",
+    "json": "{\"cid\":\"3\",\"msg\":{\"matchmaker_add\":{\"min_count\":2,\"max_count\":4,\"query\":\"+properties.mode:ranked\",\"string_properties\":{\"region\":\"eu\"},\"numeric_properties\":{\"mmr\":1532.5},\"count_multiple\":2}}}",
+    "postcard": "0101330d0204172b70726f706572746965732e6d6f64653a72616e6b65640106726567696f6e02657501036d6d720000000000f2974002"
+  },
+  {
+    "name": "matchmaker_add_defaults",
+    "kind": "client",
+    "json": "{\"cid\":null,\"msg\":{\"matchmaker_add\":{\"min_count\":2,\"max_count\":2,\"query\":\"*\",\"string_properties\":{},\"numeric_properties\":{},\"count_multiple\":1}}}",
+    "postcard": "000d0202012a000001"
+  },
+  {
+    "name": "match_data_send",
+    "kind": "client",
+    "json": "{\"cid\":null,\"msg\":{\"match_data_send\":{\"match_id\":\"m-1\",\"op_code\":7,\"data\":[1,2,3,255],\"presences\":[],\"reliable\":false,\"channel\":null}}}",
+    "postcard": "0026036d2d310e04010203ff000000"
+  },
+  {
+    "name": "world_subscribe",
+    "kind": "client",
+    "json": "{\"cid\":\"4\",\"msg\":{\"world_subscribe\":{\"world\":\"overworld\",\"x\":1234.5,\"y\":-77.25,\"radius\":300.0,\"budget_bytes\":200,\"filter\":[\"pos\",\"hp\"],\"max_hz\":20,\"unreliable_updates\":true,\"inside\":null}}}",
+    "postcard": "01013422096f766572776f726c6400000000004a934000000000005053c00000000000c0724001c8010c5b22706f73222c226870225d01140100"
+  },
+  {
+    "name": "world_input",
+    "kind": "client",
+    "json": "{\"cid\":null,\"msg\":{\"world_input\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"input\":{\"jump\":true,\"move\":[1,0]}}}}",
+    "postcard": "0024096f766572776f726c642430313866326133632d346235642d376536662d386139622d3063316432653366346135621a7b226a756d70223a747275652c226d6f7665223a5b312c305d7d"
+  },
+  {
+    "name": "pong",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":\"pong\"}",
+    "postcard": "0000"
+  },
+  {
+    "name": "session",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"session\":{\"session_id\":\"s-1\",\"resume_token\":\"r-1\",\"resumed\":false}}}",
+    "postcard": "000103732d3103722d3100"
+  },
+  {
+    "name": "error",
+    "kind": "server",
+    "json": "{\"cid\":\"3\",\"msg\":{\"error\":{\"code\":\"not_found\",\"message\":\"no such match\"}}}",
+    "postcard": "01013302000d6e6f2073756368206d61746368"
+  },
+  {
+    "name": "channel_message",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"channel_message\":{\"channel_id\":\"c-1\",\"message_id\":\"m-1\",\"kind\":2,\"code\":0,\"sender_id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"username\":\"neo\",\"content\":{\"at\":[1,2],\"text\":\"hi\"},\"create_time\":1700000000000,\"update_time\":1700000000000,\"persistent\":true,\"reactions\":[],\"reply_to\":null,\"mentions\":[]}}}",
+    "postcard": "000903632d31036d2d3104000110018f2a3c4b5d7e6f8a9b0c1d2e3f4a5b036e656f187b226174223a5b312c325d2c2274657874223a226869227d80a0abfef96280a0abfef96201000000"
+  },
+  {
+    "name": "world_delta",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"world_delta\":{\"world\":\"overworld\",\"tick\":42,\"spawned\":[{\"id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"x\":12.34,\"y\":-0.02,\"components\":[{\"name\":\"hp\",\"value\":{\"cur\":90,\"max\":100},\"version\":3}]}],\"updated\":[],\"despawned\":[\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\"],\"time_scale\":0.5,\"sequenced\":true}}}",
+    "postcard": "001c096f766572776f726c642a0110018f2a3c4b5d7e6f8a9b0c1d2e3f4a5ba4130301026870147b22637572223a39302c226d6178223a3130307d03000110018f2a3c4b5d7e6f8a9b0c1d2e3f4a5c000000000000e03f01"
+  },
+  {
+    "name": "world_delta_defaults",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"world_delta\":{\"world\":\"overworld\",\"tick\":43,\"spawned\":[],\"updated\":[],\"despawned\":[],\"time_scale\":1.0,\"sequenced\":false}}}",
+    "postcard": "001c096f766572776f726c642b000000000000000000f03f00"
+  },
+  {
+    "name": "matchmaker_matched",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"matchmaker_matched\":{\"ticket\":\"t-1\",\"token\":\"tok\",\"users\":[],\"self\":{\"presence\":{\"account_id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"session_id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\",\"username\":\"neo\",\"status\":\"\",\"rich\":false,\"invisible\":false},\"string_properties\":{},\"numeric_properties\":{},\"team\":1},\"server\":{\"server_id\":\"gs-1\",\"fleet_id\":\"eu\",\"address\":\"10.0.0.1\",\"port\":7777,\"connect_token\":\"ct\"}}}}",
+    "postcard": "000f03742d3103746f6b0010018f2a3c4b5d7e6f8a9b0c1d2e3f4a5b10018f2a3c4b5d7e6f8a9b0c1d2e3f4a5d036e656f01000566616c73650000000101010467732d310265750831302e302e302e31e13c026374"
+  }
+]

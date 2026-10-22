@@ -9,9 +9,6 @@
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FMusubiOnSession, bool, bOk, const FMusubiSession&, Session);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FMusubiOnSocketConnected);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FMusubiOnSocketClosed, int32, Code, const FString&, Reason);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMusubiOnMatchData, const FMusubiMatchData&, Data);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMusubiOnWorldDelta, const FMusubiWorldDelta&, Delta);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMusubiOnMatchmakerMatched, const FMusubiMatchmakerMatched&, Matched);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FMusubiOnVoiceGrant, bool, bOk, const FMusubiVoiceGrant&, Grant);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMusubiOnError, const FMusubiError&, Error);
 
@@ -64,9 +61,6 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnSession OnSession;
     UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnSocketConnected OnSocketConnected;
     UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnSocketClosed OnSocketClosed;
-    UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnMatchData OnMatchData;
-    UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnWorldDelta OnWorldDelta;
-    UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnMatchmakerMatched OnMatchmakerMatched;
     UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnVoiceGrant OnVoiceGrant;
     UPROPERTY(BlueprintAssignable, Category = "Musubi") FMusubiOnError OnError;
 
@@ -77,4 +71,6 @@ public:
 private:
     TSharedPtr<FMusubiClient> Http;
     TSharedPtr<FMusubiSocket> Rt;
+    FTSTicker::FDelegateHandle TickHandle;
+    FString PendingStatus;
 };
