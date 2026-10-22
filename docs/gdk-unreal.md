@@ -335,7 +335,8 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 1. Wire layer: typed structs for all 80 messages, JSON + postcard, golden vectors, reconnect,
    session/refresh. Replaces today's 1 072-line scaffold.
 2. Facades: presence, storage, rpc, notifications, chat, matchmaker, parties, matches (no
-   rollback yet), streams; Blueprint latent nodes; editor settings page.
+   rollback yet), streams — shipped as `UMusubiFacade` subsystems with C++ delegates and
+   Blueprint wrappers; Blueprint latent nodes and the editor settings page are deferred to 8.
 3. World view: subscription driver, registry, actor/ISM sinks, interpolation, time scale,
    bandwidth guard; demo map with the 10k meshbench world.
 4. Server module: sim loop over the stream, cell → level streaming, authority component,
