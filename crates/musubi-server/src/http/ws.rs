@@ -28,6 +28,11 @@ struct WsQuery {
     resume: Option<String>,
 }
 
+/// tungstenite zero-fills up to `read_buffer_size` bytes before *every* read (`read_in`), and
+/// the default is 128 KiB: at 1 000 players that memset was a fifth of the node's CPU while
+/// client frames are a few hundred bytes. Larger frames still arrive, in more reads.
+const WS_READ_BUFFER: usize = 8 * 1024;
+
 /// `GET /ws?token=<access jwt>&format=json|binary[&status=...]`
 async fn upgrade(
     State(s): State<AppState>,
@@ -46,6 +51,7 @@ async fn upgrade(
         let encoding = crate::realtime::connect::encoding_of(&hello)?;
         return Ok(ws
             .max_message_size(Limits::default().max_frame_bytes)
+            .read_buffer_size(WS_READ_BUFFER)
             .on_upgrade(move |socket| async move {
                 let conn = Box::new(WsConnection::new(socket));
                 crate::realtime::connect::resume_any(&s, &token, conn, encoding).await;
@@ -54,6 +60,7 @@ async fn upgrade(
     let (presence, encoding) = crate::realtime::connect::authorize(&s, &hello).await?;
     Ok(ws
         .max_message_size(Limits::default().max_frame_bytes)
+        .read_buffer_size(WS_READ_BUFFER)
         .on_upgrade(move |socket| async move {
             let mut params = crate::realtime::connect::params(&s, presence, encoding);
             params.resumable = hello.resumable;
