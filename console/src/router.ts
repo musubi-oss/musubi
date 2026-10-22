@@ -10,7 +10,8 @@ export const sections = [
   { id: 'content', title: 'Content', sub: 'Content bundles, config sources, schemas' },
   { id: 'social', title: 'Social', sub: 'Groups, chat, leaderboards, matchmaking' },
   { id: 'world', title: 'World', sub: 'Persistent worlds, cells and simulators' },
-  { id: 'cluster', title: 'Cluster', sub: 'Nodes, Raft, bus, placement, mesh, telemetry' },
+  { id: 'analytics', title: 'Analytics', sub: 'Active users, retention, revenue, events, crashes, reports' },
+  { id: 'cluster', title: 'Cluster', sub: 'Nodes, Raft, bus, placement, mesh, logs' },
   { id: 'settings', title: 'Settings', sub: 'Operators, keys, environments, legal, sanctions, audit' },
 ]
 
@@ -111,6 +112,11 @@ export const router = createRouter({
       { path: 'bundles/:id', component: () => import('./pages/content/Version.vue') },
       { path: 'modules/:name', component: () => import('./pages/content/Module.vue') },
       { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.content.find((x) => x.id === r.params.page) ?? catalog.content[0] }) },
+    ]},
+    { path: '/analytics', component: () => import('./pages/analytics/Index.vue'), children: [
+      { path: '', component: () => import('./pages/analytics/Overview.vue') },
+      { path: 'events', component: () => import('./pages/analytics/Events.vue') },
+      { path: ':page', component: () => import('./pages/Generic.vue'), props: (r) => ({ res: catalog.analytics.find((x) => x.id === r.params.page) ?? catalog.analytics[0] }) },
     ]},
     { path: '/settings', component: () => import('./pages/settings/Index.vue'), children: [
       { path: 'accounts_policy', component: () => import('./pages/settings/AccountsPolicy.vue') },
