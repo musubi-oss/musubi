@@ -3187,11 +3187,19 @@ impl WorldRegistry {
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
-        let cell = st
+        let a_cell = st
             .world
             .get(a)
             .ok_or_else(|| Error::NotFound(format!("entity {a} is not on this shard")))?
             .cell;
+        // the reporter may itself be pinned to a partner's cell: the whole contact group
+        // gathers there, not in the cell its position happens to name
+        let cell = st.world.pinned_to(a).map(|(c, _)| c).unwrap_or(a_cell);
+        let b_cell = st
+            .world
+            .pinned_to(b)
+            .map(|(c, _)| c)
+            .or_else(|| st.world.get(b).map(|e| e.cell));
         match st.world.owner(cell) {
             Some(o) if o == sim => {}
             Some(o) => {
@@ -3209,11 +3217,14 @@ impl WorldRegistry {
             // when it arrives, and ask that node to pin and ship it
             let until = st.world.pin(b, cell, ttl_ticks);
             fanout.world_co_locate(name, b, cell, sim, ttl_ticks);
+            let followers =
+                self.co_locate_followers(st, name, sim, b, b_cell, cell, ttl_ticks, fanout);
             return Ok(
-                json!({"pinned": b, "with": a, "cell": cell, "until_tick": until, "forwarded": true}),
+                json!({"pinned": b, "with": a, "cell": cell, "until_tick": until, "forwarded": true, "followers": followers}),
             );
         }
         let until = st.world.pin(b, cell, ttl_ticks);
+        let followers = self.co_locate_followers(st, name, sim, b, b_cell, cell, ttl_ticks, fanout);
         if let Some(owner) = st.world.owner(st.world.get(b).unwrap().cell) {
             push_event(
                 st,
@@ -3221,7 +3232,72 @@ impl WorldRegistry {
                 json!({"type": "co_locate", "entity": b, "with": a, "cell": cell, "by": sim, "until_tick": until}),
             );
         }
-        Ok(json!({"pinned": b, "with": a, "cell": cell, "until_tick": until}))
+        Ok(
+            json!({"pinned": b, "with": a, "cell": cell, "until_tick": until, "followers": followers}),
+        )
+    }
+
+    /// Bodies pinned next to `b` because they were touching it (A–B–C over two borders) move
+    /// with it: a pair-by-pair pin otherwise pulls `b` into one partner's cell and the third body
+    /// into `b`'s old one, and the next contact report pulls them back — every co-location a
+    /// handover. Followers are `b`'s recent contact partners whose pin named `b`'s cell.
+    #[allow(clippy::too_many_arguments)]
+    fn co_locate_followers(
+        &self,
+        st: &mut WorldState,
+        name: &str,
+        sim: Uuid,
+        b: EntityId,
+        b_cell: Option<CellId>,
+        anchor: CellId,
+        ttl_ticks: u64,
+        fanout: &Fanout,
+    ) -> Vec<EntityId> {
+        let Some(b_cell) = b_cell else {
+            return Vec::new();
+        };
+        if b_cell == anchor {
+            return Vec::new();
+        }
+        let now = st.world.tick;
+        let partners: Vec<EntityId> = st
+            .contacts
+            .iter()
+            .filter(|(_, (t, _))| now.saturating_sub(*t) <= CONTACT_WINDOW_TICKS)
+            .filter_map(|((x, y), _)| {
+                if *x == b {
+                    Some(*y)
+                } else if *y == b {
+                    Some(*x)
+                } else {
+                    None
+                }
+            })
+            .filter(|x| st.world.pinned_to(*x).is_some_and(|(c, _)| c == b_cell))
+            .collect();
+        let mut moved = Vec::new();
+        for x in partners {
+            let until = st.world.pin(x, anchor, ttl_ticks);
+            match st.world.get(x).map(|e| e.cell) {
+                Some(c) => {
+                    if let Some(owner) = st.world.owner(c) {
+                        push_event(
+                            st,
+                            owner,
+                            json!({"type": "co_locate", "entity": x, "with": b, "cell": anchor, "by": sim, "until_tick": until}),
+                        );
+                    }
+                }
+                None if self.is_split(name) => {
+                    fanout.world_co_locate(name, x, anchor, sim, ttl_ticks)
+                }
+                None => {}
+            }
+            metrics::counter!("musubi_world_contacts_total", "path" => "colocated_follower")
+                .increment(1);
+            moved.push(x);
+        }
+        moved
     }
 
     /// Lag compensation query: where `entity` was at `tick` (and whether `at` was within
@@ -4506,13 +4582,19 @@ impl WorldRegistry {
             // the pair keeps touching across a border: pin the target into the reporter's cell
             let pinned = self
                 .co_locate(name, sim, &other.to_string(), entity, colocate_ttl, fanout)
-                .is_ok();
+                .ok();
             metrics::counter!("musubi_world_contacts_total", "path" => "colocated").increment(1);
             let w = self.get(name)?;
             let mut st = w.lock();
             let st = &mut *st;
             let mut r = self.deliver_interaction(name, st, id, ev, fanout)?;
-            r["colocated"] = json!(pinned);
+            r["colocated"] = json!(pinned.is_some());
+            // bodies that were pinned next to the moved one and came along (see `co_locate`)
+            if let Some(f) = pinned.as_ref().and_then(|p| p.get("followers")) {
+                if f.as_array().is_some_and(|a| !a.is_empty()) {
+                    r["followers"] = f.clone();
+                }
+            }
             return Ok(r);
         }
         self.deliver_interaction(name, st, id, ev, fanout)

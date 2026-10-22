@@ -21792,3 +21792,147 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
         assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{c}");
     }
 }
+
+/// Three bodies in a row over two borders: once A–B co-locate, B–C touching must gather C in the
+/// same cell as A and B (not pull B back into C's cell pair by pair).
+#[tokio::test]
+async fn cross_border_contact_chain_gathers_in_one_cell() {
+    let Some((_addr, router)) = start().await else {
+        return;
+    };
+    let name = format!("w{}", uuid::Uuid::now_v7().simple());
+    let (st, w) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": name, "config": {"cell_size": 100.0, "contact_colocate_after_ticks": 3}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{w}");
+    let sims = [
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+    ];
+    let mut ids = Vec::new();
+    for (i, sim) in sims.iter().enumerate() {
+        let (st, v) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/lease"),
+            None,
+            true,
+            Some(json!({"sim": sim, "cells": [{"x": i, "y": 0}]})),
+        )
+        .await;
+        assert_eq!(st, 200, "{v}");
+        let x = 100.0 * i as f64
+            + if i == 0 {
+                95.0
+            } else if i == 1 {
+                50.0
+            } else {
+                5.0
+            };
+        let (st, e) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/spawn"),
+            None,
+            true,
+            Some(json!({"sim": sim, "x": x, "y": 50.0, "components": {"body": true}})),
+        )
+        .await;
+        assert_eq!(st, 200, "{e}");
+        ids.push(e["id"].as_str().unwrap().to_string());
+    }
+    let (a, b, c) = (&ids[0], &ids[1], &ids[2]);
+    // B's simulator reports A touching B until the pair co-locates: A is pinned into B's cell
+    let mut cell_ab = Value::Null;
+    for tick in 1..=6u64 {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/interact"),
+            None,
+            true,
+            Some(
+                json!({"sim": sims[1], "entity": a, "kind": "contact", "tick": tick,
+                "payload": {"other": b, "impulse": [1.0, 0.0, 0.0]}}),
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        if r["colocated"] == json!(true) {
+            cell_ab = json!(true);
+            break;
+        }
+    }
+    // C's simulator reports B touching C: B is pinned into C's cell — and A, pinned next to B,
+    // must follow instead of staying behind in B's old cell
+    let mut joined = Value::Null;
+    for tick in 1..=6u64 {
+        let (st, r) = http_json(
+            &router,
+            "POST",
+            &format!("/v1/server/worlds/{name}/interact"),
+            None,
+            true,
+            Some(
+                json!({"sim": sims[2], "entity": b, "kind": "contact", "tick": tick,
+                "payload": {"other": c, "impulse": [-1.0, 0.0, 0.0]}}),
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{r}");
+        if r["colocated"] == json!(true) {
+            joined = r.clone();
+            break;
+        }
+    }
+    assert!(!joined.is_null(), "B–C never co-located");
+    assert!(!cell_ab.is_null(), "A–B never co-located");
+    assert_eq!(joined["followers"], json!([a]), "{joined}");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // every body now resolves in one cell: the reporter's pin decides, and partners follow
+    let (st, v) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{name}/entities/{b}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let (st, vc) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{name}/entities/{c}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{vc}");
+    let (st, va) = http_json(
+        &router,
+        "GET",
+        &format!("/v1/server/worlds/{name}/entities/{a}"),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(st, 200, "{va}");
+    assert_eq!(
+        v["cell"], va["cell"],
+        "B left A's cell: {v} vs {va} (ab={cell_ab})"
+    );
+    assert_eq!(
+        vc["cell"], va["cell"],
+        "C did not join: {vc} vs {va} ({joined})"
+    );
+}
