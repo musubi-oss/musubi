@@ -435,8 +435,10 @@ void UMusubiWorldComponent::ApplyDespawn(const FMusubiUuid& Id)
 void UMusubiWorldComponent::ResetRegistry()
 {
 	for (auto& KV : Registry) Dematerialize(KV.Value);
+	const bool bHadAny = Registry.Num() > 0;
 	Registry.Reset();
 	PendingUnknown.Reset();
+	if (bHadAny) OnRegistryReset.Broadcast();
 	LastReliableTick = LastSequencedTick = LastTick = 0;
 	LastDeltaWallTime = -1;
 	bAwaitingKeyframe = false;
@@ -538,7 +540,7 @@ void UMusubiWorldComponent::Materialize(FMusubiEntityRecord& R, const FMusubiWor
 	}
 	if (Sink == EMusubiEntitySink::Actor && !Class) Sink = EMusubiEntitySink::None;
 	if (Sink == EMusubiEntitySink::Instanced && !Mesh) Sink = EMusubiEntitySink::None;
-	R.Sink = Sink;
+	R.Sink = Sink; // Mass: nothing to create here, UMusubiMassSinkComponent picks the record up from OnRecordSpawned
 	if (Sink == EMusubiEntitySink::Actor)
 	{
 		R.Actor = AcquireActor(Class, R.RenderPos);

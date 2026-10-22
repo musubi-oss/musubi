@@ -113,6 +113,8 @@ public:
 	FMusubiEntityGoneEvent OnRecordDespawned;
 	/** Every applied delta, after the registry changed. */
 	FMusubiWorldDeltaEvent OnDeltaApplied;
+	/** The whole registry was dropped (unsubscribe, socket closed) without per-entity despawn events. */
+	FSimpleMulticastDelegate OnRegistryReset;
 
 	// UActorComponent
 	virtual void BeginPlay() override;

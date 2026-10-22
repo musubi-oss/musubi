@@ -58,7 +58,8 @@ Consequences:
 | Module | Type / phase | Depends on | Contents |
 |---|---|---|---|
 | `Musubi` | Runtime, `PreDefault` | Core, CoreUObject, Engine, Json, JsonUtilities, HTTP, WebSockets, Sockets, Networking | `FMusubiClient` (REST), `FMusubiSocket` (realtime), typed messages, `UMusubiSubsystem` (GameInstance), world view, match/party/chat/matchmaker facades, Blueprint nodes |
-| `MusubiWorld` | Runtime, `Default` | Musubi, Engine, (MassEntity optional) | `UMusubiWorldComponent`, `AMusubiEntityActor`, ISM/Mass sinks, interpolation, interest driver |
+| `MusubiWorld` | Runtime, `Default` | Musubi, Engine | `UMusubiWorldComponent`, `UMusubiEntityComponent`, actor/ISM sinks, interpolation, interest driver |
+| `MusubiMass` | Runtime, `Default` | Musubi, MusubiWorld, MassEntity, MassCommon (plugin dep `MassGameplay`) | `UMusubiMassSinkComponent`, `FMusubiEntityFragment`, `FMusubiEntityTag` |
 | `MusubiIris` | Runtime, `Default`, only when `MUSUBI_UE_IRIS` | Musubi, IrisCore, NetCore | `UMusubiReplicationBridge`, `UMusubiNetObjectFactory` (tier B only) |
 | `MusubiEditor` | Editor | Musubi, UnrealEd, Settings | project settings page, world-id picker, "connect to local node" button, validation of `DefaultGame.ini` keys |
 | `MusubiServer` | Runtime, server-only (`Target.Type == Server || WITH_SERVER_CODE`) | Musubi, Engine, PhysicsCore, Chaos | section 6 |
@@ -159,8 +160,18 @@ Wire: `WorldEntity{id: Uuid, x, y, components: [{name, value: JSON, version}]}`;
   Pooling: despawned actors return to a per-class pool (`PoolSize` 64) to avoid spawn hitches.
 * **Instanced sink**: entities whose mapping says `ISM` go to a `UInstancedStaticMeshComponent`
   per mesh; positions updated via `BatchUpdateInstancesTransforms`. For 10k+ static-ish props.
-* **Mass sink** (optional, `WITH_MASSENTITY`): `FMusubiMassFragment` carries id/components,
-  processors move transforms; used by projects already on Mass for crowds.
+* **Mass sink** (module `MusubiMass`): rules with `Sink = Mass` leave the record actor-less; a
+  `UMusubiMassSinkComponent` next to the world component mirrors those records into Mass entities of
+  archetype `FTransformFragment + FMusubiEntityFragment + FMusubiEntityTag` (`CreateEntity` on spawn,
+  `DestroyEntity` on despawn/registry reset — immediate, the sink ticks on the game thread after the
+  world component and outside Mass processing). The transform follows the interpolated `RenderPos`
+  (+ yaw component or heading, uniform `Scale`); components stay on the record and
+  `FMusubiEntityFragment::ComponentsRevision` bumps when any version changed, so processors re-read
+  JSON only on change. Projects add their own fragments from `OnMassEntityCreated(Manager, Handle, Record)`.
+  Engine check: `MassEntity` is a plugin in 5.3/5.4 and an engine module from 5.5 (the plugin is a
+  deprecated empty stub) — same module name, so `Build.cs` is version-free; `CreateArchetype` takes an
+  `FName` in 5.3 and `FMassArchetypeCreationParams` in 5.5+, the one-argument call is common;
+  `FMassEntityHandle` is `USTRUCT()` without `BlueprintType` on every version → `FindMassEntity` is C++ only.
 * Local player's own entity: a `world_input` is sent per input sample (`SendInput(json)`),
   client-side prediction is the project's business; the GDK offers
   `FMusubiPredictionBuffer` (ring of inputs × ticks, reconcile on `updated` with our id).
@@ -282,7 +293,7 @@ receive `world_delta` through Iris' own apply path) without hand-written mapping
 - `OnProtocolMismatchReported(Handle, ConnectionId)` gains `const TArray<uint8>& ClientCDOStateBytes` in 5.8.
 - Factory (5.7 `NetObjectFactory.h`): `CreateAndFillHeader`, `SerializeHeader(FCreationHeaderContext{Handle, Bridge, Factory, FNetSerializationContext& Serialization})`, `CreateAndDeserializeHeader` (PURE_VIRTUAL), `InstantiateReplicatedObjectFromHeader → FInstantiateResult{Instance, Template}`, `PostInstantiation(FPostInstantiationContext{Instance, Header})`, `DetachedFromReplication(FDestroyedContext{DestroyedInstance, RootObject, DestroyReason, DestroyFlags})` (PURE_VIRTUAL); `DestroyReplicatedObject` is `final`. Header bits via `UE::Net::WriteString/WriteBytes` (`NetBitStreamUtil.h`). Registration: `FNetObjectFactoryRegistry::RegisterFactory(UClass*, FName)`.
 - UBT: `ModuleRules.SetupIrisSupport(Target)` adds `IrisCore` + `UE_WITH_IRIS=1` unconditionally; `TargetRules` has no `bUseIris`, so `MusubiIris.Build.cs` gates only on `Target.Version.MinorVersion >= 5`.
-- Still open: Mass sink; UBT compile of this module is part of the phase 8 matrix (shim cannot cover Iris).
+- Still open: UBT compile of this module is part of the phase 8 matrix (shim cannot cover Iris).
 
 ## 8. Transport
 
@@ -369,7 +380,7 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 5. Rollback matches (input ring, tick hash, desync recovery) — shipped as `UMusubiMatch` over
    `UMusubiMatches` (+ RFC 6902 patching of the synced state); the world prediction buffer
    waits for a project that needs it.
-6. Iris bridge (tier B) + Mass sink.
+6. Iris bridge (tier B) + Mass sink — done (`MusubiIris`, `MusubiMass`).
 7. QUIC transport — done: `musubi-quic-ffi` (Rust static lib) + `MusubiQuic`, `IMusubiTransport` seam, Auto with WS fallback. Consoles (platform ffi builds) and live WS→QUIC migration later.
 8. CI compile matrix 5.3/5.7/5.8 + node-in-the-loop tests + docs (`docs/parity.md` L146/L192
    updated: SDK/GDK no longer "after").

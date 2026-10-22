@@ -17,6 +17,8 @@ enum class EMusubiEntitySink : uint8
 	Instanced,
 	/** Keep the record (components, position) but render nothing. */
 	None,
+	/** Hand the entity to the Mass sink (`MusubiMass` module): a Mass entity with a transform fragment, no actor. */
+	Mass,
 };
 
 /** One component of an entity as the client knows it. */

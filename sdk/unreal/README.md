@@ -98,7 +98,13 @@ Compiles to an empty stub on 5.3/5.4 (`MUSUBI_WITH_IRIS=0`, gate = engine versio
 - `UMusubiReplicationBridge : UObjectReplicationBridge` — Iris keeps owning dirty tracking and descriptors. The bridge tracks objects that carry a `UMusubiAuthorityComponent` from `CacheNetRefHandleCreationInfo` (the one hook both 5.7 and 5.8 call when an object starts replicating), and in `PreSendUpdate` serializes their replicated `UPROPERTY`s (plus replicated components, `Comp.Prop` keys) to JSON, hash-gated (FNV-1a 64), into the entity component `iris` — the simulator subsystem ships it as `apply` on the next `tick_done`. Ghosts are never mirrored back. Detach from Iris = `RequestDespawn` for owned entities: 5.7 via the `DetachInstance` override, 5.8 via `GetRootObjectDetachedDelegate / GetSubObjectDetachedDelegate` (the virtual was removed). `OnProtocolMismatchReported` has the 5.8 `ClientCDOStateBytes` signature behind `ENGINE_MINOR_VERSION >= 8`.
 - `UMusubiNetObjectFactory : UNetObjectFactory`, registered as `MusubiEntity` at module startup (`PostConfigInit`). Creation header = class path + entity uuid + actor flag; remote instantiation spawns the class deferred, `PostInstantiation` binds the authority component as a ghost (`Bind(sim, uuid, cell, owned=false)`) and finishes spawning; `DetachedFromReplication` destroys the actor unless Iris says `DoNotDestroy`.
 
-Not done here: Mass sink (entities → Mass fragments).
+**Mass sink** (`MusubiMass`, §3/§6): mapping rules with `Sink = Mass` get no actor; `UMusubiMassSinkComponent`
+(same actor as the world component, or `World` set) creates one Mass entity per record — archetype
+`FTransformFragment + FMusubiEntityFragment{IdHi, IdLo, LastTick, ComponentsRevision, bLocal} + FMusubiEntityTag` —
+writes the interpolated transform every frame (ticks after the world component), bumps `ComponentsRevision` when
+any component version changed, destroys on despawn / registry reset. `OnMassEntityCreated(Manager, Handle, Record)`
+is where a project adds its own fragments; `FindMassEntity` / `FindRecordId` map both ways. Plugin dependency
+`MassGameplay` (brings `MassEntity` on 5.3/5.4; from 5.5 MassEntity is an engine module).
 
 **Transport** (`MusubiTransport.h`, §8): `FMusubiSocket` runs over an `IMusubiTransport`. `FMusubiWsTransport`
 (engine `IWebSocket`, token/format/resume in the `/ws` query) ships in the core module; the `MusubiQuic` module
@@ -118,8 +124,7 @@ No library for the platform → the module compiles to a stub and the plugin sta
 
 ## Status / caveats
 
-- Not yet: Blueprint latent (`K2_`) twins of the request calls, the editor settings page, the Mass
-  sink, a demo map (needs the editor; the 10k meshbench world is the intended content), live WS→QUIC
+- Not yet: Blueprint latent (`K2_`) twins of the request calls, the editor settings page, a demo map (needs the editor; the 10k meshbench world is the intended content), live WS→QUIC
   migration (Auto only decides at connect time), console platform builds of `musubi-quic-ffi`.
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
   Core/Json). The facades reference engine types the shim does not model (UObject, HTTP, WebSockets)
