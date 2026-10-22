@@ -21,6 +21,7 @@ public:
 	bool TryGetBool(bool& Out) const { if (Type != EJson::Boolean) return false; Out = B; return true; }
 	bool TryGetArray(const TArray<TSharedPtr<FJsonValue>>*& Out) const { if (Type != EJson::Array) return false; Out = &Arr; return true; }
 	bool TryGetObject(const TSharedPtr<FJsonObject>*& Out) const { if (Type != EJson::Object) return false; Out = &Obj; return true; }
+	const TSharedPtr<FJsonObject>& AsObject() const { return Obj; }
 	FString AsString() const { return Str; }
 	double AsNumber() const { return Num; }
 };

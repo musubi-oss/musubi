@@ -8,6 +8,8 @@ use syn::{Attribute, Fields, GenericArgument, Item, PathArguments, Type};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ty {
     Bool,
+    /// Single byte in postcard (not a varint).
+    U8,
     U16,
     U32,
     U64,
@@ -40,6 +42,9 @@ pub struct Field {
     pub rename: Option<String>,
     /// `#[serde(default = "fn")]`: the function that supplies the default.
     pub default_fn: Option<String>,
+    /// `#[serde(skip_serializing_if = "fn")]`: the key is omitted when the value is the
+    /// default (None / false / zero) — the C++ encoder must omit it too for byte-equal JSON.
+    pub skip_if_default: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +66,8 @@ pub struct Variant {
     pub name: String,
     pub tag: String,
     pub kind: VariantKind,
+    /// `#[serde(other)]`: catch-all for unknown tags (internally tagged enums only).
+    pub other: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +76,9 @@ pub struct Enum {
     pub variants: Vec<Variant>,
     /// `#[serde(into = "i16", try_from = "i16")]` + explicit discriminants: an integer on the wire.
     pub int_repr: Option<Vec<(String, i64)>>,
+    /// `#[serde(tag = "type")]`: internally tagged — the tag is a key inside the variant's
+    /// object. JSON only (the simulator stream never uses postcard).
+    pub internal_tag: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -151,13 +161,15 @@ pub fn parse_ty(t: &Type) -> Result<Ty> {
                 _ => bail!("unsupported Arc<..>"),
             }
         }
-        "Uuid" | "AccountId" | "SessionId" => Ty::Uuid,
+        "Uuid" | "AccountId" | "SessionId" | "EntityId" | "SimId" => Ty::Uuid,
+        // `SimEvent<E = Value>` & co. are instantiated with `WorldEntity` by the node's stream.
+        "E" => Ty::Named("WorldEntity".into()),
         "Value" | "JsonText" => Ty::Json,
         "Vec" => {
             let inner = arg(0)?;
             if inner == Ty::U16 || inner == Ty::U32 {
                 Ty::Vec(Box::new(inner))
-            } else if matches!(inner, Ty::Named(ref n) if n == "u8") {
+            } else if inner == Ty::U8 {
                 Ty::Bytes
             } else {
                 Ty::Vec(Box::new(inner))
@@ -171,7 +183,7 @@ pub fn parse_ty(t: &Type) -> Result<Ty> {
             }
             Ty::Map(Box::new(arg(1)?))
         }
-        "u8" => Ty::Named("u8".into()),
+        "u8" => Ty::U8,
         other => Ty::Named(other.to_string()),
     })
 }
@@ -186,11 +198,17 @@ fn parse_fields(f: &Fields) -> Result<Vec<Field>> {
         .map(|f| {
             Ok(Field {
                 name: f.ident.as_ref().context("unnamed")?.to_string(),
-                ty: parse_ty(&f.ty)?,
+                ty: {
+                    if serde_attr_has(&f.attrs, "flatten") {
+                        bail!("#[serde(flatten)] unsupported (write that struct by hand)");
+                    }
+                    parse_ty(&f.ty)?
+                },
                 pos_cm: serde_attr_has(&f.attrs, "pos_cm"),
                 default: serde_attr_has(&f.attrs, "default"),
                 rename: serde_attr_value(&f.attrs, "rename"),
                 default_fn: serde_attr_value(&f.attrs, "default"),
+                skip_if_default: serde_attr_has(&f.attrs, "skip_serializing_if"),
             })
         })
         .collect()
@@ -223,6 +241,8 @@ pub fn lift(src: &str, wanted: &[&str], model: &mut Model) -> Result<()> {
                 } else {
                     None
                 };
+                // without `rename_all = "snake_case"` serde uses the variant name verbatim
+                let snake_tags = serde_attr_has(&e.attrs, "rename_all=\"snake_case\"");
                 let mut variants = Vec::new();
                 for v in &e.variants {
                     let kind = match &v.fields {
@@ -233,16 +253,41 @@ pub fn lift(src: &str, wanted: &[&str], model: &mut Model) -> Result<()> {
                         Fields::Unnamed(_) => bail!("tuple variants unsupported"),
                         Fields::Named(_) => VariantKind::Struct(parse_fields(&v.fields)?),
                     };
+                    let other = serde_attr_has(&v.attrs, "other");
+                    if other && !matches!(kind, VariantKind::Unit) {
+                        bail!(
+                            "{}::{}: #[serde(other)] must be a unit variant",
+                            e.ident,
+                            v.ident
+                        );
+                    }
                     variants.push(Variant {
                         name: v.ident.to_string(),
-                        tag: snake(&v.ident.to_string()),
+                        tag: if snake_tags {
+                            snake(&v.ident.to_string())
+                        } else {
+                            v.ident.to_string()
+                        },
                         kind,
+                        other,
                     });
+                }
+                let internal_tag = serde_attr_value(&e.attrs, "tag");
+                if internal_tag.is_some()
+                    && variants
+                        .iter()
+                        .any(|v| matches!(v.kind, VariantKind::Newtype(_)))
+                {
+                    bail!(
+                        "{}: internally tagged newtype variants unsupported",
+                        e.ident
+                    );
                 }
                 model.enums.push(Enum {
                     name: e.ident.to_string(),
                     variants,
                     int_repr,
+                    internal_tag,
                 });
             }
             _ => {}

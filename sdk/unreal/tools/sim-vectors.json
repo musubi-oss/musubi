@@ -1,0 +1,202 @@
+[
+  {
+    "name": "tick_full",
+    "kind": "frame",
+    "json": "{\"type\":\"tick\",\"tick\":120,\"cells\":[{\"cell\":{\"x\":1,\"y\":-2},\"tick\":120,\"owner\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"full\":true,\"owned\":[{\"components\":[{\"name\":\"kind\",\"value\":\"player\",\"version\":3},{\"name\":\"hp\",\"value\":{\"cur\":90,\"max\":100},\"version\":7}],\"id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"x\":1234.5,\"y\":-67.25}],\"ghosts\":[{\"components\":[],\"id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\",\"x\":5000.0,\"y\":5000.0}],\"globals\":[\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5e\"],\"time_scale\":0.5}],\"events\":[{\"type\":\"cell_assigned\",\"cell\":{\"x\":1,\"y\":-2},\"from\":null,\"reason\":\"lease\"}]}"
+  },
+  {
+    "name": "tick_delta_gone",
+    "kind": "frame",
+    "json": "{\"type\":\"tick\",\"tick\":121,\"cells\":[{\"cell\":{\"x\":1,\"y\":-2,\"z\":3,\"level\":1},\"tick\":121,\"owner\":null,\"owned\":[],\"ghosts\":[],\"gone\":[\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\"],\"globals\":[]}],\"events\":[]}"
+  },
+  {
+    "name": "cell_revoked",
+    "kind": "event",
+    "json": "{\"type\":\"cell_revoked\",\"cell\":{\"x\":0,\"y\":0},\"to\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"reason\":\"rebalance\"}"
+  },
+  {
+    "name": "cell_released",
+    "kind": "event",
+    "json": "{\"type\":\"cell_released\",\"cell\":{\"x\":0,\"y\":0},\"node\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"entities\":12}"
+  },
+  {
+    "name": "cell_reloaded",
+    "kind": "event",
+    "json": "{\"type\":\"cell_reloaded\",\"cell\":{\"x\":0,\"y\":0},\"entities\":3}"
+  },
+  {
+    "name": "cell_hibernated",
+    "kind": "event",
+    "json": "{\"type\":\"cell_hibernated\",\"cell\":{\"x\":0,\"y\":0},\"ephemeral_despawned\":5,\"persistent_kept\":2}"
+  },
+  {
+    "name": "cell_full",
+    "kind": "event",
+    "json": "{\"type\":\"cell_full\",\"cell\":{\"x\":0,\"y\":0},\"soft_cap\":500}"
+  },
+  {
+    "name": "queued",
+    "kind": "event",
+    "json": "{\"type\":\"queued\",\"ticket\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f\",\"cell\":{\"x\":0,\"y\":0},\"position\":4,\"eta_ticks\":90,\"soft_cap\":500}"
+  },
+  {
+    "name": "queue_update",
+    "kind": "event",
+    "json": "{\"type\":\"queue_update\",\"ticket\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f\",\"cell\":{\"x\":0,\"y\":0},\"position\":1,\"eta_ticks\":null}"
+  },
+  {
+    "name": "queue_admitted",
+    "kind": "event",
+    "json": "{\"type\":\"queue_admitted\",\"ticket\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f\",\"cell\":{\"x\":0,\"y\":0},\"entity\":{\"components\":[],\"id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"x\":1.0,\"y\":2.0}}"
+  },
+  {
+    "name": "queue_expired",
+    "kind": "event",
+    "json": "{\"type\":\"queue_expired\",\"ticket\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f\",\"cell\":{\"x\":0,\"y\":0},\"reason\":\"timeout\"}"
+  },
+  {
+    "name": "decayed",
+    "kind": "event",
+    "json": "{\"type\":\"decayed\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"cell\":{\"x\":0,\"y\":0}}"
+  },
+  {
+    "name": "time_scale",
+    "kind": "event",
+    "json": "{\"type\":\"time_scale\",\"cell\":{\"x\":0,\"y\":0},\"scale\":0.25}"
+  },
+  {
+    "name": "handover_request",
+    "kind": "event",
+    "json": "{\"type\":\"handover_request\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"from\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"state\":{\"components\":[{\"name\":\"vel\",\"value\":[1.5,-2.0],\"version\":1}],\"id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"x\":1.0,\"y\":2.0},\"group\":[]}"
+  },
+  {
+    "name": "handover_started",
+    "kind": "event",
+    "json": "{\"type\":\"handover_started\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"to\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"node\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a60\",\"group\":[\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a61\"]}"
+  },
+  {
+    "name": "handover_completed",
+    "kind": "event",
+    "json": "{\"type\":\"handover_completed\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"to\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\"}"
+  },
+  {
+    "name": "handover_cancelled",
+    "kind": "event",
+    "json": "{\"type\":\"handover_cancelled\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"reason\":\"refused\"}"
+  },
+  {
+    "name": "handover_arrived",
+    "kind": "event",
+    "json": "{\"type\":\"handover_arrived\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"from_node\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a60\",\"state\":{\"components\":[],\"id\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"x\":1.0,\"y\":2.0},\"buffered_inputs\":[{\"input\":{\"mv\":[0,1]}}]}"
+  },
+  {
+    "name": "input",
+    "kind": "event",
+    "json": "{\"type\":\"input\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"session\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a62\",\"input\":{\"jump\":true,\"mv\":[1,0]}}"
+  },
+  {
+    "name": "interaction",
+    "kind": "event",
+    "json": "{\"type\":\"interaction\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"kind\":\"hit\",\"payload\":{\"dmg\":10},\"from_sim\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"at_tick\":119,\"at\":{\"x\":1.0,\"y\":2.0,\"z\":0.5},\"tolerance\":1.0,\"seq\":7,\"tick\":120}"
+  },
+  {
+    "name": "co_locate",
+    "kind": "event",
+    "json": "{\"type\":\"co_locate\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"with\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\",\"cell\":{\"x\":0,\"y\":0},\"by\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"until_tick\":420}"
+  },
+  {
+    "name": "tx_committed",
+    "kind": "event",
+    "json": "{\"type\":\"tx_committed\",\"tx\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a63\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\"}"
+  },
+  {
+    "name": "tx_aborted",
+    "kind": "event",
+    "json": "{\"type\":\"tx_aborted\",\"tx\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a63\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"reason\":\"conflict\"}"
+  },
+  {
+    "name": "unknown",
+    "kind": "event",
+    "json": "{\"type\":\"unknown\"}"
+  },
+  {
+    "name": "lease",
+    "kind": "command",
+    "json": "{\"op\":\"lease\",\"cells\":[{\"x\":0,\"y\":0},{\"x\":1,\"y\":0}]}"
+  },
+  {
+    "name": "spawn",
+    "kind": "command",
+    "json": "{\"id\":1,\"op\":\"spawn\",\"x\":10.5,\"y\":-3.0,\"components\":{\"kind\":\"npc\"},\"persistent\":true,\"decay_ticks\":600}"
+  },
+  {
+    "name": "spawn_defaults",
+    "kind": "command",
+    "json": "{\"op\":\"spawn\",\"x\":0.0,\"y\":0.0,\"components\":null}"
+  },
+  {
+    "name": "tick_done",
+    "kind": "command",
+    "json": "{\"op\":\"tick_done\",\"tick\":120}"
+  },
+  {
+    "name": "despawn",
+    "kind": "command",
+    "json": "{\"id\":\"d-1\",\"op\":\"despawn\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\"}"
+  },
+  {
+    "name": "attach",
+    "kind": "command",
+    "json": "{\"op\":\"attach\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"root\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\",\"contained\":true}"
+  },
+  {
+    "name": "detach",
+    "kind": "command",
+    "json": "{\"op\":\"detach\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\"}"
+  },
+  {
+    "name": "apply",
+    "kind": "command",
+    "json": "{\"op\":\"apply\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"x\":11.0,\"y\":-2.5,\"components\":{\"hp\":{\"cur\":80,\"max\":100}}}"
+  },
+  {
+    "name": "interact",
+    "kind": "command",
+    "json": "{\"op\":\"interact\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"kind\":\"hit\",\"payload\":{\"dmg\":10},\"tick\":120,\"x\":1.0,\"y\":2.0,\"tolerance\":0.5}"
+  },
+  {
+    "name": "colocate",
+    "kind": "command",
+    "json": "{\"op\":\"colocate\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"with\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\",\"ttl_ticks\":300}"
+  },
+  {
+    "name": "rewind",
+    "kind": "command",
+    "json": "{\"op\":\"rewind\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"tick\":100,\"x\":1.0,\"y\":2.0}"
+  },
+  {
+    "name": "handover_ack",
+    "kind": "command",
+    "json": "{\"op\":\"handover_ack\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\"}"
+  },
+  {
+    "name": "co_locate_result",
+    "kind": "CoLocateResult",
+    "json": "{\"pinned\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"with\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\",\"cell\":{\"x\":0,\"y\":0},\"until_tick\":420,\"forwarded\":true,\"followers\":[]}"
+  },
+  {
+    "name": "handover_ack_result",
+    "kind": "HandoverAckResult",
+    "json": "{\"outcome\":{\"Started\":{\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"from\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"to\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a60\",\"group\":[]}},\"buffered_inputs\":[{\"input\":{\"mv\":[0,1]}}]}"
+  },
+  {
+    "name": "rewind_result",
+    "kind": "RewindResult",
+    "json": "{\"tick\":100,\"pos\":{\"x\":1.0,\"y\":2.0},\"hit\":true,\"history_from\":60}"
+  },
+  {
+    "name": "interact_result",
+    "kind": "InteractResult",
+    "json": "{\"delivered\":\"forwarded\",\"seq\":7,\"tick\":120,\"colocated\":false,\"followers\":[\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\"]}"
+  }
+]

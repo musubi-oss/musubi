@@ -90,6 +90,18 @@ struct MUSUBI_API FMusubiUserPresence
 	static void Read(FMusubiPostcardReader& R, FMusubiUserPresence& Out);
 };
 
+struct MUSUBI_API FMusubiWorldComponent
+{
+	FString name;
+	FMusubiJson value;
+	uint64 version = 0;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiWorldComponent& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiWorldComponent& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiWorldComponent& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiWorldComponent& Out);
+};
+
 struct MUSUBI_API FMusubiWorldEntity
 {
 	FMusubiUuid id;
@@ -101,18 +113,6 @@ struct MUSUBI_API FMusubiWorldEntity
 	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiWorldEntity& Out);
 	static void Write(FMusubiPostcardWriter& W, const FMusubiWorldEntity& V);
 	static void Read(FMusubiPostcardReader& R, FMusubiWorldEntity& Out);
-};
-
-struct MUSUBI_API FMusubiWorldComponent
-{
-	FString name;
-	FMusubiJson value;
-	uint64 version = 0;
-
-	static TSharedPtr<FJsonValue> ToJson(const FMusubiWorldComponent& V);
-	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiWorldComponent& Out);
-	static void Write(FMusubiPostcardWriter& W, const FMusubiWorldComponent& V);
-	static void Read(FMusubiPostcardReader& R, FMusubiWorldComponent& Out);
 };
 
 struct MUSUBI_API FMusubiMatchmakerServer
@@ -142,6 +142,18 @@ struct MUSUBI_API FMusubiMatchmakerUser
 	static void Read(FMusubiPostcardReader& R, FMusubiMatchmakerUser& Out);
 };
 
+struct MUSUBI_API FMusubiReaction
+{
+	FString emoji;
+	uint32 count = 0;
+	bool me = false;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiReaction& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiReaction& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiReaction& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiReaction& Out);
+};
+
 struct MUSUBI_API FMusubiChannelMessage
 {
 	FString channel_id;
@@ -162,18 +174,6 @@ struct MUSUBI_API FMusubiChannelMessage
 	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiChannelMessage& Out);
 	static void Write(FMusubiPostcardWriter& W, const FMusubiChannelMessage& V);
 	static void Read(FMusubiPostcardReader& R, FMusubiChannelMessage& Out);
-};
-
-struct MUSUBI_API FMusubiReaction
-{
-	FString emoji;
-	uint32 count = 0;
-	bool me = false;
-
-	static TSharedPtr<FJsonValue> ToJson(const FMusubiReaction& V);
-	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiReaction& Out);
-	static void Write(FMusubiPostcardWriter& W, const FMusubiReaction& V);
-	static void Read(FMusubiPostcardReader& R, FMusubiReaction& Out);
 };
 
 struct MUSUBI_API FMusubiPartyListing

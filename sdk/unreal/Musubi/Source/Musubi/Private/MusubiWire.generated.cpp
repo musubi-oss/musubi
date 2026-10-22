@@ -247,6 +247,41 @@ void FMusubiUserPresence::Read(FMusubiPostcardReader& R, FMusubiUserPresence& Ou
 	Out.invisible = R.Bool();
 }
 
+TSharedPtr<FJsonValue> FMusubiWorldComponent::ToJson(const FMusubiWorldComponent& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("name"), MakeShared<FJsonValueString>(V.name));
+	O->SetField(TEXT("value"), MusubiJson::JsonOrNull(V.value));
+	O->SetField(TEXT("version"), MakeShared<FJsonValueNumber>((double)V.version));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiWorldComponent::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiWorldComponent& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("name")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.name = MoveTemp(V0); else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("value")); F.IsValid()) { Out.value = FMusubiJson(F); } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("version")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.version = (uint64)V0; else bOk = false; } } else bOk = false;
+	return bOk;
+}
+
+void FMusubiWorldComponent::Write(FMusubiPostcardWriter& W, const FMusubiWorldComponent& V)
+{
+	W.Str(V.name);
+	W.Str(V.value.ToText());
+	W.Varint((uint64)V.version);
+}
+
+void FMusubiWorldComponent::Read(FMusubiPostcardReader& R, FMusubiWorldComponent& Out)
+{
+	Out.name = R.Str();
+	Out.value = FMusubiJson::FromText(R.Str());
+	Out.version = R.Varint();
+}
+
 TSharedPtr<FJsonValue> FMusubiWorldEntity::ToJson(const FMusubiWorldEntity& V)
 {
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -284,41 +319,6 @@ void FMusubiWorldEntity::Read(FMusubiPostcardReader& R, FMusubiWorldEntity& Out)
 	Out.x = MusubiPostcard::FromCm((int32)R.Zigzag());
 	Out.y = MusubiPostcard::FromCm((int32)R.Zigzag());
 	{ uint64 V0N = R.Len(); Out.components.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiWorldComponent V0{}; FMusubiWorldComponent::Read(R, V0); Out.components.Add(MoveTemp(V0)); } }
-}
-
-TSharedPtr<FJsonValue> FMusubiWorldComponent::ToJson(const FMusubiWorldComponent& V)
-{
-	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
-	O->SetField(TEXT("name"), MakeShared<FJsonValueString>(V.name));
-	O->SetField(TEXT("value"), MusubiJson::JsonOrNull(V.value));
-	O->SetField(TEXT("version"), MakeShared<FJsonValueNumber>((double)V.version));
-	return MakeShared<FJsonValueObject>(O);
-}
-
-bool FMusubiWorldComponent::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiWorldComponent& Out)
-{
-	const TSharedPtr<FJsonObject>* OP;
-	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
-	const FJsonObject& O = **OP;
-	bool bOk = true;
-	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("name")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.name = MoveTemp(V0); else bOk = false; } } else bOk = false;
-	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("value")); F.IsValid()) { Out.value = FMusubiJson(F); } else bOk = false;
-	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("version")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.version = (uint64)V0; else bOk = false; } } else bOk = false;
-	return bOk;
-}
-
-void FMusubiWorldComponent::Write(FMusubiPostcardWriter& W, const FMusubiWorldComponent& V)
-{
-	W.Str(V.name);
-	W.Str(V.value.ToText());
-	W.Varint((uint64)V.version);
-}
-
-void FMusubiWorldComponent::Read(FMusubiPostcardReader& R, FMusubiWorldComponent& Out)
-{
-	Out.name = R.Str();
-	Out.value = FMusubiJson::FromText(R.Str());
-	Out.version = R.Varint();
 }
 
 TSharedPtr<FJsonValue> FMusubiMatchmakerServer::ToJson(const FMusubiMatchmakerServer& V)
@@ -403,6 +403,41 @@ void FMusubiMatchmakerUser::Read(FMusubiPostcardReader& R, FMusubiMatchmakerUser
 	if (R.Byte() == 1) { uint32 V0{}; V0 = (uint32)R.Varint(); Out.team = MoveTemp(V0); } else Out.team.Reset();
 }
 
+TSharedPtr<FJsonValue> FMusubiReaction::ToJson(const FMusubiReaction& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("emoji"), MakeShared<FJsonValueString>(V.emoji));
+	O->SetField(TEXT("count"), MakeShared<FJsonValueNumber>((double)V.count));
+	O->SetField(TEXT("me"), MakeShared<FJsonValueBoolean>(V.me));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiReaction::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiReaction& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("emoji")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.emoji = MoveTemp(V0); else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("count")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.count = (uint32)V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("me")); F.IsValid() && !F->IsNull()) { { bool V0; if (F->TryGetBool(V0)) Out.me = V0; else bOk = false; } }
+	return bOk;
+}
+
+void FMusubiReaction::Write(FMusubiPostcardWriter& W, const FMusubiReaction& V)
+{
+	W.Str(V.emoji);
+	W.Varint((uint64)V.count);
+	W.Bool(V.me);
+}
+
+void FMusubiReaction::Read(FMusubiPostcardReader& R, FMusubiReaction& Out)
+{
+	Out.emoji = R.Str();
+	Out.count = (uint32)R.Varint();
+	Out.me = R.Bool();
+}
+
 TSharedPtr<FJsonValue> FMusubiChannelMessage::ToJson(const FMusubiChannelMessage& V)
 {
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -478,41 +513,6 @@ void FMusubiChannelMessage::Read(FMusubiPostcardReader& R, FMusubiChannelMessage
 	{ uint64 V0N = R.Len(); Out.mentions.Reset((int32)V0N); for (uint64 V0I = 0; V0I < V0N && R.Ok(); ++V0I) { FMusubiUuid V0{}; V0 = R.Uuid(); Out.mentions.Add(MoveTemp(V0)); } }
 }
 
-TSharedPtr<FJsonValue> FMusubiReaction::ToJson(const FMusubiReaction& V)
-{
-	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
-	O->SetField(TEXT("emoji"), MakeShared<FJsonValueString>(V.emoji));
-	O->SetField(TEXT("count"), MakeShared<FJsonValueNumber>((double)V.count));
-	O->SetField(TEXT("me"), MakeShared<FJsonValueBoolean>(V.me));
-	return MakeShared<FJsonValueObject>(O);
-}
-
-bool FMusubiReaction::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiReaction& Out)
-{
-	const TSharedPtr<FJsonObject>* OP;
-	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
-	const FJsonObject& O = **OP;
-	bool bOk = true;
-	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("emoji")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.emoji = MoveTemp(V0); else bOk = false; } } else bOk = false;
-	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("count")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.count = (uint32)V0; else bOk = false; } } else bOk = false;
-	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("me")); F.IsValid() && !F->IsNull()) { { bool V0; if (F->TryGetBool(V0)) Out.me = V0; else bOk = false; } }
-	return bOk;
-}
-
-void FMusubiReaction::Write(FMusubiPostcardWriter& W, const FMusubiReaction& V)
-{
-	W.Str(V.emoji);
-	W.Varint((uint64)V.count);
-	W.Bool(V.me);
-}
-
-void FMusubiReaction::Read(FMusubiPostcardReader& R, FMusubiReaction& Out)
-{
-	Out.emoji = R.Str();
-	Out.count = (uint32)R.Varint();
-	Out.me = R.Bool();
-}
-
 TSharedPtr<FJsonValue> FMusubiPartyListing::ToJson(const FMusubiPartyListing& V)
 {
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -521,7 +521,7 @@ TSharedPtr<FJsonValue> FMusubiPartyListing::ToJson(const FMusubiPartyListing& V)
 	O->SetField(TEXT("open"), MakeShared<FJsonValueBoolean>(V.open));
 	O->SetField(TEXT("max_size"), MakeShared<FJsonValueNumber>((double)V.max_size));
 	O->SetField(TEXT("size"), MakeShared<FJsonValueNumber>((double)V.size));
-	O->SetField(TEXT("leader_id"), (V.leader_id.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueString>(V.leader_id.GetValue())) : MusubiJson::Null()));
+	if (V.leader_id.IsSet()) O->SetField(TEXT("leader_id"), (V.leader_id.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueString>(V.leader_id.GetValue())) : MusubiJson::Null()));
 	return MakeShared<FJsonValueObject>(O);
 }
 
@@ -2513,7 +2513,7 @@ TSharedPtr<FJsonValue> FMusubiServerMessageNotification::ToJson(const FMusubiSer
 	O->SetField(TEXT("sender_id"), (V.sender_id.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueString>(V.sender_id.GetValue().ToString())) : MusubiJson::Null()));
 	O->SetField(TEXT("create_time"), MakeShared<FJsonValueNumber>((double)V.create_time));
 	O->SetField(TEXT("persistent"), MakeShared<FJsonValueBoolean>(V.persistent));
-	O->SetField(TEXT("expire_time"), (V.expire_time.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueNumber>((double)V.expire_time.GetValue())) : MusubiJson::Null()));
+	if (V.expire_time.IsSet()) O->SetField(TEXT("expire_time"), (V.expire_time.IsSet() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueNumber>((double)V.expire_time.GetValue())) : MusubiJson::Null()));
 	return MakeShared<FJsonValueObject>(O);
 }
 
@@ -3658,7 +3658,7 @@ TSharedPtr<FJsonValue> FMusubiServerMessageStreamData::ToJson(const FMusubiServe
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
 	O->SetField(TEXT("stream"), MakeShared<FJsonValueString>(V.stream));
 	O->SetField(TEXT("data"), MusubiJson::JsonOrNull(V.data));
-	O->SetField(TEXT("sender"), (V.sender.IsSet() ? TSharedPtr<FJsonValue>(FMusubiUserPresence::ToJson(V.sender.GetValue())) : MusubiJson::Null()));
+	if (V.sender.IsSet()) O->SetField(TEXT("sender"), (V.sender.IsSet() ? TSharedPtr<FJsonValue>(FMusubiUserPresence::ToJson(V.sender.GetValue())) : MusubiJson::Null()));
 	return MakeShared<FJsonValueObject>(O);
 }
 

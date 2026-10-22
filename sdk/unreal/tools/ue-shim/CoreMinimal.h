@@ -21,6 +21,8 @@ typedef int8_t int8; typedef int16_t int16; typedef int32_t int32; typedef int64
 typedef char ANSICHAR; typedef char TCHAR; typedef size_t SIZE_T;
 #define TEXT(x) x
 #define MUSUBI_API
+#define MUSUBIWORLD_API
+#define MUSUBISERVER_API
 #define UE_LOG(Cat, Verb, Fmt, ...) ((void)0)
 #define DECLARE_LOG_CATEGORY_EXTERN(Cat, D, V) struct Cat##_t {};
 #define DEFINE_LOG_CATEGORY(Cat)

@@ -11,3 +11,7 @@ for f in MusubiWireTypes MusubiJson MusubiPostcard MusubiWire.generated MusubiEn
     -I tools/ue-shim -I "$SRC/Public" "$SRC/Private/$f.cpp"
   echo "ok $f"
 done
+SRV=Musubi/Source/MusubiServer
+"$CXX" -std=c++17 -fsyntax-only -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
+  -I tools/ue-shim -I "$SRC/Public" -I "$SRV/Public" "$SRV/Private/MusubiSimWire.generated.cpp"
+echo "ok MusubiSimWire.generated"
