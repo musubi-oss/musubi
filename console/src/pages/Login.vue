@@ -2,8 +2,9 @@
 import { ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useSession } from '../stores/session'
+import { auth } from '../api/client'
 const s = useSession(); const router = useRouter(); const route = useRoute()
-const key = ref(''); const base = ref(''); const busy = ref(false); const err = ref('')
+const key = ref(''); const base = ref(auth.base); const busy = ref(false); const err = ref('')
 async function go() {
   busy.value = true; err.value = ''
   if (await s.login(key.value, base.value)) router.push(String(route.query.to || '/players'))
@@ -23,8 +24,8 @@ onMounted(async () => {
   <div class="login"><div class="card">
     <div class="logo" style="margin-bottom:14px"><i></i>musubi console</div>
     <div class="form">
-      <div class="f"><label>Operator key</label><input class="in" v-model="key" type="password" placeholder="admin / support / liveops / ops key" @keyup.enter="go" /></div>
-      <div class="f"><label>API base (empty = this host)</label><input class="in" v-model="base" placeholder="https://api.example.com" /></div>
+      <div class="f"><label>Operator key</label><input class="in" v-model="key" type="password" autofocus placeholder="admin / support / liveops / ops key" @keyup.enter="go" /></div>
+      <div class="f"><label>API base (empty = this host)</label><input class="in" v-model="base" placeholder="https://api.example.com" @keyup.enter="go" /></div>
       <p class="err" v-if="err">{{ err }}</p>
       <div class="row"><button class="btn" @click="sso">Sign in with SSO</button><button class="btn p" :disabled="busy || !key" @click="go">Sign in</button></div>
     </div>

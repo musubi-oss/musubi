@@ -4,6 +4,7 @@ import { useSession } from '../stores/session'
 import { sections } from '../router'
 import { useRouter } from 'vue-router'
 import { toast } from '../stores/toast'
+import { net } from '../api/client'
 const s = useSession(); const router = useRouter()
 function logout() { s.logout(); router.push('/login') }
 // `/` focuses the first search / filter box on the page, `r` refreshes it, `Esc` blurs an input.
@@ -18,6 +19,7 @@ onMounted(() => window.addEventListener('keydown', key)); onBeforeUnmount(() => 
 </script>
 <template>
   <div class="top">
+    <div class="prog" :class="{ on: net.busy > 0 }"></div>
     <div class="brand">
       <div class="logo"><i></i>musubi</div>
       <span class="proj">{{ s.node?.project || 'default' }}</span>

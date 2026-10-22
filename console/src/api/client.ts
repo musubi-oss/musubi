@@ -3,6 +3,9 @@
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string, public body: any) { super(message) }
 }
+import { reactive } from 'vue'
+// Number of requests in flight; the layout shows a progress bar while it is > 0.
+export const net = reactive({ busy: 0 })
 const KEY = 'musubi.console.key'
 const BASE = 'musubi.console.base'
 export const auth = {
@@ -16,7 +19,9 @@ export async function api<T = any>(method: string, path: string, body?: unknown,
   let payload: BodyInit | undefined
   if (body instanceof Uint8Array || body instanceof Blob) { payload = body as BodyInit; h['content-type'] ||= 'application/octet-stream' }
   else if (body !== undefined) { payload = JSON.stringify(body); h['content-type'] = 'application/json' }
-  const r = await fetch(auth.base + path, { method, headers: h, body: payload })
+  net.busy++
+  let r: Response
+  try { r = await fetch(auth.base + path, { method, headers: h, body: payload }) } finally { net.busy-- }
   if (opts.raw) return r as unknown as T
   const text = await r.text()
   let v: any = null
