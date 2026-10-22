@@ -1569,8 +1569,31 @@ impl Fanout {
                                     && fresh.is_none_or(|h| h == w.node_id() || h == from_node);
                                 if forced_here || fresh == Some(w.node_id()) {
                                     metrics::counter!("musubi_world_handover_recv_total", "path" => "here_after_fresh_lookup").increment(1);
-                                    if let Err(e) = w.ensure_hosting(&world, c).await {
-                                        tracing::warn!(world = %world, ?c, error = %e, "handover target cell not hosted");
+                                    // a forced shipment is fire-and-forget on the sender (the
+                                    // entity is already gone there), so hosting that is not up
+                                    // yet — a transient database error while the shard loads,
+                                    // the shard dropped between two shipments — must not cost
+                                    // the entity: retry until the cell is ours, then take it
+                                    let mut attempt = 0u32;
+                                    loop {
+                                        match w.ensure_hosting(&world, c).await {
+                                            Ok(()) if w.hosts_cell_cached(&world, c) => break,
+                                            Ok(()) => {}
+                                            Err(e) => {
+                                                tracing::warn!(world = %world, ?c, attempt, error = %e, "handover target cell not hosted");
+                                            }
+                                        }
+                                        if !forced || attempt >= 50 {
+                                            if forced {
+                                                metrics::counter!("musubi_world_handover_recv_total", "path" => "forced_lost").increment(1);
+                                                tracing::error!(world = %world, ?c, id = %entity.id, "forced shipment dropped: cell never came up here");
+                                            }
+                                            break;
+                                        }
+                                        attempt += 1;
+                                        metrics::counter!("musubi_world_handover_recv_total", "path" => "forced_retry").increment(1);
+                                        tokio::time::sleep(std::time::Duration::from_millis(100))
+                                            .await;
                                     }
                                     me.take_handover(
                                         w, world, entity, from_node, inputs, forced, base_rev,

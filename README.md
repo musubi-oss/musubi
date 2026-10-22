@@ -305,9 +305,7 @@ retry for a few seconds after a kill, because the cluster hands a session over o
 declared its node dead (`MUSUBI_SOAK_DEBUG=1` prints each rejected attempt). The SIGKILL numbers are SWIM's suspect timeout plus one
 failover round, which now starts the moment the death verdict lands (it used to wait for the next
 15 s tick, making it 11 – 12 s); a drained node announces its departure, so its worlds move an order
-of magnitude faster. Open item: in two of roughly twenty kills on this VM the re-home did not settle
-within the 60 s budget; the stand now dumps Raft/world/member state of the survivors when that
-happens so it can be chased down.
+of magnitude faster. Open item, now with a trace: in two of roughly twenty kills on this VM the re-home did not settle within the 60 s budget. Reproduced in 1 of 8 kill-only runs with the survivors' Raft/world/member state dumped: the Raft group had been churning elections the whole run (terms 6 → 141 with no new log entry, 142 elections against 3–8 in the clean runs) because vote RPCs to a *live* leader timed out after 1.5 s — that run shared the 8 cores with a `cargo clippy` build, i.e. CPU starvation, not a network fault (one stale-certificate handshake failure after a restart, otherwise none). When the leader was then killed, the two survivors never formed a quorum within 60 s and every world the leader homed stayed unreachable (`leader: null` on both). The failover round needs directory writes, so a leaderless group blocks re-homing entirely. Next: Raft timing that survives a starved box (heartbeat/election as cluster config, vote RPC timeout bounded by the election timeout) and a controlled starvation experiment on the stand.
 
 Split worlds are in the stand too: every world gets cell `(1,0)` hosted on the node after its home,
 one simulator per side leases its cell and 20 persistent entities keep crossing the border
