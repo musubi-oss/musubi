@@ -100,6 +100,13 @@ pub struct NodeConfig {
     pub bus_listen: String,
     /// Address other nodes dial for the bus; defaults to the bound address.
     pub bus_advertise: String,
+    /// Raft (cell/world directory) leader heartbeat, ms. Followers start an election when no
+    /// heartbeat arrives within `raft_election_min_ms..raft_election_max_ms`; the vote RPC is
+    /// bounded by the minimum. A starved box (CPU contention, swapping) that cannot answer a vote
+    /// within the minimum churns elections and blocks failover — raise these there.
+    pub raft_heartbeat_ms: u64,
+    pub raft_election_min_ms: u64,
+    pub raft_election_max_ms: u64,
     /// Cluster group: independent clusters can share one Postgres.
     pub cluster_group: String,
     /// Name of the project this node's base configuration serves (`[[projects]]` add more).
@@ -191,6 +198,9 @@ impl Default for NodeConfig {
             region: "local".into(),
             bus_listen: String::new(),
             bus_advertise: String::new(),
+            raft_heartbeat_ms: 500,
+            raft_election_min_ms: 1500,
+            raft_election_max_ms: 2500,
             cluster_group: "default".into(),
             project: "default".into(),
             environment: "dev".into(),

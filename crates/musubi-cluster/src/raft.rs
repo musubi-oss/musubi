@@ -400,9 +400,9 @@ impl Cluster {
         let config = openraft::Config {
             // followers refuse votes while the leader lease (= election_timeout_min since the
             // last heartbeat) runs, so this also bounds how fast a leaving leader is replaced
-            heartbeat_interval: 500,
-            election_timeout_min: 1500,
-            election_timeout_max: 2500,
+            heartbeat_interval: self.raft_timing.0,
+            election_timeout_min: self.raft_timing.1,
+            election_timeout_max: self.raft_timing.2,
             ..Default::default()
         };
         let config = Arc::new(config.validate().map_err(Error::internal)?);

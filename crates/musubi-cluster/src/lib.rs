@@ -140,6 +140,8 @@ pub struct Cluster {
     me: NodeInfo,
     bus_tx: broadcast::Sender<BusMessage>,
     pub(crate) peers: Arc<RwLock<Vec<NodeInfo>>>,
+    /// (heartbeat, election_min, election_max) in ms for the Raft group.
+    pub(crate) raft_timing: (u64, u64, u64),
     pub(crate) bus: Option<Arc<QuicBus>>,
     pub(crate) members: Arc<RwLock<HashMap<Uuid, swim::Member>>>,
     pub(crate) incarnation: Arc<AtomicU64>,
@@ -307,6 +309,7 @@ impl Cluster {
             },
             bus_tx,
             peers: Arc::new(RwLock::new(Vec::new())),
+            raft_timing: (500, 1500, 2500),
             bus: None,
             members: Arc::new(RwLock::new(HashMap::new())),
             // seeded from the clock so a process restarted with the same identity outranks every
@@ -508,6 +511,17 @@ impl Cluster {
     /// Membership scope: nodes only see, gossip with and replicate to their own group.
     pub fn with_group(mut self, group: &str) -> Self {
         self.me.group = group.to_string();
+        self
+    }
+
+    /// Raft heartbeat / election timing (ms); see `NodeConfig::raft_heartbeat_ms`.
+    pub fn with_raft_timing(
+        mut self,
+        heartbeat_ms: u64,
+        election_min_ms: u64,
+        election_max_ms: u64,
+    ) -> Self {
+        self.raft_timing = (heartbeat_ms, election_min_ms, election_max_ms);
         self
     }
 

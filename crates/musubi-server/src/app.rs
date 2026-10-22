@@ -213,7 +213,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<AppState> {
         let adv = overlay
             .as_deref()
             .or((!cfg.node.bus_advertise.is_empty()).then_some(cfg.node.bus_advertise.as_str()));
-        cluster = cluster.with_bus(listen, adv)?;
+        cluster = cluster
+            .with_raft_timing(
+                cfg.node.raft_heartbeat_ms,
+                cfg.node.raft_election_min_ms,
+                cfg.node.raft_election_max_ms,
+            )
+            .with_bus(listen, adv)?;
         tracing::info!(addr = ?cluster.bus_addr(), "quic node bus enabled");
     }
     let cluster = Arc::new(cluster);
