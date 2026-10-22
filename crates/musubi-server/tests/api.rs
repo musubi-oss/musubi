@@ -41713,7 +41713,7 @@ async fn stable_server_hostnames_from_dns_zone() {
         hostname,
         format!(
             "{}.{}.gs.example.internal",
-            &sid.replace('-', "")[24..],
+            &sid.replace('-', "")[..8],
             name
         ),
         "{h}"
