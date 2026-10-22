@@ -21683,12 +21683,18 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
             }
         }
     }
-    async fn reply(ws: &mut Ws, op: &str) -> Value {
+    // tick frames read while waiting for a reply are kept for `cell`, not dropped — the
+    // first (full) frame of the cell may land between a spawn and its reply
+    type Stash = std::collections::VecDeque<Value>;
+    async fn reply(ws: &mut Ws, op: &str, stash: &mut Stash) -> Value {
         let t0 = std::time::Instant::now();
         loop {
             let v = next(ws).await;
             if v["op"] == op {
                 return v;
+            }
+            if v["type"] == "tick" {
+                stash.push_back(v.clone());
             }
             assert!(
                 t0.elapsed() < std::time::Duration::from_secs(5),
@@ -21697,10 +21703,13 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
         }
     }
     /// The next tick frame's view of cell (0, 0).
-    async fn cell(ws: &mut Ws) -> Value {
+    async fn cell(ws: &mut Ws, stash: &mut Stash) -> Value {
         let t0 = std::time::Instant::now();
         loop {
-            let v = next(ws).await;
+            let v = match stash.pop_front() {
+                Some(v) => v,
+                None => next(ws).await,
+            };
             if v["type"] == "tick" {
                 if let Some(c) = v["cells"]
                     .as_array()
@@ -21715,12 +21724,13 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
             );
         }
     }
+    let mut stash = Stash::new();
     ws.send(Message::Text(
         json!({"op": "lease", "id": 1, "cells": [{"x": 0, "y": 0}]}).to_string(),
     ))
     .await
     .unwrap();
-    let r = reply(&mut ws, "lease").await;
+    let r = reply(&mut ws, "lease", &mut stash).await;
     assert_eq!(r["cells"].as_array().unwrap().len(), 1, "{r}");
     for (i, x) in [20.0, 50.0].iter().enumerate() {
         ws.send(Message::Text(
@@ -21729,14 +21739,14 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
         ))
         .await
         .unwrap();
-        reply(&mut ws, "spawn").await;
+        reply(&mut ws, "spawn", &mut stash).await;
     }
     // frames are full exactly until the first entity has been delivered (a frame may land
     // between the two spawns); applied like a simulator would, they add up to both entities
     let t0 = std::time::Instant::now();
     let mut have: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     let ids: Vec<String> = loop {
-        let c = cell(&mut ws).await;
+        let c = cell(&mut ws, &mut stash).await;
         assert_eq!(c["full"], json!(have.is_empty()), "{c}");
         assert_eq!(c["gone"], json!([]), "{c}");
         for e in c["owned"].as_array().into_iter().flatten() {
@@ -21748,7 +21758,7 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
         assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{c}");
     };
     // a quiet tick sends nothing for the cell
-    let c = cell(&mut ws).await;
+    let c = cell(&mut ws, &mut stash).await;
     assert_eq!(c["full"], false, "{c}");
     assert_eq!(c["owned"], json!([]), "{c}");
     assert_eq!(c["gone"], json!([]), "{c}");
@@ -21759,10 +21769,10 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
     ))
     .await
     .unwrap();
-    reply(&mut ws, "apply").await;
+    reply(&mut ws, "apply", &mut stash).await;
     let t0 = std::time::Instant::now();
     loop {
-        let c = cell(&mut ws).await;
+        let c = cell(&mut ws, &mut stash).await;
         let owned = c["owned"].as_array().cloned().unwrap_or_default();
         if !owned.is_empty() {
             assert_eq!(owned.len(), 1, "{c}");
@@ -21779,10 +21789,10 @@ async fn simulator_stream_delta_frames_carry_only_changes() {
     ))
     .await
     .unwrap();
-    reply(&mut ws, "despawn").await;
+    reply(&mut ws, "despawn", &mut stash).await;
     let t0 = std::time::Instant::now();
     loop {
-        let c = cell(&mut ws).await;
+        let c = cell(&mut ws, &mut stash).await;
         let gone = c["gone"].as_array().cloned().unwrap_or_default();
         if !gone.is_empty() {
             assert_eq!(gone, vec![json!(ids[1])], "{c}");

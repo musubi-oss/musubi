@@ -3437,6 +3437,82 @@ mod tests {
     }
 
     #[test]
+    fn moved_view_flips_visibility_without_touching_the_rest() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..Default::default()
+        });
+        let s1 = Uuid::now_v7();
+        for x in -1..=1 {
+            w.grant_lease(
+                CellId {
+                    x,
+                    y: 0,
+                    level: 0,
+                    z: 0,
+                },
+                s1,
+            );
+        }
+        let at = |x: f64| Pos { x, y: 0.0, z: 0.0 };
+        let c = Uuid::now_v7();
+        w.subscribe(c, at(0.0), 60.0);
+        let a = w.spawn(at(10.0), comps(serde_json::json!({"hp": 5})), false);
+        let b = w.spawn(at(80.0), BTreeMap::new(), false);
+        let d = w.spawn(at(-50.0), BTreeMap::new(), false);
+        w.advance();
+        let first = w.delta_for(c).unwrap();
+        let mut ids: Vec<_> = first.spawned.iter().map(|e| e.id).collect();
+        ids.sort();
+        let mut want = vec![a, d];
+        want.sort();
+        assert_eq!(ids, want);
+        w.advance();
+        assert_eq!(w.delta_for(c).unwrap(), Delta::default());
+        // the client walks to x=40 with nothing else changing: d (x=-50) leaves the circle,
+        // b (x=80) enters, a stays as it was — no update for it
+        w.subscribe(c, at(40.0), 60.0);
+        w.advance();
+        let moved = w.delta_for(c).unwrap();
+        assert_eq!(
+            moved.spawned.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![b]
+        );
+        assert_eq!(moved.despawned, vec![d]);
+        assert!(moved.updated.is_empty(), "{moved:?}");
+        // a change while moving again is still delivered exactly once
+        w.apply(s1, a, None, comps(serde_json::json!({"hp": 4})))
+            .unwrap();
+        w.subscribe(c, at(45.0), 60.0);
+        w.advance();
+        let moved = w.delta_for(c).unwrap();
+        assert_eq!(
+            moved.updated.iter().map(|u| u.id).collect::<Vec<_>>(),
+            vec![a]
+        );
+        assert!(
+            moved.spawned.is_empty() && moved.despawned.is_empty(),
+            "{moved:?}"
+        );
+        w.advance();
+        assert_eq!(w.delta_for(c).unwrap(), Delta::default());
+        // what the client holds equals what a fresh client at the same spot sees
+        let fresh = Uuid::now_v7();
+        w.subscribe(fresh, at(45.0), 60.0);
+        let mut full: Vec<_> = w
+            .delta_for(fresh)
+            .unwrap()
+            .spawned
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        full.sort();
+        let mut held: Vec<_> = w.interests[&c].known.keys().copied().collect();
+        held.sort();
+        assert_eq!(held, full);
+    }
+
+    #[test]
     fn delta_budget_sends_nearest_first_and_catches_up() {
         let mut w = World::new(WorldConfig {
             cell_size: 1000.0,
@@ -4080,12 +4156,17 @@ impl WorldView {
         let mut cands: Vec<Cand> = Vec::new();
         // same view as the last scan and the change log reaches back to it: only entities that
         // changed since can differ from what the client knows, so only those are examined
-        let fast = interest.last_view == Some((interest.pos, interest.radius))
-            && interest.last_inside == interest.inside
+        let same_lens = interest.last_inside == interest.inside
             && interest.last_filter == interest.filter
             && self.by_cell.log_covers(interest.last_delta_tick);
+        let fast = same_lens && interest.last_view == Some((interest.pos, interest.radius));
+        // the view moved but the lens is the same and the log reaches back: the client holds
+        // exactly what the old circle saw, so besides the changed entities only those whose
+        // visibility flips between the two circles need a look — decided from the entity's
+        // position alone, without touching the client's (cold) `known` map for the rest
+        let moved = !fast && same_lens && interest.last_view.is_some();
         let mut fast_gone: Vec<EntityId> = Vec::new();
-        let scan: Vec<&Entity> = if fast {
+        let scan: Vec<&Entity> = if fast || moved {
             let mut ids: Vec<EntityId> = self
                 .by_cell
                 .changed_since(interest.last_delta_tick)
@@ -4093,11 +4174,36 @@ impl WorldView {
             ids.sort_unstable();
             ids.dedup();
             let mut v = Vec::with_capacity(ids.len());
-            for id in ids {
-                match self.entities.get(&id) {
+            for id in &ids {
+                match self.entities.get(id) {
                     Some(e) => v.push(e),
-                    None if interest.known.contains_key(&id) => fast_gone.push(id),
+                    None if interest.known.contains_key(id) => fast_gone.push(*id),
                     None => {}
+                }
+            }
+            if moved {
+                let (opos, orad) = interest
+                    .last_view
+                    .unwrap_or((interest.pos, interest.radius));
+                let old_cells = self.cells_in_radius(opos, orad);
+                let touched = cells
+                    .iter()
+                    .chain(old_cells.iter().filter(|c| !cells.contains(c)));
+                for id in touched.filter_map(|c| self.by_cell.get(c)).flatten() {
+                    if ids.binary_search(id).is_ok() {
+                        continue;
+                    }
+                    let Some(e) = self.entities.get(id) else {
+                        continue;
+                    };
+                    if e.global {
+                        continue;
+                    }
+                    let was = e.pos.dist(&opos) <= orad;
+                    let now = e.pos.dist(&interest.pos) <= interest.radius;
+                    if was != now || e.contained {
+                        v.push(e);
+                    }
                 }
             }
             v
@@ -4132,7 +4238,7 @@ impl WorldView {
                     .iter()
                     .all(|(k, v)| e.components.get(k).is_some_and(|c| &c.value == v));
             if !visible {
-                if fast && interest.known.contains_key(&e.id) {
+                if (fast || moved) && interest.known.contains_key(&e.id) {
                     fast_gone.push(e.id);
                 }
                 continue;
@@ -4220,7 +4326,7 @@ impl WorldView {
                 },
             );
         }
-        let gone: Vec<EntityId> = if fast {
+        let gone: Vec<EntityId> = if fast || moved {
             for id in &fast_gone {
                 interest.known.remove(id);
             }
