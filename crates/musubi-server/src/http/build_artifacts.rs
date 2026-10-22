@@ -277,7 +277,7 @@ async fn read_chunk(s: &AppState, hash: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn add_refs(s: &AppState, m: &Manifest, by: i32) -> Result<()> {
+async fn add_refs<'e>(db: impl sqlx::PgExecutor<'e>, m: &Manifest, by: i32) -> Result<()> {
     let uniq: Vec<String> = m
         .chunks
         .iter()
@@ -288,7 +288,7 @@ async fn add_refs(s: &AppState, m: &Manifest, by: i32) -> Result<()> {
     sqlx::query("update musubi.build_chunks set refs = refs + $2 where hash = any($1)")
         .bind(&uniq)
         .bind(by)
-        .execute(&s.db)
+        .execute(db)
         .await
         .map_err(Error::internal)?;
     Ok(())
@@ -296,13 +296,30 @@ async fn add_refs(s: &AppState, m: &Manifest, by: i32) -> Result<()> {
 
 /// Remove chunks no committed artifact references and no pending upload still needs.
 async fn gc_orphans(s: &AppState) -> Result<(u64, u64)> {
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    let freed = free_orphans(s, &mut tx, None).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(freed)
+}
+
+/// The orphan sweep itself, inside `tx`: orphans (optionally among `only`) are locked while
+/// their blobs go, so two sweeps never free and count the same chunk, and a chunk that is
+/// re-stored meanwhile is not deleted under the new upload (`store_chunk`'s insert waits for
+/// the lock and then inserts afresh). Rows another sweep holds are skipped, not waited for.
+async fn free_orphans(
+    s: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    only: Option<&[String]>,
+) -> Result<(u64, u64)> {
     let rows: Vec<(String, Option<String>, i32)> = sqlx::query_as(
         "select c.hash, c.blob_key, c.size from musubi.build_chunks c
-         where c.refs <= 0 and not exists (
+         where ($1::text[] is null or c.hash = any($1)) and c.refs <= 0 and not exists (
              select 1 from musubi.build_uploads u
-             where u.manifest->'chunks' @> jsonb_build_array(jsonb_build_object('hash', c.hash)))",
+             where u.manifest->'chunks' @> jsonb_build_array(jsonb_build_object('hash', c.hash)))
+         for update skip locked",
     )
-    .fetch_all(&s.db)
+    .bind(only)
+    .fetch_all(&mut **tx)
     .await
     .map_err(Error::internal)?;
     if rows.is_empty() {
@@ -322,7 +339,7 @@ async fn gc_orphans(s: &AppState) -> Result<(u64, u64)> {
     }
     sqlx::query("delete from musubi.build_chunks where hash = any($1)")
         .bind(&hashes)
-        .execute(&s.db)
+        .execute(&mut **tx)
         .await
         .map_err(Error::internal)?;
     Ok((hashes.len() as u64, bytes))
@@ -507,10 +524,14 @@ async fn finalize(
         }
         None => None,
     };
+    // refs, row and the pending upload move in one transaction: between an older version's
+    // decrement and this one's increment, shared chunks would otherwise sit at refs = 0 where
+    // a concurrent sweep could free them from under the version being committed
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
     // an older upload of this exact version gives its chunks back (and its legacy blob)
     if let Ok(old) = load(s, name, version).await {
         if let Some(prev) = load_manifest(s, name, version).await? {
-            add_refs(s, &prev, -1).await?;
+            add_refs(&mut *tx, &prev, -1).await?;
         }
         if let (Some(key), Some(store)) = (&old.6, &s.blobs) {
             let _ = store.delete(key).await;
@@ -539,16 +560,17 @@ async fn finalize(
     .bind(&meta.metadata)
     .bind(&manifest)
     .bind(&delta)
-    .fetch_one(&s.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(Error::internal)?;
-    add_refs(s, m, 1).await?;
+    add_refs(&mut *tx, m, 1).await?;
     sqlx::query("delete from musubi.build_uploads where name = $1 and version = $2")
         .bind(name)
         .bind(version)
-        .execute(&s.db)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     let _ = gc_orphans(s).await;
     s.events
         .emit(
@@ -909,19 +931,38 @@ async fn delete(
         }
         Err(e) => return Err(e.into()),
     };
-    if let Some(m) = load_manifest(&s, &name, &version).await? {
-        add_refs(&s, &m, -1).await?;
-    }
+    let manifest = load_manifest(&s, &name, &version).await?;
     if let (Some(key), Some(store)) = (&r.6, &s.blobs) {
         let _ = store.delete(key).await;
     }
+    // One transaction: the refs this version held, the row, and the chunks only it referenced.
+    // Decrementing on the pool first left the chunks at refs = 0 with the artifact still
+    // listed, and a concurrent sweep (another delete, the periodic gc) freed and counted
+    // them before this one did; inside the transaction they become orphans only at commit.
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    let own: Vec<String> = match &manifest {
+        Some(m) => {
+            add_refs(&mut *tx, m, -1).await?;
+            m.chunks
+                .iter()
+                .map(|c| c.hash.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
+        }
+        None => Vec::new(),
+    };
     sqlx::query("delete from musubi.build_artifacts where name = $1 and version = $2")
         .bind(&name)
         .bind(&version)
-        .execute(&s.db)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
-    let (chunks, bytes) = gc_orphans(&s).await?;
+    let (mut chunks, mut bytes) = free_orphans(&s, &mut tx, Some(&own)).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    let (c, b) = gc_orphans(&s).await?;
+    chunks += c;
+    bytes += b;
     s.events
         .emit(
             "build.artifact_deleted",
