@@ -14,6 +14,11 @@ pub use ghost::{GhostCache, GhostDelta, GhostSendState, GhostUpsert};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+/// Entity-keyed maps use ahash: the per-client scan hashes thousands of ids per tick and
+/// SipHash was ~8% of a loaded node; keys stay random per map, so crafted ids cannot collide.
+pub type IdMap<V> = HashMap<EntityId, V, ahash::RandomState>;
+pub type IdSet = HashSet<EntityId, ahash::RandomState>;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -406,7 +411,7 @@ pub struct SimView {
 
 /// A contained entity shows up for a client that looks inside its container (`inside`) or when
 /// the container itself is open (`container.open == true`).
-fn contents_visible(entities: &HashMap<EntityId, Entity>, e: &Entity, interest: &Interest) -> bool {
+fn contents_visible(entities: &IdMap<Entity>, e: &Entity, interest: &Interest) -> bool {
     let Some(root) = e.attached_to else {
         return true;
     };
@@ -525,7 +530,7 @@ pub struct Interest {
     pos: Pos,
     radius: f64,
     /// entity → last component versions the client received (pos is always sent on move).
-    known: HashMap<EntityId, (Pos, u64)>,
+    known: IdMap<(Pos, u64)>,
     /// Per-tick byte budget override (`None` = world default).
     #[serde(default)]
     budget_bytes: Option<usize>,
@@ -538,7 +543,7 @@ pub struct Interest {
     inside: Option<EntityId>,
     /// entity → tick of the last delta that carried it (priority grows with age).
     #[serde(default)]
-    last_sent: HashMap<EntityId, u64>,
+    last_sent: IdMap<u64>,
     /// Tick of the last full scan, and the view/filter it was made with: while the view is
     /// unchanged and no touched cell changed since, the scan is skipped outright.
     #[serde(default)]
@@ -663,7 +668,7 @@ pub enum MeshError {
 pub struct World {
     pub cfg: WorldConfig,
     pub tick: u64,
-    entities: HashMap<EntityId, Entity>,
+    entities: IdMap<Entity>,
     by_cell: CellIndex,
     /// Cells put to sleep by `hibernate_cell`: not orphans, re-leased only when interest returns.
     hibernated: HashSet<CellId>,
@@ -698,7 +703,7 @@ impl World {
         Self {
             cfg,
             tick: 0,
-            entities: HashMap::new(),
+            entities: IdMap::default(),
             children: HashMap::new(),
             by_cell: CellIndex::default(),
             hibernated: HashSet::new(),
@@ -2229,11 +2234,11 @@ impl World {
             Interest {
                 pos,
                 radius,
-                known: HashMap::new(),
+                known: IdMap::default(),
                 budget_bytes,
                 filter,
                 inside: None,
-                last_sent: HashMap::new(),
+                last_sent: IdMap::default(),
                 last_delta_tick: 0,
                 last_view: None,
                 last_inside: None,
@@ -3956,7 +3961,7 @@ pub struct WorldView {
     /// Always-relevant entities and the cells they sit in (scanned for every interest).
     globals: Vec<(EntityId, CellId)>,
     globals_changed: u64,
-    entities: HashMap<EntityId, Entity>,
+    entities: IdMap<Entity>,
     by_cell: CellIndex,
     cell_scale: HashMap<CellId, f64>,
     split: HashSet<CellId>,
@@ -4044,7 +4049,7 @@ impl WorldView {
             return Some(Delta::default());
         }
         let budget = interest.budget_bytes.unwrap_or(default_budget);
-        let mut seen = HashSet::new();
+        let mut seen = IdSet::with_capacity_and_hasher(64, Default::default());
         struct Cand {
             prio: f64,
             bytes: usize,

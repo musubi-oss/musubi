@@ -3026,6 +3026,7 @@ dependencies = [
 name = "musubi-mesh"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "criterion",
  "rayon",
  "serde",

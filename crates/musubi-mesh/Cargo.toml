@@ -10,6 +10,7 @@ rust-version.workspace = true
 bench = false
 
 [dependencies]
+ahash.workspace = true
 rayon = "1"
 serde.workspace = true
 serde_json.workspace = true
