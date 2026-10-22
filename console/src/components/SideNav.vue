@@ -24,9 +24,9 @@ function target(to: string): string {
 const current = computed(() => { const base = norm(route.path); const tab = route.query.tab; return tab ? `${base}?tab=${tab}` : base })
 function on(e: Entry) {
   const t = target(e.to); const cur = current.value
-  if (t.includes('?')) return cur === t
-  if (cur.startsWith(t + '?')) return !items.value.some((o) => o !== e && target(o.to) === cur)
-  return cur === t || (cur.startsWith(t + '/') && !items.value.some((o) => o !== e && cur.startsWith(target(o.to) + '/')))
+  if (cur === t) return true
+  if (t.includes('?') || !(cur.startsWith(t + '/') || cur.startsWith(t + '?'))) return false
+  return !items.value.some((o) => { if (o === e) return false; const ot = target(o.to); return ot.length > t.length && (cur === ot || cur.startsWith(ot + '/') || cur.startsWith(ot + '?')) })
 }
 const long = computed(() => (catalog[props.section]?.length ?? 0) + (props.extra?.length ?? 0) > 12)
 </script>

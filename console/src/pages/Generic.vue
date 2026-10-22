@@ -15,7 +15,7 @@ const router = useRouter(); const route = useRoute()
 const pending = ref<{ act: Act; row: any; text: string } | null>(null)
 const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const busy = ref(false)
 const q = ref(String(route.query.q ?? '')); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
-const open = ref<any>(null); const edit = ref(''); const creating = ref(false); const text = ref('')
+const open = ref<any>(null); const edit = ref(''); const raw = ref(false); const creating = ref(false); const text = ref('')
 const cols = computed<Col[]>(() => {
   const keys = props.res.cols ?? (rows.value[0] ? Object.keys(rows.value[0]).slice(0, 7) : ['id'])
   return keys.map((k) => ({ key: k, label: k.replace(/_/g, ' '), mono: /(^|_)(id|sha256|hash|address|code)$/.test(k) }))
@@ -81,6 +81,13 @@ async function run(act: Act, row: any) {
     toast.show(act.label + ': ok'); pending.value = null; open.value = null; load()
   } catch (e: any) { toast.err(e) }
 }
+function fmtVal(k: string, v: any) {
+  if (v === null || v === undefined || v === '') return '—'
+  if (typeof v === 'boolean') return v ? 'yes' : 'no'
+  if (typeof v === 'number' && /(_at|At|_until|_ts|_since)$/.test(k) && v > 1e9) return new Date(v * (v < 1e12 ? 1000 : 1)).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
+  return String(v)
+}
+function copyJson(v: any) { navigator.clipboard?.writeText(JSON.stringify(v, null, 2)); toast.show('copied') }
 function visible(acts: Act[] | undefined, row: any) { return (acts ?? []).filter((a) => !a.when || a.when(row)) }
 onMounted(() => { if (props.res.custom !== 'zanshin') load() })
 </script>
@@ -125,7 +132,13 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
     <div v-else-if="!err && !busy" class="empty">No Data</div>
   </div>
   <Drawer v-if="open" :title="res.title.replace(/s$/, '') + (open?.[res.key ?? 'id'] ? ' · ' + open[res.key ?? 'id'] : '')" wide @close="open = null">
-    <template v-if="!res.item"><JsonView :value="open" />
+    <template v-if="!res.item">
+      <div class="tools" style="margin-bottom:10px"><span class="n">{{ Object.keys(open).length }} fields</span><button class="btn s" style="margin-left:auto" @click="raw = !raw">{{ raw ? 'Fields' : 'Raw JSON' }}</button><button class="btn s" @click="copyJson(open)">Copy JSON</button></div>
+      <JsonView v-if="raw" :value="open" />
+      <div v-else class="grid" style="grid-template-columns:repeat(2,1fr)">
+        <div v-for="(v, k) in open" :key="String(k)" style="border:0;margin:0"><Kv :k="String(k).replace(/_/g, ' ')" :v="typeof v === 'object' && v !== null ? undefined : fmtVal(String(k), v)" :mono="typeof v === 'string'" :copy="typeof v === 'string' && v.length > 6">
+          <JsonView v-if="typeof v === 'object' && v !== null" :value="v" /><template v-else>{{ fmtVal(String(k), v) }}</template></Kv></div>
+      </div>
       <div class="form" v-if="res.actions?.length"><div class="row"><button v-for="a in visible(res.actions, open)" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, open)">{{ a.label }}</button></div></div></template>
     <template v-else>
       <textarea class="in" v-model="edit" style="min-height:360px"></textarea>

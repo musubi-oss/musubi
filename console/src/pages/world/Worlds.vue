@@ -38,7 +38,7 @@ const pg1 = usePager(() => shown)
     <p class="dim" v-if="disabled">Worlds are switched off on this cluster. Set <code>[worlds] enabled = true</code> and give at least one node the <code>sim</code> role to use persistent worlds.</p>
     <template v-else>
       <div class="tools"><input class="in" v-model="q" placeholder="filter by name" /><button class="btn" @click="load">Refresh</button><button class="btn p" style="margin-left:auto" @click="creating = true">Create world</button></div>
-      <table><thead><tr><th>Name</th><th style="width:220px">Home node</th><th style="width:120px">Here</th><th style="width:170px">Created</th><th style="width:80px"></th></tr></thead><tbody>
+      <table><thead><tr><th class="sortable" @click="pg1.sort('name')">Name{{ pg1.arrow('name') }}</th><th class="sortable" style="width:220px" @click="pg1.sort('node_id')">Home node{{ pg1.arrow('node_id') }}</th><th class="sortable" style="width:120px" @click="pg1.sort('local')">Here{{ pg1.arrow('local') }}</th><th class="sortable" style="width:170px" @click="pg1.sort('created_at')">Created{{ pg1.arrow('created_at') }}</th><th style="width:80px"></th></tr></thead><tbody>
         <tr v-for="r in pg1.rows" :key="r.name" class="row" @click="router.push(`/world/worlds/${r.name}`)">
           <td class="m">{{ r.name }}</td><td class="dim">{{ nodes[r.node_id] ?? r.node_id ?? 'pending adoption' }}</td><td :class="r.local ? 'ok' : 'dim'">{{ r.local ? 'homed here' : 'remote' }}</td><td class="dim">{{ ts(r.created_at) }}</td>
           <td @click.stop><button class="btn s d" @click="del(r.name)">Delete</button></td>
