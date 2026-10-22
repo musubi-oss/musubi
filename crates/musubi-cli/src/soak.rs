@@ -1381,7 +1381,7 @@ async fn mesh_streamer(
         };
         let ws_base = base.replacen("http", "ws", 1);
         let Ok(mut req) = format!(
-            "{ws_base}/v1/server/worlds/{}/stream?sim={}",
+            "{ws_base}/v1/server/worlds/{}/stream?sim={}&delta=1",
             mw.name, mw.sim_a
         )
         .into_client_request() else {

@@ -21936,3 +21936,102 @@ async fn cross_border_contact_chain_gathers_in_one_cell() {
         "C did not join: {vc} vs {va} ({joined})"
     );
 }
+
+#[tokio::test]
+async fn sim_sdk_stream_mode_hands_an_entity_over() {
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let world = format!("sdk{}", uuid::Uuid::now_v7().simple());
+    let client = musubi_sim_sdk::WorldClient::new(&base, "defaultkey", &world);
+    client
+        .create_world(json!({"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 5.0, "handover_timeout_ticks": 60, "lease_ttl_ticks": 600}), json!({}))
+        .await
+        .unwrap();
+    let (s1, s2) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    client.register(s1, 1).await.unwrap();
+    client.register(s2, 1).await.unwrap();
+    client
+        .lease(
+            s1,
+            &[musubi_mesh::CellId {
+                x: 0,
+                y: 0,
+                level: 0,
+                z: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    client
+        .lease(
+            s2,
+            &[musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+                z: 0,
+            }],
+        )
+        .await
+        .unwrap();
+    let e = client
+        .spawn(s1, 50.0, 50.0, json!({"kind": "car"}), false)
+        .await
+        .unwrap();
+    let (tx1, rx1) = tokio::sync::oneshot::channel::<()>();
+    let (tx2, rx2) = tokio::sync::oneshot::channel::<()>();
+    let cfg = || musubi_sim_sdk::SimConfig {
+        capacity: 1,
+        hz: 30,
+        renew_every: 5,
+    };
+    let c1 = client.clone();
+    let c2 = client.clone();
+    let h1 = tokio::spawn(async move {
+        musubi_sim_sdk::run_sim_stream(c1, s1, cfg(), Mover, async {
+            let _ = rx1.await;
+        })
+        .await
+    });
+    let h2 = tokio::spawn(async move {
+        musubi_sim_sdk::run_sim_stream(c2, s2, cfg(), Mover, async {
+            let _ = rx2.await;
+        })
+        .await
+    });
+    // the car drives from x=50 into cell (1,0); s2 must end up owning and moving it
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut handed_over = false;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let v = client
+            .view(musubi_mesh::CellId {
+                x: 1,
+                y: 0,
+                level: 0,
+                z: 0,
+            })
+            .await
+            .unwrap();
+        if let Some(car) = v.owned.iter().find(|c| c.id == e.id) {
+            if car.x > 130.0 {
+                handed_over = true;
+                break;
+            }
+        }
+    }
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    h1.await.unwrap().unwrap();
+    h2.await.unwrap().unwrap();
+    assert!(
+        handed_over,
+        "entity never continued moving under s2: {:?}",
+        client.info().await.unwrap()
+    );
+}

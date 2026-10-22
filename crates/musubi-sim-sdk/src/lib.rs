@@ -19,6 +19,8 @@ pub enum SdkError {
     Http(#[from] reqwest::Error),
     #[error("server {status}: {body}")]
     Server { status: u16, body: String },
+    #[error("protocol: {0}")]
+    Protocol(String),
 }
 
 pub type Result<T> = std::result::Result<T, SdkError>;
@@ -360,4 +362,204 @@ pub async fn run_sim<S: Simulator, F: std::future::Future<Output = ()>>(
     }
     let _ = client.unregister(sim).await;
     Ok(())
+}
+
+/// Streaming variant of [`run_sim`]: one WebSocket (`stream?sim=&delta=1`) carries leases,
+/// per-tick delta frames, events and commands, and the SDK keeps each leased cell's [`View`]
+/// itself (first frame of a cell is full, later frames carry only changed `owned`/`ghosts`
+/// and departed ids in `gone`). `logic.tick` runs once per received frame per owned cell, so
+/// the cadence is the world's tick rate; `cfg.hz`/`cfg.renew_every` are not used (the stream
+/// renews the lease on every frame). Disconnects reconnect after 300 ms with the local view
+/// dropped — the server sends full frames again on a fresh stream.
+pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
+    client: WorldClient,
+    sim: Uuid,
+    cfg: SimConfig,
+    mut logic: S,
+    stop: F,
+) -> Result<()> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    client.register(sim, cfg.capacity).await?;
+    tokio::pin!(stop);
+    let ws_base = client.base.replacen("http", "ws", 1);
+    let url = format!(
+        "{ws_base}/v1/server/worlds/{}/stream?sim={sim}&delta=1",
+        client.world
+    );
+    let mut views: HashMap<CellId, View> = HashMap::new();
+    'conn: loop {
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| SdkError::Protocol(e.to_string()))?;
+        req.headers_mut().insert(
+            "x-musubi-server-key",
+            client
+                .key
+                .parse()
+                .map_err(|_| SdkError::Protocol("invalid server key header".into()))?,
+        );
+        let ws = tokio::select! {
+            _ = &mut stop => break 'conn,
+            r = tokio_tungstenite::connect_async(req) => r,
+        };
+        let (mut tx, mut rx) = match ws {
+            Ok((ws, _)) => ws.split(),
+            Err(e) => {
+                tracing::warn!(error = %e, "sim stream connect failed");
+                tokio::select! {
+                    _ = &mut stop => break 'conn,
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => continue 'conn,
+                }
+            }
+        };
+        for c in views.keys() {
+            logic.on_cell_revoked(*c);
+        }
+        views.clear();
+        let mut pending_acks: std::collections::VecDeque<String> = Default::default();
+        loop {
+            let msg = tokio::select! {
+                _ = &mut stop => break 'conn,
+                m = rx.next() => m,
+            };
+            let text = match msg {
+                Some(Ok(Message::Text(t))) => t,
+                Some(Ok(Message::Binary(b))) => match String::from_utf8(b) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => continue,
+            };
+            let v: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v["type"] == "tick" {
+                let mut seen: Vec<CellId> = Vec::new();
+                for cv in v["cells"].as_array().cloned().unwrap_or_default() {
+                    let Ok(c) = serde_json::from_value::<CellId>(cv["cell"].clone()) else {
+                        continue;
+                    };
+                    seen.push(c);
+                    let fresh = !views.contains_key(&c);
+                    let view = views.entry(c).or_insert_with(|| View {
+                        tick: 0,
+                        owner: None,
+                        owned: Vec::new(),
+                        ghosts: Vec::new(),
+                    });
+                    apply_delta(view, &cv);
+                    if fresh {
+                        logic.on_cell_assigned(c);
+                    }
+                }
+                let gone: Vec<CellId> = views
+                    .keys()
+                    .filter(|c| !seen.contains(c))
+                    .copied()
+                    .collect();
+                for c in gone {
+                    views.remove(&c);
+                    logic.on_cell_revoked(c);
+                }
+                for ev in v["events"].as_array().cloned().unwrap_or_default() {
+                    match ev["type"].as_str().unwrap_or("") {
+                        "handover_request" => {
+                            let Ok(e) = serde_json::from_value::<WorldEntity>(ev["state"].clone())
+                            else {
+                                continue;
+                            };
+                            if logic.on_handover_request(&e) {
+                                let id = e.id.to_string();
+                                let cmd = json!({"op": "handover_ack", "entity": id});
+                                if tx.send(Message::Text(cmd.to_string())).await.is_err() {
+                                    break;
+                                }
+                                pending_acks.push_back(id);
+                            }
+                        }
+                        "input" => {
+                            if let Some(id) = ev["entity"].as_str() {
+                                logic.on_input(id, &ev["input"]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut updates: HashMap<String, Update> = HashMap::new();
+                for (c, view) in views.iter() {
+                    if view.owner != Some(sim) {
+                        continue;
+                    }
+                    for u in logic.tick(*c, view) {
+                        updates.insert(u.entity.clone(), u);
+                    }
+                }
+                for u in updates.values() {
+                    let mut cmd =
+                        json!({"op": "apply", "entity": u.entity, "components": u.components});
+                    if let Some((x, y)) = u.pos {
+                        cmd["x"] = json!(x);
+                        cmd["y"] = json!(y);
+                    }
+                    if tx.send(Message::Text(cmd.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+            } else if v["op"] == "handover_ack" {
+                let id = pending_acks.pop_front();
+                if let (Some(id), Some(inputs)) = (id, v["result"]["buffered_inputs"].as_array()) {
+                    for i in inputs {
+                        logic.on_input(&id, &i["input"]);
+                    }
+                }
+            } else if v["op"] == "apply" && !v["error"].is_null() {
+                tracing::debug!(error = %v["error"], "apply rejected (handover in flight?)");
+            }
+        }
+        tokio::select! {
+            _ = &mut stop => break 'conn,
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+    }
+    let _ = client.unregister(sim).await;
+    Ok(())
+}
+
+/// Folds one cell frame (full or delta) into a locally kept [`View`].
+fn apply_delta(view: &mut View, cv: &Value) {
+    if cv["full"].as_bool().unwrap_or(false) {
+        view.owned.clear();
+        view.ghosts.clear();
+    }
+    if let Some(t) = cv["tick"].as_u64() {
+        view.tick = t;
+    }
+    view.owner = cv["owner"].as_str().and_then(|s| s.parse().ok());
+    let owned: Vec<WorldEntity> = serde_json::from_value(cv["owned"].clone()).unwrap_or_default();
+    let ghosts: Vec<WorldEntity> = serde_json::from_value(cv["ghosts"].clone()).unwrap_or_default();
+    let gone: Vec<Uuid> = serde_json::from_value(cv["gone"].clone()).unwrap_or_default();
+    for e in owned {
+        view.ghosts.retain(|g| g.id != e.id);
+        match view.owned.iter_mut().find(|o| o.id == e.id) {
+            Some(o) => *o = e,
+            None => view.owned.push(e),
+        }
+    }
+    for e in ghosts {
+        view.owned.retain(|o| o.id != e.id);
+        match view.ghosts.iter_mut().find(|g| g.id == e.id) {
+            Some(g) => *g = e,
+            None => view.ghosts.push(e),
+        }
+    }
+    if !gone.is_empty() {
+        view.owned.retain(|o| !gone.contains(&o.id));
+        view.ghosts.retain(|g| !gone.contains(&g.id));
+    }
 }
