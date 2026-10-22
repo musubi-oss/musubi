@@ -1015,7 +1015,13 @@ impl WorldRegistry {
             tracing::debug!(world = name, %id, %node, "release: entity shipped");
             let inputs = st.world.take_buffered_inputs(id);
             st.world.forget_for_clients(id);
-            st.world.despawn(id);
+            // Keep our copy in transit: the new host's ack despawns it and the tick re-ships
+            // it on timeout, so a shipment the receiver drops is not lost.
+            if st.world.begin_remote_handover(id, node) {
+                st.remote_transit.insert(id, (node, 1, cell));
+            } else {
+                st.world.despawn(id);
+            }
             e.transit = None;
             fanout.world_handover(name, e, self.node_id, inputs, true, None);
         }
@@ -1039,7 +1045,9 @@ impl WorldRegistry {
     pub fn drop_idle_shard(&self, name: &str) -> bool {
         let idle = match self.worlds.get(name) {
             Some(w) => {
-                w.lock().hosted_only
+                let st = w.lock();
+                st.hosted_only
+                    && st.remote_transit.is_empty()
                     && !self
                         .cell_hosts
                         .iter()
