@@ -47798,8 +47798,24 @@ async fn build_artifacts_delta_uploads_chunks_manifest_and_gc() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let g: Value = serde_json::from_slice(&b).unwrap();
-    assert_eq!(g["chunks_freed"], 0, "pending upload keeps its chunk: {g}");
+    // The sweep may free expired uploads of other test binaries (or earlier runs); what matters
+    // is that our pending upload's chunk survived: re-opening it must report nothing missing.
+    let _g: Value = serde_json::from_slice(&b).unwrap();
+    let (st, _, b) = raw(
+        "POST",
+        format!("/v1/server/builds/{name}/2.0.0/upload"),
+        keyed("application/json"),
+        serde_json::to_vec(&json!({"manifest": m3})).unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let reopened: Value = serde_json::from_slice(&b).unwrap();
+    let still_missing = reopened["missing"].as_array().unwrap();
+    assert!(
+        !still_missing.iter().any(|c| c["hash"] == h3),
+        "pending upload keeps its chunk: {reopened}"
+    );
+    assert_eq!(still_missing.len() + 1, m3.chunks.len(), "{reopened}");
     let (st, _, b) = raw(
         "DELETE",
         format!("/v1/server/builds/{name}/2.0.0"),
@@ -47858,10 +47874,22 @@ async fn build_artifacts_delta_uploads_chunks_manifest_and_gc() {
     assert_eq!(st, StatusCode::OK);
     let del: Value = serde_json::from_slice(&b).unwrap();
     assert_eq!(del["removed"], true);
-    // delete also sweeps orphans left by parallel test binaries, so at least ours are freed
+    // Freed = chunks only 1.0.0 referenced, i.e. the ones the patch replaced — not the ones
+    // 1.0.1 added (content-defined chunking may replace two chunks with three). The delete
+    // also sweeps orphans left by parallel test binaries, so at least ours are freed.
+    let kept: std::collections::HashSet<&str> = m2.chunks.iter().map(|c| c.hash.as_str()).collect();
+    let replaced: std::collections::HashSet<&str> = m1
+        .chunks
+        .iter()
+        .map(|c| c.hash.as_str())
+        .filter(|h| !kept.contains(h))
+        .collect();
+    assert!(!replaced.is_empty(), "patch touched no chunk");
     assert!(
-        del["chunks_freed"].as_u64().unwrap() as usize >= missing.len(),
-        "{del}"
+        del["chunks_freed"].as_u64().unwrap() as usize >= replaced.len(),
+        "freed {} < replaced {}: {del}",
+        del["chunks_freed"],
+        replaced.len()
     );
     let (st, _, b) = raw(
         "GET",
