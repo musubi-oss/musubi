@@ -31,6 +31,10 @@ const PEER_REFRESH_TICKS: u64 = 30;
 /// Postgres-bus mode: how often `musubi.world_cell_hosts` is re-read against the cache.
 const CELL_HOST_RECONCILE_TICKS: u64 = 90;
 pub const MAX_SIM_EVENTS: usize = 4096;
+
+/// What a simulator stream in delta mode was last sent for one cell: entity → (rev,
+/// changed_tick, is_ghost).
+pub type SimKnown = HashMap<EntityId, (u64, u64, bool)>;
 /// Persistent entities are snapshotted this often (ticks); 30 Hz → every 5 s.
 const SNAPSHOT_EVERY: u64 = 150;
 /// Controller pass every N ticks (1 s at 30 Hz).
@@ -3491,10 +3495,74 @@ impl WorldRegistry {
     pub fn view(&self, name: &str, cell: CellId) -> Result<Value> {
         let w = self.get(name)?;
         let st = w.lock();
+        let v = self.cell_view(&st, name, cell)?;
+        Ok(json!({
+            "tick": st.world.tick,
+            "owner": st.world.owner(cell),
+            "owned": v.owned.iter().map(to_wire).collect::<Vec<_>>(),
+            "ghosts": v.ghosts.iter().map(to_wire).collect::<Vec<_>>(),
+            "globals": st.world.globals(),
+        }))
+    }
+
+    /// `view` as a delta against what this simulator stream was last sent for the cell:
+    /// `owned`/`ghosts` carry only entities that changed (or moved between the two lists) since,
+    /// `gone` the ids that left the view, `full: true` when nothing was known (first frame of a
+    /// cell). A full frame of a 500-entity cell is ~100 KB of JSON thirty times a second per
+    /// simulator; the stand's bots spent 70 % of a core parsing it.
+    pub fn view_delta(&self, name: &str, cell: CellId, known: &mut SimKnown) -> Result<Value> {
+        let w = self.get(name)?;
+        let st = w.lock();
+        let v = self.cell_view(&st, name, cell)?;
+        let full = known.is_empty();
+        let mut seen: std::collections::HashSet<EntityId> =
+            std::collections::HashSet::with_capacity(v.owned.len() + v.ghosts.len());
+        let mut changed = |e: &Entity, ghost: bool| -> bool {
+            seen.insert(e.id);
+            let now = (e.rev, e.changed_tick, ghost);
+            known.insert(e.id, now) != Some(now)
+        };
+        let owned: Vec<WorldEntity> = v
+            .owned
+            .iter()
+            .filter(|e| changed(e, false))
+            .map(to_wire)
+            .collect();
+        let ghosts: Vec<WorldEntity> = v
+            .ghosts
+            .iter()
+            .filter(|e| changed(e, true))
+            .map(to_wire)
+            .collect();
+        let mut gone: Vec<EntityId> = Vec::new();
+        known.retain(|id, _| {
+            let keep = seen.contains(id);
+            if !keep {
+                gone.push(*id);
+            }
+            keep
+        });
+        gone.sort();
+        metrics::counter!("musubi_world_sim_frame_entities_total", "mode" => "delta")
+            .increment((owned.len() + ghosts.len()) as u64);
+        metrics::counter!("musubi_world_sim_frame_entities_total", "mode" => "full")
+            .increment((v.owned.len() + v.ghosts.len()) as u64);
+        Ok(json!({
+            "tick": st.world.tick,
+            "owner": st.world.owner(cell),
+            "full": full,
+            "owned": owned,
+            "ghosts": ghosts,
+            "gone": gone,
+            "globals": st.world.globals(),
+        }))
+    }
+
+    fn cell_view(&self, st: &WorldState, name: &str, cell: CellId) -> Result<musubi_mesh::SimView> {
         // only the cell's host has its authoritative state; a node that merely knows the world
         // (home of a hosted-only world, a node that lost the cell) must not answer with an empty
         // or stale view as if it were the truth
-        if !self.hosts_cell(&st, name, cell) {
+        if !self.hosts_cell(st, name, cell) {
             let host = self
                 .cell_hosts
                 .get(&(name.to_string(), cell))
@@ -3520,13 +3588,7 @@ impl WorldRegistry {
             }
         }
         v.ghosts.sort_by_key(|e| e.id);
-        Ok(json!({
-            "tick": st.world.tick,
-            "owner": st.world.owner(cell),
-            "owned": v.owned.iter().map(to_wire).collect::<Vec<_>>(),
-            "ghosts": v.ghosts.iter().map(to_wire).collect::<Vec<_>>(),
-            "globals": st.world.globals(),
-        }))
+        Ok(v)
     }
 
     /// Ghosts from another node: border entities of `cell`, which lives there, not here.

@@ -582,6 +582,7 @@ async fn host_stream(
         ))
     };
     let mut frame_no = 0u64;
+    let mut owned: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut pending_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut first = true;
     while !past(&deadline) {
@@ -594,9 +595,11 @@ async fn host_stream(
         if mine.is_empty() {
             return;
         }
-        let Ok(mut req) = format!("{ws_base}/v1/server/worlds/{}/stream?sim={sim}", arena.name)
-            .into_client_request()
-        else {
+        let Ok(mut req) = format!(
+            "{ws_base}/v1/server/worlds/{}/stream?sim={sim}&delta=1",
+            arena.name
+        )
+        .into_client_request() else {
             return;
         };
         req.headers_mut()
@@ -694,9 +697,35 @@ async fn host_stream(
                         _ => {}
                     }
                 }
-                let mut i = 0u64;
+                // delta frames: keep the owned entities of every cell up to date and walk the map
+                let mut live: Vec<String> = Vec::new();
                 for c in v["cells"].as_array().into_iter().flatten() {
+                    let key = c["cell"].to_string();
+                    live.push(key.clone());
+                    let m = owned.entry(key).or_default();
+                    if c["full"] == true {
+                        m.clear();
+                    }
                     for e in c["owned"].as_array().into_iter().flatten() {
+                        if let Some(id) = e["id"].as_str() {
+                            m.insert(id.to_string(), e.clone());
+                        }
+                    }
+                    for e in c["ghosts"].as_array().into_iter().flatten() {
+                        if let Some(id) = e["id"].as_str() {
+                            m.remove(id);
+                        }
+                    }
+                    for id in c["gone"].as_array().into_iter().flatten() {
+                        if let Some(id) = id.as_str() {
+                            m.remove(id);
+                        }
+                    }
+                }
+                owned.retain(|c, _| live.contains(c));
+                let mut i = 0u64;
+                for m in owned.values() {
+                    for e in m.values() {
                         i += 1;
                         if (i + frame_no) % 30 != 0 {
                             continue;

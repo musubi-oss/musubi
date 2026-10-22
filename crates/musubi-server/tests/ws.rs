@@ -21647,3 +21647,151 @@ async fn world_cells_offload_automatically() {
     .await;
     assert_eq!(st, 200, "{view}");
 }
+
+/// `stream?delta=1`: the first frame of a cell is full, later frames carry only what changed
+/// since the simulator's previous frame, and an entity that leaves the view is named in `gone`.
+#[tokio::test]
+async fn simulator_stream_delta_frames_carry_only_changes() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let req = Request::post("/v1/server/worlds")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::from(
+            json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 2.0}})
+                .to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let sim = uuid::Uuid::now_v7();
+    let mut creq = format!("ws://{addr}/v1/server/worlds/{world}/stream?sim={sim}&delta=1")
+        .into_client_request()
+        .unwrap();
+    creq.headers_mut()
+        .insert("x-musubi-server-key", "defaultkey".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(creq).await.unwrap();
+    async fn next(ws: &mut Ws) -> Value {
+        loop {
+            if let Message::Text(t) = ws.next().await.unwrap().unwrap() {
+                return serde_json::from_str(&t).unwrap();
+            }
+        }
+    }
+    async fn reply(ws: &mut Ws, op: &str) -> Value {
+        let t0 = std::time::Instant::now();
+        loop {
+            let v = next(ws).await;
+            if v["op"] == op {
+                return v;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "no `{op}` reply: {v}"
+            );
+        }
+    }
+    /// The next tick frame's view of cell (0, 0).
+    async fn cell(ws: &mut Ws) -> Value {
+        let t0 = std::time::Instant::now();
+        loop {
+            let v = next(ws).await;
+            if v["type"] == "tick" {
+                if let Some(c) = v["cells"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|c| c["cell"] == json!({"x": 0, "y": 0})))
+                {
+                    return c.clone();
+                }
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "no frame for the cell: {v}"
+            );
+        }
+    }
+    ws.send(Message::Text(
+        json!({"op": "lease", "id": 1, "cells": [{"x": 0, "y": 0}]}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let r = reply(&mut ws, "lease").await;
+    assert_eq!(r["cells"].as_array().unwrap().len(), 1, "{r}");
+    for (i, x) in [20.0, 50.0].iter().enumerate() {
+        ws.send(Message::Text(
+            json!({"op": "spawn", "id": 10 + i, "x": x, "y": 50.0, "components": {"hp": 7}})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        reply(&mut ws, "spawn").await;
+    }
+    // the first frame that shows the cell is full and carries both entities
+    let t0 = std::time::Instant::now();
+    let ids: Vec<String> = loop {
+        let c = cell(&mut ws).await;
+        let owned = c["owned"].as_array().cloned().unwrap_or_default();
+        if owned.len() == 2 {
+            assert_eq!(c["full"], true, "{c}");
+            assert_eq!(c["gone"], json!([]), "{c}");
+            break owned
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect();
+        }
+        assert!(
+            owned.is_empty() || c["full"] == true,
+            "a partial first view: {c}"
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{c}");
+    };
+    // a quiet tick sends nothing for the cell
+    let c = cell(&mut ws).await;
+    assert_eq!(c["full"], false, "{c}");
+    assert_eq!(c["owned"], json!([]), "{c}");
+    assert_eq!(c["gone"], json!([]), "{c}");
+    // moving one entity: only that one is in the next frame
+    ws.send(Message::Text(
+        json!({"op": "apply", "id": 20, "entity": ids[0], "x": 25.0, "y": 50.0, "components": {}})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    reply(&mut ws, "apply").await;
+    let t0 = std::time::Instant::now();
+    loop {
+        let c = cell(&mut ws).await;
+        let owned = c["owned"].as_array().cloned().unwrap_or_default();
+        if !owned.is_empty() {
+            assert_eq!(owned.len(), 1, "{c}");
+            assert_eq!(owned[0]["id"], ids[0], "{c}");
+            assert_eq!(owned[0]["x"].as_f64(), Some(25.0), "{c}");
+            assert_eq!(c["full"], false, "{c}");
+            break;
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{c}");
+    }
+    // despawning the other: it is named in `gone`
+    ws.send(Message::Text(
+        json!({"op": "despawn", "id": 30, "entity": ids[1]}).to_string(),
+    ))
+    .await
+    .unwrap();
+    reply(&mut ws, "despawn").await;
+    let t0 = std::time::Instant::now();
+    loop {
+        let c = cell(&mut ws).await;
+        let gone = c["gone"].as_array().cloned().unwrap_or_default();
+        if !gone.is_empty() {
+            assert_eq!(gone, vec![json!(ids[1])], "{c}");
+            assert_eq!(c["owned"], json!([]), "{c}");
+            break;
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{c}");
+    }
+}

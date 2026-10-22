@@ -5,6 +5,8 @@
 // Handlers return a ready `Response` (redirect) on the error path; axum's Response is large.
 #![allow(clippy::result_large_err)]
 
+use std::collections::HashMap;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -217,6 +219,16 @@ struct SimQuery {
     /// Last world tick the simulator has fully processed (drives time dilation).
     #[serde(default)]
     tick: Option<u64>,
+    /// Stream only: frames carry what changed since the simulator's previous frame instead of
+    /// every entity of every leased cell (`delta=1`).
+    #[serde(default)]
+    delta: Option<String>,
+}
+
+impl SimQuery {
+    fn delta(&self) -> bool {
+        matches!(self.delta.as_deref(), Some("1" | "true"))
+    }
 }
 
 #[derive(Deserialize)]
@@ -877,7 +889,9 @@ async fn rewind(
 /// events. Commands go the other way as JSON objects with an `op` (`lease`, `spawn`, `despawn`,
 /// `apply`, `interact`, `handover_ack`) and the same fields as the matching HTTP body (minus `sim`); the reply
 /// echoes `op` and an optional `id`. A cell hosted by another node answers `lease`/`spawn` with
-/// `redirect` (that node's URL) exactly like the HTTP endpoints.
+/// `redirect` (that node's URL) exactly like the HTTP endpoints. With `delta=1` each cell's
+/// view is a delta against the simulator's previous frame (`view_delta`): changed entities in
+/// `owned`/`ghosts`, departed ids in `gone`, `full: true` on the first frame of a cell.
 async fn stream(
     State(s): State<AppState>,
     uri: OriginalUri,
@@ -887,11 +901,22 @@ async fn stream(
     ws: WebSocketUpgrade,
 ) -> Result<Response, Response> {
     ensure_shard(&s, &w, &uri).await?;
-    Ok(ws.on_upgrade(move |socket| serve_stream(s, w, q.sim, uri, socket)))
+    Ok(ws.on_upgrade(move |socket| serve_stream(s, w, q.sim, q.delta(), uri, socket)))
 }
 
-async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, socket: WebSocket) {
+async fn serve_stream(
+    s: AppState,
+    w: String,
+    sim: Uuid,
+    delta: bool,
+    uri: OriginalUri,
+    socket: WebSocket,
+) {
     use futures::{SinkExt, StreamExt};
+    // `delta=1`: per leased cell, what the simulator was last sent (see `view_delta`); a cell
+    // the simulator no longer leases is forgotten, so re-leasing it starts with a full view
+    let mut known: Option<HashMap<CellId, crate::realtime::world::SimKnown>> =
+        delta.then(HashMap::new);
     // Frames leave through a bounded channel on their own task, so writing to a slow simulator
     // never stops this loop from reading what the simulator sends: a handover ack used to wait
     // behind the full-state frame being written (the stand's simulators took 18.7 of 30 frames
@@ -920,7 +945,7 @@ async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, socke
                     metrics::counter!("musubi_world_sim_frames_skipped_total").increment(1);
                     continue;
                 };
-                let frame = match tick_frame(&s, &w, sim, t) {
+                let frame = match tick_frame(&s, &w, sim, t, known.as_mut()) {
                     Ok(f) => f,
                     Err(e) => json!({ "type": "error", "tick": t, "error": e.to_string() }),
                 };
@@ -944,11 +969,23 @@ async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, socke
     writer.abort();
 }
 
-fn tick_frame(s: &AppState, w: &str, sim: Uuid, tick: u64) -> Result<Value, Error> {
+fn tick_frame(
+    s: &AppState,
+    w: &str,
+    sim: Uuid,
+    tick: u64,
+    mut known: Option<&mut HashMap<CellId, crate::realtime::world::SimKnown>>,
+) -> Result<Value, Error> {
     let cells = s.worlds.renew(w, sim)?;
+    if let Some(k) = known.as_deref_mut() {
+        k.retain(|c, _| cells.contains(c));
+    }
     let mut views = Vec::with_capacity(cells.len());
     for c in &cells {
-        let mut v = s.worlds.view(w, *c)?;
+        let mut v = match known.as_deref_mut() {
+            Some(k) => s.worlds.view_delta(w, *c, k.entry(*c).or_default())?,
+            None => s.worlds.view(w, *c)?,
+        };
         if let Some(o) = v.as_object_mut() {
             o.insert("cell".into(), json!(c));
             let scale = s.worlds.time_scale(w, *c)?;
