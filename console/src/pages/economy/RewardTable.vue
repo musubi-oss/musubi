@@ -68,5 +68,4 @@ async function save() {
     <div class="f"><label>Account id</label><input class="in m" v-model="form.account_id" /></div><div class="f"><label>Reason (ledger)</label><input class="in" v-model="form.reason" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.account_id" @click="act(() => post('/v1/server/rewards/grant', { account_id: form.account_id, table_id: id, reason: form.reason }), 'granted')">Grant</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

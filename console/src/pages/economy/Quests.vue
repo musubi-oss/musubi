@@ -1,11 +1,12 @@
 <script setup lang="ts">
+import { useRoute } from 'vue-router'
 import { ref, computed, onMounted } from 'vue'
 import { api, get, post, put } from '../../api/client'
 import Drawer from '../../components/Drawer.vue'
 import JsonView from '../../components/JsonView.vue'
 import { toast } from '../../stores/toast'
 const ask = (m: string) => window.confirm(m)
-const tab = ref<'quests' | 'pools'>('quests'); const quests = ref<any[]>([]); const pools = ref<any[]>([]); const tables = ref<any[]>([]); const err = ref(''); const q = ref(''); const dlg = ref(''); const x = ref<any>(null); const isNew = ref(false); const ev = ref({ account_id: '', event: '', amount: 1 }); const preview = ref<any>(null); const acc = ref('')
+const tab = ref<'quests' | 'pools'>((['quests', 'pools'] as const).find((k) => k === useRoute().query.tab) ?? 'quests'); const quests = ref<any[]>([]); const pools = ref<any[]>([]); const tables = ref<any[]>([]); const err = ref(''); const q = ref(''); const dlg = ref(''); const x = ref<any>(null); const isNew = ref(false); const ev = ref({ account_id: '', event: '', amount: 1 }); const preview = ref<any>(null); const acc = ref('')
 async function load() { err.value = ''; const r = await Promise.allSettled([get('/v1/server/quests'), get('/v1/server/quests/pools'), get('/v1/server/reward_tables')]); quests.value = r[0].status === 'fulfilled' ? r[0].value.quests ?? [] : (err.value = (r[0] as any).reason.message, []); pools.value = r[1].status === 'fulfilled' ? r[1].value.pools ?? [] : []; tables.value = r[2].status === 'fulfilled' ? r[2].value.tables ?? r[2].value.reward_tables ?? [] : [] }
 onMounted(load)
 const vq = computed(() => quests.value.filter((a) => !q.value || JSON.stringify(a).toLowerCase().includes(q.value.toLowerCase())))
@@ -62,5 +63,4 @@ const ts = (v: any) => v ? new Date(typeof v === 'number' ? v * 1000 : v).toISOS
   <Drawer v-if="dlg === 'preview'" :title="`Pool ${x.id} — what a player gets`" @close="dlg = ''"><div class="form"><div class="f"><label>Account id</label><input class="in m" v-model="acc" /></div><div class="row"><button class="btn s" :disabled="!acc" @click="runPreview(x)">Preview</button><button class="btn s" :disabled="!acc" @click="act(() => post(`/v1/server/quests/pools/${encodeURIComponent(x.id)}/accelerate`, { account_id: acc }), 'rotation accelerated')">Accelerate rotation</button></div><JsonView v-if="preview" :value="preview" /></div></Drawer>
   <Drawer v-if="dlg === 'event'" title="Emit a quest event" @close="dlg = ''"><div class="form"><p class="note">Advances every active quest objective listening to this event for the player — handy to test a quest or compensate a player.</p><div class="f"><label>Account id</label><input class="in m" v-model="ev.account_id" /></div><div class="f" style="display:flex;gap:8px"><input class="in m" v-model="ev.event" placeholder="event" style="flex:1" /><input class="in" type="number" min="1" v-model.number="ev.amount" style="width:90px" /></div><div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!ev.account_id || !ev.event" @click="act(() => post('/v1/server/quests/event', { ...ev, amount: Number(ev.amount) }), 'event emitted')">Emit</button></div></div></Drawer>
   <datalist id="rtables"><option v-for="t in tables" :key="t.id" :value="t.id" /></datalist>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

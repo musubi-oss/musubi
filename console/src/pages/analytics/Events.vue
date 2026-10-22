@@ -35,5 +35,4 @@ async function saveSchema() { let body: any; try { body = JSON.parse(form.value.
     <div class="f"><label>Schema (JSON: properties, required, strict)</label><textarea class="in" v-model="form.text" style="min-height:200px"></textarea></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.name" @click="saveSchema">Save</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

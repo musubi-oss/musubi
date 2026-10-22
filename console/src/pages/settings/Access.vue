@@ -45,5 +45,4 @@ const inviteState = (i: any) => i.decided_at ? (i.accepted ? 'accepted' : 'decli
       <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.email" @click="invite">Create invite</button></div></template>
     <template v-else><p class="note">Send this to the operator; it is shown once.</p><pre class="pre">{{ JSON.stringify(made, null, 2) }}</pre><div class="row"><button class="btn p" @click="dlg = ''">Done</button></div></template>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

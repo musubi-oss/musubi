@@ -57,5 +57,4 @@ async function rotate() { const label = window.prompt('Label for the new secret 
     <div class="f" v-if="dlg === 'new'"><label>First secret label</label><input class="in" v-model="form.secret_label" /></div>
     <div class="row"><button class="btn" @click="dlg = dlg === 'edit' ? 'client' : ''">{{ made ? 'Done' : 'Cancel' }}</button><button class="btn p" :disabled="!form.name || !!made" @click="dlg === 'new' ? create() : saveEdit()">{{ dlg === 'new' ? 'Create' : 'Save' }}</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

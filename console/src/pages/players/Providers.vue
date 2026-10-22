@@ -50,5 +50,4 @@ const kinds = [['oidc', 'OpenID Connect (discovery by issuer)'], ['oauth2', 'OAu
     </template>
     <pre class="pre" v-if="test" style="max-height:160px">{{ JSON.stringify(test, null, 2) }}</pre>
     <div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn s" v-if="!isNew" @click="runTest(p.name)">Test</button><button class="btn p" :disabled="!p.name" @click="save">Save</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

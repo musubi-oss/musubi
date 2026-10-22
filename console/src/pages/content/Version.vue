@@ -52,5 +52,4 @@ const ts = (x: any) => x ? String(x).replace('T', ' ').slice(0, 19) : '—'
     </template>
     <h3>Counts</h3><JsonView :value="v.counts" />
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

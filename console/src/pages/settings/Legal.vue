@@ -44,5 +44,4 @@ const docs = () => x.value.l?.documents ?? []
     <DataTable v-if="x.c && !x.c.error" :cols="[{ key: 'account_id', mono: true }, { key: 'accepted', fmt: (r) => r.accepted ? 'accepted' : 'declined' }, { key: 'locale' }, { key: 'at', fmt: (r) => ts(r.at ?? r.created_at), dim: true }]" :rows="x.c.consents ?? []" empty="No consents recorded" />
     <JsonView v-else-if="x.c" :value="x.c" />
   </Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

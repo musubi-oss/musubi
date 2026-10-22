@@ -71,5 +71,4 @@ const redList = computed<any[]>(() => x.value.red?.redemptions ?? [])
     <div class="f"><label>Max uses</label><input class="in" type="number" v-model.number="form.max_uses" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.code" @click="act(() => post(`/v1/server/codes/campaigns/${encodeURIComponent(cur.id)}/codes`, { code: form.code, max_uses: form.max_uses }), 'code added')">Add</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

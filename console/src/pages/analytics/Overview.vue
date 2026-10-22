@@ -52,5 +52,4 @@ async function flush() { try { await post('/v1/server/analytics/flush'); toast.s
       <router-link to="/analytics/reports" class="dim" style="font-size:12px">all reports →</router-link>
     </div>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

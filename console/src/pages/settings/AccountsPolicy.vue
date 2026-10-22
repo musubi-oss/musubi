@@ -20,5 +20,4 @@ async function save() { try { await put('/v1/admin/accounts/policy', { ...p.valu
       <tr v-for="(f, i) in fields" :key="i"><td><input class="in m" v-model="f.name" placeholder="clan_tag" /></td><td><select class="sel" v-model="f.kind"><option>string</option><option>int</option><option>bool</option><option>url</option><option>enum</option></select></td><td><input class="in" type="number" min="0" v-model.number="f.max_len" :disabled="f.kind !== 'string' && f.kind !== 'url'" /></td><td><input type="checkbox" v-model="f.required" /></td><td><input type="checkbox" v-model="f.public" /></td><td><button class="btn s" @click="fields.splice(i, 1)">×</button></td></tr>
       <tr v-if="!fields.length"><td colspan="6" class="empty">No custom fields — profiles have username, display name, avatar, language, timezone, metadata</td></tr></tbody></table>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

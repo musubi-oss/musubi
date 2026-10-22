@@ -45,5 +45,4 @@ const logText = computed(() => { const l = x.value.logs; if (!l || l.error) retu
     <h3>Logs <small>(tail)</small></h3><pre class="json" style="max-height:480px">{{ logText || 'No Data' }}</pre>
     <h3>Exit</h3><div class="dim">{{ sv.exit_reason ?? '—' }} <span v-if="sv.terminated_at">· terminated {{ ts(sv.terminated_at) }}</span></div>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

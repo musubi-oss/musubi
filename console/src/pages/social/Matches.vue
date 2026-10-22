@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { api, get, post } from '../../api/client'
 import Kv from '../../components/Kv.vue'
 import JsonView from '../../components/JsonView.vue'
 import { toast } from '../../stores/toast'
 const router = useRouter(); const ask = (m: string) => window.confirm(m)
-const tab = ref<'matches' | 'rejections' | 'stats' | 'turns'>('matches'); const matches = ref<any[]>([]); const rej = ref<any[]>([]); const stats = ref<any>(null); const turns = ref<any[]>([]); const err = ref(''); const sel = ref<any>(null); const trace = ref<any>(null); const tf = ref('active')
+const tab = ref<'matches' | 'rejections' | 'stats' | 'turns'>((['matches', 'rejections', 'stats', 'turns'] as const).find((k) => k === useRoute().query.tab) ?? 'matches'); const matches = ref<any[]>([]); const rej = ref<any[]>([]); const stats = ref<any>(null); const turns = ref<any[]>([]); const err = ref(''); const sel = ref<any>(null); const trace = ref<any>(null); const tf = ref('active')
 async function load() {
   err.value = ''
   const r = await Promise.allSettled([get('/v1/server/matchmaker/matches'), get('/v1/server/matchmaker/rejections'), get('/v1/server/matchmaker/stats'), get('/v1/server/turns')])
@@ -52,5 +52,4 @@ const turnState = (t: any) => t.finished_at ? 'finished' : t.current_seat == nul
         <tr v-if="!turns.length"><td colspan="8" class="empty">No turn-based matches</td></tr></tbody></table>
     </template>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

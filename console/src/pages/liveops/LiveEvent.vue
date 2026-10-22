@@ -68,5 +68,4 @@ const ts = (v: any) => v ? new Date(v * 1000).toISOString().replace('T', ' ').sl
     </template>
     <h3 v-if="!isNew">Raw</h3><JsonView v-if="!isNew" :value="e" />
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

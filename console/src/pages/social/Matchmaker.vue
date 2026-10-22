@@ -79,5 +79,4 @@ const summary = (x: any) => [x.teams ? `${x.teams.count}×${x.teams.size} teams`
     <div class="f"><label>Queue</label><select class="sel" v-model="sel"><option v-for="x in queues" :key="x.name" :value="x">{{ x.name }}</option></select></div><div class="f"><label>Tickets</label><input class="in" type="number" min="1" v-model.number="simForm.tickets" /></div>
     <pre class="pre" v-if="sim" style="max-height:260px">{{ JSON.stringify(sim, null, 2) }}</pre>
     <div class="row"><button class="btn" @click="dlg = ''">Close</button><button class="btn p" :disabled="!sel" @click="async () => { try { sim = await post('/v1/server/matchmaker/simulate', { queue: sel.name, tickets: Number(simForm.tickets) }) } catch (x: any) { toast.err(x) } }">Run</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

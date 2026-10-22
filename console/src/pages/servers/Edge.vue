@@ -31,5 +31,4 @@ onMounted(load)
       <h3>Allow / deny lists</h3><JsonView :value="{ allow: st.guard?.allow ?? [], deny: st.guard?.deny ?? [] }" />
     </template>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

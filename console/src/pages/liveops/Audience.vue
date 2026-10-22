@@ -75,5 +75,4 @@ const mrows = computed(() => { const m = members.value; if (!m || m.error) retur
     </template>
     <template v-else><JsonView :value="a" /></template>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

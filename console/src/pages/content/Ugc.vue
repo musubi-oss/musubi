@@ -28,5 +28,4 @@ const counts = computed(() => items.value.length)
     <div class="f"><label>Decision</label><select class="sel" v-model="form.decision"><option value="approved">approve — visible to everyone</option><option value="rejected">reject — hidden, owner notified</option><option value="removed">remove — delete the file</option></select></div>
     <div class="f"><label>Note to the owner</label><input class="in" v-model="form.note" /></div>
     <div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn p" @click="decide">Submit</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

@@ -53,5 +53,4 @@ async function runExtra() { try { const res = await ex.value.run({ ...form.value
     <details v-if="raw" style="margin-top:8px"><summary class="dim">Raw record</summary><JsonView :value="raw" /></details>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form[D.key]" @click="save">Save</button></div></div></Drawer>
   <Drawer v-if="dlg === 'extra'" :title="ex.label" @close="dlg = ''"><div class="form"><FormFields :fields="ex.body" :model="form" /><div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="runExtra">Run</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

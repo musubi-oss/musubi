@@ -1,25 +1,32 @@
 <script setup lang="ts">
 // Generic resource page: list table from `res.list`, item drawer (raw JSON + edit), create via
 // template, delete. Non-list endpoints render as a key/value sheet of the JSON object.
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { api, get, qs } from '../api/client'
 import type { Res, Act } from '../catalog'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import DataTable, { type Col } from '../components/DataTable.vue'
 import Drawer from '../components/Drawer.vue'
 import JsonView from '../components/JsonView.vue'
 import Kv from '../components/Kv.vue'
 import { toast } from '../stores/toast'
 const props = defineProps<{ res: Res }>()
-const router = useRouter()
+const router = useRouter(); const route = useRoute()
 const pending = ref<{ act: Act; row: any; text: string } | null>(null)
 const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const busy = ref(false)
-const q = ref(''); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
+const q = ref(String(route.query.q ?? '')); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
 const open = ref<any>(null); const edit = ref(''); const creating = ref(false); const text = ref('')
 const cols = computed<Col[]>(() => {
   const keys = props.res.cols ?? (rows.value[0] ? Object.keys(rows.value[0]).slice(0, 7) : ['id'])
   return keys.map((k) => ({ key: k, label: k.replace(/_/g, ' '), mono: /(^|_)(id|sha256|hash|address|code)$/.test(k) }))
 })
+const shown = computed(() => {
+  const s = q.value.trim().toLowerCase(); if (!s) return rows.value
+  const terms = s.split(/\s+/)
+  return rows.value.filter((r) => { const hay = JSON.stringify(r).toLowerCase(); return terms.every((t) => hay.includes(t)) })
+})
+watch(q, (v) => { router.replace({ query: { ...route.query, q: v || undefined } }) })
+watch(() => props.res.id, () => { q.value = ''; stack.value = []; load() })
 const isList = computed(() => Array.isArray(rows.value) && (rows.value.length > 0 || props.res.rowsKey !== undefined || Array.isArray(data.value)))
 async function load(c: string | null = null) {
   busy.value = true; err.value = ''
@@ -79,9 +86,9 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
 </script>
 <template>
   <div class="card">
-    <h2>{{ res.title }} <small v-if="isList">({{ rows.length }})</small></h2>
+    <h2>{{ res.title }} <small v-if="isList">({{ shown.length !== rows.length ? shown.length + ' of ' : '' }}{{ rows.length }}{{ cursor ? '+' : '' }})</small></h2>
     <div class="tools" v-if="isList && res.custom !== 'zanshin'">
-      <input class="in" v-model="q" placeholder="search" @keyup.enter="load()" />
+      <input class="in" v-model="q" placeholder="filter — any field, space = and" @keyup.enter="load()" /><button class="btn s" v-if="q" @click="q = ''" title="clear">×</button>
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>
       <span style="margin-left:auto;display:flex;gap:8px">
         <button v-for="a in res.pageActions ?? []" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, null)">{{ a.label }}</button>
@@ -98,7 +105,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
       </div>
     </template>
     <template v-else-if="isList">
-      <DataTable :cols="cols" :rows="rows" pick @pick="pick">
+      <DataTable :cols="cols" :rows="shown" :loading="busy" pick @pick="pick" :empty="q ? 'Nothing matches the filter' : 'No Data'">
         <template #actions="{ row }" v-if="res.actions || res.link">
           <span style="display:flex;gap:6px;justify-content:flex-end">
             <button v-if="res.link && res.link(row)" class="btn s" @click="router.push(res.link(row)!)">Open</button>
@@ -106,7 +113,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
           </span>
         </template>
       </DataTable>
-      <div class="pager" v-if="cursor || stack.length"><button class="btn s" :disabled="!stack.length" @click="prev">Prev</button><button class="btn s" :disabled="!cursor" @click="next">Next</button></div>
+      <div class="pager" v-if="cursor || stack.length"><span>server page {{ stack.length + 1 }}</span><button class="btn s" :disabled="!stack.length" @click="prev">Prev 50</button><button class="btn s" :disabled="!cursor" @click="next">Next 50</button></div>
     </template>
     <template v-else-if="data && typeof data === 'object'">
       <div class="grid" style="grid-template-columns:repeat(3,1fr)">
@@ -117,7 +124,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
     </template>
     <div v-else-if="!err && !busy" class="empty">No Data</div>
   </div>
-  <Drawer v-if="open" :title="res.title.replace(/s$/, '')" @close="open = null">
+  <Drawer v-if="open" :title="res.title.replace(/s$/, '') + (open?.[res.key ?? 'id'] ? ' · ' + open[res.key ?? 'id'] : '')" wide @close="open = null">
     <template v-if="!res.item"><JsonView :value="open" />
       <div class="form" v-if="res.actions?.length"><div class="row"><button v-for="a in visible(res.actions, open)" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, open)">{{ a.label }}</button></div></div></template>
     <template v-else>
@@ -125,7 +132,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
       <div class="form"><div class="row"><button v-for="a in visible(res.actions, open)" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, open)">{{ a.label }}</button><button class="btn d" @click="remove">Delete</button><button class="btn" @click="open = null">Close</button><button class="btn p" @click="save">Save</button></div></div>
     </template>
   </Drawer>
-  <Drawer v-if="creating" :title="'New ' + res.title.replace(/s$/, '').toLowerCase()" @close="creating = false">
+  <Drawer v-if="creating" :title="'New ' + res.title.replace(/s$/, '').toLowerCase()" wide @close="creating = false">
     <textarea class="in" v-model="text" style="min-height:300px"></textarea>
     <div class="form"><div class="row"><button class="btn" @click="creating = false">Cancel</button><button class="btn p" @click="create">Create</button></div></div>
   </Drawer>
@@ -134,5 +141,4 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
     <textarea class="in" v-model="pending.text" style="min-height:260px"></textarea>
     <div class="form"><div class="row"><button class="btn" @click="pending = null">Cancel</button><button class="btn p" :class="{ d: pending.act.danger }" @click="run(pending.act, pending.row)">Send</button></div></div>
   </Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

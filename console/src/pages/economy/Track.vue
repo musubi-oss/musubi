@@ -46,5 +46,4 @@ async function grant() { try { await post('/v1/server/progression/xp', { ...form
     <h3 v-if="!isNew">Raw</h3><JsonView v-if="!isNew" :value="t" />
   </div>
   <Drawer v-if="dlg" title="Grant XP" @close="dlg = false"><div class="form"><div class="f"><label>Account id</label><input class="in m" v-model="form.account_id" /></div><div class="f"><label>XP</label><input class="in" type="number" v-model.number="form.xp" /></div><div class="f"><label>Reason</label><input class="in" v-model="form.reason" /></div><div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn p" :disabled="!form.account_id" @click="grant">Grant</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

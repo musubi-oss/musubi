@@ -25,5 +25,4 @@ const ts = (v: any) => !v ? '—' : (typeof v === 'number' ? new Date(v * 1000) 
       <tr v-if="!sources.length"><td colspan="5" class="empty">No external sources — attach one from a remote config's page</td></tr></tbody></table>
     <details v-if="schedules.length"><summary class="dim">Raw</summary><JsonView :value="schedules" /></details>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

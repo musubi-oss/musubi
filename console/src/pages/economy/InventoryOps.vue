@@ -55,5 +55,4 @@ function mailBody() { const m = mail.value; return { account_ids: m.account_id ?
       <template #actions="{ row }"><button class="btn s d" @click="ask('Delete this limit?') && run('lim', () => api('DELETE', `/v1/server/grant_limits/${row.kind}/${encodeURIComponent(row.key)}`), 'deleted')">Delete</button></template>
     </DataTable>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

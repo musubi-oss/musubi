@@ -45,5 +45,4 @@ function copy(s: string) { navigator.clipboard?.writeText(s); toast.show('copied
     <div class="f"><label>Burst</label><input class="in" type="number" min="1" v-model.number="form.burst" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="act(() => put(`/v1/admin/keys/${sel.id}/limits`, { rps: form.rps || null, burst: form.burst || null }), 'limits saved')">Save</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

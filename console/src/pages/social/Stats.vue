@@ -42,5 +42,4 @@ const kinds = [['int', 'int — counter / score'], ['float', 'float'], ['max', '
     <div class="f"><label>Account id</label><input class="in m" v-model="upd.account_id" /></div><div class="f"><label>Stat</label><select class="sel" v-model="upd.stat"><option v-for="x in defs" :key="x.id" :value="x.id">{{ x.id }}</option></select></div>
     <div class="f" style="display:flex;gap:8px"><div><label>Operation</label><select class="sel" v-model="upd.op"><option value="set">set</option><option value="incr">increment</option><option value="max">max</option><option value="min">min</option></select></div><div><label>Value</label><input class="in" type="number" v-model.number="upd.value" style="width:140px" /></div></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!upd.account_id || !upd.stat" @click="update">Apply</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

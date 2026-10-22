@@ -34,5 +34,4 @@ const props = (x: any) => Object.keys(x.schema?.properties ?? {})
   <Drawer v-if="dlg === 'migrate'" :title="`Migrate ${s.collection}`" @close="dlg = ''"><div class="form"><p class="note">Rewrites every object stored at <i>from version</i> with the script (a JSON patch array or a runtime module function name), stamping them with the current version.</p>
     <div class="f"><label>From version</label><input class="in" type="number" min="1" v-model.number="mig.from_version" style="width:90px" /></div><div class="f"><label>Patch / function</label><textarea class="in m" v-model="mig.script" style="min-height:120px" placeholder='[{"op":"add","path":"/level","value":1}]'></textarea></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="act(() => post(`/v1/admin/storage_schemas/${encodeURIComponent(s.collection)}/migrate`, { from_version: Number(mig.from_version), patch: (() => { try { return JSON.parse(mig.script) } catch { return mig.script } })() }), 'migrated')">Run migration</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

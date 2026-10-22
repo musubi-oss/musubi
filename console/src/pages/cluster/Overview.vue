@@ -107,5 +107,4 @@ async function profile() {
     <h2>This node</h2>
     <div class="tools"><button class="btn" :disabled="profiling" @click="profile">{{ profiling ? 'profiling ~10 s…' : 'CPU flame graph' }}</button><router-link class="btn" to="/cluster/logs">Logs</router-link><router-link class="btn" to="/cluster/loadtests">Load tests</router-link><span class="dim">mesh network: {{ x.mesh?.enabled ? `on · ${(x.mesh.peers ?? []).length} peers` : 'off' }} · <router-link to="/cluster/mesh_net">details</router-link></span></div>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

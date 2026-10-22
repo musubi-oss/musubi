@@ -77,5 +77,4 @@ const ts = (v: any) => v ? new Date(v * 1000).toISOString().replace('T', ' ').sl
   <Drawer v-if="dlg === 'approve' || dlg === 'reject'" :title="dlg === 'approve' ? 'Approve changeset' : 'Reject changeset'" @close="dlg = ''"><div class="form">
     <div class="f"><label>Review note</label><input class="in" v-model="form.note" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="act(() => post(`${C}/${dlg}`, { note: form.note }), dlg === 'approve' ? 'approved' : 'rejected')">{{ dlg === 'approve' ? 'Approve' : 'Reject' }}</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

@@ -37,5 +37,4 @@ const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 19) : '—'
     <pre class="pre" v-if="result" style="max-height:220px">{{ JSON.stringify(result, null, 2) }}</pre>
     <div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn p" :disabled="!text.trim() || loading" @click="doImport">{{ dry ? 'Validate' : 'Import' }}</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

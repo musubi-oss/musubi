@@ -43,5 +43,4 @@ async function doImport() { let entries: any[]; try { entries = form.value.text.
     <div class="f"><label>Reason</label><input class="in" v-model="form.reason" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn d" :disabled="!form.by || !form.reason" @click="act(() => post(`/v1/admin/deletions/${form.id}/lift`, { by: form.by, reason: form.reason }), 'lifted')">Lift</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

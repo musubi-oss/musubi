@@ -30,5 +30,4 @@ const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 16) : '—'
     <div class="f"><label>Kind</label><select class="sel" v-model="form.kind"><option value="export">export — produce a downloadable archive</option><option value="erase">erase — anonymise and delete personal data</option></select></div>
     <div class="f"><label><input type="checkbox" v-model="form.include_game_data" /> include game data (inventory, progression, matches)</label></div>
     <div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn p" :disabled="!form.account_id" @click="(form.kind === 'export' || ask('Erasure is irreversible. Continue?')) && act(() => post('/v1/server/data_rights', form), 'request created')">Create</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

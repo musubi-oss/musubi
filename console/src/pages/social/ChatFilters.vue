@@ -32,5 +32,4 @@ const preview = computed(() => { let t = sample.value; for (const x of hits.valu
     <div class="f" style="display:flex;gap:8px"><div><label>Action</label><select class="sel" v-model="f.action"><option value="mask">mask</option><option value="block">block</option><option value="flag">flag for moderators</option></select></div><div v-if="f.action === 'mask'" style="flex:1"><label>Replacement</label><input class="in m" v-model="f.replacement" /></div></div>
     <div class="f"><label>Note</label><input class="in" v-model="f.note" /></div><div class="f"><label><input type="checkbox" v-model="f.enabled" /> enabled</label></div>
     <div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn p" :disabled="!f.pattern" @click="save">Save</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

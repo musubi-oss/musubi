@@ -52,5 +52,4 @@ const state = computed(() => { if (!s.value?.starts_at) return 'draft'; const n 
     <h3 v-if="!isNew">Raw</h3><JsonView v-if="!isNew" :value="s" />
   </div>
   <Drawer v-if="dlg" title="Grant premium pass" @close="dlg = false"><div class="form"><div class="f"><label>Account id</label><input class="in m" v-model="acc" /></div><div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn p" :disabled="!acc" @click="premium">Grant</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

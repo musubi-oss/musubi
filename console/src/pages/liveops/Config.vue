@@ -49,5 +49,4 @@ function ts(v: any) { if (!v) return '—'; const d = typeof v === 'number' ? ne
     <div class="f"><label>Patch (JSON, merged over base value)</label><textarea class="in" v-model="vform.patch" style="min-height:140px"></textarea></div>
     <div class="row"><button class="btn" @click="vdlg = false">Cancel</button><button class="btn p" :disabled="!vform.variant" @click="act(() => api('PUT', `${C}/variants/${encodeURIComponent(vform.variant)}`, { selector: JSON.parse(vform.selector), patch: JSON.parse(vform.patch), priority: vform.priority, enabled: vform.enabled }), 'variant saved')">Save</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

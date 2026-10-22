@@ -66,5 +66,4 @@ async function del() { if (!window.confirm(`Delete flag ${name.value}?`)) return
     <p class="note" v-if="dirty" style="margin-top:10px">Unsaved changes</p>
     <h3>Raw</h3><JsonView :value="f" />
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

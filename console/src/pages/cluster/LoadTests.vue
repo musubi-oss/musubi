@@ -39,5 +39,4 @@ const start = () => act(() => post('/v1/admin/dev/loadtests', { ...f.value, url:
     <template v-if="cmp"><h3>Comparison</h3><JsonView :value="cmp" /></template>
     <h3>Full report</h3><JsonView :value="sel.report ?? sel" />
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

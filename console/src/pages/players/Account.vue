@@ -209,5 +209,4 @@ const list = (k: string, sub?: string) => { const v = x.value[k]; if (!v || v.er
     <div class="f"><label>Limits (JSON)</label><textarea class="in" v-model="form" style="min-height:200px"></textarea></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="act(() => api('PUT', `${A}/limits`, JSON.parse(form)), 'limits saved')">Save</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

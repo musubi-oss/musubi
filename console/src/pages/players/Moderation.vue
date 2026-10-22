@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { api, get, post, qs } from '../../api/client'
 import Drawer from '../../components/Drawer.vue'
 import JsonView from '../../components/JsonView.vue'
 import { toast } from '../../stores/toast'
 const router = useRouter(); const ask = (m: string) => window.confirm(m)
-const tab = ref<'reports' | 'chat' | 'bans' | 'rules'>('reports')
+const tab = ref<'reports' | 'chat' | 'bans' | 'rules'>((['reports', 'chat', 'bans', 'rules'] as const).find((k) => k === useRoute().query.tab) ?? 'reports')
 const reports = ref<any[]>([]); const cursor = ref<string | null>(null); const chat = ref<any[]>([]); const bans = ref<any[]>([]); const bansTotal = ref(0); const rules = ref<any[]>([]); const err = ref('')
 const rf = ref({ status: 'open', category: '' }); const bf = ref({ q: '', shadow: 'all' }); const dlg = ref(''); const sel = ref<any>(null); const form = ref<any>({})
 async function load(more = false) {
@@ -77,5 +77,4 @@ const short = (s: any) => s ? String(s).slice(0, 8) + '…' : '—'
     <div class="f" style="display:flex;gap:8px"><div><label>Action</label><select class="sel" v-model="form.action"><option value="ban">ban</option><option value="shadow_ban">shadow ban</option><option value="mute">mute</option></select></div><div><label>Duration (s, 0 = permanent)</label><input class="in" type="number" min="0" v-model.number="form.until_secs" style="width:160px" /></div></div>
     <div class="f"><label>Reason shown to the player</label><input class="in" v-model="form.reason" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="act(() => post('/v1/admin/bans/rules', { ...form, until_secs: form.until_secs || null }), 'rule added')">Add</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

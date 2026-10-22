@@ -196,5 +196,4 @@ const pct = (a: number, b: number) => (b ? Math.round((a / b) * 100) : 0)
     <textarea class="in" v-model="form" style="min-height:420px"></textarea>
     <div class="form"><div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="act(() => api('PUT', F, { spec: JSON.parse(form) }), 'spec saved')">Save</button></div></div>
   </Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

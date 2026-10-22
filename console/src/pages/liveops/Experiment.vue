@@ -57,5 +57,4 @@ function save() {
       </tr></tbody></table>
     <h3>Raw</h3><JsonView :value="e" />
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

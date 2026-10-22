@@ -58,5 +58,4 @@ async function lock() { const e = lockEmail.value.trim(); if (!e) return; try { 
     <div class="f"><label><input type="checkbox" v-model="form.reset" /> reset — drop the fixture first if it exists</label></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.name" @click="act(() => post('/v1/admin/dev/fixtures', { name: form.name, reset: form.reset, ...JSON.parse(form.manifest || '{}') }), 'fixture applied')">Apply</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

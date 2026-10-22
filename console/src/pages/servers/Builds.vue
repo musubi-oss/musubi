@@ -34,5 +34,4 @@ async function act(fn: () => Promise<any>, ok: string) { try { await fn(); toast
       <JsonView :value="{ ...manifest, chunks: (manifest.chunks ?? []).slice(0, 20).concat((manifest.chunks ?? []).length > 20 ? [`… ${(manifest.chunks ?? []).length - 20} more`] : []) }" /></template>
     <template v-if="chunking"><h3>Chunk store</h3><JsonView :value="chunking" /></template>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

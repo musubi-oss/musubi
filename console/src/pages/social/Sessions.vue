@@ -48,5 +48,4 @@ function openTemplate(t?: any) { dlg.value = 'tpl'; form.value = { id: t?.id ?? 
     <div class="f"><label>Template (JSON)</label><textarea class="in" v-model="form.text" style="min-height:180px"></textarea></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.id" @click="act(() => put(`/v1/server/session_templates/${encodeURIComponent(form.id)}`, JSON.parse(form.text)), 'saved')">Save</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

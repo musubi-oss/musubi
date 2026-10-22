@@ -34,5 +34,4 @@ const ts = (v: any) => v ? String(v).replace('T', ' ').slice(0, 16) : '—'
     </div>
     <div class="card dim" v-else style="display:flex;align-items:center;justify-content:center">Select a group to see the sample, stack and triage controls</div>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

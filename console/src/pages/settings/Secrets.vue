@@ -44,5 +44,4 @@ const total = (f: string) => (x.value.s?.stores ?? []).reduce((a: number, s: any
     <template v-if="x.dor"><h3>Dormant accounts</h3><JsonView :value="x.dor" /></template>
     <template v-if="x.del"><h3>Deletions</h3><JsonView :value="x.del" /></template>
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

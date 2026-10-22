@@ -23,5 +23,4 @@ const ts = (v: any) => v ? new Date(v * 1000).toISOString().replace('T', ' ').sl
       <tr v-if="!view.length"><td colspan="7" class="empty">No {{ show }} flags</td></tr></tbody></table>
   </div>
   <Drawer v-if="dlg" title="Resolve fraud flag" @close="dlg = false"><div class="form"><p class="dim">{{ sel.rule }} · {{ sel.count }} / {{ sel.limit }}{{ sel.blocked ? ' · unblocks the player' : '' }}</p><div class="f"><label>Note</label><input class="in" v-model="note" placeholder="false positive / refunded / banned" /></div><div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn p" @click="resolve">Resolve</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

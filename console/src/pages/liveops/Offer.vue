@@ -54,5 +54,4 @@ const fmt = (s: number) => !s ? '—' : s >= 86400 ? `${(s / 86400).toFixed(1)}d
     <p class="dim" v-if="!isNew" style="margin-top:8px">Cooldown {{ fmt(o.cooldown_secs) }} · visible {{ fmt(o.duration_secs) }}</p>
   </div>
   <Drawer v-if="dlg" title="Force this offer for a player" @close="dlg = false"><div class="form"><p class="note">Bypasses audience, window and precursor for one account (QA / support). Remove with the same account id.</p><div class="f"><label>Account id</label><input class="in m" v-model="acc" /></div><div class="row"><button class="btn" @click="dlg = false">Cancel</button><button class="btn s" :disabled="!acc" @click="act(() => api('DELETE', `${O}/force/${acc}`), 'force removed')">Remove force</button><button class="btn p" :disabled="!acc" @click="act(() => put(`${O}/force/${acc}`, { account_id: acc }), 'forced')">Force</button></div></div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

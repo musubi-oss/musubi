@@ -203,7 +203,6 @@ function openDlg(k: typeof dlg.value) { dlg.value = k; form.value = k === 'host'
     <div class="f"><label>Data (JSON)</label><textarea class="in" v-model="form.data" style="min-height:120px"></textarea></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" @click="act(() => post(`${S}/spawn`, { kind: form.kind, pos: { x: form.x, y: form.y }, persistent: form.persistent, data: JSON.parse(form.data || '{}') }), 'spawned')">Spawn</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>
 <style scoped>
 .hstep{display:inline-block;font-size:12px;padding:1px 6px;margin:1px 4px 1px 0;border:1px solid var(--line2);border-radius:4px;color:var(--fg2)}

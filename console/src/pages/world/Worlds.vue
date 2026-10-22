@@ -48,5 +48,4 @@ async function del(w: string) { if (!window.confirm(`Delete world ${w}? Its jour
     <div class="f"><label>Config (JSON — cell_size, max_depth, three_d, hibernate_after_ticks, …)</label><textarea class="in" v-model="form.config" style="min-height:220px"></textarea></div>
     <div class="row"><button class="btn" @click="creating = false">Cancel</button><button class="btn p" :disabled="!form.name" @click="create">Create</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

@@ -49,5 +49,4 @@ async function save() {
     <datalist id="items"><option v-for="i in items" :key="i" :value="i" /></datalist><datalist id="currencies"><option v-for="c in currencies" :key="c" :value="c" /></datalist>
     <h3 v-if="!isNew">Raw</h3><JsonView v-if="!isNew" :value="s" />
   </div>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

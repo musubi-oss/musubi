@@ -67,5 +67,4 @@ const counts = () => { const s = x.value.s?.sanctions ?? []; return { pending: s
     <div class="f"><label>Features restricted (comma-separated, empty = whole account)</label><input class="in" v-model="form.features" placeholder="chat, trading" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.code || !form.title" @click="act(() => put(`/v1/admin/bans/reasons/${encodeURIComponent(form.code)}`, { title: form.title, message: form.message, severity: form.severity, default_duration_secs: form.default_duration_secs === '' ? null : Number(form.default_duration_secs), features: String(form.features).split(',').map((s: string) => s.trim()).filter(Boolean) }), 'saved')">Save</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

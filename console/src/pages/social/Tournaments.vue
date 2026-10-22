@@ -62,5 +62,4 @@ function report(m: any) { dlg.value = 'report'; form.value = { mid: m.id ?? m.ma
     <div class="f"><label>Participant who forfeits</label><input class="in" v-model="form.participant" /></div>
     <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn d" @click="act(() => post(`/v1/server/tournaments/${cur.id}/bracket/matches/${form.mid}/forfeit`, { participant: form.participant }), 'forfeited')">Forfeit</button></div>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>

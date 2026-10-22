@@ -53,5 +53,4 @@ async function promote() { const f = form.value; try { x.value.promoteResult = a
     <div class="row"><button class="btn" @click="dlg = ''">Close</button><button class="btn" :class="form.dry_run ? 'p' : 'd'" @click="(form.dry_run || ask(`Promote to ${form.to} for real?`)) && promote()">{{ form.dry_run ? 'Dry run' : 'Promote' }}</button></div>
     <template v-if="x.promoteResult"><h3>Result <small :class="x.promoteResult.ok === false ? 'bad' : 'ok'">{{ x.promoteResult.ok === false ? 'failed' : 'ok' }}</small></h3><JsonView :value="x.promoteResult" /></template>
   </div></Drawer>
-  <div class="toast" v-if="toast.msg" :class="{ bad: toast.bad }">{{ toast.msg }}</div>
 </template>
