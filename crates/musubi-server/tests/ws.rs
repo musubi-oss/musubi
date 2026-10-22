@@ -7390,32 +7390,36 @@ async fn cross_border_contact_dedupes_and_colocates() {
         Some(9),
         "tenth consecutive contact co-locates"
     );
+    // the forwarded contacts reach whichever simulator owns the crate when they land: the old
+    // owner sees a prefix, the rest ride with the pin's handover as buffered inputs and surface
+    // on the reporter's side (under load the whole batch can arrive after the crate left) —
+    // every contact is delivered exactly once, to exactly one of them
     let mut got: Vec<Value> = Vec::new();
     for _ in 0..40 {
-        let (_, ev) = http_json(
-            &router1,
-            "GET",
-            &format!("/v1/server/worlds/{name}/events?sim={sim1}"),
-            None,
-            true,
-            None,
-        )
-        .await;
-        got.extend(
-            ev["events"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| e["type"] == "interaction"),
-        );
+        for (router, sim) in [(&router1, sim1), (&router2, sim2)] {
+            let (_, ev) = http_json(
+                router,
+                "GET",
+                &format!("/v1/server/worlds/{name}/events?sim={sim}"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            got.extend(
+                ev["events"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| e["type"] == "interaction"),
+            );
+        }
         if got.len() >= 10 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    // contacts reported after the pin took effect ride with the handover as buffered inputs
-    // instead of reaching the old owner, so the old owner sees a prefix — never a duplicate
     assert!(!got.is_empty(), "{got:?}");
     assert!(got
         .iter()
