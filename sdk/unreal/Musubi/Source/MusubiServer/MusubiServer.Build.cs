@@ -6,6 +6,6 @@ public class MusubiServer : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Json", "Musubi" });
-        PrivateDependencyModuleNames.AddRange(new string[] { "HTTP", "WebSockets", "PhysicsCore" });
+        PrivateDependencyModuleNames.AddRange(new string[] { "HTTP", "WebSockets", "PhysicsCore", "DeveloperSettings" });
     }
 }

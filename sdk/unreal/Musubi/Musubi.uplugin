@@ -12,6 +12,7 @@
   "CanContainContent": false,
   "Modules": [
     { "Name": "Musubi", "Type": "Runtime", "LoadingPhase": "Default" },
-    { "Name": "MusubiWorld", "Type": "Runtime", "LoadingPhase": "Default" }
+    { "Name": "MusubiWorld", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "MusubiServer", "Type": "Runtime", "LoadingPhase": "Default", "TargetAllowList": [ "Server", "Editor" ] }
   ]
 }

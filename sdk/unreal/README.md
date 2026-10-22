@@ -61,7 +61,28 @@ or camera owner:
   comes with rollback matches, §5). `OnStats` once a second: entities, actors, instances, deltas/s,
   sequenced/s, late/s, tick rate, time scale, radius.
 
-Rollback matches, the server module and the Iris bridge are the next phases (§5–§7).
+**Server module** (`MusubiServer`, `docs/gdk-unreal.md` §6) — a dedicated-server build of the project as a
+Musubi simulator (the engine owns physics, Musubi owns authority and meshing):
+
+- `MusubiSimWire.generated.{h,cpp}`: the simulator stream types generated from `crates/musubi-mesh`
+  (`SimFrame`/`CellFrame`, every `SimEvent`, `SimCommand`, results) with golden vectors
+  (`tools/sim-wire-test.sh`, 40 fixtures from `musubi-mesh/tests/sim_wire_vectors.rs`).
+- `FMusubiSimStream`: one WebSocket to `GET /v1/server/worlds/{w}/stream?sim=&delta=1` with the fleet key,
+  commands with echoed ids, backoff reconnect.
+- `UMusubiSimulatorSubsystem`: starts on a dedicated server from `UMusubiSimulatorSettings`
+  (`[/Script/MusubiServer.MusubiSimulatorSettings]`; `MUSUBI_API/_WORLD/_SERVER_KEY` and `-MusubiApi= -MusubiWorld=
+  -MusubiKey= -MusubiCells=0,0;1,0` override). Ticks at `Hz` from the core ticker: frames → owned actors
+  (authoritative, `CustomTimeDilation` follows the cell's `time_scale`) and ghosts (kinematic); changed owned
+  actors → `apply`; `tick_done` closes the tick and renews the lease (lost/new cells surface as cell events).
+  Handover: request → `CanRelease` → final `apply` with velocity → `handover_ack` → frozen until completed;
+  arrival restores velocity and replays buffered inputs. Inputs/interactions reach the actor's
+  `UMusubiAuthorityComponent` (`ApplyInput`, `OnInteraction`, `CanRelease` as BlueprintNativeEvents;
+  `SetComponent*` marks dirty for the next `apply`; `Interact`, `RequestDespawn`). Project hook
+  `SpawnEntityActor` picks the actor class per entity; otherwise the settings' classes.
+- Not yet: cell → level-streaming, Chaos deterministic-mode assertions, `rewind` driven snapshots
+  (`rewind` is exposed as a command only), QUIC.
+
+Rollback matches and the Iris bridge are the next phases (§5, §7).
 
 ## Status / caveats
 
@@ -71,7 +92,7 @@ Rollback matches, the server module and the Iris bridge are the next phases (§5
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
   Core/Json). The facades reference engine types the shim does not model (UObject, HTTP, WebSockets)
   and have **not been compiled by UBT yet** — the 5.3/5.7/5.8 compile matrix is phase 8; the same goes
-  for `MusubiWorld`. Engine APIs they use were checked against the 5.3.2 / 5.7.4 / 5.8.4 sources
+  for `MusubiWorld` and `MusubiServer`. Engine APIs they use were checked against the 5.3.2 / 5.7.4 / 5.8.4 sources
   (`FSubsystemCollectionBase::InitializeDependency<T>()`, `IWebSocket`, `FHttpModule`, `FTSTicker`,
   `UInstancedStaticMeshComponent::AddInstance/UpdateInstanceTransform/BatchUpdateInstancesTransforms`,
   `UWorld::SpawnActor`; `TArray` shrink arguments kept to the 5.3 form), but a build error report is

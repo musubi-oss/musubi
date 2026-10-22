@@ -340,8 +340,10 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 3. World view: subscription driver, registry, actor/ISM sinks, interpolation, time scale,
    bandwidth guard — shipped as module `MusubiWorld`; the Mass sink moves to 6, the demo map
    (editor content) to 8.
-4. Server module: sim loop over the stream, cell → level streaming, authority component,
-   handover with physics state, ghosts as kinematics, interact/colocate, rewind ring.
+4. Server module: sim loop over the stream, authority component, handover with physics
+   state, ghosts as kinematics, interact/colocate — shipped as `MusubiServer` (generated sim
+   wire + golden vectors, stream, subsystem); cell → level streaming and the rewind ring are
+   project hooks for now (see README).
 5. Rollback matches (input ring, tick hash, desync recovery) + prediction buffer.
 6. Iris bridge (tier B) + Mass sink.
 7. QUIC transport (`quiche` static libs: Win64, Linux, Mac; consoles later), `transport` switch.
