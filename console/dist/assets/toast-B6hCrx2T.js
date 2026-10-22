@@ -1,1 +1,0 @@
-import{L as i}from"./index-CbzR5sxQ.js";const o=i({msg:"",bad:!1,t:0,show(t,s=!1){this.msg=t,this.bad=s,clearTimeout(this.t),this.t=setTimeout(()=>this.msg="",3500)},err(t){this.show((t==null?void 0:t.message)??String(t),!0)}});export{o as t};
