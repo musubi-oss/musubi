@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use musubi_core::Error;
 use musubi_mesh::controller::ControllerConfig;
-use musubi_mesh::{CellId, Pos, WorldConfig};
+use musubi_mesh::{CellId, Pos, SimCommand, SimCommandFrame, WorldConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -206,11 +206,6 @@ struct RegisterSimReq {
 
 fn one() -> u32 {
     1
-}
-
-#[derive(Deserialize)]
-struct TickDoneReq {
-    tick: u64,
 }
 
 #[derive(Deserialize)]
@@ -1018,7 +1013,7 @@ fn redirected(mut reply: Value, r: Result<(), Response>) -> Result<Value, Value>
 }
 
 async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt: &str) -> Value {
-    let mut cmd: Value = match serde_json::from_str(txt) {
+    let cmd: Value = match serde_json::from_str(txt) {
         Ok(v) => v,
         Err(e) => return json!({ "error": format!("bad command: {e}") }),
     };
@@ -1027,26 +1022,34 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
     if let Some(id) = cmd.get("id").cloned() {
         reply["id"] = id;
     }
-    cmd["sim"] = json!(sim);
     let r: Result<Value, Error> = async {
-        match op.as_str() {
-            "lease" => {
-                let r: LeaseReq = serde_json::from_value(cmd).map_err(bad)?;
-                let mut reply =
-                    match redirected(reply, ensure_cells_home(s, w, &r.cells, uri).await) {
-                        Ok(r) => r,
-                        Err(r) => return Ok(r),
-                    };
-                reply["cells"] = json!(s.worlds.lease(w, sim, &r.cells)?);
+        let frame: SimCommandFrame = serde_json::from_value(cmd).map_err(|e| {
+            if SimCommand::OPS.contains(&op.as_str()) {
+                bad(e)
+            } else {
+                Error::InvalidArgument(format!("unknown op `{op}`"))
+            }
+        })?;
+        match frame.cmd {
+            SimCommand::Lease { cells } => {
+                let mut reply = match redirected(reply, ensure_cells_home(s, w, &cells, uri).await)
+                {
+                    Ok(r) => r,
+                    Err(r) => return Ok(r),
+                };
+                reply["cells"] = json!(s.worlds.lease(w, sim, &cells)?);
                 Ok(reply)
             }
-            "spawn" => {
-                let r: SpawnReq = serde_json::from_value(cmd).map_err(bad)?;
-                let pos = Pos {
-                    x: r.x,
-                    y: r.y,
-                    z: 0.0,
-                };
+            SimCommand::Spawn {
+                x,
+                y,
+                components,
+                persistent,
+                global,
+                queue,
+                decay_ticks,
+            } => {
+                let pos = Pos { x, y, z: 0.0 };
                 let at_home = match s.worlds.cell_of_any(w, pos).await {
                     Ok(c) => ensure_cell_home(s, w, c, uri).await,
                     Err(_) => ensure_home(s, w, uri).await,
@@ -1060,11 +1063,11 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                     sim,
                     SpawnSpec {
                         pos,
-                        components: r.components,
-                        persistent: r.persistent,
-                        global: r.global,
-                        decay_ticks: r.decay_ticks,
-                        queue: r.queue,
+                        components,
+                        persistent,
+                        global,
+                        decay_ticks,
+                        queue,
                     },
                 )? {
                     SpawnOutcome::Spawned(e) => {
@@ -1074,70 +1077,97 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                 }
                 Ok(reply)
             }
-            "tick_done" => {
-                let r: TickDoneReq = serde_json::from_value(cmd).map_err(bad)?;
-                reply["cells"] = json!(s.worlds.renew_at(w, sim, Some(r.tick))?);
+            SimCommand::TickDone { tick } => {
+                reply["cells"] = json!(s.worlds.renew_at(w, sim, Some(tick))?);
                 Ok(reply)
             }
-            "despawn" => {
-                let r: EntityReq = serde_json::from_value(cmd).map_err(bad)?;
-                s.worlds.despawn(w, sim, &r.entity)?;
+            SimCommand::Despawn { entity } => {
+                s.worlds.despawn(w, sim, &entity)?;
                 reply["ok"] = json!(true);
                 Ok(reply)
             }
-            "attach" => {
-                let r: AttachReq = serde_json::from_value(cmd).map_err(bad)?;
-                s.worlds.attach(w, sim, &r.entity, &r.root, r.contained)?;
+            SimCommand::Attach {
+                entity,
+                root,
+                contained,
+            } => {
+                s.worlds.attach(w, sim, &entity, &root, contained)?;
                 reply["ok"] = json!(true);
                 Ok(reply)
             }
-            "detach" => {
-                let r: EntityReq = serde_json::from_value(cmd).map_err(bad)?;
-                s.worlds.detach(w, sim, &r.entity)?;
+            SimCommand::Detach { entity } => {
+                s.worlds.detach(w, sim, &entity)?;
                 reply["ok"] = json!(true);
                 Ok(reply)
             }
-            "apply" => {
-                let r: ApplyReq = serde_json::from_value(cmd).map_err(bad)?;
-                let pos = match (r.x, r.y) {
+            SimCommand::Apply {
+                entity,
+                x,
+                y,
+                components,
+            } => {
+                let pos = match (x, y) {
                     (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
                     (None, None) => None,
                     _ => return Err(Error::InvalidArgument("x and y go together".into())),
                 };
-                s.worlds.apply(w, sim, &r.entity, pos, r.components)?;
+                s.worlds.apply(w, sim, &entity, pos, components)?;
                 reply["ok"] = json!(true);
                 Ok(reply)
             }
-            "interact" => {
-                let r: InteractReq = serde_json::from_value(cmd).map_err(bad)?;
-                let (_, entity, spec) = r.spec();
+            SimCommand::Interact {
+                entity,
+                kind,
+                payload,
+                tick,
+                x,
+                y,
+                tolerance,
+            } => {
+                let at = match (x, y) {
+                    (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
+                    _ => None,
+                };
+                let spec = InteractSpec {
+                    kind,
+                    payload,
+                    at_tick: tick,
+                    at,
+                    tolerance,
+                };
                 reply["result"] = s.worlds.interact(w, sim, &entity, spec, &s.fanout)?;
                 Ok(reply)
             }
-            "colocate" => {
-                let r: CoLocateReq = serde_json::from_value(cmd).map_err(bad)?;
-                reply["result"] =
-                    s.worlds
-                        .co_locate(w, sim, &r.entity, &r.with, r.ttl_ticks, &s.fanout)?;
+            SimCommand::Colocate {
+                entity,
+                with,
+                ttl_ticks,
+            } => {
+                reply["result"] = s
+                    .worlds
+                    .co_locate(w, sim, &entity, &with, ttl_ticks, &s.fanout)?;
                 Ok(reply)
             }
-            "rewind" => {
-                let r: RewindReq = serde_json::from_value(cmd).map_err(bad)?;
-                let at = match (r.x, r.y) {
+            SimCommand::Rewind {
+                entity,
+                tick,
+                x,
+                y,
+                tolerance,
+            } => {
+                let at = match (x, y) {
                     (Some(x), Some(y)) => Some(Pos { x, y, z: 0.0 }),
                     _ => None,
                 };
                 reply["result"] =
                     s.worlds
-                        .rewind(w, &r.entity, r.tick, at, r.tolerance.unwrap_or(1.0))?;
+                        .rewind(w, &entity, tick, at, tolerance.unwrap_or(1.0))?;
                 Ok(reply)
             }
-            "handover_ack" => {
-                let r: EntityReq = serde_json::from_value(cmd).map_err(bad)?;
-                reply["result"] = s.worlds.handover_ack(w, sim, &r.entity)?;
+            SimCommand::HandoverAck { entity } => {
+                reply["result"] = s.worlds.handover_ack(w, sim, &entity)?;
                 Ok(reply)
             }
-            other => Err(Error::InvalidArgument(format!("unknown op `{other}`"))),
         }
     }
     .await;

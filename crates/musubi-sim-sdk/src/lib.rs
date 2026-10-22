@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use musubi_mesh::{CellId, SimEvent};
+use musubi_mesh::{CellId, SimCommand, SimEvent};
 use musubi_proto::realtime::WorldEntity;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -295,7 +295,7 @@ pub async fn run_sim<S: Simulator, F: std::future::Future<Output = ()>>(
             }
         };
         for ev in events {
-            let ev: SimEvent = match serde_json::from_value(ev) {
+            let ev: SimEvent<WorldEntity> = match serde_json::from_value(ev) {
                 Ok(ev) => ev,
                 Err(e) => {
                     tracing::warn!(error = %e, "event not understood");
@@ -313,12 +313,7 @@ pub async fn run_sim<S: Simulator, F: std::future::Future<Output = ()>>(
                     cells.retain(|x| *x != c);
                     logic.on_cell_revoked(c);
                 }
-                SimEvent::HandoverRequest {
-                    state: Some(state), ..
-                } => {
-                    let Ok(e) = serde_json::from_value::<WorldEntity>(state) else {
-                        continue;
-                    };
+                SimEvent::HandoverRequest { state: Some(e), .. } => {
                     if logic.on_handover_request(&e) {
                         let id = e.id.to_string();
                         match client.handover_ack(sim, &id).await {
@@ -471,7 +466,7 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
                     logic.on_cell_revoked(c);
                 }
                 for ev in v["events"].as_array().cloned().unwrap_or_default() {
-                    let ev: SimEvent = match serde_json::from_value(ev) {
+                    let ev: SimEvent<WorldEntity> = match serde_json::from_value(ev) {
                         Ok(ev) => ev,
                         Err(e) => {
                             tracing::warn!(error = %e, "event not understood");
@@ -479,16 +474,11 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
                         }
                     };
                     match ev {
-                        SimEvent::HandoverRequest {
-                            state: Some(state), ..
-                        } => {
-                            let Ok(e) = serde_json::from_value::<WorldEntity>(state) else {
-                                continue;
-                            };
+                        SimEvent::HandoverRequest { state: Some(e), .. } => {
                             if logic.on_handover_request(&e) {
                                 let id = e.id.to_string();
-                                let cmd = json!({"op": "handover_ack", "entity": id});
-                                if tx.send(Message::Text(cmd.to_string())).await.is_err() {
+                                let cmd = SimCommand::HandoverAck { entity: id.clone() };
+                                if tx.send(Message::Text(cmd.to_json())).await.is_err() {
                                     break;
                                 }
                                 pending_acks.push_back(id);
@@ -510,13 +500,13 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
                     }
                 }
                 for u in updates.values() {
-                    let mut cmd =
-                        json!({"op": "apply", "entity": u.entity, "components": u.components});
-                    if let Some((x, y)) = u.pos {
-                        cmd["x"] = json!(x);
-                        cmd["y"] = json!(y);
-                    }
-                    if tx.send(Message::Text(cmd.to_string())).await.is_err() {
+                    let cmd = SimCommand::Apply {
+                        entity: u.entity.clone(),
+                        x: u.pos.map(|p| p.0),
+                        y: u.pos.map(|p| p.1),
+                        components: serde_json::to_value(&u.components).unwrap_or(Value::Null),
+                    };
+                    if tx.send(Message::Text(cmd.to_json())).await.is_err() {
                         break;
                     }
                 }

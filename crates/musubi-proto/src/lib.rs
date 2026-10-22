@@ -53,12 +53,95 @@ impl Serialize for JsonText {
 impl<'de> Deserialize<'de> for JsonText {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         if d.is_human_readable() {
-            let raw: Box<serde_json::value::RawValue> = Deserialize::deserialize(d)?;
-            Ok(Self(raw.get().into()))
+            // Ask for serde_json's raw value: its own deserializers (text and `Value`) answer
+            // with the untouched text, which is the point of this type. Anything else — the
+            // buffered content serde builds for a `type`-tagged enum or a `flatten`, another
+            // format — hands over a plain value, which is re-serialized to text here, so a
+            // `JsonText` inside such an enum decodes instead of failing with "newtype struct".
+            d.deserialize_newtype_struct(RAW_VALUE_TOKEN, JsonTextVisitor)
         } else {
             let text = String::deserialize(d)?;
             Ok(Self(text.into()))
         }
+    }
+}
+
+/// serde_json's marker name for `RawValue` (stable since serde_json 1.0.25, what `RawValue`'s
+/// own `Deserialize` asks for).
+const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+struct JsonTextVisitor;
+
+impl<'de> serde::de::Visitor<'de> for JsonTextVisitor {
+    type Value = JsonText;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    /// serde_json's raw-value protocol: a one-entry map whose value is the raw text.
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<JsonText, A::Error> {
+        let Some(key) = map.next_key::<RawKey>()? else {
+            return Ok(JsonText("{}".into()));
+        };
+        if key.0 {
+            let text: String = map.next_value()?;
+            return Ok(JsonText(text.into()));
+        }
+        // an ordinary object (a buffered one): rebuild it as a value
+        let mut m = serde_json::Map::new();
+        m.insert(key.1, map.next_value()?);
+        while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+            m.insert(k, v);
+        }
+        Ok(JsonText::from_value(&serde_json::Value::Object(m)))
+    }
+
+    fn visit_newtype_struct<D: serde::Deserializer<'de>>(self, d: D) -> Result<JsonText, D::Error> {
+        Ok(JsonText::from_value(&serde_json::Value::deserialize(d)?))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<JsonText, A::Error> {
+        let v = serde_json::Value::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
+        Ok(JsonText::from_value(&v))
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<JsonText, E> {
+        Ok(JsonText::from_value(&v.into()))
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<JsonText, E> {
+        Ok(JsonText::from_value(&v.into()))
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<JsonText, E> {
+        Ok(JsonText::from_value(&v.into()))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<JsonText, E> {
+        Ok(JsonText::from_value(&v.into()))
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<JsonText, E> {
+        Ok(JsonText::from_value(&v.into()))
+    }
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<JsonText, E> {
+        Ok(JsonText::from_value(&v.into()))
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<JsonText, E> {
+        Ok(JsonText("null".into()))
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<JsonText, E> {
+        Ok(JsonText("null".into()))
+    }
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<JsonText, D::Error> {
+        JsonText::deserialize(d)
+    }
+}
+
+/// A map key: `true` when it is serde_json's raw-value marker, else the key's text.
+struct RawKey(bool, String);
+
+impl<'de> Deserialize<'de> for RawKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let k = String::deserialize(d)?;
+        Ok(RawKey(k == RAW_VALUE_TOKEN, k))
     }
 }
 
@@ -416,5 +499,58 @@ mod pos_cm_tests {
             .unwrap()
             .len();
         assert!(cm_len < f64_len, "{cm_len} vs {f64_len}");
+    }
+}
+
+#[cfg(test)]
+mod json_text_buffered_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Carrier {
+        name: String,
+        value: JsonText,
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Tagged {
+        Set { carrier: Carrier },
+    }
+
+    /// Straight from text the raw bytes are kept; from a type-tagged enum (serde buffers the
+    /// content and cannot hand out raw text) the value still decodes, re-serialized.
+    #[test]
+    fn decodes_raw_and_buffered() {
+        let raw = r#"{"name":"hp","value":{ "a" : [1, 2,3] }}"#;
+        let c: Carrier = serde_json::from_str(raw).unwrap();
+        assert_eq!(&*c.value.0, r#"{ "a" : [1, 2,3] }"#);
+        let t: Tagged =
+            serde_json::from_str(&format!(r#"{{"type":"set","carrier":{raw}}}"#)).unwrap();
+        let Tagged::Set { carrier } = t;
+        assert_eq!(
+            carrier.value.to_value(),
+            serde_json::json!({"a": [1, 2, 3]})
+        );
+        for v in [
+            serde_json::json!(7),
+            serde_json::json!("s"),
+            serde_json::json!(null),
+            serde_json::json!([1, {"k": true}]),
+            serde_json::json!({"n": 1.5}),
+        ] {
+            let wire = serde_json::json!({"type": "set", "carrier": {"name": "x", "value": v}});
+            let t: Tagged = serde_json::from_value(wire.clone()).unwrap();
+            let Tagged::Set { carrier } = t;
+            assert_eq!(carrier.value.to_value(), v, "{wire}");
+            let t: Tagged = serde_json::from_str(&wire.to_string()).unwrap();
+            let Tagged::Set { carrier } = t;
+            assert_eq!(carrier.value.to_value(), v, "{wire}");
+        }
+        // binary encodings carry the text as a string
+        let bytes = postcard::to_allocvec(&c).unwrap();
+        let back: Carrier = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, c);
     }
 }

@@ -2,10 +2,10 @@
 //! stream `tick` frame): one typed enum, tagged by `type`, serialized exactly like the ad-hoc
 //! JSON it replaces (`sim_event_wire` tests pin every variant). Generic over the entity payload
 //! so the server fills it with its wire entity type and a simulator reads it back as the same
-//! type (or as raw JSON with `SimEvent<serde_json::Value>`, the default). A reader whose entity
-//! type keeps component values as raw JSON text (`musubi_proto::JsonText`) must read the event
-//! as `SimEvent<Value>` and convert the payload afterwards: a `type`-tagged enum is decoded
-//! through serde's buffered content, which cannot hand out raw text.
+//! type (or as raw JSON with `SimEvent<serde_json::Value>`, the default). Note for payload
+//! types: a `type`-tagged enum is decoded through serde's buffered content, which cannot hand
+//! out raw JSON text — `musubi_proto::JsonText` handles that itself (re-serializing), a custom
+//! raw-text type must do the same.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
