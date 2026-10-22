@@ -890,7 +890,23 @@ async fn stream(
     Ok(ws.on_upgrade(move |socket| serve_stream(s, w, q.sim, uri, socket)))
 }
 
-async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, mut socket: WebSocket) {
+async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, socket: WebSocket) {
+    use futures::{SinkExt, StreamExt};
+    // Frames leave through a bounded channel on their own task, so writing to a slow simulator
+    // never stops this loop from reading what the simulator sends: a handover ack used to wait
+    // behind the full-state frame being written (the stand's simulators took 18.7 of 30 frames
+    // a second and ~15 000 handovers a run expired on the 10-tick timeout before their ack was
+    // read). A tick that finds the channel full is skipped — the next frame carries the current
+    // state, and events are drained only when a frame is actually built, so none are lost.
+    let (mut sink, mut source) = socket.split();
+    let (out, mut out_rx) = tokio::sync::mpsc::channel::<Message>(2);
+    let mut writer = tokio::spawn(async move {
+        while let Some(m) = out_rx.recv().await {
+            if sink.send(m).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut ticks = s.worlds.subscribe_ticks();
     loop {
         tokio::select! {
@@ -900,19 +916,21 @@ async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, mut s
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 };
+                let Ok(slot) = out.try_reserve() else {
+                    metrics::counter!("musubi_world_sim_frames_skipped_total").increment(1);
+                    continue;
+                };
                 let frame = match tick_frame(&s, &w, sim, t) {
                     Ok(f) => f,
                     Err(e) => json!({ "type": "error", "tick": t, "error": e.to_string() }),
                 };
-                if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
-                    break;
-                }
+                slot.send(Message::Text(frame.to_string().into()));
             }
-            m = socket.recv() => {
+            m = source.next() => {
                 match m {
                     Some(Ok(Message::Text(txt))) => {
                         let reply = stream_command(&s, &w, sim, &uri, txt.as_str()).await;
-                        if socket.send(Message::Text(reply.to_string().into())).await.is_err() {
+                        if out.send(Message::Text(reply.to_string().into())).await.is_err() {
                             break;
                         }
                     }
@@ -920,8 +938,10 @@ async fn serve_stream(s: AppState, w: String, sim: Uuid, uri: OriginalUri, mut s
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 }
             }
+            _ = &mut writer => break,
         }
     }
+    writer.abort();
 }
 
 fn tick_frame(s: &AppState, w: &str, sim: Uuid, tick: u64) -> Result<Value, Error> {

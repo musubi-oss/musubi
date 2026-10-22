@@ -4502,11 +4502,14 @@ impl WorldRegistry {
         let from = st
             .world
             .get(id)
-            .and_then(|e| e.transit.as_ref().map(|t| t.from));
+            .and_then(|e| e.transit.as_ref().map(|t| (t.from, t.requested_tick)));
         let (outcome, inputs) = st.world.handover_ack(sim, id).map_err(mesh_err)?;
-        if let Some(from) = from {
+        if let Some((from, asked)) = from {
             metrics::counter!("musubi_world_handovers_total", "world" => name.to_string())
                 .increment(1);
+            // how long the simulator's answer took: the handover timeout should sit above this
+            metrics::histogram!("musubi_world_handover_ack_latency_ticks")
+                .record(st.world.tick.saturating_sub(asked) as f64);
             metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
                 .increment(1);
             push_event(

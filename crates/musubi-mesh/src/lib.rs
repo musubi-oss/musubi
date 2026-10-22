@@ -307,8 +307,10 @@ pub struct WorldConfig {
     pub hysteresis: f64,
     pub lease_ttl_ticks: u64,
     /// Ticks the new owner has to `handover_ack` before the handover is rolled back. A simulator
-    /// on the stream answers on its next frame, so under load 3 ticks (100 ms at 30 Hz) cancelled
-    /// half of them; 10 is a third of a second.
+    /// on the stream answers on its next frame: 3 ticks (100 ms at 30 Hz) cancelled half of them
+    /// under load, and at 10 the acks that made it in time peaked at 9–10 ticks while 13 500 a
+    /// run came later and were only rescued as late acks. 30 (1 s) sits above a loaded
+    /// simulator's round trip; the same as the remote timeout.
     pub handover_timeout_ticks: u64,
     /// Ticks a handover to a shard on another node may wait for its ack before it is rolled
     /// back and re-sent: the ack crosses the node bus twice and the receiver's journal flush, so
@@ -378,7 +380,7 @@ impl Default for WorldConfig {
             ghost_margin: 48.0,
             hysteresis: 24.0,
             lease_ttl_ticks: 60,
-            handover_timeout_ticks: 10,
+            handover_timeout_ticks: 30,
             remote_handover_timeout_ticks: 30,
             contact_colocate_after_ticks: 10,
             contact_colocate_ttl_ticks: 300,

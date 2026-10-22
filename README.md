@@ -133,7 +133,15 @@ per run expired after `handover_timeout_ticks` because the simulator's ack took 
 thrown away. A late ack is now accepted when the entity still stands in a cell the acking
 simulator owns — distinct requests per run 10 771 → 4 202 with 3 245 completed (77 %, was
 32 %), local expiries 15 257 → 7 465, and each expiry is closed by the ack instead of a
-re-ask. The control lane's gap replay (`OrderNack`, above) was then put on the same stand: a
+re-ask. The simulator stream itself no longer makes an ack wait: frames used to be written
+in the same loop that read the simulator's commands, so an ack sat behind the full-state frame
+being sent — frames now leave through a bounded channel on their own task, a tick that finds it
+full is skipped (`musubi_world_sim_frames_skipped_total`; events are drained only when a frame
+is built, so none are lost) and the ack's age is measured
+(`musubi_world_handover_ack_latency_ticks`). Honest result: on this stand the server's writer
+was almost never the blocker (34 skipped frames a run) — the simulators here are 32 bots in one
+bench process parsing full-state JSON at 70 % CPU, so the split alone moved expiries only
+15 406 → 13 530; the timeout default did the rest (next bullet list). The control lane's gap replay (`OrderNack`, above) was then put on the same stand: a
 players-split run showed no gaps and no nacks on either node and two duplicate frames dropped on
 the peer — the QUIC bus loses nothing on one VM, so the replay is exercised by its unit tests and
 is there for the Postgres fallback, reconnects and lossy links (26.7 fps per client, p99 171 ms,
@@ -206,6 +214,11 @@ the world's single thread, with the other cores idle (run 3 before: 1.6 of 8 cor
 - `handover_timeout_ticks` default 3 → 10: a simulator on the stream answers on its next frame,
   and 100 ms cancelled half of the handovers under load (run 3 before: 6 982 of 13 744 asked —
   the rest were rolled back and re-requested); at 10 ticks every handover completes.
+- `handover_timeout_ticks` default 10 → 30 (same as the remote timeout): measured on the
+  two-node stand (`musubi_world_handover_ack_latency_ticks`), the acks that made it in time
+  peaked at 9–10 ticks and ~13 500 a run came later; at 30 the in-time acks sit at p50 5 /
+  p99 19 ticks and expiries halve (13 530 → 8 204) — the rest are simulators that take over a
+  second to answer on a 70 %-CPU bench process, and a late ack still completes them.
 
 Also fixed on the way: a session whose outbound queue was full used to spill its message onto
 the cluster bus (whose Postgres `NOTIFY` lane caps payloads at 7 900 bytes — the log filled with
