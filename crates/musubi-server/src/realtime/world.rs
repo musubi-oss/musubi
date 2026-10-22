@@ -11,6 +11,7 @@ use std::time::Duration;
 use dashmap::{DashMap, DashSet};
 use musubi_core::{Error, Result, SessionId};
 use musubi_mesh::controller::{Assignment, Controller, ControllerConfig, SimInfo, Strategy};
+use musubi_mesh::SimEvent;
 use musubi_mesh::{
     CellId, ClientId, Delta, Entity, EntityId, HandoverOutcome, Interest, Pos, World, WorldConfig,
 };
@@ -185,7 +186,10 @@ fn tx_apply_local(st: &mut WorldState, tx: Uuid, ops: &[TxOp]) -> Vec<EntityId> 
             push_event(
                 st,
                 owner,
-                json!({"type": "tx_committed", "tx": tx, "entity": op.entity}),
+                SimEvent::<WorldEntity>::TxCommitted {
+                    tx,
+                    entity: op.entity,
+                },
             );
         }
         applied.push(op.entity);
@@ -1050,7 +1054,11 @@ impl WorldRegistry {
             push_event(
                 st,
                 sim,
-                json!({"type": "cell_released", "cell": cell, "node": node, "entities": n}),
+                SimEvent::<WorldEntity>::CellReleased {
+                    cell,
+                    node,
+                    entities: n,
+                },
             );
         }
         if n > 0 {
@@ -2392,7 +2400,12 @@ impl WorldRegistry {
                     Err(Error::NotFound(_)) if self.is_split(&env.world) => {
                         match parse_entity(&entity) {
                             Ok(id) => {
-                                let ev = json!({"type": "input", "entity": id, "session": env.session_id, "input": input});
+                                let ev = SimEvent::<WorldEntity>::Input {
+                                    entity: id,
+                                    session: json!(env.session_id),
+                                    input,
+                                }
+                                .to_value();
                                 fanout.world_input(&env.world, id, ev);
                                 Ok(())
                             }
@@ -2458,7 +2471,10 @@ impl WorldRegistry {
                         push_event(
                             st,
                             t.from,
-                            json!({"type": "handover_cancelled", "entity": id, "reason": "target node died; cell re-homed"}),
+                            SimEvent::<WorldEntity>::HandoverCancelled {
+                                entity: id,
+                                reason: "target node died; cell re-homed".into(),
+                            },
                         );
                     }
                 }
@@ -3111,7 +3127,10 @@ impl WorldRegistry {
             push_event(
                 st,
                 sim,
-                json!({"type": "cell_full", "cell": cell, "soft_cap": st.world.cfg.soft_cap}),
+                SimEvent::<WorldEntity>::CellFull {
+                    cell,
+                    soft_cap: st.world.cfg.soft_cap,
+                },
             );
             return Err(mesh_err(musubi_mesh::MeshError::CellFull(
                 cell,
@@ -3148,8 +3167,13 @@ impl WorldRegistry {
             push_event(
                 st,
                 sim,
-                json!({"type": "queued", "ticket": ticket, "cell": cell, "position": position,
-                       "eta_ticks": eta_ticks, "soft_cap": soft_cap}),
+                SimEvent::<WorldEntity>::Queued {
+                    ticket,
+                    cell,
+                    position,
+                    eta_ticks,
+                    soft_cap,
+                },
             );
             return Ok(SpawnOutcome::Queued {
                 ticket,
@@ -3189,7 +3213,13 @@ impl WorldRegistry {
             push_event(
                 st,
                 owner,
-                json!({"type": "co_locate", "entity": id, "cell": cell, "by": by, "until_tick": until}),
+                SimEvent::<WorldEntity>::CoLocate {
+                    entity: id,
+                    with: None,
+                    cell,
+                    by,
+                    until_tick: until,
+                },
             );
         }
     }
@@ -3250,7 +3280,13 @@ impl WorldRegistry {
             push_event(
                 st,
                 owner,
-                json!({"type": "co_locate", "entity": b, "with": a, "cell": cell, "by": sim, "until_tick": until}),
+                SimEvent::<WorldEntity>::CoLocate {
+                    entity: b,
+                    with: Some(a),
+                    cell,
+                    by: sim,
+                    until_tick: until,
+                },
             );
         }
         Ok(
@@ -3305,7 +3341,13 @@ impl WorldRegistry {
                         push_event(
                             st,
                             owner,
-                            json!({"type": "co_locate", "entity": x, "with": b, "cell": anchor, "by": sim, "until_tick": until}),
+                            SimEvent::<WorldEntity>::CoLocate {
+                                entity: x,
+                                with: Some(b),
+                                cell: anchor,
+                                by: sim,
+                                until_tick: until,
+                            },
                         );
                     }
                 }
@@ -4006,7 +4048,12 @@ impl WorldRegistry {
             push_event(
                 st,
                 owner,
-                json!({"type": "handover_arrived", "entity": id, "from_node": from_node, "state": state, "buffered_inputs": inputs}),
+                SimEvent::HandoverArrived {
+                    entity: id,
+                    from_node,
+                    state,
+                    buffered_inputs: inputs,
+                },
             );
         }
         if durable {
@@ -4186,14 +4233,21 @@ impl WorldRegistry {
             push_event(
                 st,
                 t.from,
-                json!({"type": "handover_completed", "entity": id, "to": t.to, "node": t.to}),
+                SimEvent::<WorldEntity>::HandoverCompleted {
+                    entity: id,
+                    to: t.to,
+                    node: Some(t.to),
+                },
             );
         } else {
             st.world.cancel_handover(id);
             push_event(
                 st,
                 t.from,
-                json!({"type": "handover_cancelled", "entity": id, "reason": format!("node {} refused: no simulator owns the cell", t.to)}),
+                SimEvent::<WorldEntity>::HandoverCancelled {
+                    entity: id,
+                    reason: format!("node {} refused: no simulator owns the cell", t.to),
+                },
             );
         }
     }
@@ -4415,7 +4469,11 @@ impl WorldRegistry {
                 push_event(
                     st,
                     owner,
-                    json!({"type": "tx_aborted", "tx": tx, "entity": id, "reason": reason}),
+                    SimEvent::<WorldEntity>::TxAborted {
+                        tx,
+                        entity: id,
+                        reason: reason.to_string(),
+                    },
                 );
             }
         }
@@ -4550,7 +4608,10 @@ impl WorldRegistry {
                                 push_event(
                                     &mut st,
                                     owner,
-                                    json!({"type": "cell_reloaded", "cell": cell, "entities": count}),
+                                    SimEvent::<WorldEntity>::CellReloaded {
+                                        cell,
+                                        entities: count,
+                                    },
                                 );
                             }
                             count
@@ -4704,10 +4765,19 @@ impl WorldRegistry {
             }
             metrics::counter!("musubi_world_contacts_total", "path" => "applied").increment(1);
         }
-        let ev = json!({
-            "type": "interaction", "entity": id, "kind": spec.kind, "payload": spec.payload,
-            "from_sim": sim, "at_tick": spec.at_tick, "at": spec.at, "tolerance": spec.tolerance,
-        });
+        let ev = SimEvent::<WorldEntity>::Interaction {
+            entity: id,
+            kind: spec.kind,
+            payload: spec.payload,
+            from_sim: sim,
+            at_tick: spec.at_tick,
+            at: spec.at,
+            tolerance: spec.tolerance,
+            rewind: None,
+            seq: None,
+            tick: None,
+        }
+        .to_value();
         if let Some(other) = colocate {
             drop(guard);
             // the pair keeps touching across a border: pin the target into the reporter's cell
@@ -4798,7 +4868,11 @@ impl WorldRegistry {
             push_event(
                 st,
                 from,
-                json!({"type": "handover_completed", "entity": id, "to": sim}),
+                SimEvent::<WorldEntity>::HandoverCompleted {
+                    entity: id,
+                    to: sim,
+                    node: None,
+                },
             );
         }
         Ok(json!({ "outcome": outcome, "buffered_inputs": inputs }))
@@ -4967,7 +5041,12 @@ impl WorldRegistry {
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
-        let ev = json!({"type": "input", "entity": id, "session": sid, "input": input});
+        let ev = SimEvent::<WorldEntity>::Input {
+            entity: id,
+            session: json!(sid),
+            input,
+        }
+        .to_value();
         if let Some(sim) = st.world.route_input(id, ev.clone()).map_err(mesh_err)? {
             push_event(st, sim, ev);
         }
@@ -5228,7 +5307,12 @@ impl WorldRegistry {
                             push_event(
                                 st,
                                 from,
-                                json!({"type": "handover_started", "entity": id, "to": host, "node": host}),
+                                SimEvent::<WorldEntity>::HandoverStarted {
+                                    entity: id,
+                                    to: host,
+                                    node: Some(host),
+                                    group: None,
+                                },
                             );
                         }
                     }
@@ -5326,8 +5410,11 @@ impl WorldRegistry {
                         push_event(
                             st,
                             sim,
-                            json!({"type": "cell_hibernated", "cell": cell, "ephemeral_despawned": ephemeral,
-                                   "persistent_kept": st.world.entities_in(cell)}),
+                            SimEvent::<WorldEntity>::CellHibernated {
+                                cell,
+                                ephemeral_despawned: ephemeral,
+                                persistent_kept: st.world.entities_in(cell),
+                            },
                         );
                     }
                     tracing::info!(world = %name, ?cell, ephemeral, "cell hibernated");
@@ -5341,7 +5428,7 @@ impl WorldRegistry {
                     push_event(
                         st,
                         owner,
-                        json!({"type": "time_scale", "cell": cell, "scale": scale}),
+                        SimEvent::<WorldEntity>::TimeScale { cell, scale },
                     );
                 }
                 tracing::info!(world = %name, ?cell, scale, "cell time scale changed");
@@ -5370,12 +5457,22 @@ impl WorldRegistry {
                         push_event(
                             st,
                             to,
-                            json!({"type": "handover_request", "entity": entity, "from": from, "state": full, "group": parts}),
+                            SimEvent::HandoverRequest {
+                                entity,
+                                from,
+                                state: full,
+                                group: parts,
+                            },
                         );
                         push_event(
                             st,
                             from,
-                            json!({"type": "handover_started", "entity": entity, "to": to, "group": group}),
+                            SimEvent::<WorldEntity>::HandoverStarted {
+                                entity,
+                                to,
+                                node: None,
+                                group: Some(group),
+                            },
                         );
                     }
                     HandoverOutcome::Completed { entity, to } => {
@@ -5499,7 +5596,10 @@ impl WorldRegistry {
                             push_event(
                                 st,
                                 s,
-                                json!({"type": "handover_cancelled", "entity": entity, "reason": reason}),
+                                SimEvent::<WorldEntity>::HandoverCancelled {
+                                    entity,
+                                    reason: reason.clone(),
+                                },
                             );
                         }
                     }
@@ -5895,13 +5995,21 @@ fn announce(st: &mut WorldState, a: &Assignment) {
         push_event(
             st,
             from,
-            json!({"type": "cell_revoked", "cell": a.cell, "to": a.to, "reason": a.reason}),
+            SimEvent::<WorldEntity>::CellRevoked {
+                cell: a.cell,
+                to: a.to,
+                reason: a.reason.clone(),
+            },
         );
     }
     push_event(
         st,
         a.to,
-        json!({"type": "cell_assigned", "cell": a.cell, "from": a.from, "reason": a.reason}),
+        SimEvent::<WorldEntity>::CellAssigned {
+            cell: a.cell,
+            from: a.from,
+            reason: a.reason.clone(),
+        },
     );
 }
 
@@ -5980,7 +6088,7 @@ fn decay_entities(st: &mut WorldState) {
             push_event(
                 st,
                 owner,
-                json!({"type": "decayed", "entity": id, "cell": cell}),
+                SimEvent::<WorldEntity>::Decayed { entity: id, cell },
             );
         }
     }
@@ -6013,8 +6121,12 @@ fn drain_admission(st: &mut WorldState) {
             if expired || lost {
                 events.push((
                     e.sim,
-                    json!({"type": "queue_expired", "ticket": e.ticket, "cell": cell,
-                           "reason": if lost { "lease_lost" } else { "timeout" }}),
+                    SimEvent::<WorldEntity>::QueueExpired {
+                        ticket: e.ticket,
+                        cell,
+                        reason: (if lost { "lease_lost" } else { "timeout" }).into(),
+                    }
+                    .to_value(),
                 ));
             }
             !(expired || lost)
@@ -6044,8 +6156,12 @@ fn drain_admission(st: &mut WorldState) {
             }
             events.push((
                 e.sim,
-                json!({"type": "queue_admitted", "ticket": e.ticket, "cell": cell,
-                       "entity": to_wire(st.world.get(id).unwrap())}),
+                SimEvent::QueueAdmitted {
+                    ticket: e.ticket,
+                    cell,
+                    entity: to_wire(st.world.get(id).unwrap()),
+                }
+                .to_value(),
             ));
         }
         let departures = q.departures;
@@ -6056,8 +6172,13 @@ fn drain_admission(st: &mut WorldState) {
                 e.reported = (position, eta);
                 events.push((
                     e.sim,
-                    json!({"type": "queue_update", "ticket": e.ticket, "cell": cell,
-                           "position": position, "eta_ticks": eta}),
+                    SimEvent::<WorldEntity>::QueueUpdate {
+                        ticket: e.ticket,
+                        cell,
+                        position,
+                        eta_ticks: eta,
+                    }
+                    .to_value(),
                 ));
             }
         }
@@ -6071,10 +6192,10 @@ fn drain_admission(st: &mut WorldState) {
     }
 }
 
-fn push_event(st: &mut WorldState, sim: Uuid, ev: Value) {
+fn push_event(st: &mut WorldState, sim: Uuid, ev: impl Into<Value>) {
     let q = st.sim_events.entry(sim).or_default();
     if q.len() < MAX_SIM_EVENTS {
-        q.push(ev);
+        q.push(ev.into());
     }
 }
 

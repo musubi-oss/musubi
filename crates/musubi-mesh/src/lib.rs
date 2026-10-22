@@ -9,6 +9,8 @@
 //! `z` index (P1-57). Non-spatial partition keys plug into `CellId` later.
 
 pub mod controller;
+pub mod sim_event;
+pub use sim_event::SimEvent;
 pub mod ghost;
 pub use ghost::{GhostCache, GhostDelta, GhostSendState, GhostUpsert};
 

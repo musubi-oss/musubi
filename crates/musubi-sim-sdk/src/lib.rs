@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use musubi_mesh::CellId;
+use musubi_mesh::{CellId, SimEvent};
 use musubi_proto::realtime::WorldEntity;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -295,23 +295,28 @@ pub async fn run_sim<S: Simulator, F: std::future::Future<Output = ()>>(
             }
         };
         for ev in events {
-            match ev["type"].as_str().unwrap_or("") {
-                "cell_assigned" => {
-                    if let Ok(c) = serde_json::from_value::<CellId>(ev["cell"].clone()) {
-                        if !cells.contains(&c) {
-                            cells.push(c);
-                        }
-                        logic.on_cell_assigned(c);
-                    }
+            let ev: SimEvent = match serde_json::from_value(ev) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    tracing::warn!(error = %e, "event not understood");
+                    continue;
                 }
-                "cell_revoked" => {
-                    if let Ok(c) = serde_json::from_value::<CellId>(ev["cell"].clone()) {
-                        cells.retain(|x| *x != c);
-                        logic.on_cell_revoked(c);
+            };
+            match ev {
+                SimEvent::CellAssigned { cell: c, .. } => {
+                    if !cells.contains(&c) {
+                        cells.push(c);
                     }
+                    logic.on_cell_assigned(c);
                 }
-                "handover_request" => {
-                    let Ok(e) = serde_json::from_value::<WorldEntity>(ev["state"].clone()) else {
+                SimEvent::CellRevoked { cell: c, .. } => {
+                    cells.retain(|x| *x != c);
+                    logic.on_cell_revoked(c);
+                }
+                SimEvent::HandoverRequest {
+                    state: Some(state), ..
+                } => {
+                    let Ok(e) = serde_json::from_value::<WorldEntity>(state) else {
                         continue;
                     };
                     if logic.on_handover_request(&e) {
@@ -328,10 +333,8 @@ pub async fn run_sim<S: Simulator, F: std::future::Future<Output = ()>>(
                         }
                     }
                 }
-                "input" => {
-                    if let Some(id) = ev["entity"].as_str() {
-                        logic.on_input(id, &ev["input"]);
-                    }
+                SimEvent::Input { entity, input, .. } => {
+                    logic.on_input(&entity.to_string(), &input);
                 }
                 _ => {}
             }
@@ -468,10 +471,18 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
                     logic.on_cell_revoked(c);
                 }
                 for ev in v["events"].as_array().cloned().unwrap_or_default() {
-                    match ev["type"].as_str().unwrap_or("") {
-                        "handover_request" => {
-                            let Ok(e) = serde_json::from_value::<WorldEntity>(ev["state"].clone())
-                            else {
+                    let ev: SimEvent = match serde_json::from_value(ev) {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "event not understood");
+                            continue;
+                        }
+                    };
+                    match ev {
+                        SimEvent::HandoverRequest {
+                            state: Some(state), ..
+                        } => {
+                            let Ok(e) = serde_json::from_value::<WorldEntity>(state) else {
                                 continue;
                             };
                             if logic.on_handover_request(&e) {
@@ -483,10 +494,8 @@ pub async fn run_sim_stream<S: Simulator, F: std::future::Future<Output = ()>>(
                                 pending_acks.push_back(id);
                             }
                         }
-                        "input" => {
-                            if let Some(id) = ev["entity"].as_str() {
-                                logic.on_input(id, &ev["input"]);
-                            }
+                        SimEvent::Input { entity, input, .. } => {
+                            logic.on_input(&entity.to_string(), &input);
                         }
                         _ => {}
                     }

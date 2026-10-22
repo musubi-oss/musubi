@@ -1211,6 +1211,9 @@ async fn world_handovers(
         .unwrap_or(i64::MIN);
     steps.extend(fresh.into_iter().filter(|st| st.ms > flushed_to));
     steps.sort_by_key(|st| st.ms);
+    if steps.len() > limit {
+        steps.drain(..steps.len() - limit);
+    }
     Ok(Json(json!({"steps": steps})))
 }
 
