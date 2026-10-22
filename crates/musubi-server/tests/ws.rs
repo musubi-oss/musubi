@@ -7261,7 +7261,10 @@ async fn cross_border_contact_dedupes_and_colocates() {
         "/v1/server/worlds",
         None,
         true,
-        Some(serde_json::json!({"name": name, "config": {"cell_size": 100.0}})),
+        Some(serde_json::json!({
+            "name": name,
+            "config": {"cell_size": 100.0, "contact_colocate_after_ticks": 4}
+        })),
     )
     .await;
     assert_eq!(st, 200, "{w}");
@@ -7354,7 +7357,7 @@ async fn cross_border_contact_dedupes_and_colocates() {
             "payload": {"other": b, "impulse": [1.0, 0.0, 0.0], "point": [100.0, 50.0]},
         })
     };
-    let mut colocated_at: Option<u64> = None;
+    let mut colocated_at: Vec<u64> = Vec::new();
     for i in 0..10u64 {
         let (st, r) = http_json(
             &router2,
@@ -7368,7 +7371,7 @@ async fn cross_border_contact_dedupes_and_colocates() {
         assert_eq!(st, 200, "{r}");
         assert_eq!(r["delivered"], "forwarded", "{r}");
         if r["colocated"] == json!(true) {
-            colocated_at = Some(i);
+            colocated_at.push(i);
         }
         if i == 0 {
             // the other side of the border reports the same contact for the same tick
@@ -7387,8 +7390,8 @@ async fn cross_border_contact_dedupes_and_colocates() {
     }
     assert_eq!(
         colocated_at,
-        Some(9),
-        "tenth consecutive contact co-locates"
+        vec![3, 7],
+        "the per-world threshold (4 consecutive contacts) co-locates and renews the pin"
     );
     // the forwarded contacts reach whichever simulator owns the crate when they land: the old
     // owner sees a prefix, the rest ride with the pin's handover as buffered inputs and surface

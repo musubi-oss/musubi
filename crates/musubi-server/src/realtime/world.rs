@@ -324,15 +324,11 @@ pub struct SpawnSpec {
     pub queue: bool,
 }
 
-/// A simulator's interaction with an entity it may not own; `at_tick`/`at` let the owner check
-/// where the target really was when the actor acted (lag compensation).
-/// A cross-border contact pair is co-located after this many consecutive ticks of contact …
-const CONTACT_COLOCATE_AFTER: u32 = 10;
-/// … for this many ticks (the pin renews if they keep touching).
-const CONTACT_COLOCATE_TTL: u64 = 300;
 /// Contact pairs not seen for this long are forgotten.
 const CONTACT_WINDOW_TICKS: u64 = 60;
 
+/// A simulator's interaction with an entity it may not own; `at_tick`/`at` let the owner check
+/// where the target really was when the actor acted (lag compensation).
 #[derive(Debug, Clone)]
 pub struct InteractSpec {
     pub kind: String,
@@ -4396,6 +4392,10 @@ impl WorldRegistry {
         let w = self.get(name)?;
         let mut guard = w.lock();
         let st = &mut *guard;
+        let (colocate_after, colocate_ttl) = (
+            st.world.cfg.contact_colocate_after_ticks,
+            st.world.cfg.contact_colocate_ttl_ticks,
+        );
         // `contact`: a physical contact with a ghost. The owner of the target applies the
         // impulse (as any interaction); the same contact seen from both sides of the border is
         // applied once; a pair that keeps touching across the border is co-located so one
@@ -4429,7 +4429,7 @@ impl WorldRegistry {
                 (Some(a), Some(b)) => a.cell != b.cell,
                 _ => true,
             };
-            if across && streak >= CONTACT_COLOCATE_AFTER {
+            if across && colocate_after > 0 && streak >= colocate_after {
                 e.1 = 0;
                 colocate = Some(other);
             }
@@ -4443,14 +4443,7 @@ impl WorldRegistry {
             drop(guard);
             // the pair keeps touching across a border: pin the target into the reporter's cell
             let pinned = self
-                .co_locate(
-                    name,
-                    sim,
-                    &other.to_string(),
-                    entity,
-                    CONTACT_COLOCATE_TTL,
-                    fanout,
-                )
+                .co_locate(name, sim, &other.to_string(), entity, colocate_ttl, fanout)
                 .is_ok();
             metrics::counter!("musubi_world_contacts_total", "path" => "colocated").increment(1);
             let w = self.get(name)?;

@@ -309,6 +309,11 @@ pub struct WorldConfig {
     /// back and re-sent: the ack crosses the node bus twice and the receiver's journal flush, so
     /// it needs more than a simulator on a local stream. 30 (1 s at 30 Hz).
     pub remote_handover_timeout_ticks: u64,
+    /// A pair of bodies reporting a cross-cell contact this many ticks in a row is co-located
+    /// in one cell (0 = never co-locate).
+    pub contact_colocate_after_ticks: u32,
+    /// How long (ticks) a co-location pin keeps the pair together after the last contact.
+    pub contact_colocate_ttl_ticks: u64,
     /// Default per-client delta budget per tick (bytes, estimated); a subscription may lower it.
     pub client_budget_bytes: usize,
     /// Fewest ticks between two deltas to one client (1 = every tick). Raising it caps the
@@ -370,6 +375,8 @@ impl Default for WorldConfig {
             lease_ttl_ticks: 60,
             handover_timeout_ticks: 10,
             remote_handover_timeout_ticks: 30,
+            contact_colocate_after_ticks: 10,
+            contact_colocate_ttl_ticks: 300,
             client_budget_bytes: 16 * 1024,
             client_min_delta_ticks: 1,
             keyframe_ticks: 30,
@@ -2330,6 +2337,24 @@ fn estimate_refs(v: &[ComponentRef]) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    /// Contact co-location is per-world config with the historical constants as defaults.
+    #[test]
+    fn contact_colocation_is_world_config() {
+        let d = WorldConfig::default();
+        assert_eq!(d.contact_colocate_after_ticks, 10);
+        assert_eq!(d.contact_colocate_ttl_ticks, 300);
+        let c: WorldConfig =
+            serde_json::from_str(r#"{"contact_colocate_after_ticks": 2}"#).unwrap();
+        assert_eq!(c.contact_colocate_after_ticks, 2);
+        assert_eq!(c.contact_colocate_ttl_ticks, 300);
+        let c: WorldConfig = serde_json::from_str(
+            r#"{"contact_colocate_after_ticks": 0, "contact_colocate_ttl_ticks": 50}"#,
+        )
+        .unwrap();
+        assert_eq!(c.contact_colocate_after_ticks, 0);
+        assert_eq!(c.contact_colocate_ttl_ticks, 50);
+    }
 
     /// Above `PAR_DELTAS_MIN` clients the per-client scan runs in parallel chunks; every client
     /// must get exactly the delta the sequential scan would have produced.
