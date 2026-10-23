@@ -1,17 +1,19 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "GameFramework/Actor.h"
+#include "GameFramework/Character.h"
 #include "MusubiNitlPawn.generated.h"
 
-/** The entity's actor in the node-in-the-loop run: replicated, walks +X on its owner at `-MusubiNitlWalk=<units/s>`. */
+/** The entity's actor in the node-in-the-loop run: a replicated Character the client possesses and drives +X (flying, no floor on the Entry map). */
 UCLASS()
-class MUSUBINITL_API AMusubiNitlPawn : public AActor
+class MUSUBINITL_API AMusubiNitlPawn : public ACharacter
 {
 	GENERATED_BODY()
 public:
 	AMusubiNitlPawn();
 	virtual void Tick(float DeltaSeconds) override;
+	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+	virtual void PossessedBy(AController* NewController) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	UPROPERTY(VisibleAnywhere, Category = "Musubi") TObjectPtr<class UMusubiAuthorityComponent> Authority;
@@ -21,6 +23,5 @@ public:
 	/** Same counter, but push-model (dirty only via MARK_PROPERTY_DIRTY): proves the classic driver still sees push-based
 	 *  dirtiness on an actor the Musubi Iris export system has registered (push ids are a single slot shared by both). */
 	UPROPERTY(Replicated) int32 PushSteps = 0;
-	float Walk = 0.f;
 	double LastLog = 0;
 };

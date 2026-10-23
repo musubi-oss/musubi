@@ -218,7 +218,7 @@ void UMusubiAuthorityComponent::RestorePhysicsFromComponents()
 	if (!S || !S->Value.Value.IsValid() || !S->Value.Value->TryGetObject(P) || !P)
 	{
 		// older owner: velocities only
-		B->SetSimulatePhysics(true);
+		B->SetSimulatePhysics(BodySimulates());
 		FVector V;
 		if (const FState* L = Components.Find(VelocityComponent()); L && VecFromJson(L->Value, V)) B->SetPhysicsLinearVelocity(V);
 		if (const FState* A = Components.Find(AngularVelocityComponent()); A && VecFromJson(A->Value, V)) B->SetPhysicsAngularVelocityInRadians(V);
@@ -227,8 +227,9 @@ void UMusubiAuthorityComponent::RestorePhysicsFromComponents()
 	// order matters in Chaos: pose while kinematic, then simulate, then velocities (ignored on a kinematic body), then sleep
 	FQuat Q;
 	if (QuatFromJson((*P)->TryGetField(TEXT("q")), Q)) B->SetWorldRotation(Q, false, nullptr, ETeleportType::TeleportPhysics);
-	bool bSim = true;
+	bool bSim = BodySimulates();
 	(*P)->TryGetBoolField(TEXT("sim"), bSim);
+	bSim = bSim && BodySimulates();
 	B->SetSimulatePhysics(bSim);
 	if (bSim)
 	{
@@ -264,5 +265,16 @@ void UMusubiAuthorityComponent::SetPhysicsEnabled(bool bEnable)
 	UPrimitiveComponent* B = Body();
 	if (!B) return;
 	// ghosts and frozen bodies stay kinematic: Chaos sees them for contacts, nothing moves them but the node
-	B->SetSimulatePhysics(bEnable);
+	B->SetSimulatePhysics(bEnable && BodySimulates());
+}
+
+bool UMusubiAuthorityComponent::BodySimulates()
+{
+	if (!bBodyKnown)
+		if (UPrimitiveComponent* B = Body())
+		{
+			bBodySimulates = B->IsSimulatingPhysics();
+			bBodyKnown = true;
+		}
+	return bBodySimulates;
 }

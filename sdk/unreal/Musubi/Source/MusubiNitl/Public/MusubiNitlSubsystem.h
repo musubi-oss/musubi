@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Containers/Ticker.h"
+#include "Engine/EngineBaseTypes.h"
 #include "MusubiTypes.h"
 #include "MusubiNitlSubsystem.generated.h"
 
@@ -35,5 +36,7 @@ private:
 	TWeakObjectPtr<class UMusubiSimulatorSubsystem> Sim;
 	TWeakObjectPtr<class UMusubiSubsystem> Client;
 	FDelegateHandle IdentifiedHandle;
+	FDelegateHandle TickHandle;
+	void OnWorldTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	FTSTicker::FDelegateHandle Ticker;
 };

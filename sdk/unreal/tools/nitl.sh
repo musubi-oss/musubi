@@ -51,7 +51,7 @@ curl -fsS "$API/v1/server/worlds/$WORLD" -H "x-musubi-server-key: $KEY" > "$OUT/
 [ -n "$ENTITY" ] || { echo "s1 never spawned the entity"; docker logs nitl-s1 2>&1 | grep -i "musubi\|error\|warning: " | tail -40; exit 1; }
 echo "entity=$ENTITY"
 echo "== client"
-ue nitl-c -game -MusubiNitl=client -MusubiEntity="$ENTITY"
+ue nitl-c -game -MusubiNitl=client -MusubiEntity="$ENTITY" -MusubiNitlWalk="$WALK"
 sleep "$DUR"
 for N in nitl-s1 nitl-s2 nitl-c; do docker logs "$N" > "$OUT/$N.log" 2>&1; done
 echo "== verdict"
@@ -70,6 +70,14 @@ chk nitl-c  "rehome: swapped"
 LASTS=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* steps=\([0-9]*\).*/\1/p'); LASTPUSH=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* push=\([0-9]*\).*/\1/p')
 if [ -n "$LASTPUSH" ] && [ -n "$LASTS" ] && [ "$LASTPUSH" -gt 0 ] && [ $((LASTS - LASTPUSH)) -lt 120 ]; then echo "PASS nitl-c: push-model property replicated (steps=$LASTS push=$LASTPUSH)"; else echo "FAIL nitl-c: push-model property replicated (steps=$LASTS push=$LASTPUSH)"; ok=0; fi
 chk nitl-c  "nitl: identified"
+# the player: possessed its entity's pawn before the rehome, possesses the new owner's copy after it, PlayerState name survived
+REH=$(grep -n "rehomed in place" "$OUT/nitl-c.log" | head -1 | cut -d: -f1); REH=${REH:-0}
+BEFORE=$(grep -n "nitl: client pawn " "$OUT/nitl-c.log" | awk -F: -v n="$REH" '$1<n' | grep "possessed=1" | tail -1)
+AFTER=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1)
+if [ -n "$BEFORE" ]; then echo "PASS nitl-c: player possessed its pawn before the rehome"; else echo "FAIL nitl-c: player possessed its pawn before the rehome"; ok=0; fi
+case "$AFTER" in *"possessed=1"*) echo "PASS nitl-c: player possesses the new owner's pawn after the rehome";; *) echo "FAIL nitl-c: player possesses the new owner's pawn after the rehome ($AFTER)"; ok=0;; esac
+N1=$(echo "$BEFORE" | sed -n 's/.* name=\(.*\)$/\1/p'); N2=$(echo "$AFTER" | sed -n 's/.* name=\(.*\)$/\1/p')
+if [ -n "$N1" ] && [ "$N1" != "-" ] && [ "$N1" = "$N2" ]; then echo "PASS nitl-c: PlayerState name survived the rehome ($N1)"; else echo "FAIL nitl-c: PlayerState name survived the rehome (before=$N1 after=$N2)"; ok=0; fi
 if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/nitl-s2.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi
 grep -h "nitl: client pawn" "$OUT/nitl-c.log" | tail -3
 [ "$ok" = 1 ] && echo "NITL PASS ($VER)" || { echo "NITL FAIL ($VER) — logs in $OUT"; exit 1; }

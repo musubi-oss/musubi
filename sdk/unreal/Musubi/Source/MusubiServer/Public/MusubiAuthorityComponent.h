@@ -92,6 +92,12 @@ public:
 	bool HasDirty() const { return Dirty.Num() > 0; }
 	/** Snapshot the physics state into components so the receiver resumes exactly (handover). */
 	void CapturePhysicsIntoComponents();
+	/** Whether this body simulates physics by nature (a prop), as opposed to a kinematic one moved by a movement component
+	 *  (a Character capsule): remembered the first time we touch it, so the authority code never switches simulation on for
+	 *  a body that never had it — a simulating capsule falls through the world and CharacterMovement stops moving it. */
+	bool BodySimulates();
+	bool bBodySimulates = true;
+	bool bBodyKnown = false;
 	/** Restore the physics state from components after arrival. */
 	void RestorePhysicsFromComponents();
 	void SetPhysicsEnabled(bool bEnable);

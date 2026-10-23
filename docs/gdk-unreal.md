@@ -582,6 +582,46 @@ engine sources did not say out loud, all fixed in `MusubiIrisImpl`:
   push id on our objects — the export polls and compares every tick anyway. The NITL pawn carries a push-model
   `PushSteps` and the run asserts it replicates and that no conflict is logged.
 
+### 9.7 Player continuity across servers (phase 9g-1)
+
+The acceptance is no longer a server-driven dummy: `AMusubiNitlPawn` is an `ACharacter` (CharacterMovement, flying,
+`MaxFlySpeed` = `-MusubiNitlWalk`), the headless client pushes `AddMovementInput(+X)` every world tick and the pawn
+crosses the cell border because the *player* drives it through `ServerMove` over the relay. What the GDK adds on the
+server side, `AMusubiGameMode` (`MusubiServer`, set as `GlobalDefaultGameMode`):
+
+* **Login carries the logical player.** The client URL is `musubi://<world>:0?entity=<uuid>`; the engine hands the
+  options to `InitNewPlayer`, the game mode parses `entity=` and remembers `PlayerController → entity id`
+  (`EntityOf(Controller)`). The relay session was authenticated by the node, so the entity id is trusted on the server.
+* **Possession is by entity, not by spawn.** `SpawnDefaultPawnFor` returns the entity's actor when it is an `APawn`
+  **owned on this server** (`IsOwned() && !IsInHandover()`), otherwise falls back to the default pawn. `PostLogin` and a
+  4 Hz `Tick` re-bind: when the entity becomes owned here (it arrives by handover after the player's connection was
+  rehomed), the controller possesses the new actor and the placeholder default pawn is destroyed.
+* **PlayerState lives in the entity.** Component `musubi.player` = `{"name","score"}`. A player seen for the first time
+  gets a stable name (`player-<last 4 of entity id>`) written into the component; a server that receives the player
+  after a handover restores `PlayerState` from it (`restored from entity …: name=… score=…`). The entity component is the
+  source of truth, the `APlayerState` on each server is a projection of it.
+* **Input and camera are the engine's.** Nothing is intercepted: after `net_rehome` the client's new engine connection
+  logs in with the same URL, gets a new `PlayerController`/`PlayerState` from the new owner and is given the same
+  logical pawn (new `UObject`, same `NetEntityId`); the `CharacterMovementComponent` resumes `ServerMove` on the new
+  autonomous proxy and the view target follows the pawn as on a normal travel. The client never disconnects.
+
+Live run (5.8.4, `tools/nitl.sh`): `PlayerController_0 logs in … (owned here)` → `possessed by PlayerController_0,
+movement mode=5` on s1; handover at the border; on s2 the player logs in again on the rehomed connection, is possessed
+and `restored from entity …: name=player-dcab score=0`; the client reports `possessed=1 name=player-dcab` before and
+after the rehome, x = 251 → 5835, one pawn at the end.
+
+**Found by the run, invisible in code review:** `UMusubiAuthorityComponent` used to force `SetSimulatePhysics(true)`
+when restoring or re-enabling a body (ghost → owner, older owner without `musubi.phys`). Harmless for an actor whose
+root is a `USceneComponent`, fatal for a Character: the capsule started simulating, fell under gravity for ~40 s until
+`AActor::CheckStillInWorld` (from `FPhysScene_Chaos::OnSyncBodies`) destroyed it at `KillZ`, and
+`CharacterMovementComponent` never moved it in between because it does not drive a simulating `UpdatedComponent`. Now
+`BodySimulates()` remembers, on first touch, whether the body simulates by nature; simulation is only ever switched
+*back on* for bodies that had it (props), kinematic bodies moved by a movement component stay kinematic.
+
+**What this is not yet:** gameplay code still gets a new actor pointer per rehome; the stable entity handle API
+(resolve `NetEntityId` → current actor, `OnEntityActorChanged`) is the next step. `score` round-trips but nothing in
+the acceptance changes it between servers; subobjects/components of the pawn are not part of the Iris export (9g-4).
+
 ## 10. Numbers, limits, failure behaviour
 
 | Item | Value | Behaviour at the edge |
