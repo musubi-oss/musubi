@@ -8,6 +8,7 @@
 //! Space is 2-D (x, y) by default; `WorldConfig::three_d` turns cells into octree voxels with a
 //! `z` index (P1-57). Non-spatial partition keys plug into `CellId` later.
 
+pub mod component;
 pub mod controller;
 pub mod sim_command;
 pub mod sim_event;
@@ -187,9 +188,11 @@ impl Pos {
     }
 }
 
+pub use component::ComponentValue;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Component {
-    pub value: serde_json::Value,
+    pub value: ComponentValue,
     pub version: u64,
     /// The entity's revision when this component last changed (see `Entity::rev`).
     #[serde(default)]
@@ -204,9 +207,9 @@ pub struct Component {
 }
 
 impl Component {
-    pub fn new(value: serde_json::Value, version: u64, changed_rev: u64) -> Self {
+    pub fn new(value: impl Into<ComponentValue>, version: u64, changed_rev: u64) -> Self {
         Self {
-            value,
+            value: value.into(),
             version,
             changed_rev,
             json: std::sync::OnceLock::new(),
@@ -218,7 +221,7 @@ impl Component {
     }
     pub fn json(&self) -> std::sync::Arc<str> {
         self.json
-            .get_or_init(|| self.value.to_string().into())
+            .get_or_init(|| self.value.to_json_text().into())
             .clone()
     }
 }
@@ -1279,7 +1282,7 @@ impl World {
     pub fn spawn(
         &mut self,
         pos: Pos,
-        components: BTreeMap<String, serde_json::Value>,
+        components: impl IntoIterator<Item = (String, impl Into<ComponentValue>)>,
         persistent: bool,
     ) -> EntityId {
         self.spawn_with_id(Uuid::now_v7(), pos, components, persistent)
@@ -1290,7 +1293,7 @@ impl World {
         &mut self,
         id: EntityId,
         pos: Pos,
-        components: BTreeMap<String, serde_json::Value>,
+        components: impl IntoIterator<Item = (String, impl Into<ComponentValue>)>,
         persistent: bool,
     ) -> EntityId {
         let cell = self.cell_of(pos);
@@ -1510,7 +1513,7 @@ impl World {
         sim: SimId,
         id: EntityId,
         pos: Option<Pos>,
-        components: BTreeMap<String, serde_json::Value>,
+        components: impl IntoIterator<Item = (String, impl Into<ComponentValue>)>,
     ) -> Result<(), MeshError> {
         let cell = self.entities.get(&id).ok_or(MeshError::NoEntity)?.cell;
         let owner = self.owner(cell).ok_or(MeshError::NoLease(cell))?;
@@ -1527,8 +1530,10 @@ impl World {
         &mut self,
         id: EntityId,
         pos: Option<Pos>,
-        components: BTreeMap<String, serde_json::Value>,
+        components: impl IntoIterator<Item = (String, impl Into<ComponentValue>)>,
     ) -> Result<(), MeshError> {
+        let components: Vec<(String, ComponentValue)> =
+            components.into_iter().map(|(k, v)| (k, v.into())).collect();
         let tick = self.tick;
         let e = self.entities.get_mut(&id).ok_or(MeshError::NoEntity)?;
         e.touched_tick = tick;
@@ -2521,8 +2526,16 @@ mod tests {
             root,
             "height picks the voxel"
         );
-        let low = w.spawn(at3(10.0, 10.0, 110.0), BTreeMap::new(), false);
-        let high = w.spawn(at3(10.0, 10.0, 190.0), BTreeMap::new(), false);
+        let low = w.spawn(
+            at3(10.0, 10.0, 110.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
+        let high = w.spawn(
+            at3(10.0, 10.0, 190.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
         let kids = w.split_cell(root).unwrap();
         assert_eq!(kids.len(), 8);
         assert!(kids
@@ -2615,10 +2628,26 @@ mod tests {
         let sim = Uuid::now_v7();
         let root = CellId::root(0, 0);
         w.grant_lease(root, sim);
-        let a = w.spawn(at(10.0, 10.0), BTreeMap::new(), false);
-        let b = w.spawn(at(90.0, 10.0), BTreeMap::new(), false);
-        let c = w.spawn(at(10.0, 90.0), BTreeMap::new(), false);
-        let far = w.spawn(at(150.0, 10.0), BTreeMap::new(), false);
+        let a = w.spawn(
+            at(10.0, 10.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
+        let b = w.spawn(
+            at(90.0, 10.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
+        let c = w.spawn(
+            at(10.0, 90.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
+        let far = w.spawn(
+            at(150.0, 10.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
         assert_eq!(w.cell_of(at(10.0, 10.0)), root);
         let kids = w.split_cell(root).unwrap();
         assert_eq!(
@@ -2787,7 +2816,11 @@ mod tests {
         let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
         let root = CellId::root(0, 0);
         w.grant_lease(root, s1);
-        let e = w.spawn(at(90.0, 90.0), BTreeMap::new(), false);
+        let e = w.spawn(
+            at(90.0, 90.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
         let kids = w.split_cell(root).unwrap();
         w.revoke_lease(kids[3]);
         w.grant_lease(kids[3], s2);
@@ -2983,7 +3016,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         assert!(w.begin_remote_handover(a, host));
@@ -3034,7 +3067,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         // crossing by less than hysteresis: nothing happens
@@ -3046,7 +3079,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         assert!(w.detect_handovers().is_empty());
@@ -3058,7 +3091,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         let out = w.detect_handovers();
@@ -3091,7 +3124,9 @@ mod tests {
             }
         );
         assert_eq!(w.route_input(a, serde_json::json!({})).unwrap(), Some(s2));
-        assert!(w.apply(s1, a, None, BTreeMap::new()).is_err());
+        assert!(w
+            .apply(s1, a, None, BTreeMap::<String, serde_json::Value>::new())
+            .is_err());
         // timeout path: move back towards s1, never ack → cancelled after 3 ticks, authority stays with s2
         w.apply(
             s2,
@@ -3101,7 +3136,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -3182,7 +3217,13 @@ mod tests {
             vec![coin],
             "contents of a closed chest leave the client's view"
         );
-        w.apply(s1, chest, Some(p(20.0)), BTreeMap::new()).unwrap();
+        w.apply(
+            s1,
+            chest,
+            Some(p(20.0)),
+            BTreeMap::<String, serde_json::Value>::new(),
+        )
+        .unwrap();
         assert_eq!(w.get(coin).unwrap().pos, p(20.0), "follows the root");
         assert!(w.delta_for(c).unwrap().spawned.is_empty());
         w.look_inside(c, Some(chest));
@@ -3299,7 +3340,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             true,
         );
         w.apply(
@@ -3310,7 +3351,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         assert!(w.detect_handovers().is_empty());
@@ -3402,7 +3443,7 @@ mod tests {
                 y: 90.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         let d = w.delta_for(c).unwrap();
@@ -3424,7 +3465,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         let d = w.delta_for(c).unwrap();
@@ -3457,7 +3498,11 @@ mod tests {
             comps(serde_json::json!({"hp": 100})),
             false,
         );
-        let litter = w.spawn(at(960.0, 960.0), BTreeMap::new(), false);
+        let litter = w.spawn(
+            at(960.0, 960.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
         assert_eq!(
             w.delta_for(c).unwrap(),
             Delta::default(),
@@ -3539,8 +3584,16 @@ mod tests {
         let c = Uuid::now_v7();
         w.subscribe(c, at(0.0), 60.0);
         let a = w.spawn(at(10.0), comps(serde_json::json!({"hp": 5})), false);
-        let b = w.spawn(at(80.0), BTreeMap::new(), false);
-        let d = w.spawn(at(-50.0), BTreeMap::new(), false);
+        let b = w.spawn(
+            at(80.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
+        let d = w.spawn(
+            at(-50.0),
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
         w.advance();
         let first = w.delta_for(c).unwrap();
         let mut ids: Vec<_> = first.spawned.iter().map(|e| e.id).collect();
@@ -3620,7 +3673,7 @@ mod tests {
             },
             500.0,
             Some(1),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             1,
         );
         let far = w.spawn(
@@ -3629,7 +3682,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         let mid = w.spawn(
@@ -3638,7 +3691,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         let near = w.spawn(
@@ -3647,7 +3700,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         let ids = |d: &Delta| d.spawned.iter().map(|e| e.id).collect::<Vec<_>>();
@@ -3667,7 +3720,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         w.apply(
@@ -3678,7 +3731,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         for _ in 0..10 {
@@ -3731,7 +3784,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         let p = w.spawn(
@@ -3740,7 +3793,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         let q = w.spawn(
@@ -3749,7 +3802,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             },
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         w.attach(p, v).unwrap();
@@ -3766,7 +3819,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         let out = w.detect_handovers();
@@ -3807,7 +3860,7 @@ mod tests {
                 y: 50.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -3901,7 +3954,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         assert_eq!(w.delta_for(c).unwrap(), Delta::default());
@@ -3913,7 +3966,7 @@ mod tests {
                 y: 0.0,
                 z: 0.0,
             }),
-            BTreeMap::new(),
+            BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         let d = w.delta_for(c).unwrap();
@@ -3967,7 +4020,7 @@ mod perf {
             }
         };
         let ids: Vec<EntityId> = (0..500u64)
-            .map(|i| w.spawn(pt(i), BTreeMap::new(), false))
+            .map(|i| w.spawn(pt(i), BTreeMap::<String, serde_json::Value>::new(), false))
             .collect();
         let clients: Vec<Uuid> = (0..500).map(|_| Uuid::now_v7()).collect();
         for (i, c) in clients.iter().enumerate() {
@@ -4001,8 +4054,13 @@ mod perf {
             }
             for j in 0..17u64 {
                 let i = ((step * 17 + j) % 500) as usize;
-                w.apply(s1, ids[i], Some(pt(5000 + step * 31 + j)), BTreeMap::new())
-                    .unwrap();
+                w.apply(
+                    s1,
+                    ids[i],
+                    Some(pt(5000 + step * 31 + j)),
+                    BTreeMap::<String, serde_json::Value>::new(),
+                )
+                .unwrap();
             }
             w.advance();
             let t0 = std::time::Instant::now();

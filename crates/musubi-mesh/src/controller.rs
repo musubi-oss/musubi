@@ -850,7 +850,7 @@ mod tests {
                     y: 10.0,
                     z: 0.0,
                 },
-                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::<String, serde_json::Value>::new(),
                 false,
             ));
         }
@@ -946,7 +946,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         w.spawn(
@@ -955,7 +955,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         assert!(!w.cell_has_room(c), "two of two slots taken");
@@ -977,7 +977,7 @@ mod tests {
                     y: 1.0,
                     z: 0.0,
                 },
-                Default::default(),
+                std::collections::BTreeMap::<String, serde_json::Value>::new(),
                 false,
             );
         }
@@ -1020,7 +1020,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         w.spawn(
@@ -1029,7 +1029,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         w.tick = 100;
@@ -1095,7 +1095,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             true,
         );
         let litter = w.spawn(
@@ -1104,7 +1104,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         // the idle clock starts at the first unwatched check (tick 1) and fires at 1 + 5
@@ -1172,7 +1172,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             true,
         );
         let forever = w.spawn(
@@ -1181,7 +1181,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         assert!(w.set_decay(litter, Some(3)));
@@ -1198,7 +1198,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             }),
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
         )
         .unwrap();
         for _ in 0..2 {
@@ -1248,7 +1248,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         w.spawn(
@@ -1257,7 +1257,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         assert!(ctl.reconcile(&mut w).is_empty(), "2 entities are no load");
@@ -1325,7 +1325,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         w.spawn(
@@ -1334,7 +1334,7 @@ mod tests {
                 y: 10.0,
                 z: 0.0,
             },
-            Default::default(),
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
             false,
         );
         for round in 0..2 {
@@ -1590,7 +1590,11 @@ mod tests {
             s1,
         );
         for x in [10.0, 20.0, 110.0, 120.0] {
-            w.spawn(Pos { x, y: 10.0, z: 0.0 }, BTreeMap::new(), false);
+            w.spawn(
+                Pos { x, y: 10.0, z: 0.0 },
+                BTreeMap::<String, serde_json::Value>::new(),
+                false,
+            );
         }
         // s1 carries 4 > split_cost 2 → one cell migrates to s2
         let out = c.reconcile(&mut w);

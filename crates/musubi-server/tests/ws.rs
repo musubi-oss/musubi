@@ -22605,7 +22605,7 @@ async fn sim_stream_speaks_cbor_when_asked() {
     };
     assert_eq!(
         iris,
-        C::Bytes(blob),
+        C::Bytes(blob.clone()),
         "iris must be a cbor byte string, not base64 text"
     );
     assert_eq!(hp, C::Integer(7.into()));
@@ -22620,4 +22620,42 @@ async fn sim_stream_speaks_cbor_when_asked() {
         .unwrap();
     let txt = String::from_utf8_lossy(&body);
     assert!(txt.contains("AQID+gD/"), "json view keeps base64: {txt}");
+    // ... and as CBOR on request: the node kept the blob as bytes, so it comes back as bytes
+    let listed: Value = serde_json::from_str(&txt).unwrap();
+    let first = ["records", "entities", "items"]
+        .iter()
+        .find_map(|k| listed.get(k).and_then(Value::as_array))
+        .or_else(|| listed.as_array())
+        .and_then(|a| a.first())
+        .unwrap_or_else(|| panic!("entity list shape: {txt}"));
+    let id = first["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("entity list shape: {txt}"))
+        .to_owned();
+    let req = Request::get(format!("/v1/server/worlds/{world}/entities/{id}"))
+        .header("x-musubi-server-key", "defaultkey")
+        .header(header::ACCEPT, "application/cbor")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/cbor")
+    );
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let doc: C = ciborium::from_reader(body.as_ref()).unwrap();
+    // REST shape: `entity.components: {name: value}`
+    let comps = get(&doc, "entity")
+        .and_then(|e| get(e, "components"))
+        .unwrap_or_else(|| panic!("entity.components in {doc:?}"));
+    assert_eq!(
+        get(comps, "iris"),
+        Some(&C::Bytes(blob.clone())),
+        "cbor REST view carries raw bytes: {doc:?}"
+    );
 }

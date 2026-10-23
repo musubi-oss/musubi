@@ -31,7 +31,7 @@ fn populated(n: usize, cells: i64) -> (World, Uuid, Vec<musubi_mesh::EntityId>) 
             y: ((i * 7919) % 1000) as f64 / 1000.0 * size * 0.9,
             z: 0.0,
         };
-        ids.push(w.spawn(p, BTreeMap::new(), false));
+        ids.push(w.spawn(p, BTreeMap::<String, serde_json::Value>::new(), false));
     }
     (w, sim, ids)
 }
@@ -53,7 +53,7 @@ fn bench(c: &mut Criterion) {
                                 y: p.y,
                                 z: 0.0,
                             }),
-                            BTreeMap::new(),
+                            BTreeMap::<String, serde_json::Value>::new(),
                         );
                     }
                     w.detect_handovers()

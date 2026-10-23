@@ -401,15 +401,23 @@ mod tests {
         assert_eq!(u.components["hp"].value, json!(90));
         assert!(d.removed.is_empty());
 
-        w.force_apply(c, Some(p(50.0, 50.0)), BTreeMap::new())
-            .unwrap();
+        w.force_apply(
+            c,
+            Some(p(50.0, 50.0)),
+            BTreeMap::<String, serde_json::Value>::new(),
+        )
+        .unwrap();
         let d = w.ghost_delta(cell, &mut st).expect("c left the band");
         assert_eq!(d.removed, vec![c]);
         assert!(d.upserts.is_empty());
         assert_eq!(st.tracked(), 1);
 
-        w.force_apply(a, Some(p(96.0, 50.0)), BTreeMap::new())
-            .unwrap();
+        w.force_apply(
+            a,
+            Some(p(96.0, 50.0)),
+            BTreeMap::<String, serde_json::Value>::new(),
+        )
+        .unwrap();
         let d = w.ghost_delta(cell, &mut st).expect("a moved");
         assert_eq!(d.upserts.len(), 1);
         assert!(
@@ -479,8 +487,12 @@ mod tests {
         assert!(!cache.stale(12 + 60, 60));
         assert!(cache.stale(12 + 61, 60));
 
-        w.force_apply(a, Some(p(50.0, 50.0)), BTreeMap::new())
-            .unwrap();
+        w.force_apply(
+            a,
+            Some(p(50.0, 50.0)),
+            BTreeMap::<String, serde_json::Value>::new(),
+        )
+        .unwrap();
         let gone = w.ghost_delta(cell, &mut st).unwrap();
         assert!(cache.apply(gone, 13));
         assert!(cache.is_empty());

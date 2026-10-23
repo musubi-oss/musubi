@@ -49,7 +49,7 @@ pub const CONTROL_EVERY: u64 = 30;
 pub struct TxOp {
     pub entity: EntityId,
     #[serde(default)]
-    pub components: std::collections::BTreeMap<String, Value>,
+    pub components: std::collections::BTreeMap<String, musubi_mesh::ComponentValue>,
     #[serde(default)]
     pub expect: std::collections::BTreeMap<String, u64>,
 }
@@ -179,7 +179,12 @@ fn tx_apply_local(st: &mut WorldState, tx: Uuid, ops: &[TxOp]) -> Vec<EntityId> 
                 op: WorldMutation::Apply {
                     id: op.entity,
                     pos: None,
-                    components: Value::Object(op.components.clone().into_iter().collect()),
+                    components: Value::Object(
+                        op.components
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.to_json()))
+                            .collect(),
+                    ),
                 },
             });
         }
@@ -317,7 +322,7 @@ struct Queued {
     ticket: Uuid,
     sim: Uuid,
     pos: Pos,
-    components: std::collections::BTreeMap<String, Value>,
+    components: std::collections::BTreeMap<String, musubi_mesh::ComponentValue>,
     persistent: bool,
     global: bool,
     decay_ticks: Option<u64>,
@@ -339,6 +344,47 @@ impl CellQueue {
     fn eta_ticks(&self, position: usize) -> Option<u64> {
         (self.departures > 1e-6).then(|| (position as f64 / self.departures).ceil() as u64)
     }
+}
+
+/// Component names whose values are engine blobs, kept as raw bytes in the node instead of the
+/// base64 string JSON callers send (`MUSUBI_BINARY_COMPONENTS`, default `iris,iris.d`). Blobs
+/// arriving as base64 text are decoded once here, at the edge; JSON surfaces re-encode on read.
+pub fn binary_components() -> &'static std::collections::HashSet<String> {
+    static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("MUSUBI_BINARY_COMPONENTS")
+            .unwrap_or_else(|_| "iris,iris.d".into())
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+/// A JSON `components` object as the node stores it (see [`binary_components`]).
+pub fn components_from_json(
+    components: &Value,
+) -> std::collections::BTreeMap<String, musubi_mesh::ComponentValue> {
+    let bin = binary_components();
+    components
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let cv = musubi_mesh::ComponentValue::Json(v.clone());
+                    (
+                        k.clone(),
+                        if bin.contains(k) {
+                            cv.into_bytes_if_base64()
+                        } else {
+                            cv
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// What a simulator asks to spawn.
@@ -2923,7 +2969,7 @@ impl WorldRegistry {
             "id": e.id, "cell": e.cell, "pos": e.pos, "persistent": e.persistent,
             "global": e.global, "attached_to": e.attached_to, "contained": e.contained,
             "rev": e.rev, "transit": e.transit, "remote_to": remote_to,
-            "components": e.components.iter().map(|(k, c)| (k.clone(), c.value.clone())).collect::<serde_json::Map<_, _>>(),
+            "components": e.components.iter().map(|(k, c)| (k.clone(), c.value.to_json())).collect::<serde_json::Map<_, _>>(),
         })
     }
 
@@ -3196,10 +3242,7 @@ impl WorldRegistry {
             decay_ticks,
             queue,
         } = spec;
-        let comps: std::collections::BTreeMap<String, Value> = components
-            .as_object()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
+        let comps = components_from_json(&components);
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
@@ -3530,7 +3573,7 @@ impl WorldRegistry {
             Value::Object(
                 e.components
                     .iter()
-                    .map(|(k, c)| (k.clone(), c.value.clone()))
+                    .map(|(k, c)| (k.clone(), c.value.to_json()))
                     .collect(),
             ),
         );
@@ -3637,10 +3680,7 @@ impl WorldRegistry {
         components: Value,
     ) -> Result<()> {
         let id = parse_entity(entity)?;
-        let comps: std::collections::BTreeMap<String, Value> = components
-            .as_object()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
+        let comps = components_from_json(&components);
         let w = self.get(name)?;
         let mut st = w.lock();
         let st = &mut *st;
@@ -3662,7 +3702,12 @@ impl WorldRegistry {
                 op: WorldMutation::Apply {
                     id,
                     pos,
-                    components: Value::Object(comps.into_iter().collect()),
+                    components: Value::Object(
+                        comps
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.to_json()))
+                            .collect(),
+                    ),
                 },
             });
         }
@@ -4141,7 +4186,7 @@ impl WorldRegistry {
                         entity
                             .components
                             .iter()
-                            .map(|(k, c)| (k.clone(), c.value.clone()))
+                            .map(|(k, c)| (k.clone(), c.value.to_json()))
                             .collect(),
                     ),
                 },
@@ -6348,7 +6393,7 @@ fn stamp_interaction(st: &mut WorldState, id: EntityId, mut ev: Value) -> Value 
 fn spawn_entity(
     st: &mut WorldState,
     pos: Pos,
-    comps: std::collections::BTreeMap<String, Value>,
+    comps: std::collections::BTreeMap<String, musubi_mesh::ComponentValue>,
     persistent: bool,
     global: bool,
     decay_ticks: Option<u64>,
@@ -6366,7 +6411,12 @@ fn spawn_entity(
             op: WorldMutation::Spawn {
                 id,
                 pos,
-                components: Value::Object(comps.into_iter().collect()),
+                components: Value::Object(
+                    comps
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.to_json()))
+                        .collect(),
+                ),
                 decay_ticks,
                 global,
             },
@@ -6469,7 +6519,12 @@ fn drain_admission(st: &mut WorldState) {
                     op: WorldMutation::Spawn {
                         id,
                         pos: e.pos,
-                        components: Value::Object(e.components.into_iter().collect()),
+                        components: Value::Object(
+                            e.components
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.to_json()))
+                                .collect(),
+                        ),
                         decay_ticks: e.decay_ticks,
                         global: e.global,
                     },

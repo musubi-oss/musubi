@@ -828,10 +828,11 @@ async fn entity_get(
     State(s): State<AppState>,
     uri: OriginalUri,
     ServerKey: ServerKey,
+    headers: axum::http::HeaderMap,
     Path((w, id)): Path<(String, String)>,
-) -> Result<Json<Value>, Response> {
+) -> Result<Response, Response> {
     ensure_shard(&s, &w, &uri).await?;
-    let r: Result<Json<Value>, ApiError> = async {
+    let r: Result<Value, ApiError> = async {
         let id = parse_id(&id)?;
         let mut v = s
             .worlds
@@ -849,10 +850,40 @@ async fn entity_get(
                 v[k] = val;
             }
         }
-        Ok(Json(v))
+        Ok(v)
     }
     .await;
-    r.map_err(IntoResponse::into_response)
+    let v = r.map_err(IntoResponse::into_response)?;
+    Ok(if wants_cbor(&headers) {
+        cbor_response(&v)
+    } else {
+        Json(v).into_response()
+    })
+}
+
+/// `Accept: application/cbor` on an entity read: the same document as CBOR, with the node's
+/// binary components (`iris`, `iris.d`, …) as byte strings instead of base64 text.
+fn wants_cbor(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("application/cbor"))
+}
+
+fn cbor_response(v: &Value) -> Response {
+    let mut buf = Vec::new();
+    let bin = crate::realtime::world::binary_components();
+    if ciborium::into_writer(&json_to_cbor(v, bin, false), &mut buf).is_err() {
+        return ApiError::from(Error::internal("cbor encode")).into_response();
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/cbor"),
+        )],
+        buf,
+    )
+        .into_response()
 }
 
 async fn entity_children(

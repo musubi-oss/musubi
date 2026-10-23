@@ -704,9 +704,16 @@ finite ones included — as a synthetic Break context and counts a map's length 
 every lossless float to a 16-bit half (`300.0`, `0.5`), and `FCborContext` has no half accessor, so the decoder takes
 the two payload bytes the reader just consumed and converts them with `FFloat16`; `FCborWriter` never pops a
 zero-length container (it pops on the item that brings the count to 0), so an empty array/map is written indefinite +
-break (the plain NITL spawn has `components: {}` — the writer's destructor asserted). What is still JSON: the node keeps
-component values as JSON internally (the blob as base64) and `WorldComponent` in the REST API is JSON — the wire is
-binary end to end, a native bytes component value in storage/REST is the remaining piece.
+break (the plain NITL spawn has `components: {}` — the writer's destructor asserted).
+
+**Bytes in the node, not base64 (phase 9g-6c).** A component value in the mesh is `ComponentValue::Json | Bytes`.
+Names listed in `MUSUBI_BINARY_COMPONENTS` (default `iris,iris.d`) are kept as raw bytes: a CBOR command delivers
+them as byte strings, a JSON command's base64 string is decoded once at the edge (`components_from_json`), and from
+then on the hot path never re-encodes — CBOR frames, handover `state` and `Accept: application/cbor` on
+`GET /v1/server/worlds/{w}/entities/{id}` carry the bytes as CBOR byte strings. Every JSON surface (the JSON sim
+stream, JSON REST, client frames, Postgres snapshots/history/cold cells, which are `jsonb`) still sees the same
+base64 string as before, so nothing stored or speaking JSON changed shape; a blob that arrived as text compares
+equal to the same blob that arrived as bytes, so `set` with an unchanged value still does not bump the version.
 
 ### 9.10 Chaos run (phase 9g-7): loss + latency, a second client, the receiving server killed mid-handover
 
