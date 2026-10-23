@@ -583,6 +583,10 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 	case EMusubiSimEventTag::CellReloaded:
 	case EMusubiSimEventTag::CoLocate:
 		break;
+	case EMusubiSimEventTag::NetPacket:
+	case EMusubiSimEventTag::NetClose:
+		// consumed by the MusubiNet driver through OnSimEvent
+		break;
 	case EMusubiSimEventTag::Unknown:
 	{
 		static bool bWarned = false;
@@ -594,6 +598,29 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 }
 
 // ---- commands ----
+
+void UMusubiSimulatorSubsystem::NetSendPacket(uint64 Conn, const FMusubiJson& Session, TArray<uint8>&& Data)
+{
+	FMusubiSimCommand Cmd;
+	Cmd.Tag = EMusubiSimCommandTag::NetPacket;
+	Cmd.NetPacket.Emplace();
+	Cmd.NetPacket->conn = Conn;
+	Cmd.NetPacket->session = Session;
+	Cmd.NetPacket->data = MoveTemp(Data);
+	SendCommand(MoveTemp(Cmd));
+}
+
+void UMusubiSimulatorSubsystem::NetClose(uint64 Conn, const FMusubiJson& Session, const FMusubiUuid& Entity, const FString& Reason)
+{
+	FMusubiSimCommand Cmd;
+	Cmd.Tag = EMusubiSimCommandTag::NetClose;
+	Cmd.NetClose.Emplace();
+	Cmd.NetClose->conn = Conn;
+	Cmd.NetClose->session = Session;
+	Cmd.NetClose->entity = Entity.ToString();
+	Cmd.NetClose->reason = Reason;
+	SendCommand(MoveTemp(Cmd));
+}
 
 void UMusubiSimulatorSubsystem::SendCommand(FMusubiSimCommand&& Cmd, FMusubiSimReply OnReply)
 {

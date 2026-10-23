@@ -112,6 +112,11 @@ public:
 	/** Every event, after the module handled it. */
 	FMusubiSimEventDelegate OnSimEvent;
 
+	/** Engine packet relay (`MusubiNet`): answer a `net_packet` event on the same conn/session. */
+	void NetSendPacket(uint64 Conn, const FMusubiJson& Session, TArray<uint8>&& Data);
+	/** Close engine connection `Conn` on `Entity`; the client gets `net_close`. */
+	void NetClose(uint64 Conn, const FMusubiJson& Session, const FMusubiUuid& Entity, const FString& Reason);
+
 private:
 	struct FCell
 	{

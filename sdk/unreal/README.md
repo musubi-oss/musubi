@@ -113,6 +113,22 @@ node's own QUIC stack) with a five-call C ABI (`musubi_quic.h`: `mq_connect / mq
 mq_close`), built per platform by `tools/build-quic-ffi.sh` into `Source/ThirdParty/MusubiQuicFfi/lib/<Platform>/`.
 No library for the platform → the module compiles to a stub and the plugin stays WebSocket-only.
 
+## Engine networking through the node — module `MusubiNet` (phase 9b)
+
+`UMusubiNetDriver` / `UMusubiNetConnection` carry the engine's own game connection (`UNetDriver` packets,
+replication Iris or classic, RPCs, login) through the node instead of a UDP socket, so the engine's
+replication code is untouched and the node decides which simulator a client talks to. Client URL
+`musubi://<world>?entity=<uuid>`: the driver asks the node for a relay on the entity (`net_open`), every packet
+is a `net_packet` the node routes to the entity's current owner (buffered while it is in transit); a dedicated
+server with `UMusubiSimulatorSubsystem` running accepts connections from `net_packet` events (first packet on
+an unknown conn opens one — `UIpNetDriver` semantics, no stateless challenge: the node already authenticated
+the session). When the entity hands over, the node closes the old owner's side and sends the client
+`net_rehome`; v1 answers it with a reconnect to the same URL (`UMusubiNetDriver::OnRehome`, overridable) — the
+in-place restart with actor adoption is the next step. `max_packet` 1200 B; conn ids stay below 2^53 because
+engines parse JSON numbers as doubles. Enable with
+`+NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/MusubiNet.MusubiNetDriver",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver",bCanUseIris=true)`.
+Built by real UBT on 5.8.4 (classic `UNetDriver` API only, so it is tier-independent). Design: `docs/gdk-unreal.md` §9.
+
 - Wire: ALPN `musubi-rt/1`; the first bidi stream carries the `hello` text frame (`{token, format, resumable,
   resume}`) and then envelopes framed `[type u8][len u32 BE][body]`; binary frames sent with `bUnreliable` travel as
   datagrams `[type u8][body]` when they fit. Layout is pinned to the node by `musubi-quic-ffi/tests/parity.rs`.
