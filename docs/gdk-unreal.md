@@ -300,6 +300,12 @@ receive `world_delta` through Iris' own apply path) without hand-written mapping
 - Factory (5.7 `NetObjectFactory.h`): `CreateAndFillHeader`, `SerializeHeader(FCreationHeaderContext{Handle, Bridge, Factory, FNetSerializationContext& Serialization})`, `CreateAndDeserializeHeader` (PURE_VIRTUAL), `InstantiateReplicatedObjectFromHeader → FInstantiateResult{Instance, Template}`, `PostInstantiation(FPostInstantiationContext{Instance, Header})`, `DetachedFromReplication(FDestroyedContext{DestroyedInstance, RootObject, DestroyReason, DestroyFlags})` (PURE_VIRTUAL); `DestroyReplicatedObject` is `final`. Header bits via `UE::Net::WriteString/WriteBytes` (`NetBitStreamUtil.h`). Registration: `FNetObjectFactoryRegistry::RegisterFactory(UClass*, FName)`.
 - UBT: `ModuleRules.SetupIrisSupport(Target)` adds `IrisCore` + `UE_WITH_IRIS=1` unconditionally; `TargetRules` has no `bUseIris`, so `MusubiIris.Build.cs` gates only on `Target.Version.MinorVersion >= 5`.
 - Built by the real UBT on 5.7.4 and 5.8.4 (`sdk/unreal/tools/ue-build.sh`, 0 warnings); 5.3.2 builds the stub.
+- **Gap found in phase 9a:** phase 6 shipped the bridge *class* but nothing instantiates it — there is no
+  `FReplicationSystemFactory::CreateReplicationSystem` call anywhere in the plugin and `MusubiServer` has no
+  Iris reference, so until 9c lands the bridge is compiled, never running. The engine's own
+  `UEngineReplicationBridge` is `final` (5.7 and 5.8) and `UNetDriver::CreateReplicationSystem` instantiates it
+  from `ReplicationBridgeClassName`, so the bridge can never be *the NetDriver's* bridge either; section 9.3 gives it
+  its own `UReplicationSystem`.
 
 ## 8. Transport
 
@@ -331,7 +337,191 @@ has no link-time dependency on the native library. Frame layout is locked to the
 * Rates: `ping` every 15 s, `rtt` every 2 s while a match/world is live; input coalescing: at
   most one `world_input` per tick (last wins), `match_input` one per tick exactly.
 
-## 9. Numbers, limits, failure behaviour
+## 9. NetDriver-level integration — `MusubiNet` (phase 9)
+
+What is missing after phases 1–8, stated plainly: the engine is integrated at *SDK* level. Clients get
+entities through `UMusubiWorldComponent`, servers publish through `UMusubiAuthorityComponent`, and the
+engine's own replication (`UNetDriver`, actor channels, `UPROPERTY(Replicated)`, RPCs, `Role`) runs beside
+Musubi, not through it. A project that already has a replicated game cannot "enable the plugin and go".
+SpatialOS closed exactly this gap with `USpatialNetDriver`; Star Citizen's shape (clients and game servers
+both talk to a replication layer + entity graph, authority moves between servers) is what the node already
+is. Phase 9 makes the engine use it.
+
+### 9.1 What the engine allows (checked in 5.7.4 / 5.8.4 sources; line numbers are 5.8.4)
+
+- A NetDriver is a transport. The virtuals a custom driver implements are `IsAvailable`, `InitBase`,
+  `InitConnect`, `InitListen`, `TickDispatch`, `LowLevelSend`, `LowLevelGetNetworkNumber`, `IsNetResourceValid`,
+  `LowLevelDestroy` (`Engine/Classes/Engine/NetDriver.h` 1569–1918); a connection implements
+  `InitBase/InitLocalConnection/InitRemoteConnection`, `LowLevelSend`, `LowLevelGetRemoteAddress`,
+  `LowLevelDescribe`, `ReceivedRawPacket`. Epic's own `UWebSocketNetDriver` / `UWebSocketConnection`
+  (`Engine/Plugins/Experimental/WebSocketNetworking`) is a complete 300-line example over a non-UDP
+  transport: `InitConnect` → `ServerConnection->InitLocalConnection(this, NULL, URL, USOCK_Pending)` + a
+  receive callback bound to `ReceivedRawPacket`; `InitListen` → per accepted socket `InitRemoteConnection` +
+  `AddClientConnection`; `LowLevelSend` routes bytes to the socket of the address. We follow it.
+- Replication is not the driver's business. `UNetDriver::CreateReplicationSystem` (`NetDriver.cpp:7613`)
+  instantiates `UEngineReplicationBridge` from `ReplicationBridgeClassName`, and that class is `final` in both
+  5.7 and 5.8 (`Engine/Public/Net/Iris/ReplicationSystem/EngineReplicationBridge.h`). A plugin driver therefore
+  **keeps Epic's bridge** and gets classic *or* Iris replication for free; Iris per driver is a config knob
+  (`FNetDriverDefinition::bCanUseIris`, `PreferredReplicationSystem`, `Engine.h:281`), negotiated with the remote
+  by `NMT_Upgrade` → `UNetDriver::TryUpgradeNetworkFeatures` (`NetDriver.cpp:2720`), which switches a live
+  driver between Iris and classic (`PostCreation`, `ReinitBase`, channel `ReInit`). Nothing to re-implement.
+- Several `UReplicationSystem`s may coexist (`NetRefHandle.h: MaxReplicationSystemCount`;
+  `FReplicationSystemFactory::CreateReplicationSystem/DestroyReplicationSystem` are public static). A system not
+  owned by a driver is ticked by hand exactly as `UNetDriver` does (`NetDriver.cpp:1240, 7805–7824`):
+  `NetUpdate(dt)` → `TickPostReceive()` → `SendUpdate(fn(ConnIds))` → `PostSendUpdate()`, after
+  `AddConnection(id)` + `SetReplicationView(id, view)` + `SetConnectionUserData`.
+- Replicated state can be (de)serialized without a connection:
+  `FReplicationStateDescriptorBuilder::CreateDescriptorsForClass(FResult&, UClass*, FParameters)` /
+  `CreateDescriptorForStruct` / `CreateDescriptorForFunction` (`Iris/ReplicationState/ReplicationStateDescriptorBuilder.h`),
+  then `FReplicationProtocolOperations::PollAndCopyPropertyData`, `Quantize`, `IsEqualQuantizedState`,
+  `SerializeWithMask` / `DeserializeWithMask`, `Dequantize`, `FreeDynamicState`
+  (`Iris/ReplicationSystem/ReplicationOperations.h:85–145`), with a plain
+  `FNetSerializationContext(FNetBitStreamWriter*)` (`Serialization/NetSerializationContext.h:36`).
+- RPCs: under Iris the driver calls `ReplicationSystem->SendRPC(Actor, SubObject, Function, Params)` (multicast)
+  or the `ConnectionId` overload for the actor's owning connection (`NetDriver.cpp:8125–8200`), and
+  `UNetDriver::ForwardRemoteFunction` (`:8420`, bound as `Params.ForwardNetRPCCallDelegate`) hands every
+  server-side RPC to *every other active driver of the world context* whose `ShouldReplicateFunction` says yes.
+  That is the hook for cross-server RPCs: a second, replication-less driver receives them.
+- Handshake: the UDP stateless-connect challenge lives in `PacketHandler` /
+  `StatelessConnectHandlerComponent`; `UWebSocketNetDriver` accepts connections without it when
+  `-NoPacketHandler` is set (`WebSocketNetDriver.cpp:240`, `bChallengeHandshake=false`). Our sessions are already
+  authenticated by the node (JWT), so the challenge is skipped by design; the per-connection `PacketHandler`
+  (encryption/Oodle components from `[PacketHandlerComponents]`) stays.
+
+### 9.2 Path A — client ↔ owning server over the node (`UMusubiNetDriver`, `UMusubiNetConnection`)
+
+Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver` API, present in 5.3).
+
+- **Addressing.** Client URL `musubi://<world>?entity=<uuid>` (`FURL::Host = world id`). The node, not the
+  client, picks the server: the simulator currently holding the cell of `entity` (the player's entity from
+  `UMusubiWorldComponent::SetLocalEntity`; created by the project's spawn flow or by the node's
+  `player_spawn` policy). No ports, no IPs: both ends only ever talk to the node.
+- **Wire (new realtime + sim-stream messages, generated like the rest):**
+  client ↔ node: `net_open{world, entity}` → `net_opened{conn, server, cell, max_packet}` | `error`;
+  `net_packet{conn, data: bytes}` both ways; `net_close{conn, reason}`; `net_rehome{conn, server, cell}`.
+  node ↔ simulator (sim stream): `SimEvent::NetOpen{conn, session, entity, options}`,
+  `SimEvent::NetPacket{conn, data}`, `SimEvent::NetClose{conn, reason}`;
+  `SimCommand::NetPacket{conn, data}`, `SimCommand::NetClose{conn, reason}`.
+  Binary frames carry `data` raw (postcard `Vec<u8>`), JSON carries base64. The node relays; it never parses
+  Unreal packets.
+- **Lanes.** `UNetConnection` is built for lossy, unordered datagrams and brings its own reliability, so driver
+  packets go on the *unreliable* lane: QUIC datagrams (`[type][body]`, `mq_max_datagram` ≥ 1200 B is required,
+  else the driver caps `MaxPacket` to it); on WebSocket they ride the single reliable stream and only lose the
+  head-of-line property (functional, worse under loss). `MaxPacket` = min(`WINSOCK_MAX_PACKET` (what `UIpConnection`/`UWebSocketConnection` pass to
+  `InitBase`), lane MTU − 12 B framing). Node → simulator uses the sim stream (reliable, ordered) — acceptable because that hop is
+  datacenter-local; the sim stream gets a per-connection byte budget so one chatty client cannot starve frames
+  (`net_bytes_per_tick`, default 16 KiB/tick/conn, excess dropped oldest-first; UE retransmits).
+- **Client side.** `InitConnect`: resolve `UMusubiSubsystem` (shares its socket/session; the driver never opens a
+  second transport), send `net_open`, create `UMusubiNetConnection` (`InitLocalConnection`, `USOCK_Pending`,
+  `MaxPacket` from `net_opened`); `TickDispatch` drains the queue of `net_packet` for its `conn` into
+  `ReceivedRawPacket` (game thread, same as `UIpNetDriver`); `LowLevelSend` → `net_packet`. Engine login
+  (`NMT_Hello/Challenge/Login/Welcome`, `UPendingNetGame`) runs untouched on top; URL options carry
+  `?MusubiSession=<id>` so `AGameModeBase::PreLogin/Login` can map the connection to the authenticated account
+  (`UMusubiNetConnection::PlayerId` = session subject as `FUniqueNetIdRepl`).
+- **Server side.** `InitListen` opens nothing; it subscribes to `UMusubiSimulatorSubsystem` for `NetOpen`
+  events. Each event → `UMusubiNetConnection` (`InitRemoteConnection` with a synthesized
+  `FMusubiInternetAddr : FInternetAddr` = `musubi:<conn>`, `USOCK_Open`), `AddClientConnection`,
+  `bChallengeHandshake=false`, `PacketHandler` begins handshaking immediately (`Handler->BeginHandshaking()`).
+  `NetPacket` → `ReceivedRawPacket`; `LowLevelSend` → `SimCommand::NetPacket`. `GetSocketSubsystem` returns the
+  platform subsystem (only for `FInternetAddr` factories, as `UWebSocketNetDriver` does).
+- **Rehome (the seamless-world part).** When the player's entity completes a handover, the node emits
+  `net_rehome{conn, server}` to the client and `NetClose{reason: rehome}` to the old server *after* the new
+  server has been told `NetOpen{…, options: "rehome=1"}`. Client driver: open connection #2 to the new server,
+  run login to `NMT_Welcome` while #1 stays live, then swap `ServerConnection`, `CleanUp()` #1. Channel
+  teardown destroys #1's actors; to avoid a frame of empty world, actors whose entity id (from
+  `UMusubiAuthorityComponent::EntityId`, replicated) also exists on #2 are *handed over locally*: the driver
+  keeps a map `entity → actor`, and `UMusubiNetConnection` on #2 adopts the existing actor in
+  `UActorChannel` creation (`UNetDriver::NotifyActorChannelOpen`-time lookup via a `IMusubiNetAdoptable`
+  interface) instead of spawning a twin. Budget: rehome must complete within `RehomeTimeout` (5 s) or the client
+  falls back to a plain reconnect (`UEngine::HandleNetworkFailure(ENetworkFailure::ConnectionLost)` → project
+  travel). PlayerController/PlayerState: the new server runs a normal login; the state a project wants to survive
+  is carried by `?MusubiResume=<token>` (node-issued, 30 s) that the new `GameMode::Login` can redeem through
+  `UMusubiSimulatorSubsystem::ResumePlayer(token) → entity components snapshot`.
+- **Config** (what a project writes):
+  ```ini
+  [/Script/Engine.Engine]
+  !NetDriverDefinitions=ClearArray
+  +NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/MusubiNet.MusubiNetDriver",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver",bCanUseIris=true)
+  [/Script/MusubiNet.MusubiNetDriver]
+  NetConnectionClassName="/Script/MusubiNet.MusubiNetConnection"
+  ```
+  `ReplicationBridgeClassName` stays the engine default (`UEngineReplicationBridge`). `net.Iris.UseIrisReplication`
+  and `UGameInstance::GetDesiredReplicationSystem` keep their engine meaning. Nothing in the project's gameplay
+  code changes: `HasAuthority()`, `Role`, `GetLifetimeReplicatedProps`, RPC macros all behave as on `UIpNetDriver`.
+- **Ghosts to clients.** A client connected to server S sees S's owned actors by normal replication. Entities
+  owned by other servers reach the client either through the world view (today) or, with
+  `UMusubiSimulatorSettings::bReplicateGhosts = true` (default), as actors S replicates too: ghosts are
+  `bReplicates=true`, locally `ROLE_Authority` for the driver's purposes but fed from the node (9.3), so the
+  client sees one uniform Unreal world; cost is one extra hop (node → S → client) and S's bandwidth. Projects with
+  a non-Unreal client keep the world view.
+
+### 9.3 Path B — authority → node → ghosts with real Iris state (tier B)
+
+- `UMusubiSimulatorSubsystem` creates **its own** `UReplicationSystem` at `Configure`:
+  `FReplicationSystemFactory::CreateReplicationSystem(Params{ReplicationBridge = NewObject<UMusubiReplicationBridge>,
+  bIsServer = true, bAllowObjectReplication = true, MaxReplicatedObjectCount = Capacity × 2})`, one pseudo
+  connection (`AddConnection(1)`, infinite `FReplicationView`), ticked inside `SimTick` with the four-call
+  sequence from 9.1 (`SendUpdate` gets an empty lambda: nothing is written to a wire; the bridge does the work in
+  `PreSendUpdate`). `DestroyReplicationSystem` on `Deinitialize`. This is what phase 6 forgot.
+- Owned actors with `UMusubiAuthorityComponent` are registered (`BeginReplication`), their replicated
+  `UPROPERTY`s (actor + replicated components, `GetLifetimeReplicatedProps` honoured through the descriptor
+  builder's `GetLifeTimeProperties`) become per-class descriptors; each tick the bridge polls
+  (`PollAndCopyPropertyData`), quantizes, diffs (`IsEqualQuantizedState` against the last sent buffer),
+  serializes only changed members (`SerializeWithMask`, mask = changed members) and writes entity component
+  `iris = {c: <class path>, v: <frame>, m: <mask bits>, s: <bytes>}` (binary frames: raw bytes; JSON: base64).
+  Typical actor: 40–200 B per changed tick; unchanged: nothing.
+- Ghosts (and, via 9.2, clients of the ghost's server) apply it the other way: descriptor for `c`,
+  `DeserializeWithMask` → `Dequantize` into an external buffer laid out by the descriptor → copy the masked
+  members into the actor/component properties, firing the per-member `RepNotifyFunction` the descriptor
+  carries (`ReplicationStateDescriptor.h:155`); `FreeDynamicState` after. Descriptor mismatch (different
+  build on the two servers): `c`'s descriptor hash is part of the component (`h`), mismatch → log once, skip
+  component, `EMusubiError::ProtocolMismatch` on the authority component.
+- JSON `components` set by hand keep working unchanged; `iris` is just one more component. Tier A (5.3/5.4)
+  has no Iris: the bridge module is the stub, `iris` is ignored, authority components stay JSON.
+
+### 9.4 Path C — RPCs through the node
+
+- Client → owning server: path A, nothing special (the actor channel's owning connection is on the owner;
+  after rehome it is on the new owner by construction).
+- Server → other server (`Server`/`NetMulticast` RPCs on ghosts, and `Client` RPCs for a player whose
+  controller lives elsewhere): a second driver `UMusubiMeshNetDriver` (`NetDriverName = MusubiMesh`,
+  no connections, `ShouldReplicateFunction` = actor has an authority component and is a ghost or the function
+  is multicast) receives them from `ForwardRemoteFunction`. Its `ProcessRemoteFunction` serializes
+  `{entity, class, function path, params}` — params via `CreateDescriptorForFunction` + `Quantize` +
+  `Serialize` (tier A: `FNetBitWriter` + `UFunction` property serialization) — and sends
+  `SimCommand::Interact{kind: "rpc", payload}` (the existing interaction path; node routes to the owner).
+  Owner: `SimEvent::Interaction{kind:"rpc"}` → `UMusubiAuthorityComponent::OnRpc` → deserialize →
+  `Actor->ProcessEvent(Function, Params)`. `NetMulticast` → node fans to every simulator that hosts a ghost of
+  the entity (`interact` with `broadcast: true`, new flag) and to the owner. Ordering: per entity FIFO
+  (interactions already are); reliability: the sim stream is reliable; unreliable RPCs are sent reliable
+  (documented, same as the engine does for unreliable RPCs on a saturated channel — they are simply allowed
+  to drop under the byte budget of 9.2).
+
+### 9.5 Path D — full physics handover and roles
+
+- `CapturePhysicsIntoComponents` grows from `{pos, vel}` to the component `phys` =
+  `FRigidBodyState` of the root primitive (`UPrimitiveComponent::GetRigidBodyState`: position, quaternion,
+  linear and angular velocity, flags incl. sleeping) + `bSimulatePhysics`, `CustomTimeDilation`, and for
+  each `UPhysicsConstraintComponent` on the actor `{name, bBroken}`; welded children are implicit in the root.
+  `RestorePhysicsFromComponents` applies it before `SetPhysicsEnabled(true)` (`SetAllPhysicsPosition/Rotation`,
+  `SetAllPhysicsLinearVelocity`, `SetAllPhysicsAngularVelocityInRadians`, `PutRigidBodyToSleep` if flagged,
+  `BreakConstraint` for broken ones). Verified against 5.3.2/5.7.4/5.8.4 headers before coding, as usual.
+- Roles: an owned actor is `ROLE_Authority`; a ghost is `ROLE_Authority` for the local driver (it must
+  replicate to this server's clients, 9.2) but `UMusubiAuthorityComponent::IsGhost()` is the project's
+  "simulated proxy" test; `AActor::HasAuthority()` therefore stays engine-true. Gameplay that must only run on
+  the owner uses `IsOwned()` — documented as the one rule a project has to learn; a `bOwned` replicated
+  bool on the component lets clients tell owner-side actors from relayed ghosts.
+
+### 9.6 Order and proof
+
+9b driver + node relay (Rust: realtime `net_*`, mesh `SimEvent/SimCommand::Net*`, routing by entity owner,
+rehome on handover complete; UE: `MusubiNet`), with a Rust test that two fake simulators and one client see
+the relay re-homed after a handover; 9c own `UReplicationSystem` + binary state; 9d RPC via node; 9e physics +
+roles; 9f node-in-the-loop: node + two headless UE 5.8.4 servers in the image + one headless client, entity
+walks across the cell border, client stays connected and its actor keeps the same `UPROPERTY` values. Each
+step is a UBT `BuildPlugin` on 5.7.4/5.8.4 (and 5.3.2 for the driver) before it is called done.
+
+## 10. Numbers, limits, failure behaviour
 
 | Item | Value | Behaviour at the edge |
 |---|---|---|
@@ -352,7 +542,7 @@ Error model: one `EMusubiError` enum (`Network, Timeout, Disconnected, Unauthori
 NotFound, Conflict, RateLimited, TooLarge, Busy, ProtocolMismatch, Server, Unknown`) + the
 node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Error, Code, Message}`.
 
-## 10. Testing
+## 11. Testing
 
 * **Compile matrix** (local, Linux): `sdk/unreal/tools/ue-build.sh <ver>` runs UAT `BuildPlugin`
   (UnrealEditor + UnrealGame, all modules) inside Epic's `dev-slim` images for 5.3.2 (tier A,
@@ -377,7 +567,7 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 * **Soak**: `musubi meshbench` bots + one headless-UE simulator for 10 min, no leaked actors
   (`GEngine->GetWorld()->GetActorCount()` back to baseline after unsubscribe).
 
-## 11. Delivery order (each = commit + README section + CI step)
+## 12. Delivery order (each = commit + README section + CI step)
 
 1. Wire layer: typed structs for all 80 messages, JSON + postcard, golden vectors, reconnect,
    session/refresh. Replaces today's 1 072-line scaffold.
@@ -401,3 +591,8 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 8. Compile matrix 5.3.2/5.7.4/5.8.4 — done locally (`tools/ue-build.sh`, real UAT `BuildPlugin`,
    0 warnings on all three); node-in-the-loop tests + docs (`docs/parity.md` L146/L192 updated:
    SDK/GDK no longer "after") still open.
+9. NetDriver-level integration (section 9): 9b `MusubiNet` driver + node relay (`net_*` messages,
+   `SimEvent::Net*`), 9c own `UReplicationSystem` + binary Iris state for authority → node → ghosts,
+   9d RPC via node (`UMusubiMeshNetDriver` + `ForwardRemoteFunction`), 9e full physics handover + roles,
+   9f node-in-the-loop with two UE servers proving rehome. Each step = UBT green on 5.7.4/5.8.4 (+5.3.2 for the
+   driver, which is classic-API only) + Rust tests for the node side.
