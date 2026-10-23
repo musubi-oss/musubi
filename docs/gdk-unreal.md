@@ -751,7 +751,8 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 
 * **Compile matrix** (local, Linux): `sdk/unreal/tools/ue-build.sh <ver>` runs UAT `BuildPlugin`
   (UnrealEditor + UnrealGame, all modules) inside Epic's `dev-slim` images for 5.3.2 (tier A,
-  `MusubiIris` stub), 5.7.4 and 5.8.4 (tier B). Not in CI: the images are 12–22 GiB and require a
+  `MusubiIris` stub), 5.5.4, 5.6.1, 5.7.4 and 5.8.4 (tier B; 5.5/5.6 differ in the `UNetObjectFactory`
+  hooks, the replication-system tick names and `EReplicationStateTraits`, all under `ENGINE_MINOR_VERSION` guards). Not in CI: the images are 12–22 GiB and require a
   GitHub account linked to Epic Games, so the matrix is re-run by hand before a release. Output
   and UBT logs land in `target/ue/<ver>/`. 5.4+: the script drops a `BuildConfiguration.xml` with
   `bAllowUBAExecutor=false` into the host project — UBA detours crash clang 20 on every Game-target
@@ -793,7 +794,7 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    waits for a project that needs it.
 6. Iris bridge (tier B) + Mass sink — done (`MusubiIris`, `MusubiMass`).
 7. QUIC transport — done: `musubi-quic-ffi` (Rust static lib) + `MusubiQuic`, `IMusubiTransport` seam, Auto with WS fallback. Consoles (platform ffi builds) and live WS→QUIC migration later.
-8. Compile matrix 5.3.2/5.7.4/5.8.4 — done locally (`tools/ue-build.sh`, real UAT `BuildPlugin`,
+8. Compile matrix 5.3.2/5.5.4/5.6.1/5.7.4/5.8.4 — done locally (`tools/ue-build.sh`, real UAT `BuildPlugin`,
    0 warnings on all three); node-in-the-loop tests + docs (`docs/parity.md` L146/L192 updated:
    SDK/GDK no longer "after") still open.
 9. NetDriver-level integration (section 9): 9b `MusubiNet` driver + node relay (`net_*` messages,

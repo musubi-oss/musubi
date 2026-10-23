@@ -8,6 +8,7 @@
 #include "Engine/GameInstance.h"
 #include "MusubiSimulatorSubsystem.h"
 
+
 const FName UMusubiNetObjectFactory::FactoryName(TEXT("MusubiEntity"));
 
 #include "Iris/Serialization/NetBitStreamUtil.h"
@@ -46,6 +47,12 @@ TUniquePtr<FNetObjectCreationHeader> UMusubiNetObjectFactory::CreateAndFillHeade
 	}
 	return H;
 }
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 5
+// 5.5 has no WriteBytes/ReadBytes in NetBitStreamUtil
+static void WriteBytes(FNetBitStreamWriter* W, const uint8* Src, uint32 N) { for (uint32 i = 0; i < N; ++i) W->WriteBits(Src[i], 8u); }
+static void ReadBytes(FNetBitStreamReader* R, uint8* Dst, uint32 N) { for (uint32 i = 0; i < N; ++i) Dst[i] = (uint8)R->ReadBits(8u); }
+#endif
 
 bool UMusubiNetObjectFactory::SerializeHeader(const FCreationHeaderContext& Context, const FNetObjectCreationHeader* Header)
 {
@@ -109,12 +116,15 @@ void UMusubiNetObjectFactory::PostInstantiation(const FPostInstantiationContext&
 }
 
 // Iris says the remote object is gone; the Musubi side mirrors despawn through the bridge's detach path.
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
 static void MusubiFillWorldInfo(const AActor& A, UNetObjectFactory::FWorldInfoData& D)
 {
 	D.WorldLocation = A.GetActorLocation();
 	D.CullDistance = A.GetNetCullDistanceSquared() > 0.f ? FMath::Sqrt(A.GetNetCullDistanceSquared()) : 0.f;
 }
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 6
+#endif
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 5
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 6
 void UMusubiNetObjectFactory::GetWorldInfo(const FWorldInfoContext& Context, FWorldInfoData& OutData)
 {
 	if (const AActor* A = Cast<AActor>(Context.Instance)) MusubiFillWorldInfo(*A, OutData);

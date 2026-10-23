@@ -123,11 +123,18 @@ void UMusubiIrisExportSubsystem::OnTick()
 	// UNetDriver's order (5.7/5.8): PostDispatchSendUpdate = TickPostReceive → SendUpdate → PostSendUpdate (the
 	// PostTickDispatch pass), then InternalIrisUpdate = NetUpdate (opens the TickFlush pass) and PostTickFlush =
 	// PostSendUpdate (closes it). TickPostReceive ensures no pass is open, so NetUpdate must not come first.
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 5
+	// 5.5: one pass, PreSendUpdate(DeltaSeconds) → SendUpdate → PostSendUpdate
+	System->PreSendUpdate(Dt);
+	System->SendUpdate([](TArrayView<uint32>) {});
+	System->PostSendUpdate();
+#else
 	System->TickPostReceive();
 	System->SendUpdate([](TArrayView<uint32>) {});
 	System->PostSendUpdate();
 	System->NetUpdate(Dt);
 	System->PostSendUpdate();
+#endif
 }
 
 void UMusubiIrisExportSubsystem::OnEntitySpawned(const FString& EntityId, AActor* Actor)

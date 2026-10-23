@@ -36,8 +36,10 @@ public:
 	virtual FInstantiateResult InstantiateReplicatedObjectFromHeader(const FInstantiateContext& Context, const UE::Net::FNetObjectCreationHeader* Header) override;
 	virtual void PostInstantiation(const FPostInstantiationContext& Context) override;
 	// PURE_VIRTUAL in the engine = compiles without, fatal at the first call (seen live on 5.8: FillRootObjectReplicationParams)
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 6
-	// 5.5/5.6: out-parameter world info, poll frequency not a factory concern, destruction via DestroyReplicatedObject
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 5
+	// 5.5: the factory only creates objects (no world info / destruction hooks yet)
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 6
+	// 5.6: out-parameter world info, poll frequency not a factory concern, destruction via DestroyReplicatedObject
 	virtual void GetWorldInfo(const FWorldInfoContext& Context, FWorldInfoData& OutData) override;
 	virtual void DestroyReplicatedObject(const FDestroyedContext& Context) override;
 #else
