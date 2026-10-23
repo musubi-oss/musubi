@@ -34,6 +34,8 @@ public:
 	FMusubiJson Session;
 	/** Client side: packets written before `net_opened`, flushed on open. */
 	TArray<TArray<uint8>> PendingOut;
+	/** Set by the driver before CleanUp() on a rehome: the relay conn lives on for the next engine connection. */
+	bool bKeepRelay = false;
 
 	bool IsOpen() const { return ConnId != 0; }
 	/** Client side: the relay is open — set the id/limit and flush what was queued. */

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/NetDriver.h"
+#include "Engine/NetworkDelegates.h"
 #include "MusubiEnvelope.h"
 #include "MusubiSimWire.generated.h"
 #include "MusubiNetDriver.generated.h"
@@ -25,7 +26,7 @@ class UMusubiSimulatorSubsystem;
  *   +NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/MusubiNet.MusubiNetDriver",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver",bCanUseIris=true)
  */
 UCLASS(transient, config = Engine)
-class MUSUBINET_API UMusubiNetDriver : public UNetDriver
+class MUSUBINET_API UMusubiNetDriver : public UNetDriver, public FNetworkNotify
 {
 	GENERATED_BODY()
 
@@ -56,12 +57,25 @@ public:
 protected:
 	/** Client: the entity moved to another simulator. Default: travel to the same URL (`TRAVEL_Absolute`), i.e. a reconnect; projects override for an in-place restart. */
 	virtual void OnRehome(const FMusubiServerMessageNetRehome& Msg);
+	int32 Rehomes = 0, Adopted = 0;
+	// FNetworkNotify: owns the control channel during an in-place rehome, forwards everything else to the world
+	virtual EAcceptConnection::Type NotifyAcceptingConnection() override { return WorldNotify ? WorldNotify->NotifyAcceptingConnection() : EAcceptConnection::Reject; }
+	virtual void NotifyAcceptedConnection(UNetConnection* Connection) override { if (WorldNotify) WorldNotify->NotifyAcceptedConnection(Connection); }
+	virtual bool NotifyAcceptingChannel(UChannel* Channel) override { return WorldNotify ? WorldNotify->NotifyAcceptingChannel(Channel) : false; }
+	virtual void NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, FInBunch& Bunch) override;
 
 private:
 	// client
 	TWeakObjectPtr<UMusubiSubsystem> Client;
 	FDelegateHandle PacketHandle, CloseHandle, RehomeHandle;
 	FURL ClientURL;
+	FNetworkNotify* WorldNotify = nullptr;
+	bool bRehoming = false;
+	double RehomeStarted = 0;
+	TMap<FString, TWeakObjectPtr<AActor>> TornOff;
+	FDelegateHandle IdentifiedHandle;
+	void FinishRehome(bool bOk, const FString& Why);
+	void OnEntityIdentified(AActor* Actor, const FString& Id);
 	void OnNetOpened(bool bOk, const FMusubiServerEnvelope& Reply);
 	void OnClientMsg(const FMusubiServerEnvelope& Env);
 	// server

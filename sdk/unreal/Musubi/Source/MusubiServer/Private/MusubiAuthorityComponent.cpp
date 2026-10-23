@@ -3,6 +3,20 @@
 #include "MusubiJson.h"
 #include "Components/PrimitiveComponent.h"
 #include "GameFramework/Actor.h"
+#include "Net/UnrealNetwork.h"
+
+UMusubiAuthorityComponent::FMusubiOnClientEntityIdentified UMusubiAuthorityComponent::OnClientEntityIdentified;
+
+void UMusubiAuthorityComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(UMusubiAuthorityComponent, NetEntityId);
+}
+
+void UMusubiAuthorityComponent::OnRep_NetEntityId()
+{
+	if (!NetEntityId.IsEmpty()) OnClientEntityIdentified.Broadcast(GetOwner(), NetEntityId);
+}
 
 FString UMusubiAuthorityComponent::GetComponentJson(const FString& Name) const
 {
@@ -75,6 +89,7 @@ void UMusubiAuthorityComponent::Bind(UMusubiSimulatorSubsystem* Owner, const FMu
 {
 	Sim = Owner;
 	EntityId = Id;
+	NetEntityId = Id.ToString();
 	Cell = InCell;
 	Components.Reset();
 	Dirty.Reset();

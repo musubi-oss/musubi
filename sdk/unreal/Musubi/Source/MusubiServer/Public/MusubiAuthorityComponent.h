@@ -19,6 +19,14 @@ class MUSUBISERVER_API UMusubiAuthorityComponent : public UActorComponent
 {
 	GENERATED_BODY()
 public:
+	UMusubiAuthorityComponent() { SetIsReplicatedByDefault(true); }
+	/** The entity id as replicated to engine clients (MusubiNet): lets a client recognise the same entity again after a rehome. */
+	UPROPERTY(ReplicatedUsing = OnRep_NetEntityId, Transient, BlueprintReadOnly, Category = "Musubi|Authority") FString NetEntityId;
+	UFUNCTION() void OnRep_NetEntityId();
+	/** Client side: an actor replicated by a server identified itself with its entity id. */
+	DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiOnClientEntityIdentified, AActor*, const FString&);
+	static FMusubiOnClientEntityIdentified OnClientEntityIdentified;
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 	UFUNCTION(BlueprintPure, Category = "Musubi|Authority") FString GetEntityId() const { return EntityId.ToString(); }
 	const FMusubiUuid& GetEntityUuid() const { return EntityId; }
 	/** True while this process is the authority (owned entity in a leased cell). */

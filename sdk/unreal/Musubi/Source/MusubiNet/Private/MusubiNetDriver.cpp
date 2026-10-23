@@ -1,4 +1,11 @@
 #include "MusubiNetDriver.h"
+#include "MusubiAuthorityComponent.h"
+#include "Net/DataChannel.h"
+#include "Engine/ActorChannel.h"
+#include "Engine/ControlChannel.h"
+#include "Engine/LocalPlayer.h"
+#include "Misc/NetworkVersion.h"
+#include "Misc/Paths.h"
 
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
@@ -78,6 +85,7 @@ bool UMusubiNetDriver::InitConnect(FNetworkNotify* InNotify, const FURL& Connect
 	PacketHandle = Sock->OnTag(EMusubiServerMessageTag::NetPacket).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
 	CloseHandle = Sock->OnTag(EMusubiServerMessageTag::NetClose).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
 	RehomeHandle = Sock->OnTag(EMusubiServerMessageTag::NetRehome).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
+	IdentifiedHandle = UMusubiAuthorityComponent::OnClientEntityIdentified.AddUObject(this, &UMusubiNetDriver::OnEntityIdentified);
 	FMusubiClientMessage Open;
 	Open.Tag = EMusubiClientMessageTag::NetOpen;
 	Open.NetOpen.Emplace();
@@ -130,11 +138,137 @@ void UMusubiNetDriver::OnClientMsg(const FMusubiServerEnvelope& Env)
 
 void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 {
-	UE_LOG(LogMusubiNet, Log, TEXT("entity %s moved to %s: reconnecting"), *Msg.entity, Msg.server.IsSet() ? *Msg.server->ToString() : TEXT("another node"));
-	// v1: a plain reconnect to the same URL; the node routes the new connection to the new owner.
-	// In-place restart with actor adoption is the next step (docs §9.2 "Rehome").
+	UMusubiNetConnection* Old = Cast<UMusubiNetConnection>(ServerConnection);
+	UWorld* W = GetWorld();
+	UE_LOG(LogMusubiNet, Log, TEXT("entity %s moved to %s: rehoming in place"), *Msg.entity, Msg.server.IsSet() ? *Msg.server->ToString() : TEXT("another node"));
+	if (!Old || !W || bRehoming || !Old->IsOpen())
+	{
+		FinishRehome(false, TEXT("no open connection to rehome"));
+		return;
+	}
+	++Rehomes;
+	bRehoming = true;
+	RehomeStarted = FPlatformTime::Seconds();
+	// 1. keep the world: actors that are Musubi entities stay as torn-off actors (the engine sets bTearOff itself in
+	//    UActorChannel::CleanUp(TearOff) and keeps the actor since ShouldClientDestroyTearOffActors() is false); the new
+	//    owner's replication re-creates them and OnEntityIdentified swaps the twin out — no empty frame in between
+	TornOff.Reset();
+	for (UChannel* Ch : TArray<UChannel*>(Old->OpenChannels))
+	{
+		UActorChannel* AC = Cast<UActorChannel>(Ch);
+		if (!AC || !AC->Actor) continue;
+		const UMusubiAuthorityComponent* Auth = AC->Actor->FindComponentByClass<UMusubiAuthorityComponent>();
+		if (!Auth || Auth->NetEntityId.IsEmpty()) continue;
+		TornOff.Add(Auth->NetEntityId, AC->Actor);
+		AC->ConditionalCleanUp(true, EChannelCloseReason::TearOff);
+	}
+	// 2. a fresh engine connection on the same relay conn (the node already routes it to the new owner; the server side
+	//    opens its UMusubiNetConnection on our first packet)
+	const uint64 ConnId = Old->ConnId;
+	const int32 OldMaxPacket = Old->MaxPacket;
+	Old->bKeepRelay = true;
+	ServerConnection = nullptr; // UNetConnection::CleanUp asserts Driver->ServerConnection == this when it is set
+	Old->CleanUp();
+	UMusubiNetConnection* Conn = NewObject<UMusubiNetConnection>(GetTransientPackage(), static_cast<UClass*>(NetConnectionClass));
+	ServerConnection = Conn;
+	Conn->InitLocalConnection(this, nullptr, ClientURL, USOCK_Pending);
+	Conn->Opened(ConnId, OldMaxPacket);
+	CreateInitialClientChannels();
+	WorldNotify = Notify;
+	Notify = this;
+	// 3. the login handshake the engine normally runs in UPendingNetGame, without the map load
+	uint8 IsLittleEndian = uint8(PLATFORM_LITTLE_ENDIAN);
+	uint32 LocalNetworkVersion = FNetworkVersion::GetLocalNetworkVersion();
+	FString EncryptionToken;
+	EEngineNetworkRuntimeFeatures LocalNetworkFeatures = GetNetworkRuntimeFeatures();
+	FNetControlMessage<NMT_Hello>::Send(Conn, IsLittleEndian, LocalNetworkVersion, EncryptionToken, LocalNetworkFeatures);
+	Conn->FlushNet();
+}
+
+void UMusubiNetDriver::NotifyControlMessage(UNetConnection* Connection, uint8 MessageType, FInBunch& Bunch)
+{
+	if (!bRehoming || Connection != ServerConnection)
+	{
+		if (WorldNotify) WorldNotify->NotifyControlMessage(Connection, MessageType, Bunch);
+		return;
+	}
+	switch (MessageType)
+	{
+	case NMT_Challenge:
+		if (FNetControlMessage<NMT_Challenge>::Receive(Bunch, Connection->Challenge))
+		{
+			FURL PartialURL(ClientURL);
+			PartialURL.Host.Empty();
+			PartialURL.Port = PartialURL.UrlConfig.DefaultPort;
+			PartialURL.Map.Empty();
+			UGameInstance* GI = GameInstanceOf(this);
+			if (ULocalPlayer* LP = GI ? GI->GetFirstGamePlayer() : nullptr) Connection->PlayerId = LP->GetPreferredUniqueNetId();
+			FString OnlinePlatformNameString = GI ? GI->GetOnlinePlatformName().ToString() : FString();
+			Connection->ClientResponse = TEXT("0");
+			FString URLString(PartialURL.ToString());
+			FNetControlMessage<NMT_Login>::Send(Connection, Connection->ClientResponse, URLString, Connection->PlayerId, OnlinePlatformNameString);
+			Connection->FlushNet();
+		}
+		break;
+	case NMT_Welcome:
+	{
+		FString Map, GameName, RedirectURL;
+		if (!FNetControlMessage<NMT_Welcome>::Receive(Bunch, Map, GameName, RedirectURL)) break;
+		FURL Default;
+		const FURL Level(&Default, *Map, TRAVEL_Partial);
+		if (!Level.Map.IsEmpty() && GetWorld() && FPaths::GetBaseFilename(Level.Map) != GetWorld()->GetMapName())
+		{
+			FinishRehome(false, FString::Printf(TEXT("new owner runs level %s, we are in %s"), *Level.Map, *GetWorld()->GetMapName()));
+			break;
+		}
+		FNetControlMessage<NMT_Netspeed>::Send(Connection, Connection->CurrentNetSpeed);
+		FNetControlMessage<NMT_Join>::Send(Connection);
+		Connection->FlushNet(true);
+		FinishRehome(true, Map);
+		break;
+	}
+	case NMT_Failure:
+	{
+		FString Why;
+		if (!FNetControlMessage<NMT_Failure>::Receive(Bunch, Why)) Why.Empty();
+		FinishRehome(false, Why.IsEmpty() ? TEXT("NMT_Failure") : Why);
+		break;
+	}
+	case NMT_Upgrade:
+		FinishRehome(false, TEXT("NMT_Upgrade"));
+		break;
+	default:
+		if (WorldNotify) WorldNotify->NotifyControlMessage(Connection, MessageType, Bunch);
+	}
+}
+
+void UMusubiNetDriver::FinishRehome(bool bOk, const FString& Why)
+{
+	const bool bWas = bRehoming;
+	bRehoming = false;
+	if (WorldNotify) { Notify = WorldNotify; WorldNotify = nullptr; }
+	if (bOk)
+	{
+		UE_LOG(LogMusubiNet, Log, TEXT("rehomed in place (%s), %d actors kept for adoption"), *Why, TornOff.Num());
+		return;
+	}
+	UE_LOG(LogMusubiNet, Warning, TEXT("in-place rehome failed (%s)%s"), *Why, bWas ? TEXT(": travelling") : TEXT(": reconnecting"));
+	TornOff.Reset();
 	if (GEngine)
 		if (UWorld* W = GetWorld()) GEngine->SetClientTravel(W, *ClientURL.ToString(), TRAVEL_Absolute);
+}
+
+void UMusubiNetDriver::OnEntityIdentified(AActor* Actor, const FString& Id)
+{
+	TWeakObjectPtr<AActor>* P = TornOff.Find(Id);
+	if (!P) return;
+	AActor* Twin = P->Get();
+	TornOff.Remove(Id);
+	if (Twin && Twin != Actor)
+	{
+		++Adopted;
+		Twin->Destroy();
+	}
 }
 
 // ----- server -----
@@ -236,6 +370,13 @@ void UMusubiNetDriver::DrainInbox()
 
 void UMusubiNetDriver::TickDispatch(float DeltaTime)
 {
+	if (bRehoming && FPlatformTime::Seconds() - RehomeStarted > RehomeTimeout) FinishRehome(false, TEXT("timeout"));
+	else if (!bRehoming && TornOff.Num() && FPlatformTime::Seconds() - RehomeStarted > 2.0 * RehomeTimeout)
+	{
+		// entities the new owner never sent again (left our interest during the move): drop the stale twins
+		for (TPair<FString, TWeakObjectPtr<AActor>>& KV : TornOff) if (AActor* A = KV.Value.Get()) A->Destroy();
+		TornOff.Reset();
+	}
 	Super::TickDispatch(DeltaTime);
 	DrainInbox();
 }
@@ -266,6 +407,7 @@ void UMusubiNetDriver::LowLevelDestroy()
 			Sock->OnTag(EMusubiServerMessageTag::NetPacket).Remove(PacketHandle);
 			Sock->OnTag(EMusubiServerMessageTag::NetClose).Remove(CloseHandle);
 			Sock->OnTag(EMusubiServerMessageTag::NetRehome).Remove(RehomeHandle);
+			UMusubiAuthorityComponent::OnClientEntityIdentified.Remove(IdentifiedHandle);
 			if (UMusubiNetConnection* Conn = Cast<UMusubiNetConnection>(ServerConnection))
 				if (Conn->IsOpen())
 				{

@@ -436,14 +436,22 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   When the entity's handover completes (both the local and the cross-node completion paths), the world
   queues a `net_close{reason: "rehome"}` event for the old owner and a `net_rehome` message for each
   client on the entity, sent at the next tick; packets already in flight were buffered during transit and
-  are replayed to the new owner. Client driver on `net_rehome`: tear down `ServerConnection`
-  (`CleanUp()`), create a fresh `UMusubiNetConnection` on the same `conn`, run login again; actors from
-  the old server are destroyed with their channels and re-created by the new server's replication. To
-  avoid a frame of empty world, actors whose entity id (`UMusubiAuthorityComponent::EntityId`,
-  replicated) also appears on the new connection are adopted instead of re-spawned (`IMusubiNetAdoptable`
-  lookup at actor-channel open). Budget: a rehome must reach `NMT_Welcome` within `RehomeTimeout` (5 s) or
-  the client falls back to `UEngine::HandleNetworkFailure(ENetworkFailure::ConnectionLost)` → project
-  travel. State a project wants to survive the server change rides `?MusubiResume=<token>` (node-issued,
+  are replayed to the new owner. Client driver on `net_rehome` (implemented, in place, no travel): every
+  actor channel whose actor carries a `UMusubiAuthorityComponent` is closed with
+  `EChannelCloseReason::TearOff` — the engine sets `bTearOff` itself in `UActorChannel::CleanUp` and keeps
+  the actor since `ShouldClientDestroyTearOffActors()` is false — and remembered by its replicated
+  `NetEntityId`; the old `ServerConnection` is cleaned up (after `ServerConnection = nullptr`, which
+  `UNetConnection::CleanUp` asserts on), a fresh `UMusubiNetConnection` opens on the same `conn`, and the
+  driver takes over `FNetworkNotify` for the handshake `UPendingNetGame` normally runs
+  (`NMT_Hello → Challenge → Login → Welcome → Netspeed → Join`), handing other control messages to the
+  world and giving the notify back after `Join`. The new owner replicates its actors; when one of them
+  reports its `NetEntityId` (RepNotify → `UMusubiAuthorityComponent::OnClientEntityIdentified`) the
+  torn-off twin is destroyed — the world never shows an empty frame. Twins nobody re-sent are dropped
+  after `2 × RehomeTimeout`. Budget: `NMT_Welcome` within `RehomeTimeout` (5 s), or the new owner runs a
+  different level, or `NMT_Failure`/`NMT_Upgrade` → fall back to a travel to the same URL. Node side: a
+  `net_packet`/`net_close` from a simulator that no longer owns the relayed entity is dropped
+  (`musubi_world_net_stale_dropped_total`), so the old owner's close bunch cannot land on the new
+  connection. State a project wants to survive the server change rides `?MusubiResume=<token>` (node-issued,
   30 s) redeemed by the new `GameMode::Login` via `UMusubiSimulatorSubsystem::ResumePlayer`.
   Session death closes every relay the session had (`net_close{reason: "session closed"}` to the owner).
 
@@ -608,7 +616,7 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    driver, which is classic-API only) + Rust tests for the node side.
    Status: 9b shipped — node relay (`net_*`, routed by entity like inputs, re-home on handover completion,
    ws test `net_relay_follows_the_entity_across_a_handover`) and `MusubiNet` (driver + connection, implicit open
-   on the server, `net_rehome` → reconnect v1), UBT green on 5.8.4. Open in 9b: in-place rehome with actor adoption,
+   on the server, `net_rehome` → reconnect v1), UBT green on 5.8.4. In-place rehome with actor adoption done (see §9.2 Rehome). Was open in 9b:
    `?MusubiResume` token, 5.3.2 build of the module (5.7.4 green).
    9c in progress: `UMusubiIrisExportSubsystem` (MusubiIrisImpl, dedicated servers) now creates the second
    `UReplicationSystem` with `UMusubiReplicationBridge`, registers owned entity actors as root objects and ticks it
