@@ -164,6 +164,24 @@ pub enum SimEvent<E = Value> {
         entity: EntityId,
         reason: String,
     },
+    /// Engine-level networking relayed through the world (Unreal `UMusubiNetDriver`): one opaque
+    /// packet from client session `session` for `entity`, which this simulator owns. `conn`
+    /// identifies the engine connection; the first packet on an unknown `conn` opens it (the
+    /// simulator answers with `net_packet` commands on the same `conn`/`session`).
+    NetPacket {
+        conn: u64,
+        session: Value,
+        entity: EntityId,
+        data: Vec<u8>,
+    },
+    /// The client (or the world, after a handover: `reason = "rehome"`) closed engine connection
+    /// `conn` on `entity`.
+    NetClose {
+        conn: u64,
+        session: Value,
+        entity: EntityId,
+        reason: String,
+    },
     /// An event this build does not know (a newer server); carried, not an error.
     #[serde(other)]
     Unknown,
@@ -412,6 +430,24 @@ mod sim_event_wire {
                     reason: "held".into(),
                 },
                 json!({"type": "tx_aborted", "tx": a, "entity": b, "reason": "held"}),
+            ),
+            (
+                SimEvent::NetPacket {
+                    conn: 7,
+                    session: json!(a),
+                    entity: b,
+                    data: vec![0, 255, 1],
+                },
+                json!({"type": "net_packet", "conn": 7, "session": a, "entity": b, "data": [0, 255, 1]}),
+            ),
+            (
+                SimEvent::NetClose {
+                    conn: 7,
+                    session: json!(a),
+                    entity: b,
+                    reason: "rehome".into(),
+                },
+                json!({"type": "net_close", "conn": 7, "session": a, "entity": b, "reason": "rehome"}),
             ),
         ];
         for (ev, wire) in cases {

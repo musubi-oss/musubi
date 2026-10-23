@@ -220,7 +220,9 @@ enum class EMusubiSimEventTag : uint8
 	CoLocate = 19,
 	TxCommitted = 20,
 	TxAborted = 21,
-	Unknown = 22,
+	NetPacket = 22,
+	NetClose = 23,
+	Unknown = 24,
 };
 MUSUBISERVER_API const TCHAR* MusubiTagName(EMusubiSimEventTag Tag);
 MUSUBISERVER_API bool MusubiTagFromName(const FString& Name, EMusubiSimEventTag& Out);
@@ -498,6 +500,32 @@ struct MUSUBISERVER_API FMusubiSimEventTxAborted
 	static void Read(FMusubiPostcardReader& R, FMusubiSimEventTxAborted& Out);
 };
 
+struct MUSUBISERVER_API FMusubiSimEventNetPacket
+{
+	uint64 conn = 0;
+	FMusubiJson session;
+	FMusubiUuid entity;
+	TArray<uint8> data;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimEventNetPacket& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimEventNetPacket& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiSimEventNetPacket& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiSimEventNetPacket& Out);
+};
+
+struct MUSUBISERVER_API FMusubiSimEventNetClose
+{
+	uint64 conn = 0;
+	FMusubiJson session;
+	FMusubiUuid entity;
+	FString reason;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimEventNetClose& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimEventNetClose& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiSimEventNetClose& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiSimEventNetClose& Out);
+};
+
 struct MUSUBISERVER_API FMusubiSimEvent
 {
 	EMusubiSimEventTag Tag = EMusubiSimEventTag::CellAssigned;
@@ -523,6 +551,8 @@ struct MUSUBISERVER_API FMusubiSimEvent
 	TOptional<FMusubiSimEventCoLocate> CoLocate;
 	TOptional<FMusubiSimEventTxCommitted> TxCommitted;
 	TOptional<FMusubiSimEventTxAborted> TxAborted;
+	TOptional<FMusubiSimEventNetPacket> NetPacket;
+	TOptional<FMusubiSimEventNetClose> NetClose;
 
 	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimEvent& V);
 	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimEvent& Out);
@@ -573,6 +603,8 @@ enum class EMusubiSimCommandTag : uint8
 	Colocate = 8,
 	Rewind = 9,
 	HandoverAck = 10,
+	NetPacket = 11,
+	NetClose = 12,
 };
 MUSUBISERVER_API const TCHAR* MusubiTagName(EMusubiSimCommandTag Tag);
 MUSUBISERVER_API bool MusubiTagFromName(const FString& Name, EMusubiSimCommandTag& Out);
@@ -710,6 +742,31 @@ struct MUSUBISERVER_API FMusubiSimCommandHandoverAck
 	static void Read(FMusubiPostcardReader& R, FMusubiSimCommandHandoverAck& Out);
 };
 
+struct MUSUBISERVER_API FMusubiSimCommandNetPacket
+{
+	uint64 conn = 0;
+	FMusubiJson session;
+	TArray<uint8> data;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimCommandNetPacket& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommandNetPacket& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiSimCommandNetPacket& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiSimCommandNetPacket& Out);
+};
+
+struct MUSUBISERVER_API FMusubiSimCommandNetClose
+{
+	uint64 conn = 0;
+	FMusubiJson session;
+	FString entity;
+	FString reason;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimCommandNetClose& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommandNetClose& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiSimCommandNetClose& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiSimCommandNetClose& Out);
+};
+
 struct MUSUBISERVER_API FMusubiSimCommand
 {
 	EMusubiSimCommandTag Tag = EMusubiSimCommandTag::Lease;
@@ -724,6 +781,8 @@ struct MUSUBISERVER_API FMusubiSimCommand
 	TOptional<FMusubiSimCommandColocate> Colocate;
 	TOptional<FMusubiSimCommandRewind> Rewind;
 	TOptional<FMusubiSimCommandHandoverAck> HandoverAck;
+	TOptional<FMusubiSimCommandNetPacket> NetPacket;
+	TOptional<FMusubiSimCommandNetClose> NetClose;
 
 	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimCommand& V);
 	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommand& Out);

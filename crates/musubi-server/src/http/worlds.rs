@@ -16,14 +16,14 @@ use axum::{Json, Router};
 use musubi_core::Error;
 use musubi_mesh::controller::ControllerConfig;
 use musubi_mesh::{CellFrame, CellId, Pos, SimCommand, SimCommandFrame, WorldConfig};
-use musubi_proto::realtime::WorldEntity;
+use musubi_proto::realtime::{ServerMessage, WorldEntity};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
-use crate::realtime::world::{InteractSpec, QueryKind, SpawnOutcome, SpawnSpec};
+use crate::realtime::world::{InteractSpec, QueryKind, SpawnOutcome, SpawnSpec, NET_MAX_PACKET};
 
 /// Simulator calls must hit the world's home node: redirect (307, same method+body) when the home
 /// advertises an HTTP address, otherwise explain which node to talk to.
@@ -1139,6 +1139,36 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                     tolerance,
                 };
                 reply["result"] = json!(s.worlds.interact(w, sim, &entity, spec, &s.fanout)?);
+                Ok(reply)
+            }
+            SimCommand::NetPacket {
+                conn,
+                session,
+                data,
+            } => {
+                if data.len() > NET_MAX_PACKET {
+                    return Err(Error::InvalidArgument(format!(
+                        "net_packet: {} bytes, max {NET_MAX_PACKET}",
+                        data.len()
+                    )));
+                }
+                let sid: musubi_core::SessionId = serde_json::from_value(session)
+                    .map_err(|e| Error::InvalidArgument(format!("session: {e}")))?;
+                s.fanout
+                    .session(sid, ServerMessage::NetPacket { conn, data });
+                Ok(reply)
+            }
+            SimCommand::NetClose {
+                conn,
+                session,
+                entity,
+                reason,
+            } => {
+                let sid: musubi_core::SessionId = serde_json::from_value(session)
+                    .map_err(|e| Error::InvalidArgument(format!("session: {e}")))?;
+                s.worlds.net_closed(w, &entity, conn)?;
+                s.fanout
+                    .session(sid, ServerMessage::NetClose { conn, reason });
                 Ok(reply)
             }
             SimCommand::Colocate {

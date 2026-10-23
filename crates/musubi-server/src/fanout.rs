@@ -1817,7 +1817,10 @@ impl Fanout {
                         // inputs run on the directory home (which forwards to the owning shard);
                         // subscriptions run on every node keeping a shard of the world
                         let run = match env.cmd {
-                            WorldCmd::Input { .. } => {
+                            WorldCmd::Input { .. }
+                            | WorldCmd::NetOpen { .. }
+                            | WorldCmd::NetPacket { .. }
+                            | WorldCmd::NetClose { .. } => {
                                 w.home_of(&env.world).await.ok().flatten() == Some(w.node_id())
                             }
                             _ => w.has_shard(&env.world),

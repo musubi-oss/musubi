@@ -96,6 +96,22 @@ pub enum SimCommand {
     HandoverAck {
         entity: String,
     },
+    /// Engine-level networking: one opaque packet for the client session behind `conn` (see the
+    /// `net_packet` event). Fire-and-forget: the reply only says whether the session was known.
+    NetPacket {
+        conn: u64,
+        session: Value,
+        #[serde(default)]
+        data: Vec<u8>,
+    },
+    /// The simulator closed engine connection `conn` on `entity`; the client gets `net_close`.
+    NetClose {
+        conn: u64,
+        session: Value,
+        entity: String,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 pub fn default_colocate_ttl() -> u64 {
@@ -116,6 +132,8 @@ impl SimCommand {
         "colocate",
         "rewind",
         "handover_ack",
+        "net_packet",
+        "net_close",
     ];
 
     pub fn op(&self) -> &'static str {
@@ -131,6 +149,8 @@ impl SimCommand {
             Self::Colocate { .. } => "colocate",
             Self::Rewind { .. } => "rewind",
             Self::HandoverAck { .. } => "handover_ack",
+            Self::NetPacket { .. } => "net_packet",
+            Self::NetClose { .. } => "net_close",
         }
     }
 

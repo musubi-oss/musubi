@@ -39,7 +39,7 @@
     "name": "match_data_send",
     "kind": "client",
     "json": "{\"cid\":null,\"msg\":{\"match_data_send\":{\"match_id\":\"m-1\",\"op_code\":7,\"data\":[1,2,3,255],\"presences\":[],\"reliable\":false,\"channel\":null}}}",
-    "postcard": "0026036d2d310e04010203ff000000"
+    "postcard": "0029036d2d310e04010203ff000000"
   },
   {
     "name": "world_subscribe",
@@ -52,6 +52,24 @@
     "kind": "client",
     "json": "{\"cid\":null,\"msg\":{\"world_input\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"input\":{\"jump\":true,\"move\":[1,0]}}}}",
     "postcard": "0024096f766572776f726c642430313866326133632d346235642d376536662d386139622d3063316432653366346135621a7b226a756d70223a747275652c226d6f7665223a5b312c305d7d"
+  },
+  {
+    "name": "net_open",
+    "kind": "client",
+    "json": "{\"cid\":\"9\",\"msg\":{\"net_open\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\"}}}",
+    "postcard": "01013925096f766572776f726c642430313866326133632d346235642d376536662d386139622d306331643265336634613562"
+  },
+  {
+    "name": "net_packet",
+    "kind": "client",
+    "json": "{\"cid\":null,\"msg\":{\"net_packet\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"conn\":4503599627370495,\"data\":[0,128,255,7]}}}",
+    "postcard": "0026096f766572776f726c642430313866326133632d346235642d376536662d386139622d306331643265336634613562ffffffffffffff07040080ff07"
+  },
+  {
+    "name": "net_close",
+    "kind": "client",
+    "json": "{\"cid\":null,\"msg\":{\"net_close\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"conn\":4503599627370495,\"reason\":\"quit\"}}}",
+    "postcard": "0027096f766572776f726c642430313866326133632d346235642d376536662d386139622d306331643265336634613562ffffffffffffff070471756974"
   },
   {
     "name": "pong",
@@ -88,6 +106,36 @@
     "kind": "server",
     "json": "{\"cid\":null,\"msg\":{\"world_delta\":{\"world\":\"overworld\",\"tick\":43,\"spawned\":[],\"updated\":[],\"despawned\":[],\"time_scale\":1.0,\"sequenced\":false}}}",
     "postcard": "001c096f766572776f726c642b000000000000000000f03f00"
+  },
+  {
+    "name": "net_opened",
+    "kind": "server",
+    "json": "{\"cid\":\"9\",\"msg\":{\"net_opened\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"conn\":4503599627370495,\"server\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c\",\"max_packet\":1200}}}",
+    "postcard": "0101391d096f766572776f726c642430313866326133632d346235642d376536662d386139622d306331643265336634613562ffffffffffffff070110018f2a3c4b5d7e6f8a9b0c1d2e3f4a5cb009"
+  },
+  {
+    "name": "net_opened_in_transit",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"net_opened\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"conn\":1,\"server\":null,\"max_packet\":1200}}}",
+    "postcard": "001d096f766572776f726c642430313866326133632d346235642d376536662d386139622d3063316432653366346135620100b009"
+  },
+  {
+    "name": "net_packet",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"net_packet\":{\"conn\":4503599627370495,\"data\":[1,2,3]}}}",
+    "postcard": "001effffffffffffff0703010203"
+  },
+  {
+    "name": "net_close",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"net_close\":{\"conn\":4503599627370495,\"reason\":\"server shutdown\"}}}",
+    "postcard": "001fffffffffffffff070f7365727665722073687574646f776e"
+  },
+  {
+    "name": "net_rehome",
+    "kind": "server",
+    "json": "{\"cid\":null,\"msg\":{\"net_rehome\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"conn\":4503599627370495,\"server\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\"}}}",
+    "postcard": "0020096f766572776f726c642430313866326133632d346235642d376536662d386139622d306331643265336634613562ffffffffffffff070110018f2a3c4b5d7e6f8a9b0c1d2e3f4a5d"
   },
   {
     "name": "matchmaker_matched",

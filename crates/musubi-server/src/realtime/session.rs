@@ -956,6 +956,32 @@ async fn handle_inner(ctx: &Ctx<'_>, msg: ClientMessage) -> Option<ServerMessage
             entity,
             input,
         } => world_dispatch(ctx, &world, WorldCmd::Input { entity, input }).await,
+        ClientMessage::NetOpen { world, entity } => {
+            world_dispatch(ctx, &world, WorldCmd::NetOpen { entity }).await
+        }
+        ClientMessage::NetPacket {
+            world,
+            entity,
+            conn,
+            data,
+        } => world_dispatch(ctx, &world, WorldCmd::NetPacket { entity, conn, data }).await,
+        ClientMessage::NetClose {
+            world,
+            entity,
+            conn,
+            reason,
+        } => {
+            world_dispatch(
+                ctx,
+                &world,
+                WorldCmd::NetClose {
+                    entity,
+                    conn,
+                    reason,
+                },
+            )
+            .await
+        }
         ClientMessage::MatchJoin {
             match_id,
             token,
@@ -1463,8 +1489,18 @@ async fn world_dispatch(ctx: &Ctx<'_>, world: &str, cmd: WorldCmd) -> Option<Ser
             }
             reply
         }
-        WorldCmd::Input { .. } if home == ctx.worlds.node_id() => ctx.worlds.exec(env, ctx.fanout),
-        WorldCmd::Input { .. } => {
+        WorldCmd::Input { .. }
+        | WorldCmd::NetOpen { .. }
+        | WorldCmd::NetPacket { .. }
+        | WorldCmd::NetClose { .. }
+            if home == ctx.worlds.node_id() =>
+        {
+            ctx.worlds.exec(env, ctx.fanout)
+        }
+        WorldCmd::Input { .. }
+        | WorldCmd::NetOpen { .. }
+        | WorldCmd::NetPacket { .. }
+        | WorldCmd::NetClose { .. } => {
             ctx.fanout.world_cmd(env);
             None
         }

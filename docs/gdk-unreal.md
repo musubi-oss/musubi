@@ -396,21 +396,28 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   client, picks the server: the simulator currently holding the cell of `entity` (the player's entity from
   `UMusubiWorldComponent::SetLocalEntity`; created by the project's spawn flow or by the node's
   `player_spawn` policy). No ports, no IPs: both ends only ever talk to the node.
-- **Wire (new realtime + sim-stream messages, generated like the rest):**
-  client ↔ node: `net_open{world, entity}` → `net_opened{conn, server, cell, max_packet}` | `error`;
-  `net_packet{conn, data: bytes}` both ways; `net_close{conn, reason}`; `net_rehome{conn, server, cell}`.
-  node ↔ simulator (sim stream): `SimEvent::NetOpen{conn, session, entity, options}`,
-  `SimEvent::NetPacket{conn, data}`, `SimEvent::NetClose{conn, reason}`;
-  `SimCommand::NetPacket{conn, data}`, `SimCommand::NetClose{conn, reason}`.
-  Binary frames carry `data` raw (postcard `Vec<u8>`), JSON carries base64. The node relays; it never parses
-  Unreal packets.
+- **Wire (shipped; generated into `MusubiWire`/`MusubiSimWire` like the rest).** Client ↔ node:
+  `net_open{world, entity}` → `net_opened{world, entity, conn, server?, max_packet}` | `error`;
+  `net_packet{world, entity, conn, data: bytes}` up, `net_packet{conn, data}` down; `net_close{world, entity,
+  conn, reason}` up, `net_close{conn, reason}` down; `net_rehome{world, entity, conn, server?}` down.
+  Node ↔ simulator (sim stream): events `net_packet{conn, session, entity, data}` and
+  `net_close{conn, session, entity, reason}`; commands `net_packet{conn, session, data}` and
+  `net_close{conn, session, entity, reason}`. `data` is a byte array (raw in postcard, numbers in JSON);
+  `conn` is node-issued and below 2^53 because engines read JSON numbers as doubles.
+  The node keeps no connection state machine: every packet is routed by `entity` through the same
+  `route_input` path as `world_input` (owner's event queue, buffered while the entity is in transit,
+  forwarded over the bus to the hosting shard), so a relay survives any owner change by construction. The
+  only state is `(conn, session)` per entity, learned from `net_open` and from routed packets on whichever
+  shard holds the entity, used for re-homing and for closing relays when the client session dies.
+  Relay latency node → simulator is one world tick (events ride the tick frame), ≈33 ms at 30 Hz.
+
 - **Lanes.** `UNetConnection` is built for lossy, unordered datagrams and brings its own reliability, so driver
   packets go on the *unreliable* lane: QUIC datagrams (`[type][body]`, `mq_max_datagram` ≥ 1200 B is required,
   else the driver caps `MaxPacket` to it); on WebSocket they ride the single reliable stream and only lose the
   head-of-line property (functional, worse under loss). `MaxPacket` = min(`WINSOCK_MAX_PACKET` (what `UIpConnection`/`UWebSocketConnection` pass to
   `InitBase`), lane MTU − 12 B framing). Node → simulator uses the sim stream (reliable, ordered) — acceptable because that hop is
-  datacenter-local; the sim stream gets a per-connection byte budget so one chatty client cannot starve frames
-  (`net_bytes_per_tick`, default 16 KiB/tick/conn, excess dropped oldest-first; UE retransmits).
+  datacenter-local; packets ride the owner's event queue (capped by `MAX_SIM_EVENTS`, excess dropped — UE
+  retransmits) and a packet over `max_packet` (1200 B) is rejected at the node.
 - **Client side.** `InitConnect`: resolve `UMusubiSubsystem` (shares its socket/session; the driver never opens a
   second transport), send `net_open`, create `UMusubiNetConnection` (`InitLocalConnection`, `USOCK_Pending`,
   `MaxPacket` from `net_opened`); `TickDispatch` drains the queue of `net_packet` for its `conn` into
@@ -424,19 +431,22 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   `bChallengeHandshake=false`, `PacketHandler` begins handshaking immediately (`Handler->BeginHandshaking()`).
   `NetPacket` → `ReceivedRawPacket`; `LowLevelSend` → `SimCommand::NetPacket`. `GetSocketSubsystem` returns the
   platform subsystem (only for `FInternetAddr` factories, as `UWebSocketNetDriver` does).
-- **Rehome (the seamless-world part).** When the player's entity completes a handover, the node emits
-  `net_rehome{conn, server}` to the client and `NetClose{reason: rehome}` to the old server *after* the new
-  server has been told `NetOpen{…, options: "rehome=1"}`. Client driver: open connection #2 to the new server,
-  run login to `NMT_Welcome` while #1 stays live, then swap `ServerConnection`, `CleanUp()` #1. Channel
-  teardown destroys #1's actors; to avoid a frame of empty world, actors whose entity id (from
-  `UMusubiAuthorityComponent::EntityId`, replicated) also exists on #2 are *handed over locally*: the driver
-  keeps a map `entity → actor`, and `UMusubiNetConnection` on #2 adopts the existing actor in
-  `UActorChannel` creation (`UNetDriver::NotifyActorChannelOpen`-time lookup via a `IMusubiNetAdoptable`
-  interface) instead of spawning a twin. Budget: rehome must complete within `RehomeTimeout` (5 s) or the client
-  falls back to a plain reconnect (`UEngine::HandleNetworkFailure(ENetworkFailure::ConnectionLost)` → project
-  travel). PlayerController/PlayerState: the new server runs a normal login; the state a project wants to survive
-  is carried by `?MusubiResume=<token>` (node-issued, 30 s) that the new `GameMode::Login` can redeem through
-  `UMusubiSimulatorSubsystem::ResumePlayer(token) → entity components snapshot`.
+- **Rehome (the seamless-world part).** The simulator opens an engine connection implicitly on the first
+  `net_packet` event for an unknown `conn` — `UIpNetDriver` semantics (first packet from a new address).
+  When the entity's handover completes (both the local and the cross-node completion paths), the world
+  queues a `net_close{reason: "rehome"}` event for the old owner and a `net_rehome` message for each
+  client on the entity, sent at the next tick; packets already in flight were buffered during transit and
+  are replayed to the new owner. Client driver on `net_rehome`: tear down `ServerConnection`
+  (`CleanUp()`), create a fresh `UMusubiNetConnection` on the same `conn`, run login again; actors from
+  the old server are destroyed with their channels and re-created by the new server's replication. To
+  avoid a frame of empty world, actors whose entity id (`UMusubiAuthorityComponent::EntityId`,
+  replicated) also appears on the new connection are adopted instead of re-spawned (`IMusubiNetAdoptable`
+  lookup at actor-channel open). Budget: a rehome must reach `NMT_Welcome` within `RehomeTimeout` (5 s) or
+  the client falls back to `UEngine::HandleNetworkFailure(ENetworkFailure::ConnectionLost)` → project
+  travel. State a project wants to survive the server change rides `?MusubiResume=<token>` (node-issued,
+  30 s) redeemed by the new `GameMode::Login` via `UMusubiSimulatorSubsystem::ResumePlayer`.
+  Session death closes every relay the session had (`net_close{reason: "session closed"}` to the owner).
+
 - **Config** (what a project writes):
   ```ini
   [/Script/Engine.Engine]

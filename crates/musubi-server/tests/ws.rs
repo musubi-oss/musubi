@@ -22088,3 +22088,220 @@ async fn sim_sdk_stream_mode_hands_an_entity_over() {
         client.info().await.unwrap()
     );
 }
+
+/// Engine packet relay (`net_*`): a client opens a relay on an entity, packets flow both ways
+/// between it and the owning simulator, and when the entity hands over to another simulator the
+/// old owner is told to close, the client to restart, and packets reach the new owner on the same
+/// `conn`.
+#[tokio::test]
+async fn net_relay_follows_the_entity_across_a_handover() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let Some(state) = build_state(true, &test_group()).await else {
+        return;
+    };
+    let router = musubi_server::http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let r = router.clone();
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    let world = format!("net{}", uuid::Uuid::now_v7().simple());
+    let (st, body) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 5.0, "lease_ttl_ticks": 600, "handover_timeout_ticks": 60}})),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let (s1, s2) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    async fn stream(addr: &str, world: &str, sim: uuid::Uuid) -> Ws {
+        let mut req = format!("ws://{addr}/v1/server/worlds/{world}/stream?sim={sim}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("x-musubi-server-key", "defaultkey".parse().unwrap());
+        tokio_tungstenite::connect_async(req).await.unwrap().0
+    }
+    async fn next(ws: &mut Ws) -> Value {
+        let m = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("stream timeout")
+            .unwrap()
+            .unwrap();
+        match m {
+            Message::Text(t) => serde_json::from_str(&t).unwrap(),
+            _ => json!(null),
+        }
+    }
+    async fn reply(ws: &mut Ws, op: &str) -> Value {
+        let t0 = std::time::Instant::now();
+        loop {
+            let v = next(ws).await;
+            if v["op"] == op {
+                return v;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "no `{op}` reply: {v}"
+            );
+        }
+    }
+    /// The next tick frame carrying an event of `ty`.
+    async fn event(ws: &mut Ws, ty: &str) -> Value {
+        let t0 = std::time::Instant::now();
+        loop {
+            let v = next(ws).await;
+            if v["type"] == "tick" {
+                if let Some(e) = v["events"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|e| e["type"] == ty))
+                {
+                    return e.clone();
+                }
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "no `{ty}` event"
+            );
+        }
+    }
+    async fn cmd(ws: &mut Ws, v: Value) -> Value {
+        let op = v["op"].as_str().unwrap().to_string();
+        ws.send(Message::Text(v.to_string())).await.unwrap();
+        let r = reply(ws, &op).await;
+        assert!(r.get("error").is_none(), "{r}");
+        r
+    }
+    let mut w1 = stream(&addr, &world, s1).await;
+    let mut w2 = stream(&addr, &world, s2).await;
+    let r = cmd(&mut w1, json!({"op": "lease", "cells": [{"x": 0, "y": 0}]})).await;
+    assert_eq!(r["cells"].as_array().unwrap().len(), 1, "{r}");
+    let r = cmd(&mut w2, json!({"op": "lease", "cells": [{"x": 1, "y": 0}]})).await;
+    assert_eq!(r["cells"].as_array().unwrap().len(), 1, "{r}");
+    let r = cmd(
+        &mut w1,
+        json!({"op": "spawn", "x": 50.0, "y": 50.0, "components": {"kind": "player"}}),
+    )
+    .await;
+    let entity = r["entity"]["id"].as_str().unwrap().to_string();
+
+    // the client opens a relay on its entity: s1 owns it
+    let f = "json";
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut c,
+        f,
+        Some("1"),
+        ClientMessage::NetOpen {
+            world: world.clone(),
+            entity: entity.clone(),
+        },
+    )
+    .await;
+    let opened = recv(&mut c).await;
+    assert_eq!(opened.cid.as_deref(), Some("1"));
+    let conn = match opened.msg {
+        ServerMessage::NetOpened {
+            conn,
+            server,
+            max_packet,
+            ..
+        } => {
+            assert_eq!(server, Some(s1));
+            assert_eq!(max_packet, 1200);
+            assert!(conn < (1u64 << 53), "{conn}");
+            conn
+        }
+        m => panic!("{m:?}"),
+    };
+    // client → owner, as a simulator event with the session to answer to
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::NetPacket {
+            world: world.clone(),
+            entity: entity.clone(),
+            conn,
+            data: vec![1, 2, 3],
+        },
+    )
+    .await;
+    let ev = event(&mut w1, "net_packet").await;
+    assert_eq!(ev["conn"].as_u64(), Some(conn), "{ev}");
+    assert_eq!(ev["data"], json!([1, 2, 3]), "{ev}");
+    assert_eq!(ev["entity"], json!(entity), "{ev}");
+    let session = ev["session"].clone();
+    assert!(session.is_string(), "{ev}");
+    // owner → client
+    cmd(
+        &mut w1,
+        json!({"op": "net_packet", "conn": conn, "session": session, "data": [9, 8]}),
+    )
+    .await;
+    match recv(&mut c).await.msg {
+        ServerMessage::NetPacket { conn: k, data } => {
+            assert_eq!(k, conn);
+            assert_eq!(data, vec![9, 8]);
+        }
+        m => panic!("{m:?}"),
+    }
+    // the entity walks into s2's cell: s2 is offered it and accepts
+    cmd(
+        &mut w1,
+        json!({"op": "apply", "entity": entity, "x": 150.0, "y": 50.0}),
+    )
+    .await;
+    let req = event(&mut w2, "handover_request").await;
+    assert_eq!(req["entity"], json!(entity), "{req}");
+    cmd(&mut w2, json!({"op": "handover_ack", "entity": entity})).await;
+    // the old owner closes its side of the engine connection, the client restarts on the new one
+    let closed = event(&mut w1, "net_close").await;
+    assert_eq!(closed["conn"].as_u64(), Some(conn), "{closed}");
+    assert_eq!(closed["reason"], "rehome", "{closed}");
+    match recv(&mut c).await.msg {
+        ServerMessage::NetRehome {
+            conn: k, server, ..
+        } => {
+            assert_eq!(k, conn);
+            assert_eq!(server, Some(s2));
+        }
+        m => panic!("{m:?}"),
+    }
+    // packets now reach s2 on the same conn
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::NetPacket {
+            world: world.clone(),
+            entity: entity.clone(),
+            conn,
+            data: vec![4],
+        },
+    )
+    .await;
+    let ev = event(&mut w2, "net_packet").await;
+    assert_eq!(ev["conn"].as_u64(), Some(conn), "{ev}");
+    assert_eq!(ev["data"], json!([4]), "{ev}");
+    // the client hangs up: the owner hears it
+    send(
+        &mut c,
+        f,
+        None,
+        ClientMessage::NetClose {
+            world: world.clone(),
+            entity: entity.clone(),
+            conn,
+            reason: "quit".into(),
+        },
+    )
+    .await;
+    let ev = event(&mut w2, "net_close").await;
+    assert_eq!(ev["conn"].as_u64(), Some(conn), "{ev}");
+    assert_eq!(ev["reason"], "quit", "{ev}");
+}

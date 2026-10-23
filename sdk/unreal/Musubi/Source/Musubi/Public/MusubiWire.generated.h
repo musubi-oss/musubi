@@ -230,10 +230,13 @@ enum class EMusubiClientMessageTag : uint8
 	WorldSubscribe = 34,
 	WorldUnsubscribe = 35,
 	WorldInput = 36,
-	MatchInput = 37,
-	MatchDataSend = 38,
-	Transport = 39,
-	PartyInvite = 40,
+	NetOpen = 37,
+	NetPacket = 38,
+	NetClose = 39,
+	MatchInput = 40,
+	MatchDataSend = 41,
+	Transport = 42,
+	PartyInvite = 43,
 };
 MUSUBI_API const TCHAR* MusubiTagName(EMusubiClientMessageTag Tag);
 MUSUBI_API bool MusubiTagFromName(const FString& Name, EMusubiClientMessageTag& Out);
@@ -656,6 +659,43 @@ struct MUSUBI_API FMusubiClientMessageWorldInput
 	static void Read(FMusubiPostcardReader& R, FMusubiClientMessageWorldInput& Out);
 };
 
+struct MUSUBI_API FMusubiClientMessageNetOpen
+{
+	FString world;
+	FString entity;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiClientMessageNetOpen& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiClientMessageNetOpen& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiClientMessageNetOpen& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiClientMessageNetOpen& Out);
+};
+
+struct MUSUBI_API FMusubiClientMessageNetPacket
+{
+	FString world;
+	FString entity;
+	uint64 conn = 0;
+	TArray<uint8> data;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiClientMessageNetPacket& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiClientMessageNetPacket& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiClientMessageNetPacket& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiClientMessageNetPacket& Out);
+};
+
+struct MUSUBI_API FMusubiClientMessageNetClose
+{
+	FString world;
+	FString entity;
+	uint64 conn = 0;
+	FString reason;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiClientMessageNetClose& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiClientMessageNetClose& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiClientMessageNetClose& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiClientMessageNetClose& Out);
+};
+
 struct MUSUBI_API FMusubiClientMessageMatchInput
 {
 	FString match_id;
@@ -745,6 +785,9 @@ struct MUSUBI_API FMusubiClientMessage
 	TOptional<FMusubiClientMessageWorldSubscribe> WorldSubscribe;
 	TOptional<FMusubiClientMessageWorldUnsubscribe> WorldUnsubscribe;
 	TOptional<FMusubiClientMessageWorldInput> WorldInput;
+	TOptional<FMusubiClientMessageNetOpen> NetOpen;
+	TOptional<FMusubiClientMessageNetPacket> NetPacket;
+	TOptional<FMusubiClientMessageNetClose> NetClose;
 	TOptional<FMusubiClientMessageMatchInput> MatchInput;
 	TOptional<FMusubiClientMessageMatchDataSend> MatchDataSend;
 	TOptional<FMusubiClientMessageTransport> Transport;
@@ -787,16 +830,20 @@ enum class EMusubiServerMessageTag : uint8
 	Match = 26,
 	MatchHost = 27,
 	WorldDelta = 28,
-	MatchInputAck = 29,
-	MatchTickHash = 30,
-	MatchState = 31,
-	MatchStateDelta = 32,
-	MatchData = 33,
-	Transport = 34,
-	MatchPresenceEvent = 35,
-	ChannelMessageReaction = 36,
-	PartyInvite = 37,
-	StreamData = 38,
+	NetOpened = 29,
+	NetPacket = 30,
+	NetClose = 31,
+	NetRehome = 32,
+	MatchInputAck = 33,
+	MatchTickHash = 34,
+	MatchState = 35,
+	MatchStateDelta = 36,
+	MatchData = 37,
+	Transport = 38,
+	MatchPresenceEvent = 39,
+	ChannelMessageReaction = 40,
+	PartyInvite = 41,
+	StreamData = 42,
 };
 MUSUBI_API const TCHAR* MusubiTagName(EMusubiServerMessageTag Tag);
 MUSUBI_API bool MusubiTagFromName(const FString& Name, EMusubiServerMessageTag& Out);
@@ -1138,6 +1185,55 @@ struct MUSUBI_API FMusubiServerMessageWorldDelta
 	static void Read(FMusubiPostcardReader& R, FMusubiServerMessageWorldDelta& Out);
 };
 
+struct MUSUBI_API FMusubiServerMessageNetOpened
+{
+	FString world;
+	FString entity;
+	uint64 conn = 0;
+	TOptional<FMusubiUuid> server;
+	uint32 max_packet = 0;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiServerMessageNetOpened& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageNetOpened& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiServerMessageNetOpened& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiServerMessageNetOpened& Out);
+};
+
+struct MUSUBI_API FMusubiServerMessageNetPacket
+{
+	uint64 conn = 0;
+	TArray<uint8> data;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiServerMessageNetPacket& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageNetPacket& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiServerMessageNetPacket& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiServerMessageNetPacket& Out);
+};
+
+struct MUSUBI_API FMusubiServerMessageNetClose
+{
+	uint64 conn = 0;
+	FString reason;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiServerMessageNetClose& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageNetClose& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiServerMessageNetClose& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiServerMessageNetClose& Out);
+};
+
+struct MUSUBI_API FMusubiServerMessageNetRehome
+{
+	FString world;
+	FString entity;
+	uint64 conn = 0;
+	TOptional<FMusubiUuid> server;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiServerMessageNetRehome& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageNetRehome& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiServerMessageNetRehome& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiServerMessageNetRehome& Out);
+};
+
 struct MUSUBI_API FMusubiServerMessageMatchInputAck
 {
 	FString match_id;
@@ -1299,6 +1395,10 @@ struct MUSUBI_API FMusubiServerMessage
 	TOptional<FMusubiServerMessageMatch> Match;
 	TOptional<FMusubiServerMessageMatchHost> MatchHost;
 	TOptional<FMusubiServerMessageWorldDelta> WorldDelta;
+	TOptional<FMusubiServerMessageNetOpened> NetOpened;
+	TOptional<FMusubiServerMessageNetPacket> NetPacket;
+	TOptional<FMusubiServerMessageNetClose> NetClose;
+	TOptional<FMusubiServerMessageNetRehome> NetRehome;
 	TOptional<FMusubiServerMessageMatchInputAck> MatchInputAck;
 	TOptional<FMusubiServerMessageMatchTickHash> MatchTickHash;
 	TOptional<FMusubiServerMessageMatchState> MatchState;

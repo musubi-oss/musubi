@@ -303,6 +303,33 @@ pub enum ClientMessage {
         #[serde(with = "crate::json_in_binary")]
         input: serde_json::Value,
     },
+    /// Engine-level networking relayed through the replication layer (Unreal `UMusubiNetDriver`):
+    /// open a packet relay to whichever simulator owns `entity` now. Reply `net_opened` carries
+    /// the `conn` id to use on this entity (below 2^53: safe as a JSON number) and the packet
+    /// size limit.
+    NetOpen {
+        world: String,
+        entity: String,
+    },
+    /// One engine packet (opaque bytes) for the current owner of `entity`; `conn` is the id from
+    /// `net_opened`. Routed like `world_input` (buffered while the entity is in transit) and
+    /// delivered to the owner as a `net_packet` simulator event. Unreliable by nature: transports
+    /// with an unreliable lane may drop it, the engine's own reliability sits on top.
+    NetPacket {
+        world: String,
+        entity: String,
+        conn: u64,
+        #[serde(default)]
+        data: Vec<u8>,
+    },
+    /// The engine closed its connection; the owner gets a `net_close` event.
+    NetClose {
+        world: String,
+        entity: String,
+        conn: u64,
+        #[serde(default)]
+        reason: String,
+    },
     /// Deterministic-rollback matches (`params.rollback`): an input stamped with the simulation
     /// `tick` it belongs to. Inputs for a future tick wait for it; inputs for a past tick within
     /// the rollback window make the server re-simulate from that tick; older ones are dropped.
@@ -568,6 +595,39 @@ pub enum ServerMessage {
         /// apply when `tick` is newer than the last applied; never carries spawns or despawns.
         #[serde(default)]
         sequenced: bool,
+    },
+    /// Reply to `net_open`: `conn` identifies this relay on `entity`, `server` is the simulator
+    /// that owns it right now (`null` while it is between owners), `max_packet` the largest `data`
+    /// accepted on the relay.
+    NetOpened {
+        world: String,
+        entity: String,
+        conn: u64,
+        #[serde(default)]
+        server: Option<uuid::Uuid>,
+        max_packet: u32,
+    },
+    /// An engine packet from the simulator owning the entity behind `conn`.
+    NetPacket {
+        conn: u64,
+        #[serde(default)]
+        data: Vec<u8>,
+    },
+    /// The simulator closed the relay (its connection to this client).
+    NetClose {
+        conn: u64,
+        #[serde(default)]
+        reason: String,
+    },
+    /// The entity behind `conn` finished a handover: packets now reach `server`, which knows
+    /// nothing of the engine connection the old owner had. The engine must restart its connection
+    /// on the same `conn` (the old owner has already been told to close its side).
+    NetRehome {
+        world: String,
+        entity: String,
+        conn: u64,
+        #[serde(default)]
+        server: Option<uuid::Uuid>,
     },
     /// `match_input` received: `applied` is `false` when the tick was older than the rollback
     /// window (or the match does not run with rollback).

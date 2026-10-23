@@ -39,6 +39,14 @@ const EVENTS: &[(&str, &str)] = &[
         r#"{"type":"cell_hibernated","cell":{"x":0,"y":0},"ephemeral_despawned":5,"persistent_kept":2}"#,
     ),
     (
+        "net_packet",
+        r#"{"type":"net_packet","conn":4503599627370495,"session":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c","data":[0,128,255,7]}"#,
+    ),
+    (
+        "net_close",
+        r#"{"type":"net_close","conn":4503599627370495,"session":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c","reason":"rehome"}"#,
+    ),
+    (
         "cell_full",
         r#"{"type":"cell_full","cell":{"x":0,"y":0},"soft_cap":500}"#,
     ),
@@ -123,6 +131,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("spawn_defaults", r#"{"op":"spawn","x":0.0,"y":0.0}"#),
     ("tick_done", r#"{"op":"tick_done","tick":120}"#),
+    (
+        "net_packet",
+        r#"{"id":5,"op":"net_packet","conn":4503599627370495,"session":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f","data":[0,128,255,7]}"#,
+    ),
+    (
+        "net_close",
+        r#"{"op":"net_close","conn":4503599627370495,"session":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5f","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c","reason":"kicked"}"#,
+    ),
     (
         "despawn",
         r#"{"id":"d-1","op":"despawn","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c"}"#,

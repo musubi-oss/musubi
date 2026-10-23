@@ -567,6 +567,8 @@ const TCHAR* MusubiTagName(EMusubiSimEventTag Tag)
 	case EMusubiSimEventTag::CoLocate: return TEXT("co_locate");
 	case EMusubiSimEventTag::TxCommitted: return TEXT("tx_committed");
 	case EMusubiSimEventTag::TxAborted: return TEXT("tx_aborted");
+	case EMusubiSimEventTag::NetPacket: return TEXT("net_packet");
+	case EMusubiSimEventTag::NetClose: return TEXT("net_close");
 	case EMusubiSimEventTag::Unknown: return TEXT("unknown");
 	}
 	return TEXT("");
@@ -596,6 +598,8 @@ bool MusubiTagFromName(const FString& Name, EMusubiSimEventTag& Out)
 	if (Name == TEXT("co_locate")) { Out = EMusubiSimEventTag::CoLocate; return true; }
 	if (Name == TEXT("tx_committed")) { Out = EMusubiSimEventTag::TxCommitted; return true; }
 	if (Name == TEXT("tx_aborted")) { Out = EMusubiSimEventTag::TxAborted; return true; }
+	if (Name == TEXT("net_packet")) { Out = EMusubiSimEventTag::NetPacket; return true; }
+	if (Name == TEXT("net_close")) { Out = EMusubiSimEventTag::NetClose; return true; }
 	if (Name == TEXT("unknown")) { Out = EMusubiSimEventTag::Unknown; return true; }
 	return false;
 }
@@ -1406,6 +1410,84 @@ void FMusubiSimEventTxAborted::Read(FMusubiPostcardReader& R, FMusubiSimEventTxA
 	Out.reason = R.Str();
 }
 
+TSharedPtr<FJsonValue> FMusubiSimEventNetPacket::ToJson(const FMusubiSimEventNetPacket& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("conn"), MakeShared<FJsonValueNumber>((double)V.conn));
+	O->SetField(TEXT("session"), MusubiJson::JsonOrNull(V.session));
+	O->SetField(TEXT("entity"), MakeShared<FJsonValueString>(V.entity.ToString()));
+	O->SetField(TEXT("data"), MusubiJson::BytesToJson(V.data));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiSimEventNetPacket::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimEventNetPacket& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("conn")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.conn = (uint64)V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("session")); F.IsValid()) { Out.session = FMusubiJson(F); } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("entity")); F.IsValid()) { { FString V0; if (F->TryGetString(V0) && FMusubiUuid::Parse(V0, Out.entity)) {} else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("data")); F.IsValid()) { if (!MusubiJson::BytesFromJson(F, Out.data)) bOk = false; } else bOk = false;
+	return bOk;
+}
+
+void FMusubiSimEventNetPacket::Write(FMusubiPostcardWriter& W, const FMusubiSimEventNetPacket& V)
+{
+	W.Varint((uint64)V.conn);
+	W.Str(V.session.ToText());
+	W.Uuid(V.entity);
+	W.Bytes(V.data);
+}
+
+void FMusubiSimEventNetPacket::Read(FMusubiPostcardReader& R, FMusubiSimEventNetPacket& Out)
+{
+	Out.conn = R.Varint();
+	Out.session = FMusubiJson::FromText(R.Str());
+	Out.entity = R.Uuid();
+	R.Bytes(Out.data);
+}
+
+TSharedPtr<FJsonValue> FMusubiSimEventNetClose::ToJson(const FMusubiSimEventNetClose& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("conn"), MakeShared<FJsonValueNumber>((double)V.conn));
+	O->SetField(TEXT("session"), MusubiJson::JsonOrNull(V.session));
+	O->SetField(TEXT("entity"), MakeShared<FJsonValueString>(V.entity.ToString()));
+	O->SetField(TEXT("reason"), MakeShared<FJsonValueString>(V.reason));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiSimEventNetClose::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimEventNetClose& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("conn")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.conn = (uint64)V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("session")); F.IsValid()) { Out.session = FMusubiJson(F); } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("entity")); F.IsValid()) { { FString V0; if (F->TryGetString(V0) && FMusubiUuid::Parse(V0, Out.entity)) {} else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("reason")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.reason = MoveTemp(V0); else bOk = false; } } else bOk = false;
+	return bOk;
+}
+
+void FMusubiSimEventNetClose::Write(FMusubiPostcardWriter& W, const FMusubiSimEventNetClose& V)
+{
+	W.Varint((uint64)V.conn);
+	W.Str(V.session.ToText());
+	W.Uuid(V.entity);
+	W.Str(V.reason);
+}
+
+void FMusubiSimEventNetClose::Read(FMusubiPostcardReader& R, FMusubiSimEventNetClose& Out)
+{
+	Out.conn = R.Varint();
+	Out.session = FMusubiJson::FromText(R.Str());
+	Out.entity = R.Uuid();
+	Out.reason = R.Str();
+}
+
 TSharedPtr<FJsonValue> FMusubiSimEvent::ToJson(const FMusubiSimEvent& V)
 {
 	TSharedPtr<FJsonValue> P;
@@ -1433,6 +1515,8 @@ TSharedPtr<FJsonValue> FMusubiSimEvent::ToJson(const FMusubiSimEvent& V)
 	case EMusubiSimEventTag::CoLocate: P = V.CoLocate.IsSet() ? FMusubiSimEventCoLocate::ToJson(V.CoLocate.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	case EMusubiSimEventTag::TxCommitted: P = V.TxCommitted.IsSet() ? FMusubiSimEventTxCommitted::ToJson(V.TxCommitted.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	case EMusubiSimEventTag::TxAborted: P = V.TxAborted.IsSet() ? FMusubiSimEventTxAborted::ToJson(V.TxAborted.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
+	case EMusubiSimEventTag::NetPacket: P = V.NetPacket.IsSet() ? FMusubiSimEventNetPacket::ToJson(V.NetPacket.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
+	case EMusubiSimEventTag::NetClose: P = V.NetClose.IsSet() ? FMusubiSimEventNetClose::ToJson(V.NetClose.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	case EMusubiSimEventTag::Unknown: P = MakeShared<FJsonValueObject>(MakeShared<FJsonObject>()); break;
 	}
 	if (P.IsValid() && P->Type == EJson::Object) P->AsObject()->SetStringField(TEXT("type"), MusubiTagName(V.Tag));
@@ -1476,6 +1560,8 @@ bool FMusubiSimEvent::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimEvent&
 	case EMusubiSimEventTag::CoLocate: { FMusubiSimEventCoLocate V0{}; if (!FMusubiSimEventCoLocate::FromJson(J, V0)) bOk = false; Out.CoLocate = MoveTemp(V0); break; }
 	case EMusubiSimEventTag::TxCommitted: { FMusubiSimEventTxCommitted V0{}; if (!FMusubiSimEventTxCommitted::FromJson(J, V0)) bOk = false; Out.TxCommitted = MoveTemp(V0); break; }
 	case EMusubiSimEventTag::TxAborted: { FMusubiSimEventTxAborted V0{}; if (!FMusubiSimEventTxAborted::FromJson(J, V0)) bOk = false; Out.TxAborted = MoveTemp(V0); break; }
+	case EMusubiSimEventTag::NetPacket: { FMusubiSimEventNetPacket V0{}; if (!FMusubiSimEventNetPacket::FromJson(J, V0)) bOk = false; Out.NetPacket = MoveTemp(V0); break; }
+	case EMusubiSimEventTag::NetClose: { FMusubiSimEventNetClose V0{}; if (!FMusubiSimEventNetClose::FromJson(J, V0)) bOk = false; Out.NetClose = MoveTemp(V0); break; }
 	case EMusubiSimEventTag::Unknown: break;
 	}
 	return bOk;
@@ -1596,6 +1682,8 @@ const TCHAR* MusubiTagName(EMusubiSimCommandTag Tag)
 	case EMusubiSimCommandTag::Colocate: return TEXT("colocate");
 	case EMusubiSimCommandTag::Rewind: return TEXT("rewind");
 	case EMusubiSimCommandTag::HandoverAck: return TEXT("handover_ack");
+	case EMusubiSimCommandTag::NetPacket: return TEXT("net_packet");
+	case EMusubiSimCommandTag::NetClose: return TEXT("net_close");
 	}
 	return TEXT("");
 }
@@ -1613,6 +1701,8 @@ bool MusubiTagFromName(const FString& Name, EMusubiSimCommandTag& Out)
 	if (Name == TEXT("colocate")) { Out = EMusubiSimCommandTag::Colocate; return true; }
 	if (Name == TEXT("rewind")) { Out = EMusubiSimCommandTag::Rewind; return true; }
 	if (Name == TEXT("handover_ack")) { Out = EMusubiSimCommandTag::HandoverAck; return true; }
+	if (Name == TEXT("net_packet")) { Out = EMusubiSimCommandTag::NetPacket; return true; }
+	if (Name == TEXT("net_close")) { Out = EMusubiSimCommandTag::NetClose; return true; }
 	return false;
 }
 
@@ -2005,6 +2095,80 @@ void FMusubiSimCommandHandoverAck::Read(FMusubiPostcardReader& R, FMusubiSimComm
 	Out.entity = R.Str();
 }
 
+TSharedPtr<FJsonValue> FMusubiSimCommandNetPacket::ToJson(const FMusubiSimCommandNetPacket& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("conn"), MakeShared<FJsonValueNumber>((double)V.conn));
+	O->SetField(TEXT("session"), MusubiJson::JsonOrNull(V.session));
+	O->SetField(TEXT("data"), MusubiJson::BytesToJson(V.data));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiSimCommandNetPacket::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommandNetPacket& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("conn")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.conn = (uint64)V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("session")); F.IsValid()) { Out.session = FMusubiJson(F); } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("data")); F.IsValid() && !F->IsNull()) { if (!MusubiJson::BytesFromJson(F, Out.data)) bOk = false; }
+	return bOk;
+}
+
+void FMusubiSimCommandNetPacket::Write(FMusubiPostcardWriter& W, const FMusubiSimCommandNetPacket& V)
+{
+	W.Varint((uint64)V.conn);
+	W.Str(V.session.ToText());
+	W.Bytes(V.data);
+}
+
+void FMusubiSimCommandNetPacket::Read(FMusubiPostcardReader& R, FMusubiSimCommandNetPacket& Out)
+{
+	Out.conn = R.Varint();
+	Out.session = FMusubiJson::FromText(R.Str());
+	R.Bytes(Out.data);
+}
+
+TSharedPtr<FJsonValue> FMusubiSimCommandNetClose::ToJson(const FMusubiSimCommandNetClose& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("conn"), MakeShared<FJsonValueNumber>((double)V.conn));
+	O->SetField(TEXT("session"), MusubiJson::JsonOrNull(V.session));
+	O->SetField(TEXT("entity"), MakeShared<FJsonValueString>(V.entity));
+	O->SetField(TEXT("reason"), MakeShared<FJsonValueString>(V.reason));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiSimCommandNetClose::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommandNetClose& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("conn")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.conn = (uint64)V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("session")); F.IsValid()) { Out.session = FMusubiJson(F); } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("entity")); F.IsValid()) { { FString V0; if (F->TryGetString(V0)) Out.entity = MoveTemp(V0); else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("reason")); F.IsValid() && !F->IsNull()) { { FString V0; if (F->TryGetString(V0)) Out.reason = MoveTemp(V0); else bOk = false; } }
+	return bOk;
+}
+
+void FMusubiSimCommandNetClose::Write(FMusubiPostcardWriter& W, const FMusubiSimCommandNetClose& V)
+{
+	W.Varint((uint64)V.conn);
+	W.Str(V.session.ToText());
+	W.Str(V.entity);
+	W.Str(V.reason);
+}
+
+void FMusubiSimCommandNetClose::Read(FMusubiPostcardReader& R, FMusubiSimCommandNetClose& Out)
+{
+	Out.conn = R.Varint();
+	Out.session = FMusubiJson::FromText(R.Str());
+	Out.entity = R.Str();
+	Out.reason = R.Str();
+}
+
 TSharedPtr<FJsonValue> FMusubiSimCommand::ToJson(const FMusubiSimCommand& V)
 {
 	TSharedPtr<FJsonValue> P;
@@ -2021,6 +2185,8 @@ TSharedPtr<FJsonValue> FMusubiSimCommand::ToJson(const FMusubiSimCommand& V)
 	case EMusubiSimCommandTag::Colocate: P = V.Colocate.IsSet() ? FMusubiSimCommandColocate::ToJson(V.Colocate.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	case EMusubiSimCommandTag::Rewind: P = V.Rewind.IsSet() ? FMusubiSimCommandRewind::ToJson(V.Rewind.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	case EMusubiSimCommandTag::HandoverAck: P = V.HandoverAck.IsSet() ? FMusubiSimCommandHandoverAck::ToJson(V.HandoverAck.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
+	case EMusubiSimCommandTag::NetPacket: P = V.NetPacket.IsSet() ? FMusubiSimCommandNetPacket::ToJson(V.NetPacket.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
+	case EMusubiSimCommandTag::NetClose: P = V.NetClose.IsSet() ? FMusubiSimCommandNetClose::ToJson(V.NetClose.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	}
 	if (P.IsValid() && P->Type == EJson::Object) P->AsObject()->SetStringField(TEXT("op"), MusubiTagName(V.Tag));
 	return P;
@@ -2051,6 +2217,8 @@ bool FMusubiSimCommand::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimComm
 	case EMusubiSimCommandTag::Colocate: { FMusubiSimCommandColocate V0{}; if (!FMusubiSimCommandColocate::FromJson(J, V0)) bOk = false; Out.Colocate = MoveTemp(V0); break; }
 	case EMusubiSimCommandTag::Rewind: { FMusubiSimCommandRewind V0{}; if (!FMusubiSimCommandRewind::FromJson(J, V0)) bOk = false; Out.Rewind = MoveTemp(V0); break; }
 	case EMusubiSimCommandTag::HandoverAck: { FMusubiSimCommandHandoverAck V0{}; if (!FMusubiSimCommandHandoverAck::FromJson(J, V0)) bOk = false; Out.HandoverAck = MoveTemp(V0); break; }
+	case EMusubiSimCommandTag::NetPacket: { FMusubiSimCommandNetPacket V0{}; if (!FMusubiSimCommandNetPacket::FromJson(J, V0)) bOk = false; Out.NetPacket = MoveTemp(V0); break; }
+	case EMusubiSimCommandTag::NetClose: { FMusubiSimCommandNetClose V0{}; if (!FMusubiSimCommandNetClose::FromJson(J, V0)) bOk = false; Out.NetClose = MoveTemp(V0); break; }
 	}
 	return bOk;
 }

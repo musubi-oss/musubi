@@ -40,6 +40,18 @@ const CLIENT: &[(&str, &str)] = &[
         "world_input",
         r#"{"msg":{"world_input":{"world":"overworld","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b","input":{"move":[1,0],"jump":true}}}}"#,
     ),
+    (
+        "net_open",
+        r#"{"cid":"9","msg":{"net_open":{"world":"overworld","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b"}}}"#,
+    ),
+    (
+        "net_packet",
+        r#"{"msg":{"net_packet":{"world":"overworld","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b","conn":4503599627370495,"data":[0,128,255,7]}}}"#,
+    ),
+    (
+        "net_close",
+        r#"{"msg":{"net_close":{"world":"overworld","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b","conn":4503599627370495,"reason":"quit"}}}"#,
+    ),
 ];
 
 const SERVER: &[(&str, &str)] = &[
@@ -63,6 +75,26 @@ const SERVER: &[(&str, &str)] = &[
     (
         "world_delta_defaults",
         r#"{"msg":{"world_delta":{"world":"overworld","tick":43,"spawned":[],"updated":[],"despawned":[]}}}"#,
+    ),
+    (
+        "net_opened",
+        r#"{"cid":"9","msg":{"net_opened":{"world":"overworld","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b","conn":4503599627370495,"server":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5c","max_packet":1200}}}"#,
+    ),
+    (
+        "net_opened_in_transit",
+        r#"{"msg":{"net_opened":{"world":"overworld","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b","conn":1,"max_packet":1200}}}"#,
+    ),
+    (
+        "net_packet",
+        r#"{"msg":{"net_packet":{"conn":4503599627370495,"data":[1,2,3]}}}"#,
+    ),
+    (
+        "net_close",
+        r#"{"msg":{"net_close":{"conn":4503599627370495,"reason":"server shutdown"}}}"#,
+    ),
+    (
+        "net_rehome",
+        r#"{"msg":{"net_rehome":{"world":"overworld","entity":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b","conn":4503599627370495,"server":"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d"}}}"#,
     ),
     (
         "matchmaker_matched",

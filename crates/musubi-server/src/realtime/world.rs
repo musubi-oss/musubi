@@ -261,6 +261,12 @@ struct WorldState {
     sub_cmds: HashMap<SessionId, WorldCmd>,
     /// simulator → pending events (handover requests, inputs, …)
     sim_events: HashMap<Uuid, Vec<Value>>,
+    /// Engine connections relayed on an entity: (conn, client session). Learned from `net_open`
+    /// and from routed packets, so the shard an entity lands on knows whom to re-home.
+    net_sessions: HashMap<EntityId, Vec<(u64, SessionId)>>,
+    /// `net_rehome`/`net_close` for clients, sent at the next tick (handover completion has no
+    /// fan-out handle).
+    net_pending: Vec<(SessionId, ServerMessage)>,
     /// Persistent-entity ops since the last journal flush (see `musubi.world_journal`).
     journal: Vec<WorldOp>,
     /// Ghosts streamed by the hosts of cells on other nodes, merged from their deltas.
@@ -653,7 +659,28 @@ pub enum WorldCmd {
         entity: String,
         input: Value,
     },
+    /// Engine-level packet relay (`net_*` messages): open on an entity, a packet for its owner,
+    /// close. Routed to the owner like `Input`.
+    NetOpen {
+        entity: String,
+    },
+    NetPacket {
+        entity: String,
+        conn: u64,
+        data: Vec<u8>,
+    },
+    NetClose {
+        entity: String,
+        conn: u64,
+        reason: String,
+    },
 }
+
+/// Largest engine packet the relay accepts (`net_opened.max_packet`): a QUIC datagram after the
+/// frame type byte, and what `UNetConnection` defaults to on UDP.
+pub const NET_MAX_PACKET: usize = 1200;
+/// Engine connections one entity may carry (a player and a spectator or two).
+const NET_MAX_CONNS_PER_ENTITY: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldCmdEnv {
@@ -1198,6 +1225,8 @@ impl WorldRegistry {
                     controller: Controller::new(ctl),
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
+                    net_sessions: HashMap::new(),
+                    net_pending: Vec::new(),
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
                     ghost_send: HashMap::new(),
@@ -2117,6 +2146,8 @@ impl WorldRegistry {
                     controller: Controller::new(ctl),
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
+                    net_sessions: HashMap::new(),
+                    net_pending: Vec::new(),
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
@@ -2375,7 +2406,55 @@ impl WorldRegistry {
         if let Err(e) = self.check_enabled() {
             return Some(ServerMessage::error(&e));
         }
+        if let WorldCmd::NetOpen { entity } = &env.cmd {
+            return Some(
+                self.net_open(&env.world, env.session_id, entity)
+                    .unwrap_or_else(|e| ServerMessage::error(&e)),
+            );
+        }
         let r = match env.cmd {
+            WorldCmd::NetOpen { .. } => unreachable!("handled above"),
+            WorldCmd::NetPacket { entity, conn, data } => {
+                if data.len() > NET_MAX_PACKET {
+                    Err(Error::InvalidArgument(format!(
+                        "net_packet: {} bytes, max {NET_MAX_PACKET}",
+                        data.len()
+                    )))
+                } else {
+                    self.net_route(
+                        &env.world,
+                        env.session_id,
+                        &entity,
+                        conn,
+                        false,
+                        fanout,
+                        |id| SimEvent::<WorldEntity>::NetPacket {
+                            conn,
+                            session: json!(env.session_id),
+                            entity: id,
+                            data,
+                        },
+                    )
+                }
+            }
+            WorldCmd::NetClose {
+                entity,
+                conn,
+                reason,
+            } => self.net_route(
+                &env.world,
+                env.session_id,
+                &entity,
+                conn,
+                true,
+                fanout,
+                |id| SimEvent::<WorldEntity>::NetClose {
+                    conn,
+                    session: json!(env.session_id),
+                    entity: id,
+                    reason,
+                },
+            ),
             WorldCmd::Subscribe {
                 x,
                 y,
@@ -2650,6 +2729,8 @@ impl WorldRegistry {
                 controller: Controller::new(ctl),
                 subs: HashMap::new(),
                 sim_events: HashMap::new(),
+                net_sessions: HashMap::new(),
+                net_pending: Vec::new(),
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
                 ghost_send: HashMap::new(),
@@ -4253,6 +4334,7 @@ impl WorldRegistry {
                 metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
                     .increment(1);
             }
+            net_rehome(st, name, id, t.from, None);
             push_event(
                 st,
                 t.from,
@@ -4718,6 +4800,14 @@ impl WorldRegistry {
         };
         let mut st = w.lock();
         let st = &mut *st;
+        if input["type"] == "net_packet" || input["type"] == "net_close" {
+            if let (Some(conn), Ok(sid)) = (
+                input["conn"].as_u64(),
+                serde_json::from_value::<SessionId>(input["session"].clone()),
+            ) {
+                net_learn(st, id, conn, sid, input["type"] == "net_close");
+            }
+        }
         if let Ok(Some(sim)) = st.world.route_input(id, input.clone()) {
             let ev = if input["type"] == "interaction" {
                 stamp_interaction(st, id, input)
@@ -4899,6 +4989,7 @@ impl WorldRegistry {
                 .record(st.world.tick.saturating_sub(asked) as f64);
             metrics::counter!("musubi_world_handover_ended_total", "path" => "completed")
                 .increment(1);
+            net_rehome(st, name, id, from, Some(sim));
             push_event(
                 st,
                 from,
@@ -5069,6 +5160,7 @@ impl WorldRegistry {
                 st.sub_opts.remove(&c);
                 st.world.unsubscribe(c);
             }
+            Self::net_close_session(st, sid);
         }
     }
 
@@ -5088,6 +5180,118 @@ impl WorldRegistry {
             push_event(st, sim, ev);
         }
         Ok(())
+    }
+
+    // ----- engine packet relay (`net_*`) -----
+
+    /// `net_open`: a relay id on `entity` for this session. The owner is informational (`None`
+    /// while the entity is in transit or lives on another shard); packets are routed per packet.
+    pub fn net_open(&self, name: &str, sid: SessionId, entity: &str) -> Result<ServerMessage> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        let server = st
+            .world
+            .get(id)
+            .filter(|e| e.transit.is_none())
+            .and_then(|e| st.world.owner(e.cell));
+        let conns = st.net_sessions.entry(id).or_default();
+        conns.retain(|(_, s)| *s != sid);
+        if conns.len() >= NET_MAX_CONNS_PER_ENTITY {
+            return Err(Error::ResourceExhausted(format!(
+                "entity {entity} already carries {NET_MAX_CONNS_PER_ENTITY} engine connections"
+            )));
+        }
+        // 53 bits: engines parse JSON numbers as doubles (Unreal's FJsonValue), so a full u64
+        // would not survive the JSON leg
+        let conn = (rand::random::<u64>() >> 11) | 1;
+        conns.push((conn, sid));
+        metrics::counter!("musubi_world_net_opened_total").increment(1);
+        Ok(ServerMessage::NetOpened {
+            world: name.to_string(),
+            entity: entity.to_string(),
+            conn,
+            server,
+            max_packet: NET_MAX_PACKET as u32,
+        })
+    }
+
+    /// Route an engine packet/close to the entity's owner exactly like an input (buffered in
+    /// transit, forwarded to the hosting shard); remembers (conn, session) on the entity so a
+    /// later handover can re-home the connection, or forgets it on close.
+    #[allow(clippy::too_many_arguments)]
+    fn net_route(
+        &self,
+        name: &str,
+        sid: SessionId,
+        entity: &str,
+        conn: u64,
+        closing: bool,
+        fanout: &Fanout,
+        ev: impl FnOnce(EntityId) -> SimEvent<WorldEntity>,
+    ) -> Result<()> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        let st = &mut *st;
+        net_learn(st, id, conn, sid, closing);
+        let ev = ev(id).to_value();
+        match st.world.route_input(id, ev.clone()) {
+            Ok(Some(sim)) => {
+                push_event(st, sim, ev);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(musubi_mesh::MeshError::NoEntity) if self.is_split(name) => {
+                fanout.world_input(name, id, ev);
+                Ok(())
+            }
+            Err(e) => Err(mesh_err(e)),
+        }
+    }
+
+    /// The simulator closed `conn` on `entity` (`net_close` command): forget the relay.
+    pub fn net_closed(&self, name: &str, entity: &str, conn: u64) -> Result<()> {
+        let id = parse_entity(entity)?;
+        let w = self.get(name)?;
+        let mut st = w.lock();
+        if let Some(c) = st.net_sessions.get_mut(&id) {
+            c.retain(|(k, _)| *k != conn);
+            if c.is_empty() {
+                st.net_sessions.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    /// The client session is gone: every engine connection it had on this shard closes on the
+    /// owning simulator.
+    fn net_close_session(st: &mut WorldState, sid: SessionId) {
+        let mut gone = Vec::new();
+        for (id, conns) in st.net_sessions.iter_mut() {
+            conns.retain(|(conn, s)| {
+                if *s == sid {
+                    gone.push((*id, *conn));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        st.net_sessions.retain(|_, c| !c.is_empty());
+        for (id, conn) in gone {
+            let ev = SimEvent::<WorldEntity>::NetClose {
+                conn,
+                session: json!(sid),
+                entity: id,
+                reason: "session closed".into(),
+            }
+            .to_value();
+            if let Ok(Some(sim)) = st.world.route_input(id, ev.clone()) {
+                push_event(st, sim, ev);
+            }
+        }
     }
 
     // ----- ticking -----
@@ -5293,6 +5497,9 @@ impl WorldRegistry {
             let mut guard = w.lock();
             let t_lock = started.elapsed();
             let st = &mut *guard;
+            for (sid, m) in std::mem::take(&mut st.net_pending) {
+                fanout.session(sid, m);
+            }
             self.drain_interest(&name, st);
             let mut outcomes = st.world.advance();
             outcomes.extend(st.world.detect_handovers());
@@ -6241,6 +6448,61 @@ fn drain_admission(st: &mut WorldState) {
     }
     for (sim, ev) in events {
         push_event(st, sim, ev);
+    }
+}
+
+/// Remember (or forget) an engine connection on `id`; packets routed through a shard teach it
+/// the relays its entities carry.
+fn net_learn(st: &mut WorldState, id: EntityId, conn: u64, sid: SessionId, closing: bool) {
+    if closing {
+        if let Some(c) = st.net_sessions.get_mut(&id) {
+            c.retain(|(k, _)| *k != conn);
+            if c.is_empty() {
+                st.net_sessions.remove(&id);
+            }
+        }
+        return;
+    }
+    let c = st.net_sessions.entry(id).or_default();
+    if !c.iter().any(|(k, _)| *k == conn) && c.len() < NET_MAX_CONNS_PER_ENTITY {
+        c.push((conn, sid));
+    }
+}
+
+/// `id` changed owner (`from` → `to`, `to` unknown when it left for another node): the old owner
+/// closes its engine connections on it, each client restarts on the new owner (`net_rehome`),
+/// which opens on the first packet it sees. The relays stay registered: packets keep flowing to
+/// whoever owns the entity now.
+fn net_rehome(st: &mut WorldState, name: &str, id: EntityId, from: Uuid, to: Option<Uuid>) {
+    let Some(conns) = st.net_sessions.get(&id).cloned() else {
+        return;
+    };
+    for (conn, sid) in conns {
+        push_event(
+            st,
+            from,
+            SimEvent::<WorldEntity>::NetClose {
+                conn,
+                session: json!(sid),
+                entity: id,
+                reason: "rehome".into(),
+            },
+        );
+        st.net_pending.push((
+            sid,
+            ServerMessage::NetRehome {
+                world: name.to_string(),
+                entity: id.to_string(),
+                conn,
+                server: to,
+            },
+        ));
+        metrics::counter!("musubi_world_net_rehomed_total").increment(1);
+    }
+    if to.is_none() {
+        // the entity now lives on another node's shard; that shard learns the relays from the
+        // next packets, this one must not re-home them again
+        st.net_sessions.remove(&id);
     }
 }
 
