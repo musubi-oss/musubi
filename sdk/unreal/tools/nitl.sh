@@ -119,7 +119,12 @@ case "$H" in *"changes=1 live=1"|*"changes=$([ "$CHAOS" = 1 ] && echo 2 || echo 
 EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | head -1 | grep -o "[0-9]*")
 if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components exported in the iris state ($EXPC)"; else echo "FAIL nitl-s1: replicated components exported in the iris state (${EXPC:-0})"; ok=0; fi
 GINV=$(grep "nitl: server pawn .* id=$ENTITY owned=0 " "$OUT/$S2LOG.log" | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
-case "$GINV" in inv=0*|"") echo "FAIL nitl-s2: ghost received the inventory component via iris ($GINV)"; ok=0;; *) echo "PASS nitl-s2: ghost received the inventory component via iris ($GINV)";; esac
+GHOW="ghost received the inventory component via iris"
+if [ -z "$GINV" ]; then
+  # no ghost phase: the entity arrived already owned (handover retried into a replacement server) — the owned spawn must restore it from the node
+  GINV=$(grep "nitl: server pawn .* id=$ENTITY owned=1 " "$OUT/$S2LOG.log" | grep -o "inv=[0-9]* gold=[0-9]*" | head -1); GHOW="owned spawn restored the inventory component from the node's iris state"
+fi
+case "$GINV" in inv=0*|"") echo "FAIL nitl-s2: $GHOW ($GINV)"; ok=0;; *) echo "PASS nitl-s2: $GHOW ($GINV)";; esac
 HO=$(grep -n "nitl: handover .* completed" "$OUT/nitl-s1.log" | head -1 | cut -d: -f1); HO=${HO:-0}
 S1INV=$(grep -n "nitl: server pawn .* id=$ENTITY owned=1 " "$OUT/nitl-s1.log" | awk -F: -v n="$HO" '$1<n' | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
 S2INV=$(grep "nitl: server pawn .* id=$ENTITY owned=1 " "$OUT/$S2LOG.log" | grep -o "inv=[0-9]* gold=[0-9]*" | head -1)

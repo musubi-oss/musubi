@@ -204,12 +204,24 @@ void UMusubiSimulatorSubsystem::ApplyFrame(const FMusubiSimFrameTick& F)
 {
 	FramesThisSec++;
 	LastTick = FMath::Max(LastTick, F.tick);
-	for (const FMusubiCellFrame& C : F.cells) ApplyCell(C);
+	// An entity that crosses between two cells of this server is `gone` in one cell frame and `owned`/`ghost` in
+	// another of the same frame: it moved, it did not leave (seen live: the actor was destroyed and re-spawned,
+	// clients got a fresh actor with an empty inventory). Removals never apply to ids listed elsewhere in the frame.
+	// Likewise an entity we own in one cell is listed as a ghost in our neighbouring cell when it stands inside
+	// the ghost margin (seen live: the ghost listing came last, flipped the owner to a ghost and parked it in a
+	// cell whose idle lease the node later dropped — the entity was destroyed). The owned listing wins.
+	TSet<FMusubiUuid> InFrame, OwnedInFrame;
+	for (const FMusubiCellFrame& C : F.cells)
+	{
+		for (const FMusubiWorldEntity& E : C.owned) { InFrame.Add(E.id); OwnedInFrame.Add(E.id); }
+		for (const FMusubiWorldEntity& E : C.ghosts) InFrame.Add(E.id);
+	}
+	for (const FMusubiCellFrame& C : F.cells) ApplyCell(C, InFrame, OwnedInFrame);
 	for (const FMusubiSimEvent& E : F.events) HandleEvent(E);
 	Stats.Tick = (int64)LastTick;
 }
 
-void UMusubiSimulatorSubsystem::ApplyCell(const FMusubiCellFrame& C)
+void UMusubiSimulatorSubsystem::ApplyCell(const FMusubiCellFrame& C, const TSet<FMusubiUuid>& InFrame, const TSet<FMusubiUuid>& OwnedInFrame)
 {
 	FCell& Cell = Cells.FindOrAdd(C.cell);
 	Cell.Id = C.cell;
@@ -217,14 +229,14 @@ void UMusubiSimulatorSubsystem::ApplyCell(const FMusubiCellFrame& C)
 	const bool bFull = C.full.Get(false);
 	TSet<FMusubiUuid> Seen;
 	for (const FMusubiWorldEntity& E : C.owned) { UpsertEntity(E, C.cell, true, C.tick); Seen.Add(E.id); }
-	for (const FMusubiWorldEntity& E : C.ghosts) { UpsertEntity(E, C.cell, false, C.tick); Seen.Add(E.id); }
-	if (C.gone.IsSet()) for (const FMusubiUuid& Id : C.gone.GetValue()) RemoveEntity(Id, TEXT("gone"));
+	for (const FMusubiWorldEntity& E : C.ghosts) { if (OwnedInFrame.Contains(E.id)) continue; UpsertEntity(E, C.cell, false, C.tick); Seen.Add(E.id); }
+	if (C.gone.IsSet()) for (const FMusubiUuid& Id : C.gone.GetValue()) if (!InFrame.Contains(Id)) RemoveEntity(Id, TEXT("gone"));
 	if (bFull)
 	{
 		// a full view is the whole truth for this cell: whatever we had there and the node did not list is gone
 		TArray<FMusubiUuid> Stale;
-		for (const FMusubiUuid& Id : Cell.Owned) if (!Seen.Contains(Id)) Stale.Add(Id);
-		for (const FMusubiUuid& Id : Cell.Ghosts) if (!Seen.Contains(Id)) Stale.Add(Id);
+		for (const FMusubiUuid& Id : Cell.Owned) if (!Seen.Contains(Id) && !InFrame.Contains(Id)) Stale.Add(Id);
+		for (const FMusubiUuid& Id : Cell.Ghosts) if (!Seen.Contains(Id) && !InFrame.Contains(Id)) Stale.Add(Id);
 		for (const FMusubiUuid& Id : Stale) RemoveEntity(Id, TEXT("not in keyframe"));
 	}
 	if (C.time_scale.IsSet())
@@ -449,7 +461,10 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 			F.cell = E.TimeScale->cell;
 			F.tick = LastTick;
 			F.time_scale = E.TimeScale->scale;
-			ApplyCell(F);
+			TSet<FMusubiUuid> InFrame;
+			for (const FMusubiWorldEntity& WE : (F).owned) InFrame.Add(WE.id);
+			for (const FMusubiWorldEntity& WE : (F).ghosts) InFrame.Add(WE.id);
+			ApplyCell(F, InFrame, InFrame);
 		}
 		break;
 	case EMusubiSimEventTag::HandoverRequest:

@@ -720,11 +720,24 @@ was only ever applied on the ghost path. `UMusubiIrisExportSubsystem::OnEntitySp
 `iris` + `iris.d` to an owned spawn before registering it (live: s2b starts at `inv=4 gold=120`, the keyframe log
 line shows `t=1296 applied`).
 
-**Open (9g-7c):** after that owner-side restore the *client* of the new owner still saw `inv=0`: the FastArray was
-written through Iris dequantize, which does not bump the classic replication key, so the GameNetDriver never
-resends the items. Needs a post-restore hook (`MarkArrayDirty` from game code, or the bridge marking FastArray
-members) — tracked. In chaos mode the entity handle may also report two actor changes on the client (the
-cancelled handover's re-spawn), both resolve live.
+**Closed (9g-7c/7d/7e, live chaos run 27/27):** three more holes the chaos run exposed, all in the GDK:
+
+- *7c — the new owner's client saw `inv=0`, then never any later items.* The restored FastArray came out of Iris
+  through a whole-struct copy, which also overwrote `FFastArraySerializer`'s own bookkeeping (`IDCounter`,
+  `ArrayReplicationKey`, `ItemMap` are UPROPERTYs) with the scratch buffer's defaults, and the items kept the old
+  owner's `ReplicationID`s — the GameNetDriver thought the clients were up to date. The bridge now copies only the
+  game's fields of a FastArray struct, forgets the imported item ids (`INDEX_NONE` → re-registered on the next delta
+  serialize) and bumps the array key; the client ends the run with the owner's exact item count.
+- *7d — a server owning several cells destroyed and re-spawned an entity that crossed between two of them.* The node
+  lists it as `gone` in one cell frame and `owned` in the other of the same frame; removals now never apply to an id
+  listed elsewhere in the frame (it moved, it did not leave).
+- *7e — the same server flipped its own entity to a ghost.* Inside the ghost margin the entity is `owned` in cell
+  N and a `ghost` of cell N+1 in the same frame; the later ghost listing won, parked it in cell N+1, and when the
+  node dropped that idle lease the entity was destroyed (`cell left`). The owned listing now wins within a frame.
+
+Both 7d and 7e are multi-cell-per-server bugs the one-cell-per-server run can never hit; the chaos run (s2b takes a
+whole row) is what covers them. With no ghost phase (the entity arrives already owned after a cancelled handover)
+the acceptance checks the owned spawn restored the inventory from the node's state instead.
 
 ## 10. Numbers, limits, failure behaviour
 

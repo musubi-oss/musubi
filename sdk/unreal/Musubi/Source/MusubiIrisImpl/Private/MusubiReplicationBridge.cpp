@@ -1,4 +1,7 @@
 #include "MusubiReplicationBridge.h"
+#include "Net/Serialization/FastArraySerializer.h"
+
+static bool ApplyFastArrayFromIris(const FProperty* P, void* Dst, const void* Src, bool bSame);
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "Iris/Serialization/NetSerializer.h"
@@ -620,7 +623,7 @@ bool UMusubiReplicationBridge::ApplyDescs(UObject* Obj, const TArray<FDescOut>& 
 			else
 			{
 				bSame = P->Identical(Dst, Src);
-				P->CopySingleValue(Dst, Src);
+				if (!ApplyFastArrayFromIris(P, Dst, Src, bSame)) P->CopySingleValue(Dst, Src);
 				P->DestroyValue(Src);
 			}
 			if (!bSame && D->MemberPropertyDescriptors)
@@ -631,6 +634,45 @@ bool UMusubiReplicationBridge::ApplyDescs(UObject* Obj, const TArray<FDescOut>& 
 		bApplied = true;
 	}
 	return bApplied;
+}
+
+// A FastArray written through Iris carries the owner's items but not the classic driver's bookkeeping: the
+// replication key is unchanged and the items keep foreign ReplicationIDs, so the GameNetDriver never resends them
+// to this server's clients (seen live: the new owner restored inv=4, its client stayed at inv=0). Forget the ids
+// (items with INDEX_NONE are re-registered on the next delta serialize) and bump the array key.
+static bool ApplyFastArrayFromIris(const FProperty* P, void* Dst, const void* Src, bool bSame)
+{
+	const FStructProperty* SP = CastField<FStructProperty>(P);
+	if (!SP || !SP->Struct || !SP->Struct->IsChildOf(FFastArraySerializer::StaticStruct())) return false;
+	if (bSame) return true;
+	// Only the game's own fields (the item array) come from Iris. FFastArraySerializer's bookkeeping (IDCounter,
+	// ArrayReplicationKey, ItemMap — UPROPERTYs, so a whole-struct copy would clobber them with the scratch
+	// buffer's defaults) belongs to this server's classic GameNetDriver and stays. Imported items carry the old
+	// owner's ReplicationIDs: forget them (INDEX_NONE items are re-registered on the next delta serialize) and
+	// bump the array key so every connection resends the array (seen live: the new owner restored inv=4, its
+	// client stayed at inv=0, then never received later items).
+	FFastArraySerializer* FA = static_cast<FFastArraySerializer*>(Dst);
+	int32 Items = 0;
+	for (TFieldIterator<FProperty> It(SP->Struct); It; ++It)
+	{
+		if (It->GetOwnerStruct() == FFastArraySerializer::StaticStruct()) continue;
+		It->CopyCompleteValue(It->ContainerPtrToValuePtr<void>(Dst), It->ContainerPtrToValuePtr<void>(Src));
+		const FArrayProperty* AP = CastField<FArrayProperty>(*It);
+		const FStructProperty* Inner = AP ? CastField<FStructProperty>(AP->Inner) : nullptr;
+		if (!Inner || !Inner->Struct || !Inner->Struct->IsChildOf(FFastArraySerializerItem::StaticStruct())) continue;
+		FScriptArrayHelper H(AP, AP->ContainerPtrToValuePtr<void>(Dst));
+		for (int32 i = 0; i < H.Num(); ++i)
+		{
+			FFastArraySerializerItem* Item = reinterpret_cast<FFastArraySerializerItem*>(H.GetRawPtr(i));
+			Item->ReplicationID = INDEX_NONE;
+			Item->ReplicationKey = INDEX_NONE;
+		}
+		Items += H.Num();
+	}
+	const int32 KeyBefore = FA->ArrayReplicationKey;
+	FA->MarkArrayDirty();
+	UE_LOG(LogMusubiIris, Log, TEXT("%s: %d FastArray item(s) imported from iris (key %d -> %d, id counter %d)"), *P->GetName(), Items, KeyBefore, FA->ArrayReplicationKey, FA->IDCounter);
+	return true;
 }
 
 bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const FMusubiJson& Value, UMusubiSimulatorSubsystem* Sim)

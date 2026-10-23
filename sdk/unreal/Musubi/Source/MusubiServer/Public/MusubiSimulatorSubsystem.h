@@ -181,7 +181,7 @@ private:
 	bool EngineTick(float DeltaSeconds);
 	void SimTick();
 	void ApplyFrame(const FMusubiSimFrameTick& F);
-	void ApplyCell(const FMusubiCellFrame& C);
+	void ApplyCell(const FMusubiCellFrame& C, const TSet<FMusubiUuid>& InFrame, const TSet<FMusubiUuid>& OwnedInFrame);
 	void HandleEvent(const FMusubiSimEvent& E);
 	void UpsertEntity(const FMusubiWorldEntity& E, const FMusubiCellId& Cell, bool bOwned, uint64 Tick);
 	void RemoveEntity(const FMusubiUuid& Id, const TCHAR* Why);
