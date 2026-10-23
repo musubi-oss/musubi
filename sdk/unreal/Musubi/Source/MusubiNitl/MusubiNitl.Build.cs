@@ -10,5 +10,8 @@ public class MusubiNitl : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Musubi", "MusubiServer", "MusubiNet" });
 		PrivateDependencyModuleNames.AddRange(new string[] { "NetCore", "Json" });
+		// The inventory FastArray needs the UHT-generated Iris binding (UE_NET_HAS_IRIS_FASTARRAY_BINDING) or the descriptor
+		// builder drops it ("FFastArray property not registered"); same tier gate as MusubiIris.
+		if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 5) SetupIrisSupport(Target);
 	}
 }

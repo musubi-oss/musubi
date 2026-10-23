@@ -76,11 +76,24 @@ BEFORE=$(grep -n "nitl: client pawn " "$OUT/nitl-c.log" | awk -F: -v n="$REH" '$
 AFTER=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1)
 if [ -n "$BEFORE" ]; then echo "PASS nitl-c: player possessed its pawn before the rehome"; else echo "FAIL nitl-c: player possessed its pawn before the rehome"; ok=0; fi
 case "$AFTER" in *"possessed=1"*) echo "PASS nitl-c: player possesses the new owner's pawn after the rehome";; *) echo "FAIL nitl-c: player possesses the new owner's pawn after the rehome ($AFTER)"; ok=0;; esac
-N1=$(echo "$BEFORE" | sed -n 's/.* name=\(.*\)$/\1/p'); N2=$(echo "$AFTER" | sed -n 's/.* name=\(.*\)$/\1/p')
+N1=$(echo "$BEFORE" | sed -n 's/.* name=\([^ ]*\).*/\1/p'); N2=$(echo "$AFTER" | sed -n 's/.* name=\([^ ]*\).*/\1/p')
 if [ -n "$N1" ] && [ "$N1" != "-" ] && [ "$N1" = "$N2" ]; then echo "PASS nitl-c: PlayerState name survived the rehome ($N1)"; else echo "FAIL nitl-c: PlayerState name survived the rehome (before=$N1 after=$N2)"; ok=0; fi
 # the stable handle: taken from the first pawn, resolves to the live possessed pawn after the swap, exactly one actor change seen
 H=$(grep "nitl: handle " "$OUT/nitl-c.log" | tail -1 | sed 's/.*nitl: handle //')
 case "$H" in *"changes=1 live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome ($H)"; ok=0;; esac
+# replicated components in the binary iris state: the ghost on s2 saw the inventory before owning, the new owner carried on from it
+EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | head -1 | grep -o "[0-9]*")
+if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components exported in the iris state ($EXPC)"; else echo "FAIL nitl-s1: replicated components exported in the iris state (${EXPC:-0})"; ok=0; fi
+GINV=$(grep "nitl: server pawn .* owned=0 " "$OUT/nitl-s2.log" | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
+case "$GINV" in inv=0*|"") echo "FAIL nitl-s2: ghost received the inventory component via iris ($GINV)"; ok=0;; *) echo "PASS nitl-s2: ghost received the inventory component via iris ($GINV)";; esac
+HO=$(grep -n "nitl: handover .* completed" "$OUT/nitl-s1.log" | head -1 | cut -d: -f1); HO=${HO:-0}
+S1INV=$(grep -n "nitl: server pawn .* owned=1 " "$OUT/nitl-s1.log" | awk -F: -v n="$HO" '$1<n' | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
+S2INV=$(grep "nitl: server pawn .* owned=1 " "$OUT/nitl-s2.log" | grep -o "inv=[0-9]* gold=[0-9]*" | head -1)
+A1=$(echo "$S1INV" | grep -o "inv=[0-9]*" | cut -d= -f2); A2=$(echo "$S2INV" | grep -o "inv=[0-9]*" | cut -d= -f2)
+G1=$(echo "$S1INV" | grep -o "gold=[0-9]*" | cut -d= -f2); G2=$(echo "$S2INV" | grep -o "gold=[0-9]*" | cut -d= -f2)
+if [ -n "$A1" ] && [ -n "$A2" ] && [ "$A1" -ge 1 ] && [ "$A2" -ge "$A1" ] && [ "${G2:-0}" -ge "${G1:-1}" ]; then echo "PASS nitl-s: inventory carried across the handover without reset (s1 $S1INV -> s2 $S2INV)"; else echo "FAIL nitl-s: inventory carried across the handover without reset (s1 $S1INV -> s2 $S2INV)"; ok=0; fi
+CINV=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1 | grep -o "inv=[0-9]*" | cut -d= -f2)
+if [ -n "$CINV" ] && [ -n "$A1" ] && [ "$CINV" -ge "$A1" ]; then echo "PASS nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV)"; else echo "FAIL nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV, s1 had $A1)"; ok=0; fi
 if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/nitl-s2.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi
 grep -h "nitl: client pawn" "$OUT/nitl-c.log" | tail -3
 [ "$ok" = 1 ] && echo "NITL PASS ($VER)" || { echo "NITL FAIL ($VER) — logs in $OUT"; exit 1; }

@@ -80,13 +80,14 @@ private:
 		uint64 LastHash = 0;
 		struct FStateBuf { TArray<uint8> External, Internal, Last; TMap<FString, FString> LastRefs; bool bHasLast = false; };
 		TArray<FStateBuf> States; // one per class descriptor (binary export)
+		TMap<FName, TArray<FStateBuf>> Subs; // replicated components of an actor, by component name
 	};
 	/** Class → Iris replication state descriptors built once (CDO as default state). */
 	TMap<TWeakObjectPtr<UClass>, TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>> ClassDescriptors;
 	const TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>& DescriptorsFor(UClass* Class);
 	/** Binary path: quantize + serialize each eligible descriptor state; false = nothing eligible (JSON fallback). */
-	bool ExportBinary(FTracked& T, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged);
-	void FreeStates(FTracked& T, UObject* Obj);
+	bool ExportBinary(TArray<FTracked::FStateBuf>& States, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged);
+	void FreeStates(TArray<FTracked::FStateBuf>& States, UObject* Obj);
 
 public:
 	/** Ghost side: deserialize + dequantize an `iris` component (binary form) into Obj's UPROPERTYs, firing RepNotifies. */

@@ -118,7 +118,10 @@ void UMusubiReplicationBridge::Untrack(FNetRefHandle Handle, UObject* Object)
 	if (UMusubiAuthorityComponent* Auth = T->Authority.Get())
 		if (Auth->IsOwned())
 			Auth->RequestDespawn(); // detach from Iris == despawn in Musubi (torn-off/destroyed)
-	FreeStates(*T, T->Object.Get());
+	FreeStates(T->States, T->Object.Get());
+	if (AActor* A = Cast<AActor>(T->Object.Get()))
+		for (TPair<FName, TArray<FTracked::FStateBuf>>& KV : T->Subs)
+			for (UActorComponent* C : A->GetComponents()) if (C && C->GetFName() == KV.Key) { FreeStates(KV.Value, C); break; }
 	Tracked.Remove(Handle);
 	DirtyThisUpdate.Remove(Handle);
 }
@@ -176,12 +179,18 @@ static FString RefId(UObject* O)
 	if (const UActorComponent* C = Cast<UActorComponent>(O))
 		if (const AActor* A = C->GetOwner())
 			if (const UMusubiAuthorityComponent* Auth = A->FindComponentByClass<UMusubiAuthorityComponent>()) return Auth->GetEntityId() + TEXT("/") + C->GetName();
+	// not a Musubi entity: a level-placed actor (or a component of one) exists under the same name on every server
+	// that has the level loaded, so its path is a stable id; dynamically spawned non-entity objects are not carried
+	const AActor* Owner = Cast<AActor>(O);
+	if (!Owner) if (const UActorComponent* C = Cast<UActorComponent>(O)) Owner = C->GetOwner();
+	if (Owner && Owner->IsNetStartupActor() && O->IsNameStableForNetworking()) return TEXT("path:") + O->GetPathName();
 	return FString();
 }
 
 static UObject* ResolveRef(UMusubiSimulatorSubsystem* Sim, const FString& Id)
 {
 	if (!Sim || Id.IsEmpty()) return nullptr;
+	if (Id.StartsWith(TEXT("path:"))) return FindObject<UObject>(nullptr, *Id.Mid(5));
 	FString Uuid, Comp;
 	if (!Id.Split(TEXT("/"), &Uuid, &Comp)) Uuid = Id;
 	FMusubiUuid U;
@@ -221,20 +230,20 @@ void UMusubiReplicationBridge::DisablePushDirtiness(UClass* Class)
 	}
 }
 
-void UMusubiReplicationBridge::FreeStates(FTracked& T, UObject* Obj)
+void UMusubiReplicationBridge::FreeStates(TArray<FTracked::FStateBuf>& States, UObject* Obj)
 {
-	if (!Obj || T.States.Num() == 0) return;
+	if (!Obj || States.Num() == 0) return;
 	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
 	FNetSerializationContext Ctx;
-	for (int32 i = 0; i < T.States.Num() && i < Descs.Num(); ++i)
+	for (int32 i = 0; i < States.Num() && i < Descs.Num(); ++i)
 	{
-		FTracked::FStateBuf& S = T.States[i];
+		FTracked::FStateBuf& S = States[i];
 		const FReplicationStateDescriptor* D = Descs[i].GetReference();
 		if (!D || S.Internal.Num() == 0) continue;
 		FReplicationStateOperations::FreeDynamicState(Ctx, S.Internal.GetData(), D);
 		if (S.bHasLast) FReplicationStateOperations::FreeDynamicState(Ctx, S.Last.GetData(), D);
 	}
-	T.States.Reset();
+	States.Reset();
 }
 
 // The `iris` component, binary form: {"c": class path, "s": [{"i": descriptor index, "bits": n, "b": base64 of
@@ -242,12 +251,12 @@ void UMusubiReplicationBridge::FreeStates(FTracked& T, UObject* Obj)
 // are exported this way — resolving references needs Iris' internal serialization context, which is engine-private;
 // classes whose every descriptor has references fall back to the JSON mirror. Unchanged states (IsEqualQuantizedState
 // against the last export) are not re-sent; a message carries only the descriptors that changed.
-bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged)
+bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged)
 {
 	bChanged = false;
 	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
 	if (Descs.Num() == 0) return false;
-	if (T.States.Num() != Descs.Num()) T.States.SetNum(Descs.Num());
+	if (TStates.Num() != Descs.Num()) TStates.SetNum(Descs.Num());
 	bool bEligible = false;
 	TArray<TSharedPtr<FJsonValue>> States;
 	for (int32 i = 0; i < Descs.Num(); ++i)
@@ -255,7 +264,7 @@ bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPt
 		const FReplicationStateDescriptor* D = Descs[i].GetReference();
 		if (!D || D->MemberCount == 0) continue;
 		bEligible = true;
-		FTracked::FStateBuf& S = T.States[i];
+		FTracked::FStateBuf& S = TStates[i];
 		if (S.External.Num() != (int32)D->ExternalSize)
 		{
 			S.External.SetNumZeroed(D->ExternalSize);
@@ -377,11 +386,35 @@ void UMusubiReplicationBridge::FlushDirty()
 		if (!Auth->IsOwned()) continue; // ghosts are driven by the node, never mirrored back
 		TSharedPtr<FJsonObject> Bin;
 		bool bChanged = false;
-		if (ExportBinary(T, Obj, Bin, bChanged))
+		if (ExportBinary(T.States, Obj, Bin, bChanged))
 		{
+			// replicated components ride along under "sub" by component name (CharacterMovement, inventories, ...);
+			// only the ones whose state changed are in the message, like the actor's own descriptors
+			TSharedPtr<FJsonObject> Subs;
+			if (AActor* A = Cast<AActor>(Obj))
+				for (UActorComponent* C : A->GetReplicatedComponents())
+				{
+					if (!C || C->IsA<UMusubiAuthorityComponent>()) continue;
+					TSharedPtr<FJsonObject> SubBin;
+					bool bSubChanged = false;
+					if (!ExportBinary(T.Subs.FindOrAdd(C->GetFName()), C, SubBin, bSubChanged) || !bSubChanged) continue;
+					if (!Subs.IsValid()) Subs = MakeShared<FJsonObject>();
+					Subs->SetObjectField(C->GetName(), SubBin);
+				}
+			if (Subs.IsValid())
+			{
+				if (!Bin.IsValid())
+				{
+					Bin = MakeShared<FJsonObject>();
+					Bin->SetStringField(TEXT("c"), Obj->GetClass()->GetPathName());
+					Bin->SetArrayField(TEXT("s"), TArray<TSharedPtr<FJsonValue>>());
+				}
+				Bin->SetObjectField(TEXT("sub"), Subs);
+				bChanged = true;
+			}
 			if (bChanged)
 			{
-				if (!T.bMirrored) UE_LOG(LogMusubiIris, Log, TEXT("%s: first binary iris state exported"), *Obj->GetName());
+				if (!T.bMirrored) UE_LOG(LogMusubiIris, Log, TEXT("%s: first binary iris state exported (%d component(s))"), *Obj->GetName(), Subs.IsValid() ? Subs->Values.Num() : 0);
 				T.bMirrored = true;
 				Auth->SetComponent(TEXT("iris"), FMusubiJson(Bin));
 			}
@@ -505,5 +538,17 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 		FReplicationStateOperations::FreeDynamicState(Ctx, Internal.GetData(), D);
 		bApplied = true;
 	}
+	const TSharedPtr<FJsonObject>* Subs = nullptr;
+	if (Iris->TryGetObjectField(TEXT("sub"), Subs) && Subs)
+		if (AActor* A = Cast<AActor>(Obj))
+			for (const TPair<FString, TSharedPtr<FJsonValue>> KV : (*Subs)->Values) // TMap iteration yields pairs by value here
+			{
+				const TSharedPtr<FJsonObject>* SubObj = nullptr;
+				if (!KV.Value.IsValid() || !KV.Value->TryGetObject(SubObj) || !SubObj) continue;
+				UActorComponent* Target = nullptr;
+				for (UActorComponent* C : A->GetComponents()) if (C && C->GetName() == KV.Key) { Target = C; break; }
+				if (!Target) { UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state for component %s, ghost has none — skipped"), *A->GetName(), *KV.Key); continue; }
+				bApplied |= ApplyBinary(Target, *SubObj, Sim);
+			}
 	return bApplied;
 }

@@ -17,6 +17,8 @@ public:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	UPROPERTY(VisibleAnywhere, Category = "Musubi") TObjectPtr<class UMusubiAuthorityComponent> Authority;
+	UPROPERTY(VisibleAnywhere, Category = "Musubi")
+	TObjectPtr<class UMusubiNitlInventoryComponent> Inventory;
 	/** Ticks walked on the owner: a client that keeps this actor across a rehome must see it keep counting up. */
 	UPROPERTY(ReplicatedUsing = OnRep_Steps) int32 Steps = 0;
 	UFUNCTION() void OnRep_Steps();

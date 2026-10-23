@@ -1,4 +1,5 @@
 #include "MusubiNitlPawn.h"
+#include "MusubiNitlInventoryComponent.h"
 #include "MusubiAuthorityComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Controller.h"
@@ -18,6 +19,7 @@ AMusubiNitlPawn::AMusubiNitlPawn()
 	bReplicates = true;
 	SetReplicatingMovement(true);
 	Authority = CreateDefaultSubobject<UMusubiAuthorityComponent>(TEXT("Authority"));
+	Inventory = CreateDefaultSubobject<UMusubiNitlInventoryComponent>(TEXT("Inventory"));
 	// the Entry map has no floor: fly, at the speed the run asks for (both sides parse it so the client's prediction agrees)
 	float Walk = 60.f;
 	FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlWalk="), Walk);
@@ -46,6 +48,11 @@ void AMusubiNitlPawn::Tick(float DeltaSeconds)
 	// movement comes from the possessing client's input (CharacterMovement ServerMove over the relay); the owner only counts
 	++Steps;
 	PushSteps = Steps;
+	if (Inventory)
+	{
+		if (Steps % 100 == 0) Inventory->Gold += 10;
+		if (Steps % 300 == 0) Inventory->AddItem(Steps / 300, 1);
+	}
 	MARK_PROPERTY_DIRTY_FROM_NAME(AMusubiNitlPawn, PushSteps, this);
 	const double Now = FPlatformTime::Seconds();
 	if (Now - LastLog > 1.0)

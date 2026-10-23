@@ -1,5 +1,6 @@
 #include "MusubiNitlSubsystem.h"
 #include "MusubiNitlPawn.h"
+#include "MusubiNitlInventoryComponent.h"
 #include "MusubiSimulatorSubsystem.h"
 #include "MusubiAuthorityComponent.h"
 #include "MusubiSubsystem.h"
@@ -147,10 +148,10 @@ bool UMusubiNitlSubsystem::Report(float)
 		const FVector L = It->GetActorLocation();
 		const APlayerController* LocalPC = Mode == TEXT("client") ? UGameplayStatics::GetPlayerController(World, 0) : nullptr;
 		const APlayerState* PS = LocalPC ? LocalPC->PlayerState.Get() : It->GetPlayerState();
-		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s"), *Mode, *It->GetName(),
+		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s inv=%d gold=%d"), *Mode, *It->GetName(),
 			It->Authority ? *It->Authority->NetEntityId : TEXT("?"), It->Authority ? (int)It->Authority->bNetOwned : -1, L.X, L.Y, It->Steps, It->PushSteps, It->GetNetPushIdDynamic(),
 			It->GetController() ? *It->GetController()->GetName() : TEXT("none"), LocalPC ? (int)(LocalPC->GetPawn() == *It) : (int)(It->GetController() != nullptr),
-			PS ? *PS->GetPlayerName() : TEXT("-"));
+			PS ? *PS->GetPlayerName() : TEXT("-"), It->Inventory ? It->Inventory->NumItems() : -1, It->Inventory ? It->Inventory->Gold : -1);
 		++N;
 	}
 	if (Mode == TEXT("client"))

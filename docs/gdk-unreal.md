@@ -630,6 +630,38 @@ resolves to the pawn the local `PlayerController` possesses on the new owner, ex
 **What this is not yet:** `score` round-trips but nothing in the acceptance changes it between servers;
 subobjects/components of the pawn are not part of the Iris export (9g-4).
 
+### 9.8 Replicated components, FastArray and non-entity references in the iris state (phase 9g-4)
+
+Until now only the actor's own descriptors went into the `iris` component; a Character's `CharacterMovement`, an
+inventory component, anything replicated as a component or subobject was invisible to ghosts and so lost on handover.
+`FlushDirty` now exports every `GetReplicatedComponents()` member of an owned actor with the same quantize → compare →
+serialize path (one state array per component in `FTracked::Subs`) and puts the changed ones under
+`"sub": {"<ComponentName>": {"c","s":[…]}}`; `ApplyBinary` on the ghost resolves the component by name on its own
+actor and recurses (class checked as for the actor, RepNotify fired). `UMusubiAuthorityComponent` itself is skipped.
+
+* **FastArray.** A `FFastArraySerializer` UPROPERTY becomes its own descriptor in the builder
+  (`IsFastArrayReplicationState`), quantized/serialized as a whole array by our connection-less path — items and their
+  fields land on the ghost as regular UPROPERTYs. **The module must call `SetupIrisSupport(Target)` in its Build.cs**: that defines
+  `UE_NET_HAS_IRIS_FASTARRAY_BINDING`, and UHT then generates the Iris binding
+  (`GetFastArrayCreateReplicationFragmentFunction`) for every `FFastArraySerializer`-derived USTRUCT — do not add
+  `UE_NET_DECLARE/IMPLEMENT_FASTARRAY` by hand (redeclared member / duplicate symbol). Without it the FastArray is
+  dropped by `CreateDescriptorsForClass` with `LogIris: Error: FFastArray property … not registered` — the same
+  requirement the engine's own Iris path has, seen live in NITL (the ghost got `Gold` but `inv=0` until the module was
+  set up). No delta: the whole array goes when any item is dirty (member-level
+  deltas are 9g-6). NITL: `UMusubiNitlInventoryComponent` (`FMusubiNitlItems` FastArray + `Gold` RepNotify) on the pawn,
+  the owner adds gold every 100 steps and an item every 300; the ghost on s2 reports `inv=N gold=G` before it owns the
+  entity, the new owner continues from those values (no reset), the client gets the FastArray from the new owner
+  through classic replication.
+* **References to non-entities.** `RefId` used to carry only actors with an authority component (entity uuid) and
+  their components (`uuid/Component`). Level-placed actors and their components (`IsNetStartupActor()` +
+  `IsNameStableForNetworking()`) exist under the same name on every server with the level loaded, so they now travel as
+  `path:<PathName>` and resolve with `FindObject`. Dynamically spawned non-entity objects are still not carried
+  (nothing stable to name them by; the ghost keeps what it has).
+
+**Not covered yet:** replicated subobjects registered with `AddReplicatedSubObject` outside the component list
+(`FSubObjectRegistry` is private to `AActor`); nested components with the same name on different owners are
+disambiguated only by their owning actor.
+
 ## 10. Numbers, limits, failure behaviour
 
 | Item | Value | Behaviour at the edge |
