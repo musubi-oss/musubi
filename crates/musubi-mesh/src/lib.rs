@@ -1821,12 +1821,23 @@ impl World {
     /// the entity is gone or its cell has no owner here.
     pub fn begin_remote_handover(&mut self, id: EntityId, host: SimId) -> bool {
         let tick = self.tick;
-        let Some((cell, pos)) = self.entities.get(&id).map(|e| (e.cell, e.pos)) else {
+        let Some((cell, pos, prev_from)) = self
+            .entities
+            .get(&id)
+            .map(|e| (e.cell, e.pos, e.transit.as_ref().map(|t| t.from)))
+        else {
             return false;
         };
-        let Some(from) = self.owner(cell) else {
-            return false;
-        };
+        // A re-ship after the first attempt timed out may come after the cell's lease here was
+        // revoked (the cell was offloaded: `release_cell` ships and drops the lease in one go).
+        // There is then no local simulator to tell, but the entity must still leave: refusing
+        // here left it parked on the old node with no owner anywhere (seen on CI as a lost entity
+        // of an offloaded cell), so fall back to the lapsed holder, the previous transit, the host.
+        let from = self
+            .owner(cell)
+            .or_else(|| self.lease_holder(cell))
+            .or(prev_from)
+            .unwrap_or(host);
         let to_cell = self.cell_of(pos);
         let group = self.attached(id);
         for m in &group {
@@ -2924,6 +2935,48 @@ mod tests {
             .unwrap();
         assert_eq!(w.get(a).unwrap().components["hp"].version, 2);
         let _ = b;
+    }
+
+    #[test]
+    fn remote_reship_after_lease_revoked() {
+        // an offloaded cell: the home ships its entities to the new host and drops its own lease
+        // in the same step; when the first shipment is lost, the timeout re-ship must still go
+        // out although no simulator here owns the cell any more
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ghost_margin: 10.0,
+            hysteresis: 5.0,
+            ..Default::default()
+        });
+        let s1 = Uuid::now_v7();
+        let host = Uuid::now_v7();
+        let cell = CellId {
+            x: 0,
+            y: 0,
+            level: 0,
+            z: 0,
+        };
+        w.grant_lease(cell, s1);
+        let a = w.spawn(
+            Pos {
+                x: 50.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            BTreeMap::new(),
+            false,
+        );
+        assert!(w.begin_remote_handover(a, host));
+        assert!(w.cancel_handover(a).is_some());
+        assert_eq!(w.revoke_lease(cell), Some(s1));
+        assert_eq!(w.owner(cell), None);
+        assert!(
+            w.begin_remote_handover(a, host),
+            "re-ship must not need a live lease on the released cell"
+        );
+        let t = w.get(a).unwrap().transit.clone().expect("in transit again");
+        assert!(t.remote);
+        assert_eq!(t.to, host);
     }
 
     #[test]

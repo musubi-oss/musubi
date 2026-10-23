@@ -5595,7 +5595,17 @@ impl WorldRegistry {
                             tracing::debug!(world = %name, %entity, attempt = n + 1, ms = musubi_cluster::unix_ms(), "hotrace: expired, re-shipping");
                         }
                         st.remote_transit.insert(entity, (host, n + 1, target));
-                        if st.world.begin_remote_handover(entity, host) {
+                        if !st.world.begin_remote_handover(entity, host) {
+                            hoj(
+                                &name,
+                                entity,
+                                st.world.tick,
+                                "ended",
+                                "reship_failed",
+                                format!("entity not here any more, host {host}"),
+                            );
+                            st.remote_transit.remove(&entity);
+                        } else {
                             let group: Vec<EntityId> = st
                                 .world
                                 .get(entity)
