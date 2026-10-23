@@ -2373,6 +2373,7 @@ const TCHAR* MusubiTagName(EMusubiServerMessageTag Tag)
 	case EMusubiServerMessageTag::NetOpened: return TEXT("net_opened");
 	case EMusubiServerMessageTag::NetPacket: return TEXT("net_packet");
 	case EMusubiServerMessageTag::NetClose: return TEXT("net_close");
+	case EMusubiServerMessageTag::NetMeta: return TEXT("net_meta");
 	case EMusubiServerMessageTag::NetRehome: return TEXT("net_rehome");
 	case EMusubiServerMessageTag::MatchInputAck: return TEXT("match_input_ack");
 	case EMusubiServerMessageTag::MatchTickHash: return TEXT("match_tick_hash");
@@ -2422,6 +2423,7 @@ bool MusubiTagFromName(const FString& Name, EMusubiServerMessageTag& Out)
 	if (Name == TEXT("net_opened")) { Out = EMusubiServerMessageTag::NetOpened; return true; }
 	if (Name == TEXT("net_packet")) { Out = EMusubiServerMessageTag::NetPacket; return true; }
 	if (Name == TEXT("net_close")) { Out = EMusubiServerMessageTag::NetClose; return true; }
+	if (Name == TEXT("net_meta")) { Out = EMusubiServerMessageTag::NetMeta; return true; }
 	if (Name == TEXT("net_rehome")) { Out = EMusubiServerMessageTag::NetRehome; return true; }
 	if (Name == TEXT("match_input_ack")) { Out = EMusubiServerMessageTag::MatchInputAck; return true; }
 	if (Name == TEXT("match_tick_hash")) { Out = EMusubiServerMessageTag::MatchTickHash; return true; }
@@ -3538,6 +3540,37 @@ void FMusubiServerMessageNetClose::Read(FMusubiPostcardReader& R, FMusubiServerM
 	Out.reason = R.Str();
 }
 
+TSharedPtr<FJsonValue> FMusubiServerMessageNetMeta::ToJson(const FMusubiServerMessageNetMeta& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("conn"), MakeShared<FJsonValueNumber>((double)V.conn));
+	O->SetField(TEXT("data"), MusubiJson::BytesToJson(V.data));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiServerMessageNetMeta::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageNetMeta& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("conn")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.conn = (uint64)V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("data")); F.IsValid() && !F->IsNull()) { if (!MusubiJson::BytesFromJson(F, Out.data)) bOk = false; }
+	return bOk;
+}
+
+void FMusubiServerMessageNetMeta::Write(FMusubiPostcardWriter& W, const FMusubiServerMessageNetMeta& V)
+{
+	W.Varint((uint64)V.conn);
+	W.Bytes(V.data);
+}
+
+void FMusubiServerMessageNetMeta::Read(FMusubiPostcardReader& R, FMusubiServerMessageNetMeta& Out)
+{
+	Out.conn = R.Varint();
+	R.Bytes(Out.data);
+}
+
 TSharedPtr<FJsonValue> FMusubiServerMessageNetRehome::ToJson(const FMusubiServerMessageNetRehome& V)
 {
 	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -4003,6 +4036,7 @@ TSharedPtr<FJsonValue> FMusubiServerMessage::ToJson(const FMusubiServerMessage& 
 	case EMusubiServerMessageTag::NetOpened: return MusubiJson::Tagged(TEXT("net_opened"), V.NetOpened.IsSet() ? FMusubiServerMessageNetOpened::ToJson(V.NetOpened.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::NetPacket: return MusubiJson::Tagged(TEXT("net_packet"), V.NetPacket.IsSet() ? FMusubiServerMessageNetPacket::ToJson(V.NetPacket.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::NetClose: return MusubiJson::Tagged(TEXT("net_close"), V.NetClose.IsSet() ? FMusubiServerMessageNetClose::ToJson(V.NetClose.GetValue()) : MusubiJson::Null());
+	case EMusubiServerMessageTag::NetMeta: return MusubiJson::Tagged(TEXT("net_meta"), V.NetMeta.IsSet() ? FMusubiServerMessageNetMeta::ToJson(V.NetMeta.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::NetRehome: return MusubiJson::Tagged(TEXT("net_rehome"), V.NetRehome.IsSet() ? FMusubiServerMessageNetRehome::ToJson(V.NetRehome.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::MatchInputAck: return MusubiJson::Tagged(TEXT("match_input_ack"), V.MatchInputAck.IsSet() ? FMusubiServerMessageMatchInputAck::ToJson(V.MatchInputAck.GetValue()) : MusubiJson::Null());
 	case EMusubiServerMessageTag::MatchTickHash: return MusubiJson::Tagged(TEXT("match_tick_hash"), V.MatchTickHash.IsSet() ? FMusubiServerMessageMatchTickHash::ToJson(V.MatchTickHash.GetValue()) : MusubiJson::Null());
@@ -4059,6 +4093,7 @@ bool FMusubiServerMessage::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServ
 	case EMusubiServerMessageTag::NetOpened: { FMusubiServerMessageNetOpened V0{}; if (!FMusubiServerMessageNetOpened::FromJson(P, V0)) bOk = false; Out.NetOpened = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetPacket: { FMusubiServerMessageNetPacket V0{}; if (!FMusubiServerMessageNetPacket::FromJson(P, V0)) bOk = false; Out.NetPacket = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetClose: { FMusubiServerMessageNetClose V0{}; if (!FMusubiServerMessageNetClose::FromJson(P, V0)) bOk = false; Out.NetClose = MoveTemp(V0); break; }
+	case EMusubiServerMessageTag::NetMeta: { FMusubiServerMessageNetMeta V0{}; if (!FMusubiServerMessageNetMeta::FromJson(P, V0)) bOk = false; Out.NetMeta = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetRehome: { FMusubiServerMessageNetRehome V0{}; if (!FMusubiServerMessageNetRehome::FromJson(P, V0)) bOk = false; Out.NetRehome = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::MatchInputAck: { FMusubiServerMessageMatchInputAck V0{}; if (!FMusubiServerMessageMatchInputAck::FromJson(P, V0)) bOk = false; Out.MatchInputAck = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::MatchTickHash: { FMusubiServerMessageMatchTickHash V0{}; if (!FMusubiServerMessageMatchTickHash::FromJson(P, V0)) bOk = false; Out.MatchTickHash = MoveTemp(V0); break; }
@@ -4111,6 +4146,7 @@ void FMusubiServerMessage::Write(FMusubiPostcardWriter& W, const FMusubiServerMe
 	case EMusubiServerMessageTag::NetOpened: if (V.NetOpened.IsSet()) FMusubiServerMessageNetOpened::Write(W, V.NetOpened.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::NetPacket: if (V.NetPacket.IsSet()) FMusubiServerMessageNetPacket::Write(W, V.NetPacket.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::NetClose: if (V.NetClose.IsSet()) FMusubiServerMessageNetClose::Write(W, V.NetClose.GetValue()); else W.Fail(); break;
+	case EMusubiServerMessageTag::NetMeta: if (V.NetMeta.IsSet()) FMusubiServerMessageNetMeta::Write(W, V.NetMeta.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::NetRehome: if (V.NetRehome.IsSet()) FMusubiServerMessageNetRehome::Write(W, V.NetRehome.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::MatchInputAck: if (V.MatchInputAck.IsSet()) FMusubiServerMessageMatchInputAck::Write(W, V.MatchInputAck.GetValue()); else W.Fail(); break;
 	case EMusubiServerMessageTag::MatchTickHash: if (V.MatchTickHash.IsSet()) FMusubiServerMessageMatchTickHash::Write(W, V.MatchTickHash.GetValue()); else W.Fail(); break;
@@ -4128,7 +4164,7 @@ void FMusubiServerMessage::Write(FMusubiPostcardWriter& W, const FMusubiServerMe
 void FMusubiServerMessage::Read(FMusubiPostcardReader& R, FMusubiServerMessage& Out)
 {
 	uint64 Idx = R.Varint();
-	if (Idx >= 43) { R.Fail(); return; }
+	if (Idx >= 44) { R.Fail(); return; }
 	Out.Tag = (EMusubiServerMessageTag)Idx;
 	switch (Out.Tag)
 	{
@@ -4164,6 +4200,7 @@ void FMusubiServerMessage::Read(FMusubiPostcardReader& R, FMusubiServerMessage& 
 	case EMusubiServerMessageTag::NetOpened: { FMusubiServerMessageNetOpened V0{}; FMusubiServerMessageNetOpened::Read(R, V0); Out.NetOpened = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetPacket: { FMusubiServerMessageNetPacket V0{}; FMusubiServerMessageNetPacket::Read(R, V0); Out.NetPacket = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetClose: { FMusubiServerMessageNetClose V0{}; FMusubiServerMessageNetClose::Read(R, V0); Out.NetClose = MoveTemp(V0); break; }
+	case EMusubiServerMessageTag::NetMeta: { FMusubiServerMessageNetMeta V0{}; FMusubiServerMessageNetMeta::Read(R, V0); Out.NetMeta = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::NetRehome: { FMusubiServerMessageNetRehome V0{}; FMusubiServerMessageNetRehome::Read(R, V0); Out.NetRehome = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::MatchInputAck: { FMusubiServerMessageMatchInputAck V0{}; FMusubiServerMessageMatchInputAck::Read(R, V0); Out.MatchInputAck = MoveTemp(V0); break; }
 	case EMusubiServerMessageTag::MatchTickHash: { FMusubiServerMessageMatchTickHash V0{}; FMusubiServerMessageMatchTickHash::Read(R, V0); Out.MatchTickHash = MoveTemp(V0); break; }

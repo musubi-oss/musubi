@@ -1,4 +1,5 @@
 #include "MusubiNitlPawn.h"
+#include "TimerManager.h"
 #include "MusubiNitlInventoryComponent.h"
 #include "MusubiNitlLoadout.h"
 #include "MusubiAuthorityComponent.h"
@@ -37,6 +38,7 @@ AMusubiNitlPawn::AMusubiNitlPawn()
 void AMusubiNitlPawn::BeginPlay()
 {
 	Super::BeginPlay();
+	GetWorldTimerManager().SetTimer(LocalTimer, FTimerDelegate::CreateWeakLambda(this, [this] { ++LocalTicks; }), 0.05f, true);
 	if (!Loadout && HasAuthority())
 	{
 		Loadout = NewObject<UMusubiNitlLoadout>(this, TEXT("Loadout"));

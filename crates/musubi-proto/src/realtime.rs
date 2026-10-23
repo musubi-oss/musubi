@@ -619,6 +619,13 @@ pub enum ServerMessage {
         #[serde(default)]
         reason: String,
     },
+    /// Control-lane bytes from the simulator owning the entity behind `conn` (`net_meta` command):
+    /// reliable and ordered, delivered before any later `net_packet` from the same owner.
+    NetMeta {
+        conn: u64,
+        #[serde(default)]
+        data: Vec<u8>,
+    },
     /// The entity behind `conn` finished a handover: packets now reach `server`, which knows
     /// nothing of the engine connection the old owner had. The engine must restart its connection
     /// on the same `conn` (the old owner has already been told to close its side).

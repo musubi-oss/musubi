@@ -833,17 +833,18 @@ enum class EMusubiServerMessageTag : uint8
 	NetOpened = 29,
 	NetPacket = 30,
 	NetClose = 31,
-	NetRehome = 32,
-	MatchInputAck = 33,
-	MatchTickHash = 34,
-	MatchState = 35,
-	MatchStateDelta = 36,
-	MatchData = 37,
-	Transport = 38,
-	MatchPresenceEvent = 39,
-	ChannelMessageReaction = 40,
-	PartyInvite = 41,
-	StreamData = 42,
+	NetMeta = 32,
+	NetRehome = 33,
+	MatchInputAck = 34,
+	MatchTickHash = 35,
+	MatchState = 36,
+	MatchStateDelta = 37,
+	MatchData = 38,
+	Transport = 39,
+	MatchPresenceEvent = 40,
+	ChannelMessageReaction = 41,
+	PartyInvite = 42,
+	StreamData = 43,
 };
 MUSUBI_API const TCHAR* MusubiTagName(EMusubiServerMessageTag Tag);
 MUSUBI_API bool MusubiTagFromName(const FString& Name, EMusubiServerMessageTag& Out);
@@ -1221,6 +1222,17 @@ struct MUSUBI_API FMusubiServerMessageNetClose
 	static void Read(FMusubiPostcardReader& R, FMusubiServerMessageNetClose& Out);
 };
 
+struct MUSUBI_API FMusubiServerMessageNetMeta
+{
+	uint64 conn = 0;
+	TArray<uint8> data;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiServerMessageNetMeta& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiServerMessageNetMeta& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiServerMessageNetMeta& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiServerMessageNetMeta& Out);
+};
+
 struct MUSUBI_API FMusubiServerMessageNetRehome
 {
 	FString world;
@@ -1398,6 +1410,7 @@ struct MUSUBI_API FMusubiServerMessage
 	TOptional<FMusubiServerMessageNetOpened> NetOpened;
 	TOptional<FMusubiServerMessageNetPacket> NetPacket;
 	TOptional<FMusubiServerMessageNetClose> NetClose;
+	TOptional<FMusubiServerMessageNetMeta> NetMeta;
 	TOptional<FMusubiServerMessageNetRehome> NetRehome;
 	TOptional<FMusubiServerMessageMatchInputAck> MatchInputAck;
 	TOptional<FMusubiServerMessageMatchTickHash> MatchTickHash;

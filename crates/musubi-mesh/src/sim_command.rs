@@ -112,6 +112,16 @@ pub enum SimCommand {
         #[serde(default)]
         reason: String,
     },
+    /// Engine-level networking, control lane: opaque bytes for the client session behind `conn`
+    /// delivered as `net_meta` — reliable and ordered with respect to other control traffic
+    /// (unlike `net_packet`), for what the engine must know before its own packets arrive
+    /// (e.g. the NetGUID table a new owner hands a rehomed client).
+    NetMeta {
+        conn: u64,
+        session: Value,
+        #[serde(default)]
+        data: Vec<u8>,
+    },
 }
 
 pub fn default_colocate_ttl() -> u64 {
@@ -151,6 +161,7 @@ impl SimCommand {
             Self::HandoverAck { .. } => "handover_ack",
             Self::NetPacket { .. } => "net_packet",
             Self::NetClose { .. } => "net_close",
+            Self::NetMeta { .. } => "net_meta",
         }
     }
 

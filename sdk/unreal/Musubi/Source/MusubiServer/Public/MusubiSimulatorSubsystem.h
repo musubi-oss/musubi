@@ -122,6 +122,8 @@ public:
 
 	/** Engine packet relay (`MusubiNet`): answer a `net_packet` event on the same conn/session. */
 	void NetSendPacket(uint64 Conn, const FMusubiJson& Session, TArray<uint8>&& Data);
+	/** Control-lane bytes for the client behind `Conn` (`net_meta`): reliable, ordered before our later packets. */
+	void NetSendMeta(uint64 Conn, const FMusubiJson& Session, TArray<uint8>&& Data);
 	/** Close engine connection `Conn` on `Entity`; the client gets `net_close`. */
 	void NetClose(uint64 Conn, const FMusubiJson& Session, const FMusubiUuid& Entity, const FString& Reason);
 

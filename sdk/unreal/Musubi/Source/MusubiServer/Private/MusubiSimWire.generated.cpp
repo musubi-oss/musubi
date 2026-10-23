@@ -1684,6 +1684,7 @@ const TCHAR* MusubiTagName(EMusubiSimCommandTag Tag)
 	case EMusubiSimCommandTag::HandoverAck: return TEXT("handover_ack");
 	case EMusubiSimCommandTag::NetPacket: return TEXT("net_packet");
 	case EMusubiSimCommandTag::NetClose: return TEXT("net_close");
+	case EMusubiSimCommandTag::NetMeta: return TEXT("net_meta");
 	}
 	return TEXT("");
 }
@@ -1703,6 +1704,7 @@ bool MusubiTagFromName(const FString& Name, EMusubiSimCommandTag& Out)
 	if (Name == TEXT("handover_ack")) { Out = EMusubiSimCommandTag::HandoverAck; return true; }
 	if (Name == TEXT("net_packet")) { Out = EMusubiSimCommandTag::NetPacket; return true; }
 	if (Name == TEXT("net_close")) { Out = EMusubiSimCommandTag::NetClose; return true; }
+	if (Name == TEXT("net_meta")) { Out = EMusubiSimCommandTag::NetMeta; return true; }
 	return false;
 }
 
@@ -2169,6 +2171,41 @@ void FMusubiSimCommandNetClose::Read(FMusubiPostcardReader& R, FMusubiSimCommand
 	Out.reason = R.Str();
 }
 
+TSharedPtr<FJsonValue> FMusubiSimCommandNetMeta::ToJson(const FMusubiSimCommandNetMeta& V)
+{
+	TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+	O->SetField(TEXT("conn"), MakeShared<FJsonValueNumber>((double)V.conn));
+	O->SetField(TEXT("session"), MusubiJson::JsonOrNull(V.session));
+	O->SetField(TEXT("data"), MusubiJson::BytesToJson(V.data));
+	return MakeShared<FJsonValueObject>(O);
+}
+
+bool FMusubiSimCommandNetMeta::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommandNetMeta& Out)
+{
+	const TSharedPtr<FJsonObject>* OP;
+	if (!J.IsValid() || !J->TryGetObject(OP)) return false;
+	const FJsonObject& O = **OP;
+	bool bOk = true;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("conn")); F.IsValid()) { { double V0; if (F->TryGetNumber(V0)) Out.conn = (uint64)V0; else bOk = false; } } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("session")); F.IsValid()) { Out.session = FMusubiJson(F); } else bOk = false;
+	if (TSharedPtr<FJsonValue> F = O.TryGetField(TEXT("data")); F.IsValid() && !F->IsNull()) { if (!MusubiJson::BytesFromJson(F, Out.data)) bOk = false; }
+	return bOk;
+}
+
+void FMusubiSimCommandNetMeta::Write(FMusubiPostcardWriter& W, const FMusubiSimCommandNetMeta& V)
+{
+	W.Varint((uint64)V.conn);
+	W.Str(V.session.ToText());
+	W.Bytes(V.data);
+}
+
+void FMusubiSimCommandNetMeta::Read(FMusubiPostcardReader& R, FMusubiSimCommandNetMeta& Out)
+{
+	Out.conn = R.Varint();
+	Out.session = FMusubiJson::FromText(R.Str());
+	R.Bytes(Out.data);
+}
+
 TSharedPtr<FJsonValue> FMusubiSimCommand::ToJson(const FMusubiSimCommand& V)
 {
 	TSharedPtr<FJsonValue> P;
@@ -2187,6 +2224,7 @@ TSharedPtr<FJsonValue> FMusubiSimCommand::ToJson(const FMusubiSimCommand& V)
 	case EMusubiSimCommandTag::HandoverAck: P = V.HandoverAck.IsSet() ? FMusubiSimCommandHandoverAck::ToJson(V.HandoverAck.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	case EMusubiSimCommandTag::NetPacket: P = V.NetPacket.IsSet() ? FMusubiSimCommandNetPacket::ToJson(V.NetPacket.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	case EMusubiSimCommandTag::NetClose: P = V.NetClose.IsSet() ? FMusubiSimCommandNetClose::ToJson(V.NetClose.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
+	case EMusubiSimCommandTag::NetMeta: P = V.NetMeta.IsSet() ? FMusubiSimCommandNetMeta::ToJson(V.NetMeta.GetValue()) : TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(MakeShared<FJsonObject>())); break;
 	}
 	if (P.IsValid() && P->Type == EJson::Object) P->AsObject()->SetStringField(TEXT("op"), MusubiTagName(V.Tag));
 	return P;
@@ -2219,6 +2257,7 @@ bool FMusubiSimCommand::FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimComm
 	case EMusubiSimCommandTag::HandoverAck: { FMusubiSimCommandHandoverAck V0{}; if (!FMusubiSimCommandHandoverAck::FromJson(J, V0)) bOk = false; Out.HandoverAck = MoveTemp(V0); break; }
 	case EMusubiSimCommandTag::NetPacket: { FMusubiSimCommandNetPacket V0{}; if (!FMusubiSimCommandNetPacket::FromJson(J, V0)) bOk = false; Out.NetPacket = MoveTemp(V0); break; }
 	case EMusubiSimCommandTag::NetClose: { FMusubiSimCommandNetClose V0{}; if (!FMusubiSimCommandNetClose::FromJson(J, V0)) bOk = false; Out.NetClose = MoveTemp(V0); break; }
+	case EMusubiSimCommandTag::NetMeta: { FMusubiSimCommandNetMeta V0{}; if (!FMusubiSimCommandNetMeta::FromJson(J, V0)) bOk = false; Out.NetMeta = MoveTemp(V0); break; }
 	}
 	return bOk;
 }

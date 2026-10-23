@@ -728,6 +728,8 @@ pub enum WorldCmd {
 /// Largest engine packet the relay accepts (`net_opened.max_packet`): a QUIC datagram after the
 /// frame type byte, and what `UNetConnection` defaults to on UDP.
 pub const NET_MAX_PACKET: usize = 1200;
+/// `net_meta` is a control frame (tables, not per-tick traffic): one WS message, generous.
+pub const NET_MAX_META: usize = 256 * 1024;
 /// Engine connections one entity may carry (a player and a spectator or two).
 const NET_MAX_CONNS_PER_ENTITY: usize = 4;
 

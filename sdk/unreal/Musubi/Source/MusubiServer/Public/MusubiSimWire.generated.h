@@ -605,6 +605,7 @@ enum class EMusubiSimCommandTag : uint8
 	HandoverAck = 10,
 	NetPacket = 11,
 	NetClose = 12,
+	NetMeta = 13,
 };
 MUSUBISERVER_API const TCHAR* MusubiTagName(EMusubiSimCommandTag Tag);
 MUSUBISERVER_API bool MusubiTagFromName(const FString& Name, EMusubiSimCommandTag& Out);
@@ -767,6 +768,18 @@ struct MUSUBISERVER_API FMusubiSimCommandNetClose
 	static void Read(FMusubiPostcardReader& R, FMusubiSimCommandNetClose& Out);
 };
 
+struct MUSUBISERVER_API FMusubiSimCommandNetMeta
+{
+	uint64 conn = 0;
+	FMusubiJson session;
+	TArray<uint8> data;
+
+	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimCommandNetMeta& V);
+	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommandNetMeta& Out);
+	static void Write(FMusubiPostcardWriter& W, const FMusubiSimCommandNetMeta& V);
+	static void Read(FMusubiPostcardReader& R, FMusubiSimCommandNetMeta& Out);
+};
+
 struct MUSUBISERVER_API FMusubiSimCommand
 {
 	EMusubiSimCommandTag Tag = EMusubiSimCommandTag::Lease;
@@ -783,6 +796,7 @@ struct MUSUBISERVER_API FMusubiSimCommand
 	TOptional<FMusubiSimCommandHandoverAck> HandoverAck;
 	TOptional<FMusubiSimCommandNetPacket> NetPacket;
 	TOptional<FMusubiSimCommandNetClose> NetClose;
+	TOptional<FMusubiSimCommandNetMeta> NetMeta;
 
 	static TSharedPtr<FJsonValue> ToJson(const FMusubiSimCommand& V);
 	static bool FromJson(const TSharedPtr<FJsonValue>& J, FMusubiSimCommand& Out);

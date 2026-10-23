@@ -457,9 +457,21 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   `NetEntityId` (RepNotify → `UMusubiAuthorityComponent::OnClientEntityIdentified`) the old twin is destroyed
   with `UWorld::DestroyActor(twin, bNetForce = true)` (a client may not `Destroy()` a replicated actor it has no
   authority over) — the world never shows an empty frame. Twins nobody re-sent are dropped after
-  `2 × RehomeTimeout`. Not possible: re-attaching the new owner's channel to the existing actor instance — a
-  dynamic NetGUID always spawns, and a net-addressable (stable-name) actor cannot be spawned by a client at all
-  (tried: `SerializeNewActor failed to find/spawn actor`). Proven live by `tools/nitl.sh` on 5.3.2 and 5.8.4 (node + two
+  `2 × RehomeTimeout`. **Same instance (9g-11):** that swap is now the fallback. The engine's dormancy path reuses an
+  actor the client already has when the open bunch's NetGUID resolves to it (`SerializeNewActor`: "we may have
+  already found it if it was dormant"), so the new owner hands the client its numbering up front: on the first
+  packet of a relay connection (`FindOrOpen`) the server assigns NetGUIDs to every entity actor it has
+  (`GuidCache->GetOrAssignNetGUID`) and sends `entity → NetGUID, class` as a `net_meta` command — a control-lane
+  message the node forwards reliably and in order, so it reaches the client before any `net_packet` from that
+  owner. The client registers each GUID on the kept actor of the same class (`RegisterNetGUID_Client`) in the fresh
+  `GuidCache`; the owner's open bunch then re-attaches the channel to the *existing* `AActor*` (no spawn, no
+  `PostNetInit`, components resolve by their stable path under it). `NMT_Join` is held after `NMT_Welcome` until the
+  table is in (`GuidTableTimeout`, 1 s; then join without it → swap). Entities missing from the table or of another
+  class there take the swap path. Dynamic subobjects (`NewObject` + `AddReplicatedSubObject`) are re-created by the
+  new owner's bunch like on any fresh connection — the old instance is orphaned, keep the pointer in a replicated
+  property (`RegisterMusubiSubObject` registry entries are replaced through the RepNotify). Stable-name
+  actors cannot be spawned by a client at all (`SerializeNewActor failed to find/spawn actor`) — this path never
+  needs that. Proven live by `tools/nitl.sh` on 5.3.2 and 5.8.4 (node + two
   dedicated servers + client, border crossing in front of the client). Budget: `NMT_Welcome` within `RehomeTimeout` (5 s), or the new owner runs a
   different level, or `NMT_Failure`/`NMT_Upgrade` → fall back to a travel to the same URL. Node side: a
   `net_packet`/`net_close` from a simulator that no longer owns the relayed entity is dropped
@@ -622,10 +634,12 @@ root is a `USceneComponent`, fatal for a Character: the capsule started simulati
 server).** Gameplay code keeps `FMusubiEntityHandle` (the entity id, Blueprint-visible) and resolves it when it needs
 the actor: `Handle.Get(WorldContext)` / `ResolveEntity(id)` / `HandleOf(Actor)`. `UMusubiAuthorityComponent` fills the
 registry itself (server: `Bind`; client: `OnRep_NetEntityId`; both: `EndPlay` unregisters), so after a rehome the same
-handle points at the new owner's copy. `OnEntityActorChanged(EntityId, Old, New)` fires *before* the old twin is
+handle keeps pointing at the live actor whichever path the rehome took. With NetGUID pre-registration the actor is
+the same instance and `OnEntityActorChanged` does not fire; on the swap fallback it fires *before* the old twin is
 destroyed (the registry is updated ahead of the driver's swap), so references can be moved over without a null frame.
-NITL: the client takes the handle from the first identified pawn and at the end reports `handle … changes=1 live=1` —
-resolves to the pawn the local `PlayerController` possesses on the new owner, exactly one actor change seen.
+NITL: the client takes the handle from the first identified pawn and at the end reports `handle … changes=0 live=1` —
+resolves to the pawn the local `PlayerController` possesses on the new owner, no actor change; the pawn's name is the
+same before and after and a client-local looping timer on it (`local=N`) keeps counting through the rehome.
 
 **What this is not yet:** `score` round-trips but nothing in the acceptance changes it between servers;
 subobjects/components of the pawn are not part of the Iris export (9g-4).

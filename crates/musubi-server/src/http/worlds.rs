@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
-use crate::realtime::world::{InteractSpec, QueryKind, SpawnOutcome, SpawnSpec, NET_MAX_PACKET};
+use crate::realtime::world::{
+    InteractSpec, QueryKind, SpawnOutcome, SpawnSpec, NET_MAX_META, NET_MAX_PACKET,
+};
 
 /// Simulator calls must hit the world's home node: redirect (307, same method+body) when the home
 /// advertises an HTTP address, otherwise explain which node to talk to.
@@ -1338,6 +1340,26 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, cmd
                 }
                 s.fanout
                     .session(sid, ServerMessage::NetPacket { conn, data });
+                Ok(reply)
+            }
+            SimCommand::NetMeta {
+                conn,
+                session,
+                data,
+            } => {
+                if data.len() > NET_MAX_META {
+                    return Err(Error::InvalidArgument(format!(
+                        "net_meta: {} bytes, max {NET_MAX_META}",
+                        data.len()
+                    )));
+                }
+                let sid: musubi_core::SessionId = serde_json::from_value(session)
+                    .map_err(|e| Error::InvalidArgument(format!("session: {e}")))?;
+                if !s.worlds.net_from_sim_allowed(w, sim, conn)? {
+                    reply["result"] = json!({"dropped": "stale owner"});
+                    return Ok(reply);
+                }
+                s.fanout.session(sid, ServerMessage::NetMeta { conn, data });
                 Ok(reply)
             }
             SimCommand::NetClose {

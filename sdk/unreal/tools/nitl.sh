@@ -114,7 +114,9 @@ chk nitl-c  "rehoming in place"
 chk nitl-c  "rehomed in place"
 LASTP=$(grep "client pawns=" "$OUT/nitl-c.log" | tail -1); case "$LASTP" in *"pawns=$PAWNS "*) echo "PASS nitl-c: $PAWNS pawn(s) at the end";; *) echo "FAIL nitl-c: $PAWNS pawn(s) at the end ($LASTP)"; ok=0;; esac
 LASTX=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* at \([-0-9]*\),.*/\1/p'); if [ -n "$LASTX" ] && [ "$LASTX" -gt 300 ]; then echo "PASS nitl-c: pawn kept moving after rehome (x=$LASTX)"; else echo "FAIL nitl-c: pawn kept moving after rehome (x=$LASTX)"; ok=0; fi
-chk nitl-c  "rehome: swapped"
+# the kept pawn is the same AActor*: the new owner's NetGUID table pre-registered it, its open bunch re-attached (no swap)
+chk nitl-c  "kept actors pre-registered"
+chk nitl-c  "rehome: reused"
 # push-model property on the same actor: the classic driver must still see MARK_PROPERTY_DIRTY on an actor the Iris export registered
 LASTS=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* steps=\([0-9]*\).*/\1/p'); LASTPUSH=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* push=\([0-9]*\).*/\1/p')
 if [ -n "${NITL_PROJECT:-}" ] && [ "${LASTS:--1}" = "-1" ]; then echo "SKIP nitl-c: push-model property (the project's pawn is not the NITL pawn)"; else
@@ -129,9 +131,15 @@ if [ -n "$BEFORE" ]; then echo "PASS nitl-c: player possessed its pawn before th
 case "$AFTER" in *"possessed=1"*) echo "PASS nitl-c: player possesses the new owner's pawn after the rehome";; *) echo "FAIL nitl-c: player possesses the new owner's pawn after the rehome ($AFTER)"; ok=0;; esac
 N1=$(echo "$BEFORE" | sed -n 's/.* name=\([^ ]*\).*/\1/p'); N2=$(echo "$AFTER" | sed -n 's/.* name=\([^ ]*\).*/\1/p')
 if [ -n "$N1" ] && [ "$N1" != "-" ] && [ "$N1" = "$N2" ]; then echo "PASS nitl-c: PlayerState name survived the rehome ($N1)"; else echo "FAIL nitl-c: PlayerState name survived the rehome (before=$N1 after=$N2)"; ok=0; fi
-# the stable handle: taken from the first pawn, resolves to the live possessed pawn after the swap, exactly one actor change seen
+# same instance: the pawn's name did not change and its client-local looping timer kept counting through the rehome
+P1=$(echo "$BEFORE" | sed -n 's/.*client pawn \([^ ]*\) .*/\1/p'); P2=$(echo "$AFTER" | sed -n 's/.*client pawn \([^ ]*\) .*/\1/p')
+if [ -n "$P1" ] && [ "$P1" = "$P2" ]; then echo "PASS nitl-c: same pawn actor before and after the rehome ($P1)"; else echo "FAIL nitl-c: same pawn actor before and after the rehome (before=$P1 after=$P2)"; ok=0; fi
+L1=$(echo "$BEFORE" | sed -n 's/.* local=\(-*[0-9]*\).*/\1/p'); L2=$(echo "$AFTER" | sed -n 's/.* local=\(-*[0-9]*\).*/\1/p')
+if [ "${L1:--1}" = "-1" ]; then echo "SKIP nitl-c: client-local timer (the project's pawn is not the NITL pawn)";
+elif [ -n "$L2" ] && [ "$L2" -gt "$L1" ]; then echo "PASS nitl-c: client-local timer on the kept pawn ran through the rehome (local $L1 -> $L2)"; else echo "FAIL nitl-c: client-local timer on the kept pawn ran through the rehome (local $L1 -> $L2)"; ok=0; fi
+# the stable handle: taken from the first pawn, still resolves to the live possessed pawn, no actor change (same instance)
 H=$(grep "nitl: handle " "$OUT/nitl-c.log" | tail -1 | sed 's/.*nitl: handle //')
-case "$H" in *"changes=1 live=1"|*"changes=$([ "$CHAOS" = 1 ] && echo 2 || echo 1) live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome ($H)"; ok=0;; esac
+case "$H" in *"changes=0 live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome, no actor change ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome, no actor change ($H)"; ok=0;; esac
 # replicated components in the binary iris state: the ghost on s2 saw the inventory before owning, the new owner carried on from it
 EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | head -1 | grep -o "[0-9]*")
 if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components exported in the iris state ($EXPC)"; else echo "FAIL nitl-s1: replicated components exported in the iris state (${EXPC:-0})"; ok=0; fi

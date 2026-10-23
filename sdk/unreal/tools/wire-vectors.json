@@ -135,7 +135,7 @@
     "name": "net_rehome",
     "kind": "server",
     "json": "{\"cid\":null,\"msg\":{\"net_rehome\":{\"world\":\"overworld\",\"entity\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5b\",\"conn\":4503599627370495,\"server\":\"018f2a3c-4b5d-7e6f-8a9b-0c1d2e3f4a5d\"}}}",
-    "postcard": "0020096f766572776f726c642430313866326133632d346235642d376536662d386139622d306331643265336634613562ffffffffffffff070110018f2a3c4b5d7e6f8a9b0c1d2e3f4a5d"
+    "postcard": "0021096f766572776f726c642430313866326133632d346235642d376536662d386139622d306331643265336634613562ffffffffffffff070110018f2a3c4b5d7e6f8a9b0c1d2e3f4a5d"
   },
   {
     "name": "matchmaker_matched",

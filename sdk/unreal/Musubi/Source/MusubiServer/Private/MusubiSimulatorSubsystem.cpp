@@ -633,6 +633,17 @@ void UMusubiSimulatorSubsystem::NetSendPacket(uint64 Conn, const FMusubiJson& Se
 	SendCommand(MoveTemp(Cmd));
 }
 
+void UMusubiSimulatorSubsystem::NetSendMeta(uint64 Conn, const FMusubiJson& Session, TArray<uint8>&& Data)
+{
+	FMusubiSimCommand Cmd;
+	Cmd.Tag = EMusubiSimCommandTag::NetMeta;
+	Cmd.NetMeta.Emplace();
+	Cmd.NetMeta->conn = Conn;
+	Cmd.NetMeta->session = Session;
+	Cmd.NetMeta->data = MoveTemp(Data);
+	SendCommand(MoveTemp(Cmd));
+}
+
 void UMusubiSimulatorSubsystem::NetClose(uint64 Conn, const FMusubiJson& Session, const FMusubiUuid& Entity, const FString& Reason)
 {
 	FMusubiSimCommand Cmd;

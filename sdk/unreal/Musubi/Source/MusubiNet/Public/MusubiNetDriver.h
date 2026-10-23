@@ -53,11 +53,15 @@ public:
 	/** Client: `net_rehome` → how long the restarted connection may take to get `NMT_Welcome` before it is a failure. */
 	UPROPERTY(Config)
 	float RehomeTimeout = 5.f;
+	/** Client: after `NMT_Welcome` on a rehome, how long to hold `NMT_Join` for the new owner's NetGUID table (`net_meta`)
+	 *  before joining without it (the kept actors are then swapped for the owner's copies instead of reused). */
+	UPROPERTY(Config)
+	float GuidTableTimeout = 1.f;
 
 protected:
 	/** Client: the entity moved to another simulator. Default: travel to the same URL (`TRAVEL_Absolute`), i.e. a reconnect; projects override for an in-place restart. */
 	virtual void OnRehome(const FMusubiServerMessageNetRehome& Msg);
-	int32 Rehomes = 0, Adopted = 0;
+	int32 Rehomes = 0, Adopted = 0, Reused = 0;
 	// FNetworkNotify: owns the control channel during an in-place rehome, forwards everything else to the world
 	virtual EAcceptConnection::Type NotifyAcceptingConnection() override { return WorldNotify ? WorldNotify->NotifyAcceptingConnection() : EAcceptConnection::Reject; }
 	virtual void NotifyAcceptedConnection(UNetConnection* Connection) override { if (WorldNotify) WorldNotify->NotifyAcceptedConnection(Connection); }
@@ -67,12 +71,20 @@ protected:
 private:
 	// client
 	TWeakObjectPtr<UMusubiSubsystem> Client;
-	FDelegateHandle PacketHandle, CloseHandle, RehomeHandle;
+	FDelegateHandle PacketHandle, CloseHandle, RehomeHandle, MetaHandle;
 	FURL ClientURL;
 	FNetworkNotify* WorldNotify = nullptr;
 	bool bRehoming = false;
 	double RehomeStarted = 0;
 	TMap<FString, TWeakObjectPtr<AActor>> TornOff;
+	// NetGUID pre-registration: the new owner sends `entity → NetGUID (+class)` as `net_meta` on our first packet; registering
+	// those GUIDs on the kept actors makes the owner's open bunches re-attach to them (the engine's dormancy path) instead
+	// of spawning copies — the same AActor* survives the rehome
+	bool bGuidTableSeen = false, bJoinDeferred = false;
+	double WelcomeAt = 0;
+	FString PendingMap;
+	void ApplyGuidTable(const TArray<uint8>& Data);
+	void SendJoin(UNetConnection* Connection);
 	FDelegateHandle IdentifiedHandle;
 	void FinishRehome(bool bOk, const FString& Why);
 	void OnEntityIdentified(AActor* Actor, const FString& Id);
@@ -84,6 +96,8 @@ private:
 	TMap<uint64, TWeakObjectPtr<UMusubiNetConnection>> ByConn;
 	void OnSimEvent(const FMusubiSimEvent& E);
 	UMusubiNetConnection* FindOrOpen(uint64 ConnId, const FMusubiJson& Session, const FMusubiUuid& Entity);
+	/** Server: NetGUIDs of every entity actor on this server, sent as `net_meta` before any packet reaches the client. */
+	void SendGuidTable(UMusubiNetConnection* Conn);
 	// packets received this frame, delivered from TickDispatch (game thread, in order)
 	TArray<TPair<TWeakObjectPtr<UMusubiNetConnection>, TArray<uint8>>> Inbox;
 	void DrainInbox();

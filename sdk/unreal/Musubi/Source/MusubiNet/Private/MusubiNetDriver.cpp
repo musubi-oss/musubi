@@ -1,4 +1,7 @@
 #include "MusubiNetDriver.h"
+#include "Serialization/MemoryWriter.h"
+#include "Serialization/MemoryReader.h"
+#include "UObject/UObjectIterator.h"
 #include "Engine/PackageMapClient.h"
 #include "MusubiAuthorityComponent.h"
 #include "Runtime/Launch/Resources/Version.h"
@@ -99,6 +102,7 @@ bool UMusubiNetDriver::InitConnect(FNetworkNotify* InNotify, const FURL& Connect
 	PacketHandle = Sock->OnTag(EMusubiServerMessageTag::NetPacket).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
 	CloseHandle = Sock->OnTag(EMusubiServerMessageTag::NetClose).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
 	RehomeHandle = Sock->OnTag(EMusubiServerMessageTag::NetRehome).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
+	MetaHandle = Sock->OnTag(EMusubiServerMessageTag::NetMeta).AddUObject(this, &UMusubiNetDriver::OnClientMsg);
 	IdentifiedHandle = UMusubiAuthorityComponent::OnClientEntityIdentified.AddUObject(this, &UMusubiNetDriver::OnEntityIdentified);
 	FMusubiClientMessage Open;
 	Open.Tag = EMusubiClientMessageTag::NetOpen;
@@ -148,6 +152,46 @@ void UMusubiNetDriver::OnClientMsg(const FMusubiServerEnvelope& Env)
 	{
 		if (Env.Msg.NetRehome->conn == Conn->ConnId) OnRehome(*Env.Msg.NetRehome);
 	}
+	else if (Env.Msg.NetMeta.IsSet())
+	{
+		if (Env.Msg.NetMeta->conn == Conn->ConnId) ApplyGuidTable(Env.Msg.NetMeta->data);
+	}
+}
+
+// net_meta kind 1: u8 kind, u32 count, count × (FString entity, FNetworkGUID (its own FArchive operator), FString class path)
+static constexpr uint8 kMetaGuidTable = 1;
+
+void UMusubiNetDriver::ApplyGuidTable(const TArray<uint8>& Data)
+{
+	FMemoryReader Ar(Data);
+	uint8 Kind = 0; Ar << Kind;
+	if (Kind != kMetaGuidTable || Ar.IsError()) { UE_LOG(LogMusubiNet, Warning, TEXT("net_meta kind %d ignored"), Kind); return; }
+	uint32 Count = 0; Ar << Count;
+	int32 Registered = 0, ClassMismatch = 0;
+	for (uint32 i = 0; i < Count && !Ar.IsError(); ++i)
+	{
+		FString Entity, ClassPath; FNetworkGUID G;
+		Ar << Entity; Ar << G; Ar << ClassPath;
+		TWeakObjectPtr<AActor>* P = TornOff.Find(Entity);
+		AActor* A = P ? P->Get() : nullptr;
+		if (!A) continue;
+		if (A->GetClass()->GetPathName() != ClassPath) { ++ClassMismatch; continue; } // the owner's copy will replace it (swap path)
+		if (!G.IsValid() || !G.IsDynamic()) continue;
+		GuidCache->RegisterNetGUID_Client(G, A);
+		++Registered;
+	}
+	bGuidTableSeen = true;
+	UE_LOG(LogMusubiNet, Log, TEXT("rehome: NetGUID table from the new owner: %u entities, %d kept actors pre-registered, %d class mismatches"), Count, Registered, ClassMismatch);
+	if (bJoinDeferred && ServerConnection) SendJoin(ServerConnection);
+}
+
+void UMusubiNetDriver::SendJoin(UNetConnection* Connection)
+{
+	bJoinDeferred = false;
+	FNetControlMessage<NMT_Netspeed>::Send(Connection, Connection->CurrentNetSpeed);
+	FNetControlMessage<NMT_Join>::Send(Connection);
+	Connection->FlushNet(true);
+	FinishRehome(true, PendingMap);
 }
 
 void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
@@ -164,9 +208,11 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 	bRehoming = true;
 	RehomeStarted = FPlatformTime::Seconds();
 	// 1. keep the world: actors that are Musubi entities stay (closed as for dormancy, so they are neither destroyed nor
-	//    torn off); the new owner's replication spawns its own copy of each (dynamic NetGUIDs cannot point at an existing
-	//    actor) and OnEntityIdentified swaps the old one out the moment the copy's NetEntityId arrives — no empty frame
+	//    torn off). The new owner sends its NetGUID table (net_meta) before its first bunch: GUIDs registered on the kept
+	//    actors make its open bunches re-attach to them (same AActor*). An entity missing from the table, or of another
+	//    class there, gets the owner's copy and OnEntityIdentified swaps the old one out — no empty frame either way
 	TornOff.Reset();
+	bGuidTableSeen = false; bJoinDeferred = false; PendingMap.Empty();
 	for (UChannel* Ch : TArray<UChannel*>(Old->OpenChannels))
 	{
 		UActorChannel* AC = Cast<UActorChannel>(Ch);
@@ -248,10 +294,9 @@ void UMusubiNetDriver::NotifyControlMessage(UNetConnection* Connection, uint8 Me
 			FinishRehome(false, FString::Printf(TEXT("new owner runs level %s, we are in %s"), *Level.Map, *GetWorld()->GetMapName()));
 			break;
 		}
-		FNetControlMessage<NMT_Netspeed>::Send(Connection, Connection->CurrentNetSpeed);
-		FNetControlMessage<NMT_Join>::Send(Connection);
-		Connection->FlushNet(true);
-		FinishRehome(true, Map);
+		PendingMap = Map;
+		if (bGuidTableSeen || TornOff.Num() == 0) SendJoin(Connection);
+		else { bJoinDeferred = true; WelcomeAt = FPlatformTime::Seconds(); } // join only once the owner's NetGUID table is in
 		break;
 	}
 	case NMT_Failure:
@@ -341,7 +386,32 @@ UMusubiNetConnection* UMusubiNetDriver::FindOrOpen(uint64 ConnId, const FMusubiJ
 	if (Conn->Handler.IsValid()) Conn->Handler->BeginHandshaking();
 	ByConn.Add(ConnId, Conn);
 	UE_LOG(LogMusubiNet, Log, TEXT("relay %llu opened by first packet (entity %s)"), (unsigned long long)ConnId, *Conn->Entity);
+	SendGuidTable(Conn);
 	return Conn;
+}
+
+void UMusubiNetDriver::SendGuidTable(UMusubiNetConnection* Conn)
+{
+	UMusubiSimulatorSubsystem* S = Sim.Get();
+	UWorld* W = GetWorld();
+	if (!S || !W || !GuidCache.IsValid()) return;
+	TArray<uint8> Bytes;
+	FMemoryWriter Ar(Bytes);
+	uint8 Kind = kMetaGuidTable; Ar << Kind;
+	uint32 Count = 0; const int64 CountPos = Ar.Tell(); Ar << Count;
+	for (TObjectIterator<UMusubiAuthorityComponent> It; It; ++It)
+	{
+		AActor* A = It->GetOwner();
+		if (!A || !IsValid(A) || A->GetWorld() != W || It->NetEntityId.IsEmpty()) continue;
+		FNetworkGUID G = GuidCache->GetOrAssignNetGUID(A);
+		if (!G.IsValid()) continue;
+		FString Entity = It->NetEntityId, ClassPath = A->GetClass()->GetPathName();
+		Ar << Entity; Ar << G; Ar << ClassPath;
+		++Count;
+	}
+	const int64 End = Ar.Tell(); Ar.Seek(CountPos); Ar << Count; Ar.Seek(End);
+	UE_LOG(LogMusubiNet, Log, TEXT("relay %llu: NetGUID table sent, %u entities, %d bytes"), (unsigned long long)Conn->ConnId, Count, Bytes.Num());
+	S->NetSendMeta(Conn->ConnId, Conn->Session, MoveTemp(Bytes));
 }
 
 void UMusubiNetDriver::OnSimEvent(const FMusubiSimEvent& E)
@@ -400,18 +470,28 @@ void UMusubiNetDriver::DrainInbox()
 
 void UMusubiNetDriver::TickDispatch(float DeltaTime)
 {
+	if (bJoinDeferred && ServerConnection && FPlatformTime::Seconds() - WelcomeAt > GuidTableTimeout)
+	{
+		UE_LOG(LogMusubiNet, Warning, TEXT("rehome: no NetGUID table from the new owner within %.1fs, joining without it (kept actors will be swapped)"), GuidTableTimeout);
+		SendJoin(ServerConnection);
+	}
 	if (bRehoming && FPlatformTime::Seconds() - RehomeStarted > RehomeTimeout) FinishRehome(false, TEXT("timeout"));
 	else if (!bRehoming && TornOff.Num() && FPlatformTime::Seconds() - RehomeStarted > 2.0 * RehomeTimeout)
 	{
-		// entities the new owner never sent again (left our interest during the move): drop the stale twins
-		int32 Reused = 0, Dropped = 0;
+		// kept actors the new owner re-attached to (pre-registered GUID) stay; entities it never sent again (left our
+		// interest during the move) are stale twins: drop them
+		int32 Kept = 0, Dropped = 0;
 		for (TPair<FString, TWeakObjectPtr<AActor>>& KV : TornOff)
 			if (AActor* A = KV.Value.Get())
 			{
-				if (ServerConnection && ServerConnection->FindActorChannelRef(A)) ++Reused;
+				if (ServerConnection && ServerConnection->FindActorChannelRef(A))
+				{
+					++Kept; ++Reused;
+					UE_LOG(LogMusubiNet, Log, TEXT("rehome: reused %s in place (entity %s)"), *A->GetName(), *KV.Key);
+				}
 				else { ++Dropped; if (UWorld* AW = A->GetWorld()) AW->DestroyActor(A, true); }
 			}
-		UE_LOG(LogMusubiNet, Log, TEXT("rehome: %d actors swapped for the new owner's, %d still on the old channel, %d dropped"), Adopted, Reused, Dropped);
+		UE_LOG(LogMusubiNet, Log, TEXT("rehome: %d actors swapped for the new owner's, %d reused in place, %d dropped"), Adopted, Kept, Dropped);
 		TornOff.Reset();
 	}
 	Super::TickDispatch(DeltaTime);
@@ -444,6 +524,7 @@ void UMusubiNetDriver::LowLevelDestroy()
 			Sock->OnTag(EMusubiServerMessageTag::NetPacket).Remove(PacketHandle);
 			Sock->OnTag(EMusubiServerMessageTag::NetClose).Remove(CloseHandle);
 			Sock->OnTag(EMusubiServerMessageTag::NetRehome).Remove(RehomeHandle);
+			Sock->OnTag(EMusubiServerMessageTag::NetMeta).Remove(MetaHandle);
 			UMusubiAuthorityComponent::OnClientEntityIdentified.Remove(IdentifiedHandle);
 			if (UMusubiNetConnection* Conn = Cast<UMusubiNetConnection>(ServerConnection))
 				if (Conn->IsOpen())

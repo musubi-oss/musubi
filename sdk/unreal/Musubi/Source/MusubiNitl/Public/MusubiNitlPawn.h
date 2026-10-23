@@ -25,6 +25,10 @@ public:
 	 *  with the authority component; the client gets the server's instance through this replicated pointer and registers
 	 *  it in the RepNotify, so the same registry read works on every side. */
 	UPROPERTY(ReplicatedUsing = OnRep_Loadout) TObjectPtr<class UMusubiNitlLoadout> Loadout;
+	/** Client-local life of this very instance: a looping timer started in BeginPlay. A rehome that keeps the same AActor*
+	 *  keeps it counting; a swapped-in copy starts from 0 again. Never replicated. */
+	int32 LocalTicks = 0;
+	FTimerHandle LocalTimer;
 	UFUNCTION() void OnRep_Loadout();
 	UPROPERTY(ReplicatedUsing = OnRep_Steps) int32 Steps = 0;
 	UFUNCTION() void OnRep_Steps();
