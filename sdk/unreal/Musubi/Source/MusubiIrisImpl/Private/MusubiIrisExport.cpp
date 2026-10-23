@@ -135,11 +135,11 @@ void UMusubiIrisExportSubsystem::OnGhostSpawned(const FString&, AActor* Actor)
 		UMusubiAuthorityComponent* A = WeakActor->FindComponentByClass<UMusubiAuthorityComponent>();
 		if (!A || A->IsOwned()) return; // we are the authority now; the state is ours
 		const TSharedPtr<FJsonObject>* Obj = nullptr;
-		if (Value.Value.IsValid() && Value.Value->TryGetObject(Obj) && Obj) WeakSelf->Bridge->ApplyBinary(WeakActor.Get(), *Obj);
+		if (Value.Value.IsValid() && Value.Value->TryGetObject(Obj) && Obj) WeakSelf->Bridge->ApplyBinary(WeakActor.Get(), *Obj, WeakSelf->Sim.Get());
 	});
 	if (const FMusubiJson* Have = Auth->FindComponent(TEXT("iris")))
 	{
 		const TSharedPtr<FJsonObject>* Obj = nullptr;
-		if (Bridge && Have->Value.IsValid() && Have->Value->TryGetObject(Obj) && Obj) Bridge->ApplyBinary(Actor, *Obj);
+		if (Bridge && Have->Value.IsValid() && Have->Value->TryGetObject(Obj) && Obj) Bridge->ApplyBinary(Actor, *Obj, Sim.Get());
 	}
 }

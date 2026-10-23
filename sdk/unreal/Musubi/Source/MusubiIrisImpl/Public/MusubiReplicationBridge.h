@@ -66,7 +66,7 @@ private:
 		TWeakObjectPtr<UObject> Object;
 		TWeakObjectPtr<UMusubiAuthorityComponent> Authority;
 		uint64 LastHash = 0;
-		struct FStateBuf { TArray<uint8> External, Internal, Last; bool bHasLast = false; };
+		struct FStateBuf { TArray<uint8> External, Internal, Last; TMap<FString, FString> LastRefs; bool bHasLast = false; };
 		TArray<FStateBuf> States; // one per class descriptor (binary export)
 	};
 	/** Class → Iris replication state descriptors built once (CDO as default state). */
@@ -78,7 +78,7 @@ private:
 
 public:
 	/** Ghost side: deserialize + dequantize an `iris` component (binary form) into Obj's UPROPERTYs, firing RepNotifies. */
-	bool ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris);
+	bool ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris, class UMusubiSimulatorSubsystem* Sim);
 
 	UMusubiSimulatorSubsystem* Simulator() const;
 	void Track(UE::Net::FNetRefHandle Handle, UObject* Object);

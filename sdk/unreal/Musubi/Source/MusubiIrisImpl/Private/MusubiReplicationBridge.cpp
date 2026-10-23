@@ -16,6 +16,9 @@
 #include "Iris/Serialization/NetBitStreamReader.h"
 #include "Iris/Serialization/NetSerializationContext.h"
 #include "Misc/Base64.h"
+#include "Net/Core/NetBitArray.h"
+#include "MusubiSimulatorSubsystem.h"
+#include "Components/ActorComponent.h"
 
 using namespace UE::Net;
 
@@ -116,6 +119,52 @@ void UMusubiReplicationBridge::Untrack(FNetRefHandle Handle, UObject* Object)
 	DirtyThisUpdate.Remove(Handle);
 }
 
+// Members whose serializer carries object references are left out of the Iris mask (resolving them needs the
+// engine-private FInternalNetSerializationContext) and travel beside the bit stream as Musubi ids:
+// "<entity uuid>" for an actor with an authority component, "<uuid>/<component name>" for one of its components.
+static bool IsRefMember(const FReplicationStateDescriptor* D, uint32 m)
+{
+	return D->MemberTraitsDescriptors && EnumHasAnyFlags(D->MemberTraitsDescriptors[m].Traits, EReplicationStateMemberTraits::HasObjectReference);
+}
+
+static FNetBitArrayView ValueMask(const FReplicationStateDescriptor* D, TArray<uint32>& Storage)
+{
+	Storage.SetNumZeroed(FMath::Max(1, (int32)((D->ChangeMaskBitCount + 31) / 32)));
+	FNetBitArrayView V(Storage.GetData(), D->ChangeMaskBitCount, FNetBitArrayView::ResetOnInit);
+	for (uint32 m = 0; m < D->MemberCount; ++m)
+	{
+		if (IsRefMember(D, m) || !D->MemberChangeMaskDescriptors) continue;
+		const FReplicationStateMemberChangeMaskDescriptor& C = D->MemberChangeMaskDescriptors[m];
+		for (uint16 b = 0; b < C.BitCount; ++b) V.SetBit(C.BitOffset + b);
+	}
+	return V;
+}
+
+static FString RefId(UObject* O)
+{
+	if (!O) return FString();
+	if (const AActor* A = Cast<AActor>(O))
+		if (const UMusubiAuthorityComponent* Auth = A->FindComponentByClass<UMusubiAuthorityComponent>()) return Auth->GetEntityId();
+	if (const UActorComponent* C = Cast<UActorComponent>(O))
+		if (const AActor* A = C->GetOwner())
+			if (const UMusubiAuthorityComponent* Auth = A->FindComponentByClass<UMusubiAuthorityComponent>()) return Auth->GetEntityId() + TEXT("/") + C->GetName();
+	return FString();
+}
+
+static UObject* ResolveRef(UMusubiSimulatorSubsystem* Sim, const FString& Id)
+{
+	if (!Sim || Id.IsEmpty()) return nullptr;
+	FString Uuid, Comp;
+	if (!Id.Split(TEXT("/"), &Uuid, &Comp)) Uuid = Id;
+	FMusubiUuid U;
+	if (!FMusubiUuid::Parse(Uuid, U)) return nullptr;
+	UMusubiAuthorityComponent* Auth = Sim->FindAuthority(U);
+	AActor* A = Auth ? Auth->GetOwner() : nullptr;
+	if (!A || Comp.IsEmpty()) return A;
+	for (UActorComponent* C : A->GetComponents()) if (C && C->GetName() == Comp) return C;
+	return nullptr;
+}
+
 const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& UMusubiReplicationBridge::DescriptorsFor(UClass* Class)
 {
 	if (TArray<TRefCountPtr<const FReplicationStateDescriptor>>* Found = ClassDescriptors.Find(Class)) return *Found;
@@ -158,7 +207,7 @@ bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPt
 	for (int32 i = 0; i < Descs.Num(); ++i)
 	{
 		const FReplicationStateDescriptor* D = Descs[i].GetReference();
-		if (!D || D->ObjectReferenceCount > 0 || D->MemberCount == 0) continue;
+		if (!D || D->MemberCount == 0) continue;
 		bEligible = true;
 		FTracked::FStateBuf& S = T.States[i];
 		if (S.External.Num() != (int32)D->ExternalSize)
@@ -175,9 +224,20 @@ bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPt
 			const uint16 ArrayIndex = D->MemberPropertyDescriptors ? D->MemberPropertyDescriptors[m].ArrayIndex : 0;
 			P->CopySingleValue(S.External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset, P->ContainerPtrToValuePtr<void>(Obj, ArrayIndex));
 		}
+		TArray<uint32> MaskStorage;
+		const FNetBitArrayView Mask = ValueMask(D, MaskStorage);
+		TMap<FString, FString> Refs;
+		for (uint32 m = 0; m < D->MemberCount; ++m)
+		{
+			if (!IsRefMember(D, m) || !D->MemberProperties) continue;
+			if (const FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(D->MemberProperties[m]))
+				Refs.Add(OP->GetName(), RefId(OP->GetObjectPropertyValue(S.External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset)));
+		}
+		const bool bRefsChanged = !S.bHasLast || !Refs.OrderIndependentCompareEqual(S.LastRefs);
 		FNetSerializationContext Ctx;
-		FReplicationStateOperations::Quantize(Ctx, S.Internal.GetData(), S.External.GetData(), D);
-		if (S.bHasLast && FReplicationStateOperations::IsEqualQuantizedState(Ctx, S.Internal.GetData(), S.Last.GetData(), D)) continue;
+		FReplicationStateOperations::QuantizeWithMask(Ctx, Mask, 0, S.Internal.GetData(), S.External.GetData(), D);
+		if (!bRefsChanged && S.bHasLast && FReplicationStateOperations::IsEqualQuantizedState(Ctx, S.Internal.GetData(), S.Last.GetData(), D)) continue;
+		S.LastRefs = Refs;
 		if (S.bHasLast) FReplicationStateOperations::FreeDynamicState(Ctx, S.Last.GetData(), D);
 		FMemory::Memcpy(S.Last.GetData(), S.Internal.GetData(), D->InternalSize);
 		FMemory::Memzero(S.Internal.GetData(), D->InternalSize); // dynamic state now owned by Last
@@ -186,7 +246,7 @@ bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPt
 		FNetBitStreamWriter W;
 		W.InitBytes(Buf, sizeof(Buf));
 		FNetSerializationContext WCtx(&W);
-		FReplicationStateOperations::Serialize(WCtx, S.Last.GetData(), D);
+		FReplicationStateOperations::SerializeWithMask(WCtx, Mask, 0, S.Last.GetData(), D);
 		W.CommitWrites();
 		if (W.IsOverflown())
 		{
@@ -198,6 +258,12 @@ bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPt
 		St->SetNumberField(TEXT("i"), i);
 		St->SetNumberField(TEXT("bits"), Bits);
 		St->SetStringField(TEXT("b"), FBase64::Encode(Buf, (Bits + 7) / 8));
+		if (Refs.Num())
+		{
+			TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+			for (const TPair<FString, FString>& KV : Refs) { if (KV.Value.IsEmpty()) R->SetField(KV.Key, MakeShared<FJsonValueNull>()); else R->SetStringField(KV.Key, KV.Value); }
+			St->SetObjectField(TEXT("r"), R);
+		}
 		States.Add(MakeShared<FJsonValueObject>(St));
 		bChanged = true;
 	}
@@ -306,7 +372,7 @@ void UMusubiReplicationBridge::OnProtocolMismatchReported(FNetRefHandle RefHandl
 			UE_LOG(LogMusubiIris, Warning, TEXT("protocol mismatch on entity %s (conn %u): client build does not match server replicated layout"), *Auth->GetEntityId(), ConnectionId);
 }
 
-bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris)
+bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris, UMusubiSimulatorSubsystem* Sim)
 {
 	if (!Obj || !Iris.IsValid()) return false;
 	const TArray<TSharedPtr<FJsonValue>>* States = nullptr;
@@ -328,14 +394,18 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 		TArray<uint8> Bytes;
 		if (!Descs.IsValidIndex(i) || !FBase64::Decode((*St)->GetStringField(TEXT("b")), Bytes) || Bytes.Num() * 8 < (int32)Bits) continue;
 		const FReplicationStateDescriptor* D = Descs[i].GetReference();
-		if (!D || D->ObjectReferenceCount > 0) continue;
+		if (!D) continue;
+		TArray<uint32> MaskStorage;
+		const FNetBitArrayView Mask = ValueMask(D, MaskStorage);
+		const TSharedPtr<FJsonObject>* Refs = nullptr;
+		(*St)->TryGetObjectField(TEXT("r"), Refs);
 		TArray<uint8> Internal, External;
 		Internal.SetNumZeroed(D->InternalSize);
 		External.SetNumZeroed(D->ExternalSize);
 		FNetBitStreamReader R;
 		R.InitBits(Bytes.GetData(), Bits);
 		FNetSerializationContext RCtx(&R);
-		FReplicationStateOperations::Deserialize(RCtx, Internal.GetData(), D);
+		FReplicationStateOperations::DeserializeWithMask(RCtx, Mask, 0, Internal.GetData(), D);
 		if (R.IsOverflown() || RCtx.HasError())
 		{
 			UE_LOG(LogMusubiIris, Warning, TEXT("%s descriptor %d: bad iris state (%u bits)"), *Obj->GetName(), i, Bits);
@@ -344,7 +414,7 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 			continue;
 		}
 		FNetSerializationContext Ctx;
-		FReplicationStateOperations::Dequantize(Ctx, External.GetData(), Internal.GetData(), D);
+		FReplicationStateOperations::DequantizeWithMask(Ctx, Mask, 0, External.GetData(), Internal.GetData(), D);
 		for (uint32 m = 0; m < D->MemberCount; ++m)
 		{
 			const FProperty* P = D->MemberProperties ? D->MemberProperties[m] : nullptr;
@@ -352,9 +422,24 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 			const uint16 ArrayIndex = D->MemberPropertyDescriptors ? D->MemberPropertyDescriptors[m].ArrayIndex : 0;
 			void* Dst = P->ContainerPtrToValuePtr<void>(Obj, ArrayIndex);
 			uint8* Src = External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset;
-			const bool bSame = P->Identical(Dst, Src);
-			P->CopySingleValue(Dst, Src);
-			P->DestroyValue(Src);
+			bool bSame = true;
+			if (IsRefMember(D, m))
+			{
+				const FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(P);
+				if (!OP || !Refs || !(*Refs)->HasField(P->GetName())) continue; // not carried: keep what the ghost has
+				FString Id;
+				(*Refs)->TryGetStringField(P->GetName(), Id);
+				UObject* Want = ResolveRef(Sim, Id);
+				if (!Id.IsEmpty() && !Want) continue; // the referenced entity is not on this server (yet)
+				bSame = OP->GetObjectPropertyValue(Dst) == Want;
+				OP->SetObjectPropertyValue(Dst, Want);
+			}
+			else
+			{
+				bSame = P->Identical(Dst, Src);
+				P->CopySingleValue(Dst, Src);
+				P->DestroyValue(Src);
+			}
 			if (!bSame && D->MemberPropertyDescriptors)
 				if (const UFunction* Fn = D->MemberPropertyDescriptors[m].RepNotifyFunction)
 					if (Fn->NumParms == 0) Obj->ProcessEvent(const_cast<UFunction*>(Fn), nullptr);

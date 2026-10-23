@@ -616,9 +616,10 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    native Iris state: per class `FReplicationStateDescriptorBuilder::CreateDescriptorsForClass` (CDO as default),
    per descriptor copy UPROPERTY → external state → `FReplicationStateOperations::Quantize` → `IsEqualQuantizedState`
    against the last export → `Serialize` into a bit stream; `{"c": class path, "s": [{"i", "bits", "b": base64}]}`,
-   only changed descriptors per message. Descriptors with object references are excluded (resolving them needs
-   `FInternalNetSerializationContext`, which is engine-private) — a class with nothing else falls back to the JSON
-   mirror. Ghosts: `UMusubiIrisExportSubsystem` hooks each ghost's `UMusubiAuthorityComponent::OnComponentApplied`
+   only changed descriptors per message. Object-reference members are masked out (`*WithMask`; resolving them
+   inside Iris needs `FInternalNetSerializationContext` — not exported, verified in 5.7: `GetReplicationSystemInternal`
+   "not exported", `FObjectReferenceCache` without `IRISCORE_API`) and carried in `"r"` as Musubi entity ids
+   (`uuid` / `uuid/Component` / null), resolved on the ghost side against its own entities. Ghosts: `UMusubiIrisExportSubsystem` hooks each ghost's `UMusubiAuthorityComponent::OnComponentApplied`
    and runs `iris` values through `UMusubiReplicationBridge::ApplyBinary` (Deserialize → Dequantize → property copy,
    RepNotify for changed members) — relayed servers now hold the real UPROPERTY state of foreign actors.
    9d (RPC): `UMusubiMeshNetDriver` + `UMusubiMeshRpcSubsystem` as in §9.4 — ghost RPCs → `interact{kind:"rpc"}` → owner
