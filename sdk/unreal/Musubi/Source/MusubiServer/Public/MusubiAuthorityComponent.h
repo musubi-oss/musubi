@@ -29,6 +29,9 @@ public:
 	/** Client side: an actor replicated by a server identified itself with its entity id. */
 	DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiOnClientEntityIdentified, AActor*, const FString&);
 	static FMusubiOnClientEntityIdentified OnClientEntityIdentified;
+	/** Server: an entity actor was bound to its id (owned or ghost) — fired at the end of Bind, before its first replication. */
+	DECLARE_MULTICAST_DELEGATE_OneParam(FMusubiOnServerEntityBound, UMusubiAuthorityComponent*);
+	static FMusubiOnServerEntityBound OnServerEntityBound;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 	UFUNCTION(BlueprintPure, Category = "Musubi|Authority") FString GetEntityId() const { return EntityId.ToString(); }
 	const FMusubiUuid& GetEntityUuid() const { return EntityId; }

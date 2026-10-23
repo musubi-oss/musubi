@@ -137,6 +137,18 @@ if [ -n "$P1" ] && [ "$P1" = "$P2" ]; then echo "PASS nitl-c: same pawn actor be
 L1=$(echo "$BEFORE" | sed -n 's/.* local=\(-*[0-9]*\).*/\1/p'); L2=$(echo "$AFTER" | sed -n 's/.* local=\(-*[0-9]*\).*/\1/p')
 if [ "${L1:--1}" = "-1" ]; then echo "SKIP nitl-c: client-local timer (the project's pawn is not the NITL pawn)";
 elif [ -n "$L2" ] && [ "$L2" -gt "$L1" ]; then echo "PASS nitl-c: client-local timer on the kept pawn ran through the rehome (local $L1 -> $L2)"; else echo "FAIL nitl-c: client-local timer on the kept pawn ran through the rehome (local $L1 -> $L2)"; ok=0; fi
+# the player's own actors: the new owner announces PlayerController/PlayerState GUIDs after login (kind 2), so both stay the same instance
+C1=$(echo "$BEFORE" | sed -n 's/.* ctrl=\([^ ]*\).*/\1/p'); C2=$(echo "$AFTER" | sed -n 's/.* ctrl=\([^ ]*\).*/\1/p')
+if [ -n "$C1" ] && [ "$C1" != "none" ] && [ "$C1" = "$C2" ]; then echo "PASS nitl-c: same PlayerController instance before and after the rehome ($C1)"; else echo "FAIL nitl-c: same PlayerController instance before and after the rehome (before=$C1 after=$C2)"; ok=0; fi
+Q1=$(echo "$BEFORE" | sed -n 's/.* ps=\([^ ]*\).*/\1/p'); Q2=$(echo "$AFTER" | sed -n 's/.* ps=\([^ ]*\).*/\1/p')
+if [ -n "$Q1" ] && [ "$Q1" != "-" ] && [ "$Q1" = "$Q2" ]; then echo "PASS nitl-c: same PlayerState instance before and after the rehome ($Q1)"; else echo "FAIL nitl-c: same PlayerState instance before and after the rehome (before=$Q1 after=$Q2)"; ok=0; fi
+# registered subobject: the owner's NetGUID table pre-registers it too, so the client keeps its Loadout instance (same name)
+S1=$(echo "$BEFORE" | sed -n 's/.* sub=\([^ ]*\).*/\1/p'); S2=$(echo "$AFTER" | sed -n 's/.* sub=\([^ ]*\).*/\1/p')
+if [ -z "$S1" ] || [ "$S1" = "-" ]; then echo "SKIP nitl-c: same subobject instance (the project's pawn has no Loadout)";
+elif [ "$S1" = "$S2" ]; then echo "PASS nitl-c: same registered-subobject instance before and after the rehome ($S1)"; else echo "FAIL nitl-c: same registered-subobject instance before and after the rehome (before=$S1 after=$S2)"; ok=0; fi
+# nothing fell back to the swap path on any client (an entity bound after the connection opened gets a table delta)
+SW=$(grep -h "rehome: [1-9][0-9]* actors swapped" "$OUT"/nitl-c*.log | head -1)
+if [ -z "$SW" ]; then echo "PASS nitl-c: no actor swapped for the new owner's copy on any client"; else echo "FAIL nitl-c: no actor swapped for the new owner's copy on any client ($SW)"; ok=0; fi
 # the stable handle: taken from the first pawn, still resolves to the live possessed pawn, no actor change (same instance)
 H=$(grep "nitl: handle " "$OUT/nitl-c.log" | tail -1 | sed 's/.*nitl: handle //')
 case "$H" in *"changes=0 live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome, no actor change ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome, no actor change ($H)"; ok=0;; esac

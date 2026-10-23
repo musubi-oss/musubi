@@ -1,5 +1,6 @@
 #include "MusubiNitlSubsystem.h"
 #include "MusubiNitlPawn.h"
+#include "MusubiNitlLoadout.h"
 #include "MusubiNitlInventoryComponent.h"
 #include "Net/Serialization/FastArraySerializer.h"
 #include "GameFramework/Pawn.h"
@@ -194,10 +195,11 @@ bool UMusubiNitlSubsystem::Report(float)
 		const APlayerState* PS = LocalPC ? LocalPC->PlayerState.Get() : It->GetPlayerState();
 		const ACharacter* Ch = Cast<ACharacter>(*It);
 		const int32 MoveMode = Ch && Ch->GetCharacterMovement() ? (int32)Ch->GetCharacterMovement()->MovementMode.GetValue() : -1;
-		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f z=%.0f mode=%d steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s inv=%d gold=%d ammo=%d local=%d"), *Mode, *It->GetName(),
+		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f z=%.0f mode=%d steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s inv=%d gold=%d ammo=%d local=%d sub=%s ps=%s"), *Mode, *It->GetName(),
 			*Authority->NetEntityId, (int)Authority->bNetOwned, L.X, L.Y, L.Z, MoveMode, Nitl ? Nitl->Steps : -1, Nitl ? Nitl->PushSteps : -1, It->GetNetPushIdDynamic(),
 			It->GetController() ? *It->GetController()->GetName() : TEXT("none"), LocalPC ? (int)(LocalPC->GetPawn() == *It) : (int)(It->GetController() != nullptr),
-			PS ? *PS->GetPlayerName() : TEXT("-"), Items, Gold, ReadAmmo(Authority), Nitl ? Nitl->LocalTicks : -1);
+			PS ? *PS->GetPlayerName() : TEXT("-"), Items, Gold, ReadAmmo(Authority), Nitl ? Nitl->LocalTicks : -1,
+			Nitl && Nitl->Loadout ? *Nitl->Loadout->GetName() : TEXT("-"), PS ? *PS->GetName() : TEXT("-"));
 		++N;
 	}
 	if (Mode == TEXT("client"))

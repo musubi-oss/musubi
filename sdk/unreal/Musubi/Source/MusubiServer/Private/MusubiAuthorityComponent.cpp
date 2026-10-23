@@ -8,6 +8,7 @@
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 
 UMusubiAuthorityComponent::FMusubiOnClientEntityIdentified UMusubiAuthorityComponent::OnClientEntityIdentified;
+UMusubiAuthorityComponent::FMusubiOnServerEntityBound UMusubiAuthorityComponent::OnServerEntityBound;
 
 void UMusubiAuthorityComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
@@ -110,6 +111,7 @@ void UMusubiAuthorityComponent::Bind(UMusubiSimulatorSubsystem* Owner, const FMu
 	bInHandover = false;
 	bOwned = !bIsOwned;
 	SetOwned(bIsOwned);
+	OnServerEntityBound.Broadcast(this);
 }
 
 void UMusubiAuthorityComponent::SetOwned(bool bIsOwned)

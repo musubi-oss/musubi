@@ -2,6 +2,8 @@
 #include "Serialization/MemoryWriter.h"
 #include "Serialization/MemoryReader.h"
 #include "UObject/UObjectIterator.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerState.h"
 #include "Engine/PackageMapClient.h"
 #include "MusubiAuthorityComponent.h"
 #include "Runtime/Launch/Resources/Version.h"
@@ -160,28 +162,70 @@ void UMusubiNetDriver::OnClientMsg(const FMusubiServerEnvelope& Env)
 
 // net_meta kind 1: u8 kind, u32 count, count × (FString entity, FNetworkGUID (its own FArchive operator), FString class path)
 static constexpr uint8 kMetaGuidTable = 1;
+// net_meta kind 2: u8 kind, u32 count, count × (FString "pc"|"ps", FNetworkGUID, FString class path) — the player's own actors
+static constexpr uint8 kMetaPlayerGuids = 2;
 
 void UMusubiNetDriver::ApplyGuidTable(const TArray<uint8>& Data)
 {
 	FMemoryReader Ar(Data);
 	uint8 Kind = 0; Ar << Kind;
-	if (Kind != kMetaGuidTable || Ar.IsError()) { UE_LOG(LogMusubiNet, Warning, TEXT("net_meta kind %d ignored"), Kind); return; }
+	if (Ar.IsError() || (Kind != kMetaGuidTable && Kind != kMetaPlayerGuids)) { UE_LOG(LogMusubiNet, Warning, TEXT("net_meta kind %d ignored"), Kind); return; }
 	uint32 Count = 0; Ar << Count;
-	int32 Registered = 0, ClassMismatch = 0;
+	if (Kind == kMetaPlayerGuids)
+	{
+		int32 Done = 0;
+		for (uint32 i = 0; i < Count && !Ar.IsError(); ++i)
+		{
+			FString What, ClassPath; FNetworkGUID G;
+			Ar << What; Ar << G; Ar << ClassPath;
+			if (!G.IsValid() || !G.IsDynamic()) continue;
+			AActor* A = What == TEXT("pc") ? static_cast<AActor*>(KeptPC.Get()) : What == TEXT("ps") ? static_cast<AActor*>(KeptPS.Get()) : nullptr;
+			if (!A || A->GetClass()->GetPathName() != ClassPath)
+			{
+				UE_LOG(LogMusubiNet, Log, TEXT("rehome: player GUID row %s (%s) not applied: kept actor %s"), *What, *ClassPath, A ? *A->GetClass()->GetPathName() : TEXT("gone"));
+				continue;
+			}
+			GuidCache->RegisterNetGUID_Client(G, A);
+			++Done;
+		}
+		UE_LOG(LogMusubiNet, Log, TEXT("rehome: player GUIDs from the new owner: %u rows, %d kept (controller/state) pre-registered"), Count, Done);
+		return;
+	}
+	int32 Registered = 0, ClassMismatch = 0, SubRegistered = 0;
+	TSet<UObject*> Taken; // subobjects already matched in this table (one per class per actor)
 	for (uint32 i = 0; i < Count && !Ar.IsError(); ++i)
 	{
-		FString Entity, ClassPath; FNetworkGUID G;
-		Ar << Entity; Ar << G; Ar << ClassPath;
+		FString Id, ClassPath; FNetworkGUID G;
+		Ar << Id; Ar << G; Ar << ClassPath;
+		if (!G.IsValid() || !G.IsDynamic()) continue;
+		FString Entity = Id, Sub;
+		Id.Split(TEXT("/"), &Entity, &Sub);
 		TWeakObjectPtr<AActor>* P = TornOff.Find(Entity);
 		AActor* A = P ? P->Get() : nullptr;
 		if (!A) continue;
-		if (A->GetClass()->GetPathName() != ClassPath) { ++ClassMismatch; continue; } // the owner's copy will replace it (swap path)
-		if (!G.IsValid() || !G.IsDynamic()) continue;
-		GuidCache->RegisterNetGUID_Client(G, A);
-		++Registered;
+		if (Sub.IsEmpty())
+		{
+			if (A->GetClass()->GetPathName() != ClassPath) { ++ClassMismatch; continue; } // the owner's copy will replace it (swap path)
+			GuidCache->RegisterNetGUID_Client(G, A);
+			++Registered;
+			continue;
+		}
+		// a registered subobject: the owner's name means nothing here (ours was created by replication under a generated
+		// name) — match by class within the kept actor's registry, one per class
+		const UMusubiAuthorityComponent* Auth = A->FindComponentByClass<UMusubiAuthorityComponent>();
+		FString SubClass = ClassPath; { FString L, R; if (ClassPath.Split(TEXT("|"), &L, &R)) SubClass = R; }
+		for (const TWeakObjectPtr<UObject>& W : Auth ? Auth->MusubiSubObjects() : TArray<TWeakObjectPtr<UObject>>())
+			if (UObject* O = W.Get())
+				if (!Taken.Contains(O) && O->GetClass()->GetPathName() == SubClass)
+				{
+					GuidCache->RegisterNetGUID_Client(G, O);
+					Taken.Add(O);
+					++SubRegistered;
+					break;
+				}
 	}
 	bGuidTableSeen = true;
-	UE_LOG(LogMusubiNet, Log, TEXT("rehome: NetGUID table from the new owner: %u entities, %d kept actors pre-registered, %d class mismatches"), Count, Registered, ClassMismatch);
+	UE_LOG(LogMusubiNet, Log, TEXT("rehome: NetGUID table from the new owner: %u rows, %d kept actors pre-registered, %d subobjects, %d class mismatches"), Count, Registered, SubRegistered, ClassMismatch);
 	if (bJoinDeferred && ServerConnection) SendJoin(ServerConnection);
 }
 
@@ -213,13 +257,17 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 	//    class there, gets the owner's copy and OnEntityIdentified swaps the old one out — no empty frame either way
 	TornOff.Reset();
 	bGuidTableSeen = false; bJoinDeferred = false; PendingMap.Empty();
+	APlayerController* LocalPC = W->GetFirstPlayerController();
+	APlayerState* LocalPS = LocalPC ? LocalPC->PlayerState.Get() : nullptr;
+	KeptPC = LocalPC; KeptPS = LocalPS;
 	for (UChannel* Ch : TArray<UChannel*>(Old->OpenChannels))
 	{
 		UActorChannel* AC = Cast<UActorChannel>(Ch);
 		if (!AC || !AC->Actor) continue;
 		const UMusubiAuthorityComponent* Auth = AC->Actor->FindComponentByClass<UMusubiAuthorityComponent>();
-		if (!Auth || Auth->NetEntityId.IsEmpty()) continue;
-		TornOff.Add(Auth->NetEntityId, AC->Actor);
+		const bool bPlayer = AC->Actor == LocalPC || (LocalPS && AC->Actor == LocalPS);
+		if (!bPlayer && (!Auth || Auth->NetEntityId.IsEmpty())) continue;
+		if (!bPlayer) TornOff.Add(Auth->NetEntityId, AC->Actor);
 		// close as for dormancy: the engine keeps the actor (ClientSetActorDormant) without tearing it off, so the new
 		// owner's open bunch can re-attach to it; `Dormant` is normally set by a received close bunch, we close locally
 		AC->Dormant = true;
@@ -233,6 +281,10 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 	// UNetConnection::CleanUp nulls Driver->ServerConnection itself when it is this connection; with it already null the
 	// engine takes the old connection for a client one and asserts in RemoveClientConnection
 	check(ServerConnection == Old);
+	// CleanUp → DestroyOwningActor → APlayerController::OnNetCleanup would destroy the kept controller: detach it first
+	// (HandleClientPlayer re-links Player/NetConnection when the new owner's bunch re-attaches)
+	Old->OwningActor = nullptr;
+	Old->PlayerController = nullptr;
 	Old->CleanUp();
 	check(ServerConnection == nullptr);
 	// the new owner numbers its NetGUIDs independently of the old one: with the old cache its GUIDs resolve to our old
@@ -362,7 +414,17 @@ bool UMusubiNetDriver::InitListen(FNetworkNotify* InNotify, FURL& LocalURL, bool
 	// no socket, no stateless-connect challenge: the node authenticated the session already
 	ServerConnection = nullptr;
 	UE_LOG(LogMusubiNet, Log, TEXT("%s listening through the node (simulator stream)"), *GetDescription());
+	BoundHandle = UMusubiAuthorityComponent::OnServerEntityBound.AddUObject(this, &UMusubiNetDriver::OnEntityBound);
 	return true;
+}
+
+void UMusubiNetDriver::OnEntityBound(UMusubiAuthorityComponent* Auth)
+{
+	// an entity that reached this server after a client's connection opened: its rows go out before its first bunch
+	if (!Auth || Auth->GetOwner() == nullptr || Auth->GetOwner()->GetWorld() != GetWorld()) return;
+	for (TPair<uint64, TWeakObjectPtr<UMusubiNetConnection>>& KV : ByConn)
+		if (UMusubiNetConnection* C = KV.Value.Get())
+			if (C->GetConnectionState() != USOCK_Closed) SendGuidTable(C, Auth);
 }
 
 UMusubiNetConnection* UMusubiNetDriver::FindOrOpen(uint64 ConnId, const FMusubiJson& Session, const FMusubiUuid& Entity)
@@ -390,7 +452,32 @@ UMusubiNetConnection* UMusubiNetDriver::FindOrOpen(uint64 ConnId, const FMusubiJ
 	return Conn;
 }
 
-void UMusubiNetDriver::SendGuidTable(UMusubiNetConnection* Conn)
+void UMusubiNetDriver::SendPlayerGuids(UMusubiNetConnection* Conn)
+{
+	UMusubiSimulatorSubsystem* S = Sim.Get();
+	if (!S || !GuidCache.IsValid() || !Conn->PlayerController) return;
+	Conn->bPlayerAnnounced = true;
+	TArray<uint8> Bytes;
+	FMemoryWriter Ar(Bytes);
+	uint8 Kind = kMetaPlayerGuids; Ar << Kind;
+	uint32 Count = 0; const int64 CountPos = Ar.Tell(); Ar << Count;
+	auto Row = [&](const TCHAR* What, AActor* A)
+	{
+		if (!A) return;
+		FNetworkGUID G = GuidCache->GetOrAssignNetGUID(A);
+		if (!G.IsValid()) return;
+		FString W = What, Cls = A->GetClass()->GetPathName();
+		Ar << W; Ar << G; Ar << Cls;
+		++Count;
+	};
+	Row(TEXT("pc"), Conn->PlayerController);
+	Row(TEXT("ps"), Conn->PlayerController->PlayerState.Get());
+	const int64 End = Ar.Tell(); Ar.Seek(CountPos); Ar << Count; Ar.Seek(End);
+	UE_LOG(LogMusubiNet, Log, TEXT("relay %llu: player GUIDs sent (%u rows)"), (unsigned long long)Conn->ConnId, Count);
+	S->NetSendMeta(Conn->ConnId, Conn->Session, MoveTemp(Bytes));
+}
+
+void UMusubiNetDriver::SendGuidTable(UMusubiNetConnection* Conn, UMusubiAuthorityComponent* Only)
 {
 	UMusubiSimulatorSubsystem* S = Sim.Get();
 	UWorld* W = GetWorld();
@@ -399,18 +486,31 @@ void UMusubiNetDriver::SendGuidTable(UMusubiNetConnection* Conn)
 	FMemoryWriter Ar(Bytes);
 	uint8 Kind = kMetaGuidTable; Ar << Kind;
 	uint32 Count = 0; const int64 CountPos = Ar.Tell(); Ar << Count;
-	for (TObjectIterator<UMusubiAuthorityComponent> It; It; ++It)
+	auto Rows = [&](UMusubiAuthorityComponent* Auth)
 	{
-		AActor* A = It->GetOwner();
-		if (!A || !IsValid(A) || A->GetWorld() != W || It->NetEntityId.IsEmpty()) continue;
+		AActor* A = Auth->GetOwner();
+		if (!A || !IsValid(A) || A->GetWorld() != W || Auth->NetEntityId.IsEmpty()) return;
 		FNetworkGUID G = GuidCache->GetOrAssignNetGUID(A);
-		if (!G.IsValid()) continue;
-		FString Entity = It->NetEntityId, ClassPath = A->GetClass()->GetPathName();
+		if (!G.IsValid()) return;
+		FString Entity = Auth->NetEntityId, ClassPath = A->GetClass()->GetPathName();
 		Ar << Entity; Ar << G; Ar << ClassPath;
 		++Count;
-	}
+		// registered subobjects (RegisterMusubiSubObject): `entity/Name`, class = actor class | subobject class
+		for (const TWeakObjectPtr<UObject>& Wk : Auth->MusubiSubObjects())
+			if (UObject* O = Wk.Get())
+			{
+				FNetworkGUID SG = GuidCache->GetOrAssignNetGUID(O);
+				if (!SG.IsValid()) continue;
+				FString Id = Entity + TEXT("/") + O->GetName(), Cls = ClassPath + TEXT("|") + O->GetClass()->GetPathName();
+				Ar << Id; Ar << SG; Ar << Cls;
+				++Count;
+			}
+	};
+	if (Only) Rows(Only);
+	else for (TObjectIterator<UMusubiAuthorityComponent> It; It; ++It) Rows(*It);
+	if (Count == 0) return;
 	const int64 End = Ar.Tell(); Ar.Seek(CountPos); Ar << Count; Ar.Seek(End);
-	UE_LOG(LogMusubiNet, Log, TEXT("relay %llu: NetGUID table sent, %u entities, %d bytes"), (unsigned long long)Conn->ConnId, Count, Bytes.Num());
+	UE_LOG(LogMusubiNet, Log, TEXT("relay %llu: NetGUID table %s, %u rows, %d bytes"), (unsigned long long)Conn->ConnId, Only ? TEXT("delta") : TEXT("sent"), Count, Bytes.Num());
 	S->NetSendMeta(Conn->ConnId, Conn->Session, MoveTemp(Bytes));
 }
 
@@ -491,11 +591,23 @@ void UMusubiNetDriver::TickDispatch(float DeltaTime)
 				}
 				else { ++Dropped; if (UWorld* AW = A->GetWorld()) AW->DestroyActor(A, true); }
 			}
+		for (AActor* A : { static_cast<AActor*>(KeptPC.Get()), static_cast<AActor*>(KeptPS.Get()) })
+			if (A)
+			{
+				const bool bOn = ServerConnection && ServerConnection->FindActorChannelRef(A);
+				UE_LOG(LogMusubiNet, Log, TEXT("rehome: %s %s"), bOn ? TEXT("reused player actor") : TEXT("dropped stale player actor"), *A->GetName());
+				if (!bOn) if (UWorld* AW = A->GetWorld()) AW->DestroyActor(A, true);
+			}
+		KeptPC.Reset(); KeptPS.Reset();
 		UE_LOG(LogMusubiNet, Log, TEXT("rehome: %d actors swapped for the new owner's, %d reused in place, %d dropped"), Adopted, Kept, Dropped);
 		TornOff.Reset();
 	}
 	Super::TickDispatch(DeltaTime);
 	DrainInbox();
+	if (!ServerConnection)
+		for (TPair<uint64, TWeakObjectPtr<UMusubiNetConnection>>& KV : ByConn)
+			if (UMusubiNetConnection* C = KV.Value.Get())
+				if (!C->bPlayerAnnounced && C->PlayerController && C->GetConnectionState() != USOCK_Closed) SendPlayerGuids(C);
 }
 
 void UMusubiNetDriver::LowLevelSend(TSharedPtr<const FInternetAddr> Address, void* Data, int32 CountBits, FOutPacketTraits& Traits)
@@ -518,6 +630,7 @@ bool UMusubiNetDriver::IsNetResourceValid()
 
 void UMusubiNetDriver::LowLevelDestroy()
 {
+	if (BoundHandle.IsValid()) { UMusubiAuthorityComponent::OnServerEntityBound.Remove(BoundHandle); BoundHandle.Reset(); }
 	if (UMusubiSubsystem* Sub = Client.Get())
 		if (TSharedPtr<FMusubiSocket> Sock = Sub->Socket())
 		{

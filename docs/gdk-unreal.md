@@ -466,10 +466,18 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   owner. The client registers each GUID on the kept actor of the same class (`RegisterNetGUID_Client`) in the fresh
   `GuidCache`; the owner's open bunch then re-attaches the channel to the *existing* `AActor*` (no spawn, no
   `PostNetInit`, components resolve by their stable path under it). `NMT_Join` is held after `NMT_Welcome` until the
-  table is in (`GuidTableTimeout`, 1 s; then join without it → swap). Entities missing from the table or of another
-  class there take the swap path. Dynamic subobjects (`NewObject` + `AddReplicatedSubObject`) are re-created by the
-  new owner's bunch like on any fresh connection — the old instance is orphaned, keep the pointer in a replicated
-  property (`RegisterMusubiSubObject` registry entries are replaced through the RepNotify). Stable-name
+  table is in (`GuidTableTimeout`, 1 s; then join without it → swap). An entity bound on the owner *after* the
+  connection opened gets a one-row table delta the moment it binds (`OnServerEntityBound`, before its first bunch),
+  so late arrivals are reused too; an entity of another class takes the swap path. Registered subobjects
+  (`RegisterMusubiSubObject`) ride in the same table as `entity/Name` rows carrying `actor class|subobject class`:
+  the client matches them by class inside the kept actor's registry (one per class — the owner's name means nothing
+  to a client whose instance was created by replication under a generated name) and pre-registers the GUID, so the
+  same `UObject` receives the new owner's state instead of a fresh instance. The player's own actors go the same way:
+  once the new owner has spawned the PlayerController (NMT_Join) it announces `pc`/`ps` GUIDs (`net_meta` kind 2)
+  before their first bunch; the client kept its controller and PlayerState dormant-closed like the entities (and
+  detached them from the dying connection first — `UNetConnection::CleanUp → DestroyOwningActor → OnNetCleanup`
+  would destroy the controller), so `HandleClientPlayer` re-links the *same* controller (it sends `NMT_PCSwap` for
+  itself, harmless: `DestroySwappedPC` only finds controllers without a player). Stable-name
   actors cannot be spawned by a client at all (`SerializeNewActor failed to find/spawn actor`) — this path never
   needs that. Proven live by `tools/nitl.sh` on 5.3.2 and 5.8.4 (node + two
   dedicated servers + client, border crossing in front of the client). Budget: `NMT_Welcome` within `RehomeTimeout` (5 s), or the new owner runs a
@@ -639,7 +647,8 @@ the same instance and `OnEntityActorChanged` does not fire; on the swap fallback
 destroyed (the registry is updated ahead of the driver's swap), so references can be moved over without a null frame.
 NITL: the client takes the handle from the first identified pawn and at the end reports `handle … changes=0 live=1` —
 resolves to the pawn the local `PlayerController` possesses on the new owner, no actor change; the pawn's name is the
-same before and after and a client-local looping timer on it (`local=N`) keeps counting through the rehome.
+same before and after, a client-local looping timer on it (`local=N`) keeps counting through the rehome, and the
+`ctrl=`/`ps=`/`sub=` names (controller, PlayerState, registered Loadout) are the same instances too.
 
 **What this is not yet:** `score` round-trips but nothing in the acceptance changes it between servers;
 subobjects/components of the pawn are not part of the Iris export (9g-4).

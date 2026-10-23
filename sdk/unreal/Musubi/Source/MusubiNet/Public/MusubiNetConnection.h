@@ -38,6 +38,8 @@ public:
 	TArray<TArray<uint8>> PendingOut;
 	/** Set by the driver before CleanUp() on a rehome: the relay conn lives on for the next engine connection. */
 	bool bKeepRelay = false;
+	/** Server side: the player's PlayerController/PlayerState NetGUIDs were announced (`net_meta` kind 2) after login. */
+	bool bPlayerAnnounced = false;
 
 	bool IsOpen() const { return ConnId != 0; }
 	/** Client side: the relay is open — set the id/limit and flush what was queued. */

@@ -25,6 +25,8 @@ class UMusubiSimulatorSubsystem;
  *   [/Script/Engine.Engine]
  *   +NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/MusubiNet.MusubiNetDriver",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver",bCanUseIris=true)
  */
+class UMusubiAuthorityComponent;
+
 UCLASS(transient, config = Engine)
 class MUSUBINET_API UMusubiNetDriver : public UNetDriver, public FNetworkNotify
 {
@@ -77,6 +79,10 @@ private:
 	bool bRehoming = false;
 	double RehomeStarted = 0;
 	TMap<FString, TWeakObjectPtr<AActor>> TornOff;
+	// the local player's controller and state kept across the rehome the same way (the new owner announces their GUIDs
+	// right after login, kind 2); dropped by the sweep when the new owner's copies came instead
+	TWeakObjectPtr<class APlayerController> KeptPC;
+	TWeakObjectPtr<class APlayerState> KeptPS;
 	// NetGUID pre-registration: the new owner sends `entity → NetGUID (+class)` as `net_meta` on our first packet; registering
 	// those GUIDs on the kept actors makes the owner's open bunches re-attach to them (the engine's dormancy path) instead
 	// of spawning copies — the same AActor* survives the rehome
@@ -96,8 +102,13 @@ private:
 	TMap<uint64, TWeakObjectPtr<UMusubiNetConnection>> ByConn;
 	void OnSimEvent(const FMusubiSimEvent& E);
 	UMusubiNetConnection* FindOrOpen(uint64 ConnId, const FMusubiJson& Session, const FMusubiUuid& Entity);
-	/** Server: NetGUIDs of every entity actor on this server, sent as `net_meta` before any packet reaches the client. */
-	void SendGuidTable(UMusubiNetConnection* Conn);
+	/** Server: NetGUIDs of every entity actor (and registered subobject) on this server, sent as `net_meta` before any
+	 *  packet reaches the client; `Only` narrows it to one entity (the delta for an entity bound after the connection opened). */
+	void SendGuidTable(UMusubiNetConnection* Conn, UMusubiAuthorityComponent* Only = nullptr);
+	void OnEntityBound(UMusubiAuthorityComponent* Auth);
+	/** Server: the connection's PlayerController/PlayerState NetGUIDs (kind 2), sent once they exist and before their first bunch. */
+	void SendPlayerGuids(UMusubiNetConnection* Conn);
+	FDelegateHandle BoundHandle;
 	// packets received this frame, delivered from TickDispatch (game thread, in order)
 	TArray<TPair<TWeakObjectPtr<UMusubiNetConnection>, TArray<uint8>>> Inbox;
 	void DrainInbox();
