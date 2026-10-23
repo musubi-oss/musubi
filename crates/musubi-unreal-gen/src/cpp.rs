@@ -114,7 +114,7 @@ fn from_json(model: &Model, t: &Ty, target: &str, j: &str, depth: usize) -> Stri
             from_json(model, i, &v, &format!("{v}E"), depth + 1)
         ),
         Ty::Map(val) => format!(
-            "{{ const TSharedPtr<FJsonObject>* {v}O; if ({j}->TryGetObject({v}O)) {{ {target}.Reset(); for (const auto& {v}P : (*{v}O)->Values) {{ {} {v}{{}}; {} {target}.Add({v}P.Key, MoveTemp({v})); }} }} else bOk = false; }}",
+            "{{ const TSharedPtr<FJsonObject>* {v}O; if ({j}->TryGetObject({v}O)) {{ {target}.Reset(); for (const auto& {v}P : (*{v}O)->Values) {{ {} {v}{{}}; {} {target}.Add(FString(*{v}P.Key), MoveTemp({v})); }} }} else bOk = false; }}",
             cpp_ty(model, val),
             from_json(model, val, &v, &format!("{v}P.Value"), depth + 1)
         ),

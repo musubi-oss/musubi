@@ -25,8 +25,11 @@ class UMusubiAuthorityComponent;
  * Verified against 5.7.4 / 5.8.4 ObjectReplicationBridge.h:
  *  - OnStartPreSendUpdate / PreSendUpdate / UpdateInstancesWorldLocation exist in both;
  *  - OnProtocolMismatchReported gained `const TArray<uint8>& ClientCDOStateBytes` in 5.8;
- *  - DetachInstance(FNetRefHandle) is virtual in 5.7, gone in 5.8 → delegates
- *    GetRootObjectDetachedDelegate / GetSubObjectDetachedDelegate instead.
+ *  - DetachInstance(FNetRefHandle) is virtual in 5.7 and gone in 5.8. The 5.8 detach delegates
+ *    (FObjectReplicationBridgeDelegates::Get*DetachedDelegate) are private + friend-only (engine
+ *    classes), so a plugin bridge cannot subscribe (UBT 5.8.4: "use of undeclared identifier"); on 5.8
+ *    detach is detected at the start of the next send update instead: a tracked handle whose
+ *    GetReplicatedObject() is null has been detached → Untrack (one update late, same outcome).
  */
 UCLASS(Transient, MinimalAPI)
 class UMusubiReplicationBridge : public UObjectReplicationBridge
@@ -68,8 +71,7 @@ private:
 	void FlushDirty();
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
-	FDelegateHandle RootDetachedHandle;
-	FDelegateHandle SubObjectDetachedHandle;
+	void SweepDetached();
 #endif
 
 	TMap<UE::Net::FNetRefHandle, FTracked> Tracked;

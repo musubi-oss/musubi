@@ -542,7 +542,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 			const FMusubiSimEventHandoverArrived& A = E.HandoverArrived.GetValue();
 			FMusubiCellId Cell;
 			if (const FEntity* En = Entities.Find(A.entity)) Cell = En->Cell;
-			else if (Cells.Num()) { for (const auto& KV : Cells) { Cell = KV.Key; break; } }
+			else if (Cells.Num()) Cell = Cells.CreateConstIterator()->Key;
 			UpsertEntity(A.state, Cell, true, LastTick);
 			if (UMusubiAuthorityComponent* Auth = FindAuthority(A.entity))
 			{

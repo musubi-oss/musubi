@@ -68,19 +68,10 @@ UMusubiSimulatorSubsystem* UMusubiReplicationBridge::Simulator() const
 void UMusubiReplicationBridge::Initialize(UReplicationSystem* InReplicationSystem)
 {
 	Super::Initialize(InReplicationSystem);
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
-	// 5.8: DetachInstance is no longer virtual; detach is observed through the bridge delegates.
-	RootDetachedHandle = GetRootObjectDetachedDelegate(this).AddLambda([this](FNetRefHandle H, UObject* O, EDetachReason) { Untrack(H, O); });
-	SubObjectDetachedHandle = GetSubObjectDetachedDelegate(this).AddLambda([this](FNetRefHandle H, UObject* O, FNetRefHandle, UObject*, EDetachReason) { Untrack(H, O); });
-#endif
 }
 
 void UMusubiReplicationBridge::Deinitialize()
 {
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
-	GetRootObjectDetachedDelegate(this).Remove(RootDetachedHandle);
-	GetSubObjectDetachedDelegate(this).Remove(SubObjectDetachedHandle);
-#endif
 	Tracked.Empty();
 	Super::Deinitialize();
 }
@@ -124,11 +115,28 @@ void UMusubiReplicationBridge::DetachInstance(FNetRefHandle Handle)
 	Untrack(Handle, GetReplicatedObject(Handle));
 	Super::DetachInstance(Handle);
 }
+#else
+// 5.8: no virtual detach hook and the bridge delegates are private — see the header.
+void UMusubiReplicationBridge::SweepDetached()
+{
+	for (auto It = Tracked.CreateIterator(); It; ++It)
+		if (GetReplicatedObject(It.Key()) == nullptr)
+		{
+			FTracked T = It.Value();
+			It.RemoveCurrent();
+			if (UMusubiAuthorityComponent* Auth = T.Authority.Get())
+				if (Auth->IsOwned())
+					Auth->RequestDespawn();
+		}
+}
 #endif
 
 void UMusubiReplicationBridge::OnStartPreSendUpdate()
 {
 	Super::OnStartPreSendUpdate();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+	SweepDetached();
+#endif
 	bInSendUpdate = true;
 }
 

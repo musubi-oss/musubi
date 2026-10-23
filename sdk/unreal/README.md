@@ -95,7 +95,7 @@ constants — hash the same bytes your handler hashes) is compared with every `m
 
 Compiles to an empty stub on 5.3/5.4 (`MUSUBI_WITH_IRIS=0`, gate = engine version; 5.7 UBT's `SetupIrisSupport()` is unconditional, there is no per-target Iris switch). The bridge/factory sources live in `Source/MusubiIrisImpl` (not a module) and are attached to `MusubiIris` with `ConditionalAddModuleDirectory` on 5.5+ only: UHT does not evaluate `#if MUSUBI_WITH_IRIS` around a base class (it drops the whole `#if/#else/#endif`, leaving `Super` undefined — seen with UE 5.3.2 UBT), so the classes must not be visible to it on tier A at all. On 5.5+:
 
-- `UMusubiReplicationBridge : UObjectReplicationBridge` — Iris keeps owning dirty tracking and descriptors. The bridge tracks objects that carry a `UMusubiAuthorityComponent` from `CacheNetRefHandleCreationInfo` (the one hook both 5.7 and 5.8 call when an object starts replicating), and in `PreSendUpdate` serializes their replicated `UPROPERTY`s (plus replicated components, `Comp.Prop` keys) to JSON, hash-gated (FNV-1a 64), into the entity component `iris` — the simulator subsystem ships it as `apply` on the next `tick_done`. Ghosts are never mirrored back. Detach from Iris = `RequestDespawn` for owned entities: 5.7 via the `DetachInstance` override, 5.8 via `GetRootObjectDetachedDelegate / GetSubObjectDetachedDelegate` (the virtual was removed). `OnProtocolMismatchReported` has the 5.8 `ClientCDOStateBytes` signature behind `ENGINE_MINOR_VERSION >= 8`.
+- `UMusubiReplicationBridge : UObjectReplicationBridge` — Iris keeps owning dirty tracking and descriptors. The bridge tracks objects that carry a `UMusubiAuthorityComponent` from `CacheNetRefHandleCreationInfo` (the one hook both 5.7 and 5.8 call when an object starts replicating), and in `PreSendUpdate` serializes their replicated `UPROPERTY`s (plus replicated components, `Comp.Prop` keys) to JSON, hash-gated (FNV-1a 64), into the entity component `iris` — the simulator subsystem ships it as `apply` on the next `tick_done`. Ghosts are never mirrored back. Detach from Iris = `RequestDespawn` for owned entities: 5.7 via the `DetachInstance` override; 5.8 removed the virtual and its detach delegates are private to the engine, so the bridge sweeps tracked handles whose `GetReplicatedObject()` is null at the start of each send update. `OnProtocolMismatchReported` has the 5.8 `ClientCDOStateBytes` signature behind `ENGINE_MINOR_VERSION >= 8`.
 - `UMusubiNetObjectFactory : UNetObjectFactory`, registered as `MusubiEntity` at module startup (`PostConfigInit`). Creation header = class path + entity uuid + actor flag; remote instantiation spawns the class deferred, `PostInstantiation` binds the authority component as a ghost (`Bind(sim, uuid, cell, owned=false)`) and finishes spawning; `DetachedFromReplication` destroys the actor unless Iris says `DoNotDestroy`.
 
 **Mass sink** (`MusubiMass`, §3/§6): mapping rules with `Sink = Mass` get no actor; `UMusubiMassSinkComponent`
@@ -139,10 +139,8 @@ on the command line and a runtime `Configure()` override the address.
 - Not yet: a demo map (needs the editor; the 10k meshbench world is the intended content), live WS→QUIC
   migration (Auto only decides at connect time), console platform builds of `musubi-quic-ffi`.
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
-  Core/Json). The facades reference engine types the shim does not model (UObject, HTTP, WebSockets)
-  and have **not been compiled by UBT yet** — the 5.3/5.7/5.8 compile matrix is phase 8; the same goes
-  for `MusubiWorld` and `MusubiServer`. Engine APIs they use were checked against the 5.3.2 / 5.7.4 / 5.8.4 sources
-  (`FSubsystemCollectionBase::InitializeDependency<T>()`, `IWebSocket`, `FHttpModule`, `FTSTicker`,
-  `UInstancedStaticMeshComponent::AddInstance/UpdateInstanceTransform/BatchUpdateInstancesTransforms`,
-  `UWorld::SpawnActor`; `TArray` shrink arguments kept to the 5.3 form), but a build error report is
-  still the most useful issue you can file.
+  Core/Json). The whole plugin (all modules, Editor + Game targets, Linux) is built by the real
+  UBT/UAT `BuildPlugin` with `tools/ue-build.sh <ver>` inside Epic's `dev-slim` images — green with
+  0 warnings on 5.3.2, 5.7.4 and 5.8.4. That runs locally, not in CI (the images are 12–22 GiB and
+  need a GitHub account linked to Epic Games), so it is re-run by hand before a release; a build
+  error report from any other version/platform is still the most useful issue you can file.

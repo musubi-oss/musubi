@@ -295,11 +295,11 @@ receive `world_delta` through Iris' own apply path) without hand-written mapping
 ### 7.x Implementation notes (phase 6, checked against 5.7.4 / 5.8.4 headers)
 
 - Begin-replication hook: there is no `OnBeginReplication` virtual on `UObjectReplicationBridge`; `CacheNetRefHandleCreationInfo(FNetRefHandle)` is called once per object before its creation header is built in both versions — used as the tracking entry.
-- Detach: `DetachInstance(FNetRefHandle)` is virtual in 5.7 (`ObjectReplicationBridge.h:338`) and **removed** in 5.8; 5.8 exposes `GetRootObjectDetachedDelegate(Bridge)` / `GetSubObjectDetachedDelegate(Bridge)` (`FOnRootObjectDetached(FNetRefHandle, UObject*, EDetachReason)`), which 5.7 does not have. Split on `ENGINE_MINOR_VERSION >= 8`.
+- Detach: `DetachInstance(FNetRefHandle)` is virtual in 5.7 (`ObjectReplicationBridge.h:338`) and **removed** in 5.8. 5.8 has `FObjectReplicationBridgeDelegates::GetRootObjectDetachedDelegate(Bridge)` / `GetSubObjectDetachedDelegate(Bridge)`, but they are private and friend-only (engine classes) — UBT 5.8.4 rejects them from a plugin bridge. So on 5.8 the bridge sweeps its tracked handles at `OnStartPreSendUpdate`: `GetReplicatedObject(Handle) == nullptr` ⇒ detached ⇒ untrack/despawn, one send update late. Split on `ENGINE_MINOR_VERSION >= 8`.
 - `OnProtocolMismatchReported(Handle, ConnectionId)` gains `const TArray<uint8>& ClientCDOStateBytes` in 5.8.
 - Factory (5.7 `NetObjectFactory.h`): `CreateAndFillHeader`, `SerializeHeader(FCreationHeaderContext{Handle, Bridge, Factory, FNetSerializationContext& Serialization})`, `CreateAndDeserializeHeader` (PURE_VIRTUAL), `InstantiateReplicatedObjectFromHeader → FInstantiateResult{Instance, Template}`, `PostInstantiation(FPostInstantiationContext{Instance, Header})`, `DetachedFromReplication(FDestroyedContext{DestroyedInstance, RootObject, DestroyReason, DestroyFlags})` (PURE_VIRTUAL); `DestroyReplicatedObject` is `final`. Header bits via `UE::Net::WriteString/WriteBytes` (`NetBitStreamUtil.h`). Registration: `FNetObjectFactoryRegistry::RegisterFactory(UClass*, FName)`.
 - UBT: `ModuleRules.SetupIrisSupport(Target)` adds `IrisCore` + `UE_WITH_IRIS=1` unconditionally; `TargetRules` has no `bUseIris`, so `MusubiIris.Build.cs` gates only on `Target.Version.MinorVersion >= 5`.
-- Still open: UBT compile of this module is part of the phase 8 matrix (shim cannot cover Iris).
+- Built by the real UBT on 5.7.4 and 5.8.4 (`sdk/unreal/tools/ue-build.sh`, 0 warnings); 5.3.2 builds the stub.
 
 ## 8. Transport
 
@@ -354,9 +354,13 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 
 ## 10. Testing
 
-* **Compile matrix** (CI, Linux): UBT for 5.3 (tier A, `MusubiIris` excluded), 5.7 and 5.8
-  (tier B) using the engine checkouts under PAT; `-NoPCH -DisableUnity` so every header stands
-  alone. A failing header on any version fails CI.
+* **Compile matrix** (local, Linux): `sdk/unreal/tools/ue-build.sh <ver>` runs UAT `BuildPlugin`
+  (UnrealEditor + UnrealGame, all modules) inside Epic's `dev-slim` images for 5.3.2 (tier A,
+  `MusubiIris` stub), 5.7.4 and 5.8.4 (tier B). Not in CI: the images are 12–22 GiB and require a
+  GitHub account linked to Epic Games, so the matrix is re-run by hand before a release. Output
+  and UBT logs land in `target/ue/<ver>/`. 5.4+: the script drops a `BuildConfiguration.xml` with
+  `bAllowUBAExecutor=false` into the host project — UBA detours crash clang 20 on every Game-target
+  action in the 5.8.4 image (`[CHAINED-SIGNAL 11]` in `opendir`), which turns a 40 s target into hours.
 * **Wire golden vectors**: `cargo test -p musubi-proto -- dump_vectors` writes JSON + postcard
   bytes for every `ClientMessage`/`ServerMessage` variant; the plugin's automation test
   (`Musubi.Wire.Vectors`) encodes/decodes all of them. New variant on the Rust side without a
@@ -390,5 +394,6 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    waits for a project that needs it.
 6. Iris bridge (tier B) + Mass sink — done (`MusubiIris`, `MusubiMass`).
 7. QUIC transport — done: `musubi-quic-ffi` (Rust static lib) + `MusubiQuic`, `IMusubiTransport` seam, Auto with WS fallback. Consoles (platform ffi builds) and live WS→QUIC migration later.
-8. CI compile matrix 5.3/5.7/5.8 + node-in-the-loop tests + docs (`docs/parity.md` L146/L192
-   updated: SDK/GDK no longer "after").
+8. Compile matrix 5.3.2/5.7.4/5.8.4 — done locally (`tools/ue-build.sh`, real UAT `BuildPlugin`,
+   0 warnings on all three); node-in-the-loop tests + docs (`docs/parity.md` L146/L192 updated:
+   SDK/GDK no longer "after") still open.

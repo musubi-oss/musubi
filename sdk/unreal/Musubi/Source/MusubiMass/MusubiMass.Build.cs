@@ -16,5 +16,10 @@ public class MusubiMass : ModuleRules
         {
             PrivateDependencyModuleNames.Add("StructUtils");
         }
+        // 5.8 moved FMassEntityHandle to the MassCore module (Mass/EntityHandle.h).
+        if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 8)
+        {
+            PublicDependencyModuleNames.Add("MassCore");
+        }
     }
 }

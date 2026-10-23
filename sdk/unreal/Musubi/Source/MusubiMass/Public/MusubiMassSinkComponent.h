@@ -4,9 +4,12 @@
 #include "Components/ActorComponent.h"
 #include "MassEntityTypes.h"
 #include "MassArchetypeTypes.h"
-// 5.5+: FMassEntityHandle has its own header and MassEntityTypes.h/MassArchetypeTypes.h only forward-declare it
-// (seen on 5.7.4: "field has incomplete type"); on 5.3/5.4 it is defined in MassEntityTypes.h.
-#if __has_include("MassEntityHandle.h")
+// FMassEntityHandle: defined in MassEntityTypes.h on 5.3/5.4; its own MassEntityHandle.h on 5.5-5.7 (MassEntityTypes.h
+// only forward-declares it there — "field has incomplete type" on 5.7.4); Mass/EntityHandle.h in MassCore on 5.8+
+// (the old header is UE_DEPRECATED_HEADER and warns).
+#if __has_include("Mass/EntityHandle.h")
+#include "Mass/EntityHandle.h"
+#elif __has_include("MassEntityHandle.h")
 #include "MassEntityHandle.h"
 #endif
 #include "MusubiWireTypes.h"
