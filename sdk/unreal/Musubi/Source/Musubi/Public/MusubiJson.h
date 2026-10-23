@@ -13,7 +13,7 @@ struct MUSUBI_API FMusubiJson
 
 	FMusubiJson() = default;
 	explicit FMusubiJson(const TSharedPtr<FJsonValue>& In) : Value(In) {}
-	explicit FMusubiJson(const TSharedPtr<FJsonObject>& In) : Value(In.IsValid() ? MakeShared<FJsonValueObject>(In) : nullptr) {}
+	explicit FMusubiJson(const TSharedPtr<FJsonObject>& In) : Value(In.IsValid() ? TSharedPtr<FJsonValue>(MakeShared<FJsonValueObject>(In)) : TSharedPtr<FJsonValue>()) {}
 
 	bool IsValid() const { return Value.IsValid() && !Value->IsNull(); }
 	TSharedPtr<FJsonObject> AsObject() const;

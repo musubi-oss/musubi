@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "MusubiClient.h"
 #include "MusubiSocket.h"
 #include "Subsystems/GameInstanceSubsystem.h"

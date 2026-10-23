@@ -1,7 +1,7 @@
 #include "MusubiIrisModule.h"
-#include "MusubiNetObjectFactory.h"
 
 #if MUSUBI_WITH_IRIS
+#include "MusubiNetObjectFactory.h"
 #include "Iris/ReplicationSystem/NetObjectFactoryRegistry.h"
 #endif
 

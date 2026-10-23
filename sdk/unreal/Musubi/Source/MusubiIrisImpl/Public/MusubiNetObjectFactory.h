@@ -4,13 +4,10 @@
 #include "Runtime/Launch/Resources/Version.h"
 #include "MusubiPostcard.h"
 
-#if MUSUBI_WITH_IRIS
 #include "Iris/ReplicationSystem/NetObjectFactory.h"
-#endif
 
 #include "MusubiNetObjectFactory.generated.h"
 
-#if MUSUBI_WITH_IRIS
 /**
  * Creation header for Musubi-owned replicated objects: the Unreal class to instantiate on the
  * remote side plus the Musubi entity id, so a ghost spawned via Iris and the same entity seen
@@ -24,22 +21,15 @@ public:
 	FMusubiUuid Entity;
 	bool bIsActor = false;
 };
-#endif
 
 /** Registered under name "MusubiEntity" (UE::Net::FNetObjectFactoryRegistry::RegisterFactory). */
 UCLASS(MinimalAPI)
-class UMusubiNetObjectFactory
-#if MUSUBI_WITH_IRIS
-	: public UNetObjectFactory
-#else
-	: public UObject
-#endif
+class UMusubiNetObjectFactory : public UNetObjectFactory
 {
 	GENERATED_BODY()
 public:
 	static const FName FactoryName;
 
-#if MUSUBI_WITH_IRIS
 	virtual TUniquePtr<UE::Net::FNetObjectCreationHeader> CreateAndFillHeader(UE::Net::FNetRefHandle Handle) override;
 	virtual bool SerializeHeader(const UE::Net::FCreationHeaderContext& Context, const UE::Net::FNetObjectCreationHeader* Header) override;
 	virtual TUniquePtr<UE::Net::FNetObjectCreationHeader> CreateAndDeserializeHeader(const UE::Net::FCreationHeaderContext& Context) override;
@@ -50,6 +40,5 @@ public:
 	virtual void DetachedFromReplication(const FDetachContext& Context, const TOptional<FSubObjectDetachContext>& SubObjectContext) override;
 #else
 	virtual void DetachedFromReplication(const FDestroyedContext& Context) override;
-#endif
 #endif
 };

@@ -68,7 +68,7 @@ public:
 	~FMusubiSocket();
 
 	/** `BaseUrl` is the http(s) API base; the socket URL and `?format=` are derived. */
-	void Connect(const FString& BaseUrl, const FString& AccessToken, const FConfig& InConfig = FConfig());
+	void Connect(const FString& BaseUrl, const FString& AccessToken, const FConfig& InConfig);
 	/** Replace the access token used by the next (re)connect, e.g. after a refresh. */
 	void SetAccessToken(const FString& AccessToken);
 	void Close(int32 Code = 1000, const FString& Reason = TEXT("client closed"));

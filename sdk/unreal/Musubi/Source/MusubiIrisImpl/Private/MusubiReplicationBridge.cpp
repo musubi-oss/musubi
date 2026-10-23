@@ -1,7 +1,6 @@
 #include "MusubiReplicationBridge.h"
 #include "MusubiIrisModule.h"
 
-#if MUSUBI_WITH_IRIS
 #include "MusubiAuthorityComponent.h"
 #include "MusubiSimulatorSubsystem.h"
 #include "MusubiJson.h"
@@ -191,4 +190,3 @@ void UMusubiReplicationBridge::OnProtocolMismatchReported(FNetRefHandle RefHandl
 }
 #else
 UMusubiReplicationBridge::UMusubiReplicationBridge() {}
-#endif // MUSUBI_WITH_IRIS

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "MusubiSimWire.generated.h"
 #include "MusubiSimStream.h"
@@ -145,7 +146,7 @@ private:
 	void UnloadCellLevel(FCell& C);
 
 	TSharedPtr<FMusubiSimStream> Link;
-	FDelegateHandle TickerHandle;
+	FTSTicker::FDelegateHandle TickerHandle;
 	FMusubiUuid SimId;
 	bool bRunning = false;
 	FString ApiBase, ServerKey, WorldName;

@@ -30,7 +30,7 @@ public:
 	};
 
 	~FMusubiSimStream();
-	void Connect(const FString& ApiBase, const FString& ServerKey, const FString& World, const FMusubiUuid& SimId, const FConfig& InConfig = FConfig());
+	void Connect(const FString& ApiBase, const FString& ServerKey, const FString& World, const FMusubiUuid& SimId, const FConfig& InConfig);
 	void Close();
 	/** Drive timeouts and reconnects; call every engine tick. */
 	void Tick(double DeltaSeconds);

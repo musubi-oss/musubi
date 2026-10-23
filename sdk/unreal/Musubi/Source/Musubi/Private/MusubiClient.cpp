@@ -1,5 +1,6 @@
 #include "MusubiClient.h"
 #include "HttpModule.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
 #include "Interfaces/IHttpResponse.h"
 #include "MusubiModule.h"
 #include "Serialization/JsonReader.h"

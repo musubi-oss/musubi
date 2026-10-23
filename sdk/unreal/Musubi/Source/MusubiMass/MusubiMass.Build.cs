@@ -10,5 +10,11 @@ public class MusubiMass : ModuleRules
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Musubi", "MusubiWorld", "MassEntity", "MassCommon" });
         PrivateDependencyModuleNames.AddRange(new string[] { "Json" });
+        // FStructTracker / FStructTypeBitSet (used inline by MassEntity headers) live in the StructUtils
+        // plugin up to 5.4 (seen as link errors on 5.3.2); from 5.5 they are in CoreUObject.
+        if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion < 5)
+        {
+            PrivateDependencyModuleNames.Add("StructUtils");
+        }
     }
 }

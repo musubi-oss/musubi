@@ -3,6 +3,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "GameFramework/Actor.h"
 #include "MusubiWorldTypes.h"
 #include "MusubiEntityComponent.generated.h"
 

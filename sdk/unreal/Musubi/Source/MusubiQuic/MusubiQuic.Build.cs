@@ -9,7 +9,7 @@ public class MusubiQuic : ModuleRules
     public MusubiQuic(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Musubi" });
+        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "Musubi", "Json" });
 
         string ThirdParty = Path.Combine(ModuleDirectory, "..", "ThirdParty", "MusubiQuicFfi");
         PublicIncludePaths.Add(Path.Combine(ThirdParty, "include"));

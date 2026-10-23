@@ -3,10 +3,8 @@
 #include "CoreMinimal.h"
 #include "Runtime/Launch/Resources/Version.h"
 
-#if MUSUBI_WITH_IRIS
 #include "Iris/ReplicationSystem/ObjectReplicationBridge.h"
 #include "Iris/ReplicationSystem/ReplicationBridgeTypes.h"
-#endif
 
 #include "MusubiReplicationBridge.generated.h"
 
@@ -14,7 +12,9 @@ class UMusubiSimulatorSubsystem;
 class UMusubiAuthorityComponent;
 
 /**
- * Tier B (5.5+): Iris → Musubi bridge.
+ * Tier B (5.5+): Iris → Musubi bridge. This directory (MusubiIrisImpl) is not a module: MusubiIris.Build.cs
+ * adds it with ConditionalAddModuleDirectory on 5.5+ only, so UHT never sees these classes on 5.3/5.4
+ * (UHT skips `#if MACRO … #else … #endif` around a base class entirely, leaving `Super` undefined).
  *
  * Iris stays the owner of dirty tracking / replication state descriptors; this bridge sits
  * on top and, once per send update, walks the root objects that Iris marked dirty, serializes
@@ -29,18 +29,12 @@ class UMusubiAuthorityComponent;
  *    GetRootObjectDetachedDelegate / GetSubObjectDetachedDelegate instead.
  */
 UCLASS(Transient, MinimalAPI)
-class UMusubiReplicationBridge
-#if MUSUBI_WITH_IRIS
-	: public UObjectReplicationBridge
-#else
-	: public UObject
-#endif
+class UMusubiReplicationBridge : public UObjectReplicationBridge
 {
 	GENERATED_BODY()
 public:
 	UMusubiReplicationBridge();
 
-#if MUSUBI_WITH_IRIS
 	virtual void Initialize(UReplicationSystem* InReplicationSystem) override;
 	virtual void Deinitialize() override;
 
@@ -81,5 +75,4 @@ private:
 	TMap<UE::Net::FNetRefHandle, FTracked> Tracked;
 	TSet<UE::Net::FNetRefHandle> DirtyThisUpdate;
 	bool bInSendUpdate = false;
-#endif // MUSUBI_WITH_IRIS
 };

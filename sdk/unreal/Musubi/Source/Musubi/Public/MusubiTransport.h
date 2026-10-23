@@ -5,6 +5,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "MusubiEnvelope.h"
 #include "MusubiWire.generated.h"
 
 enum class EMusubiTransport : uint8

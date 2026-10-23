@@ -6,6 +6,7 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 
 FMusubiQuicTransport::~FMusubiQuicTransport()
 {

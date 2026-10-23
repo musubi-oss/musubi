@@ -9,7 +9,6 @@
 
 const FName UMusubiNetObjectFactory::FactoryName(TEXT("MusubiEntity"));
 
-#if MUSUBI_WITH_IRIS
 #include "Iris/Serialization/NetBitStreamUtil.h"
 #include "Iris/Serialization/NetBitStreamWriter.h"
 #include "Iris/Serialization/NetBitStreamReader.h"
@@ -125,4 +124,3 @@ void UMusubiNetObjectFactory::DetachedFromReplication(const FDestroyedContext& C
 			A->Destroy();
 }
 #endif
-#endif // MUSUBI_WITH_IRIS
