@@ -361,6 +361,10 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
   and UBT logs land in `target/ue/<ver>/`. 5.4+: the script drops a `BuildConfiguration.xml` with
   `bAllowUBAExecutor=false` into the host project — UBA detours crash clang 20 on every Game-target
   action in the 5.8.4 image (`[CHAINED-SIGNAL 11]` in `opendir`), which turns a 40 s target into hours.
+  `tools/ue-package.sh <ver>...` turns a green build into the release artifact: a prebuilt-plugin zip
+  (Binaries without `.debug`, `Intermediate/Build/*/Inc` generated headers, Source incl. the QUIC `.a`,
+  `.uplugin` with `EngineVersion` pinned to `<major.minor>.0`), refusing a `Package/` whose
+  `build.log` is not `ExitCode=0`.
 * **Wire golden vectors**: `cargo test -p musubi-proto -- dump_vectors` writes JSON + postcard
   bytes for every `ClientMessage`/`ServerMessage` variant; the plugin's automation test
   (`Musubi.Wire.Vectors`) encodes/decodes all of them. New variant on the Rust side without a

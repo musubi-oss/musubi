@@ -142,5 +142,8 @@ on the command line and a runtime `Configure()` override the address.
   Core/Json). The whole plugin (all modules, Editor + Game targets, Linux) is built by the real
   UBT/UAT `BuildPlugin` with `tools/ue-build.sh <ver>` inside Epic's `dev-slim` images — green with
   0 warnings on 5.3.2, 5.7.4 and 5.8.4. That runs locally, not in CI (the images are 12–22 GiB and
-  need a GitHub account linked to Epic Games), so it is re-run by hand before a release; a build
-  error report from any other version/platform is still the most useful issue you can file.
+  need a GitHub account linked to Epic Games), so it is re-run by hand before a release;
+  `tools/ue-package.sh <ver>...` then zips each build into a drop-in prebuilt plugin
+  (`target/ue/Musubi-<plugin>-ue<major.minor>-<platforms>.zip`: Binaries, generated headers, Source,
+  `.uplugin` pinned to that engine). A build error report from any other version/platform is still
+  the most useful issue you can file.
