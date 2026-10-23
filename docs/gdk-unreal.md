@@ -678,10 +678,20 @@ later saw only the descriptors that happened to change last. The export now has 
 Ghost side (`ApplyBinary`): the carried mask is intersected with the exportable-member mask, `Deserialize/Dequantize
 WithMask` use it, and members outside it are not written (their `External` bytes are zeros).
 
+**Envelope.** Both components are one base64 string over a compact blob (`u8 version, u8 kind, u64 tick,
+[keyframe: class path], descriptors (u8 index, u32 bits, [delta: mask words], bytes, refs), u8 subs × (component
+name, descriptors)`) instead of a JSON object per descriptor with the class path repeated in every message.
+
 NITL (5.8.4): on the pawn (`Steps`/`PushSteps` change every tick, inventory every 100–300) the owner logged
-`keyframes=90 avg 58 B, deltas=2581 avg 19 B` — ~3× fewer payload bytes per tick than the per-descriptor export,
-with the inventory still arriving on the ghost and surviving the handover. The remaining overhead is the JSON/base64
-envelope around the bits in the node's component value; that is the node-side half of 9g-6.
+`keyframes=90 avg 272 B, deltas=2581 avg 76 B` for the whole blob (≈19 B of those are the member bits of a delta; the
+rest is the fixed per-descriptor framing, three descriptors per message), with the inventory still arriving on the
+ghost and surviving the handover.
+
+**What is still JSON/base64 and why (9g-6b, open).** The simulator stream between the node and an Unreal server is
+JSON text over one WebSocket (`SimFrame`/`SimCommand` are internally tagged, which postcard cannot encode), so the
+blob travels base64-encoded inside it and the node stores component values as JSON. Raw bytes end to end need a
+binary simulator stream (re-tagged frame types, binary WebSocket frames, a bytes component value in the node and in
+`WorldComponent`); that is tracked as 9g-6b and is independent of the GDK-side format above.
 
 ## 10. Numbers, limits, failure behaviour
 

@@ -95,12 +95,15 @@ private:
 	TMap<TWeakObjectPtr<UClass>, TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>> ClassDescriptors;
 	const TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>& DescriptorsFor(UClass* Class);
 	/** Binary path: quantize + serialize each eligible descriptor state; false = nothing eligible (JSON fallback). */
-	bool ExportBinary(TArray<FTracked::FStateBuf>& States, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged, bool bKeyframe, uint32& OutBytes);
 	void FreeStates(TArray<FTracked::FStateBuf>& States, UObject* Obj);
 
 public:
+	/** One exported descriptor state: index, bit count, change-mask words (deltas only), the bits, object refs by member. */
+	struct FDescOut { int32 Index = 0; uint32 Bits = 0; TArray<uint32> Mask; TArray<uint8> Bytes; TMap<FString, FString> Refs; };
+	bool ExportBinary(TArray<FTracked::FStateBuf>& States, UObject* Obj, TArray<FDescOut>& Out, bool bKeyframe, uint32& OutBytes);
+	bool ApplyDescs(UObject* Obj, const TArray<FDescOut>& Descs, bool bKeyframe, class UMusubiSimulatorSubsystem* Sim);
 	/** Ghost side: deserialize + dequantize an `iris` component (binary form) into Obj's UPROPERTYs, firing RepNotifies. */
-	bool ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris, class UMusubiSimulatorSubsystem* Sim);
+	bool ApplyBinary(UObject* Obj, const struct FMusubiJson& Value, class UMusubiSimulatorSubsystem* Sim);
 
 	UMusubiSimulatorSubsystem* Simulator() const;
 	void Untrack(UE::Net::FNetRefHandle Handle, UObject* Object); // EDetachReason exists only since 5.8, so the reason is not part of the signature

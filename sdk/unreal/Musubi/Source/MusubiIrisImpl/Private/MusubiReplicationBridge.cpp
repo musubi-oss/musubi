@@ -1,4 +1,6 @@
 #include "MusubiReplicationBridge.h"
+#include "Serialization/MemoryWriter.h"
+#include "Serialization/MemoryReader.h"
 #include "Iris/Serialization/NetSerializer.h"
 #include "Iris/ReplicationState/PropertyNetSerializerInfoRegistry.h"
 #include "Engine/EngineTypes.h"
@@ -258,15 +260,13 @@ static bool MemberInMask(const FReplicationStateDescriptor* D, uint32 m, const F
 	return C.BitCount == 0 || Mask.IsAnyBitSet(C.BitOffset, C.BitCount);
 }
 
-bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged, bool bKeyframe, uint32& OutBytes)
+bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates, UObject* Obj, TArray<FDescOut>& Out, bool bKeyframe, uint32& OutBytes)
 {
-	bChanged = false;
 	OutBytes = 0;
 	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
 	if (Descs.Num() == 0) return false;
 	if (TStates.Num() != Descs.Num()) TStates.SetNum(Descs.Num());
 	bool bEligible = false;
-	TArray<TSharedPtr<FJsonValue>> States;
 	for (int32 i = 0; i < Descs.Num(); ++i)
 	{
 		const FReplicationStateDescriptor* D = Descs[i].GetReference();
@@ -354,39 +354,58 @@ bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates
 			continue;
 		}
 		const uint32 Bits = W.GetPosBits();
-		TSharedPtr<FJsonObject> St = MakeShared<FJsonObject>();
-		St->SetNumberField(TEXT("i"), i);
-		St->SetNumberField(TEXT("bits"), Bits);
-		St->SetStringField(TEXT("b"), FBase64::Encode(Buf, (Bits + 7) / 8));
-		if (!bKeyframe)
-		{
-			TArray<TSharedPtr<FJsonValue>> M;
-			for (int32 w = 0; w < Words && w < SendStorage.Num(); ++w) M.Add(MakeShared<FJsonValueNumber>((double)SendStorage[w]));
-			St->SetArrayField(TEXT("m"), M);
-		}
-		if (Refs.Num() && (bKeyframe || S.bRefsDirty))
-		{
-			TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
-			for (const TPair<FString, FString>& KV : Refs) { if (KV.Value.IsEmpty()) R->SetField(KV.Key, MakeShared<FJsonValueNull>()); else R->SetStringField(KV.Key, KV.Value); }
-			St->SetObjectField(TEXT("r"), R);
-		}
+		FDescOut& O = Out.AddDefaulted_GetRef();
+		O.Index = i;
+		O.Bits = Bits;
+		O.Bytes.Append(Buf, (Bits + 7) / 8);
+		if (!bKeyframe) for (int32 w = 0; w < Words && w < SendStorage.Num(); ++w) O.Mask.Add(SendStorage[w]);
+		if (Refs.Num() && (bKeyframe || S.bRefsDirty)) O.Refs = Refs;
 		OutBytes += (Bits + 7) / 8;
 		if (bKeyframe)
 		{
 			FMemory::Memzero(S.Dirty.GetData(), S.Dirty.Num() * sizeof(uint32));
 			S.bRefsDirty = false;
 		}
-		States.Add(MakeShared<FJsonValueObject>(St));
-		bChanged = true;
 	}
-	if (!bEligible) return false;
-	if (bChanged)
+	return bEligible;
+}
+
+// Blob: u8 version, u8 kind (0 keyframe / 1 delta), u64 tick, [keyframe: class path], descriptors, u8 subs × (name,
+// descriptors). One base64 string per message instead of a JSON object per descriptor: the envelope is two quotes.
+static void WriteDescs(FArchive& Ar, TArray<UMusubiReplicationBridge::FDescOut>& Descs, bool bKey)
+{
+	uint8 N = (uint8)FMath::Min(Descs.Num(), 255);
+	Ar << N;
+	for (int32 d = 0; d < N; ++d)
 	{
-		Out = MakeShared<FJsonObject>();
-		Out->SetStringField(TEXT("c"), Obj->GetClass()->GetPathName());
-		Out->SetArrayField(TEXT("s"), States);
+		UMusubiReplicationBridge::FDescOut& D = Descs[d];
+		uint8 I = (uint8)D.Index;
+		Ar << I << D.Bits;
+		if (!bKey) Ar << D.Mask;
+		Ar << D.Bytes;
+		uint8 R = (uint8)FMath::Min(D.Refs.Num(), 255);
+		Ar << R;
+		for (TPair<FString, FString>& KV : D.Refs) { Ar << KV.Key << KV.Value; }
 	}
-	return true;
+}
+
+static bool ReadDescs(FArchive& Ar, TArray<UMusubiReplicationBridge::FDescOut>& Descs, bool bKey)
+{
+	uint8 N = 0;
+	Ar << N;
+	for (int32 d = 0; d < N && !Ar.IsError(); ++d)
+	{
+		UMusubiReplicationBridge::FDescOut& D = Descs.AddDefaulted_GetRef();
+		uint8 I = 0;
+		Ar << I << D.Bits;
+		D.Index = I;
+		if (!bKey) Ar << D.Mask;
+		Ar << D.Bytes;
+		uint8 R = 0;
+		Ar << R;
+		for (int32 r = 0; r < R && !Ar.IsError(); ++r) { FString K, V; Ar << K << V; D.Refs.Add(K, V); }
+	}
+	return !Ar.IsError();
 }
 
 #if !(ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
@@ -440,50 +459,50 @@ void UMusubiReplicationBridge::FlushDirty()
 		UMusubiAuthorityComponent* Auth = T.Authority.Get();
 		if (!Obj || !Auth) { It.RemoveCurrent(); continue; }
 		if (!Auth->IsOwned()) continue; // ghosts are driven by the node, never mirrored back
-		TSharedPtr<FJsonObject> Bin;
-		bool bChanged = false;
+		TArray<FDescOut> Own;
 		const bool bKey = !T.bMirrored || (T.bDirtySinceKey && ExportTick - T.KeyTick >= KeyframeInterval);
 		uint32 Bytes = 0;
-		if (ExportBinary(T.States, Obj, Bin, bChanged, bKey, Bytes))
+		if (ExportBinary(T.States, Obj, Own, bKey, Bytes))
 		{
+			bool bChanged = Own.Num() > 0;
 			// replicated components ride along under "sub" by component name (CharacterMovement, inventories, ...);
 			// only the ones whose state changed are in the message, like the actor's own descriptors
-			TSharedPtr<FJsonObject> Subs;
+			TArray<TPair<FString, TArray<FDescOut>>> Subs;
 			if (AActor* A = Cast<AActor>(Obj))
 				for (UActorComponent* C : A->GetReplicatedComponents())
 				{
 					if (!C || C->IsA<UMusubiAuthorityComponent>()) continue;
-					TSharedPtr<FJsonObject> SubBin;
-					bool bSubChanged = false;
+					TArray<FDescOut> SubOut;
 					uint32 SubBytes = 0;
-					if (!ExportBinary(T.Subs.FindOrAdd(C->GetFName()), C, SubBin, bSubChanged, bKey, SubBytes) || !bSubChanged) continue;
+					if (!ExportBinary(T.Subs.FindOrAdd(C->GetFName()), C, SubOut, bKey, SubBytes) || SubOut.Num() == 0) continue;
 					Bytes += SubBytes;
-					if (!Subs.IsValid()) Subs = MakeShared<FJsonObject>();
-					Subs->SetObjectField(C->GetName(), SubBin);
+					Subs.Emplace(C->GetName(), MoveTemp(SubOut));
+					bChanged = true;
 				}
-			if (Subs.IsValid())
-			{
-				if (!Bin.IsValid())
-				{
-					Bin = MakeShared<FJsonObject>();
-					Bin->SetStringField(TEXT("c"), Obj->GetClass()->GetPathName());
-					Bin->SetArrayField(TEXT("s"), TArray<TSharedPtr<FJsonValue>>());
-				}
-				Bin->SetObjectField(TEXT("sub"), Subs);
-				bChanged = true;
-			}
 			if (bChanged)
 			{
-				if (!T.bMirrored) UE_LOG(LogMusubiIris, Log, TEXT("%s: first binary iris state exported (%d component(s))"), *Obj->GetName(), Subs.IsValid() ? Subs->Values.Num() : 0);
+				if (!T.bMirrored) UE_LOG(LogMusubiIris, Log, TEXT("%s: first binary iris state exported (%d component(s))"), *Obj->GetName(), Subs.Num());
 				T.bMirrored = true;
-				Bin->SetNumberField(TEXT("t"), (double)ExportTick);
+				TArray<uint8> Blob;
+				FMemoryWriter Ar(Blob);
+				uint8 Ver = 1, Kind = bKey ? 0 : 1;
+				uint64 Tick = ExportTick;
+				Ar << Ver << Kind << Tick;
+				if (bKey) { FString Class = Obj->GetClass()->GetPathName(); Ar << Class; }
+				WriteDescs(Ar, Own, bKey);
+				uint8 NSubs = (uint8)FMath::Min(Subs.Num(), 255);
+				Ar << NSubs;
+				for (int32 sI = 0; sI < NSubs; ++sI) { Ar << Subs[sI].Key; WriteDescs(Ar, Subs[sI].Value, bKey); }
+				FMusubiJson Bin;
+				Bin.Value = MakeShared<FJsonValueString>(FBase64::Encode(Blob));
+				Bytes = Blob.Num(); // what the node carries (before base64)
 				if (bKey)
 				{
 					T.KeyTick = ExportTick;
 					T.bDirtySinceKey = false;
 					++T.Keys;
 					T.KeyBytes += Bytes;
-					Auth->SetComponent(TEXT("iris"), FMusubiJson(Bin));
+					Auth->SetComponent(TEXT("iris"), Bin);
 					if (T.Keys % 10 == 0)
 						UE_LOG(LogMusubiIris, Log, TEXT("%s: iris stats keyframes=%u (%llu B, avg %llu) deltas=%u (%llu B, avg %llu)"), *Obj->GetName(), T.Keys, T.KeyBytes, T.KeyBytes / T.Keys, T.Deltas, T.DeltaBytes, T.Deltas ? T.DeltaBytes / T.Deltas : 0);
 				}
@@ -492,7 +511,7 @@ void UMusubiReplicationBridge::FlushDirty()
 					T.bDirtySinceKey = true;
 					++T.Deltas;
 					T.DeltaBytes += Bytes;
-					Auth->SetComponent(TEXT("iris.d"), FMusubiJson(Bin));
+					Auth->SetComponent(TEXT("iris.d"), Bin);
 				}
 			}
 			continue;
@@ -535,51 +554,30 @@ void UMusubiReplicationBridge::OnProtocolMismatchReported(FNetRefHandle RefHandl
 			UE_LOG(LogMusubiIris, Warning, TEXT("protocol mismatch on entity %s (conn %u): client build does not match server replicated layout"), *Auth->GetEntityId(), ConnectionId);
 }
 
-bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris, UMusubiSimulatorSubsystem* Sim)
+bool UMusubiReplicationBridge::ApplyDescs(UObject* Obj, const TArray<FDescOut>& In, bool bKeyframe, UMusubiSimulatorSubsystem* Sim)
 {
-	if (!Obj || !Iris.IsValid()) return false;
-	const TArray<TSharedPtr<FJsonValue>>* States = nullptr;
-	if (!Iris->TryGetArrayField(TEXT("s"), States) || !States) return false; // JSON mirror form, not ours
-	FString ClassPath;
-	if (Iris->TryGetStringField(TEXT("c"), ClassPath) && ClassPath != Obj->GetClass()->GetPathName())
-	{
-		UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state is for %s, ghost is %s — skipped"), *Obj->GetName(), *ClassPath, *Obj->GetClass()->GetPathName());
-		return false;
-	}
-	double TickD = 0;
-	if (Iris->TryGetNumberField(TEXT("t"), TickD))
-	{
-		uint64& Last = AppliedTick.FindOrAdd(Obj);
-		if ((uint64)TickD < Last) return false; // an older keyframe arriving after a newer delta
-		Last = (uint64)TickD;
-	}
 	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
 	bool bApplied = false;
-	for (const TSharedPtr<FJsonValue>& V : *States)
+	for (const FDescOut& Desc : In)
 	{
-		const TSharedPtr<FJsonObject>* St = nullptr;
-		if (!V.IsValid() || !V->TryGetObject(St) || !St) continue;
-		const int32 i = (int32)(*St)->GetNumberField(TEXT("i"));
-		const uint32 Bits = (uint32)(*St)->GetNumberField(TEXT("bits"));
-		TArray<uint8> Bytes;
-		if (!Descs.IsValidIndex(i) || !FBase64::Decode((*St)->GetStringField(TEXT("b")), Bytes) || Bytes.Num() * 8 < (int32)Bits) continue;
+		const int32 i = Desc.Index;
+		const uint32 Bits = Desc.Bits;
+		if (!Descs.IsValidIndex(i) || Desc.Bytes.Num() * 8 < (int32)Bits) continue;
 		const FReplicationStateDescriptor* D = Descs[i].GetReference();
 		if (!D) continue;
 		TArray<uint32> MaskStorage;
 		FNetBitArrayView Mask = ValueMask(D, MaskStorage);
-		const TArray<TSharedPtr<FJsonValue>>* M = nullptr;
-		if ((*St)->TryGetArrayField(TEXT("m"), M) && M) // delta: only the members the owner marked dirty are in the bits
+		if (!bKeyframe) // delta: only the members the owner marked dirty are in the bits
 		{
-			for (int32 w = 0; w < MaskStorage.Num(); ++w) MaskStorage[w] &= M->IsValidIndex(w) && (*M)[w].IsValid() ? (uint32)(*M)[w]->AsNumber() : 0u;
+			for (int32 w = 0; w < MaskStorage.Num(); ++w) MaskStorage[w] &= Desc.Mask.IsValidIndex(w) ? Desc.Mask[w] : 0u;
 			Mask = FNetBitArrayView(MaskStorage.GetData(), D->ChangeMaskBitCount, FNetBitArrayView::NoResetNoValidate);
 		}
-		const TSharedPtr<FJsonObject>* Refs = nullptr;
-		(*St)->TryGetObjectField(TEXT("r"), Refs);
+		const TMap<FString, FString>* Refs = Desc.Refs.Num() ? &Desc.Refs : nullptr;
 		TArray<uint8> Internal, External;
 		Internal.SetNumZeroed(D->InternalSize);
 		External.SetNumZeroed(D->ExternalSize);
 		FNetBitStreamReader R;
-		R.InitBits(Bytes.GetData(), Bits);
+		R.InitBits(Desc.Bytes.GetData(), Bits);
 		FNetSerializationContext RCtx(&R);
 		RCtx.SetChangeMask(&Mask);
 		FReplicationStateOperations::DeserializeWithMask(RCtx, Mask, 0, Internal.GetData(), D);
@@ -608,9 +606,9 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 			if (IsRefMember(D, m))
 			{
 				const FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(P);
-				if (!OP || !Refs || !(*Refs)->HasField(P->GetName())) continue; // not carried: keep what the ghost has
-				FString Id;
-				(*Refs)->TryGetStringField(P->GetName(), Id);
+				const FString* IdP = Refs ? Refs->Find(P->GetName()) : nullptr;
+				if (!OP || !IdP) continue; // not carried: keep what the ghost has
+				const FString Id = *IdP;
 				UObject* Want = ResolveRef(Sim, Id);
 				if (!Id.IsEmpty() && !Want) continue; // the referenced entity is not on this server (yet)
 				bSame = OP->GetObjectPropertyValue(Dst) == Want;
@@ -629,17 +627,50 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 		FReplicationStateOperations::FreeDynamicState(Ctx, Internal.GetData(), D);
 		bApplied = true;
 	}
-	const TSharedPtr<FJsonObject>* Subs = nullptr;
-	if (Iris->TryGetObjectField(TEXT("sub"), Subs) && Subs)
-		if (AActor* A = Cast<AActor>(Obj))
-			for (const TPair<FString, TSharedPtr<FJsonValue>> KV : (*Subs)->Values) // TMap iteration yields pairs by value here
-			{
-				const TSharedPtr<FJsonObject>* SubObj = nullptr;
-				if (!KV.Value.IsValid() || !KV.Value->TryGetObject(SubObj) || !SubObj) continue;
-				UActorComponent* Target = nullptr;
-				for (UActorComponent* C : A->GetComponents()) if (C && C->GetName() == KV.Key) { Target = C; break; }
-				if (!Target) { UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state for component %s, ghost has none — skipped"), *A->GetName(), *KV.Key); continue; }
-				bApplied |= ApplyBinary(Target, *SubObj, Sim);
-			}
+	return bApplied;
+}
+
+bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const FMusubiJson& Value, UMusubiSimulatorSubsystem* Sim)
+{
+	FString B64;
+	if (!Obj || !Value.Value.IsValid() || !Value.Value->TryGetString(B64)) return false; // JSON mirror form, not ours
+	TArray<uint8> Blob;
+	if (!FBase64::Decode(B64, Blob)) return false;
+	FMemoryReader Ar(Blob);
+	uint8 Ver = 0, Kind = 0;
+	uint64 Tick = 0;
+	Ar << Ver << Kind << Tick;
+	if (Ar.IsError() || Ver != 1) { UE_LOG(LogMusubiIris, Warning, TEXT("%s: bad iris blob (version %u)"), *Obj->GetName(), Ver); return false; }
+	const bool bKey = Kind == 0;
+	if (bKey)
+	{
+		FString ClassPath;
+		Ar << ClassPath;
+		if (ClassPath != Obj->GetClass()->GetPathName())
+		{
+			UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state is for %s, ghost is %s — skipped"), *Obj->GetName(), *ClassPath, *Obj->GetClass()->GetPathName());
+			return false;
+		}
+	}
+	uint64& Last = AppliedTick.FindOrAdd(Obj);
+	if (Tick < Last) return false; // an older keyframe arriving after a newer delta
+	Last = Tick;
+	TArray<FDescOut> Own;
+	if (!ReadDescs(Ar, Own, bKey)) return false;
+	bool bApplied = ApplyDescs(Obj, Own, bKey, Sim);
+	uint8 NSubs = 0;
+	Ar << NSubs;
+	AActor* A = Cast<AActor>(Obj);
+	for (int32 sI = 0; sI < NSubs && !Ar.IsError(); ++sI)
+	{
+		FString Name;
+		Ar << Name;
+		TArray<FDescOut> Sub;
+		if (!ReadDescs(Ar, Sub, bKey)) break;
+		UActorComponent* Target = nullptr;
+		if (A) for (UActorComponent* C : A->GetComponents()) if (C && C->GetName() == Name) { Target = C; break; }
+		if (!Target) { UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state for component %s, ghost has none — skipped"), *Obj->GetName(), *Name); continue; }
+		bApplied |= ApplyDescs(Target, Sub, bKey, Sim);
+	}
 	return bApplied;
 }

@@ -173,14 +173,12 @@ void UMusubiIrisExportSubsystem::OnGhostSpawned(const FString&, AActor* Actor)
 		if ((Name != TEXT("iris") && Name != TEXT("iris.d")) || !WeakActor.IsValid() || !WeakSelf.IsValid() || !WeakSelf->Bridge) return;
 		UMusubiAuthorityComponent* A = WeakActor->FindComponentByClass<UMusubiAuthorityComponent>();
 		if (!A || A->IsOwned()) return; // we are the authority now; the state is ours
-		const TSharedPtr<FJsonObject>* Obj = nullptr;
-		if (Value.Value.IsValid() && Value.Value->TryGetObject(Obj) && Obj) WeakSelf->Bridge->ApplyBinary(WeakActor.Get(), *Obj, WeakSelf->Sim.Get());
+		WeakSelf->Bridge->ApplyBinary(WeakActor.Get(), Value, WeakSelf->Sim.Get());
 	});
 	// a ghost spawned mid-stream: the last keyframe, then the cumulative delta on top of it = the owner's current state
 	for (const TCHAR* Name : { TEXT("iris"), TEXT("iris.d") })
 		if (const FMusubiJson* Have = Auth->FindComponent(Name))
 		{
-			const TSharedPtr<FJsonObject>* Obj = nullptr;
-			if (Bridge && Have->Value.IsValid() && Have->Value->TryGetObject(Obj) && Obj) Bridge->ApplyBinary(Actor, *Obj, Sim.Get());
+			if (Bridge) Bridge->ApplyBinary(Actor, *Have, Sim.Get());
 		}
 }
