@@ -609,4 +609,8 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    Status: 9b shipped — node relay (`net_*`, routed by entity like inputs, re-home on handover completion,
    ws test `net_relay_follows_the_entity_across_a_handover`) and `MusubiNet` (driver + connection, implicit open
    on the server, `net_rehome` → reconnect v1), UBT green on 5.8.4. Open in 9b: in-place rehome with actor adoption,
-   `?MusubiResume` token, 5.7.4/5.3.2 builds of the module.
+   `?MusubiResume` token, 5.3.2 build of the module (5.7.4 green).
+   9c in progress: `UMusubiIrisExportSubsystem` (MusubiIrisImpl, dedicated servers) now creates the second
+   `UReplicationSystem` with `UMusubiReplicationBridge`, registers owned entity actors as root objects and ticks it
+   per simulator tick — the phase-6 bridge is live for the first time (UBT 5.7.4). Binary Iris state in `iris` and
+   ghost apply still pending (JSON mirror meanwhile).

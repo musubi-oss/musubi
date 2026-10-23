@@ -61,6 +61,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Musubi|Simulator") void Start();
 	UFUNCTION(BlueprintCallable, Category = "Musubi|Simulator") void Stop();
 	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") bool IsRunning() const { return bRunning; }
+	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") int32 GetHz() const { return Hz; }
 	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") FString GetSimulatorId() const { return SimId.ToString(); }
 	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") FMusubiSimulatorStats GetStats() const { return Stats; }
 	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") TArray<FString> LeasedCells() const;
@@ -111,6 +112,10 @@ public:
 	FMusubiSpawnEntityActor SpawnEntityActor;
 	/** Every event, after the module handled it. */
 	FMusubiSimEventDelegate OnSimEvent;
+	/** Start of every simulator tick (before owned actors are collected into `apply`): exporters hook here. */
+	FSimpleMulticastDelegate OnSimTicked;
+	/** The simulator started / stopped (C++ listeners such as the Iris exporter). */
+	FSimpleMulticastDelegate OnStarted, OnStopped;
 
 	/** Engine packet relay (`MusubiNet`): answer a `net_packet` event on the same conn/session. */
 	void NetSendPacket(uint64 Conn, const FMusubiJson& Session, TArray<uint8>&& Data);

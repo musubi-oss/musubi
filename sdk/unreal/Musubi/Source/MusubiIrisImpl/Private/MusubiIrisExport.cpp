@@ -1,0 +1,121 @@
+#include "MusubiIrisExport.h"
+
+#include "Engine/GameInstance.h"
+#include "GameFramework/Actor.h"
+#include "Iris/ReplicationSystem/ObjectReplicationBridge.h"
+#include "Iris/ReplicationSystem/ReplicationBridgeTypes.h"
+#include "Iris/ReplicationSystem/ReplicationSystem.h"
+#include "Iris/ReplicationSystem/ReplicationView.h"
+#include "Misc/EngineVersionComparison.h"
+#include "MusubiAuthorityComponent.h"
+#include "MusubiIrisModule.h"
+#include "MusubiNetObjectFactory.h"
+#include "MusubiReplicationBridge.h"
+#include "MusubiSimulatorSubsystem.h"
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+using FMusubiRootParams = UE::Net::FRootObjectReplicationParams;
+#else
+using FMusubiRootParams = UObjectReplicationBridge::FRootObjectReplicationParams;
+#endif
+
+bool UMusubiIrisExportSubsystem::ShouldCreateSubsystem(UObject* Outer) const
+{
+	return IsRunningDedicatedServer() && Super::ShouldCreateSubsystem(Outer);
+}
+
+void UMusubiIrisExportSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+	UMusubiSimulatorSubsystem* S = Collection.InitializeDependency<UMusubiSimulatorSubsystem>();
+	if (!S) return;
+	Sim = S;
+	StartedHandle = S->OnStarted.AddUObject(this, &UMusubiIrisExportSubsystem::OnStarted);
+	StoppedHandle = S->OnStopped.AddUObject(this, &UMusubiIrisExportSubsystem::OnStopped);
+	S->OnEntitySpawned.AddDynamic(this, &UMusubiIrisExportSubsystem::OnEntitySpawned);
+	S->OnEntityDespawned.AddDynamic(this, &UMusubiIrisExportSubsystem::OnEntityDespawned);
+	if (S->IsRunning()) OnStarted();
+}
+
+void UMusubiIrisExportSubsystem::Deinitialize()
+{
+	OnStopped();
+	if (UMusubiSimulatorSubsystem* S = Sim.Get())
+	{
+		S->OnStarted.Remove(StartedHandle);
+		S->OnStopped.Remove(StoppedHandle);
+		S->OnEntitySpawned.RemoveDynamic(this, &UMusubiIrisExportSubsystem::OnEntitySpawned);
+		S->OnEntityDespawned.RemoveDynamic(this, &UMusubiIrisExportSubsystem::OnEntityDespawned);
+	}
+	Super::Deinitialize();
+}
+
+void UMusubiIrisExportSubsystem::OnStarted()
+{
+	if (System) return;
+	UMusubiSimulatorSubsystem* S = Sim.Get();
+	if (!S) return;
+	FactoryId = UE::Net::FNetObjectFactoryRegistry::GetFactoryIdFromName(UMusubiNetObjectFactory::FactoryName);
+	Bridge = NewObject<UMusubiReplicationBridge>(this);
+	UReplicationSystem::FReplicationSystemParams Params;
+	Params.ReplicationBridge = Bridge;
+	Params.bIsServer = true;
+	Params.bAllowObjectReplication = true;
+	System = UE::Net::FReplicationSystemFactory::CreateReplicationSystem(Params);
+	if (!System)
+	{
+		UE_LOG(LogMusubiIris, Error, TEXT("could not create the export ReplicationSystem"));
+		Bridge = nullptr;
+		return;
+	}
+	// one pseudo connection that sees everything: nothing is written to a wire, the bridge does the
+	// work in PreSendUpdate, but Iris only polls/quantizes state that some connection could receive
+	System->AddConnection(1);
+	UE::Net::FReplicationView View;
+	View.Views.AddDefaulted(); // position/direction only; no filters are configured on this system, so one view sees all
+	System->SetReplicationView(1, View);
+	TickHandle = S->OnSimTicked.AddUObject(this, &UMusubiIrisExportSubsystem::OnTick);
+	UE_LOG(LogMusubiIris, Log, TEXT("export ReplicationSystem %u up (bridge %s)"), System->GetId(), *Bridge->GetName());
+}
+
+void UMusubiIrisExportSubsystem::OnStopped()
+{
+	if (UMusubiSimulatorSubsystem* S = Sim.Get()) S->OnSimTicked.Remove(TickHandle);
+	Handles.Reset();
+	if (System)
+	{
+		UE::Net::FReplicationSystemFactory::DestroyReplicationSystem(System);
+		System = nullptr;
+	}
+	Bridge = nullptr;
+}
+
+void UMusubiIrisExportSubsystem::OnTick()
+{
+	if (!System) return;
+	UMusubiSimulatorSubsystem* S = Sim.Get();
+	const float Dt = S && S->GetHz() > 0 ? 1.0f / (float)S->GetHz() : 1.0f / 30.0f;
+	System->NetUpdate(Dt);
+	System->TickPostReceive();
+	System->SendUpdate([](TArrayView<uint32>) {});
+	System->PostSendUpdate();
+}
+
+void UMusubiIrisExportSubsystem::OnEntitySpawned(const FString& EntityId, AActor* Actor)
+{
+	if (!System || !Bridge || !Actor) return;
+	UMusubiAuthorityComponent* Auth = Actor->FindComponentByClass<UMusubiAuthorityComponent>();
+	if (!Auth || !Auth->IsOwned() || Handles.Contains(Actor)) return;
+	FMusubiRootParams P;
+	P.bNeedsWorldLocationUpdate = true;
+	const UE::Net::FNetRefHandle H = Bridge->StartReplicatingRootObject(Actor, P, FactoryId);
+	if (H.IsValid()) Handles.Add(Actor, H);
+	else UE_LOG(LogMusubiIris, Warning, TEXT("entity %s: Iris refused %s as a root object"), *EntityId, *Actor->GetName());
+}
+
+void UMusubiIrisExportSubsystem::OnEntityDespawned(const FString& EntityId, AActor* Actor)
+{
+	if (!Bridge || !Actor) return;
+	UE::Net::FNetRefHandle H;
+	if (Handles.RemoveAndCopyValue(Actor, H) && H.IsValid()) Bridge->StopReplicatingNetRefHandle(H, EEndReplicationFlags::Destroy);
+}

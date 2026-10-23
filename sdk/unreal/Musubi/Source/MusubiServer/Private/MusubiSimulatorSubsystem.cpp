@@ -92,6 +92,7 @@ void UMusubiSimulatorSubsystem::Start()
 		return;
 	}
 	bRunning = true;
+	OnStarted.Broadcast();
 	SimId = NewSimId();
 	Link = MakeShared<FMusubiSimStream>();
 	TWeakObjectPtr<UMusubiSimulatorSubsystem> Weak(this);
@@ -121,6 +122,7 @@ void UMusubiSimulatorSubsystem::Start()
 
 void UMusubiSimulatorSubsystem::Stop()
 {
+	if (bRunning) OnStopped.Broadcast();
 	if (!bRunning) return;
 	bRunning = false;
 	FTSTicker::GetCoreTicker().RemoveTicker(TickerHandle);
@@ -157,6 +159,7 @@ bool UMusubiSimulatorSubsystem::EngineTick(float DeltaSeconds)
 
 void UMusubiSimulatorSubsystem::SimTick()
 {
+	OnSimTicked.Broadcast();
 	for (const FMusubiSimFrameTick& F : Inbox) ApplyFrame(F);
 	Inbox.Reset();
 	if (!Link.IsValid() || !Link->IsOpen()) return;
