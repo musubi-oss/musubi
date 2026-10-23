@@ -11,6 +11,8 @@
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FMusubiOnAuthorityComponentChanged, const FString&, Name, const FString&, ValueJson);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMusubiOnAuthorityChanged, bool, bOwned);
+/** Native: a component value arrived from the node (after it is stored). */
+DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiOnComponentApplied, const FString& /*Name*/, const FMusubiJson& /*Value*/);
 
 UCLASS(ClassGroup = (Musubi), meta = (BlueprintSpawnableComponent))
 class MUSUBISERVER_API UMusubiAuthorityComponent : public UActorComponent
@@ -58,6 +60,7 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category = "Musubi|Authority") FMusubiOnAuthorityComponentChanged OnComponentChanged;
 	UPROPERTY(BlueprintAssignable, Category = "Musubi|Authority") FMusubiOnAuthorityChanged OnAuthorityChanged;
+	FMusubiOnComponentApplied OnComponentApplied;
 
 	/** Component names the module writes itself on handover (velocity restore); projects should not use them. */
 	static const TCHAR* VelocityComponent() { return TEXT("musubi.vel"); }

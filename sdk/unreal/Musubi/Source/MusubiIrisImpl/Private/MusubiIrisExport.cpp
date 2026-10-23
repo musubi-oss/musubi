@@ -34,6 +34,7 @@ void UMusubiIrisExportSubsystem::Initialize(FSubsystemCollectionBase& Collection
 	StoppedHandle = S->OnStopped.AddUObject(this, &UMusubiIrisExportSubsystem::OnStopped);
 	S->OnEntitySpawned.AddDynamic(this, &UMusubiIrisExportSubsystem::OnEntitySpawned);
 	S->OnEntityDespawned.AddDynamic(this, &UMusubiIrisExportSubsystem::OnEntityDespawned);
+	S->OnGhostSpawned.AddDynamic(this, &UMusubiIrisExportSubsystem::OnGhostSpawned);
 	if (S->IsRunning()) OnStarted();
 }
 
@@ -118,4 +119,27 @@ void UMusubiIrisExportSubsystem::OnEntityDespawned(const FString& EntityId, AAct
 	if (!Bridge || !Actor) return;
 	UE::Net::FNetRefHandle H;
 	if (Handles.RemoveAndCopyValue(Actor, H) && H.IsValid()) Bridge->StopReplicatingNetRefHandle(H, EEndReplicationFlags::Destroy);
+}
+
+// Ghosts: every `iris` value the node delivers for this actor goes through the bridge into its UPROPERTYs.
+void UMusubiIrisExportSubsystem::OnGhostSpawned(const FString&, AActor* Actor)
+{
+	if (!Actor) return;
+	UMusubiAuthorityComponent* Auth = Actor->FindComponentByClass<UMusubiAuthorityComponent>();
+	if (!Auth) return;
+	TWeakObjectPtr<AActor> WeakActor = Actor;
+	TWeakObjectPtr<UMusubiIrisExportSubsystem> WeakSelf = this;
+	Auth->OnComponentApplied.AddLambda([WeakActor, WeakSelf](const FString& Name, const FMusubiJson& Value)
+	{
+		if (Name != TEXT("iris") || !WeakActor.IsValid() || !WeakSelf.IsValid() || !WeakSelf->Bridge) return;
+		UMusubiAuthorityComponent* A = WeakActor->FindComponentByClass<UMusubiAuthorityComponent>();
+		if (!A || A->IsOwned()) return; // we are the authority now; the state is ours
+		const TSharedPtr<FJsonObject>* Obj = nullptr;
+		if (Value.Value.IsValid() && Value.Value->TryGetObject(Obj) && Obj) WeakSelf->Bridge->ApplyBinary(WeakActor.Get(), *Obj);
+	});
+	if (const FMusubiJson* Have = Auth->FindComponent(TEXT("iris")))
+	{
+		const TSharedPtr<FJsonObject>* Obj = nullptr;
+		if (Bridge && Have->Value.IsValid() && Have->Value->TryGetObject(Obj) && Obj) Bridge->ApplyBinary(Actor, *Obj);
+	}
 }

@@ -103,6 +103,7 @@ bool UMusubiAuthorityComponent::ApplyFromNode(const FMusubiWorldEntity& E)
 		T.Version = C.version;
 		bChanged = true;
 		OnComponentChanged.Broadcast(C.name, C.value.ToText());
+		OnComponentApplied.Broadcast(C.name, T.Value);
 	}
 	return bChanged;
 }

@@ -13,6 +13,7 @@
 #include "Iris/ReplicationState/ReplicationStateDescriptorBuilder.h"
 #include "Iris/ReplicationSystem/ReplicationOperations.h"
 #include "Iris/Serialization/NetBitStreamWriter.h"
+#include "Iris/Serialization/NetBitStreamReader.h"
 #include "Iris/Serialization/NetSerializationContext.h"
 #include "Misc/Base64.h"
 
@@ -303,4 +304,63 @@ void UMusubiReplicationBridge::OnProtocolMismatchReported(FNetRefHandle RefHandl
 	if (const FTracked* T = Tracked.Find(RefHandle))
 		if (UMusubiAuthorityComponent* Auth = T->Authority.Get())
 			UE_LOG(LogMusubiIris, Warning, TEXT("protocol mismatch on entity %s (conn %u): client build does not match server replicated layout"), *Auth->GetEntityId(), ConnectionId);
+}
+
+bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris)
+{
+	if (!Obj || !Iris.IsValid()) return false;
+	const TArray<TSharedPtr<FJsonValue>>* States = nullptr;
+	if (!Iris->TryGetArrayField(TEXT("s"), States) || !States) return false; // JSON mirror form, not ours
+	FString ClassPath;
+	if (Iris->TryGetStringField(TEXT("c"), ClassPath) && ClassPath != Obj->GetClass()->GetPathName())
+	{
+		UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state is for %s, ghost is %s — skipped"), *Obj->GetName(), *ClassPath, *Obj->GetClass()->GetPathName());
+		return false;
+	}
+	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
+	bool bApplied = false;
+	for (const TSharedPtr<FJsonValue>& V : *States)
+	{
+		const TSharedPtr<FJsonObject>* St = nullptr;
+		if (!V.IsValid() || !V->TryGetObject(St) || !St) continue;
+		const int32 i = (int32)(*St)->GetNumberField(TEXT("i"));
+		const uint32 Bits = (uint32)(*St)->GetNumberField(TEXT("bits"));
+		TArray<uint8> Bytes;
+		if (!Descs.IsValidIndex(i) || !FBase64::Decode((*St)->GetStringField(TEXT("b")), Bytes) || Bytes.Num() * 8 < (int32)Bits) continue;
+		const FReplicationStateDescriptor* D = Descs[i].GetReference();
+		if (!D || D->ObjectReferenceCount > 0) continue;
+		TArray<uint8> Internal, External;
+		Internal.SetNumZeroed(D->InternalSize);
+		External.SetNumZeroed(D->ExternalSize);
+		FNetBitStreamReader R;
+		R.InitBits(Bytes.GetData(), Bits);
+		FNetSerializationContext RCtx(&R);
+		FReplicationStateOperations::Deserialize(RCtx, Internal.GetData(), D);
+		if (R.IsOverflown() || RCtx.HasError())
+		{
+			UE_LOG(LogMusubiIris, Warning, TEXT("%s descriptor %d: bad iris state (%u bits)"), *Obj->GetName(), i, Bits);
+			FNetSerializationContext Ctx;
+			FReplicationStateOperations::FreeDynamicState(Ctx, Internal.GetData(), D);
+			continue;
+		}
+		FNetSerializationContext Ctx;
+		FReplicationStateOperations::Dequantize(Ctx, External.GetData(), Internal.GetData(), D);
+		for (uint32 m = 0; m < D->MemberCount; ++m)
+		{
+			const FProperty* P = D->MemberProperties ? D->MemberProperties[m] : nullptr;
+			if (!P) continue;
+			const uint16 ArrayIndex = D->MemberPropertyDescriptors ? D->MemberPropertyDescriptors[m].ArrayIndex : 0;
+			void* Dst = P->ContainerPtrToValuePtr<void>(Obj, ArrayIndex);
+			uint8* Src = External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset;
+			const bool bSame = P->Identical(Dst, Src);
+			P->CopySingleValue(Dst, Src);
+			P->DestroyValue(Src);
+			if (!bSame && D->MemberPropertyDescriptors)
+				if (const UFunction* Fn = D->MemberPropertyDescriptors[m].RepNotifyFunction)
+					if (Fn->NumParms == 0) Obj->ProcessEvent(const_cast<UFunction*>(Fn), nullptr);
+		}
+		FReplicationStateOperations::FreeDynamicState(Ctx, Internal.GetData(), D);
+		bApplied = true;
+	}
+	return bApplied;
 }

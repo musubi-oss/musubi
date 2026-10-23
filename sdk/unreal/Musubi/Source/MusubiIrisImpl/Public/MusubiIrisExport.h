@@ -38,6 +38,7 @@ private:
 	void OnTick();
 	UFUNCTION() void OnEntitySpawned(const FString& EntityId, AActor* Actor);
 	UFUNCTION() void OnEntityDespawned(const FString& EntityId, AActor* Actor);
+	UFUNCTION() void OnGhostSpawned(const FString& EntityId, AActor* Actor);
 
 	UPROPERTY() TObjectPtr<UReplicationSystem> System;
 	UPROPERTY() TObjectPtr<UMusubiReplicationBridge> Bridge;

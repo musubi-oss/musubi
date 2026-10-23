@@ -76,6 +76,10 @@ private:
 	bool ExportBinary(FTracked& T, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged);
 	void FreeStates(FTracked& T, UObject* Obj);
 
+public:
+	/** Ghost side: deserialize + dequantize an `iris` component (binary form) into Obj's UPROPERTYs, firing RepNotifies. */
+	bool ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris);
+
 	UMusubiSimulatorSubsystem* Simulator() const;
 	void Track(UE::Net::FNetRefHandle Handle, UObject* Object);
 	void Untrack(UE::Net::FNetRefHandle Handle, UObject* Object); // EDetachReason exists only since 5.8, so the reason is not part of the signature

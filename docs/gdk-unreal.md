@@ -618,4 +618,6 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    against the last export → `Serialize` into a bit stream; `{"c": class path, "s": [{"i", "bits", "b": base64}]}`,
    only changed descriptors per message. Descriptors with object references are excluded (resolving them needs
    `FInternalNetSerializationContext`, which is engine-private) — a class with nothing else falls back to the JSON
-   mirror. Ghost apply (Deserialize → Dequantize → UPROPERTY) still pending.
+   mirror. Ghosts: `UMusubiIrisExportSubsystem` hooks each ghost's `UMusubiAuthorityComponent::OnComponentApplied`
+   and runs `iris` values through `UMusubiReplicationBridge::ApplyBinary` (Deserialize → Dequantize → property copy,
+   RepNotify for changed members) — relayed servers now hold the real UPROPERTY state of foreign actors.
