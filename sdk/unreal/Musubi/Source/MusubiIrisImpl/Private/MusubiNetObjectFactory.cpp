@@ -109,15 +109,32 @@ void UMusubiNetObjectFactory::PostInstantiation(const FPostInstantiationContext&
 }
 
 // Iris says the remote object is gone; the Musubi side mirrors despawn through the bridge's detach path.
+static void MusubiFillWorldInfo(const AActor& A, UNetObjectFactory::FWorldInfoData& D)
+{
+	D.WorldLocation = A.GetActorLocation();
+	D.CullDistance = A.GetNetCullDistanceSquared() > 0.f ? FMath::Sqrt(A.GetNetCullDistanceSquared()) : 0.f;
+}
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 6
+void UMusubiNetObjectFactory::GetWorldInfo(const FWorldInfoContext& Context, FWorldInfoData& OutData)
+{
+	if (const AActor* A = Cast<AActor>(Context.Instance)) MusubiFillWorldInfo(*A, OutData);
+}
+void UMusubiNetObjectFactory::DestroyReplicatedObject(const FDestroyedContext& Context)
+{
+	if (AActor* A = Cast<AActor>(Context.DestroyedInstance))
+		if (Context.DestroyReason != EReplicationBridgeDestroyInstanceReason::DoNotDestroy)
+			A->Destroy();
+}
+#else
 TOptional<UNetObjectFactory::FWorldInfoData> UMusubiNetObjectFactory::GetWorldInfo(const FWorldInfoContext& Context) const
 {
 	const AActor* A = Cast<AActor>(Context.Instance);
 	if (!A) return NullOpt;
 	FWorldInfoData D;
-	D.WorldLocation = A->GetActorLocation();
-	D.CullDistance = A->GetNetCullDistanceSquared() > 0.f ? FMath::Sqrt(A->GetNetCullDistanceSquared()) : 0.f;
+	MusubiFillWorldInfo(*A, D);
 	return D;
 }
+#endif
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
 void UMusubiNetObjectFactory::FillRootObjectReplicationParams(const UE::Net::FRootObjectReplicationParamsContext& Context, UE::Net::FRootObjectReplicationParams& OutParams)
@@ -136,7 +153,7 @@ void UMusubiNetObjectFactory::DetachedFromReplication(const FDetachContext& Cont
 		if (Context.Reason != EDetachReason::Stopped) // Stopped = still alive locally, only no longer replicated
 			A->Destroy();
 }
-#else
+#elif ENGINE_MINOR_VERSION >= 7
 void UMusubiNetObjectFactory::DetachedFromReplication(const FDestroyedContext& Context)
 {
 	if (AActor* A = Cast<AActor>(Context.DestroyedInstance))

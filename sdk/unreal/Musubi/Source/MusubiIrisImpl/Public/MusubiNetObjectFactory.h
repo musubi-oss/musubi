@@ -36,16 +36,19 @@ public:
 	virtual FInstantiateResult InstantiateReplicatedObjectFromHeader(const FInstantiateContext& Context, const UE::Net::FNetObjectCreationHeader* Header) override;
 	virtual void PostInstantiation(const FPostInstantiationContext& Context) override;
 	// PURE_VIRTUAL in the engine = compiles without, fatal at the first call (seen live on 5.8: FillRootObjectReplicationParams)
-	virtual TOptional<FWorldInfoData> GetWorldInfo(const FWorldInfoContext& Context) const override;
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
-	virtual void FillRootObjectReplicationParams(const UE::Net::FRootObjectReplicationParamsContext& Context, UE::Net::FRootObjectReplicationParams& OutParams) override;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 6
+	// 5.5/5.6: out-parameter world info, poll frequency not a factory concern, destruction via DestroyReplicatedObject
+	virtual void GetWorldInfo(const FWorldInfoContext& Context, FWorldInfoData& OutData) override;
+	virtual void DestroyReplicatedObject(const FDestroyedContext& Context) override;
 #else
-	virtual float GetPollFrequency(UE::Net::FNetRefHandle RootObjectHandle, UObject* RootObjectInstance) override { return 100.0f; }
-#endif
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+	virtual TOptional<FWorldInfoData> GetWorldInfo(const FWorldInfoContext& Context) const override;
+#if ENGINE_MINOR_VERSION >= 8
+	virtual void FillRootObjectReplicationParams(const UE::Net::FRootObjectReplicationParamsContext& Context, UE::Net::FRootObjectReplicationParams& OutParams) override;
 	// 5.8: FDestroyedContext is deprecated, the pure virtual is the FDetachContext overload
 	virtual void DetachedFromReplication(const FDetachContext& Context, const TOptional<FSubObjectDetachContext>& SubObjectContext) override;
 #else
+	virtual float GetPollFrequency(UE::Net::FNetRefHandle RootObjectHandle, UObject* RootObjectInstance) override { return 100.0f; }
 	virtual void DetachedFromReplication(const FDestroyedContext& Context) override;
+#endif
 #endif
 };

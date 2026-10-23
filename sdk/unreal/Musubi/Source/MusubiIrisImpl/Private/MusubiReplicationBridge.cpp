@@ -227,7 +227,10 @@ void UMusubiReplicationBridge::DisablePushDirtiness(UClass* Class)
 	{
 		if (FReplicationStateDescriptor* D = const_cast<FReplicationStateDescriptor*>(Ref.GetReference()))
 		{
-			EnumRemoveFlags(D->Traits, EReplicationStateTraits::HasPushBasedDirtiness | EReplicationStateTraits::HasFullPushBasedDirtiness);
+			EnumRemoveFlags(D->Traits, EReplicationStateTraits::HasPushBasedDirtiness);
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
+			EnumRemoveFlags(D->Traits, EReplicationStateTraits::HasFullPushBasedDirtiness);
+#endif
 		}
 	}
 }
