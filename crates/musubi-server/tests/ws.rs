@@ -22466,3 +22466,158 @@ async fn engine_connection_keeps_the_cell_awake() {
         "cell hibernated after the connection closed: {seen:?}"
     );
 }
+
+/// Phase 9g-6b: `enc=cbor` turns the simulator stream into CBOR binary messages both ways; the
+/// `iris` blob a simulator writes as bytes comes back as bytes in the frame (no base64 on the
+/// wire), while the node keeps storing it as the base64 string JSON simulators see.
+#[tokio::test]
+async fn sim_stream_speaks_cbor_when_asked() {
+    use ciborium::Value as C;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let req = Request::post("/v1/server/worlds")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::from(
+            json!({"name": world, "config": {"cell_size": 100.0, "ghost_margin": 10.0, "hysteresis": 2.0}})
+                .to_string(),
+        ))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let sim = uuid::Uuid::now_v7();
+    let mut creq = format!("ws://{addr}/v1/server/worlds/{world}/stream?sim={sim}&enc=cbor")
+        .into_client_request()
+        .unwrap();
+    creq.headers_mut()
+        .insert("x-musubi-server-key", "defaultkey".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(creq).await.unwrap();
+    fn text(s: &str) -> C {
+        C::Text(s.to_owned())
+    }
+    fn get<'a>(m: &'a C, key: &str) -> Option<&'a C> {
+        m.as_map()?
+            .iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .map(|(_, v)| v)
+    }
+    fn enc(v: &C) -> Message {
+        let mut b = Vec::new();
+        ciborium::into_writer(v, &mut b).unwrap();
+        Message::Binary(b)
+    }
+    async fn next(ws: &mut Ws) -> C {
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Binary(b) => return ciborium::from_reader::<C, &[u8]>(&b[..]).unwrap(),
+                Message::Text(t) => panic!("text frame on a cbor stream: {t}"),
+                _ => {}
+            }
+        }
+    }
+    async fn reply(ws: &mut Ws, op: &str) -> C {
+        let t0 = std::time::Instant::now();
+        loop {
+            let v = next(ws).await;
+            if get(&v, "op").and_then(C::as_text) == Some(op) {
+                return v;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "no `{op}` reply: {v:?}"
+            );
+        }
+    }
+    let lease = C::Map(vec![
+        (text("op"), text("lease")),
+        (text("id"), C::Integer(1.into())),
+        (
+            text("cells"),
+            C::Array(vec![C::Map(vec![
+                (text("x"), C::Integer(0.into())),
+                (text("y"), C::Integer(0.into())),
+            ])]),
+        ),
+    ]);
+    ws.send(enc(&lease)).await.unwrap();
+    let r = reply(&mut ws, "lease").await;
+    assert_eq!(get(&r, "id"), Some(&C::Integer(1.into())), "{r:?}");
+    assert!(get(&r, "error").is_none(), "{r:?}");
+    let blob: Vec<u8> = vec![1, 2, 3, 250, 0, 255];
+    let spawn = C::Map(vec![
+        (text("op"), text("spawn")),
+        (text("id"), C::Integer(2.into())),
+        (text("x"), C::Float(5.0)),
+        (text("y"), C::Float(5.0)),
+        (
+            text("components"),
+            C::Map(vec![
+                (text("iris"), C::Bytes(blob.clone())),
+                (text("hp"), C::Integer(7.into())),
+            ]),
+        ),
+    ]);
+    ws.send(enc(&spawn)).await.unwrap();
+    let r = reply(&mut ws, "spawn").await;
+    assert!(get(&r, "error").is_none(), "{r:?}");
+    // the frame carries the entity with `iris` as a byte string and `hp` as a number
+    let t0 = std::time::Instant::now();
+    let (iris, hp) = loop {
+        let f = next(&mut ws).await;
+        let mut found = None;
+        if let Some(cells) = get(&f, "cells").and_then(C::as_array) {
+            for cell in cells {
+                for e in get(cell, "owned")
+                    .and_then(C::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let comps = get(e, "components")
+                        .and_then(C::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let iris = comps
+                        .iter()
+                        .find(|c| get(c, "name").and_then(C::as_text) == Some("iris"));
+                    let hp = comps
+                        .iter()
+                        .find(|c| get(c, "name").and_then(C::as_text) == Some("hp"));
+                    if let (Some(i), Some(h)) = (iris, hp) {
+                        found = Some((
+                            get(i, "value").cloned().unwrap(),
+                            get(h, "value").cloned().unwrap(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(x) = found {
+            break x;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "no entity frame: {f:?}"
+        );
+    };
+    assert_eq!(
+        iris,
+        C::Bytes(blob),
+        "iris must be a cbor byte string, not base64 text"
+    );
+    assert_eq!(hp, C::Integer(7.into()));
+    // the same entity through the JSON API: the blob is the base64 string JSON clients expect
+    let req = Request::get(format!("/v1/server/worlds/{world}/entities"))
+        .header("x-musubi-server-key", "defaultkey")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let txt = String::from_utf8_lossy(&body);
+    assert!(txt.contains("AQID+gD/"), "json view keeps base64: {txt}");
+}

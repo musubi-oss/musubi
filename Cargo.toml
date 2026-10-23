@@ -69,6 +69,7 @@ hex = "0.4"
 include_dir = "0.7"
 regex = "1"
 base64 = "0.22"
+ciborium = "0.2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 tokio-tungstenite = "0.24"

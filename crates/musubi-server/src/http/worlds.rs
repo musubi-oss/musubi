@@ -5,7 +5,7 @@
 // Handlers return a ready `Response` (redirect) on the error path; axum's Response is large.
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{OriginalUri, Path, Query, State};
@@ -219,11 +219,147 @@ struct SimQuery {
     /// every entity of every leased cell (`delta=1`).
     #[serde(default)]
     delta: Option<String>,
+    /// Stream only: `enc=cbor` — frames and replies are CBOR binary WebSocket messages, and
+    /// commands may be sent as CBOR binary messages (JSON text is still accepted on the same
+    /// socket). JSON strings that are base64 blobs travel as CBOR byte strings, see `bin`.
+    #[serde(default)]
+    enc: Option<String>,
+    /// Stream only, with `enc=cbor`: comma-separated component names whose values are base64
+    /// strings in JSON and go over the wire as raw CBOR byte strings (default `iris,iris.d`,
+    /// the GDK's binary Iris state, docs/gdk-unreal.md §9.9).
+    #[serde(default)]
+    bin: Option<String>,
 }
 
 impl SimQuery {
     fn delta(&self) -> bool {
         matches!(self.delta.as_deref(), Some("1" | "true"))
+    }
+
+    fn codec(&self) -> SimCodec {
+        if !matches!(self.enc.as_deref(), Some("cbor")) {
+            return SimCodec::Json;
+        }
+        let names = self.bin.as_deref().unwrap_or("iris,iris.d");
+        SimCodec::Cbor(
+            names
+                .split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+}
+
+/// How a simulator stream is framed on the wire (phase 9g-6b). JSON text is the default; `cbor`
+/// is the same structure as binary WebSocket messages, with the named components' base64 strings
+/// as byte strings — the GDK's `iris`/`iris.d` blobs then cost their bytes, not 4/3 of them
+/// inside a JSON string. The node still stores component values as JSON text; the codec
+/// converts at the socket.
+#[derive(Clone, Debug)]
+pub(crate) enum SimCodec {
+    Json,
+    Cbor(HashSet<String>),
+}
+
+impl SimCodec {
+    fn message(&self, v: &Value) -> Message {
+        match self {
+            SimCodec::Json => Message::Text(v.to_string().into()),
+            SimCodec::Cbor(bin) => {
+                let mut buf = Vec::new();
+                ciborium::into_writer(&json_to_cbor(v, bin, false), &mut buf)
+                    .expect("cbor encoding of a json value cannot fail");
+                Message::Binary(buf.into())
+            }
+        }
+    }
+}
+
+/// JSON → CBOR; `as_bytes` marks a string that is a base64 blob and goes as a byte string. A
+/// `WorldComponent` object (`{name, value, version}`) whose `name` is in `bin`, and a map key
+/// that is itself a binary component name (`components: {iris: ...}` in commands), are the two
+/// places that happens. A string that is not valid base64 stays text.
+fn json_to_cbor(v: &Value, bin: &HashSet<String>, as_bytes: bool) -> ciborium::Value {
+    use base64::Engine as _;
+    use ciborium::Value as C;
+    match v {
+        Value::Null => C::Null,
+        Value::Bool(b) => C::Bool(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                C::Integer(i.into())
+            } else if let Some(u) = n.as_u64() {
+                C::Integer(u.into())
+            } else {
+                C::Float(n.as_f64().unwrap_or(f64::NAN))
+            }
+        }
+        Value::String(t) => {
+            if as_bytes {
+                match base64::engine::general_purpose::STANDARD.decode(t) {
+                    Ok(b) => C::Bytes(b),
+                    Err(_) => C::Text(t.clone()),
+                }
+            } else {
+                C::Text(t.clone())
+            }
+        }
+        Value::Array(a) => C::Array(a.iter().map(|x| json_to_cbor(x, bin, false)).collect()),
+        Value::Object(o) => {
+            let named = o.contains_key("value")
+                && o.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| bin.contains(n));
+            C::Map(
+                o.iter()
+                    .map(|(k, x)| {
+                        let b = (named && k == "value") || bin.contains(k.as_str());
+                        (C::Text(k.clone()), json_to_cbor(x, bin, b))
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// CBOR → JSON: byte strings become the base64 strings the node stores and JSON clients see.
+fn cbor_to_json(v: ciborium::Value) -> Value {
+    use base64::Engine as _;
+    use ciborium::Value as C;
+    match v {
+        C::Null => Value::Null,
+        C::Bool(b) => Value::Bool(b),
+        C::Integer(i) => {
+            let i: i128 = i.into();
+            if let Ok(x) = i64::try_from(i) {
+                Value::from(x)
+            } else if let Ok(x) = u64::try_from(i) {
+                Value::from(x)
+            } else {
+                Value::from(i as f64)
+            }
+        }
+        C::Float(f) => serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        C::Bytes(b) => Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
+        C::Text(t) => Value::String(t),
+        C::Array(a) => Value::Array(a.into_iter().map(cbor_to_json).collect()),
+        C::Map(m) => Value::Object(
+            m.into_iter()
+                .map(|(k, x)| {
+                    let k = match k {
+                        C::Text(t) => t,
+                        other => format!("{other:?}"),
+                    };
+                    (k, cbor_to_json(x))
+                })
+                .collect(),
+        ),
+        C::Tag(_, inner) => cbor_to_json(*inner),
+        _ => Value::Null,
     }
 }
 
@@ -902,7 +1038,8 @@ async fn stream(
     ws: WebSocketUpgrade,
 ) -> Result<Response, Response> {
     ensure_shard(&s, &w, &uri).await?;
-    Ok(ws.on_upgrade(move |socket| serve_stream(s, w, q.sim, q.delta(), uri, socket)))
+    let codec = q.codec();
+    Ok(ws.on_upgrade(move |socket| serve_stream(s, w, q.sim, q.delta(), codec, uri, socket)))
 }
 
 async fn serve_stream(
@@ -910,6 +1047,7 @@ async fn serve_stream(
     w: String,
     sim: Uuid,
     delta: bool,
+    codec: SimCodec,
     uri: OriginalUri,
     socket: WebSocket,
 ) {
@@ -950,17 +1088,29 @@ async fn serve_stream(
                     Ok(f) => f,
                     Err(e) => json!({ "type": "error", "tick": t, "error": e.to_string() }),
                 };
-                slot.send(Message::Text(frame.to_string().into()));
+                slot.send(codec.message(&frame));
             }
             m = source.next() => {
                 match m {
                     Some(Ok(Message::Text(txt))) => {
-                        let reply = stream_command(&s, &w, sim, &uri, txt.as_str()).await;
-                        if out.send(Message::Text(reply.to_string().into())).await.is_err() {
+                        let reply = match serde_json::from_str::<Value>(&txt) {
+                            Ok(cmd) => stream_command(&s, &w, sim, &uri, cmd).await,
+                            Err(e) => json!({ "error": format!("bad command: {e}") }),
+                        };
+                        if out.send(codec.message(&reply)).await.is_err() {
                             break;
                         }
                     }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => {}
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let reply = match ciborium::from_reader::<ciborium::Value, _>(bytes.as_ref()) {
+                            Ok(cmd) => stream_command(&s, &w, sim, &uri, cbor_to_json(cmd)).await,
+                            Err(e) => json!({ "error": format!("bad cbor command: {e}") }),
+                        };
+                        if out.send(codec.message(&reply)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 }
             }
@@ -1015,11 +1165,8 @@ fn redirected(mut reply: Value, r: Result<(), Response>) -> Result<Value, Value>
     }
 }
 
-async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt: &str) -> Value {
-    let cmd: Value = match serde_json::from_str(txt) {
-        Ok(v) => v,
-        Err(e) => return json!({ "error": format!("bad command: {e}") }),
-    };
+async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, cmd: Value) -> Value {
+    let cmd_id = cmd.get("id").cloned();
     let op = cmd["op"].as_str().unwrap_or("").to_string();
     let mut reply = json!({ "op": op });
     if let Some(id) = cmd.get("id").cloned() {
@@ -1217,10 +1364,7 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
         Ok(v) => v,
         Err(e) => {
             let mut reply = json!({ "op": op, "error": e.to_string() });
-            if let Some(id) = serde_json::from_str::<Value>(txt)
-                .ok()
-                .and_then(|v| v.get("id").cloned())
-            {
+            if let Some(id) = cmd_id {
                 reply["id"] = id;
             }
             reply

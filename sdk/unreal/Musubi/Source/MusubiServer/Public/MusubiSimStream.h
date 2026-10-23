@@ -24,6 +24,8 @@ public:
 	struct FConfig
 	{
 		bool bDelta = true;
+		/** `enc=cbor`: CBOR binary frames both ways, iris blobs as byte strings (phase 9g-6b); false = JSON text. */
+		bool bCbor = true;
 		double ReplyTimeoutSec = 10.0;
 		double BackoffMinSec = 0.5, BackoffMaxSec = 10.0;
 		bool bAutoReconnect = true;
@@ -46,7 +48,7 @@ public:
 	FMusubiSimStreamErrorEvent OnFrameError;
 	FMusubiSimStreamStateEvent OnStateChanged;
 
-	struct FStats { uint64 FramesIn = 0, CommandsOut = 0, RepliesIn = 0, Errors = 0, Reconnects = 0; double LastFrameAt = 0; };
+	struct FStats { uint64 FramesIn = 0, CommandsOut = 0, RepliesIn = 0, Errors = 0, Reconnects = 0, CborFramesIn = 0, CborBytesIn = 0; double LastFrameAt = 0; };
 	const FStats& GetStats() const { return Stats; }
 
 private:
@@ -65,6 +67,9 @@ private:
 	void Open();
 	void SetState(EMusubiSimStreamState S);
 	void HandleText(const FString& Text);
+	void HandleBinary(const TArray<uint8>& Bytes);
+	void HandleFrame(const TSharedPtr<FJsonValue>& J, int32 WireBytes);
+	TArray<uint8> RawBuf;
 	void FailPending(const FString& Why);
 	void ScheduleReconnect();
 };

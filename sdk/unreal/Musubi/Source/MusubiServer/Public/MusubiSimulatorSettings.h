@@ -32,6 +32,8 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Levels") float CellLevelStride = 0.f;
 	/** Ask the node for per-cell deltas instead of full views every tick. */
 	UPROPERTY(Config, EditAnywhere, Category = "Simulation") bool bDeltaFrames = true;
+	/** Simulator stream as CBOR binary WebSocket messages (iris blobs as raw bytes) instead of JSON text; see docs §9.9. */
+	UPROPERTY(Config, EditAnywhere, Category = "Simulation") bool bBinaryStream = true;
 	/** Cells to lease at start as "x,y" (empty = wait for the node to assign). */
 	UPROPERTY(Config, EditAnywhere, Category = "Simulation") TArray<FString> InitialCells;
 	/** Start the loop as soon as the game instance exists (dedicated server builds). */

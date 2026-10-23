@@ -6,6 +6,7 @@
 #   tools/nitl.sh 5.3.2 [seconds]
 #   NITL_PROJECT=target/ue/demo-5.8.4/MusubiThirdPerson NITL_MAP=/Game/ThirdPerson/Lvl_ThirdPerson NITL_SPAWN_Z=300 \
 #     tools/nitl.sh 5.8.4 [seconds]      # the same run on the Third Person demo (after tools/demo-build.sh 5.8.4)
+#   NITL_LOGCMDS_EXTRA=", LogWebSockets VeryVerbose" tools/nitl.sh 5.8.4   # extra -LogCmds for the UE processes
 set -euo pipefail
 VER="${1:?engine version, e.g. 5.3.2}"; DUR="${2:-90}"
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -54,7 +55,7 @@ ue() { # name, extra args...
   local UPATH="/out/proj-$N/$UPROJ" MOUNT=(); if [ -n "${NITL_PROJECT:-}" ]; then MOUNT=(-v "$OUT/proj-$N:/out/$PNAME"); UPATH="/out/$PNAME/$UPROJ"; fi
   docker run -d --name "$N" --network host -u "$(id -u):$(id -g)" -e HOME="/out/home-$N" -v "$OUT:/out" "${MOUNT[@]}" "$IMG" \
     /home/ue4/UnrealEngine/Engine/Binaries/Linux/UnrealEditor "$UPATH" "$MAP" \
-    -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput -log -LogCmds="LogMusubiServer VeryVerbose, LogMusubiNet Verbose, LogMusubiMesh Verbose, LogNet Verbose" \
+    -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput -log -LogCmds="LogMusubiServer VeryVerbose, LogMusubiNet Verbose, LogMusubiMesh Verbose, LogNet Verbose${NITL_LOGCMDS_EXTRA:-}" \
     -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" "$@" >/dev/null
 }
 echo "== servers"

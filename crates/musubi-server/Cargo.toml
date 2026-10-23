@@ -34,6 +34,7 @@ musubi-integrations.workspace = true
 musubi-economy.workspace = true
 parking_lot = "0.12"
 base64.workspace = true
+ciborium.workspace = true
 ring.workspace = true
 x509-parser.workspace = true
 musubi-proto.workspace = true

@@ -3090,6 +3090,7 @@ dependencies = [
  "bytes",
  "cbc",
  "chrono",
+ "ciborium",
  "clap",
  "crc32fast",
  "cron",

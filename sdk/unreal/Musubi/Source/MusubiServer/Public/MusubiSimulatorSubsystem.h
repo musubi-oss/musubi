@@ -165,6 +165,7 @@ private:
 	FString ApiBase, ServerKey, WorldName;
 	int32 Capacity = 4, Hz = 30;
 	bool bDelta = true;
+	bool bCbor = true;
 	float PositionEpsilon = 0.5f;
 	FString HeightComponent;
 	TArray<FString> InitialCells;

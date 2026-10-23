@@ -42,6 +42,7 @@ void UMusubiSimulatorSubsystem::LoadSettings()
 	Hz = FMath::Clamp(S->Hz, 1, 240);
 	HistoryTicks = FMath::Clamp(S->HistoryTicks, 2, 1024);
 	bDelta = S->bDeltaFrames;
+	bCbor = S->bBinaryStream;
 	PositionEpsilon = S->PositionEpsilon;
 	HeightComponent = S->HeightComponent;
 	InitialCells = S->InitialCells;
@@ -112,6 +113,7 @@ void UMusubiSimulatorSubsystem::Start()
 	});
 	FMusubiSimStream::FConfig Cfg;
 	Cfg.bDelta = bDelta;
+	Cfg.bCbor = bCbor;
 	Link->Connect(ApiBase, ServerKey, WorldName, SimId, Cfg);
 	Accum = 0;
 	StatsWindowStart = FPlatformTime::Seconds();

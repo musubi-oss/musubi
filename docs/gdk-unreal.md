@@ -687,11 +687,26 @@ NITL (5.8.4): on the pawn (`Steps`/`PushSteps` change every tick, inventory ever
 rest is the fixed per-descriptor framing, three descriptors per message), with the inventory still arriving on the
 ghost and surviving the handover.
 
-**What is still JSON/base64 and why (9g-6b, open).** The simulator stream between the node and an Unreal server is
-JSON text over one WebSocket (`SimFrame`/`SimCommand` are internally tagged, which postcard cannot encode), so the
-blob travels base64-encoded inside it and the node stores component values as JSON. Raw bytes end to end need a
-binary simulator stream (re-tagged frame types, binary WebSocket frames, a bytes component value in the node and in
-`WorldComponent`); that is tracked as 9g-6b and is independent of the GDK-side format above.
+**Binary simulator stream (phase 9g-6b).** The node ↔ Unreal-server simulator stream is one WebSocket; by default
+frames and commands are JSON text. With `enc=cbor` on the stream URL (`UMusubiSimulatorSettings::bBinaryStream`,
+default on, appends `&enc=cbor`) the node speaks CBOR (RFC 8949) in both directions: frames arrive as binary
+WebSocket messages, commands and replies likewise, and text commands are still accepted on a CBOR stream. The tagged
+structure of `SimFrame`/`SimCommand` is unchanged (CBOR maps with the JSON wire's keys, so the typed
+`FromJson`/`ToJson` layer in `MusubiSimWire.generated.cpp` is reused as is); the one representational difference is
+that component values whose names are in the binary set (`iris`, `iris.d` by default; `&bin=a,b` overrides) travel
+as CBOR byte strings instead of base64 text — in frames (`owned`/`ghosts` state, handover `state`) and in commands
+(`spawn`/`set` values). The GDK encodes with `FCborWriter`/decodes with `FCborReader` (`MusubiCbor` in
+`MusubiSimStream.cpp`), reassembling fragmented raw messages by `BytesRemaining`. Measured on the Third Person demo
+run (5.8.4, `tools/nitl.sh` with `NITL_PROJECT`): owner 12000 frames avg 423 B, non-owner 8400 frames avg 57 B, zero
+JSON frames, all 23 checks green. Engine behaviour that only the live run showed: `IWebSocket::OnRawMessage` fires for
+text frames too (bind exactly one of `OnMessage`/`OnRawMessage`); `FCborReader` reports the end of every container —
+finite ones included — as a synthetic Break context and counts a map's length in keys plus values; ciborium shrinks
+every lossless float to a 16-bit half (`300.0`, `0.5`), and `FCborContext` has no half accessor, so the decoder takes
+the two payload bytes the reader just consumed and converts them with `FFloat16`; `FCborWriter` never pops a
+zero-length container (it pops on the item that brings the count to 0), so an empty array/map is written indefinite +
+break (the plain NITL spawn has `components: {}` — the writer's destructor asserted). What is still JSON: the node keeps
+component values as JSON internally (the blob as base64) and `WorldComponent` in the REST API is JSON — the wire is
+binary end to end, a native bytes component value in storage/REST is the remaining piece.
 
 ### 9.10 Chaos run (phase 9g-7): loss + latency, a second client, the receiving server killed mid-handover
 
