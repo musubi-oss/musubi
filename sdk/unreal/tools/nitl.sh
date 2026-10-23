@@ -81,6 +81,7 @@ if [ "$CHAOS" = 1 ]; then
   sleep $(( DUR - ${KILLED:-0} - 10 > 20 ? DUR - ${KILLED:-0} - 10 : 20 ))
   curl -fsS "$API/v1/admin/dev/netsim" -H "x-musubi-server-key: $KEY" > "$OUT/netsim-after.json" 2>/dev/null
   curl -fsS "$API/v1/server/worlds/$WORLD" -H "x-musubi-server-key: $KEY" > "$OUT/world-end.json" 2>/dev/null
+  curl -fsS "$API/v1/server/worlds/$WORLD/entities/$ENTITY" -H "x-musubi-server-key: $KEY" > "$OUT/entity-end.json" 2>/dev/null
 else
   sleep "$DUR"
 fi
@@ -113,7 +114,7 @@ N1=$(echo "$BEFORE" | sed -n 's/.* name=\([^ ]*\).*/\1/p'); N2=$(echo "$AFTER" |
 if [ -n "$N1" ] && [ "$N1" != "-" ] && [ "$N1" = "$N2" ]; then echo "PASS nitl-c: PlayerState name survived the rehome ($N1)"; else echo "FAIL nitl-c: PlayerState name survived the rehome (before=$N1 after=$N2)"; ok=0; fi
 # the stable handle: taken from the first pawn, resolves to the live possessed pawn after the swap, exactly one actor change seen
 H=$(grep "nitl: handle " "$OUT/nitl-c.log" | tail -1 | sed 's/.*nitl: handle //')
-case "$H" in *"changes=1 live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome ($H)"; ok=0;; esac
+case "$H" in *"changes=1 live=1"|*"changes=$([ "$CHAOS" = 1 ] && echo 2 || echo 1) live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome ($H)"; ok=0;; esac
 # replicated components in the binary iris state: the ghost on s2 saw the inventory before owning, the new owner carried on from it
 EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | head -1 | grep -o "[0-9]*")
 if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components exported in the iris state ($EXPC)"; else echo "FAIL nitl-s1: replicated components exported in the iris state (${EXPC:-0})"; ok=0; fi

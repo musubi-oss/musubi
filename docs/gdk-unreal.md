@@ -713,10 +713,18 @@ What the run found and fixed:
   relay stayed on the dead owner. The node now tracks the last owner it re-homed each relayed entity to and sends
   `net_rehome` on any owner change (`relayed entity changed owner outside a handover`).
 
-**Open (next):** after the cancelled handover the inventory the new owner restored was stale (`inv=0 gold=10` on
-s2b against `inv=4 gold=120` on s1 at the completed handover) while the client later saw the new owner continue
-from a fresh count — the entity's component state the node holds after a cancel/retry needs the same scrutiny the
-actor path got; tracked as the first item of 9g-7b.
+**Found and fixed by the run (second pass):** the new owner restored a stale inventory (`inv=0 gold=10` against
+`inv=4 gold=120` on s1). The node's state was fresh (s1 kept exporting after the cancel); the entity simply arrived
+on s2b *already owned* — a handover completed into a server that never held its ghost — and the binary Iris state
+was only ever applied on the ghost path. `UMusubiIrisExportSubsystem::OnEntitySpawned` now applies the stored
+`iris` + `iris.d` to an owned spawn before registering it (live: s2b starts at `inv=4 gold=120`, the keyframe log
+line shows `t=1296 applied`).
+
+**Open (9g-7c):** after that owner-side restore the *client* of the new owner still saw `inv=0`: the FastArray was
+written through Iris dequantize, which does not bump the classic replication key, so the GameNetDriver never
+resends the items. Needs a post-restore hook (`MarkArrayDirty` from game code, or the bridge marking FastArray
+members) — tracked. In chaos mode the entity handle may also report two actor changes on the client (the
+cancelled handover's re-spawn), both resolve live.
 
 ## 10. Numbers, limits, failure behaviour
 

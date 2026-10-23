@@ -135,6 +135,10 @@ void UMusubiIrisExportSubsystem::OnEntitySpawned(const FString& EntityId, AActor
 	if (!System || !Bridge || !Actor) return;
 	UMusubiAuthorityComponent* Auth = Actor->FindComponentByClass<UMusubiAuthorityComponent>();
 	if (!Auth || !Auth->IsOwned() || Handles.Contains(Actor)) return;
+	// An entity that arrives already owned (handover completed into a server that never held its ghost, e.g. the
+	// receiver replaced a dead one) must start from the node's state, not from the class defaults.
+	for (const TCHAR* Name : { TEXT("iris"), TEXT("iris.d") })
+		if (const FMusubiJson* Have = Auth->FindComponent(Name)) Bridge->ApplyBinary(Actor, *Have, Sim.Get());
 	Bridge->DisablePushDirtiness(Actor->GetClass());
 #if ENGINE_MAJOR_VERSION > 5 || ENGINE_MINOR_VERSION >= 8
 	// 5.8: the root params moved to UNetObjectFactory; the overload taking them is deprecated
