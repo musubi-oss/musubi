@@ -4,7 +4,10 @@
 #include "Runtime/Launch/Resources/Version.h"
 
 #include "Iris/ReplicationSystem/ObjectReplicationBridge.h"
+#include "Iris/ReplicationState/ReplicationStateDescriptor.h"
 #include "Iris/ReplicationSystem/ReplicationBridgeTypes.h"
+
+class FJsonObject;
 
 #include "MusubiReplicationBridge.generated.h"
 
@@ -63,7 +66,15 @@ private:
 		TWeakObjectPtr<UObject> Object;
 		TWeakObjectPtr<UMusubiAuthorityComponent> Authority;
 		uint64 LastHash = 0;
+		struct FStateBuf { TArray<uint8> External, Internal, Last; bool bHasLast = false; };
+		TArray<FStateBuf> States; // one per class descriptor (binary export)
 	};
+	/** Class → Iris replication state descriptors built once (CDO as default state). */
+	TMap<TWeakObjectPtr<UClass>, TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>> ClassDescriptors;
+	const TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>& DescriptorsFor(UClass* Class);
+	/** Binary path: quantize + serialize each eligible descriptor state; false = nothing eligible (JSON fallback). */
+	bool ExportBinary(FTracked& T, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged);
+	void FreeStates(FTracked& T, UObject* Obj);
 
 	UMusubiSimulatorSubsystem* Simulator() const;
 	void Track(UE::Net::FNetRefHandle Handle, UObject* Object);

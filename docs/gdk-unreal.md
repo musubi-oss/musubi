@@ -612,5 +612,10 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    `?MusubiResume` token, 5.3.2 build of the module (5.7.4 green).
    9c in progress: `UMusubiIrisExportSubsystem` (MusubiIrisImpl, dedicated servers) now creates the second
    `UReplicationSystem` with `UMusubiReplicationBridge`, registers owned entity actors as root objects and ticks it
-   per simulator tick — the phase-6 bridge is live for the first time (UBT 5.7.4). Binary Iris state in `iris` and
-   ghost apply still pending (JSON mirror meanwhile).
+   per simulator tick — the phase-6 bridge is live for the first time (UBT 5.7.4). The `iris` component is now the
+   native Iris state: per class `FReplicationStateDescriptorBuilder::CreateDescriptorsForClass` (CDO as default),
+   per descriptor copy UPROPERTY → external state → `FReplicationStateOperations::Quantize` → `IsEqualQuantizedState`
+   against the last export → `Serialize` into a bit stream; `{"c": class path, "s": [{"i", "bits", "b": base64}]}`,
+   only changed descriptors per message. Descriptors with object references are excluded (resolving them needs
+   `FInternalNetSerializationContext`, which is engine-private) — a class with nothing else falls back to the JSON
+   mirror. Ghost apply (Deserialize → Dequantize → UPROPERTY) still pending.

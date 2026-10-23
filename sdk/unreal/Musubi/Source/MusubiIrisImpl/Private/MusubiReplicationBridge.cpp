@@ -10,6 +10,11 @@
 #include "GameFramework/Actor.h"
 #include "JsonObjectConverter.h"
 #include "Iris/ReplicationSystem/ReplicationSystem.h"
+#include "Iris/ReplicationState/ReplicationStateDescriptorBuilder.h"
+#include "Iris/ReplicationSystem/ReplicationOperations.h"
+#include "Iris/Serialization/NetBitStreamWriter.h"
+#include "Iris/Serialization/NetSerializationContext.h"
+#include "Misc/Base64.h"
 
 using namespace UE::Net;
 
@@ -105,8 +110,104 @@ void UMusubiReplicationBridge::Untrack(FNetRefHandle Handle, UObject* Object)
 	if (UMusubiAuthorityComponent* Auth = T->Authority.Get())
 		if (Auth->IsOwned())
 			Auth->RequestDespawn(); // detach from Iris == despawn in Musubi (torn-off/destroyed)
+	FreeStates(*T, T->Object.Get());
 	Tracked.Remove(Handle);
 	DirtyThisUpdate.Remove(Handle);
+}
+
+const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& UMusubiReplicationBridge::DescriptorsFor(UClass* Class)
+{
+	if (TArray<TRefCountPtr<const FReplicationStateDescriptor>>* Found = ClassDescriptors.Find(Class)) return *Found;
+	TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Out = ClassDescriptors.Add(Class);
+	FReplicationStateDescriptorBuilder::FParameters P;
+	P.DefaultStateSource = Class->GetDefaultObject();
+	FReplicationStateDescriptorBuilder::CreateDescriptorsForClass(Out, Class, P);
+	return Out;
+}
+
+void UMusubiReplicationBridge::FreeStates(FTracked& T, UObject* Obj)
+{
+	if (!Obj || T.States.Num() == 0) return;
+	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
+	FNetSerializationContext Ctx;
+	for (int32 i = 0; i < T.States.Num() && i < Descs.Num(); ++i)
+	{
+		FTracked::FStateBuf& S = T.States[i];
+		const FReplicationStateDescriptor* D = Descs[i].GetReference();
+		if (!D || S.Internal.Num() == 0) continue;
+		FReplicationStateOperations::FreeDynamicState(Ctx, S.Internal.GetData(), D);
+		if (S.bHasLast) FReplicationStateOperations::FreeDynamicState(Ctx, S.Last.GetData(), D);
+	}
+	T.States.Reset();
+}
+
+// The `iris` component, binary form: {"c": class path, "s": [{"i": descriptor index, "bits": n, "b": base64 of
+// FReplicationStateOperations::Serialize of the quantized state}]}. Only descriptors without object references
+// are exported this way — resolving references needs Iris' internal serialization context, which is engine-private;
+// classes whose every descriptor has references fall back to the JSON mirror. Unchanged states (IsEqualQuantizedState
+// against the last export) are not re-sent; a message carries only the descriptors that changed.
+bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged)
+{
+	bChanged = false;
+	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
+	if (Descs.Num() == 0) return false;
+	if (T.States.Num() != Descs.Num()) T.States.SetNum(Descs.Num());
+	bool bEligible = false;
+	TArray<TSharedPtr<FJsonValue>> States;
+	for (int32 i = 0; i < Descs.Num(); ++i)
+	{
+		const FReplicationStateDescriptor* D = Descs[i].GetReference();
+		if (!D || D->ObjectReferenceCount > 0 || D->MemberCount == 0) continue;
+		bEligible = true;
+		FTracked::FStateBuf& S = T.States[i];
+		if (S.External.Num() != (int32)D->ExternalSize)
+		{
+			S.External.SetNumZeroed(D->ExternalSize);
+			S.Internal.SetNumZeroed(D->InternalSize);
+			S.Last.SetNumZeroed(D->InternalSize);
+			S.bHasLast = false;
+		}
+		for (uint32 m = 0; m < D->MemberCount; ++m)
+		{
+			const FProperty* P = D->MemberProperties ? D->MemberProperties[m] : nullptr;
+			if (!P) continue;
+			const uint16 ArrayIndex = D->MemberPropertyDescriptors ? D->MemberPropertyDescriptors[m].ArrayIndex : 0;
+			P->CopySingleValue(S.External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset, P->ContainerPtrToValuePtr<void>(Obj, ArrayIndex));
+		}
+		FNetSerializationContext Ctx;
+		FReplicationStateOperations::Quantize(Ctx, S.Internal.GetData(), S.External.GetData(), D);
+		if (S.bHasLast && FReplicationStateOperations::IsEqualQuantizedState(Ctx, S.Internal.GetData(), S.Last.GetData(), D)) continue;
+		if (S.bHasLast) FReplicationStateOperations::FreeDynamicState(Ctx, S.Last.GetData(), D);
+		FMemory::Memcpy(S.Last.GetData(), S.Internal.GetData(), D->InternalSize);
+		FMemory::Memzero(S.Internal.GetData(), D->InternalSize); // dynamic state now owned by Last
+		S.bHasLast = true;
+		uint8 Buf[8192];
+		FNetBitStreamWriter W;
+		W.InitBytes(Buf, sizeof(Buf));
+		FNetSerializationContext WCtx(&W);
+		FReplicationStateOperations::Serialize(WCtx, S.Last.GetData(), D);
+		W.CommitWrites();
+		if (W.IsOverflown())
+		{
+			UE_LOG(LogMusubiIris, Warning, TEXT("%s descriptor %d: state over %d bytes, not exported"), *Obj->GetName(), i, (int32)sizeof(Buf));
+			continue;
+		}
+		const uint32 Bits = W.GetPosBits();
+		TSharedPtr<FJsonObject> St = MakeShared<FJsonObject>();
+		St->SetNumberField(TEXT("i"), i);
+		St->SetNumberField(TEXT("bits"), Bits);
+		St->SetStringField(TEXT("b"), FBase64::Encode(Buf, (Bits + 7) / 8));
+		States.Add(MakeShared<FJsonValueObject>(St));
+		bChanged = true;
+	}
+	if (!bEligible) return false;
+	if (bChanged)
+	{
+		Out = MakeShared<FJsonObject>();
+		Out->SetStringField(TEXT("c"), Obj->GetClass()->GetPathName());
+		Out->SetArrayField(TEXT("s"), States);
+	}
+	return true;
 }
 
 #if !(ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
@@ -159,6 +260,13 @@ void UMusubiReplicationBridge::FlushDirty()
 		UMusubiAuthorityComponent* Auth = T.Authority.Get();
 		if (!Obj || !Auth) { It.RemoveCurrent(); continue; }
 		if (!Auth->IsOwned()) continue; // ghosts are driven by the node, never mirrored back
+		TSharedPtr<FJsonObject> Bin;
+		bool bChanged = false;
+		if (ExportBinary(T, Obj, Bin, bChanged))
+		{
+			if (bChanged) Auth->SetComponent(TEXT("iris"), FMusubiJson(Bin));
+			continue;
+		}
 		TSharedPtr<FJsonObject> J = ReplicatedToJson(Obj);
 		const uint64 H = HashJson(J);
 		if (H == T.LastHash) continue;
