@@ -14,7 +14,13 @@ rm -rf "$PROJ/Plugins/Musubi"; mkdir -p "$PROJ/Plugins"; cp -r "$ROOT/sdk/unreal
 # "'Musubi' is Incompatible ... load anyway?" and -unattended answers No, so the plugin's modules are silently skipped
 sed -i "s/\"EngineVersion\": \"[0-9.]*\"/\"EngineVersion\": \"${VER%.*}.0\"/" "$PROJ/Plugins/Musubi/Musubi.uplugin"
 sed -i "s/\"EngineAssociation\": \"[0-9.]*\"/\"EngineAssociation\": \"${VER%.*}\"/" "$PROJ/MusubiThirdPerson.uproject"
-printf '<?xml version="1.0" encoding="utf-8" ?>\n<Configuration xmlns="https://www.unrealengine.com/BuildConfiguration">\n  <BuildConfiguration>\n    <bAllowUBAExecutor>false</bAllowUBAExecutor>\n    <bAllowUBALocalExecutor>false</bAllowUBALocalExecutor>\n  </BuildConfiguration>\n</Configuration>\n' > "$OUT/home/.config/Unreal Engine/UnrealBuildTool/BuildConfiguration.xml"
+# UBA fields do not exist on 5.3 (UBT warns about the unknown element): only write the XML where UBA exists, as ue-build.sh does
+UE_MINOR=$(echo "$VER" | cut -d. -f2)
+if [ "$UE_MINOR" -ge 4 ]; then
+  printf '<?xml version="1.0" encoding="utf-8" ?>\n<Configuration xmlns="https://www.unrealengine.com/BuildConfiguration">\n  <BuildConfiguration>\n    <bAllowUBAExecutor>false</bAllowUBAExecutor>\n    <bAllowUBALocalExecutor>false</bAllowUBALocalExecutor>\n  </BuildConfiguration>\n</Configuration>\n' > "$OUT/home/.config/Unreal Engine/UnrealBuildTool/BuildConfiguration.xml"
+else
+  rm -f "$OUT/home/.config/Unreal Engine/UnrealBuildTool/BuildConfiguration.xml"
+fi
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/out/home -v "$OUT:/out" "$IMG" bash -c "
   set -o pipefail; mkdir -p '/home/ue4/.config/Unreal Engine/UnrealBuildTool' 2>/dev/null && cp '/out/home/.config/Unreal Engine/UnrealBuildTool/BuildConfiguration.xml' '/home/ue4/.config/Unreal Engine/UnrealBuildTool/' || true
   /home/ue4/UnrealEngine/Engine/Build/BatchFiles/Linux/Build.sh $TGT Linux Development -Project=/out/MusubiThirdPerson/MusubiThirdPerson.uproject -NoUBA 2>&1 | tee /out/build.log | grep -E 'error|warning: |Total|Result|succeeded|failed' || rc=\${PIPESTATUS[0]}

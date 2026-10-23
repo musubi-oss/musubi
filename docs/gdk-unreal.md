@@ -885,8 +885,10 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
 6. Iris bridge (tier B) + Mass sink — done (`MusubiIris`, `MusubiMass`).
 7. QUIC transport — done: `musubi-quic-ffi` (Rust static lib) + `MusubiQuic`, `IMusubiTransport` seam, Auto with WS fallback. Consoles (platform ffi builds) and live WS→QUIC migration later.
 8. Compile matrix 5.3.2/5.5.4/5.6.1/5.7.4/5.8.4 — done locally (`tools/ue-build.sh`, real UAT `BuildPlugin`,
-   0 warnings on all three); node-in-the-loop tests + docs (`docs/parity.md` L146/L192 updated:
-   SDK/GDK no longer "after") still open.
+   0 warnings on all five, re-run on the final phase-9g code 98748b9 by rotating one `dev-slim` image at a time —
+   the box holds one 57 GB image); the Third Person demo (`tools/demo-build.sh`, UBT Editor target) is 0 warnings on
+   5.3.2 (tier A, no FastArray iris binding), 5.5.4, 5.6.1, 5.7.4 and 5.8.4. Node-in-the-loop: plain run 21/21 and demo run 23 PASS + 1 SKIP on 5.8.4,
+   chaos run 27/27 on 5.8.4 (§9.10). `docs/parity.md` L146/L192 updated: SDK/GDK no longer "after".
 9. NetDriver-level integration (section 9): 9b `MusubiNet` driver + node relay (`net_*` messages,
    `SimEvent::Net*`), 9c own `UReplicationSystem` + binary Iris state for authority → node → ghosts,
    9d RPC via node (`UMusubiMeshNetDriver` + `ForwardRemoteFunction`), 9e full physics handover + roles,

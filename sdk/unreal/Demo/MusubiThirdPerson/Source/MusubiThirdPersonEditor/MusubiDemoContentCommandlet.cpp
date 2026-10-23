@@ -120,7 +120,7 @@ int32 UMusubiDemoContentCommandlet::Main(const FString& Params)
 	Default(Print2, TEXT("Duration"), TEXT("5.0"));
 	bOk &= Link(Begin->GetThenPin(), Bind->GetExecPin());
 	bOk &= Link(InvGet->GetValuePin(), Bind->FindPinChecked(UEdGraphSchema_K2::PN_Self));
-	bOk &= Link(Changed->GetDelegatePin(), Bind->GetDelegatePin());
+	bOk &= Link(Changed->FindPinChecked(UK2Node_Event::DelegateOutputName), Bind->GetDelegatePin());
 	bOk &= Link(InvGet->GetValuePin(), Self(Items));
 	bOk &= Link(InvGet->GetValuePin(), Self(Gold));
 	bOk &= Link(Items->GetReturnValuePin(), Pin(S1, TEXT("InInt")));
@@ -145,7 +145,7 @@ int32 UMusubiDemoContentCommandlet::Main(const FString& Params)
 	Default(Print, TEXT("Duration"), TEXT("10.0"));
 	bOk &= Link(Bind->GetThenPin(), ABind->GetExecPin());
 	bOk &= Link(AuthGet->GetValuePin(), ABind->FindPinChecked(UEdGraphSchema_K2::PN_Self));
-	bOk &= Link(AChanged->GetDelegatePin(), ABind->GetDelegatePin());
+	bOk &= Link(AChanged->FindPinChecked(UK2Node_Event::DelegateOutputName), ABind->GetDelegatePin());
 	bOk &= Link(AChanged->GetThenPin(), Branch->GetExecPin());
 	bOk &= Link(AChanged->FindPinChecked(TEXT("bOwned")), Branch->GetConditionPin());
 	bOk &= Link(Branch->GetThenPin(), Print->GetExecPin());
@@ -165,7 +165,7 @@ int32 UMusubiDemoContentCommandlet::Main(const FString& Params)
 	Default(AddItem, TEXT("Id"), TEXT("1"));
 	Default(AddItem, TEXT("Count"), TEXT("1"));
 	bOk &= Link(ABind->GetThenPin(), Timer->GetExecPin());
-	bOk &= Link(Tick->GetDelegatePin(), Pin(Timer, TEXT("Delegate")));
+	bOk &= Link(Tick->FindPinChecked(UK2Node_Event::DelegateOutputName), Pin(Timer, TEXT("Delegate")));
 	bOk &= Link(Tick->GetThenPin(), Branch2->GetExecPin());
 	bOk &= Link(Owned->GetReturnValuePin(), Branch2->GetConditionPin());
 	bOk &= Link(Branch2->GetThenPin(), AddGold->GetExecPin());
