@@ -1463,6 +1463,16 @@ impl World {
         }
     }
 
+    /// Keeps the entity (and so its cell) awake this tick without reporting a change: an engine
+    /// connection relayed to the entity means a player is on it, even if nothing moved for a while —
+    /// such a cell must neither hibernate nor let the entity decay.
+    pub fn keep_awake(&mut self, id: EntityId) {
+        let tick = self.tick;
+        if let Some(e) = self.entities.get_mut(&id) {
+            e.touched_tick = tick;
+        }
+    }
+
     /// Despawns entities whose decay ran out (never one in transit). Returns
     /// `(id, cell, persistent)` so the caller can journal the persistent ones.
     pub fn decay(&mut self) -> Vec<(EntityId, CellId, bool)> {

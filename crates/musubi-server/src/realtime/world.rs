@@ -5672,6 +5672,12 @@ impl WorldRegistry {
                     });
                 }
             }
+            // a live engine connection is a player on the entity: no hibernation, no decay
+            for (id, conns) in &st.net_sessions {
+                if !conns.is_empty() {
+                    st.world.keep_awake(*id);
+                }
+            }
             st.controller.observe(&st.world);
             if st.world.tick % CONTROL_EVERY == 0 {
                 let moves = st.controller.reconcile(&mut st.world);

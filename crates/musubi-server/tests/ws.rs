@@ -22335,3 +22335,134 @@ async fn net_relay_follows_the_entity_across_a_handover() {
     assert_eq!(ev["conn"].as_u64(), Some(conn), "{ev}");
     assert_eq!(ev["reason"], "quit", "{ev}");
 }
+
+/// Seen live with Unreal: a player sat still on an entity for 60 s, the node declared the cell
+/// unwatched, hibernated it and despawned the entity under the connected client. An engine
+/// connection relayed to an entity (`net_open`) is a player on it: while it is open the cell stays
+/// awake and the entity does not decay; once it closes, both resume.
+#[tokio::test]
+async fn engine_connection_keeps_the_cell_awake() {
+    let Some((addr, router)) = start().await else {
+        return;
+    };
+    let world = format!("ws-{}", uuid::Uuid::now_v7().simple());
+    let (st, _) = http_json(
+        &router,
+        "POST",
+        "/v1/server/worlds",
+        None,
+        true,
+        Some(json!({"name": world, "config": {"cell_size": 100.0, "hibernate_after_ticks": 10}})),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let sim = uuid::Uuid::now_v7();
+    // the simulator stays alive and keeps renewing its lease, as a dedicated server does
+    let lease = |router: axum::Router| {
+        let world = world.clone();
+        async move {
+            let (st, r) = http_json(
+                &router,
+                "POST",
+                &format!("/v1/server/worlds/{world}/lease"),
+                None,
+                true,
+                Some(json!({"sim": sim, "cells": [{"x": 0, "y": 0}]})),
+            )
+            .await;
+            assert_eq!(st, 200, "{r}");
+        }
+    };
+    lease(router.clone()).await;
+    let (st, pawn) = http_json(
+        &router,
+        "POST",
+        &format!("/v1/server/worlds/{world}/spawn"),
+        None,
+        true,
+        Some(json!({"sim": sim, "x": 20.0, "y": 10.0, "components": {}, "persistent": false, "decay_ticks": 3})),
+    )
+    .await;
+    assert_eq!(st, 200, "{pawn}");
+    let entity = pawn["id"].as_str().unwrap().to_string();
+    let f = "json";
+    let (tc, _) = token(&router).await;
+    let mut c = connect(&addr, &tc, f).await;
+    send(
+        &mut c,
+        f,
+        Some("1"),
+        ClientMessage::NetOpen {
+            world: world.clone(),
+            entity: entity.clone(),
+        },
+    )
+    .await;
+    let conn = match recv(&mut c).await.msg {
+        ServerMessage::NetOpened { conn, .. } => conn,
+        m => panic!("{m:?}"),
+    };
+    let events = |router: axum::Router| {
+        let world = world.clone();
+        async move {
+            let (st, ev) = http_json(
+                &router,
+                "GET",
+                &format!("/v1/server/worlds/{world}/events?sim={sim}"),
+                None,
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(st, 200, "{ev}");
+            ev["events"].as_array().cloned().unwrap_or_default()
+        }
+    };
+    // nothing moves for far longer than decay (3 ticks) and hibernation (10 ticks) allow
+    let mut seen: Vec<Value> = Vec::new();
+    for i in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if i % 10 == 0 {
+            lease(router.clone()).await;
+        }
+        seen.extend(events(router.clone()).await);
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|e| e["type"] == "decayed" || e["type"] == "cell_hibernated"),
+        "an entity with an engine connection must neither decay nor let its cell sleep: {seen:?}"
+    );
+    // the player leaves: the clocks start again
+    send(
+        &mut c,
+        f,
+        Some("2"),
+        ClientMessage::NetClose {
+            world: world.clone(),
+            entity: entity.clone(),
+            conn,
+            reason: String::new(),
+        },
+    )
+    .await;
+    for i in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if i % 10 == 0 {
+            lease(router.clone()).await;
+        }
+        seen.extend(events(router.clone()).await);
+        if seen.iter().any(|e| e["type"] == "cell_hibernated") {
+            break;
+        }
+    }
+    let decayed = seen
+        .iter()
+        .find(|e| e["type"] == "decayed")
+        .unwrap_or_else(|| panic!("entity decayed after the connection closed: {seen:?}"));
+    assert_eq!(decayed["entity"], pawn["id"], "{decayed}");
+    assert!(
+        seen.iter().any(|e| e["type"] == "cell_hibernated"),
+        "cell hibernated after the connection closed: {seen:?}"
+    );
+}
