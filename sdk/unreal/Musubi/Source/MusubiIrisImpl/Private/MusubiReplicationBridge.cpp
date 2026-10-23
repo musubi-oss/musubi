@@ -1,4 +1,7 @@
 #include "MusubiReplicationBridge.h"
+#include "Iris/Serialization/NetSerializer.h"
+#include "Iris/ReplicationState/PropertyNetSerializerInfoRegistry.h"
+#include "Engine/EngineTypes.h"
 #include "MusubiIrisModule.h"
 
 #include "MusubiAuthorityComponent.h"
@@ -100,6 +103,7 @@ void UMusubiReplicationBridge::Track(FNetRefHandle Handle, UObject* Object)
 	if (!Object || !Auth)
 		return; // not a Musubi entity: Iris replicates it as usual, nothing to mirror
 	FTracked& T = Tracked.FindOrAdd(Handle);
+	if (!T.Object.IsValid()) UE_LOG(LogMusubiIris, Log, TEXT("mirroring %s (entity %s)"), *Object->GetName(), *Auth->GetEntityId());
 	T.Object = Object;
 	T.Authority = Auth;
 	T.LastHash = 0; // force a first full mirror
@@ -127,13 +131,37 @@ static bool IsRefMember(const FReplicationStateDescriptor* D, uint32 m)
 	return D->MemberTraitsDescriptors && EnumHasAnyFlags(D->MemberTraitsDescriptors[m].Traits, EReplicationStateMemberTraits::HasObjectReference);
 }
 
+// Members whose serializer is connection-specific (FNetRoleNetSerializer: Role/RemoteRole swap per connection) need
+// a real connection in the context; we serialize with none, and ghosts set their roles locally anyway.
+static bool IsConnectionSpecificMember(const FReplicationStateDescriptor* D, uint32 m)
+{
+	// The builder folds this trait into the state descriptor, not the member one, so ask the serializer itself.
+	if (D->MemberSerializerDescriptors && D->MemberSerializerDescriptors[m].Serializer
+		&& EnumHasAnyFlags(D->MemberSerializerDescriptors[m].Serializer->Traits, ENetSerializerTraits::HasConnectionSpecificSerialization))
+		return true;
+	// FNetRoleNetSerializer (Role/RemoteRole) does not declare the trait yet dereferences the internal context
+	// unconditionally; the engine picks it for byte properties whose enum is ENetRole, so match the same way.
+	if (D->MemberProperties)
+		if (const FByteProperty* BP = CastField<FByteProperty>(D->MemberProperties[m]))
+			if (BP->Enum && BP->Enum == StaticEnum<ENetRole>()) return true;
+	return D->MemberTraitsDescriptors && EnumHasAnyFlags(D->MemberTraitsDescriptors[m].Traits, EReplicationStateMemberTraits::HasConnectionSpecificSerialization);
+}
+// Iris adds AActor::NetCullDistanceSquared to the actor's state with a nop serializer purely so its own filtering can
+// read it: it is never in the bitstream, so it must neither be masked in nor written back.
+static bool IsNopMember(const FReplicationStateDescriptor* D, uint32 m)
+{
+	if (!D->MemberSerializerDescriptors || !D->MemberProperties) return false;
+	const FPropertyNetSerializerInfo* Nop = FPropertyNetSerializerInfoRegistry::GetNopNetSerializerInfo();
+	return Nop && D->MemberSerializerDescriptors[m].Serializer == Nop->GetNetSerializer(D->MemberProperties[m]);
+}
+
 static FNetBitArrayView ValueMask(const FReplicationStateDescriptor* D, TArray<uint32>& Storage)
 {
 	Storage.SetNumZeroed(FMath::Max(1, (int32)((D->ChangeMaskBitCount + 31) / 32)));
 	FNetBitArrayView V(Storage.GetData(), D->ChangeMaskBitCount, FNetBitArrayView::ResetOnInit);
 	for (uint32 m = 0; m < D->MemberCount; ++m)
 	{
-		if (IsRefMember(D, m) || !D->MemberChangeMaskDescriptors) continue;
+		if (IsRefMember(D, m) || IsConnectionSpecificMember(D, m) || IsNopMember(D, m) || !D->MemberChangeMaskDescriptors) continue;
 		const FReplicationStateMemberChangeMaskDescriptor& C = D->MemberChangeMaskDescriptors[m];
 		for (uint16 b = 0; b < C.BitCount; ++b) V.SetBit(C.BitOffset + b);
 	}
@@ -170,6 +198,10 @@ const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& UMusubiReplicatio
 	if (TArray<TRefCountPtr<const FReplicationStateDescriptor>>* Found = ClassDescriptors.Find(Class)) return *Found;
 	TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Out = ClassDescriptors.Add(Class);
 	FReplicationStateDescriptorBuilder::FParameters P;
+	// Same context the engine bridge hands to FFragmentRegistrationContext: without the registry the builder
+	// dereferences a null registry (5.8 asserts in a scope lock on the first owned actor).
+	P.DescriptorRegistry = GetReplicationStateDescriptorRegistry();
+	P.ReplicationSystem = GetReplicationSystem();
 	P.DefaultStateSource = Class->GetDefaultObject();
 	FReplicationStateDescriptorBuilder::CreateDescriptorsForClass(Out, Class, P);
 	return Out;
@@ -235,6 +267,7 @@ bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPt
 		}
 		const bool bRefsChanged = !S.bHasLast || !Refs.OrderIndependentCompareEqual(S.LastRefs);
 		FNetSerializationContext Ctx;
+		Ctx.SetChangeMask(&Mask); // the *WithMask operations check the context carries this exact mask
 		FReplicationStateOperations::QuantizeWithMask(Ctx, Mask, 0, S.Internal.GetData(), S.External.GetData(), D);
 		if (!bRefsChanged && S.bHasLast && FReplicationStateOperations::IsEqualQuantizedState(Ctx, S.Internal.GetData(), S.Last.GetData(), D)) continue;
 		S.LastRefs = Refs;
@@ -246,6 +279,7 @@ bool UMusubiReplicationBridge::ExportBinary(FTracked& T, UObject* Obj, TSharedPt
 		FNetBitStreamWriter W;
 		W.InitBytes(Buf, sizeof(Buf));
 		FNetSerializationContext WCtx(&W);
+		WCtx.SetChangeMask(&Mask);
 		FReplicationStateOperations::SerializeWithMask(WCtx, Mask, 0, S.Last.GetData(), D);
 		W.CommitWrites();
 		if (W.IsOverflown())
@@ -331,7 +365,12 @@ void UMusubiReplicationBridge::FlushDirty()
 		bool bChanged = false;
 		if (ExportBinary(T, Obj, Bin, bChanged))
 		{
-			if (bChanged) Auth->SetComponent(TEXT("iris"), FMusubiJson(Bin));
+			if (bChanged)
+			{
+				if (!T.bMirrored) UE_LOG(LogMusubiIris, Log, TEXT("%s: first binary iris state exported"), *Obj->GetName());
+				T.bMirrored = true;
+				Auth->SetComponent(TEXT("iris"), FMusubiJson(Bin));
+			}
 			continue;
 		}
 		TSharedPtr<FJsonObject> J = ReplicatedToJson(Obj);
@@ -405,6 +444,7 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 		FNetBitStreamReader R;
 		R.InitBits(Bytes.GetData(), Bits);
 		FNetSerializationContext RCtx(&R);
+		RCtx.SetChangeMask(&Mask);
 		FReplicationStateOperations::DeserializeWithMask(RCtx, Mask, 0, Internal.GetData(), D);
 		if (R.IsOverflown() || RCtx.HasError())
 		{
@@ -414,11 +454,15 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 			continue;
 		}
 		FNetSerializationContext Ctx;
+		Ctx.SetChangeMask(&Mask);
 		FReplicationStateOperations::DequantizeWithMask(Ctx, Mask, 0, External.GetData(), Internal.GetData(), D);
 		for (uint32 m = 0; m < D->MemberCount; ++m)
 		{
 			const FProperty* P = D->MemberProperties ? D->MemberProperties[m] : nullptr;
 			if (!P) continue;
+			// Not in the bitstream (Role/RemoteRole, the nop NetCullDistanceSquared): External holds zeros here, and writing
+			// ROLE_None or a zero cull distance onto the ghost would strip HasAuthority() / relevancy once it becomes the owner.
+			if (IsConnectionSpecificMember(D, m) || IsNopMember(D, m)) continue;
 			const uint16 ArrayIndex = D->MemberPropertyDescriptors ? D->MemberPropertyDescriptors[m].ArrayIndex : 0;
 			void* Dst = P->ContainerPtrToValuePtr<void>(Obj, ArrayIndex);
 			uint8* Src = External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset;

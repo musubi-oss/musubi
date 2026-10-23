@@ -59,10 +59,15 @@ public:
 
 	/** Objects that carry a UMusubiAuthorityComponent and are owned by this simulator. */
 	int32 NumTrackedObjects() const { return Tracked.Num(); }
+	// Begin mirroring a root object the export subsystem just registered. CacheNetRefHandleCreationInfo only
+	// fires when a creation header is built for a real connection; our export system has none, so the owner
+	// of the handle has to tell us explicitly.
+	void Track(UE::Net::FNetRefHandle Handle, UObject* Object);
 
 private:
 	struct FTracked
 	{
+		bool bMirrored = false;
 		TWeakObjectPtr<UObject> Object;
 		TWeakObjectPtr<UMusubiAuthorityComponent> Authority;
 		uint64 LastHash = 0;
@@ -81,7 +86,6 @@ public:
 	bool ApplyBinary(UObject* Obj, const TSharedPtr<FJsonObject>& Iris, class UMusubiSimulatorSubsystem* Sim);
 
 	UMusubiSimulatorSubsystem* Simulator() const;
-	void Track(UE::Net::FNetRefHandle Handle, UObject* Object);
 	void Untrack(UE::Net::FNetRefHandle Handle, UObject* Object); // EDetachReason exists only since 5.8, so the reason is not part of the signature
 	void FlushDirty();
 

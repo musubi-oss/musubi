@@ -4,6 +4,10 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Iris/ReplicationSystem/NetRefHandle.h"
 #include "Iris/ReplicationSystem/NetObjectFactoryRegistry.h"
+#include "Runtime/Launch/Resources/Version.h"
+#if ENGINE_MINOR_VERSION >= 7
+#include "Iris/ReplicationSystem/NetTokenStore.h"
+#endif
 #include "MusubiIrisExport.generated.h"
 
 class UReplicationSystem;
@@ -42,6 +46,10 @@ private:
 
 	UPROPERTY() TObjectPtr<UReplicationSystem> System;
 	UPROPERTY() TObjectPtr<UMusubiReplicationBridge> Bridge;
+#if ENGINE_MINOR_VERSION >= 7
+	/** 5.7+: UReplicationSystem::Init refuses to start without a NetTokenStore carrying FString/FName token stores (UNetDriver builds the same one). */
+	TUniquePtr<UE::Net::FNetTokenStore> NetTokenStore;
+#endif
 	TWeakObjectPtr<UMusubiSimulatorSubsystem> Sim;
 	TMap<TWeakObjectPtr<AActor>, UE::Net::FNetRefHandle> Handles;
 	UE::Net::FNetObjectFactoryId FactoryId = UE::Net::InvalidNetObjectFactoryId;

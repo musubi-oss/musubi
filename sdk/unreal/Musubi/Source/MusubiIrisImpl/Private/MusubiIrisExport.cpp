@@ -7,7 +7,12 @@
 #include "Iris/ReplicationSystem/ReplicationBridgeTypes.h"
 #include "Iris/ReplicationSystem/ReplicationSystem.h"
 #include "Iris/ReplicationSystem/ReplicationView.h"
+#if ENGINE_MINOR_VERSION >= 7
+#include "Iris/ReplicationSystem/NameTokenStore.h"
+#include "Iris/ReplicationSystem/StringTokenStore.h"
+#endif
 #include "Misc/EngineVersionComparison.h"
+#include "Modules/ModuleManager.h"
 #include "MusubiAuthorityComponent.h"
 #include "MusubiIrisModule.h"
 #include "MusubiNetObjectFactory.h"
@@ -59,10 +64,25 @@ void UMusubiIrisExportSubsystem::OnStarted()
 	if (!S) return;
 	FactoryId = UE::Net::FNetObjectFactoryRegistry::GetFactoryIdFromName(UMusubiNetObjectFactory::FactoryName);
 	Bridge = NewObject<UMusubiReplicationBridge>(this);
+	// With a classic GameNetDriver the engine never starts the IrisCore *module*: its .so is only pulled in as a
+	// library dependency, so FIrisCoreModule::StartupModule (which binds NetCore's Iris push-model delegates) never
+	// runs. Our root objects carry Iris push ids, and the classic driver's MARK_PROPERTY_DIRTY on them would then
+	// Execute an unbound delegate (SIGSEGV in UEPushModelPrivate::MarkPropertyDirty on 5.8).
+	FModuleManager::LoadModuleChecked<IModuleInterface>(TEXT("IrisCore"));
 	UReplicationSystem::FReplicationSystemParams Params;
 	Params.ReplicationBridge = Bridge;
 	Params.bIsServer = true;
 	Params.bAllowObjectReplication = true;
+#if ENGINE_MINOR_VERSION >= 7
+	NetTokenStore = MakeUnique<UE::Net::FNetTokenStore>();
+	UE::Net::FNetTokenStore::FInitParams TokenParams;
+	TokenParams.Authority = UE::Net::FNetToken::ENetTokenAuthority::Authority;
+	TokenParams.MaxConnections = 2;
+	NetTokenStore->Init(TokenParams);
+	NetTokenStore->CreateAndRegisterDataStore<UE::Net::FStringTokenStore>();
+	NetTokenStore->CreateAndRegisterDataStore<UE::Net::FNameTokenStore>();
+	Params.NetTokenStore = NetTokenStore.Get();
+#endif
 	System = UE::Net::FReplicationSystemFactory::CreateReplicationSystem(Params);
 	if (!System)
 	{
@@ -90,6 +110,9 @@ void UMusubiIrisExportSubsystem::OnStopped()
 		System = nullptr;
 	}
 	Bridge = nullptr;
+#if ENGINE_MINOR_VERSION >= 7
+	NetTokenStore.Reset();
+#endif
 }
 
 void UMusubiIrisExportSubsystem::OnTick()
@@ -97,9 +120,13 @@ void UMusubiIrisExportSubsystem::OnTick()
 	if (!System) return;
 	UMusubiSimulatorSubsystem* S = Sim.Get();
 	const float Dt = S && S->GetHz() > 0 ? 1.0f / (float)S->GetHz() : 1.0f / 30.0f;
-	System->NetUpdate(Dt);
+	// UNetDriver's order (5.7/5.8): PostDispatchSendUpdate = TickPostReceive → SendUpdate → PostSendUpdate (the
+	// PostTickDispatch pass), then InternalIrisUpdate = NetUpdate (opens the TickFlush pass) and PostTickFlush =
+	// PostSendUpdate (closes it). TickPostReceive ensures no pass is open, so NetUpdate must not come first.
 	System->TickPostReceive();
 	System->SendUpdate([](TArrayView<uint32>) {});
+	System->PostSendUpdate();
+	System->NetUpdate(Dt);
 	System->PostSendUpdate();
 }
 
@@ -116,8 +143,13 @@ void UMusubiIrisExportSubsystem::OnEntitySpawned(const FString& EntityId, AActor
 	P.bNeedsWorldLocationUpdate = true;
 	const UE::Net::FNetRefHandle H = Bridge->StartReplicatingRootObject(Actor, P, FactoryId);
 #endif
-	if (H.IsValid()) Handles.Add(Actor, H);
-	else UE_LOG(LogMusubiIris, Warning, TEXT("entity %s: Iris refused %s as a root object"), *EntityId, *Actor->GetName());
+	if (!H.IsValid())
+	{
+		UE_LOG(LogMusubiIris, Warning, TEXT("entity %s: Iris refused %s as a root object"), *EntityId, *Actor->GetName());
+		return;
+	}
+	Handles.Add(Actor, H);
+	Bridge->Track(H, Actor);
 }
 
 void UMusubiIrisExportSubsystem::OnEntityDespawned(const FString& EntityId, AActor* Actor)

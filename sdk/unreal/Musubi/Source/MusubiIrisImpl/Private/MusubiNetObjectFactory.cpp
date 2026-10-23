@@ -109,6 +109,25 @@ void UMusubiNetObjectFactory::PostInstantiation(const FPostInstantiationContext&
 }
 
 // Iris says the remote object is gone; the Musubi side mirrors despawn through the bridge's detach path.
+TOptional<UNetObjectFactory::FWorldInfoData> UMusubiNetObjectFactory::GetWorldInfo(const FWorldInfoContext& Context) const
+{
+	const AActor* A = Cast<AActor>(Context.Instance);
+	if (!A) return NullOpt;
+	FWorldInfoData D;
+	D.WorldLocation = A->GetActorLocation();
+	D.CullDistance = A->GetNetCullDistanceSquared() > 0.f ? FMath::Sqrt(A->GetNetCullDistanceSquared()) : 0.f;
+	return D;
+}
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+void UMusubiNetObjectFactory::FillRootObjectReplicationParams(const UE::Net::FRootObjectReplicationParamsContext& Context, UE::Net::FRootObjectReplicationParams& OutParams)
+{
+	OutParams.bNeedsWorldLocationUpdate = true;
+	OutParams.bNeedsPreUpdate = false;
+	OutParams.bIsDormant = false;
+}
+#endif
+
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
 void UMusubiNetObjectFactory::DetachedFromReplication(const FDetachContext& Context, const TOptional<FSubObjectDetachContext>& SubObjectContext)
 {

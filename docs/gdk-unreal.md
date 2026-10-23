@@ -459,7 +459,7 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   authority over) — the world never shows an empty frame. Twins nobody re-sent are dropped after
   `2 × RehomeTimeout`. Not possible: re-attaching the new owner's channel to the existing actor instance — a
   dynamic NetGUID always spawns, and a net-addressable (stable-name) actor cannot be spawned by a client at all
-  (tried: `SerializeNewActor failed to find/spawn actor`). Proven live by `tools/nitl.sh` on 5.3.2 (node + two
+  (tried: `SerializeNewActor failed to find/spawn actor`). Proven live by `tools/nitl.sh` on 5.3.2 and 5.8.4 (node + two
   dedicated servers + client, border crossing in front of the client). Budget: `NMT_Welcome` within `RehomeTimeout` (5 s), or the new owner runs a
   different level, or `NMT_Failure`/`NMT_Upgrade` → fall back to a travel to the same URL. Node side: a
   `net_packet`/`net_close` from a simulator that no longer owns the relayed entity is dropped
@@ -553,6 +553,26 @@ the relay re-homed after a handover; 9c own `UReplicationSystem` + binary state;
 roles; 9f node-in-the-loop: node + two headless UE 5.8.4 servers in the image + one headless client, entity
 walks across the cell border, client stays connected and its actor keeps the same `UPROPERTY` values. Each
 step is a UBT `BuildPlugin` on 5.7.4/5.8.4 (and 5.3.2 for the driver) before it is called done.
+
+9f is green on 5.3.2 (tier A, classic path) and 5.8.4 (Iris path): on 5.8.4 the replicated `Steps` counter of the
+NITL pawn runs s1 → ghost on s2 → owner on s2 → client without a reset (476 → 465 → 495 → 510 in one run), and
+the client swaps to the new owner's actor while it keeps walking. Four things the live run taught that the
+engine sources did not say out loud, all fixed in `MusubiIrisImpl`:
+
+- With a classic `GameNetDriver` the IrisCore *module* is never started — its .so is loaded as a library, so
+  `FIrisCoreModule::StartupModule` (which binds the Iris PushModel dirty delegate in NetCore) does not run.
+  Our root objects get Iris push ids, so the first `MARK_PROPERTY_DIRTY` from `AActor::PreReplication`
+  dereferenced an unbound delegate. `LoadModuleChecked("IrisCore")` before creating the export system.
+- `FReplicationStateDescriptorBuilder` needs `DescriptorRegistry` + `ReplicationSystem` (null registry asserts
+  on its mutex) and every `*WithMask` operation checks `Context.GetChangeMask()` is the very mask passed in.
+- `Role`/`RemoteRole` use `FNetRoleNetSerializer`, which dereferences the internal (connection) context
+  unconditionally and does *not* declare `HasConnectionSpecificSerialization`; the builder only folds that trait
+  into the state descriptor anyway. They are recognised the way the engine picks the serializer (byte property
+  with `ENetRole`) and excluded from the mask.
+- Iris adds `AActor::NetCullDistanceSquared` to the actor state with the nop serializer so its own filter can
+  read it; it is never in the bitstream. Writing the (zero) external scratch value back onto a ghost set its cull
+  distance to 0, so when the ghost became the owner the classic driver found it irrelevant and the client never
+  received it. Members that are not in the bitstream (nop, connection-specific) are never written back.
 
 ## 10. Numbers, limits, failure behaviour
 

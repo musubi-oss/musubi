@@ -41,8 +41,8 @@ ue() { # name, extra args...
     -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" "$@" >/dev/null
 }
 echo "== servers"
-ue nitl-s1 -server -MusubiNitl=server -MusubiCells="0,0" -MusubiNitlSpawn="$X0,100" -MusubiNitlWalk="$WALK"
-ue nitl-s2 -server -MusubiNitl=server -MusubiCells="1,0" -MusubiNitlWalk="$WALK"
+ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" -MusubiNitlSpawn="$X0,100" -MusubiNitlWalk="$WALK"
+ue nitl-s2 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="1,0" -MusubiNitlWalk="$WALK"
 ENTITY=""
 for i in $(seq 1 180); do
   ENTITY=$(docker logs nitl-s1 2>&1 | sed -n 's/.*nitl: spawned \([0-9a-f-]*\).*/\1/p' | head -1); [ -n "$ENTITY" ] && break; sleep 1
