@@ -75,7 +75,10 @@ Musubi simulator (the engine owns physics, Musubi owns authority and meshing):
   (authoritative, `CustomTimeDilation` follows the cell's `time_scale`) and ghosts (kinematic); changed owned
   actors → `apply`; `tick_done` closes the tick and renews the lease (lost/new cells surface as cell events).
   Handover: request → `CanRelease` → final `apply` with velocity → `handover_ack` → frozen until completed;
-  arrival restores velocity and replays buffered inputs. Inputs/interactions reach the actor's
+  the final `apply` also carries `musubi.phys` (root quaternion, linear/angular velocity, simulate flag, sleep, broken
+  constraints); arrival restores it in Chaos order (pose → simulate → velocities → sleep → break) and replays buffered inputs.
+  Roles: owner and ghost are both `ROLE_Authority` on their server (`HasAuthority()` cannot tell them apart); simulation
+  authority is `IsOwned()`/`IsGhost()`, replicated to clients as `bNetOwned`. Inputs/interactions reach the actor's
   `UMusubiAuthorityComponent` (`ApplyInput`, `OnInteraction`, `CanRelease` as BlueprintNativeEvents;
   `SetComponent*` marks dirty for the next `apply`; `Interact`, `RequestDespawn`). Project hook
   `SpawnEntityActor` picks the actor class per entity; otherwise the settings' classes.

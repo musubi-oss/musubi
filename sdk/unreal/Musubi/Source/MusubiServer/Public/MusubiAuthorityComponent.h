@@ -23,6 +23,8 @@ public:
 	/** The entity id as replicated to engine clients (MusubiNet): lets a client recognise the same entity again after a rehome. */
 	UPROPERTY(ReplicatedUsing = OnRep_NetEntityId, Transient, BlueprintReadOnly, Category = "Musubi|Authority") FString NetEntityId;
 	UFUNCTION() void OnRep_NetEntityId();
+	/** Replicated to engine clients: true on the actor of the owning server, false on a relayed ghost of another server's entity. */
+	UPROPERTY(Replicated, Transient, BlueprintReadOnly, Category = "Musubi|Authority") bool bNetOwned = false;
 	/** Client side: an actor replicated by a server identified itself with its entity id. */
 	DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiOnClientEntityIdentified, AActor*, const FString&);
 	static FMusubiOnClientEntityIdentified OnClientEntityIdentified;
@@ -73,6 +75,10 @@ public:
 	/** Component names the module writes itself on handover (velocity restore); projects should not use them. */
 	static const TCHAR* VelocityComponent() { return TEXT("musubi.vel"); }
 	static const TCHAR* AngularVelocityComponent() { return TEXT("musubi.ang"); }
+	/** Full rigid-body state for the handover: {q:[x,y,z,w], v, w, sleep, sim, broken:[constraint names]}. */
+	static const TCHAR* PhysicsComponent() { return TEXT("musubi.phys"); }
+	/** Rotation the owner last captured into `musubi.phys` (ghosts apply it). */
+	bool GetPhysicsRotation(FQuat& Out) const;
 
 	// ---- driven by UMusubiSimulatorSubsystem ----
 	void Bind(class UMusubiSimulatorSubsystem* Owner, const FMusubiUuid& Id, const FMusubiCellId& InCell, bool bIsOwned);

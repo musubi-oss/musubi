@@ -332,6 +332,8 @@ void UMusubiSimulatorSubsystem::UpsertEntity(const FMusubiWorldEntity& E, const 
 		// ghosts follow the node; our own bodies move themselves (the node only echoes what we sent)
 		const FVector P = WirePos(E, A->GetActorLocation());
 		A->SetActorLocation(P, false, nullptr, ETeleportType::TeleportPhysics);
+		FQuat Q;
+		if (Auth && !bOwned && Auth->GetPhysicsRotation(Q)) A->SetActorRotation(Q, ETeleportType::TeleportPhysics);
 		if (Auth) Auth->LastSentPos = P;
 	}
 	if (bNew)
@@ -501,7 +503,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 	case EMusubiSimEventTag::HandoverStarted:
 		if (E.HandoverStarted.IsSet())
 		{
-			if (UMusubiAuthorityComponent* A = FindAuthority(E.HandoverStarted->entity)) { A->SetInHandover(true); A->SetPhysicsEnabled(false); }
+			if (UMusubiAuthorityComponent* A = FindAuthority(E.HandoverStarted->entity)) { A->CapturePhysicsIntoComponents(); A->SetInHandover(true); A->SetPhysicsEnabled(false); }
 			OnHandover.Broadcast(E.HandoverStarted->entity.ToString(), TEXT("started"), E.HandoverStarted->to.ToString());
 		}
 		break;
@@ -531,9 +533,9 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 						if (const FSnapshot* S = En->Newest(); S && En->Actor.IsValid())
 						{
 							En->Actor->SetActorLocation(S->Pos, false, nullptr, ETeleportType::TeleportPhysics);
-							if (UPrimitiveComponent* B = Cast<UPrimitiveComponent>(En->Actor->GetRootComponent())) B->SetPhysicsLinearVelocity(S->Vel);
 						}
-					A->SetPhysicsEnabled(true);
+					// the rigid-body state captured for the handover (pose, velocities, sleep) resumes the simulation
+					A->RestorePhysicsFromComponents();
 				}
 			}
 			OnHandover.Broadcast(E.HandoverCancelled->entity.ToString(), TEXT("cancelled"), E.HandoverCancelled->reason);
@@ -550,8 +552,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 			if (UMusubiAuthorityComponent* Auth = FindAuthority(A.entity))
 			{
 				Auth->SetInHandover(false);
-				Auth->SetPhysicsEnabled(true);
-				Auth->RestorePhysicsFromComponents();
+				Auth->RestorePhysicsFromComponents(); // enables the simulation itself, per the captured `sim` flag
 				for (const FMusubiJson& In : A.buffered_inputs)
 				{
 					const TSharedPtr<FJsonObject>* O;

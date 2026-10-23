@@ -4,6 +4,7 @@
 #include "Components/PrimitiveComponent.h"
 #include "GameFramework/Actor.h"
 #include "Net/UnrealNetwork.h"
+#include "PhysicsEngine/PhysicsConstraintComponent.h"
 
 UMusubiAuthorityComponent::FMusubiOnClientEntityIdentified UMusubiAuthorityComponent::OnClientEntityIdentified;
 
@@ -11,6 +12,7 @@ void UMusubiAuthorityComponent::GetLifetimeReplicatedProps(TArray<FLifetimePrope
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(UMusubiAuthorityComponent, NetEntityId);
+	DOREPLIFETIME(UMusubiAuthorityComponent, bNetOwned);
 }
 
 void UMusubiAuthorityComponent::OnRep_NetEntityId()
@@ -102,6 +104,7 @@ void UMusubiAuthorityComponent::SetOwned(bool bIsOwned)
 {
 	if (bOwned == bIsOwned) return;
 	bOwned = bIsOwned;
+	bNetOwned = bIsOwned;
 	SetPhysicsEnabled(bIsOwned);
 	OnAuthorityChanged.Broadcast(bIsOwned);
 }
@@ -158,25 +161,102 @@ static bool VecFromJson(const FMusubiJson& J, FVector& Out)
 	return true;
 }
 
+static TSharedPtr<FJsonValue> QuatJson(const FQuat& Q)
+{
+	TArray<TSharedPtr<FJsonValue>> A;
+	A.Add(MakeShared<FJsonValueNumber>(Q.X)); A.Add(MakeShared<FJsonValueNumber>(Q.Y));
+	A.Add(MakeShared<FJsonValueNumber>(Q.Z)); A.Add(MakeShared<FJsonValueNumber>(Q.W));
+	return MakeShared<FJsonValueArray>(A);
+}
+
+static bool QuatFromJson(const TSharedPtr<FJsonValue>& J, FQuat& Out)
+{
+	const TArray<TSharedPtr<FJsonValue>>* A;
+	if (!J.IsValid() || !J->TryGetArray(A) || A->Num() != 4) return false;
+	Out = FQuat((*A)[0]->AsNumber(), (*A)[1]->AsNumber(), (*A)[2]->AsNumber(), (*A)[3]->AsNumber());
+	if (!Out.IsNormalized()) Out.Normalize();
+	return true;
+}
+
 void UMusubiAuthorityComponent::CapturePhysicsIntoComponents()
 {
 	UPrimitiveComponent* B = Body();
-	if (!B || !B->IsSimulatingPhysics()) return;
-	FMusubiJson V; V.Value = VecJson(B->GetPhysicsLinearVelocity());
-	FMusubiJson W; W.Value = VecJson(B->GetPhysicsAngularVelocityInRadians());
+	if (!B) return;
+	const bool bSim = B->IsSimulatingPhysics();
+	const FVector Lin = bSim ? B->GetPhysicsLinearVelocity() : B->GetComponentVelocity();
+	const FVector Ang = bSim ? B->GetPhysicsAngularVelocityInRadians() : FVector::ZeroVector;
+	FMusubiJson V; V.Value = VecJson(Lin);
+	FMusubiJson W; W.Value = VecJson(Ang);
 	Components.FindOrAdd(VelocityComponent()).Value = V;
 	Components.FindOrAdd(AngularVelocityComponent()).Value = W;
 	Dirty.Add(VelocityComponent());
 	Dirty.Add(AngularVelocityComponent());
+	// the full rigid-body state: the receiver resumes the simulation exactly where this side stopped it
+	TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+	P->SetField(TEXT("q"), QuatJson(B->GetComponentQuat()));
+	P->SetField(TEXT("v"), VecJson(Lin));
+	P->SetField(TEXT("w"), VecJson(Ang));
+	P->SetBoolField(TEXT("sim"), bSim);
+	P->SetBoolField(TEXT("sleep"), bSim && !B->RigidBodyIsAwake());
+	TArray<TSharedPtr<FJsonValue>> Broken;
+	if (AActor* A = GetOwner())
+		for (UActorComponent* C : A->GetComponents())
+			if (UPhysicsConstraintComponent* K = Cast<UPhysicsConstraintComponent>(C))
+				if (K->IsBroken()) Broken.Add(MakeShared<FJsonValueString>(K->GetName()));
+	if (Broken.Num()) P->SetArrayField(TEXT("broken"), Broken);
+	FMusubiJson Phys; Phys.Value = MakeShared<FJsonValueObject>(P);
+	Components.FindOrAdd(PhysicsComponent()).Value = Phys;
+	Dirty.Add(PhysicsComponent());
 }
 
 void UMusubiAuthorityComponent::RestorePhysicsFromComponents()
 {
 	UPrimitiveComponent* B = Body();
 	if (!B) return;
-	FVector V;
-	if (const FState* S = Components.Find(VelocityComponent()); S && VecFromJson(S->Value, V)) B->SetPhysicsLinearVelocity(V);
-	if (const FState* S = Components.Find(AngularVelocityComponent()); S && VecFromJson(S->Value, V)) B->SetPhysicsAngularVelocityInRadians(V);
+	const FState* S = Components.Find(PhysicsComponent());
+	const TSharedPtr<FJsonObject>* P = nullptr;
+	if (!S || !S->Value.Value.IsValid() || !S->Value.Value->TryGetObject(P) || !P)
+	{
+		// older owner: velocities only
+		B->SetSimulatePhysics(true);
+		FVector V;
+		if (const FState* L = Components.Find(VelocityComponent()); L && VecFromJson(L->Value, V)) B->SetPhysicsLinearVelocity(V);
+		if (const FState* A = Components.Find(AngularVelocityComponent()); A && VecFromJson(A->Value, V)) B->SetPhysicsAngularVelocityInRadians(V);
+		return;
+	}
+	// order matters in Chaos: pose while kinematic, then simulate, then velocities (ignored on a kinematic body), then sleep
+	FQuat Q;
+	if (QuatFromJson((*P)->TryGetField(TEXT("q")), Q)) B->SetWorldRotation(Q, false, nullptr, ETeleportType::TeleportPhysics);
+	bool bSim = true;
+	(*P)->TryGetBoolField(TEXT("sim"), bSim);
+	B->SetSimulatePhysics(bSim);
+	if (bSim)
+	{
+		FVector V;
+		FMusubiJson J;
+		J.Value = (*P)->TryGetField(TEXT("v"));
+		if (VecFromJson(J, V)) B->SetPhysicsLinearVelocity(V);
+		J.Value = (*P)->TryGetField(TEXT("w"));
+		if (VecFromJson(J, V)) B->SetPhysicsAngularVelocityInRadians(V);
+		bool bSleep = false;
+		(*P)->TryGetBoolField(TEXT("sleep"), bSleep);
+		if (bSleep) B->PutRigidBodyToSleep(); else B->WakeRigidBody();
+	}
+	const TArray<TSharedPtr<FJsonValue>>* Broken = nullptr;
+	if ((*P)->TryGetArrayField(TEXT("broken"), Broken) && Broken)
+		if (AActor* A = GetOwner())
+			for (UActorComponent* C : A->GetComponents())
+				if (UPhysicsConstraintComponent* K = Cast<UPhysicsConstraintComponent>(C))
+					if (!K->IsBroken())
+						for (const TSharedPtr<FJsonValue>& N : *Broken)
+							if (N.IsValid() && N->AsString() == K->GetName()) { K->BreakConstraint(); break; }
+}
+
+bool UMusubiAuthorityComponent::GetPhysicsRotation(FQuat& Out) const
+{
+	const FState* S = Components.Find(PhysicsComponent());
+	const TSharedPtr<FJsonObject>* P = nullptr;
+	return S && S->Value.Value.IsValid() && S->Value.Value->TryGetObject(P) && P && QuatFromJson((*P)->TryGetField(TEXT("q")), Out);
 }
 
 void UMusubiAuthorityComponent::SetPhysicsEnabled(bool bEnable)

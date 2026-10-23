@@ -107,9 +107,14 @@ void UMusubiIrisExportSubsystem::OnEntitySpawned(const FString& EntityId, AActor
 	if (!System || !Bridge || !Actor) return;
 	UMusubiAuthorityComponent* Auth = Actor->FindComponentByClass<UMusubiAuthorityComponent>();
 	if (!Auth || !Auth->IsOwned() || Handles.Contains(Actor)) return;
+#if ENGINE_MAJOR_VERSION > 5 || ENGINE_MINOR_VERSION >= 8
+	// 5.8: the root params moved to UNetObjectFactory; the overload taking them is deprecated
+	const UE::Net::FNetRefHandle H = Bridge->StartReplicatingRootObject(Actor, FactoryId);
+#else
 	FMusubiRootParams P;
 	P.bNeedsWorldLocationUpdate = true;
 	const UE::Net::FNetRefHandle H = Bridge->StartReplicatingRootObject(Actor, P, FactoryId);
+#endif
 	if (H.IsValid()) Handles.Add(Actor, H);
 	else UE_LOG(LogMusubiIris, Warning, TEXT("entity %s: Iris refused %s as a root object"), *EntityId, *Actor->GetName());
 }

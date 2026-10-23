@@ -517,18 +517,20 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
 
 ### 9.5 Path D — full physics handover and roles
 
-- `CapturePhysicsIntoComponents` grows from `{pos, vel}` to the component `phys` =
-  `FRigidBodyState` of the root primitive (`UPrimitiveComponent::GetRigidBodyState`: position, quaternion,
-  linear and angular velocity, flags incl. sleeping) + `bSimulatePhysics`, `CustomTimeDilation`, and for
-  each `UPhysicsConstraintComponent` on the actor `{name, bBroken}`; welded children are implicit in the root.
-  `RestorePhysicsFromComponents` applies it before `SetPhysicsEnabled(true)` (`SetAllPhysicsPosition/Rotation`,
-  `SetAllPhysicsLinearVelocity`, `SetAllPhysicsAngularVelocityInRadians`, `PutRigidBodyToSleep` if flagged,
-  `BreakConstraint` for broken ones). Verified against 5.3.2/5.7.4/5.8.4 headers before coding, as usual.
-- Roles: an owned actor is `ROLE_Authority`; a ghost is `ROLE_Authority` for the local driver (it must
-  replicate to this server's clients, 9.2) but `UMusubiAuthorityComponent::IsGhost()` is the project's
-  "simulated proxy" test; `AActor::HasAuthority()` therefore stays engine-true. Gameplay that must only run on
-  the owner uses `IsOwned()` — documented as the one rule a project has to learn; a `bOwned` replicated
-  bool on the component lets clients tell owner-side actors from relayed ghosts.
+- Physics (done): `CapturePhysicsIntoComponents` writes the component `musubi.phys` =
+  `{q: root quaternion, v, w: linear/angular velocity, sim: bSimulatePhysics, sleep: !RigidBodyIsAwake(),
+  broken: [names of UPhysicsConstraintComponents with IsBroken()]}` (plus the older `musubi.vel/ang`) at
+  handover request and at a node-initiated `handover_started`, before the body is frozen.
+  `RestorePhysicsFromComponents` (arrival and cancel) applies it in the order Chaos needs: rotation while still
+  kinematic (`SetWorldRotation`, `TeleportPhysics`), `SetSimulatePhysics(sim)`, then velocities (ignored on a
+  kinematic body, hence after), `PutRigidBodyToSleep`/`WakeRigidBody`, `BreakConstraint` for the broken ones.
+  Ghosts apply `q` with the position every frame they are updated. Welded children ride in the root; per-bone
+  states of skeletal bodies are out of scope (the root body is what crosses the border).
+- Roles (done as designed): an owned actor is `ROLE_Authority`; a ghost is `ROLE_Authority` for the local
+  driver too (it must replicate to this server's clients, 9.2), so `AActor::HasAuthority()` stays
+  engine-true on both and cannot tell them apart. The one rule a project learns: simulation authority is
+  `UMusubiAuthorityComponent::IsOwned()` / `IsGhost()`; clients get the same answer from the replicated
+  `bNetOwned` (and the entity from `NetEntityId`).
 
 ### 9.6 Order and proof
 
