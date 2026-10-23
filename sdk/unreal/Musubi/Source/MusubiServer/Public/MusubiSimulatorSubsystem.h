@@ -116,6 +116,9 @@ public:
 	FSimpleMulticastDelegate OnSimTicked;
 	/** The simulator started / stopped (C++ listeners such as the Iris exporter). */
 	FSimpleMulticastDelegate OnStarted, OnStopped;
+	/** An engine RPC routed by the node (`interact` kind `rpc`) for one of our actors: payload = {f, c, b, bits, from}. MusubiNet executes it. */
+	DECLARE_MULTICAST_DELEGATE_TwoParams(FMusubiOnSimRpc, AActor*, const FMusubiJson&);
+	FMusubiOnSimRpc OnRpc;
 
 	/** Engine packet relay (`MusubiNet`): answer a `net_packet` event on the same conn/session. */
 	void NetSendPacket(uint64 Conn, const FMusubiJson& Session, TArray<uint8>&& Data);

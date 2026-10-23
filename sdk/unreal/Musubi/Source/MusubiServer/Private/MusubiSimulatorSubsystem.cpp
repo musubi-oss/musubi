@@ -571,6 +571,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 		if (E.Interaction.IsSet())
 			if (UMusubiAuthorityComponent* A = FindAuthority(E.Interaction->entity))
 			{
+				if (E.Interaction->kind == TEXT("rpc")) { OnRpc.Broadcast(A->GetOwner(), E.Interaction->payload); break; }
 				FString From;
 				const TSharedPtr<FJsonObject>* O;
 				if (E.Interaction->payload.Value.IsValid() && E.Interaction->payload.Value->TryGetObject(O)) (*O)->TryGetStringField(TEXT("from"), From);

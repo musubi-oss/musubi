@@ -621,3 +621,6 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    mirror. Ghosts: `UMusubiIrisExportSubsystem` hooks each ghost's `UMusubiAuthorityComponent::OnComponentApplied`
    and runs `iris` values through `UMusubiReplicationBridge::ApplyBinary` (Deserialize → Dequantize → property copy,
    RepNotify for changed members) — relayed servers now hold the real UPROPERTY state of foreign actors.
+   9d (RPC): `UMusubiMeshNetDriver` + `UMusubiMeshRpcSubsystem` as in §9.4 — ghost RPCs → `interact{kind:"rpc"}` → owner
+   `ProcessEvent`; classic property net serialization for parameters (all tiers), no object references, no
+   multicast fan-out to other ghost hosts yet (needs a node `broadcast` flag). UBT 5.7.4 green.

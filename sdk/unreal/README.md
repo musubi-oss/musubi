@@ -127,6 +127,8 @@ the session). When the entity hands over, the node closes the old owner's side a
 in-place restart with actor adoption is the next step. `max_packet` 1200 B; conn ids stay below 2^53 because
 engines parse JSON numbers as doubles. Enable with
 `+NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/MusubiNet.MusubiNetDriver",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver",bCanUseIris=true)`.
+
+RPCs through the node (`UMusubiMeshNetDriver`, `UMusubiMeshRpcSubsystem`): a second, connection-less driver named `MusubiMesh` that the RPC subsystem creates on dedicated servers while the simulator runs — needs `+NetDriverDefinitions=(DefName="MusubiMeshNetDriver",DriverClassName="/Script/MusubiNet.MusubiMeshNetDriver",DriverClassNameFallback="/Script/MusubiNet.MusubiMeshNetDriver")`. The engine offers every RPC to every active driver (`ShouldReplicateFunction`); this one takes calls on actors that carry a `UMusubiAuthorityComponent` and are ghosts here, serializes the parameters with the classic property net serialization (no package map → object references arrive null) and sends `interact{kind:"rpc", payload:{f, c, b, bits}}`; the node routes it to the entity's owner in per-entity order, where `UMusubiSimulatorSubsystem::OnRpc` → `DecodeAndCall` → `ProcessEvent`. Multicasts reach the owner (its own engine replication relays them to its clients); other servers' ghosts do not get them yet.
 Built by real UBT on 5.8.4 (classic `UNetDriver` API only, so it is tier-independent). Design: `docs/gdk-unreal.md` §9.
 
 - Wire: ALPN `musubi-rt/1`; the first bidi stream carries the `hello` text frame (`{token, format, resumable,
