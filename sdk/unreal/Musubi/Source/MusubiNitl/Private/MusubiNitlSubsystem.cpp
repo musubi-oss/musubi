@@ -168,6 +168,16 @@ static void ReadInventory(const APawn* P, int32& OutItems, int32& OutGold)
 	}
 }
 
+// The first registered subobject with an int `Ammo` (the NITL pawn's Loadout), -1 when the pawn has none. By property,
+// not by name: a dynamically replicated subobject is created on the client under a generated name.
+static int32 ReadAmmo(const UMusubiAuthorityComponent* Authority)
+{
+	for (const TWeakObjectPtr<UObject>& W : Authority->MusubiSubObjects())
+		if (const UObject* L = W.Get())
+			if (const FIntProperty* P = CastField<FIntProperty>(L->GetClass()->FindPropertyByName(TEXT("Ammo")))) return P->GetPropertyValue_InContainer(L);
+	return -1;
+}
+
 bool UMusubiNitlSubsystem::Report(float)
 {
 	UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
@@ -184,10 +194,10 @@ bool UMusubiNitlSubsystem::Report(float)
 		const APlayerState* PS = LocalPC ? LocalPC->PlayerState.Get() : It->GetPlayerState();
 		const ACharacter* Ch = Cast<ACharacter>(*It);
 		const int32 MoveMode = Ch && Ch->GetCharacterMovement() ? (int32)Ch->GetCharacterMovement()->MovementMode.GetValue() : -1;
-		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f z=%.0f mode=%d steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s inv=%d gold=%d"), *Mode, *It->GetName(),
+		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f z=%.0f mode=%d steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s inv=%d gold=%d ammo=%d"), *Mode, *It->GetName(),
 			*Authority->NetEntityId, (int)Authority->bNetOwned, L.X, L.Y, L.Z, MoveMode, Nitl ? Nitl->Steps : -1, Nitl ? Nitl->PushSteps : -1, It->GetNetPushIdDynamic(),
 			It->GetController() ? *It->GetController()->GetName() : TEXT("none"), LocalPC ? (int)(LocalPC->GetPawn() == *It) : (int)(It->GetController() != nullptr),
-			PS ? *PS->GetPlayerName() : TEXT("-"), Items, Gold);
+			PS ? *PS->GetPlayerName() : TEXT("-"), Items, Gold, ReadAmmo(Authority));
 		++N;
 	}
 	if (Mode == TEXT("client"))

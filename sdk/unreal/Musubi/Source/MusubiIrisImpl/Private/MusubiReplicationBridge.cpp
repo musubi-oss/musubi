@@ -126,7 +126,12 @@ void UMusubiReplicationBridge::Untrack(FNetRefHandle Handle, UObject* Object)
 	FreeStates(T->States, T->Object.Get());
 	if (AActor* A = Cast<AActor>(T->Object.Get()))
 		for (TPair<FName, TArray<FTracked::FStateBuf>>& KV : T->Subs)
-			for (UActorComponent* C : A->GetComponents()) if (C && C->GetFName() == KV.Key) { FreeStates(KV.Value, C); break; }
+		{
+			UObject* Sub = nullptr;
+			for (UActorComponent* C : A->GetComponents()) if (C && C->GetFName() == KV.Key) { Sub = C; break; }
+			if (!Sub) if (UMusubiAuthorityComponent* Auth = T->Authority.Get()) Sub = Auth->FindMusubiSubObject(KV.Key.ToString());
+			if (Sub) FreeStates(KV.Value, Sub);
+		}
 	Tracked.Remove(Handle);
 	DirtyThisUpdate.Remove(Handle);
 }
@@ -184,6 +189,15 @@ static FString RefId(UObject* O)
 	if (const UActorComponent* C = Cast<UActorComponent>(O))
 		if (const AActor* A = C->GetOwner())
 			if (const UMusubiAuthorityComponent* Auth = A->FindComponentByClass<UMusubiAuthorityComponent>()) return Auth->GetEntityId() + TEXT("/") + C->GetName();
+	// a registered subobject of an entity (RegisterMusubiSubObject): same id form as a component, resolved by name on the
+	// receiver's registry — the receiver created its own instance, the owner's object path means nothing there
+	for (UObject* Outer = O->GetOuter(); Outer; Outer = Outer->GetOuter())
+		if (const AActor* A = Cast<AActor>(Outer))
+		{
+			if (const UMusubiAuthorityComponent* Auth = A->FindComponentByClass<UMusubiAuthorityComponent>())
+				if (Auth->MusubiSubObjects().Contains(O)) return Auth->GetEntityId() + TEXT("/") + O->GetName();
+			break;
+		}
 	// not a Musubi entity: a level-placed actor (or a component of one) exists under the same name on every server
 	// that has the level loaded, so its path is a stable id; dynamically spawned non-entity objects are not carried
 	const AActor* Owner = Cast<AActor>(O);
@@ -204,7 +218,7 @@ static UObject* ResolveRef(UMusubiSimulatorSubsystem* Sim, const FString& Id)
 	AActor* A = Auth ? Auth->GetOwner() : nullptr;
 	if (!A || Comp.IsEmpty()) return A;
 	for (UActorComponent* C : A->GetComponents()) if (C && C->GetName() == Comp) return C;
-	return nullptr;
+	return Auth->FindMusubiSubObject(Comp);
 }
 
 const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& UMusubiReplicationBridge::DescriptorsFor(UClass* Class)
@@ -474,17 +488,21 @@ void UMusubiReplicationBridge::FlushDirty()
 			// replicated components ride along under "sub" by component name (CharacterMovement, inventories, ...);
 			// only the ones whose state changed are in the message, like the actor's own descriptors
 			TArray<TPair<FString, TArray<FDescOut>>> Subs;
+			auto ExportSub = [&](UObject* S)
+			{
+				TArray<FDescOut> SubOut;
+				uint32 SubBytes = 0;
+				if (!ExportBinary(T.Subs.FindOrAdd(S->GetFName()), S, SubOut, bKey, SubBytes) || SubOut.Num() == 0) return;
+				Bytes += SubBytes;
+				Subs.Emplace(S->GetName(), MoveTemp(SubOut));
+				bChanged = true;
+			};
 			if (AActor* A = Cast<AActor>(Obj))
 				for (UActorComponent* C : A->GetReplicatedComponents())
-				{
-					if (!C || C->IsA<UMusubiAuthorityComponent>()) continue;
-					TArray<FDescOut> SubOut;
-					uint32 SubBytes = 0;
-					if (!ExportBinary(T.Subs.FindOrAdd(C->GetFName()), C, SubOut, bKey, SubBytes) || SubOut.Num() == 0) continue;
-					Bytes += SubBytes;
-					Subs.Emplace(C->GetName(), MoveTemp(SubOut));
-					bChanged = true;
-				}
+					if (C && !C->IsA<UMusubiAuthorityComponent>()) ExportSub(C);
+			// registered replicated subobjects (AddReplicatedSubObject + RegisterMusubiSubObject) ride the same way, by name
+			for (const TWeakObjectPtr<UObject>& S : Auth->MusubiSubObjects())
+				if (UObject* O = S.Get()) ExportSub(O);
 			if (bChanged)
 			{
 				if (!T.bMirrored) UE_LOG(LogMusubiIris, Log, TEXT("%s: first binary iris state exported (%d component(s))"), *Obj->GetName(), Subs.Num());
@@ -713,9 +731,10 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const FMusubiJson& Valu
 		Ar << Name;
 		TArray<FDescOut> Sub;
 		if (!ReadDescs(Ar, Sub, bKey)) break;
-		UActorComponent* Target = nullptr;
+		UObject* Target = nullptr;
 		if (A) for (UActorComponent* C : A->GetComponents()) if (C && C->GetName() == Name) { Target = C; break; }
-		if (!Target) { UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state for component %s, ghost has none — skipped"), *Obj->GetName(), *Name); continue; }
+		if (!Target) if (UMusubiAuthorityComponent* Auth = AuthorityOf(Obj)) Target = Auth->FindMusubiSubObject(Name);
+		if (!Target) { UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state for component/subobject %s, this side has none — skipped"), *Obj->GetName(), *Name); continue; }
 		bApplied |= ApplyDescs(Target, Sub, bKey, Sim);
 	}
 	return bApplied;

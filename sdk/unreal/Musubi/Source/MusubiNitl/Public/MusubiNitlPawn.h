@@ -11,6 +11,7 @@ class MUSUBINITL_API AMusubiNitlPawn : public ACharacter
 	GENERATED_BODY()
 public:
 	AMusubiNitlPawn();
+	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaSeconds) override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 	virtual void PossessedBy(AController* NewController) override;
@@ -20,6 +21,11 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "Musubi")
 	TObjectPtr<class UMusubiNitlInventoryComponent> Inventory;
 	/** Ticks walked on the owner: a client that keeps this actor across a rehome must see it keep counting up. */
+	/** Replicated subobject (not a component): created in BeginPlay on every server (owner and ghost alike) and registered
+	 *  with the authority component; the client gets the server's instance through this replicated pointer and registers
+	 *  it in the RepNotify, so the same registry read works on every side. */
+	UPROPERTY(ReplicatedUsing = OnRep_Loadout) TObjectPtr<class UMusubiNitlLoadout> Loadout;
+	UFUNCTION() void OnRep_Loadout();
 	UPROPERTY(ReplicatedUsing = OnRep_Steps) int32 Steps = 0;
 	UFUNCTION() void OnRep_Steps();
 	/** Same counter, but push-model (dirty only via MARK_PROPERTY_DIRTY): proves the classic driver still sees push-based

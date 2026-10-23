@@ -55,6 +55,15 @@ public:
 	void SetComponent(const FString& Name, const FMusubiJson& Value);
 	/** Owned only: ask the node to despawn this entity. */
 	UFUNCTION(BlueprintCallable, Category = "Musubi|Authority") void RequestDespawn();
+
+	/** Replicated subobjects (`AddReplicatedSubObject`) the engine keeps in a private list: register them here too so their
+	 *  replicated state rides in the Musubi handover beside the actor and its components. The object must have a stable
+	 *  name under this actor (`NewObject<T>(Actor, TEXT("Loadout"))`) and the receiving server must register the same
+	 *  name — the owner's state is applied to the receiver's instance by name, like a replicated component's. */
+	UFUNCTION(BlueprintCallable, Category = "Musubi|Authority") void RegisterMusubiSubObject(UObject* SubObject);
+	UFUNCTION(BlueprintCallable, Category = "Musubi|Authority") void UnregisterMusubiSubObject(UObject* SubObject);
+	const TArray<TWeakObjectPtr<UObject>>& MusubiSubObjects() const { return SubObjects; }
+	UObject* FindMusubiSubObject(const FString& Name) const;
 	/** Owned only: report a contact/interaction with another entity (usually a ghost); the node routes it to the owner. */
 	UFUNCTION(BlueprintCallable, Category = "Musubi|Authority") void Interact(const FString& Kind, const FString& PayloadJson, const FString& TargetEntityId = "");
 
@@ -114,5 +123,6 @@ private:
 	struct FState { FMusubiJson Value; uint64 Version = 0; };
 	TMap<FString, FState> Components;
 	TSet<FString> Dirty;
+	TArray<TWeakObjectPtr<UObject>> SubObjects;
 	class UPrimitiveComponent* Body() const;
 };

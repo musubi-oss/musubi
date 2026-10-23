@@ -1,5 +1,6 @@
 #include "MusubiNitlPawn.h"
 #include "MusubiNitlInventoryComponent.h"
+#include "MusubiNitlLoadout.h"
 #include "MusubiAuthorityComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Controller.h"
@@ -20,6 +21,7 @@ AMusubiNitlPawn::AMusubiNitlPawn()
 	SetReplicatingMovement(true);
 	Authority = CreateDefaultSubobject<UMusubiAuthorityComponent>(TEXT("Authority"));
 	Inventory = CreateDefaultSubobject<UMusubiNitlInventoryComponent>(TEXT("Inventory"));
+	bReplicateUsingRegisteredSubObjectList = true;
 	// the Entry map has no floor: fly, at the speed the run asks for (both sides parse it so the client's prediction agrees)
 	float Walk = 60.f;
 	FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlWalk="), Walk);
@@ -32,10 +34,28 @@ AMusubiNitlPawn::AMusubiNitlPawn()
 	}
 }
 
+void AMusubiNitlPawn::BeginPlay()
+{
+	Super::BeginPlay();
+	if (!Loadout && HasAuthority())
+	{
+		Loadout = NewObject<UMusubiNitlLoadout>(this, TEXT("Loadout"));
+		AddReplicatedSubObject(Loadout);
+		if (Authority) Authority->RegisterMusubiSubObject(Loadout);
+	}
+}
+
+void AMusubiNitlPawn::OnRep_Loadout()
+{
+	UE_LOG(LogMusubiNitl, Log, TEXT("%s: replicated subobject %s arrived"), *GetName(), Loadout ? *Loadout->GetName() : TEXT("null"));
+	if (Authority && Loadout) Authority->RegisterMusubiSubObject(Loadout);
+}
+
 void AMusubiNitlPawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AMusubiNitlPawn, Steps);
+	DOREPLIFETIME(AMusubiNitlPawn, Loadout);
 	FDoRepLifetimeParams Push;
 	Push.bIsPushBased = true;
 	DOREPLIFETIME_WITH_PARAMS_FAST(AMusubiNitlPawn, PushSteps, Push);
@@ -53,6 +73,7 @@ void AMusubiNitlPawn::Tick(float DeltaSeconds)
 		if (Steps % 100 == 0) Inventory->Gold += 10;
 		if (Steps % 300 == 0) Inventory->AddItem(Steps / 300, 1);
 	}
+	if (Loadout && Steps % 100 == 0) { ++Loadout->Ammo; Loadout->Weapon = FString::Printf(TEXT("rifle%d"), Loadout->Ammo); }
 	MARK_PROPERTY_DIRTY_FROM_NAME(AMusubiNitlPawn, PushSteps, this);
 	const double Now = FPlatformTime::Seconds();
 	if (Now - LastLog > 1.0)

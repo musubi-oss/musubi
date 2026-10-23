@@ -290,3 +290,22 @@ bool UMusubiAuthorityComponent::BodySimulates()
 		}
 	return bBodySimulates;
 }
+
+void UMusubiAuthorityComponent::RegisterMusubiSubObject(UObject* SubObject)
+{
+	if (!SubObject || SubObjects.Contains(SubObject)) return;
+	SubObjects.RemoveAll([](const TWeakObjectPtr<UObject>& O) { return !O.IsValid(); });
+	SubObjects.Add(SubObject);
+}
+
+void UMusubiAuthorityComponent::UnregisterMusubiSubObject(UObject* SubObject)
+{
+	SubObjects.RemoveAll([SubObject](const TWeakObjectPtr<UObject>& O) { return !O.IsValid() || O.Get() == SubObject; });
+}
+
+UObject* UMusubiAuthorityComponent::FindMusubiSubObject(const FString& Name) const
+{
+	for (const TWeakObjectPtr<UObject>& O : SubObjects)
+		if (UObject* S = O.Get()) if (S->GetName() == Name) return S;
+	return nullptr;
+}

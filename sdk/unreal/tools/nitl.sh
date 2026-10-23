@@ -155,6 +155,14 @@ DMIN=$KN; [ -n "${NITL_PROJECT:-}" ] && DMIN=0 # a game pawn changes rarely (the
 if [ -n "$KN" ] && [ -n "$DN" ] && [ "$DN" -gt "$DMIN" ] && [ "${DA:-999999}" -lt "${KA:-0}" ]; then echo "PASS nitl-s1: member-level deltas (keyframes=$KN avg ${KA}B, deltas=$DN avg ${DA}B)"; else echo "FAIL nitl-s1: member-level deltas ($ST)"; ok=0; fi
 CINV=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | grep -o "inv=[0-9]*" | cut -d= -f2)
 if [ -n "$CINV" ] && [ -n "$A1" ] && [ "$CINV" -ge "$A1" ]; then echo "PASS nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV)"; else echo "FAIL nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV, s1 had $A1)"; ok=0; fi
+# registered replicated subobject (AddReplicatedSubObject + RegisterMusubiSubObject, the NITL pawn's "Loadout"): its state
+# must arrive on the new owner with the handover and reach the client from there; a game pawn without one is SKIP
+M1=$(grep -n "nitl: server pawn .* id=$ENTITY owned=1 " "$OUT/nitl-s1.log" | awk -F: -v n="$HO" '$1<n' | grep -o "ammo=-*[0-9]*" | tail -1 | cut -d= -f2)
+M2=$(grep "nitl: server pawn .* id=$ENTITY owned=1 " "$OUT/$S2LOG.log" | grep -o "ammo=-*[0-9]*" | head -1 | cut -d= -f2)
+MC=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | grep -o "ammo=-*[0-9]*" | cut -d= -f2)
+if [ "${M1:--1}" = "-1" ]; then echo "SKIP nitl-s: registered subobject carried across the handover (pawn has no Loadout subobject)"
+elif [ -n "$M2" ] && [ "$M1" -ge 1 ] && [ "$M2" -ge "$M1" ]; then echo "PASS nitl-s: registered subobject carried across the handover without reset (ammo s1 $M1 -> s2 $M2)"; else echo "FAIL nitl-s: registered subobject carried across the handover without reset (ammo s1 ${M1:-?} -> s2 ${M2:-?})"; ok=0; fi
+if [ "${M1:--1}" = "-1" ]; then :; elif [ -n "$MC" ] && [ "$MC" -ge "$M1" ]; then echo "PASS nitl-c: client sees the registered subobject from the new owner (ammo=$MC)"; else echo "FAIL nitl-c: client sees the registered subobject from the new owner (ammo=${MC:-?}, s1 had $M1)"; ok=0; fi
 if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/$S2LOG.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi
 if [ "$CHAOS" = 1 ]; then
   chk nitl-s1 "nitl: handover $ENTITY cancelled"

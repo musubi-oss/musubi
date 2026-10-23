@@ -658,9 +658,19 @@ actor and recurses (class checked as for the actor, RepNotify fired). `UMusubiAu
   `path:<PathName>` and resolve with `FindObject`. Dynamically spawned non-entity objects are still not carried
   (nothing stable to name them by; the ghost keeps what it has).
 
-**Not covered yet:** replicated subobjects registered with `AddReplicatedSubObject` outside the component list
-(`FSubObjectRegistry` is private to `AActor`); nested components with the same name on different owners are
-disambiguated only by their owning actor.
+**Replicated subobjects outside the component list** (`AddReplicatedSubObject`): the engine keeps that registry
+private to `AActor` (`FSubObjectRegistry`, reachable only through an engine-private header), so the game registers
+them with Musubi explicitly — `Authority->RegisterMusubiSubObject(Obj)` (Blueprint-callable, `Unregister…` to drop).
+A registered object is exported and applied exactly like a replicated component, keyed by its name, so the contract
+is: give it a stable name under the actor (`NewObject<ULoadout>(this, TEXT("Loadout"))`), create and register it on
+every *server* side (BeginPlay runs on the ghost too, `HasAuthority()` is true on both), and set
+`bReplicateUsingRegisteredSubObjectList = true` so the classic driver ships it to clients — a client must not create
+its own (the replicated instance would land beside a local empty one): keep the pointer in a replicated UPROPERTY
+and register it in the RepNotify if the client reads it through the registry too. A replicated UPROPERTY that points
+at a registered subobject travels as `<entity>/<Name>` (like a component reference) and resolves to the receiver's
+instance; until the receiver has created it the pointer is left alone (never nulled). The owner's state lands
+on the receiver's instance of the same name; a name the receiver has not registered is logged and skipped. Nested
+components with the same name on different owners are disambiguated only by their owning actor.
 
 ### 9.9 Keyframes and member-level deltas (phase 9g-6, GDK side)
 
@@ -832,11 +842,12 @@ timer grew on s1 (`inv=1 gold=90`) is the ghost's state on s2 via iris and the n
 server (iris apply → RepNotify → `OnInventoryChanged`) and on the client. The two NITL-pawn-only checks (push-model
 `Steps`, delta/keyframe ratio) are skipped/relaxed for a project pawn and say so in the verdict.
 
-**Still not covered.** `AddReplicatedSubObject` subobjects outside the component list: in 5.8 `AActor` exposes only
-`IsReplicatedSubObjectRegistered()`; the registry itself is reachable only through
-`Engine/Private/Net/NetSubObjectRegistryGetter.h` (engine-private), so exporting them needs an engine patch or a
-public accessor from Epic — documented, not worked around. The demo is headless-verified; nobody has clicked through
-it in the editor UI on this box (no display), the editor-side classes are the same ones the commandlet drives.
+**`AddReplicatedSubObject` subobjects** are carried since 9g-10 through explicit registration
+(`RegisterMusubiSubObject`, §9.8): the NITL pawn's `Loadout` UObject (`Ammo` grows on the owner) arrives on the new
+owner with the handover and reaches the client from there — the run checks `ammo` s1 → s2 → client. What stays
+out: a subobject the game did not register, or one without a stable name (the receiver has nothing to apply the
+state to). The demo is headless-verified; nobody has clicked through it in the editor UI on this box (no display),
+the editor-side classes are the same ones the commandlet drives.
 
 ## 10. Numbers, limits, failure behaviour
 
