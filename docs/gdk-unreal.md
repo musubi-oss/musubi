@@ -739,6 +739,83 @@ Both 7d and 7e are multi-cell-per-server bugs the one-cell-per-server run can ne
 whole row) is what covers them. With no ghost phase (the entity arrives already owned after a cancelled handover)
 the acceptance checks the owned spawn restored the inventory from the node's state instead.
 
+### 9.11 The Third Person demo (phase 9g-9): a real project, Blueprint logic, the same live run
+
+`sdk/unreal/Demo/MusubiThirdPerson` is Epic's Third Person template turned into a Musubi game — the acceptance project
+for "how does an integrator plug this in", and the same node-in-the-loop run as §9.6/§9.10 executed on it.
+
+**What the project is.** A C++ game module `MusubiThirdPerson` with the template's three classes renamed
+(`AMusubiThirdPersonCharacter : ACharacter` — camera boom, follow camera, Enhanced Input, `DoMove/DoLook/DoJump*`;
+`AMusubiThirdPersonGameMode : AMusubiGameMode`; `AMusubiThirdPersonPlayerController`), plus what makes it Musubi:
+
+- the character owns a `UMusubiAuthorityComponent` ("Authority") and a replicated `UMusubiThirdPersonInventory`
+  ("Inventory": a FastArray of items + `Gold` with RepNotify, `AddItem/AddGold/NumItems/GetItems` BlueprintCallable,
+  `OnInventoryChanged` BlueprintAssignable), and exposes `IsEntityOwned()` / `GetEntityId()` to Blueprints;
+- the game mode derives from `AMusubiGameMode` (§9.7), so possession follows the player's entity across servers;
+- `Config/DefaultEngine.ini` is the NITL host config (`MusubiNetDriver` as GameNetDriver, `MusubiMeshNetDriver`,
+  `[URL] Protocol=musubi`) + the template's map/game mode + `[CoreRedirects]`; `DefaultGame.ini` points
+  `OwnedActorClass` at `BP_ThirdPersonCharacter_C`, so the simulator spawns the *Blueprint* character for entities.
+
+Epic's template content (`Lvl_ThirdPerson`, `BP_ThirdPersonCharacter/GameMode/PlayerController`, mannequins, input
+assets, LevelPrototyping — 130 MB) is under the UE EULA and is not in the repository: `tools/demo-content.sh
+<engine root>` copies it from an engine install (or `--gitdeps Commit.gitdeps.xml` fetches it from Epic's CDN the
+way `Setup.sh` does). The template Blueprints are reparented onto our classes with
+`+PackageRedirects=(OldName="/Script/TP_ThirdPerson",NewName="/Script/MusubiThirdPerson")` **and** one
+`+ClassRedirects` per class — the package redirect alone does not rename the class part (the parent came out as
+`/Script/MusubiThirdPerson.TP_ThirdPersonCharacter` and failed to load); `-run=CompileAllBlueprints` is the proof.
+
+**Blueprint logic without an interactive editor.** `Source/MusubiThirdPersonEditor` (an Editor module) holds
+`UMusubiDemoContentCommandlet`: `UnrealEditor-Cmd MusubiThirdPerson.uproject -run=MusubiDemoContent` writes the demo's
+graph into `BP_ThirdPersonCharacter`'s event graph with the same `UK2Node_*` the editor places, compiles it with
+`FKismetEditorUtilities::CompileBlueprint` and saves the asset; nodes it placed are tagged (node comment) so the
+commandlet is re-runnable. The graph is the integrator pattern:
+
+```
+Event BeginPlay
+ ├─ Bind Event to Inventory.OnInventoryChanged ─▶ MusubiDemoInventoryChanged ─▶ Print "musubi-demo inventory items=N gold=G"
+ ├─ Bind Event to Authority.OnAuthorityChanged ─▶ MusubiDemoAuthorityChanged(bOwned) ─▶ Branch ─▶ Print "musubi-demo owned entity <id>"
+ └─ Set Timer by Event (2 s, looping) ─▶ MusubiDemoPickup ─▶ Branch(IsEntityOwned) ─▶ Inventory.AddGold(10), AddItem(1, 1)
+```
+
+Two things the first version got wrong and every integrator will meet: (1) *ownership is not known at BeginPlay* —
+the simulator spawns the actor (BeginPlay runs inside `SpawnActor`) and binds the authority component afterwards, so
+a `Branch(IsEntityOwned)` at BeginPlay is always false; `UMusubiAuthorityComponent::OnAuthorityChanged` fires on that
+bind and on every later owner/ghost flip, hang ownership-dependent logic off it; (2) a `Get` of an inherited C++
+UPROPERTY (`Inventory`, `Authority`) is a *self* member (`FMemberReference::SetSelfMember`), an external-member
+reference leaves an unconnected target pin and the compiler purges the node ("uses an invalid target").
+
+**Building and running it headless.** `tools/demo-build.sh <ver>` copies project + content + the plugin into
+`target/ue/demo-<ver>/MusubiThirdPerson` and runs UBT on the Editor target inside Epic's dev-slim image;
+`tools/nitl.sh` takes `NITL_PROJECT=<that dir> NITL_MAP=/Game/ThirdPerson/Lvl_ThirdPerson NITL_SPAWN_Z=300` and runs
+the §9.6 scenario on the demo instead of the host project. What only the live run showed:
+
+- *the plugin was silently not loaded.* A source plugin dropped into a 5.8 project with `"EngineVersion": "5.3.0"`
+  makes the editor ask "'Musubi' is Incompatible — attempt to load it anyway?"; `-unattended` answers **No** and
+  the log says only `Skipping load of 'Musubi'`. The game module still linked (`MusubiServer` came in as a shared-
+  library dependency, the sim stream even connected) but no plugin module ran, no `MusubiNitl`, no cells. UAT
+  `BuildPlugin` stamps the engine version, a hand copy does not; `demo-build.sh` stamps `<major.minor>.0` (the check
+  is *plugin ≤ engine* including the patch digit — the engine reports `5.8.0-<changelist>`, so `5.8.4` is "newer");
+- *the game module's RPATH to the plugin is anchored at the build path* (`$ORIGIN/../../../../…/out/MusubiThirdPerson/
+  Plugins/Musubi/Binaries/Linux`): copy the project elsewhere and `libUnrealEditor-Musubi.so` is "not found". The
+  run bind-mounts every instance copy at the path it was built at;
+- *spawn height matters on a map with a floor.* The template floor top is at z≈196 (PlayerStart 444,0,292); the
+  simulator's default height put the capsule inside it and the character sat in `MOVE_Falling` at a constant z,
+  taking no input. `-MusubiNitlSpawn=x,y[,z]` now sets the simulator's height component.
+
+**Result (5.8.4, 2 servers + 1 client, no chaos).** The Blueprint character walks from x=216 across the border to
+x=1765: handover `started → completed`, client rehomed in place and swapped to `BP_ThirdPersonCharacter_C_1`,
+possession before/after, PlayerState name kept, entity handle `changes=1 live=1`; the inventory the *Blueprint*
+timer grew on s1 (`inv=1 gold=90`) is the ghost's state on s2 via iris and the new owner continues from it
+(`gold=100 → 700`), the client receives it from the new owner; the Blueprint prints fire on the owner, on the ghost
+server (iris apply → RepNotify → `OnInventoryChanged`) and on the client. The two NITL-pawn-only checks (push-model
+`Steps`, delta/keyframe ratio) are skipped/relaxed for a project pawn and say so in the verdict.
+
+**Still not covered.** `AddReplicatedSubObject` subobjects outside the component list: in 5.8 `AActor` exposes only
+`IsReplicatedSubObjectRegistered()`; the registry itself is reachable only through
+`Engine/Private/Net/NetSubObjectRegistryGetter.h` (engine-private), so exporting them needs an engine patch or a
+public accessor from Epic — documented, not worked around. The demo is headless-verified; nobody has clicked through
+it in the editor UI on this box (no display), the editor-side classes are the same ones the commandlet drives.
+
 ## 10. Numbers, limits, failure behaviour
 
 | Item | Value | Behaviour at the edge |

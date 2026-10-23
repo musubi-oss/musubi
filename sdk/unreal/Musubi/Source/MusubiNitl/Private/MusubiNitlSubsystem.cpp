@@ -1,6 +1,10 @@
 #include "MusubiNitlSubsystem.h"
 #include "MusubiNitlPawn.h"
 #include "MusubiNitlInventoryComponent.h"
+#include "Net/Serialization/FastArraySerializer.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "MusubiSimulatorSubsystem.h"
 #include "MusubiAuthorityComponent.h"
 #include "MusubiSubsystem.h"
@@ -88,10 +92,13 @@ void UMusubiNitlSubsystem::OnSimStarted()
 	UE_LOG(LogMusubiNitl, Log, TEXT("nitl: sim started, spawn arg present=%d"), (int)FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlSpawn="), At, false));
 	if (!FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlSpawn="), At, false) || !Sim.IsValid() || bSpawned) return;
 	bSpawned = true;
-	FString X, Y;
+	FString X, Y, Z;
 	if (!At.Split(TEXT(","), &X, &Y)) return;
+	if (Y.Split(TEXT(","), &Y, &Z)) {} // -MusubiNitlSpawn=x,y[,z]: z = the simulator's height component (a map with a floor)
 	FMusubiJson Components;
-	Components.Value = MakeShared<FJsonValueObject>(MakeShared<FJsonObject>());
+	TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+	if (!Z.IsEmpty()) Obj->SetNumberField(TEXT("z"), FCString::Atod(*Z));
+	Components.Value = MakeShared<FJsonValueObject>(Obj);
 	Sim->Spawn(FCString::Atod(*X), FCString::Atod(*Y), Components, false, false, false, TOptional<uint64>(), [](bool bOk, const TSharedPtr<FJsonObject>& R)
 	{
 		const TSharedPtr<FJsonObject>* E = nullptr;
@@ -140,20 +147,47 @@ void UMusubiNitlSubsystem::OnSocketClosed(int32 Code, const FString& Reason)
 	UE_LOG(LogMusubiNitl, Warning, TEXT("nitl: socket closed %d %s"), Code, *Reason);
 }
 
+// The report is pawn-agnostic so the same checks run on the NITL pawn and on a game's own character (the Third Person
+// demo): any pawn with an authority component counts; Steps/PushSteps come from the NITL pawn only, the inventory is
+// read through reflection from a component named "Inventory" (int `Gold` + the first FastArray's item count).
+static void ReadInventory(const APawn* P, int32& OutItems, int32& OutGold)
+{
+	OutItems = -1; OutGold = -1;
+	const UActorComponent* Inv = nullptr;
+	for (const UActorComponent* C : P->GetComponents()) if (C && C->GetFName() == TEXT("Inventory")) { Inv = C; break; }
+	if (!Inv) return;
+	if (const FIntProperty* G = CastField<FIntProperty>(Inv->GetClass()->FindPropertyByName(TEXT("Gold")))) OutGold = G->GetPropertyValue_InContainer(Inv);
+	for (TFieldIterator<FStructProperty> It(Inv->GetClass()); It; ++It)
+	{
+		if (!It->Struct || !It->Struct->IsChildOf(FFastArraySerializer::StaticStruct())) continue;
+		TFieldIterator<FArrayProperty> A(It->Struct);
+		if (!A) continue;
+		FScriptArrayHelper H(*A, A->ContainerPtrToValuePtr<void>(It->ContainerPtrToValuePtr<void>(Inv)));
+		OutItems = H.Num();
+		return;
+	}
+}
+
 bool UMusubiNitlSubsystem::Report(float)
 {
 	UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
 	if (!World) return true;
 	int32 N = 0;
-	for (TActorIterator<AMusubiNitlPawn> It(World); It; ++It)
+	for (TActorIterator<APawn> It(World); It; ++It)
 	{
+		const UMusubiAuthorityComponent* Authority = It->FindComponentByClass<UMusubiAuthorityComponent>();
+		if (!Authority) continue;
+		const AMusubiNitlPawn* Nitl = Cast<AMusubiNitlPawn>(*It);
+		int32 Items, Gold; ReadInventory(*It, Items, Gold);
 		const FVector L = It->GetActorLocation();
 		const APlayerController* LocalPC = Mode == TEXT("client") ? UGameplayStatics::GetPlayerController(World, 0) : nullptr;
 		const APlayerState* PS = LocalPC ? LocalPC->PlayerState.Get() : It->GetPlayerState();
-		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s inv=%d gold=%d"), *Mode, *It->GetName(),
-			It->Authority ? *It->Authority->NetEntityId : TEXT("?"), It->Authority ? (int)It->Authority->bNetOwned : -1, L.X, L.Y, It->Steps, It->PushSteps, It->GetNetPushIdDynamic(),
+		const ACharacter* Ch = Cast<ACharacter>(*It);
+		const int32 MoveMode = Ch && Ch->GetCharacterMovement() ? (int32)Ch->GetCharacterMovement()->MovementMode.GetValue() : -1;
+		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f z=%.0f mode=%d steps=%d push=%d pushid=%016llx ctrl=%s possessed=%d name=%s inv=%d gold=%d"), *Mode, *It->GetName(),
+			*Authority->NetEntityId, (int)Authority->bNetOwned, L.X, L.Y, L.Z, MoveMode, Nitl ? Nitl->Steps : -1, Nitl ? Nitl->PushSteps : -1, It->GetNetPushIdDynamic(),
 			It->GetController() ? *It->GetController()->GetName() : TEXT("none"), LocalPC ? (int)(LocalPC->GetPawn() == *It) : (int)(It->GetController() != nullptr),
-			PS ? *PS->GetPlayerName() : TEXT("-"), It->Inventory ? It->Inventory->NumItems() : -1, It->Inventory ? It->Inventory->Gold : -1);
+			PS ? *PS->GetPlayerName() : TEXT("-"), Items, Gold);
 		++N;
 	}
 	if (Mode == TEXT("client"))

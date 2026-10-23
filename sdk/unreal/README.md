@@ -156,8 +156,14 @@ on the command line and a runtime `Configure()` override the address.
 
 ## Status / caveats
 
-- Not yet: a demo map (needs the editor; the 10k meshbench world is the intended content), live WS→QUIC
-  migration (Auto only decides at connect time), console platform builds of `musubi-quic-ffi`.
+- Demo project: `Demo/MusubiThirdPerson` — Epic's Third Person template on a Musubi dedicated server (C++ game module
+  over `AMusubiGameMode`, Blueprint character with authority + inventory components, Blueprint logic authored by the
+  `MusubiDemoContent` commandlet). Template content is fetched with `tools/demo-content.sh` (UE EULA, not in git),
+  built with `tools/demo-build.sh <ver>`, and run through the same node-in-the-loop scenario with
+  `NITL_PROJECT=target/ue/demo-<ver>/MusubiThirdPerson NITL_MAP=/Game/ThirdPerson/Lvl_ThirdPerson NITL_SPAWN_Z=300
+  tools/nitl.sh <ver>` — see docs §9.11.
+- Not yet: live WS→QUIC migration (Auto only decides at connect time), console platform builds of `musubi-quic-ffi`,
+  an interactive editor pass (the demo is verified headless).
 - The wire layer is compiled and tested in CI against `tools/ue-shim` (a minimal stand-in for
   Core/Json). The whole plugin (all modules, Editor + Game targets, Linux) is built by the real
   UBT/UAT `BuildPlugin` with `tools/ue-build.sh <ver>` inside Epic's `dev-slim` images — green with

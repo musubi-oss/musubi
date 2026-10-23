@@ -4,6 +4,8 @@
 # stay connected (in-place rehome) and keep its actor. Needs `tools/ue-build.sh <ver>` green first (the plugin
 # binaries come from target/ue/<ver>/Package) and the dev Postgres (`docker start musubi-pg`).
 #   tools/nitl.sh 5.3.2 [seconds]
+#   NITL_PROJECT=target/ue/demo-5.8.4/MusubiThirdPerson NITL_MAP=/Game/ThirdPerson/Lvl_ThirdPerson NITL_SPAWN_Z=300 \
+#     tools/nitl.sh 5.8.4 [seconds]      # the same run on the Third Person demo (after tools/demo-build.sh 5.8.4)
 set -euo pipefail
 VER="${1:?engine version, e.g. 5.3.2}"; DUR="${2:-90}"
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -14,11 +16,21 @@ DB="${MUSUBI_TEST_DATABASE_URL:-postgres://musubi:musubi@localhost:5433/musubi}"
 # NITL_CHAOS=1 (phase 9g-7): node netsim on the client sessions (latency/jitter/loss), a second client on its own
 # entity owned by s2, s2 killed while the handover is in flight, s2b takes the cell over.
 CHAOS="${NITL_CHAOS:-0}"; NAMES="nitl-s1 nitl-s2 nitl-c"; [ "$CHAOS" = 1 ] && NAMES="nitl-s1 nitl-s2 nitl-c nitl-c2 nitl-s2b"
-[ -f "$PKG/Musubi.uplugin" ] || { echo "no plugin build in $PKG — run tools/ue-build.sh $VER"; exit 2; }
-rm -rf "$OUT"; mkdir -p "$OUT/home"; cp -r "$ROOT/sdk/unreal/tools/nitl/HostProject" "$PROJ"
-mkdir -p "$PROJ/Plugins"; cp -r "$PKG" "$PROJ/Plugins/Musubi"
-cp -r "$ROOT/sdk/unreal/Musubi/Config" "$PROJ/Plugins/Musubi/"  # BuildPlugin output has no Config/
-sed -i "s/\"EngineAssociation\": \"\"/\"EngineAssociation\": \"${VER%.*}\"/" "$PROJ/HostProject.uproject"
+# NITL_PROJECT=<dir of a built project incl. Plugins/Musubi> + NITL_MAP=<map>: run the same scenario on another project
+# (the Third Person demo, phase 9g-9: `tools/demo-build.sh <ver>` then NITL_PROJECT=target/ue/demo-<ver>/MusubiThirdPerson).
+MAP="${NITL_MAP:-/Engine/Maps/Entry}"; UPROJ=HostProject.uproject
+rm -rf "$OUT"; mkdir -p "$OUT/home"
+if [ -n "${NITL_PROJECT:-}" ]; then
+  # the game module's RPATH to Plugins/Musubi is anchored at the build path, so every instance is mounted at /out/<name>
+  cp -r "$NITL_PROJECT" "$PROJ"; rm -rf "$PROJ/Saved" "$PROJ/Intermediate" "$PROJ/DerivedDataCache"
+  UPROJ=$(cd "$PROJ" && ls *.uproject | head -1); PNAME=$(basename "$NITL_PROJECT")
+else
+  [ -f "$PKG/Musubi.uplugin" ] || { echo "no plugin build in $PKG — run tools/ue-build.sh $VER"; exit 2; }
+  cp -r "$ROOT/sdk/unreal/tools/nitl/HostProject" "$PROJ"
+  mkdir -p "$PROJ/Plugins"; cp -r "$PKG" "$PROJ/Plugins/Musubi"
+  cp -r "$ROOT/sdk/unreal/Musubi/Config" "$PROJ/Plugins/Musubi/"  # BuildPlugin output has no Config/
+  sed -i "s/\"EngineAssociation\": \"\"/\"EngineAssociation\": \"${VER%.*}\"/" "$PROJ/HostProject.uproject"
+fi
 
 cleanup() { set +e; curl -s http://127.0.0.1:7360/metrics > "$OUT/metrics.txt" 2>/dev/null; for N in $NAMES; do docker logs "$N" > "$OUT/$N.log" 2>&1; done; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; docker rm -f nitl-s1 nitl-s2 nitl-c >/dev/null 2>&1; }
 trap cleanup EXIT
@@ -39,18 +51,20 @@ ue() { # name, extra args...
   # every instance gets its own project copy + HOME: UE processes sharing Saved/DDC/shader autogen race at boot
   docker rm -f "$N" >/dev/null 2>&1 || true # a leftover from an aborted run must not block this one
   cp -r "$PROJ" "$OUT/proj-$N"; mkdir -p "$OUT/home-$N"
-  docker run -d --name "$N" --network host -u "$(id -u):$(id -g)" -e HOME="/out/home-$N" -v "$OUT:/out" "$IMG" \
-    /home/ue4/UnrealEngine/Engine/Binaries/Linux/UnrealEditor "/out/proj-$N/HostProject.uproject" /Engine/Maps/Entry \
+  local UPATH="/out/proj-$N/$UPROJ" MOUNT=(); if [ -n "${NITL_PROJECT:-}" ]; then MOUNT=(-v "$OUT/proj-$N:/out/$PNAME"); UPATH="/out/$PNAME/$UPROJ"; fi
+  docker run -d --name "$N" --network host -u "$(id -u):$(id -g)" -e HOME="/out/home-$N" -v "$OUT:/out" "${MOUNT[@]}" "$IMG" \
+    /home/ue4/UnrealEngine/Engine/Binaries/Linux/UnrealEditor "$UPATH" "$MAP" \
     -unattended -nosplash -nullrhi -NoSound -stdout -FullStdOutLogOutput -log -LogCmds="LogMusubiServer VeryVerbose, LogMusubiNet Verbose, LogMusubiMesh Verbose, LogNet Verbose" \
     -MusubiApi="$API" -MusubiKey="$KEY" -MusubiWorld="$WORLD" "$@" >/dev/null
 }
 echo "== servers"
 S2SPAWN=""; if [ "$CHAOS" = 1 ]; then
-  S2SPAWN="-MusubiNitlSpawn=$((CELL + CELL / 2)),100"
+  S2SPAWN="-MusubiNitlSpawn=$((CELL + CELL / 2)),100${NITL_SPAWN_Z:+,$NITL_SPAWN_Z}"
   curl -fsS -X PUT "$API/v1/admin/dev/netsim" -H "x-musubi-server-key: $KEY" -H 'content-type: application/json' -d '{"latency_ms":60,"jitter_ms":20,"loss_pct":2}' > "$OUT/netsim.json" 2>&1 || curl -fsS -X POST "$API/v1/admin/dev/netsim" -H "x-musubi-server-key: $KEY" -H 'content-type: application/json' -d '{"latency_ms":60,"jitter_ms":20,"loss_pct":2}' > "$OUT/netsim.json" 2>&1
   echo "netsim: $(head -c 300 "$OUT/netsim.json")"
 fi
-ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" -MusubiNitlSpawn="$X0,100" -MusubiNitlWalk="$WALK"
+SZ=""; [ -n "${NITL_SPAWN_Z:-}" ] && SZ=",$NITL_SPAWN_Z" # a map with a floor (the demo): spawn height, the Entry map has none
+ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" -MusubiNitlSpawn="$X0,100$SZ" -MusubiNitlWalk="$WALK"
 ue nitl-s2 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="1,0" -MusubiNitlWalk="$WALK" $S2SPAWN
 ENTITY=""
 for i in $(seq 1 180); do
@@ -102,7 +116,9 @@ LASTX=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | se
 chk nitl-c  "rehome: swapped"
 # push-model property on the same actor: the classic driver must still see MARK_PROPERTY_DIRTY on an actor the Iris export registered
 LASTS=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* steps=\([0-9]*\).*/\1/p'); LASTPUSH=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* push=\([0-9]*\).*/\1/p')
+if [ -n "${NITL_PROJECT:-}" ] && [ "${LASTS:--1}" = "-1" ]; then echo "SKIP nitl-c: push-model property (the project's pawn is not the NITL pawn)"; else
 if [ -n "$LASTPUSH" ] && [ -n "$LASTS" ] && [ "$LASTPUSH" -gt 0 ] && [ $((LASTS - LASTPUSH)) -lt 120 ]; then echo "PASS nitl-c: push-model property replicated (steps=$LASTS push=$LASTPUSH)"; else echo "FAIL nitl-c: push-model property replicated (steps=$LASTS push=$LASTPUSH)"; ok=0; fi
+fi
 chk nitl-c  "nitl: identified"
 # the player: possessed its entity's pawn before the rehome, possesses the new owner's copy after it, PlayerState name survived
 REH=$(grep -n "rehomed in place" "$OUT/nitl-c.log" | head -1 | cut -d: -f1); REH=${REH:-0}
@@ -134,7 +150,8 @@ if [ -n "$A1" ] && [ -n "$A2" ] && [ "$A1" -ge 1 ] && [ "$A2" -ge "$A1" ] && [ "
 # member-level deltas: keyframes are rare and big, deltas frequent and small (iris stats line on the owner)
 ST=$(grep -o "iris stats keyframes=[0-9]* ([0-9]* B, avg [0-9]*) deltas=[0-9]* ([0-9]* B, avg [0-9]*)" "$OUT/nitl-s1.log" | tail -1)
 KN=$(echo "$ST" | sed -n 's/.*keyframes=\([0-9]*\).*/\1/p'); KA=$(echo "$ST" | sed -n 's/.*keyframes=[0-9]* ([0-9]* B, avg \([0-9]*\)).*/\1/p'); DN=$(echo "$ST" | sed -n 's/.*deltas=\([0-9]*\).*/\1/p'); DA=$(echo "$ST" | sed -n 's/.*deltas=[0-9]* ([0-9]* B, avg \([0-9]*\)).*/\1/p')
-if [ -n "$KN" ] && [ -n "$DN" ] && [ "$DN" -gt "$KN" ] && [ "${DA:-999999}" -lt "${KA:-0}" ]; then echo "PASS nitl-s1: member-level deltas (keyframes=$KN avg ${KA}B, deltas=$DN avg ${DA}B)"; else echo "FAIL nitl-s1: member-level deltas ($ST)"; ok=0; fi
+DMIN=$KN; [ -n "${NITL_PROJECT:-}" ] && DMIN=0 # a game pawn changes rarely (the demo: gold every 2 s): the ratio only holds for the NITL pawn
+if [ -n "$KN" ] && [ -n "$DN" ] && [ "$DN" -gt "$DMIN" ] && [ "${DA:-999999}" -lt "${KA:-0}" ]; then echo "PASS nitl-s1: member-level deltas (keyframes=$KN avg ${KA}B, deltas=$DN avg ${DA}B)"; else echo "FAIL nitl-s1: member-level deltas ($ST)"; ok=0; fi
 CINV=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | grep -o "inv=[0-9]*" | cut -d= -f2)
 if [ -n "$CINV" ] && [ -n "$A1" ] && [ "$CINV" -ge "$A1" ]; then echo "PASS nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV)"; else echo "FAIL nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV, s1 had $A1)"; ok=0; fi
 if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/$S2LOG.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi
@@ -149,4 +166,9 @@ if [ "$CHAOS" = 1 ]; then
   if [ -n "$DROP" ] && [ "${DROP%.*}" -gt 0 ]; then echo "PASS node: netsim dropped packets on the client sessions ($DROP)"; else echo "FAIL node: netsim dropped packets ($(head -c 200 "$OUT/netsim-after.json" 2>/dev/null))"; ok=0; fi
 fi
 grep -h "nitl: client pawn" "$OUT/nitl-c.log" | tail -3
+if [ -n "${NITL_PROJECT:-}" ]; then # the project's own Blueprint logic ran on every side (demo: PrintString from the authored graph)
+  chk nitl-s1 "musubi-demo owned entity $ENTITY"
+  chk $S2LOG "musubi-demo owned entity $ENTITY"
+  chk nitl-c "musubi-demo inventory items="
+fi
 [ "$ok" = 1 ] && echo "NITL PASS ($VER)" || { echo "NITL FAIL ($VER) — logs in $OUT"; exit 1; }

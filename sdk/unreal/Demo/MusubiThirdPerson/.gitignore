@@ -1,0 +1,7 @@
+# Epic's template content (UE EULA, 130 MB): fetched by ../../tools/demo-content.sh, never committed
+/Content/
+/Binaries/
+/Intermediate/
+/Saved/
+/DerivedDataCache/
+/Plugins/
