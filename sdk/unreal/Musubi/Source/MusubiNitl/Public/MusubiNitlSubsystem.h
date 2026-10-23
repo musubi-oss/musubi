@@ -4,6 +4,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Containers/Ticker.h"
 #include "Engine/EngineBaseTypes.h"
+#include "MusubiEntityRegistry.h"
 #include "MusubiTypes.h"
 #include "MusubiNitlSubsystem.generated.h"
 
@@ -36,6 +37,7 @@ private:
 	TWeakObjectPtr<class UMusubiSimulatorSubsystem> Sim;
 	TWeakObjectPtr<class UMusubiSubsystem> Client;
 	FDelegateHandle IdentifiedHandle;
+	FMusubiEntityHandle Handle; // client: taken from the first identified pawn, must keep resolving across the rehome
 	FDelegateHandle TickHandle;
 	void OnWorldTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 	FTSTicker::FDelegateHandle Ticker;

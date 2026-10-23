@@ -78,6 +78,9 @@ if [ -n "$BEFORE" ]; then echo "PASS nitl-c: player possessed its pawn before th
 case "$AFTER" in *"possessed=1"*) echo "PASS nitl-c: player possesses the new owner's pawn after the rehome";; *) echo "FAIL nitl-c: player possesses the new owner's pawn after the rehome ($AFTER)"; ok=0;; esac
 N1=$(echo "$BEFORE" | sed -n 's/.* name=\(.*\)$/\1/p'); N2=$(echo "$AFTER" | sed -n 's/.* name=\(.*\)$/\1/p')
 if [ -n "$N1" ] && [ "$N1" != "-" ] && [ "$N1" = "$N2" ]; then echo "PASS nitl-c: PlayerState name survived the rehome ($N1)"; else echo "FAIL nitl-c: PlayerState name survived the rehome (before=$N1 after=$N2)"; ok=0; fi
+# the stable handle: taken from the first pawn, resolves to the live possessed pawn after the swap, exactly one actor change seen
+H=$(grep "nitl: handle " "$OUT/nitl-c.log" | tail -1 | sed 's/.*nitl: handle //')
+case "$H" in *"changes=1 live=1") echo "PASS nitl-c: entity handle resolves to the live pawn after the rehome ($H)";; *) echo "FAIL nitl-c: entity handle resolves to the live pawn after the rehome ($H)"; ok=0;; esac
 if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/nitl-s2.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi
 grep -h "nitl: client pawn" "$OUT/nitl-c.log" | tail -3
 [ "$ok" = 1 ] && echo "NITL PASS ($VER)" || { echo "NITL FAIL ($VER) — logs in $OUT"; exit 1; }

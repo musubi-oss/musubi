@@ -23,6 +23,7 @@ public:
 	/** The entity id as replicated to engine clients (MusubiNet): lets a client recognise the same entity again after a rehome. */
 	UPROPERTY(ReplicatedUsing = OnRep_NetEntityId, Transient, BlueprintReadOnly, Category = "Musubi|Authority") FString NetEntityId;
 	UFUNCTION() void OnRep_NetEntityId();
+	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 	/** Replicated to engine clients: true on the actor of the owning server, false on a relayed ghost of another server's entity. */
 	UPROPERTY(Replicated, Transient, BlueprintReadOnly, Category = "Musubi|Authority") bool bNetOwned = false;
 	/** Client side: an actor replicated by a server identified itself with its entity id. */

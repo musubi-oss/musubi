@@ -1,4 +1,5 @@
 #include "MusubiAuthorityComponent.h"
+#include "MusubiEntityRegistry.h"
 #include "MusubiSimulatorSubsystem.h"
 #include "MusubiJson.h"
 #include "Components/PrimitiveComponent.h"
@@ -17,7 +18,17 @@ void UMusubiAuthorityComponent::GetLifetimeReplicatedProps(TArray<FLifetimePrope
 
 void UMusubiAuthorityComponent::OnRep_NetEntityId()
 {
-	if (!NetEntityId.IsEmpty()) OnClientEntityIdentified.Broadcast(GetOwner(), NetEntityId);
+	if (NetEntityId.IsEmpty()) return;
+	// registry first: its OnEntityActorChanged fires while the old twin is still alive, the driver destroys it right after
+	if (UMusubiEntityRegistry* R = UMusubiEntityRegistry::Get(GetOwner())) R->Register(NetEntityId, GetOwner());
+	OnClientEntityIdentified.Broadcast(GetOwner(), NetEntityId);
+}
+
+void UMusubiAuthorityComponent::EndPlay(const EEndPlayReason::Type Reason)
+{
+	const FString Id = NetEntityId.IsEmpty() ? EntityId.ToString() : NetEntityId;
+	if (UMusubiEntityRegistry* R = Id.IsEmpty() ? nullptr : UMusubiEntityRegistry::Get(GetOwner())) R->Unregister(Id, GetOwner());
+	Super::EndPlay(Reason);
 }
 
 FString UMusubiAuthorityComponent::GetComponentJson(const FString& Name) const
@@ -92,6 +103,7 @@ void UMusubiAuthorityComponent::Bind(UMusubiSimulatorSubsystem* Owner, const FMu
 	Sim = Owner;
 	EntityId = Id;
 	NetEntityId = Id.ToString();
+	if (UMusubiEntityRegistry* R = UMusubiEntityRegistry::Get(GetOwner())) R->Register(NetEntityId, GetOwner());
 	Cell = InCell;
 	Components.Reset();
 	Dirty.Reset();

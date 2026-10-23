@@ -618,9 +618,17 @@ root is a `USceneComponent`, fatal for a Character: the capsule started simulati
 `BodySimulates()` remembers, on first touch, whether the body simulates by nature; simulation is only ever switched
 *back on* for bodies that had it (props), kinematic bodies moved by a movement component stay kinematic.
 
-**What this is not yet:** gameplay code still gets a new actor pointer per rehome; the stable entity handle API
-(resolve `NetEntityId` → current actor, `OnEntityActorChanged`) is the next step. `score` round-trips but nothing in
-the acceptance changes it between servers; subobjects/components of the pawn are not part of the Iris export (9g-4).
+**Stable handle instead of actor pointers — `UMusubiEntityRegistry` (`MusubiServer`, a `UWorldSubsystem` on client and
+server).** Gameplay code keeps `FMusubiEntityHandle` (the entity id, Blueprint-visible) and resolves it when it needs
+the actor: `Handle.Get(WorldContext)` / `ResolveEntity(id)` / `HandleOf(Actor)`. `UMusubiAuthorityComponent` fills the
+registry itself (server: `Bind`; client: `OnRep_NetEntityId`; both: `EndPlay` unregisters), so after a rehome the same
+handle points at the new owner's copy. `OnEntityActorChanged(EntityId, Old, New)` fires *before* the old twin is
+destroyed (the registry is updated ahead of the driver's swap), so references can be moved over without a null frame.
+NITL: the client takes the handle from the first identified pawn and at the end reports `handle … changes=1 live=1` —
+resolves to the pawn the local `PlayerController` possesses on the new owner, exactly one actor change seen.
+
+**What this is not yet:** `score` round-trips but nothing in the acceptance changes it between servers;
+subobjects/components of the pawn are not part of the Iris export (9g-4).
 
 ## 10. Numbers, limits, failure behaviour
 

@@ -45,9 +45,10 @@ void UMusubiNitlSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		C->OnSession.AddDynamic(this, &UMusubiNitlSubsystem::OnSession);
 		C->OnSocketConnected.AddDynamic(this, &UMusubiNitlSubsystem::OnSocketConnected);
 		C->OnSocketClosed.AddDynamic(this, &UMusubiNitlSubsystem::OnSocketClosed);
-		IdentifiedHandle = UMusubiAuthorityComponent::OnClientEntityIdentified.AddLambda([](AActor* A, const FString& Id)
+		IdentifiedHandle = UMusubiAuthorityComponent::OnClientEntityIdentified.AddLambda([this](AActor* A, const FString& Id)
 		{
 			UE_LOG(LogMusubiNitl, Log, TEXT("nitl: identified %s as %s"), A ? *A->GetName() : TEXT("?"), *Id);
+			if (!Handle.IsSet()) Handle = UMusubiEntityRegistry::HandleOf(A);
 		});
 		C->AuthenticateDevice(FGuid::NewGuid().ToString(EGuidFormats::Digits));
 	}
@@ -153,6 +154,16 @@ bool UMusubiNitlSubsystem::Report(float)
 		++N;
 	}
 	if (Mode == TEXT("client"))
+	{
 		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: client pawns=%d netdriver=%s"), N, World->GetNetDriver() ? *World->GetNetDriver()->GetDescription() : TEXT("none"));
+		if (Handle.IsSet())
+		{
+			AActor* A = Handle.Get(World);
+			const APlayerController* LocalPC = UGameplayStatics::GetPlayerController(World, 0);
+			const UMusubiEntityRegistry* R = UMusubiEntityRegistry::Get(World);
+			UE_LOG(LogMusubiNitl, Log, TEXT("nitl: handle %s -> %s changes=%d live=%d"), *Handle.EntityId, A ? *A->GetName() : TEXT("null"),
+				R ? R->ChangeCount() : -1, (int)(A && LocalPC && LocalPC->GetPawn() == A));
+		}
+	}
 	return true;
 }
