@@ -64,6 +64,13 @@ public:
 	// of the handle has to tell us explicitly.
 	void Track(UE::Net::FNetRefHandle Handle, UObject* Object);
 
+	// Build this class's descriptors in our registry without push-based dirtiness. An object's push id is a single
+	// slot shared by Iris and the classic driver (FNetPushObjectId: legacy id or Iris id, never both); if our
+	// export system claims it, MARK_PROPERTY_DIRTY on that actor goes to Iris and the GameNetDriver's changelist
+	// never sees push-model properties change (and the reverse assignment logs LogRep errors). We poll and
+	// compare every tick anyway, so our fragments do not need dirtiness. Call before StartReplicatingRootObject.
+	void DisablePushDirtiness(UClass* Class);
+
 private:
 	struct FTracked
 	{

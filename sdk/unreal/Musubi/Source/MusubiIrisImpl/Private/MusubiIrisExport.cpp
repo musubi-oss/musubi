@@ -135,6 +135,7 @@ void UMusubiIrisExportSubsystem::OnEntitySpawned(const FString& EntityId, AActor
 	if (!System || !Bridge || !Actor) return;
 	UMusubiAuthorityComponent* Auth = Actor->FindComponentByClass<UMusubiAuthorityComponent>();
 	if (!Auth || !Auth->IsOwned() || Handles.Contains(Actor)) return;
+	Bridge->DisablePushDirtiness(Actor->GetClass());
 #if ENGINE_MAJOR_VERSION > 5 || ENGINE_MINOR_VERSION >= 8
 	// 5.8: the root params moved to UNetObjectFactory; the overload taking them is deprecated
 	const UE::Net::FNetRefHandle H = Bridge->StartReplicatingRootObject(Actor, FactoryId);

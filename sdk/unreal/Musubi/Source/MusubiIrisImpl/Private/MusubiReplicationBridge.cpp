@@ -207,6 +207,20 @@ const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& UMusubiReplicatio
 	return Out;
 }
 
+void UMusubiReplicationBridge::DisablePushDirtiness(UClass* Class)
+{
+	// The builder registers class descriptors in the registry it is given and FReplicationFragmentUtil reuses them
+	// when the fragments are created, so clearing the trait here is what the fragments (and so
+	// SetNetPushIdOnInstance) will see.
+	for (const TRefCountPtr<const FReplicationStateDescriptor>& Ref : DescriptorsFor(Class))
+	{
+		if (FReplicationStateDescriptor* D = const_cast<FReplicationStateDescriptor*>(Ref.GetReference()))
+		{
+			EnumRemoveFlags(D->Traits, EReplicationStateTraits::HasPushBasedDirtiness | EReplicationStateTraits::HasFullPushBasedDirtiness);
+		}
+	}
+}
+
 void UMusubiReplicationBridge::FreeStates(FTracked& T, UObject* Obj)
 {
 	if (!Obj || T.States.Num() == 0) return;

@@ -66,6 +66,10 @@ chk nitl-c  "rehomed in place"
 LASTP=$(grep "client pawns=" "$OUT/nitl-c.log" | tail -1); case "$LASTP" in *"pawns=1 "*) echo "PASS nitl-c: one pawn at the end";; *) echo "FAIL nitl-c: one pawn at the end ($LASTP)"; ok=0;; esac
 LASTX=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* at \([-0-9]*\),.*/\1/p'); if [ -n "$LASTX" ] && [ "$LASTX" -gt 300 ]; then echo "PASS nitl-c: pawn kept moving after rehome (x=$LASTX)"; else echo "FAIL nitl-c: pawn kept moving after rehome (x=$LASTX)"; ok=0; fi
 chk nitl-c  "rehome: swapped"
+# push-model property on the same actor: the classic driver must still see MARK_PROPERTY_DIRTY on an actor the Iris export registered
+LASTS=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* steps=\([0-9]*\).*/\1/p'); LASTPUSH=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1 | sed -n 's/.* push=\([0-9]*\).*/\1/p')
+if [ -n "$LASTPUSH" ] && [ -n "$LASTS" ] && [ "$LASTPUSH" -gt 0 ] && [ $((LASTS - LASTPUSH)) -lt 120 ]; then echo "PASS nitl-c: push-model property replicated (steps=$LASTS push=$LASTPUSH)"; else echo "FAIL nitl-c: push-model property replicated (steps=$LASTS push=$LASTPUSH)"; ok=0; fi
 chk nitl-c  "nitl: identified"
+if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/nitl-s2.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi
 grep -h "nitl: client pawn" "$OUT/nitl-c.log" | tail -3
 [ "$ok" = 1 ] && echo "NITL PASS ($VER)" || { echo "NITL FAIL ($VER) — logs in $OUT"; exit 1; }

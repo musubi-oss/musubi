@@ -573,6 +573,14 @@ engine sources did not say out loud, all fixed in `MusubiIrisImpl`:
   read it; it is never in the bitstream. Writing the (zero) external scratch value back onto a ghost set its cull
   distance to 0, so when the ghost became the owner the classic driver found it irrelevant and the client never
   received it. Members that are not in the bitstream (nop, connection-specific) are never written back.
+- An object's push id is one slot shared by Iris and the classic driver (`FNetPushObjectId` is a legacy id *or*
+  an Iris id). With `net.IsPushModelEnabled=1` (engine default is off; real projects turn it on) our export
+  system claimed the slot first and the GameNetDriver's `FRepChangelistState` logged `SetNetPushID: … already
+  has a push id` and took it back; in the other order (an already-replicated ghost becoming the owner) the
+  classic changelist would never see `MARK_PROPERTY_DIRTY` again. Our descriptors are built without
+  `HasPushBasedDirtiness` (`UMusubiReplicationBridge::DisablePushDirtiness`), so Iris never sets or clears a
+  push id on our objects — the export polls and compares every tick anyway. The NITL pawn carries a push-model
+  `PushSteps` and the run asserts it replicates and that no conflict is logged.
 
 ## 10. Numbers, limits, failure behaviour
 

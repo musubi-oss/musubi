@@ -2,6 +2,7 @@
 #include "MusubiAuthorityComponent.h"
 #include "Components/SceneComponent.h"
 #include "Net/UnrealNetwork.h"
+#include "Net/Core/PushModel/PushModel.h"
 #include "Engine/NetDriver.h"
 #include "Engine/NetConnection.h"
 #include "Engine/World.h"
@@ -24,6 +25,9 @@ void AMusubiNitlPawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AMusubiNitlPawn, Steps);
+	FDoRepLifetimeParams Push;
+	Push.bIsPushBased = true;
+	DOREPLIFETIME_WITH_PARAMS_FAST(AMusubiNitlPawn, PushSteps, Push);
 }
 
 void AMusubiNitlPawn::Tick(float DeltaSeconds)
@@ -36,6 +40,8 @@ void AMusubiNitlPawn::Tick(float DeltaSeconds)
 	if (ND) for (const UNetConnection* C : ND->ClientConnections) if (C && C->PlayerController) { bClientJoined = true; break; }
 	if (Walk > 0.f && bClientJoined) AddActorWorldOffset(FVector(Walk * DeltaSeconds, 0, 0));
 	++Steps;
+	PushSteps = Steps;
+	MARK_PROPERTY_DIRTY_FROM_NAME(AMusubiNitlPawn, PushSteps, this);
 	const double Now = FPlatformTime::Seconds();
 	if (Now - LastLog > 1.0)
 	{
@@ -50,6 +56,6 @@ void AMusubiNitlPawn::OnRep_Steps()
 	if (Steps % 30 == 0)
 	{
 		const FVector L = GetActorLocation();
-		UE_LOG(LogMusubiNitl, Log, TEXT("client sees %s (%s) at %.0f,%.0f steps=%d owned=%d"), *GetName(), Authority ? *Authority->NetEntityId : TEXT("?"), L.X, L.Y, Steps, Authority ? (int)Authority->bNetOwned : -1);
+		UE_LOG(LogMusubiNitl, Log, TEXT("client sees %s (%s) at %.0f,%.0f steps=%d push=%d owned=%d"), *GetName(), Authority ? *Authority->NetEntityId : TEXT("?"), L.X, L.Y, Steps, PushSteps, Authority ? (int)Authority->bNetOwned : -1);
 	}
 }

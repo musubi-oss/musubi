@@ -130,8 +130,8 @@ bool UMusubiNitlSubsystem::Report(float)
 	for (TActorIterator<AMusubiNitlPawn> It(World); It; ++It)
 	{
 		const FVector L = It->GetActorLocation();
-		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f steps=%d"), *Mode, *It->GetName(),
-			It->Authority ? *It->Authority->NetEntityId : TEXT("?"), It->Authority ? (int)It->Authority->bNetOwned : -1, L.X, L.Y, It->Steps);
+		UE_LOG(LogMusubiNitl, Log, TEXT("nitl: %s pawn %s id=%s owned=%d at %.0f,%.0f steps=%d push=%d pushid=%016llx"), *Mode, *It->GetName(),
+			It->Authority ? *It->Authority->NetEntityId : TEXT("?"), It->Authority ? (int)It->Authority->bNetOwned : -1, L.X, L.Y, It->Steps, It->PushSteps, It->GetNetPushIdDynamic());
 		++N;
 	}
 	if (Mode == TEXT("client"))
