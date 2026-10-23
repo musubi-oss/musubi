@@ -655,6 +655,7 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const FMusubiJson& Valu
 	uint64& Last = AppliedTick.FindOrAdd(Obj);
 	if (Tick < Last) return false; // an older keyframe arriving after a newer delta
 	Last = Tick;
+	if (bKey) UE_LOG(LogMusubiIris, Log, TEXT("%s: iris keyframe t=%llu applied (%d bytes)"), *Obj->GetName(), Tick, Blob.Num());
 	TArray<FDescOut> Own;
 	if (!ReadDescs(Ar, Own, bKey)) return false;
 	bool bApplied = ApplyDescs(Obj, Own, bKey, Sim);

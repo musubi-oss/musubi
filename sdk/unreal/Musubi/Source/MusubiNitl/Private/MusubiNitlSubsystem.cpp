@@ -63,6 +63,8 @@ void UMusubiNitlSubsystem::OnWorldTick(UWorld* World, ELevelTick, float)
 	if (!World || !GetGameInstance() || World != GetGameInstance()->GetWorld()) return;
 	APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
 	APawn* P = PC ? PC->GetPawn() : nullptr;
+	static const float Walk = [] { float W = 60.f; FParse::Value(FCommandLine::Get(), TEXT("MusubiNitlWalk="), W); return W; }();
+	if (Walk <= 0.f) return; // -MusubiNitlWalk=0: a spectator whose pawn stays put
 	if (P && P->FindComponentByClass<UMusubiAuthorityComponent>()) P->AddMovementInput(FVector::XAxisVector, 1.f);
 }
 

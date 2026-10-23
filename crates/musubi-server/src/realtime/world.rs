@@ -264,6 +264,9 @@ struct WorldState {
     /// Engine connections relayed on an entity: (conn, client session). Learned from `net_open`
     /// and from routed packets, so the shard an entity lands on knows whom to re-home.
     net_sessions: HashMap<EntityId, Vec<(u64, SessionId)>>,
+    /// Owner each relayed entity was last re-homed to: an owner change outside a handover (the
+    /// owner died, a new lease holder picked the cell up) must re-home the clients too.
+    net_owner: HashMap<EntityId, Uuid>,
     /// `net_rehome`/`net_close` for clients, sent at the next tick (handover completion has no
     /// fan-out handle).
     net_pending: Vec<(SessionId, ServerMessage)>,
@@ -1226,6 +1229,7 @@ impl WorldRegistry {
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
                     net_sessions: HashMap::new(),
+                    net_owner: HashMap::new(),
                     net_pending: Vec::new(),
                     journal: Vec::new(),
                     remote_ghosts: HashMap::new(),
@@ -2147,6 +2151,7 @@ impl WorldRegistry {
                     subs: HashMap::new(),
                     sim_events: HashMap::new(),
                     net_sessions: HashMap::new(),
+                    net_owner: HashMap::new(),
                     net_pending: Vec::new(),
                     journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
@@ -2730,6 +2735,7 @@ impl WorldRegistry {
                 subs: HashMap::new(),
                 sim_events: HashMap::new(),
                 net_sessions: HashMap::new(),
+                net_owner: HashMap::new(),
                 net_pending: Vec::new(),
                 journal: Vec::new(),
                 remote_ghosts: HashMap::new(),
@@ -5673,6 +5679,25 @@ impl WorldRegistry {
                 }
             }
             // a live engine connection is a player on the entity: no hibernation, no decay
+            let mut rehome = Vec::new();
+            for (id, conns) in &st.net_sessions {
+                if conns.is_empty() {
+                    continue;
+                }
+                if let Some(now) = st.world.entity_owner(*id) {
+                    match st.net_owner.get(id) {
+                        Some(prev) if *prev != now => rehome.push((*id, *prev, now)),
+                        None => {
+                            st.net_owner.insert(*id, now);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for (id, prev, now) in rehome {
+                tracing::info!(entity = %id, from = %prev, to = %now, "relayed entity changed owner outside a handover; re-homing its clients");
+                net_rehome(st, &name, id, prev, Some(now));
+            }
             for (id, conns) in &st.net_sessions {
                 if !conns.is_empty() {
                     st.world.keep_awake(*id);
@@ -6514,6 +6539,14 @@ fn net_rehome(st: &mut WorldState, name: &str, id: EntityId, from: Uuid, to: Opt
     let Some(conns) = st.net_sessions.get(&id).cloned() else {
         return;
     };
+    match to {
+        Some(t) => {
+            st.net_owner.insert(id, t);
+        }
+        None => {
+            st.net_owner.remove(&id);
+        }
+    }
     for (conn, sid) in conns {
         push_event(
             st,

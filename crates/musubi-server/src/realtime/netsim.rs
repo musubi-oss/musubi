@@ -109,6 +109,7 @@ fn refresh_active() {
 
 /// Apply `[dev] netsim` from the config at startup.
 pub fn configure(cfg: &musubi_core::config::NetsimConfig) {
+    ENABLED.store(cfg.enabled, Ordering::Relaxed);
     if !cfg.enabled {
         return;
     }
@@ -179,74 +180,149 @@ pub fn snapshot() -> Value {
 }
 
 /// A connection with the simulated conditions applied around the real transport.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+enum Cmd {
+    Send(tokio::time::Instant, Frame, bool),
+    Many(tokio::time::Instant, Vec<Frame>),
+    Close,
+}
+
+type Inbound = std::result::Result<(tokio::time::Instant, Frame), TransportError>;
+
+/// A delay line in front of a connection: every frame gets a release time (`max(previous, now + delay)`) and a
+/// pump task owning the real connection sends/receives on time, so order is kept and a 60 Hz stream is never
+/// serialised behind one frame's delay (the old inline `sleep` did exactly that and starved the relay).
 pub struct NetsimConn {
-    inner: Box<dyn Connection>,
     sid: SessionId,
+    kind: &'static str,
+    out_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
+    in_rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+    out_release: tokio::time::Instant,
 }
 
 impl NetsimConn {
-    pub fn new(inner: Box<dyn Connection>, sid: SessionId) -> Self {
-        Self { inner, sid }
+    /// The wrapper only when the dev profile is configured or a profile is active; production sessions keep the
+    /// bare connection.
+    pub fn wrap(inner: Box<dyn Connection>, sid: SessionId) -> Box<dyn Connection> {
+        if ENABLED.load(Ordering::Relaxed) || is_active() {
+            Box::new(Self::new(inner, sid))
+        } else {
+            inner
+        }
     }
 
-    /// `(drop, delay)` decision for one frame in the given direction.
-    fn decide(&self, outbound: bool) -> (bool, Option<Duration>) {
-        let Some(p) = effective(self.sid) else {
-            return (false, None);
-        };
-        if !p.applies(outbound) {
-            return (false, None);
-        }
-        if p.drops() {
-            if outbound {
-                DROPPED_OUT.fetch_add(1, Ordering::Relaxed);
-            } else {
-                DROPPED_IN.fetch_add(1, Ordering::Relaxed);
+    pub fn new(mut inner: Box<dyn Connection>, sid: SessionId) -> Self {
+        let kind = inner.kind();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
+        let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
+        tokio::spawn(async move {
+            let mut queue: std::collections::VecDeque<Cmd> = std::collections::VecDeque::new();
+            let mut in_release = tokio::time::Instant::now();
+            loop {
+                let next = match queue.front() {
+                    Some(Cmd::Send(d, ..)) | Some(Cmd::Many(d, _)) => Some(*d),
+                    Some(Cmd::Close) => Some(tokio::time::Instant::now()),
+                    None => None,
+                };
+                tokio::select! {
+                    _ = async { match next { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending::<()>().await } } => {
+                        let r = match queue.pop_front() {
+                            Some(Cmd::Send(_, f, false)) => inner.send(f).await,
+                            Some(Cmd::Send(_, f, true)) => inner.send_unreliable(f).await,
+                            Some(Cmd::Many(_, fs)) => inner.send_many(fs).await,
+                            Some(Cmd::Close) => { inner.close().await; break; }
+                            None => Ok(()),
+                        };
+                        if r.is_err() { break; }
+                    }
+                    cmd = out_rx.recv() => match cmd {
+                        Some(c) => queue.push_back(c),
+                        None => { inner.close().await; break; }
+                    },
+                    r = inner.recv() => match r {
+                        Ok(f) => {
+                            let (drop_it, delay) = decide(sid, false, false);
+                            if drop_it { continue; }
+                            let now = tokio::time::Instant::now();
+                            in_release = (now + delay.unwrap_or_default()).max(in_release);
+                            if in_tx.send(Ok((in_release, f))).is_err() { break; }
+                        }
+                        Err(e) => { let _ = in_tx.send(Err(e)); break; }
+                    },
+                }
             }
-            return (true, None);
+        });
+        Self {
+            sid,
+            kind,
+            out_tx,
+            in_rx,
+            out_release: tokio::time::Instant::now(),
         }
-        let d = p.delay();
-        if d.is_some() {
-            if outbound {
-                DELAYED_OUT.fetch_add(1, Ordering::Relaxed);
-            } else {
-                DELAYED_IN.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        (false, d)
     }
+
+    fn schedule(&mut self, delay: Option<Duration>) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        self.out_release = (now + delay.unwrap_or_default()).max(self.out_release);
+        self.out_release
+    }
+}
+
+/// `lossy`: the frame may be dropped — only unreliable outbound frames. The sim sits above the reliable
+/// transport, so a dropped control frame would never be retransmitted, which no real network does.
+fn decide(sid: SessionId, outbound: bool, lossy: bool) -> (bool, Option<Duration>) {
+    let Some(p) = effective(sid) else {
+        return (false, None);
+    };
+    if !p.applies(outbound) {
+        return (false, None);
+    }
+    if lossy && p.drops() {
+        if outbound {
+            DROPPED_OUT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DROPPED_IN.fetch_add(1, Ordering::Relaxed);
+        }
+        return (true, None);
+    }
+    let d = p.delay();
+    if d.is_some() {
+        if outbound {
+            DELAYED_OUT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DELAYED_IN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    (false, d)
 }
 
 type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 impl Connection for NetsimConn {
     fn send(&mut self, frame: Frame) -> BoxFut<'_, std::result::Result<(), TransportError>> {
-        let (drop_it, delay) = self.decide(true);
-        Box::pin(async move {
-            if drop_it {
-                return Ok(());
-            }
-            if let Some(d) = delay {
-                tokio::time::sleep(d).await;
-            }
-            self.inner.send(frame).await
-        })
+        let (drop_it, delay) = decide(self.sid, true, false);
+        if !drop_it {
+            let at = self.schedule(delay);
+            let _ = self.out_tx.send(Cmd::Send(at, frame, false));
+        }
+        Box::pin(async { Ok(()) })
     }
 
     fn send_unreliable(
         &mut self,
         frame: Frame,
     ) -> BoxFut<'_, std::result::Result<(), TransportError>> {
-        let (drop_it, delay) = self.decide(true);
-        Box::pin(async move {
-            if drop_it {
-                return Ok(());
-            }
-            if let Some(d) = delay {
-                tokio::time::sleep(d).await;
-            }
-            self.inner.send_unreliable(frame).await
-        })
+        let (drop_it, delay) = decide(self.sid, true, true);
+        if !drop_it {
+            let at = self.schedule(delay);
+            let _ = self.out_tx.send(Cmd::Send(at, frame, true));
+        }
+        Box::pin(async { Ok(()) })
     }
 
     fn send_many(
@@ -257,7 +333,7 @@ impl Connection for NetsimConn {
         let mut kept = Vec::with_capacity(frames.len());
         let mut delay = None;
         for f in frames {
-            let (drop_it, d) = self.decide(true);
+            let (drop_it, d) = decide(self.sid, true, false);
             if !drop_it {
                 kept.push(f);
                 if delay.is_none() {
@@ -265,39 +341,33 @@ impl Connection for NetsimConn {
                 }
             }
         }
-        Box::pin(async move {
-            if kept.is_empty() {
-                return Ok(());
-            }
-            if let Some(d) = delay {
-                tokio::time::sleep(d).await;
-            }
-            self.inner.send_many(kept).await
-        })
+        if !kept.is_empty() {
+            let at = self.schedule(delay);
+            let _ = self.out_tx.send(Cmd::Many(at, kept));
+        }
+        Box::pin(async { Ok(()) })
     }
 
     fn recv(&mut self) -> BoxFut<'_, std::result::Result<Frame, TransportError>> {
         Box::pin(async move {
-            loop {
-                let frame = self.inner.recv().await?;
-                let (drop_it, delay) = self.decide(false);
-                if drop_it {
-                    continue;
+            match self.in_rx.recv().await {
+                Some(Ok((at, f))) => {
+                    tokio::time::sleep_until(at).await;
+                    Ok(f)
                 }
-                if let Some(d) = delay {
-                    tokio::time::sleep(d).await;
-                }
-                return Ok(frame);
+                Some(Err(e)) => Err(e),
+                None => Err(TransportError::Closed),
             }
         })
     }
 
     fn close(&mut self) -> BoxFut<'_, ()> {
-        self.inner.close()
+        let _ = self.out_tx.send(Cmd::Close);
+        Box::pin(async {})
     }
 
     fn kind(&self) -> &'static str {
-        self.inner.kind()
+        self.kind
     }
 }
 

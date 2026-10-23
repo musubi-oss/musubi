@@ -693,6 +693,31 @@ blob travels base64-encoded inside it and the node stores component values as JS
 binary simulator stream (re-tagged frame types, binary WebSocket frames, a bytes component value in the node and in
 `WorldComponent`); that is tracked as 9g-6b and is independent of the GDK-side format above.
 
+### 9.10 Chaos run (phase 9g-7): loss + latency, a second client, the receiving server killed mid-handover
+
+`NITL_CHAOS=1 tools/nitl.sh 5.8.4 150`: the node's dev netsim puts 60 ms ± 20 ms and 2 % loss on every client
+session; a second client (`nitl-c2`, `-MusubiNitlWalk=0`, its own entity owned by s2) watches the walking pawn;
+s2 is killed (`docker kill`) when the pawn is 1–2 s from the border, so the node starts the handover towards a dead
+server; `nitl-s2b` takes the whole row of cells 10 s later. Live result (5.8.4): handover `started → cancelled (no
+ack from … within 30 ticks)` → `started → completed` to s2b; client 1 never travelled, rehomed in place, swapped,
+kept moving, kept its PlayerState; client 2 was re-homed to s2b too and saw the walking pawn through both owners
+(steps 599 → 1580); netsim dropped 265 relay packets.
+
+What the run found and fixed:
+* **netsim serialised the stream.** `NetsimConn` slept inline per frame, so a 60 Hz relay became one frame per
+  60 ms with an unbounded backlog — the server pawn never moved. It is now a delay line (pump task, FIFO release
+  times). It also dropped frames *above* the reliable transport, which lost control frames forever (a client never
+  connected); loss now applies only to unreliable outbound frames (`NetPacket`, unreliable match data, sequenced
+  world deltas), latency to everything. Sessions are wrapped only when the dev profile is enabled or active.
+* **Owner change without a handover did not re-home clients.** When s2 died and s2b picked the cell up, client 2's
+  relay stayed on the dead owner. The node now tracks the last owner it re-homed each relayed entity to and sends
+  `net_rehome` on any owner change (`relayed entity changed owner outside a handover`).
+
+**Open (next):** after the cancelled handover the inventory the new owner restored was stale (`inv=0 gold=10` on
+s2b against `inv=4 gold=120` on s1 at the completed handover) while the client later saw the new owner continue
+from a fresh count — the entity's component state the node holds after a cancel/retry needs the same scrutiny the
+actor path got; tracked as the first item of 9g-7b.
+
 ## 10. Numbers, limits, failure behaviour
 
 | Item | Value | Behaviour at the edge |
