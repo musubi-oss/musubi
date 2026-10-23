@@ -662,6 +662,27 @@ actor and recurses (class checked as for the actor, RepNotify fired). `UMusubiAu
 (`FSubObjectRegistry` is private to `AActor`); nested components with the same name on different owners are
 disambiguated only by their owning actor.
 
+### 9.9 Keyframes and member-level deltas (phase 9g-6, GDK side)
+
+Until now every change re-sent the whole descriptor, and the node kept only the last message — a ghost spawned
+later saw only the descriptors that happened to change last. The export now has two components:
+
+* `iris` — **keyframe**: every exportable member of every descriptor (actor + `sub` components). Sent on the first
+  export and then at most every `KeyframeInterval` (30) export ticks, only if anything changed since the last one.
+* `iris.d` — **delta**: per descriptor the change-mask words (`"m"`) and only the bits of the members in them.
+  Member dirtiness is the serializer's own `IsEqual` on the quantized form against the previous tick, accumulated
+  since the last keyframe, so the delta is *cumulative*: keyframe + latest delta = the owner's exact state. A ghost
+  spawned mid-stream applies the stored `iris`, then the stored `iris.d`; `"t"` (export tick) on both stops an
+  older keyframe from undoing a newer delta.
+
+Ghost side (`ApplyBinary`): the carried mask is intersected with the exportable-member mask, `Deserialize/Dequantize
+WithMask` use it, and members outside it are not written (their `External` bytes are zeros).
+
+NITL (5.8.4): on the pawn (`Steps`/`PushSteps` change every tick, inventory every 100–300) the owner logged
+`keyframes=90 avg 58 B, deltas=2581 avg 19 B` — ~3× fewer payload bytes per tick than the per-descriptor export,
+with the inventory still arriving on the ghost and surviving the handover. The remaining overhead is the JSON/base64
+envelope around the bits in the node's component value; that is the node-side half of 9g-6.
+
 ## 10. Numbers, limits, failure behaviour
 
 | Item | Value | Behaviour at the edge |

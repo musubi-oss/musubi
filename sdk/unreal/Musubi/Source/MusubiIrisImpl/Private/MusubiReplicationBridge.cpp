@@ -251,9 +251,17 @@ void UMusubiReplicationBridge::FreeStates(TArray<FTracked::FStateBuf>& States, U
 // are exported this way — resolving references needs Iris' internal serialization context, which is engine-private;
 // classes whose every descriptor has references fall back to the JSON mirror. Unchanged states (IsEqualQuantizedState
 // against the last export) are not re-sent; a message carries only the descriptors that changed.
-bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged)
+static bool MemberInMask(const FReplicationStateDescriptor* D, uint32 m, const FNetBitArrayView& Mask)
+{
+	if (!D->MemberChangeMaskDescriptors) return true;
+	const FReplicationStateMemberChangeMaskDescriptor& C = D->MemberChangeMaskDescriptors[m];
+	return C.BitCount == 0 || Mask.IsAnyBitSet(C.BitOffset, C.BitCount);
+}
+
+bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged, bool bKeyframe, uint32& OutBytes)
 {
 	bChanged = false;
+	OutBytes = 0;
 	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
 	if (Descs.Num() == 0) return false;
 	if (TStates.Num() != Descs.Num()) TStates.SetNum(Descs.Num());
@@ -265,11 +273,13 @@ bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates
 		if (!D || D->MemberCount == 0) continue;
 		bEligible = true;
 		FTracked::FStateBuf& S = TStates[i];
+		const int32 Words = FMath::Max(1, (int32)((D->ChangeMaskBitCount + 31) / 32));
 		if (S.External.Num() != (int32)D->ExternalSize)
 		{
 			S.External.SetNumZeroed(D->ExternalSize);
 			S.Internal.SetNumZeroed(D->InternalSize);
 			S.Last.SetNumZeroed(D->InternalSize);
+			S.Dirty.SetNumZeroed(Words);
 			S.bHasLast = false;
 		}
 		for (uint32 m = 0; m < D->MemberCount; ++m)
@@ -279,8 +289,8 @@ bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates
 			const uint16 ArrayIndex = D->MemberPropertyDescriptors ? D->MemberPropertyDescriptors[m].ArrayIndex : 0;
 			P->CopySingleValue(S.External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset, P->ContainerPtrToValuePtr<void>(Obj, ArrayIndex));
 		}
-		TArray<uint32> MaskStorage;
-		const FNetBitArrayView Mask = ValueMask(D, MaskStorage);
+		TArray<uint32> ValueStorage;
+		const FNetBitArrayView Value = ValueMask(D, ValueStorage);
 		TMap<FString, FString> Refs;
 		for (uint32 m = 0; m < D->MemberCount; ++m)
 		{
@@ -288,22 +298,55 @@ bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates
 			if (const FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(D->MemberProperties[m]))
 				Refs.Add(OP->GetName(), RefId(OP->GetObjectPropertyValue(S.External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset)));
 		}
-		const bool bRefsChanged = !S.bHasLast || !Refs.OrderIndependentCompareEqual(S.LastRefs);
 		FNetSerializationContext Ctx;
-		Ctx.SetChangeMask(&Mask); // the *WithMask operations check the context carries this exact mask
-		FReplicationStateOperations::QuantizeWithMask(Ctx, Mask, 0, S.Internal.GetData(), S.External.GetData(), D);
-		if (!bRefsChanged && S.bHasLast && FReplicationStateOperations::IsEqualQuantizedState(Ctx, S.Internal.GetData(), S.Last.GetData(), D)) continue;
-		S.LastRefs = Refs;
-		if (S.bHasLast) FReplicationStateOperations::FreeDynamicState(Ctx, S.Last.GetData(), D);
-		FMemory::Memcpy(S.Last.GetData(), S.Internal.GetData(), D->InternalSize);
-		FMemory::Memzero(S.Internal.GetData(), D->InternalSize); // dynamic state now owned by Last
-		S.bHasLast = true;
+		Ctx.SetChangeMask(&Value); // the *WithMask operations check the context carries this exact mask
+		FReplicationStateOperations::QuantizeWithMask(Ctx, Value, 0, S.Internal.GetData(), S.External.GetData(), D);
+		// Member-level diff against the previous tick (serializer IsEqual on the quantized form), accumulated into the
+		// dirty mask since the last keyframe so a delta always carries everything a ghost that only has the keyframe lacks.
+		bool bAnyMember = !S.bHasLast;
+		for (uint32 m = 0; m < D->MemberCount; ++m)
+		{
+			if (!D->MemberChangeMaskDescriptors || !D->MemberSerializerDescriptors || IsRefMember(D, m) || IsConnectionSpecificMember(D, m) || IsNopMember(D, m)) continue;
+			const FReplicationStateMemberSerializerDescriptor& SD = D->MemberSerializerDescriptors[m];
+			if (S.bHasLast && SD.Serializer)
+			{
+				FNetIsEqualArgs A;
+				A.Version = 0;
+				A.NetSerializerConfig = SD.SerializerConfig;
+				A.Source0 = NetSerializerValuePointer(S.Internal.GetData() + D->MemberDescriptors[m].InternalMemberOffset);
+				A.Source1 = NetSerializerValuePointer(S.Last.GetData() + D->MemberDescriptors[m].InternalMemberOffset);
+				A.bStateIsQuantized = true;
+				if (SD.Serializer->IsEqual(Ctx, A)) continue;
+			}
+			const FReplicationStateMemberChangeMaskDescriptor& C = D->MemberChangeMaskDescriptors[m];
+			for (uint16 b = 0; b < C.BitCount; ++b) S.Dirty[(C.BitOffset + b) / 32] |= 1u << ((C.BitOffset + b) % 32);
+			bAnyMember = true;
+		}
+		if (!S.bHasLast || !Refs.OrderIndependentCompareEqual(S.LastRefs)) { S.LastRefs = Refs; S.bRefsDirty = true; }
+		if (bAnyMember)
+		{
+			if (S.bHasLast) FReplicationStateOperations::FreeDynamicState(Ctx, S.Last.GetData(), D);
+			FMemory::Memcpy(S.Last.GetData(), S.Internal.GetData(), D->InternalSize);
+			S.bHasLast = true;
+		}
+		else
+		{
+			FReplicationStateOperations::FreeDynamicState(Ctx, S.Internal.GetData(), D);
+		}
+		FMemory::Memzero(S.Internal.GetData(), D->InternalSize); // dynamic state now owned by Last (or freed)
+		bool bDirtyAny = S.bRefsDirty;
+		for (int32 w = 0; w < Words && !bDirtyAny; ++w) bDirtyAny |= S.Dirty[w] != 0;
+		if (!bKeyframe && !bDirtyAny) continue;
+		// keyframe: every exportable member; delta: the members dirty since the keyframe (the mask travels with the bits)
+		TArray<uint32> SendStorage = ValueStorage;
+		if (!bKeyframe) for (int32 w = 0; w < Words && w < SendStorage.Num(); ++w) SendStorage[w] &= S.Dirty[w];
+		FNetBitArrayView Send(SendStorage.GetData(), D->ChangeMaskBitCount, FNetBitArrayView::NoResetNoValidate);
 		uint8 Buf[8192];
 		FNetBitStreamWriter W;
 		W.InitBytes(Buf, sizeof(Buf));
 		FNetSerializationContext WCtx(&W);
-		WCtx.SetChangeMask(&Mask);
-		FReplicationStateOperations::SerializeWithMask(WCtx, Mask, 0, S.Last.GetData(), D);
+		WCtx.SetChangeMask(&Send);
+		FReplicationStateOperations::SerializeWithMask(WCtx, Send, 0, S.Last.GetData(), D);
 		W.CommitWrites();
 		if (W.IsOverflown())
 		{
@@ -315,11 +358,23 @@ bool UMusubiReplicationBridge::ExportBinary(TArray<FTracked::FStateBuf>& TStates
 		St->SetNumberField(TEXT("i"), i);
 		St->SetNumberField(TEXT("bits"), Bits);
 		St->SetStringField(TEXT("b"), FBase64::Encode(Buf, (Bits + 7) / 8));
-		if (Refs.Num())
+		if (!bKeyframe)
+		{
+			TArray<TSharedPtr<FJsonValue>> M;
+			for (int32 w = 0; w < Words && w < SendStorage.Num(); ++w) M.Add(MakeShared<FJsonValueNumber>((double)SendStorage[w]));
+			St->SetArrayField(TEXT("m"), M);
+		}
+		if (Refs.Num() && (bKeyframe || S.bRefsDirty))
 		{
 			TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 			for (const TPair<FString, FString>& KV : Refs) { if (KV.Value.IsEmpty()) R->SetField(KV.Key, MakeShared<FJsonValueNull>()); else R->SetStringField(KV.Key, KV.Value); }
 			St->SetObjectField(TEXT("r"), R);
+		}
+		OutBytes += (Bits + 7) / 8;
+		if (bKeyframe)
+		{
+			FMemory::Memzero(S.Dirty.GetData(), S.Dirty.Num() * sizeof(uint32));
+			S.bRefsDirty = false;
 		}
 		States.Add(MakeShared<FJsonValueObject>(St));
 		bChanged = true;
@@ -374,6 +429,7 @@ void UMusubiReplicationBridge::PreSendUpdate()
 
 void UMusubiReplicationBridge::FlushDirty()
 {
+	++ExportTick;
 	// Iris has just polled dirty state (PreSendUpdate). We mirror owned Musubi entities whose replicated
 	// property set changed since the last send into the authority component; the simulator subsystem
 	// picks it up as `apply` at the next tick_done. Hash-gated so an unchanged object costs one serialize.
@@ -386,7 +442,9 @@ void UMusubiReplicationBridge::FlushDirty()
 		if (!Auth->IsOwned()) continue; // ghosts are driven by the node, never mirrored back
 		TSharedPtr<FJsonObject> Bin;
 		bool bChanged = false;
-		if (ExportBinary(T.States, Obj, Bin, bChanged))
+		const bool bKey = !T.bMirrored || (T.bDirtySinceKey && ExportTick - T.KeyTick >= KeyframeInterval);
+		uint32 Bytes = 0;
+		if (ExportBinary(T.States, Obj, Bin, bChanged, bKey, Bytes))
 		{
 			// replicated components ride along under "sub" by component name (CharacterMovement, inventories, ...);
 			// only the ones whose state changed are in the message, like the actor's own descriptors
@@ -397,7 +455,9 @@ void UMusubiReplicationBridge::FlushDirty()
 					if (!C || C->IsA<UMusubiAuthorityComponent>()) continue;
 					TSharedPtr<FJsonObject> SubBin;
 					bool bSubChanged = false;
-					if (!ExportBinary(T.Subs.FindOrAdd(C->GetFName()), C, SubBin, bSubChanged) || !bSubChanged) continue;
+					uint32 SubBytes = 0;
+					if (!ExportBinary(T.Subs.FindOrAdd(C->GetFName()), C, SubBin, bSubChanged, bKey, SubBytes) || !bSubChanged) continue;
+					Bytes += SubBytes;
 					if (!Subs.IsValid()) Subs = MakeShared<FJsonObject>();
 					Subs->SetObjectField(C->GetName(), SubBin);
 				}
@@ -416,7 +476,24 @@ void UMusubiReplicationBridge::FlushDirty()
 			{
 				if (!T.bMirrored) UE_LOG(LogMusubiIris, Log, TEXT("%s: first binary iris state exported (%d component(s))"), *Obj->GetName(), Subs.IsValid() ? Subs->Values.Num() : 0);
 				T.bMirrored = true;
-				Auth->SetComponent(TEXT("iris"), FMusubiJson(Bin));
+				Bin->SetNumberField(TEXT("t"), (double)ExportTick);
+				if (bKey)
+				{
+					T.KeyTick = ExportTick;
+					T.bDirtySinceKey = false;
+					++T.Keys;
+					T.KeyBytes += Bytes;
+					Auth->SetComponent(TEXT("iris"), FMusubiJson(Bin));
+					if (T.Keys % 10 == 0)
+						UE_LOG(LogMusubiIris, Log, TEXT("%s: iris stats keyframes=%u (%llu B, avg %llu) deltas=%u (%llu B, avg %llu)"), *Obj->GetName(), T.Keys, T.KeyBytes, T.KeyBytes / T.Keys, T.Deltas, T.DeltaBytes, T.Deltas ? T.DeltaBytes / T.Deltas : 0);
+				}
+				else
+				{
+					T.bDirtySinceKey = true;
+					++T.Deltas;
+					T.DeltaBytes += Bytes;
+					Auth->SetComponent(TEXT("iris.d"), FMusubiJson(Bin));
+				}
 			}
 			continue;
 		}
@@ -469,6 +546,13 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 		UE_LOG(LogMusubiIris, Warning, TEXT("%s: iris state is for %s, ghost is %s — skipped"), *Obj->GetName(), *ClassPath, *Obj->GetClass()->GetPathName());
 		return false;
 	}
+	double TickD = 0;
+	if (Iris->TryGetNumberField(TEXT("t"), TickD))
+	{
+		uint64& Last = AppliedTick.FindOrAdd(Obj);
+		if ((uint64)TickD < Last) return false; // an older keyframe arriving after a newer delta
+		Last = (uint64)TickD;
+	}
 	const TArray<TRefCountPtr<const FReplicationStateDescriptor>>& Descs = DescriptorsFor(Obj->GetClass());
 	bool bApplied = false;
 	for (const TSharedPtr<FJsonValue>& V : *States)
@@ -482,7 +566,13 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 		const FReplicationStateDescriptor* D = Descs[i].GetReference();
 		if (!D) continue;
 		TArray<uint32> MaskStorage;
-		const FNetBitArrayView Mask = ValueMask(D, MaskStorage);
+		FNetBitArrayView Mask = ValueMask(D, MaskStorage);
+		const TArray<TSharedPtr<FJsonValue>>* M = nullptr;
+		if ((*St)->TryGetArrayField(TEXT("m"), M) && M) // delta: only the members the owner marked dirty are in the bits
+		{
+			for (int32 w = 0; w < MaskStorage.Num(); ++w) MaskStorage[w] &= M->IsValidIndex(w) && (*M)[w].IsValid() ? (uint32)(*M)[w]->AsNumber() : 0u;
+			Mask = FNetBitArrayView(MaskStorage.GetData(), D->ChangeMaskBitCount, FNetBitArrayView::NoResetNoValidate);
+		}
 		const TSharedPtr<FJsonObject>* Refs = nullptr;
 		(*St)->TryGetObjectField(TEXT("r"), Refs);
 		TArray<uint8> Internal, External;
@@ -510,6 +600,7 @@ bool UMusubiReplicationBridge::ApplyBinary(UObject* Obj, const TSharedPtr<FJsonO
 			// Not in the bitstream (Role/RemoteRole, the nop NetCullDistanceSquared): External holds zeros here, and writing
 			// ROLE_None or a zero cull distance onto the ghost would strip HasAuthority() / relevancy once it becomes the owner.
 			if (IsConnectionSpecificMember(D, m) || IsNopMember(D, m)) continue;
+			if (!IsRefMember(D, m) && !MemberInMask(D, m, Mask)) continue; // not in this delta
 			const uint16 ArrayIndex = D->MemberPropertyDescriptors ? D->MemberPropertyDescriptors[m].ArrayIndex : 0;
 			void* Dst = P->ContainerPtrToValuePtr<void>(Obj, ArrayIndex);
 			uint8* Src = External.GetData() + D->MemberDescriptors[m].ExternalMemberOffset;

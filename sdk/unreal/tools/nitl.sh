@@ -92,6 +92,10 @@ S2INV=$(grep "nitl: server pawn .* owned=1 " "$OUT/nitl-s2.log" | grep -o "inv=[
 A1=$(echo "$S1INV" | grep -o "inv=[0-9]*" | cut -d= -f2); A2=$(echo "$S2INV" | grep -o "inv=[0-9]*" | cut -d= -f2)
 G1=$(echo "$S1INV" | grep -o "gold=[0-9]*" | cut -d= -f2); G2=$(echo "$S2INV" | grep -o "gold=[0-9]*" | cut -d= -f2)
 if [ -n "$A1" ] && [ -n "$A2" ] && [ "$A1" -ge 1 ] && [ "$A2" -ge "$A1" ] && [ "${G2:-0}" -ge "${G1:-1}" ]; then echo "PASS nitl-s: inventory carried across the handover without reset (s1 $S1INV -> s2 $S2INV)"; else echo "FAIL nitl-s: inventory carried across the handover without reset (s1 $S1INV -> s2 $S2INV)"; ok=0; fi
+# member-level deltas: keyframes are rare and big, deltas frequent and small (iris stats line on the owner)
+ST=$(grep -o "iris stats keyframes=[0-9]* ([0-9]* B, avg [0-9]*) deltas=[0-9]* ([0-9]* B, avg [0-9]*)" "$OUT/nitl-s1.log" | tail -1)
+KN=$(echo "$ST" | sed -n 's/.*keyframes=\([0-9]*\).*/\1/p'); KA=$(echo "$ST" | sed -n 's/.*keyframes=[0-9]* ([0-9]* B, avg \([0-9]*\)).*/\1/p'); DN=$(echo "$ST" | sed -n 's/.*deltas=\([0-9]*\).*/\1/p'); DA=$(echo "$ST" | sed -n 's/.*deltas=[0-9]* ([0-9]* B, avg \([0-9]*\)).*/\1/p')
+if [ -n "$KN" ] && [ -n "$DN" ] && [ "$DN" -gt "$KN" ] && [ "${DA:-999999}" -lt "${KA:-0}" ]; then echo "PASS nitl-s1: member-level deltas (keyframes=$KN avg ${KA}B, deltas=$DN avg ${DA}B)"; else echo "FAIL nitl-s1: member-level deltas ($ST)"; ok=0; fi
 CINV=$(grep "nitl: client pawn " "$OUT/nitl-c.log" | tail -1 | grep -o "inv=[0-9]*" | cut -d= -f2)
 if [ -n "$CINV" ] && [ -n "$A1" ] && [ "$CINV" -ge "$A1" ]; then echo "PASS nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV)"; else echo "FAIL nitl-c: client sees the inventory (FastArray) from the new owner (inv=$CINV, s1 had $A1)"; ok=0; fi
 if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/nitl-s2.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi

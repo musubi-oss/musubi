@@ -78,15 +78,24 @@ private:
 		TWeakObjectPtr<UObject> Object;
 		TWeakObjectPtr<UMusubiAuthorityComponent> Authority;
 		uint64 LastHash = 0;
-		struct FStateBuf { TArray<uint8> External, Internal, Last; TMap<FString, FString> LastRefs; bool bHasLast = false; };
+		struct FStateBuf { TArray<uint8> External, Internal, Last; TArray<uint32> Dirty; TMap<FString, FString> LastRefs; bool bHasLast = false, bRefsDirty = false; };
 		TArray<FStateBuf> States; // one per class descriptor (binary export)
 		TMap<FName, TArray<FStateBuf>> Subs; // replicated components of an actor, by component name
+		uint64 KeyTick = 0, KeyBytes = 0, DeltaBytes = 0;
+		uint32 Keys = 0, Deltas = 0;
+		bool bDirtySinceKey = false;
 	};
+	/** Export ticks (FlushDirty calls); keyframes ("iris", full state) every KeyframeInterval ticks when anything changed,
+	 *  member-level deltas ("iris.d", cumulative since the keyframe) on every change. Both carry "t". */
+	uint64 ExportTick = 0;
+	static constexpr uint64 KeyframeInterval = 30;
+	/** Ghost side: last applied "t" per object, so an older keyframe cannot undo a newer delta. */
+	TMap<TWeakObjectPtr<UObject>, uint64> AppliedTick;
 	/** Class → Iris replication state descriptors built once (CDO as default state). */
 	TMap<TWeakObjectPtr<UClass>, TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>> ClassDescriptors;
 	const TArray<TRefCountPtr<const UE::Net::FReplicationStateDescriptor>>& DescriptorsFor(UClass* Class);
 	/** Binary path: quantize + serialize each eligible descriptor state; false = nothing eligible (JSON fallback). */
-	bool ExportBinary(TArray<FTracked::FStateBuf>& States, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged);
+	bool ExportBinary(TArray<FTracked::FStateBuf>& States, UObject* Obj, TSharedPtr<FJsonObject>& Out, bool& bChanged, bool bKeyframe, uint32& OutBytes);
 	void FreeStates(TArray<FTracked::FStateBuf>& States, UObject* Obj);
 
 public:
