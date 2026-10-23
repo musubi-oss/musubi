@@ -13,6 +13,7 @@
 
 class UMusubiAuthorityComponent;
 class UMusubiSimulatorSettings;
+class ULevelStreamingDynamic;
 
 inline uint32 GetTypeHash(const FMusubiCellId& C) { return HashCombine(HashCombine(::GetTypeHash(C.x), ::GetTypeHash(C.y)), HashCombine(::GetTypeHash(C.z), ::GetTypeHash((int32)C.level))); }
 inline bool operator==(const FMusubiCellId& A, const FMusubiCellId& B) { return A.x == B.x && A.y == B.y && A.z == B.z && A.level == B.level; }
@@ -77,6 +78,13 @@ public:
 	void Interact(const FMusubiUuid& Entity, const FString& Kind, const FMusubiJson& Payload, const FMusubiUuid& From, FMusubiSimReply OnReply = nullptr);
 	void Colocate(const FMusubiUuid& Entity, const FMusubiUuid& With, uint64 TtlTicks = 300, FMusubiSimReply OnReply = nullptr);
 	void Rewind(const FMusubiUuid& Entity, uint64 Tick, TOptional<FVector2D> At, TOptional<double> Tolerance, FMusubiSimReply OnReply = nullptr);
+	/** Typed rewind: node answer (pos at tick, hit) plus the local ring's view of the same tick for owned entities (nullopt when not ours / out of history). */
+	void RewindChecked(const FMusubiUuid& Entity, uint64 Tick, TOptional<FVector2D> At, TOptional<double> Tolerance, TFunction<void(bool bOk, const FMusubiRewindResult& Node, TOptional<FVector> Local)> OnReply);
+	/** Where an owned entity was at `Tick` per the local history ring (lerp between the two nearest ticks). No round trip. */
+	bool LocalRewind(const FMusubiUuid& Entity, uint64 Tick, FVector& OutPos, FVector& OutVel) const;
+	/** Oldest tick the ring still holds for the entity (0 = none). */
+	uint64 HistoryFrom(const FMusubiUuid& Entity) const;
+	UFUNCTION(BlueprintPure, Category = "Musubi|Simulator") ULevelStreamingDynamic* CellLevel(const FString& Cell) const;
 	/** Set a world-global component value on an entity we own and flush it now (otherwise `apply` goes with the tick). */
 	void FlushNow();
 
@@ -111,6 +119,13 @@ private:
 		float TimeScale = 1.f;
 		bool bHibernated = false;
 		TSet<FMusubiUuid> Owned, Ghosts;
+		TWeakObjectPtr<class ULevelStreamingDynamic> Level;
+	};
+	struct FSnapshot
+	{
+		uint64 Tick = 0;
+		FVector Pos = FVector::ZeroVector;
+		FVector Vel = FVector::ZeroVector;
 	};
 	struct FEntity
 	{
@@ -118,7 +133,16 @@ private:
 		TWeakObjectPtr<UMusubiAuthorityComponent> Auth;
 		FMusubiCellId Cell;
 		bool bOwned = false;
+		/** Ring of the last HistoryTicks owned states, oldest first once full (Head = next write slot). */
+		TArray<FSnapshot> History;
+		int32 Head = 0;
+		bool bFull = false;
+		void Record(uint64 Tick, const FVector& P, const FVector& V, int32 Cap);
+		const FSnapshot* Newest() const;
 	};
+	int32 HistoryTicks = 64;
+	void LoadCellLevel(FCell& C);
+	void UnloadCellLevel(FCell& C);
 
 	TSharedPtr<FMusubiSimStream> Link;
 	FDelegateHandle TickerHandle;

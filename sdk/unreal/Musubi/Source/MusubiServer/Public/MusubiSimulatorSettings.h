@@ -23,6 +23,13 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Simulation", meta = (ClampMin = "1")) int32 Capacity = 4;
 	/** Simulation rate; the node expects `tick_done` at this cadence and measures lag against it. */
 	UPROPERTY(Config, EditAnywhere, Category = "Simulation", meta = (ClampMin = "1", ClampMax = "240")) int32 Hz = 30;
+	/** Ticks of owned-entity history kept per entity (position + velocity) for LocalRewind and handover-cancel restore. 64 @ 30 Hz ≈ 2 s. */
+	UPROPERTY(Config, EditAnywhere, Category = "Simulation", meta = (ClampMin = "2", ClampMax = "1024")) int32 HistoryTicks = 64;
+	/** Stream a level instance per leased cell: key = cell id as "x,y", value = the cell's static level. Loaded on CellAssigned, unloaded on revoke/release. */
+	UPROPERTY(Config, EditAnywhere, Category = "Levels") bool bStreamCellLevels = true;
+	UPROPERTY(Config, EditAnywhere, Category = "Levels") TMap<FString, TSoftObjectPtr<UWorld>> CellLevels;
+	/** World offset of a cell level = cell index × this (cm); 0 → every level loads at the origin (levels already placed in world space). */
+	UPROPERTY(Config, EditAnywhere, Category = "Levels") float CellLevelStride = 0.f;
 	/** Ask the node for per-cell deltas instead of full views every tick. */
 	UPROPERTY(Config, EditAnywhere, Category = "Simulation") bool bDeltaFrames = true;
 	/** Cells to lease at start as "x,y" (empty = wait for the node to assign). */

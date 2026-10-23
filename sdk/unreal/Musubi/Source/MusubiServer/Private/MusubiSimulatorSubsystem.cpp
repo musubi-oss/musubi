@@ -1,4 +1,6 @@
 #include "MusubiSimulatorSubsystem.h"
+#include "Engine/LevelStreamingDynamic.h"
+#include "Components/PrimitiveComponent.h"
 #include "MusubiSimulatorSettings.h"
 #include "MusubiAuthorityComponent.h"
 #include "MusubiServerModule.h"
@@ -38,6 +40,7 @@ void UMusubiSimulatorSubsystem::LoadSettings()
 	WorldName = S->World;
 	Capacity = FMath::Max(1, S->Capacity);
 	Hz = FMath::Clamp(S->Hz, 1, 240);
+	HistoryTicks = FMath::Clamp(S->HistoryTicks, 2, 1024);
 	bDelta = S->bDeltaFrames;
 	PositionEpsilon = S->PositionEpsilon;
 	HeightComponent = S->HeightComponent;
@@ -353,8 +356,9 @@ void UMusubiSimulatorSubsystem::CollectAndApply()
 		FEntity& En = KV.Value;
 		if (!En.bOwned || !En.Actor.IsValid() || !En.Auth.IsValid()) continue;
 		UMusubiAuthorityComponent* Auth = En.Auth.Get();
-		if (Auth->IsInHandover()) continue;
+		if (Auth->IsInHandover()) continue; // frozen: the ring keeps the pre-handover state for a cancel
 		const FVector P = En.Actor->GetActorLocation();
+		En.Record(LastTick, P, En.Actor->GetVelocity(), HistoryTicks);
 		const bool bMoved = FVector::Dist2D(P, Auth->LastSentPos) > PositionEpsilon;
 		TSharedPtr<FJsonObject> Dirty = Auth->TakeDirty();
 		if (!bMoved && !Dirty.IsValid()) continue;
@@ -383,6 +387,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 		{
 			FCell& C = Cells.FindOrAdd(E.CellAssigned->cell);
 			C.Id = E.CellAssigned->cell;
+			LoadCellLevel(C);
 			OnCellChanged.Broadcast(CellKey(C.Id), true);
 		}
 		break;
@@ -397,6 +402,7 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 			TArray<FMusubiUuid> Ids = Gone.Owned.Array();
 			Ids.Append(Gone.Ghosts.Array());
 			for (const FMusubiUuid& Id : Ids) RemoveEntity(Id, TEXT("cell left"));
+			UnloadCellLevel(Gone);
 			OnCellChanged.Broadcast(CellKey(Cell), false);
 		}
 		break;
@@ -512,7 +518,21 @@ void UMusubiSimulatorSubsystem::HandleEvent(const FMusubiSimEvent& E)
 	case EMusubiSimEventTag::HandoverCancelled:
 		if (E.HandoverCancelled.IsSet())
 		{
-			if (UMusubiAuthorityComponent* A = FindAuthority(E.HandoverCancelled->entity)) { A->SetInHandover(false); if (A->IsOwned()) A->SetPhysicsEnabled(true); }
+			if (UMusubiAuthorityComponent* A = FindAuthority(E.HandoverCancelled->entity))
+			{
+				A->SetInHandover(false);
+				if (A->IsOwned())
+				{
+					// the node kept the entity with us at its pre-handover state; put the actor back there before physics resumes
+					if (FEntity* En = Entities.Find(E.HandoverCancelled->entity))
+						if (const FSnapshot* S = En->Newest(); S && En->Actor.IsValid())
+						{
+							En->Actor->SetActorLocation(S->Pos, false, nullptr, ETeleportType::TeleportPhysics);
+							if (UPrimitiveComponent* B = Cast<UPrimitiveComponent>(En->Actor->GetRootComponent())) B->SetPhysicsLinearVelocity(S->Vel);
+						}
+					A->SetPhysicsEnabled(true);
+				}
+			}
 			OnHandover.Broadcast(E.HandoverCancelled->entity.ToString(), TEXT("cancelled"), E.HandoverCancelled->reason);
 		}
 		break;
@@ -718,6 +738,100 @@ void UMusubiSimulatorSubsystem::Rewind(const FMusubiUuid& Entity, uint64 Tick, T
 	R.tolerance = Tolerance;
 	Cmd.Rewind = R;
 	SendCommand(MoveTemp(Cmd), MoveTemp(OnReply));
+}
+
+void UMusubiSimulatorSubsystem::RewindChecked(const FMusubiUuid& Entity, uint64 Tick, TOptional<FVector2D> At, TOptional<double> Tolerance, TFunction<void(bool, const FMusubiRewindResult&, TOptional<FVector>)> OnReply)
+{
+	TOptional<FVector> Local;
+	FVector P, V;
+	if (LocalRewind(Entity, Tick, P, V)) Local = P;
+	Rewind(Entity, Tick, At, Tolerance, [Local, OnReply = MoveTemp(OnReply)](bool bOk, const TSharedPtr<FJsonObject>& Reply)
+	{
+		FMusubiRewindResult R;
+		bool bParsed = false;
+		if (bOk && Reply.IsValid())
+		{
+			const TSharedPtr<FJsonObject>* Res;
+			if (Reply->TryGetObjectField(TEXT("result"), Res)) bParsed = FMusubiRewindResult::FromJson(MakeShared<FJsonValueObject>(*Res), R);
+		}
+		if (OnReply) OnReply(bOk && bParsed, R, Local);
+	});
+}
+
+void UMusubiSimulatorSubsystem::FEntity::Record(uint64 Tick, const FVector& P, const FVector& V, int32 Cap)
+{
+	if (const FSnapshot* N = Newest(); N && N->Tick == Tick) return; // one sample per tick
+	if (!bFull && History.Num() < Cap) { History.Add({Tick, P, V}); return; }
+	if (!bFull) { bFull = true; Head = 0; }
+	History[Head] = {Tick, P, V};
+	Head = (Head + 1) % History.Num();
+}
+
+const UMusubiSimulatorSubsystem::FSnapshot* UMusubiSimulatorSubsystem::FEntity::Newest() const
+{
+	if (History.Num() == 0) return nullptr;
+	return &History[bFull ? (Head + History.Num() - 1) % History.Num() : History.Num() - 1];
+}
+
+bool UMusubiSimulatorSubsystem::LocalRewind(const FMusubiUuid& Entity, uint64 Tick, FVector& OutPos, FVector& OutVel) const
+{
+	const FEntity* En = Entities.Find(Entity);
+	if (!En || !En->bOwned || En->History.Num() == 0) return false;
+	const FSnapshot* Before = nullptr; const FSnapshot* After = nullptr;
+	for (const FSnapshot& S : En->History)
+	{
+		if (S.Tick <= Tick && (!Before || S.Tick > Before->Tick)) Before = &S;
+		if (S.Tick >= Tick && (!After || S.Tick < After->Tick)) After = &S;
+	}
+	if (!Before && !After) return false;
+	if (!Before) return false; // older than the ring: caller falls back to the node's history
+	if (!After || After == Before || After->Tick == Before->Tick) { OutPos = Before->Pos; OutVel = Before->Vel; return true; }
+	const double A = (double)(Tick - Before->Tick) / (double)(After->Tick - Before->Tick);
+	OutPos = FMath::Lerp(Before->Pos, After->Pos, A);
+	OutVel = FMath::Lerp(Before->Vel, After->Vel, A);
+	return true;
+}
+
+uint64 UMusubiSimulatorSubsystem::HistoryFrom(const FMusubiUuid& Entity) const
+{
+	const FEntity* En = Entities.Find(Entity);
+	if (!En || En->History.Num() == 0) return 0;
+	uint64 Min = TNumericLimits<uint64>::Max();
+	for (const FSnapshot& S : En->History) Min = FMath::Min(Min, S.Tick);
+	return Min;
+}
+
+void UMusubiSimulatorSubsystem::LoadCellLevel(FCell& C)
+{
+	const UMusubiSimulatorSettings* S = GetDefault<UMusubiSimulatorSettings>();
+	if (!S || !S->bStreamCellLevels || C.Level.IsValid()) return;
+	const TSoftObjectPtr<UWorld>* Level = S->CellLevels.Find(CellKey(C.Id));
+	if (!Level || Level->IsNull()) return;
+	UWorld* W = GetWorld();
+	if (!W) return;
+	bool bOk = false;
+	const FVector At = S->CellLevelStride > 0.f ? FVector((double)C.Id.x * S->CellLevelStride, (double)C.Id.y * S->CellLevelStride, 0.0) : FVector::ZeroVector;
+	// same signature on 5.3 and 5.7 (Engine/LevelStreamingDynamic.h); the name override keeps one instance per cell
+	ULevelStreamingDynamic* LS = ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr(W, *Level, At, FRotator::ZeroRotator, bOk, FString::Printf(TEXT("MusubiCell_%s"), *CellKey(C.Id).Replace(TEXT(","), TEXT("_"))));
+	if (!bOk || !LS) { UE_LOG(LogMusubiServer, Warning, TEXT("cell %s: level %s failed to load"), *CellKey(C.Id), *Level->ToString()); return; }
+	C.Level = LS;
+}
+
+void UMusubiSimulatorSubsystem::UnloadCellLevel(FCell& C)
+{
+	if (ULevelStreamingDynamic* LS = C.Level.Get())
+	{
+		LS->SetShouldBeLoaded(false);
+		LS->SetShouldBeVisible(false);
+		LS->SetIsRequestingUnloadAndRemoval(true);
+	}
+	C.Level.Reset();
+}
+
+ULevelStreamingDynamic* UMusubiSimulatorSubsystem::CellLevel(const FString& Cell) const
+{
+	for (const auto& KV : Cells) if (CellKey(KV.Key) == Cell) return KV.Value.Level.Get();
+	return nullptr;
 }
 
 // ---- queries / stats ----

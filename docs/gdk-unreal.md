@@ -222,7 +222,7 @@ simulator. It is the C++ port of `crates/musubi-sim-sdk`.
    steps Chaos with `dt × time_scale`.
 
 ### 6.2 Events → engine (`SimEvent`, all variants handled)
-`CellAssigned` (load the cell's static level section via `ULevelStreaming` by cell id → bounds),
+`CellAssigned` (loads the cell's level instance: `UMusubiSimulatorSettings::CellLevels["x,y"]` via `ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr`, one instance per cell, optional `CellLevelStride` offset; unloaded with `SetIsRequestingUnloadAndRemoval` on revoke/release),
 `CellRevoked/CellReleased` (unload, drop owned actors), `CellReloaded` (re-pull view), 
 `CellHibernated` (sleep: stop ticking that cell), `CellFull` (log + metric), `Queued/QueueUpdate/
 QueueAdmitted/QueueExpired` (login queue surface for ops HUD), `Decayed`, `TimeScale` (6.1.4),
@@ -250,8 +250,14 @@ our cell — spawn ghosts as full actors), `TxCommitted/TxAborted` (inventory tx
   and after N contacts pins the pair (`colocate`) into one cell, after which physics is local.
 
 ### 6.4 Determinism and rewind
-`rewind(tick)` arrives when the node rolls a cell back (e.g. failed handover): the module
-restores the last `CellFrame` snapshot ≤ tick (ring of 8 keyframes) and re-steps. Projects
+`rewind` on the node is a lag-compensation history query (`realtime/world.rs`: where `entity` was
+at `tick`, and whether `at` was within `tolerance`; `RewindResult{tick, pos, hit, history_from}`) —
+it does not roll a cell back. The module keeps its own ring per owned entity (`HistoryTicks`, default
+64: position + velocity per tick, recorded in `CollectAndApply`): `LocalRewind(entity, tick)` answers
+hit checks for our own actors without a round trip (lerp between neighbouring ticks, `HistoryFrom`
+tells how far back), `RewindChecked` sends the node query and returns both views so a project can log
+divergence. The same ring restores an actor (location + linear velocity) when a handover is
+cancelled by the node — the entity stays ours at its pre-handover state. Projects
 needing bit-exact physics run Chaos deterministic mode (`p.Chaos.Solver.Deterministic 1`) and
 fixed `1/hz` step; the GDK asserts both on startup when `params.rollback` is set.
 
@@ -378,8 +384,7 @@ node's `{code, message}` on every failure; Blueprint gets `FMusubiResult{bOk, Er
    (editor content) to 8.
 4. Server module: sim loop over the stream, authority component, handover with physics
    state, ghosts as kinematics, interact/colocate — shipped as `MusubiServer` (generated sim
-   wire + golden vectors, stream, subsystem); cell → level streaming and the rewind ring are
-   project hooks for now (see README).
+   wire + golden vectors, stream, subsystem); cell → level streaming and the history ring shipped later (`CellLevels`, `LocalRewind`).
 5. Rollback matches (input ring, tick hash, desync recovery) — shipped as `UMusubiMatch` over
    `UMusubiMatches` (+ RFC 6902 patching of the synced state); the world prediction buffer
    waits for a project that needs it.
