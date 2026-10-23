@@ -16,7 +16,7 @@ public class MusubiIris : ModuleRules
 		bool bIris = Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 5;
 		if (bIris)
 		{
-			PrivateDependencyModuleNames.Add("NetCore");
+			PrivateDependencyModuleNames.AddRange(new string[] { "NetCore", "JsonUtilities" }); // JsonUtilities: FJsonObjectConverter in the bridge (link error on 5.7.4 without it)
 			SetupIrisSupport(Target);
 			PublicDefinitions.Add("MUSUBI_WITH_IRIS=1");
 			ConditionalAddModuleDirectory(new DirectoryReference(Path.Combine(ModuleDirectory, "..", "MusubiIrisImpl")));

@@ -4,6 +4,11 @@
 #include "Components/ActorComponent.h"
 #include "MassEntityTypes.h"
 #include "MassArchetypeTypes.h"
+// 5.5+: FMassEntityHandle has its own header and MassEntityTypes.h/MassArchetypeTypes.h only forward-declare it
+// (seen on 5.7.4: "field has incomplete type"); on 5.3/5.4 it is defined in MassEntityTypes.h.
+#if __has_include("MassEntityHandle.h")
+#include "MassEntityHandle.h"
+#endif
 #include "MusubiWireTypes.h"
 #include "MusubiWorldTypes.h"
 #include "MusubiMassSinkComponent.generated.h"

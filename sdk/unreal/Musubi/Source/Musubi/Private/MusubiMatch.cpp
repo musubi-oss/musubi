@@ -1,6 +1,8 @@
 #include "MusubiMatch.h"
 #include "MusubiMatches.h"
 #include "MusubiSubsystem.h"
+#include "Engine/GameInstance.h"
+#include "Subsystems/SubsystemCollection.h"
 #include "MusubiSocket.h"
 #include "MusubiJson.h"
 #include "MusubiModule.h"

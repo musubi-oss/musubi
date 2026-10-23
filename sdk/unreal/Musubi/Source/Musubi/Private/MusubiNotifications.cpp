@@ -1,6 +1,7 @@
 #include "MusubiNotifications.h"
 #include "MusubiSubsystem.h"
 #include "MusubiClient.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
 
 void UMusubiNotifications::Initialize(FSubsystemCollectionBase& Collection)
 {

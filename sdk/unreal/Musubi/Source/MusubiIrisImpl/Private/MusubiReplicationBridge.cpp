@@ -188,5 +188,3 @@ void UMusubiReplicationBridge::OnProtocolMismatchReported(FNetRefHandle RefHandl
 		if (UMusubiAuthorityComponent* Auth = T->Authority.Get())
 			UE_LOG(LogMusubiIris, Warning, TEXT("protocol mismatch on entity %s (conn %u): client build does not match server replicated layout"), *Auth->GetEntityId(), ConnectionId);
 }
-#else
-UMusubiReplicationBridge::UMusubiReplicationBridge() {}

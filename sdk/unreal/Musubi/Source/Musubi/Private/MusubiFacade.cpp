@@ -1,5 +1,7 @@
 #include "MusubiFacade.h"
 #include "MusubiSubsystem.h"
+#include "Engine/GameInstance.h"
+#include "Subsystems/SubsystemCollection.h"
 #include "MusubiEnvelope.h"
 
 void UMusubiFacade::Initialize(FSubsystemCollectionBase& Collection)

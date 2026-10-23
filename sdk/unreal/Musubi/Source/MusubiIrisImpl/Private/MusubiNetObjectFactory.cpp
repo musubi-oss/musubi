@@ -4,6 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "Engine/World.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/Package.h"
 #include "Engine/GameInstance.h"
 #include "MusubiSimulatorSubsystem.h"
 
