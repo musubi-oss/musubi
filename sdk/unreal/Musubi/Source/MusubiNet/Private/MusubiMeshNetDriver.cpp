@@ -18,6 +18,15 @@ DEFINE_LOG_CATEGORY_STATIC(LogMusubiMesh, Log, All);
 const FName UMusubiMeshNetDriver::DriverName(TEXT("MusubiMesh"));
 const FName UMusubiMeshNetDriver::DefinitionName(TEXT("MusubiMeshNetDriver"));
 
+UMusubiMeshNetDriver::UMusubiMeshNetDriver(const FObjectInitializer& OI) : Super(OI)
+{
+	NetConnectionClassName = TEXT("/Script/MusubiNet.MusubiNetConnection");
+	SetNetServerMaxTickRate(30);
+	MaxNetTickRate = 120;
+	MaxClientRate = 100000;
+	MaxInternetClientRate = 100000;
+}
+
 bool UMusubiMeshNetDriver::InitConnect(FNetworkNotify*, const FURL&, FString& Error)
 {
 	Error = TEXT("MusubiMesh is a server-side driver");
@@ -124,10 +133,16 @@ void UMusubiMeshRpcSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	StoppedHandle = SimSub->OnStopped.AddUObject(this, &UMusubiMeshRpcSubsystem::OnStopped);
 	RpcHandle = SimSub->OnRpc.AddUObject(this, &UMusubiMeshRpcSubsystem::OnRpc);
 	if (SimSub->IsRunning()) OnStarted();
+	// the driver belongs to a world: LoadMap shuts it down with the old one, so re-create it for the new one
+	WorldHandle = FWorldDelegates::OnPostWorldInitialization.AddLambda([this](UWorld* W, const UWorld::InitializationValues)
+	{
+		if (W && W->IsGameWorld() && Sim.IsValid() && Sim->IsRunning() && GetGameInstance() && W->GetGameInstance() == GetGameInstance()) OnStarted();
+	});
 }
 
 void UMusubiMeshRpcSubsystem::Deinitialize()
 {
+	FWorldDelegates::OnPostWorldInitialization.Remove(WorldHandle);
 	OnStopped();
 	if (UMusubiSimulatorSubsystem* S = Sim.Get())
 	{

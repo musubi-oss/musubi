@@ -23,6 +23,7 @@ class MUSUBINET_API UMusubiMeshNetDriver : public UNetDriver
 {
 	GENERATED_BODY()
 public:
+	UMusubiMeshNetDriver(const FObjectInitializer& OI);
 	static const FName DriverName;      // "MusubiMesh"
 	static const FName DefinitionName;  // "MusubiMeshNetDriver" (NetDriverDefinitions)
 
@@ -61,5 +62,5 @@ private:
 	void OnStopped();
 	void OnRpc(AActor* Actor, const struct FMusubiJson& Payload);
 	TWeakObjectPtr<class UMusubiSimulatorSubsystem> Sim;
-	FDelegateHandle StartedHandle, StoppedHandle, RpcHandle;
+	FDelegateHandle StartedHandle, StoppedHandle, RpcHandle, WorldHandle;
 };

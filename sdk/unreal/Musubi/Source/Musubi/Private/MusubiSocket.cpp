@@ -184,7 +184,7 @@ void FMusubiSocket::HandleBinary(const uint8* Data, int32 Size)
 	if (!bOk)
 	{
 		Stats.DecodeErrors++;
-		UE_LOG(LogMusubi, Warning, TEXT("undecodable binary frame"));
+		UE_LOG(LogMusubi, Warning, TEXT("undecodable binary frame (%d bytes, head %s)"), Size, *BytesToHex(Data, FMath::Min(Size, 24)));
 		return;
 	}
 	Dispatch(Env);

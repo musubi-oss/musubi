@@ -429,6 +429,7 @@ async fn run_loop_inner(
                         continue;
                     }
                 };
+                tracing::debug!(session = %sid, cid = ?env.cid, msg = ?env.msg, "client frame");
                 if let Err(e) = ctx.rate.socket(ctx.presence.account_id) {
                     conn.send(wire.frame(&Envelope { cid: env.cid, msg: ServerMessage::error(&e) })?).await?;
                     continue;

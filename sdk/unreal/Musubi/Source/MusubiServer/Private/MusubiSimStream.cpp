@@ -86,6 +86,7 @@ void FMusubiSimStream::SetState(EMusubiSimStreamState S)
 {
 	if (State == S) return;
 	State = S;
+	UE_LOG(LogMusubiServer, Log, TEXT("sim stream %s: %s"), *Url, S == EMusubiSimStreamState::Open ? TEXT("open") : S == EMusubiSimStreamState::Connecting ? TEXT("connecting") : S == EMusubiSimStreamState::Backoff ? TEXT("backoff") : TEXT("closed"));
 	OnStateChanged.Broadcast(S);
 }
 
@@ -150,13 +151,16 @@ bool FMusubiSimStream::Send(const FMusubiSimCommand& Cmd, FMusubiSimReply OnRepl
 	IdJ.Value = MakeShared<FJsonValueNumber>((double)Id);
 	F.Id = IdJ;
 	Pending.Add(Id, FPending{MoveTemp(OnReply), Now, FString(MusubiTagName(Cmd.Tag))});
-	Ws->Send(F.ToJsonText());
+	const FString Text = F.ToJsonText();
+	UE_LOG(LogMusubiServer, Verbose, TEXT("sim stream -> %s"), *Text.Left(300));
+	Ws->Send(Text);
 	Stats.CommandsOut++;
 	return true;
 }
 
 void FMusubiSimStream::HandleText(const FString& Text)
 {
+	UE_LOG(LogMusubiServer, VeryVerbose, TEXT("sim stream <- %s"), *Text.Left(200));
 	TSharedPtr<FJsonValue> J = MusubiJson::Deserialize(Text);
 	const TSharedPtr<FJsonObject>* OP;
 	if (!J.IsValid() || !J->TryGetObject(OP)) { UE_LOG(LogMusubiServer, Warning, TEXT("sim stream: non-object frame")); return; }

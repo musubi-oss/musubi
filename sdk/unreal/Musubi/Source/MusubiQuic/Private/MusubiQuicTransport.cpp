@@ -1,4 +1,5 @@
 #include "MusubiQuicTransport.h"
+#include "HAL/PlatformTime.h"
 #include "MusubiQuicModule.h"
 
 #if MUSUBI_WITH_QUIC
@@ -92,6 +93,7 @@ void FMusubiQuicTransport::Connect(const FMusubiTransportArgs& Args)
 		OnError.Broadcast(FString::Printf(TEXT("quic: cannot resolve %s:%d"), *Host, Port));
 		return;
 	}
+	ConnectStarted = FPlatformTime::Seconds();
 	UE_LOG(LogMusubiQuic, Log, TEXT("quic connecting %s:%d"), *Host, Port);
 }
 
@@ -129,6 +131,12 @@ bool FMusubiQuicTransport::HasUnreliable() const
 void FMusubiQuicTransport::Tick(double /*DeltaSeconds*/)
 {
 	if (!Conn) return;
+	if (!bConnected && FPlatformTime::Seconds() - ConnectStarted > HandshakeTimeoutSec)
+	{
+		Drop();
+		OnError.Broadcast(FString::Printf(TEXT("quic: no handshake within %.0fs"), HandshakeTimeoutSec));
+		return;
+	}
 	MqEvent Ev;
 	for (int32 N = 0; N < MaxEventsPerTick && Conn && mq_poll(Conn, &Ev) > 0; ++N)
 	{

@@ -5236,18 +5236,26 @@ impl WorldRegistry {
         let mut st = w.lock();
         let st = &mut *st;
         net_learn(st, id, conn, sid, closing);
+        tracing::debug!(world = name, %id, conn, closing, "net_route");
         let ev = ev(id).to_value();
         match st.world.route_input(id, ev.clone()) {
             Ok(Some(sim)) => {
+                tracing::debug!(%id, conn, %sim, "net_route: to owner");
                 push_event(st, sim, ev);
                 Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok(None) => {
+                tracing::debug!(%id, conn, "net_route: buffered, entity in transit");
+                Ok(())
+            }
             Err(musubi_mesh::MeshError::NoEntity) if self.is_split(name) => {
                 fanout.world_input(name, id, ev);
                 Ok(())
             }
-            Err(e) => Err(mesh_err(e)),
+            Err(e) => {
+                tracing::debug!(%id, conn, error = %e, "net_route: failed");
+                Err(mesh_err(e))
+            }
         }
     }
 

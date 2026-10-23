@@ -61,7 +61,7 @@ FString FMusubiWsTransport::SocketUrl(const FMusubiTransportArgs& Args)
 	else if (Url.StartsWith(TEXT("http://"))) Url = TEXT("ws://") + Url.Mid(7);
 	Url = FString::Printf(TEXT("%s/ws?token=%s&format=%s"), *Url, *FGenericPlatformHttp::UrlEncode(Args.AccessToken),
 		Args.Encoding == EMusubiEncoding::Postcard ? TEXT("binary") : TEXT("json"));
-	if (Args.bResumable) Url += TEXT("&resumable=1");
+	if (Args.bResumable) Url += TEXT("&resumable=true");
 	if (!Args.Resume.IsEmpty()) Url += TEXT("&resume=") + FGenericPlatformHttp::UrlEncode(Args.Resume);
 	return Url;
 }
@@ -88,7 +88,8 @@ void FMusubiWsTransport::Connect(const FMusubiTransportArgs& Args)
 	Ws->OnConnectionError().AddLambda([this](const FString& E) { OnError.Broadcast(E); });
 	Ws->OnClosed().AddLambda([this](int32 Code, const FString& Reason, bool bClean) { OnClosed.Broadcast(Code, Reason, bClean); });
 	Ws->OnMessage().AddLambda([this](const FString& T) { OnText.Broadcast(T); });
-	Ws->OnRawMessage().AddRaw(this, &FMusubiWsTransport::HandleBinary);
+	// IWebSocket::OnRawMessage fires for text frames too; only the binary wire format wants them
+	if (Args.Encoding == EMusubiEncoding::Postcard) Ws->OnRawMessage().AddRaw(this, &FMusubiWsTransport::HandleBinary);
 	Ws->Connect();
 }
 

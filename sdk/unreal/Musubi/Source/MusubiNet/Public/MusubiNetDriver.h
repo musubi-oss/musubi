@@ -14,7 +14,7 @@ class UMusubiSimulatorSubsystem;
 /**
  * Engine networking through the Musubi node (docs/gdk-unreal.md §9.2).
  *
- * Client: `musubi://<world>?entity=<uuid>` — `net_open` on the entity, then every engine packet is a
+ * Client: `musubi://<world>:0?entity=<uuid>` — `net_open` on the entity, then every engine packet is a
  * `net_packet` the node routes to whichever simulator owns the entity right now; after a handover the
  * node sends `net_rehome` and the driver restarts the engine connection (`OnRehome`).
  * Server (dedicated, with UMusubiSimulatorSubsystem running): `InitListen` opens nothing; `net_packet`
@@ -47,9 +47,9 @@ public:
 	/** Transport for one connection's bytes: `net_packet` up (client) or a `net_packet` command (server). */
 	void SendPacket(UMusubiNetConnection* Conn, const uint8* Data, int32 Count);
 
-	/** Largest `data` the node relays; also the connection's MaxPacket. */
+	/** Connection MaxPacket: the node relays up to 1200 bytes, the engine asserts MaxPacket <= MAX_PACKET_SIZE (1024). */
 	UPROPERTY(Config)
-	int32 MaxRelayPacket = 1200;
+	int32 MaxRelayPacket = 1024;
 	/** Client: `net_rehome` → how long the restarted connection may take to get `NMT_Welcome` before it is a failure. */
 	UPROPERTY(Config)
 	float RehomeTimeout = 5.f;

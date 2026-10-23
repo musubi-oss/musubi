@@ -32,6 +32,9 @@ private:
 
 	MqConn* Conn = nullptr;
 	bool bConnected = false;
+	/** When the handshake started; a node without QUIC answers nothing, so give up well before the 60 s idle timeout. */
+	double ConnectStarted = 0;
+	double HandshakeTimeoutSec = 5.0;
 	bool bClosing = false;
 	FString PendingHello;
 	int32 MaxFrameBytes = 4 * 1024 * 1024;

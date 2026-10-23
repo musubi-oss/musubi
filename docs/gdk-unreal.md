@@ -385,14 +385,20 @@ is. Phase 9 makes the engine use it.
 - Handshake: the UDP stateless-connect challenge lives in `PacketHandler` /
   `StatelessConnectHandlerComponent`; `UWebSocketNetDriver` accepts connections without it when
   `-NoPacketHandler` is set (`WebSocketNetDriver.cpp:240`, `bChallengeHandshake=false`). Our sessions are already
-  authenticated by the node (JWT), so the challenge is skipped by design; the per-connection `PacketHandler`
-  (encryption/Oodle components from `[PacketHandlerComponents]`) stays.
+  authenticated by the node (JWT), so the challenge is skipped by design: `UMusubiNetConnection::InitHandler` creates
+  no `PacketHandler` at all (the engine's `-NoPacketHandler` path, in every configuration). Leaving the component in is
+  not an option — it answers the cookie exchange through connectionless `UNetDriver::LowLevelSend(Address)`, which a relay
+  has no equivalent of (observed live: the server-side component rejected every packet with "invalid session id /
+  connection id"); a `PacketHandler` with no components is not either — `PacketHandler::BeginHandshaking` only fires
+  its completion delegate from a component, so `UPendingNetGame` would never send `NMT_Hello` (also observed live).
+  Consequence: `[PacketHandlerComponents]` (encryption, Oodle) do not apply to relayed connections — the transport to
+  the node is already TLS/QUIC-encrypted and compressed.
 
 ### 9.2 Path A — client ↔ owning server over the node (`UMusubiNetDriver`, `UMusubiNetConnection`)
 
 Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver` API, present in 5.3).
 
-- **Addressing.** Client URL `musubi://<world>?entity=<uuid>` (`FURL::Host = world id`). The node, not the
+- **Addressing.** Client URL `musubi://<world>:0?entity=<uuid>` (`FURL::Host = world id`, the port is ignored — the node address comes from settings). Two `FURL` rules shape this form: `scheme://host` is only honoured for the default scheme, so the project sets `[URL] Protocol=musubi` in `DefaultEngine.ini`; and a host without a dot is taken for a map name unless it carries a port, hence the `:0`. The node, not the
   client, picks the server: the simulator currently holding the cell of `entity` (the player's entity from
   `UMusubiWorldComponent::SetLocalEntity`; created by the project's spawn flow or by the node's
   `player_spawn` policy). No ports, no IPs: both ends only ever talk to the node.
@@ -437,17 +443,24 @@ Module `MusubiNet` (runtime, all tiers: the driver uses only classic `UNetDriver
   queues a `net_close{reason: "rehome"}` event for the old owner and a `net_rehome` message for each
   client on the entity, sent at the next tick; packets already in flight were buffered during transit and
   are replayed to the new owner. Client driver on `net_rehome` (implemented, in place, no travel): every
-  actor channel whose actor carries a `UMusubiAuthorityComponent` is closed with
-  `EChannelCloseReason::TearOff` — the engine sets `bTearOff` itself in `UActorChannel::CleanUp` and keeps
-  the actor since `ShouldClientDestroyTearOffActors()` is false — and remembered by its replicated
-  `NetEntityId`; the old `ServerConnection` is cleaned up (after `ServerConnection = nullptr`, which
-  `UNetConnection::CleanUp` asserts on), a fresh `UMusubiNetConnection` opens on the same `conn`, and the
-  driver takes over `FNetworkNotify` for the handshake `UPendingNetGame` normally runs
-  (`NMT_Hello → Challenge → Login → Welcome → Netspeed → Join`), handing other control messages to the
-  world and giving the notify back after `Join`. The new owner replicates its actors; when one of them
-  reports its `NetEntityId` (RepNotify → `UMusubiAuthorityComponent::OnClientEntityIdentified`) the
-  torn-off twin is destroyed — the world never shows an empty frame. Twins nobody re-sent are dropped
-  after `2 × RehomeTimeout`. Budget: `NMT_Welcome` within `RehomeTimeout` (5 s), or the new owner runs a
+  actor channel whose actor carries a `UMusubiAuthorityComponent` is closed as for dormancy
+  (`UChannel::Dormant = true` + `EChannelCloseReason::Dormancy`: the engine keeps the actor via
+  `ClientSetActorDormant`, neither destroyed nor torn off — a torn-off actor would make the engine refuse the
+  new owner's open bunch) and remembered by its replicated `NetEntityId`; the old `ServerConnection` is cleaned
+  up while still being `ServerConnection` (`UNetConnection::CleanUp` nulls it itself; with it already null the
+  engine takes the connection for a client one and asserts in `RemoveClientConnection`), the driver's
+  `GuidCache` is replaced (the new owner numbers NetGUIDs independently — with the old cache its GUIDs resolve
+  to the old actors), a fresh `UMusubiNetConnection` opens on the same `conn`, and the driver takes over
+  `FNetworkNotify` for the handshake `UPendingNetGame` normally runs
+  (`NMT_Hello → Login → Welcome → Netspeed → Join`), handing other control messages to the world and giving
+  the notify back after `Join`. The new owner replicates its actors; when one of them reports its
+  `NetEntityId` (RepNotify → `UMusubiAuthorityComponent::OnClientEntityIdentified`) the old twin is destroyed
+  with `UWorld::DestroyActor(twin, bNetForce = true)` (a client may not `Destroy()` a replicated actor it has no
+  authority over) — the world never shows an empty frame. Twins nobody re-sent are dropped after
+  `2 × RehomeTimeout`. Not possible: re-attaching the new owner's channel to the existing actor instance — a
+  dynamic NetGUID always spawns, and a net-addressable (stable-name) actor cannot be spawned by a client at all
+  (tried: `SerializeNewActor failed to find/spawn actor`). Proven live by `tools/nitl.sh` on 5.3.2 (node + two
+  dedicated servers + client, border crossing in front of the client). Budget: `NMT_Welcome` within `RehomeTimeout` (5 s), or the new owner runs a
   different level, or `NMT_Failure`/`NMT_Upgrade` → fall back to a travel to the same URL. Node side: a
   `net_packet`/`net_close` from a simulator that no longer owns the relayed entity is dropped
   (`musubi_world_net_stale_dropped_total`), so the old owner's close bunch cannot land on the new

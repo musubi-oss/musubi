@@ -1,0 +1,12 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "",
+	"Category": "",
+	"Description": "Musubi node-in-the-loop host",
+	"Plugins": [
+		{
+			"Name": "Musubi",
+			"Enabled": true
+		}
+	]
+}

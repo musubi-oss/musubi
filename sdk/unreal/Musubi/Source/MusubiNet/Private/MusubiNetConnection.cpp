@@ -1,19 +1,22 @@
 #include "MusubiNetConnection.h"
+#include "PacketHandler.h"
 
 #include "MusubiNetDriver.h"
 #include "Net/DataChannel.h"
-#include "PacketHandler.h"
 
 UMusubiNetConnection::UMusubiNetConnection(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
 }
 
+/** Per-packet cost of the relay envelope (`net_packet` + conn + base64 padding), the engine asserts PacketOverhead > 0. */
+static constexpr int32 RelayPacketOverhead = 48;
+
 void UMusubiNetConnection::InitBase(UNetDriver* InDriver, FSocket* InSocket, const FURL& InURL, EConnectionState InState, int32 InMaxPacket, int32 InPacketOverhead)
 {
 	const UMusubiNetDriver* D = Cast<UMusubiNetDriver>(InDriver);
 	// no UDP/IP headers underneath: the relay frame is the packet
-	Super::InitBase(InDriver, InSocket, InURL, InState, InMaxPacket == 0 ? (D ? D->MaxRelayPacket : 1200) : InMaxPacket, InPacketOverhead);
+	Super::InitBase(InDriver, InSocket, InURL, InState, FMath::Min(InMaxPacket == 0 ? (D ? D->MaxRelayPacket : MAX_PACKET_SIZE) : InMaxPacket, (int32)MAX_PACKET_SIZE), InPacketOverhead > 0 ? InPacketOverhead : RelayPacketOverhead);
 }
 
 void UMusubiNetConnection::InitLocalConnection(UNetDriver* InDriver, FSocket* InSocket, const FURL& InURL, EConnectionState InState, int32 InMaxPacket, int32 InPacketOverhead)
@@ -43,6 +46,16 @@ void UMusubiNetConnection::Opened(uint64 InConnId, int32 InMaxPacket)
 	PendingOut.Reset();
 	if (D)
 		for (const TArray<uint8>& P : Out) D->SendPacket(this, P.GetData(), P.Num());
+}
+
+void UMusubiNetConnection::InitHandler()
+{
+	// No PacketHandler at all (the engine's -NoPacketHandler path, here in every configuration): with the stateless-connect
+	// component the cookie exchange needs connectionless sends a relay has none of, and without any component
+	// PacketHandler::BeginHandshaking never fires its completion delegate, so UPendingNetGame would never send NMT_Hello.
+	// The relay is already authenticated by the node and encrypted/compressed by the transport, so nothing is lost.
+	check(!Handler.IsValid());
+	MaxPacketHandlerBits = 0;
 }
 
 void UMusubiNetConnection::LowLevelSend(void* Data, int32 CountBits, FOutPacketTraits& Traits)

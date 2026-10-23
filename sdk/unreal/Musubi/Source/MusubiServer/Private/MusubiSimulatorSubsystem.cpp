@@ -56,7 +56,8 @@ void UMusubiSimulatorSubsystem::LoadSettings()
 	FParse::Value(FCommandLine::Get(), TEXT("MusubiWorld="), WorldName);
 	FParse::Value(FCommandLine::Get(), TEXT("MusubiKey="), ServerKey);
 	FString CellsArg;
-	if (FParse::Value(FCommandLine::Get(), TEXT("MusubiCells="), CellsArg))
+	// bShouldStopOnSeparator=false: the default cuts the value at the first comma ("0,0;1,0" would become "0")
+	if (FParse::Value(FCommandLine::Get(), TEXT("MusubiCells="), CellsArg, false))
 	{
 		InitialCells.Reset();
 		CellsArg.ParseIntoArray(InitialCells, TEXT(";"), true);

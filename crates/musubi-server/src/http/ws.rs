@@ -22,10 +22,21 @@ struct WsQuery {
     format: Option<String>,
     #[serde(default)]
     status: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_bool")]
     resumable: bool,
     #[serde(default)]
     resume: Option<String>,
+}
+
+/// Query flags arrive as `true`/`false` from the Rust clients and as `1`/`0` from engines that
+/// print booleans as numbers; both spell the same flag.
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let raw = String::deserialize(d)?;
+    match raw.as_str() {
+        "" | "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(serde::de::Error::custom(format!("not a boolean: {other}"))),
+    }
 }
 
 /// tungstenite zero-fills up to `read_buffer_size` bytes before *every* read (`read_in`), and

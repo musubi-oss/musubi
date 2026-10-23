@@ -1,4 +1,5 @@
 #include "MusubiNetDriver.h"
+#include "Engine/PackageMapClient.h"
 #include "MusubiAuthorityComponent.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include "Net/DataChannel.h"
@@ -46,6 +47,18 @@ UMusubiNetDriver::UMusubiNetDriver(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
 	if (NetConnectionClassName.IsEmpty()) NetConnectionClassName = TEXT("/Script/MusubiNet.MusubiNetConnection");
+	// what [/Script/OnlineSubsystemUtils.IpNetDriver] gives the stock driver and a subclass does not inherit: without
+	// these a dedicated server ticks at 1 Hz (GetNetServerMaxTickRate() == 0). A class ini section still overrides.
+	SetNetServerMaxTickRate(30);
+	MaxNetTickRate = 120;
+	MaxClientRate = 100000;
+	MaxInternetClientRate = 100000;
+	RelevantTimeout = 5.f;
+	KeepAliveTime = 0.2f;
+	InitialConnectTimeout = 60.f;
+	ConnectionTimeout = 60.f;
+	SpawnPrioritySeconds = 1.f;
+	ServerTravelPause = 4.f;
 }
 
 bool UMusubiNetDriver::InitBase(bool bInitAsClient, FNetworkNotify* InNotify, const FURL& URL, bool bReuseAddressAndPort, FString& Error)
@@ -75,7 +88,7 @@ bool UMusubiNetDriver::InitConnect(FNetworkNotify* InNotify, const FURL& Connect
 	const FString Entity = ConnectURL.GetOption(TEXT("entity="), TEXT(""));
 	if (ConnectURL.Host.IsEmpty() || Entity.IsEmpty())
 	{
-		Error = TEXT("MusubiNet: URL must be musubi://<world>?entity=<uuid>");
+		Error = TEXT("MusubiNet: URL must be musubi://<world>:0?entity=<uuid>");
 		return false;
 	}
 	Client = Sub;
@@ -150,9 +163,9 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 	++Rehomes;
 	bRehoming = true;
 	RehomeStarted = FPlatformTime::Seconds();
-	// 1. keep the world: actors that are Musubi entities stay as torn-off actors (the engine sets bTearOff itself in
-	//    UActorChannel::CleanUp(TearOff) and keeps the actor since ShouldClientDestroyTearOffActors() is false); the new
-	//    owner's replication re-creates them and OnEntityIdentified swaps the twin out — no empty frame in between
+	// 1. keep the world: actors that are Musubi entities stay (closed as for dormancy, so they are neither destroyed nor
+	//    torn off); the new owner's replication spawns its own copy of each (dynamic NetGUIDs cannot point at an existing
+	//    actor) and OnEntityIdentified swaps the old one out the moment the copy's NetEntityId arrives — no empty frame
 	TornOff.Reset();
 	for (UChannel* Ch : TArray<UChannel*>(Old->OpenChannels))
 	{
@@ -161,15 +174,24 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 		const UMusubiAuthorityComponent* Auth = AC->Actor->FindComponentByClass<UMusubiAuthorityComponent>();
 		if (!Auth || Auth->NetEntityId.IsEmpty()) continue;
 		TornOff.Add(Auth->NetEntityId, AC->Actor);
-		AC->ConditionalCleanUp(true, EChannelCloseReason::TearOff);
+		// close as for dormancy: the engine keeps the actor (ClientSetActorDormant) without tearing it off, so the new
+		// owner's open bunch can re-attach to it; `Dormant` is normally set by a received close bunch, we close locally
+		AC->Dormant = true;
+		AC->ConditionalCleanUp(true, EChannelCloseReason::Dormancy);
 	}
 	// 2. a fresh engine connection on the same relay conn (the node already routes it to the new owner; the server side
 	//    opens its UMusubiNetConnection on our first packet)
 	const uint64 ConnId = Old->ConnId;
 	const int32 OldMaxPacket = Old->MaxPacket;
 	Old->bKeepRelay = true;
-	ServerConnection = nullptr; // UNetConnection::CleanUp asserts Driver->ServerConnection == this when it is set
+	// UNetConnection::CleanUp nulls Driver->ServerConnection itself when it is this connection; with it already null the
+	// engine takes the old connection for a client one and asserts in RemoveClientConnection
+	check(ServerConnection == Old);
 	Old->CleanUp();
+	check(ServerConnection == nullptr);
+	// the new owner numbers its NetGUIDs independently of the old one: with the old cache its GUIDs resolve to our old
+	// actors ("open bunch for a torn off actor") — start the cache over
+	GuidCache = TSharedPtr<FNetGUIDCache>(new FNetGUIDCache(this));
 	UMusubiNetConnection* Conn = NewObject<UMusubiNetConnection>(GetTransientPackage(), static_cast<UClass*>(NetConnectionClass));
 	ServerConnection = Conn;
 	Conn->InitLocalConnection(this, nullptr, ClientURL, USOCK_Pending);
@@ -272,7 +294,9 @@ void UMusubiNetDriver::OnEntityIdentified(AActor* Actor, const FString& Id)
 	if (Twin && Twin != Actor)
 	{
 		++Adopted;
-		Twin->Destroy();
+		UE_LOG(LogMusubiNet, Log, TEXT("rehome: swapped %s for %s (entity %s)"), *Twin->GetName(), *Actor->GetName(), *Id);
+		// a client may not Destroy() a replicated actor it does not own (DestroyActor refuses without authority or tear-off)
+		if (UWorld* W = Twin->GetWorld()) W->DestroyActor(Twin, true);
 	}
 }
 
@@ -362,6 +386,7 @@ void UMusubiNetDriver::SendPacket(UMusubiNetConnection* Conn, const uint8* Data,
 	M.NetPacket->conn = Conn->ConnId;
 	M.NetPacket->data = TArray<uint8>(Data, Count);
 	Sock->Send(M);
+	UE_LOG(LogMusubiNet, Verbose, TEXT("-> net_packet %d bytes on relay %llu"), Count, (unsigned long long)Conn->ConnId);
 }
 
 void UMusubiNetDriver::DrainInbox()
@@ -379,7 +404,14 @@ void UMusubiNetDriver::TickDispatch(float DeltaTime)
 	else if (!bRehoming && TornOff.Num() && FPlatformTime::Seconds() - RehomeStarted > 2.0 * RehomeTimeout)
 	{
 		// entities the new owner never sent again (left our interest during the move): drop the stale twins
-		for (TPair<FString, TWeakObjectPtr<AActor>>& KV : TornOff) if (AActor* A = KV.Value.Get()) A->Destroy();
+		int32 Reused = 0, Dropped = 0;
+		for (TPair<FString, TWeakObjectPtr<AActor>>& KV : TornOff)
+			if (AActor* A = KV.Value.Get())
+			{
+				if (ServerConnection && ServerConnection->FindActorChannelRef(A)) ++Reused;
+				else { ++Dropped; if (UWorld* AW = A->GetWorld()) AW->DestroyActor(A, true); }
+			}
+		UE_LOG(LogMusubiNet, Log, TEXT("rehome: %d actors swapped for the new owner's, %d still on the old channel, %d dropped"), Adopted, Reused, Dropped);
 		TornOff.Reset();
 	}
 	Super::TickDispatch(DeltaTime);

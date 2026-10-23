@@ -21,6 +21,8 @@ public:
 	virtual void InitBase(UNetDriver* InDriver, class FSocket* InSocket, const FURL& InURL, EConnectionState InState, int32 InMaxPacket = 0, int32 InPacketOverhead = 0) override;
 	virtual void InitLocalConnection(UNetDriver* InDriver, class FSocket* InSocket, const FURL& InURL, EConnectionState InState, int32 InMaxPacket = 0, int32 InPacketOverhead = 0) override;
 	virtual void InitRemoteConnection(UNetDriver* InDriver, class FSocket* InSocket, const FURL& InURL, const class FInternetAddr& InRemoteAddr, EConnectionState InState, int32 InMaxPacket = 0, int32 InPacketOverhead = 0) override;
+	/** No PacketHandler: the node has already authenticated the session and relays only to the entity's owner; the stateless cookie exchange would need connectionless sends, which a relay has none of. `[PacketHandlerComponents]` do not apply to relayed connections. */
+	virtual void InitHandler() override;
 	virtual void LowLevelSend(void* Data, int32 CountBits, FOutPacketTraits& Traits) override;
 	virtual FString LowLevelGetRemoteAddress(bool bAppendPort = false) override;
 	virtual FString LowLevelDescribe() override;

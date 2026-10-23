@@ -121,12 +121,12 @@ No library for the platform → the module compiles to a stub and the plugin sta
 `UMusubiNetDriver` / `UMusubiNetConnection` carry the engine's own game connection (`UNetDriver` packets,
 replication Iris or classic, RPCs, login) through the node instead of a UDP socket, so the engine's
 replication code is untouched and the node decides which simulator a client talks to. Client URL
-`musubi://<world>?entity=<uuid>`: the driver asks the node for a relay on the entity (`net_open`), every packet
+`musubi://<world>:0?entity=<uuid>` (requires `[URL] Protocol=musubi` in `DefaultEngine.ini`; the `:0` port is ignored but keeps `FURL` from reading a dot-less world id as a map name): the driver asks the node for a relay on the entity (`net_open`), every packet
 is a `net_packet` the node routes to the entity's current owner (buffered while it is in transit); a dedicated
 server with `UMusubiSimulatorSubsystem` running accepts connections from `net_packet` events (first packet on
 an unknown conn opens one — `UIpNetDriver` semantics, no stateless challenge: the node already authenticated
 the session). When the entity hands over, the node closes the old owner's side and sends the client
-`net_rehome`; the driver rehomes in place (`UMusubiNetDriver::OnRehome`, overridable): actors of Musubi entities stay as torn-off actors (keyed by the replicated `UMusubiAuthorityComponent::NetEntityId`), a fresh engine connection opens on the same relay conn and the driver runs the login handshake itself (`NMT_Hello → Challenge → Login → Welcome → Netspeed → Join`) without a map load; as the new owner's actors arrive and report their `NetEntityId`, the torn-off twins are destroyed, so the world never shows an empty frame (PlayerController/PlayerState/GameState are re-created by the new server as usual). The new owner's `GameMode` sees a normal `NMT_Join`; `UMusubiNetConnection::Entity` tells it which entity the player is. `RehomeTimeout` (5 s) without `NMT_Welcome`, a different level on the new owner or `NMT_Failure` fall back to a travel to the same URL.
+`net_rehome`; the driver rehomes in place (`UMusubiNetDriver::OnRehome`, overridable): actors of Musubi entities stay on screen (closed as for dormancy, keyed by the replicated `UMusubiAuthorityComponent::NetEntityId`), a fresh engine connection opens on the same relay conn and the driver runs the login handshake itself (`NMT_Hello → Login → Welcome → Netspeed → Join`) without a map load; as the new owner's actors arrive and report their `NetEntityId`, the old twins are destroyed, so the world never shows an empty frame (PlayerController/PlayerState/GameState are re-created by the new server as usual). The new owner's `GameMode` sees a normal `NMT_Join`; `UMusubiNetConnection::Entity` tells it which entity the player is. `RehomeTimeout` (5 s) without `NMT_Welcome`, a different level on the new owner or `NMT_Failure` fall back to a travel to the same URL.
 `max_packet` 1200 B; conn ids stay below 2^53 because engines parse JSON numbers as doubles. Enable with
 `+NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/MusubiNet.MusubiNetDriver",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver",bCanUseIris=true)`.
 
@@ -165,5 +165,8 @@ on the command line and a runtime `Configure()` override the address.
   need a GitHub account linked to Epic Games), so it is re-run by hand before a release;
   `tools/ue-package.sh <ver>...` then zips each build into a drop-in prebuilt plugin
   (`target/ue/Musubi-<plugin>-ue<major.minor>-<platforms>.zip`: Binaries, generated headers, Source,
-  `.uplugin` pinned to that engine). A build error report from any other version/platform is still
+  `.uplugin` pinned to that engine). `tools/nitl.sh <ver> [seconds]` is the node-in-the-loop run on top of such a
+  build: a node on the box, two headless dedicated servers (cells `0,0` / `1,0`) and a headless client, an entity
+  walked across the cell border in front of the client — handover, relay login, in-place rehome and the actor
+  swap are asserted from the logs (module `MusubiNitl`, command-line gated, inert in a normal game). A build error report from any other version/platform is still
   the most useful issue you can file.
