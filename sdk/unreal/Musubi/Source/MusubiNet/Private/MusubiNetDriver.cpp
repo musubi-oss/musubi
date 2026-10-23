@@ -1,5 +1,6 @@
 #include "MusubiNetDriver.h"
 #include "MusubiAuthorityComponent.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "Net/DataChannel.h"
 #include "Engine/ActorChannel.h"
 #include "Engine/ControlChannel.h"
@@ -180,7 +181,11 @@ void UMusubiNetDriver::OnRehome(const FMusubiServerMessageNetRehome& Msg)
 	uint8 IsLittleEndian = uint8(PLATFORM_LITTLE_ENDIAN);
 	uint32 LocalNetworkVersion = FNetworkVersion::GetLocalNetworkVersion();
 	FString EncryptionToken;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION <= 3
+	uint16 LocalNetworkFeatures = static_cast<uint16>(GetNetworkRuntimeFeatures()); // NMT_Hello carries a uint16 in 5.3
+#else
 	EEngineNetworkRuntimeFeatures LocalNetworkFeatures = GetNetworkRuntimeFeatures();
+#endif
 	FNetControlMessage<NMT_Hello>::Send(Conn, IsLittleEndian, LocalNetworkVersion, EncryptionToken, LocalNetworkFeatures);
 	Conn->FlushNet();
 }

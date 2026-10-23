@@ -1,4 +1,5 @@
 #include "MusubiIrisExport.h"
+#include "Runtime/Launch/Resources/Version.h"
 
 #include "Engine/GameInstance.h"
 #include "GameFramework/Actor.h"
