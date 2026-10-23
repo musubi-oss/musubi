@@ -2223,6 +2223,16 @@ impl World {
 
     /// Route a player input to the entity's current owner; while in transit it is buffered for the
     /// new owner. Returns the simulator that should receive it now (None = buffered).
+    /// The simulator that owns `id` right now: `None` while it is in transit, unknown here, or its
+    /// cell has no lease.
+    pub fn entity_owner(&self, id: EntityId) -> Option<SimId> {
+        let e = self.entities.get(&id)?;
+        if e.transit.is_some() {
+            return None;
+        }
+        self.owner(e.cell)
+    }
+
     pub fn route_input(
         &mut self,
         id: EntityId,

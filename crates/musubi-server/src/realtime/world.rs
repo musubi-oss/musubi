@@ -5251,6 +5251,29 @@ impl WorldRegistry {
         }
     }
 
+    /// Whether a `net_packet`/`net_close` command from `sim` on `conn` may reach the client: after a
+    /// handover the old owner still flushes its engine connection (close bunches, late acks) for a
+    /// tick or two, and those must not land on the connection the client has meanwhile restarted on
+    /// the new owner. Relays this shard does not know (split worlds) pass.
+    pub fn net_from_sim_allowed(&self, name: &str, sim: Uuid, conn: u64) -> Result<bool> {
+        let w = self.get(name)?;
+        let st = w.lock();
+        let Some((id, _)) = st
+            .net_sessions
+            .iter()
+            .find_map(|(id, c)| c.iter().find(|(k, _)| *k == conn).map(|_| (*id, ())))
+        else {
+            return Ok(true);
+        };
+        match st.world.entity_owner(id) {
+            Some(owner) if owner != sim => {
+                metrics::counter!("musubi_world_net_stale_dropped_total").increment(1);
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
     /// The simulator closed `conn` on `entity` (`net_close` command): forget the relay.
     pub fn net_closed(&self, name: &str, entity: &str, conn: u64) -> Result<()> {
         let id = parse_entity(entity)?;

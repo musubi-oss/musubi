@@ -22288,6 +22288,36 @@ async fn net_relay_follows_the_entity_across_a_handover() {
     let ev = event(&mut w2, "net_packet").await;
     assert_eq!(ev["conn"].as_u64(), Some(conn), "{ev}");
     assert_eq!(ev["data"], json!([4]), "{ev}");
+    // the old owner still flushes its side (close bunch, late acks): nothing of it reaches the client,
+    // who is on the new owner now, and its net_close does not forget the relay
+    cmd(
+        &mut w1,
+        json!({"op": "net_packet", "conn": conn, "session": session, "data": [7]}),
+    )
+    .await;
+    cmd(
+        &mut w1,
+        json!({"op": "net_close", "conn": conn, "session": session, "entity": entity, "reason": "rehome"}),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), recv(&mut c))
+            .await
+            .is_err(),
+        "stale owner reached the client"
+    );
+    cmd(
+        &mut w2,
+        json!({"op": "net_packet", "conn": conn, "session": session, "data": [5]}),
+    )
+    .await;
+    match recv(&mut c).await.msg {
+        ServerMessage::NetPacket { conn: k, data } => {
+            assert_eq!(k, conn);
+            assert_eq!(data, vec![5]);
+        }
+        m => panic!("{m:?}"),
+    }
     // the client hangs up: the owner hears it
     send(
         &mut c,

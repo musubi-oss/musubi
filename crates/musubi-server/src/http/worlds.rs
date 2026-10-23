@@ -1154,6 +1154,10 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
                 }
                 let sid: musubi_core::SessionId = serde_json::from_value(session)
                     .map_err(|e| Error::InvalidArgument(format!("session: {e}")))?;
+                if !s.worlds.net_from_sim_allowed(w, sim, conn)? {
+                    reply["result"] = json!({"dropped": "stale owner"});
+                    return Ok(reply);
+                }
                 s.fanout
                     .session(sid, ServerMessage::NetPacket { conn, data });
                 Ok(reply)
@@ -1166,6 +1170,10 @@ async fn stream_command(s: &AppState, w: &str, sim: Uuid, uri: &OriginalUri, txt
             } => {
                 let sid: musubi_core::SessionId = serde_json::from_value(session)
                     .map_err(|e| Error::InvalidArgument(format!("session: {e}")))?;
+                if !s.worlds.net_from_sim_allowed(w, sim, conn)? {
+                    reply["result"] = json!({"dropped": "stale owner"});
+                    return Ok(reply);
+                }
                 s.worlds.net_closed(w, &entity, conn)?;
                 s.fanout
                     .session(sid, ServerMessage::NetClose { conn, reason });
