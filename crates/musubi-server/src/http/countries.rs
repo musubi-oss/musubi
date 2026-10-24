@@ -20,6 +20,8 @@ use crate::http::{ApiError, ServerKey};
 
 const CACHE_SECS: u64 = 15;
 const MAX_METADATA_BYTES: usize = 4 * 1024;
+/// A group lists at most every country a few times over (duplicates / alpha-3 / numeric mixes).
+const MAX_GROUP_CODES: usize = 1000;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -77,11 +79,11 @@ fn cache() -> &'static Cache {
 }
 
 fn invalidate() {
-    *cache().write().unwrap() = None;
+    *cache().write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 async fn load(s: &AppState) -> Result<Snapshot> {
-    if let Some((at, snap)) = cache().read().unwrap().as_ref() {
+    if let Some((at, snap)) = cache().read().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if at.elapsed() < Duration::from_secs(CACHE_SECS) {
             return Ok(snap.clone());
         }
@@ -123,7 +125,7 @@ async fn load(s: &AppState) -> Result<Snapshot> {
             })
             .collect(),
     };
-    *cache().write().unwrap() = Some((Instant::now(), snap.clone()));
+    *cache().write().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), snap.clone()));
     Ok(snap)
 }
 
@@ -362,8 +364,11 @@ async fn put_group(
     Json(b): Json<GroupBody>,
 ) -> Result<Json<Value>, ApiError> {
     let name = group_name(&name)?;
-    if b.countries.is_empty() {
-        return Err(Error::InvalidArgument("countries must not be empty".into()).into());
+    if b.countries.is_empty() || b.countries.len() > MAX_GROUP_CODES {
+        return Err(Error::InvalidArgument(format!(
+            "countries must have 1..={MAX_GROUP_CODES} codes"
+        ))
+        .into());
     }
     if b.description.as_ref().is_some_and(|d| d.len() > 200) {
         return Err(Error::InvalidArgument("description exceeds 200 chars".into()).into());
@@ -391,7 +396,11 @@ async fn put_group(
     .map_err(Error::internal)?;
     invalidate();
     let snap = load(&s).await?;
-    let g = snap.groups.iter().find(|g| g.name == name).unwrap();
+    let g = snap
+        .groups
+        .iter()
+        .find(|g| g.name == name)
+        .ok_or_else(|| Error::NotFound(format!("country group {name}")))?;
     Ok(Json(group_doc(g)))
 }
 

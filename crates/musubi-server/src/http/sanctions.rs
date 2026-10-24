@@ -36,6 +36,52 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/sanctions/sync", get(sync))
 }
 
+/// Longest sanction / delay: 100 years (keeps timestamp arithmetic in range).
+const MAX_SANCTION_SECS: i64 = 100 * 365 * 24 * 3600;
+const MAX_REASON: usize = 256;
+const MAX_MESSAGE: usize = 1024;
+const MAX_NOTE: usize = 4000;
+const MAX_SOURCE_BYTES: usize = 4 * 1024;
+const MAX_FEATURES: usize = 32;
+/// `to_timestamp()` cursor ceiling (9999-12-31T23:59:59Z): larger values make Postgres error out.
+const MAX_CURSOR: i64 = 253_402_300_799;
+
+/// Window of a sanction: `starts_in_secs` (negative = now) and `duration_secs`, both bounded by
+/// [`MAX_SANCTION_SECS`] so `now + delay + duration` can never overflow.
+fn schedule(
+    now: OffsetDateTime,
+    starts_in_secs: i64,
+    duration_secs: Option<i64>,
+) -> Result<(OffsetDateTime, Option<OffsetDateTime>)> {
+    let delay = starts_in_secs.max(0);
+    if delay > MAX_SANCTION_SECS {
+        return Err(Error::InvalidArgument(format!(
+            "starts_in_secs must be at most {MAX_SANCTION_SECS}"
+        )));
+    }
+    if duration_secs.is_some_and(|d| !(1..=MAX_SANCTION_SECS).contains(&d)) {
+        return Err(Error::InvalidArgument(format!(
+            "duration_secs must be 1..={MAX_SANCTION_SECS}"
+        )));
+    }
+    let starts = now
+        .checked_add(time::Duration::seconds(delay))
+        .ok_or_else(|| Error::InvalidArgument("starts_in_secs out of range".into()))?;
+    let ends = duration_secs
+        .map(|d| {
+            starts
+                .checked_add(time::Duration::seconds(d))
+                .ok_or_else(|| Error::InvalidArgument("duration_secs out of range".into()))
+        })
+        .transpose()?;
+    Ok((starts, ends))
+}
+
+/// Clamp a unix-seconds cursor into what `to_timestamp()` accepts.
+fn cursor(secs: Option<i64>) -> Option<i64> {
+    secs.map(|s| s.clamp(0, MAX_CURSOR))
+}
+
 pub const ACTIONS: &[&str] = &[
     "warn",
     "mute",
@@ -327,13 +373,35 @@ async fn create(
     if action == "custom" && features.is_empty() {
         return Err(Error::InvalidArgument("custom needs features".into()).into());
     }
-    if b.duration_secs.is_some_and(|d| d <= 0) {
-        return Err(Error::InvalidArgument("duration_secs must be positive".into()).into());
+    if features.len() > MAX_FEATURES {
+        return Err(Error::InvalidArgument(format!("at most {MAX_FEATURES} features")).into());
+    }
+    if b.reason
+        .as_deref()
+        .is_some_and(|r| r.chars().count() > MAX_REASON)
+    {
+        return Err(Error::InvalidArgument(format!("reason over {MAX_REASON} chars")).into());
+    }
+    if b.message
+        .as_deref()
+        .is_some_and(|m| m.chars().count() > MAX_MESSAGE)
+    {
+        return Err(Error::InvalidArgument(format!("message over {MAX_MESSAGE} chars")).into());
+    }
+    if b.note.chars().count() > MAX_NOTE {
+        return Err(Error::InvalidArgument(format!("note over {MAX_NOTE} chars")).into());
+    }
+    if b.source.is_object()
+        && serde_json::to_vec(&b.source)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
+            > MAX_SOURCE_BYTES
+    {
+        return Err(Error::InvalidArgument("source exceeds 4 KiB".into()).into());
     }
     let sid = Uuid::now_v7();
     let status = if b.pending { "pending" } else { "active" };
-    let starts = OffsetDateTime::now_utc() + time::Duration::seconds(b.starts_in_secs.max(0));
-    let ends = b.duration_secs.map(|d| starts + time::Duration::seconds(d));
+    let (starts, ends) = schedule(OffsetDateTime::now_utc(), b.starts_in_secs, b.duration_secs)?;
     sqlx::query(
         "insert into musubi.sanctions (id, account_id, action, features, reason_code, reason, message, status,
             starts_at, ends_at, created_by, source, note)
@@ -413,7 +481,7 @@ async fn list(
     ))
     .bind(q.status.as_deref())
     .bind(q.action.as_deref())
-    .bind(q.before)
+    .bind(cursor(q.before))
     .bind(q.limit.unwrap_or(100).clamp(1, 500))
     .fetch_all(&s.db)
     .await
@@ -469,6 +537,11 @@ async fn set_status(
     to: &str,
     note: &str,
 ) -> Result<(Row, bool)> {
+    if note.chars().count() > MAX_NOTE {
+        return Err(Error::InvalidArgument(format!(
+            "note over {MAX_NOTE} chars"
+        )));
+    }
     let r = load(s, id).await?;
     if !from.contains(&r.status.as_str()) {
         return Err(Error::Conflict(format!(
@@ -476,18 +549,28 @@ async fn set_status(
             r.status
         )));
     }
-    sqlx::query(
+    // the transition itself is conditional: two moderators racing on the same sanction cannot
+    // both win (the loser sees a conflict instead of re-applying the update)
+    let from_list: Vec<String> = from.iter().map(|f| f.to_string()).collect();
+    let n = sqlx::query(
         "update musubi.sanctions set status = $2, updated_at = now(),
             revoke_note = case when $2 = 'revoked' then $3 else revoke_note end,
             revoked_at = case when $2 = 'revoked' then now() else revoked_at end
-         where id = $1",
+         where id = $1 and status = any($4)",
     )
     .bind(id)
     .bind(to)
     .bind(note)
+    .bind(&from_list)
     .execute(&s.db)
     .await
-    .map_err(Error::internal)?;
+    .map_err(Error::internal)?
+    .rows_affected();
+    if n == 0 {
+        return Err(Error::Conflict(format!(
+            "sanction {id} changed concurrently, expected one of {from:?}"
+        )));
+    }
     let was_pending = r.status == "pending";
     Ok((r, was_pending))
 }
@@ -574,6 +657,7 @@ pub(crate) async fn expire_sanctions(s: &AppState) -> Result<usize> {
     .await
     .map_err(Error::internal)?;
     let mut accounts: Vec<Uuid> = rows.iter().map(|r| r.1).collect();
+    accounts.sort_unstable();
     accounts.dedup();
     for a in accounts {
         recompute(s, AccountId(a)).await?;
@@ -649,6 +733,9 @@ async fn decide(
 ) -> Result<Json<Value>, ApiError> {
     if !["upheld", "overturned"].contains(&b.outcome.as_str()) {
         return Err(Error::InvalidArgument("outcome must be upheld or overturned".into()).into());
+    }
+    if b.note.chars().count() > MAX_NOTE {
+        return Err(Error::InvalidArgument(format!("note over {MAX_NOTE} chars")).into());
     }
     let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
         "update musubi.sanction_appeals set status = $2, decision_note = $3, decided_by = 'admin', decided_at = now()
@@ -842,7 +929,7 @@ async fn sync(
     let rows: Vec<Row> = sqlx::query_as(&format!(
         "{SELECT} where updated_at > to_timestamp($1) order by updated_at, id limit $2"
     ))
-    .bind(q.since.unwrap_or(0))
+    .bind(cursor(q.since).unwrap_or(0))
     .bind(limit)
     .fetch_all(&s.db)
     .await
@@ -853,4 +940,46 @@ async fn sync(
         "sanctions": rows.into_iter().map(to_json).collect::<Vec<_>>(),
         "next": next, "more": more,
     })))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn schedule_rejects_values_that_used_to_panic() {
+        let now = OffsetDateTime::now_utc();
+        assert!(schedule(now, i64::MAX, None).is_err());
+        assert!(schedule(now, 0, Some(i64::MAX)).is_err());
+        assert!(schedule(now, MAX_SANCTION_SECS, Some(MAX_SANCTION_SECS)).is_ok());
+        assert!(schedule(now, MAX_SANCTION_SECS + 1, None).is_err());
+        assert!(schedule(now, 0, Some(0)).is_err());
+        assert!(schedule(now, 0, Some(-1)).is_err());
+    }
+
+    #[test]
+    fn schedule_keeps_the_old_semantics_in_range() {
+        let now = OffsetDateTime::now_utc();
+        let (s, e) = schedule(now, -30, None).unwrap();
+        assert_eq!(s, now, "negative delay = now");
+        assert_eq!(e, None);
+        let (s, e) = schedule(now, 60, Some(3600)).unwrap();
+        assert_eq!(s, now + time::Duration::seconds(60));
+        assert_eq!(e, Some(s + time::Duration::seconds(3600)));
+    }
+
+    #[test]
+    fn cursors_stay_inside_to_timestamp_range() {
+        assert_eq!(cursor(None), None);
+        assert_eq!(cursor(Some(-5)), Some(0));
+        assert_eq!(cursor(Some(1_700_000_000)), Some(1_700_000_000));
+        assert_eq!(cursor(Some(i64::MAX)), Some(MAX_CURSOR));
+    }
+
+    #[test]
+    fn features_of_maps_actions() {
+        assert_eq!(features_of("mute", &[]), vec!["chat", "voice"]);
+        assert!(features_of("ban", &[]).is_empty());
+        assert_eq!(features_of("custom", &["ugc".to_string()]), vec!["ugc"]);
+    }
 }

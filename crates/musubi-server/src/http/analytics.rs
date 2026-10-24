@@ -147,7 +147,7 @@ async fn ingest_anonymous(
         .get("x-telemetry-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if key.is_empty() || !s.analytics.cfg.telemetry_keys.iter().any(|k| k == key) {
+    if key.is_empty() || !telemetry_key_matches(&s.analytics.cfg.telemetry_keys, key) {
         return Err(Error::Unauthenticated("telemetry key".into()).into());
     }
     let device = b
@@ -161,6 +161,17 @@ async fn ingest_anonymous(
         .ingest(events, None, Some(device), "client")
         .await?;
     Ok(Json(serde_json::to_value(r).map_err(Error::internal)?).into_response())
+}
+
+/// Constant-time membership test for the shared `X-Telemetry-Key` (no early exit on the first
+/// differing byte; the key length is the only thing a timing side channel can learn).
+fn telemetry_key_matches(keys: &[String], presented: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    keys.iter()
+        .fold(subtle::Choice::from(0u8), |acc, k| {
+            acc | k.as_bytes().ct_eq(presented.as_bytes())
+        })
+        .into()
 }
 
 async fn list_schemas(
@@ -469,9 +480,6 @@ async fn event_counts(
 ) -> std::result::Result<Json<Value>, ApiError> {
     Ok(Json(s.analytics.event_counts(q.days).await?))
 }
-
-#[allow(dead_code)]
-fn _unused(_: Result<()>) {}
 
 /// `GET /v1/account/event_properties` — the caller's computed per-event properties.
 async fn my_event_props(
@@ -825,4 +833,20 @@ async fn delete_report(
         return Err(Error::NotFound(format!("report {id}")).into());
     }
     Ok(Json(json!({ "deleted": true })))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::telemetry_key_matches;
+
+    #[test]
+    fn telemetry_key_membership() {
+        let keys = vec!["tk_live_abcdef".to_string(), "tk_test_123456".to_string()];
+        assert!(telemetry_key_matches(&keys, "tk_live_abcdef"));
+        assert!(telemetry_key_matches(&keys, "tk_test_123456"));
+        assert!(!telemetry_key_matches(&keys, "tk_live_abcdeg"));
+        assert!(!telemetry_key_matches(&keys, "tk_live_abcde"));
+        assert!(!telemetry_key_matches(&keys, ""));
+        assert!(!telemetry_key_matches(&[], "tk_live_abcdef"));
+    }
 }

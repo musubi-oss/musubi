@@ -17,6 +17,28 @@ use uuid::Uuid;
 const SCHEMA_TTL: Duration = Duration::from_secs(30);
 const QUEUE_CAP: usize = 50_000;
 const SINK_BATCH: usize = 2_000;
+/// Longest `session_id` / `device_id` / `platform` a client event may carry.
+pub const MAX_ID_LEN: usize = 128;
+/// `country` is an ISO code (alpha-2/alpha-3/numeric), not free text.
+pub const MAX_COUNTRY_LEN: usize = 8;
+/// An `s3` sink that cannot upload keeps rows in memory up to this many bytes, then drops new ones.
+const S3_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Which optional identity field of an event is too long, if any.
+fn oversized_field(e: &Incoming) -> Option<&'static str> {
+    let too_long = |v: &Option<String>, max: usize| v.as_deref().is_some_and(|s| s.len() > max);
+    if too_long(&e.session_id, MAX_ID_LEN) {
+        Some("session_id")
+    } else if too_long(&e.device_id, MAX_ID_LEN) {
+        Some("device_id")
+    } else if too_long(&e.platform, MAX_ID_LEN) {
+        Some("platform")
+    } else if too_long(&e.country, MAX_COUNTRY_LEN) {
+        Some("country")
+    } else {
+        None
+    }
+}
 
 type SchemaCache = Option<(Instant, Arc<HashMap<String, Schema>>)>;
 
@@ -284,6 +306,18 @@ impl Analytics {
         {
             let mut bufs = self.s3_buffers.lock().unwrap_or_else(|e| e.into_inner());
             let b = bufs.entry(sink.name.clone()).or_default();
+            if b.lines.len() >= S3_BUFFER_MAX_BYTES {
+                b.last_error = Some(format!(
+                    "buffer full ({} bytes buffered, {} rows dropped)",
+                    b.lines.len(),
+                    rows.len()
+                ));
+                return Err(Error::ResourceExhausted(format!(
+                    "s3 sink {} buffer full; {} rows dropped",
+                    sink.name,
+                    rows.len()
+                )));
+            }
             for r in rows {
                 b.lines
                     .push_str(&serde_json::to_string(r).map_err(Error::internal)?);
@@ -544,6 +578,11 @@ impl Analytics {
                 self.cfg.max_batch
             )));
         }
+        if device_id.as_deref().is_some_and(|d| d.len() > MAX_ID_LEN) {
+            return Err(Error::InvalidArgument(format!(
+                "device_id must be at most {MAX_ID_LEN} chars"
+            )));
+        }
         let schemas = self.schemas().await?;
         let sampling = self.sampling().await?;
         let now = OffsetDateTime::now_utc();
@@ -558,6 +597,10 @@ impl Analytics {
             }
             if !e.properties.is_null() && !e.properties.is_object() {
                 report.rejected.push(reject("properties must be an object"));
+                continue;
+            }
+            if let Some(f) = oversized_field(&e) {
+                report.rejected.push(reject(&format!("{f} too long")));
                 continue;
             }
             let props = if e.properties.is_null() {
@@ -852,13 +895,15 @@ impl Analytics {
             "last" => ("last", "last_at"),
             _ => ("first", "first_at"),
         };
+        // `col` / `at` are fixed identifiers chosen above; the key is a bound parameter
         let rows: Vec<(Option<String>, i64)> = sqlx::query_as(&format!(
-            "select {col}->>'{group_by}', count(*) from musubi.account_attribution
+            "select {col}->>$3::text, count(*) from musubi.account_attribution
              where $1::timestamptz is null or {at} >= $1
              group by 1 order by 2 desc, 1 limit $2"
         ))
         .bind(since)
         .bind(limit)
+        .bind(group_by)
         .fetch_all(&self.db)
         .await
         .map_err(Error::internal)?;
@@ -1414,5 +1459,53 @@ fn s3_batch_secs(sink: &AnalyticsSink) -> u64 {
         60
     } else {
         sink.batch_secs
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    fn ev(f: impl FnOnce(&mut Incoming)) -> Incoming {
+        let mut e = Incoming {
+            name: "app_open".into(),
+            at: None,
+            properties: Value::Null,
+            session_id: None,
+            device_id: None,
+            platform: None,
+            country: None,
+        };
+        f(&mut e);
+        e
+    }
+
+    #[test]
+    fn identity_fields_are_capped() {
+        assert_eq!(oversized_field(&ev(|_| {})), None);
+        assert_eq!(
+            oversized_field(&ev(|e| e.session_id = Some("s".repeat(MAX_ID_LEN)))),
+            None
+        );
+        assert_eq!(
+            oversized_field(&ev(|e| e.session_id = Some("s".repeat(MAX_ID_LEN + 1)))),
+            Some("session_id")
+        );
+        assert_eq!(
+            oversized_field(&ev(|e| e.device_id = Some("d".repeat(MAX_ID_LEN + 1)))),
+            Some("device_id")
+        );
+        assert_eq!(
+            oversized_field(&ev(|e| e.platform = Some("p".repeat(MAX_ID_LEN + 1)))),
+            Some("platform")
+        );
+        assert_eq!(
+            oversized_field(&ev(|e| e.country = Some("DEU".into()))),
+            None
+        );
+        assert_eq!(
+            oversized_field(&ev(|e| e.country = Some("Germany, Federal Republic".into()))),
+            Some("country")
+        );
     }
 }

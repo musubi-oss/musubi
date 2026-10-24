@@ -67,6 +67,8 @@ struct BanMsg {
 #[derive(Default)]
 pub struct Bans {
     ids: DashMap<Uuid, BanInfo>,
+    /// Set by [`Bans::load`]; lets the bus listener resync after it lagged.
+    db: std::sync::OnceLock<PgPool>,
 }
 
 impl Bans {
@@ -150,6 +152,7 @@ impl Bans {
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
+        let _ = self.db.set(db.clone());
         for (id, reason, message, until, shadow, features) in &rows {
             self.ids.insert(
                 *id,
@@ -162,7 +165,25 @@ impl Bans {
                 },
             );
         }
+        // a (re)load is authoritative: bans lifted while we were not listening go away too
+        self.ids.retain(|id, _| rows.iter().any(|r| r.0 == *id));
         Ok(rows.len())
+    }
+
+    /// The bus dropped messages for us: the DB is the truth, reload everything from it.
+    async fn resync(&self, what: &str) {
+        let Some(db) = self.db.get() else {
+            tracing::warn!(what, "bus lagged before the first load; cache may be stale");
+            return;
+        };
+        match self.load(db).await {
+            Ok(n) => tracing::warn!(
+                what,
+                entries = n,
+                "bus lagged; cache reloaded from the database"
+            ),
+            Err(e) => tracing::error!(what, error = %e, "bus lagged and the reload failed"),
+        }
     }
 
     pub fn start(self: &Arc<Self>, cluster: &Arc<musubi_cluster::Cluster>) {
@@ -178,7 +199,9 @@ impl Bans {
                         }
                     }
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        me.resync("account bans").await;
+                    }
                     Err(_) => break,
                 }
             }
@@ -270,7 +293,8 @@ impl IpNet {
             Some((a, p)) => (a, Some(p)),
             None => (s, None),
         };
-        let addr: std::net::IpAddr = a.trim().parse().ok()?;
+        // `::ffff:a.b.c.d` is the same host as `a.b.c.d`: compare in one address family
+        let addr: std::net::IpAddr = a.trim().parse::<std::net::IpAddr>().ok()?.to_canonical();
         let max = if addr.is_ipv4() { 32 } else { 128 };
         let prefix = match p {
             Some(p) => p.trim().parse::<u8>().ok().filter(|p| *p <= max)?,
@@ -280,7 +304,7 @@ impl IpNet {
     }
 
     pub fn contains(&self, ip: std::net::IpAddr) -> bool {
-        match (self.addr, ip) {
+        match (self.addr, ip.to_canonical()) {
             (std::net::IpAddr::V4(n), std::net::IpAddr::V4(a)) => {
                 let mask = if self.prefix == 0 {
                     0
@@ -315,6 +339,8 @@ struct RuleMsg {
 pub struct BanRules {
     devices: DashMap<String, Rule>,
     nets: parking_lot::RwLock<Vec<(IpNet, Rule)>>,
+    /// Set by [`BanRules::load`]; lets the bus listener resync after it lagged.
+    db: std::sync::OnceLock<PgPool>,
 }
 
 impl BanRules {
@@ -405,6 +431,7 @@ impl BanRules {
         .fetch_all(db)
         .await
         .map_err(Error::internal)?;
+        let _ = self.db.set(db.clone());
         for (id, kind, value, reason, message, until) in rows.iter().cloned() {
             self.apply(
                 id,
@@ -418,7 +445,28 @@ impl BanRules {
                 }),
             );
         }
+        // a (re)load is authoritative: rules deleted while we were not listening go away too
+        self.devices
+            .retain(|_, r| rows.iter().any(|row| row.0 == r.id));
+        self.nets
+            .write()
+            .retain(|(_, r)| rows.iter().any(|row| row.0 == r.id));
         Ok(rows.len())
+    }
+
+    /// The bus dropped messages for us: the DB is the truth, reload everything from it.
+    async fn resync(&self) {
+        let Some(db) = self.db.get() else {
+            tracing::warn!("ban rule bus lagged before the first load; cache may be stale");
+            return;
+        };
+        match self.load(db).await {
+            Ok(n) => tracing::warn!(
+                rules = n,
+                "ban rule bus lagged; cache reloaded from the database"
+            ),
+            Err(e) => tracing::error!(error = %e, "ban rule bus lagged and the reload failed"),
+        }
     }
 
     pub fn start(self: &Arc<Self>, cluster: &Arc<musubi_cluster::Cluster>) {
@@ -434,7 +482,9 @@ impl BanRules {
                         }
                     }
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        me.resync().await;
+                    }
                     Err(_) => break,
                 }
             }
@@ -546,5 +596,45 @@ mod rule_tests {
         r.apply(id, None);
         assert!(r.check_ip("192.168.0.77").is_ok());
         assert_eq!(r.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_mapped_ipv6_does_not_dodge_a_v4_ban() {
+        let net = IpNet::parse("203.0.113.0/24").unwrap();
+        assert!(net.contains("203.0.113.9".parse().unwrap()));
+        assert!(net.contains("::ffff:203.0.113.9".parse().unwrap()));
+        assert!(!net.contains("::ffff:203.0.114.9".parse().unwrap()));
+        let mapped = IpNet::parse("::ffff:203.0.113.7").unwrap();
+        assert_eq!(mapped, IpNet::parse("203.0.113.7").unwrap());
+        assert!(mapped.contains("203.0.113.7".parse().unwrap()));
+        assert!(
+            IpNet::parse("::ffff:203.0.113.0/120").is_none(),
+            "v4 prefix after canonicalization"
+        );
+    }
+
+    #[test]
+    fn rules_reject_mapped_addresses_as_plain_v4() {
+        let rules = BanRules::default();
+        rules.apply(
+            Uuid::now_v7(),
+            Some(Rule {
+                id: Uuid::now_v7(),
+                kind: "ip".into(),
+                value: "198.51.100.4".into(),
+                reason: None,
+                message: None,
+                until: None,
+            }),
+        );
+        assert!(rules.check_ip("198.51.100.4").is_err());
+        assert!(rules.check_ip("::ffff:198.51.100.4").is_err());
+        assert!(rules.check_ip("198.51.100.5").is_ok());
+        assert!(rules.check_ip("not-an-ip").is_ok());
     }
 }

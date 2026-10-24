@@ -118,9 +118,75 @@ fn position_of(data: &[u8], field: &str) -> Option<Vec<f64>> {
     ((2..=3).contains(&nums.len()) && nums.iter().all(|n| n.is_finite())).then_some(nums)
 }
 
+/// Longest serialized `details` a flag may carry (they are stored verbatim per signal).
+pub const MAX_DETAILS_BYTES: usize = 16 * 1024;
+pub const MAX_MATCH_ID_LEN: usize = 128;
+/// Above this many tracked sessions `observe_input` evicts guards idle for `GUARD_IDLE`
+/// (realtime does not always call [`AntiCheat::forget_session`]).
+const MAX_TRACKED_SESSIONS: usize = 65_536;
+const GUARD_IDLE: Duration = Duration::from_secs(60);
+
 pub struct AntiCheat {
     state: OnceLock<AppState>,
     inputs: DashMap<Uuid, InputGuard>,
+    http: reqwest::Client,
+}
+
+/// What a vendor answer means for the player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Verified,
+    /// The vendor looked at the ticket and said no: counts as a signal.
+    Rejected,
+    /// The vendor (or our credentials for it) is broken: no signal, the caller gets 503.
+    Unavailable,
+}
+
+/// `2xx` + `ok`/`valid: true` verifies; `2xx` without the flag or any other `4xx` rejects;
+/// `401`/`407` (our vendor key) and `5xx` (their outage) are *not* evidence against the player.
+pub(crate) fn vendor_verdict(status: u16, body: &Value) -> Verdict {
+    let flag = body["ok"].as_bool().or(body["valid"].as_bool());
+    match status {
+        200..=299 => {
+            if flag == Some(true) {
+                Verdict::Verified
+            } else {
+                Verdict::Rejected
+            }
+        }
+        401 | 407 => Verdict::Unavailable,
+        400..=499 => Verdict::Rejected,
+        _ => Verdict::Unavailable,
+    }
+}
+
+/// Bounds on a flag that hold for every source (HTTP, modules, realtime).
+pub(crate) fn validate_flag(
+    kind: &str,
+    severity: i32,
+    match_id: Option<&str>,
+    details: &Value,
+) -> Result<()> {
+    if kind.is_empty() || kind.len() > 64 {
+        return Err(Error::InvalidArgument("kind must be 1..=64 chars".into()));
+    }
+    if !(1..=100).contains(&severity) {
+        return Err(Error::InvalidArgument("severity must be 1..=100".into()));
+    }
+    if match_id.is_some_and(|m| m.is_empty() || m.len() > MAX_MATCH_ID_LEN) {
+        return Err(Error::InvalidArgument(format!(
+            "match_id must be 1..={MAX_MATCH_ID_LEN} chars"
+        )));
+    }
+    let bytes = serde_json::to_vec(details)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    if bytes > MAX_DETAILS_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "details must serialize to at most {MAX_DETAILS_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for AntiCheat {
@@ -134,6 +200,10 @@ impl AntiCheat {
         Self {
             state: OnceLock::new(),
             inputs: DashMap::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -158,8 +228,20 @@ impl AntiCheat {
         if !cfg.enabled {
             return None;
         }
+        let now = Instant::now();
+        if self.inputs.len() > MAX_TRACKED_SESSIONS {
+            self.evict_stale(now);
+        }
         let mut g = self.inputs.entry(session).or_default();
-        g.observe(cfg, Instant::now(), data)
+        g.observe(cfg, now, data)
+    }
+
+    /// Drop guards that saw no input for [`GUARD_IDLE`].
+    fn evict_stale(&self, now: Instant) {
+        self.inputs.retain(|_, g| {
+            g.started
+                .is_some_and(|t| now.duration_since(t) < GUARD_IDLE)
+        });
     }
 
     pub fn forget_session(&self, session: Uuid) {
@@ -181,12 +263,7 @@ impl AntiCheat {
     ) -> Result<Value> {
         let s = self.state()?;
         let kind = kind.trim();
-        if kind.is_empty() || kind.len() > 64 {
-            return Err(Error::InvalidArgument("kind must be 1..=64 chars".into()));
-        }
-        if !(1..=100).contains(&severity) {
-            return Err(Error::InvalidArgument("severity must be 1..=100".into()));
-        }
+        validate_flag(kind, severity, match_id, &details)?;
         let cfg = &s.cfg.anticheat;
         let id = Uuid::now_v7();
         sqlx::query(
@@ -253,27 +330,28 @@ impl AntiCheat {
                 "ticket must be 1..=8192 chars".into(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(cfg.vendor_timeout_secs.max(1)))
-            .build()
-            .map_err(Error::internal)?;
-        let mut req = client
+        let mut req = self
+            .http
             .post(url)
+            .timeout(Duration::from_secs(cfg.vendor_timeout_secs.max(1)))
             .json(&json!({ "provider": provider, "account_id": account, "ticket": ticket }));
         if !key.is_empty() {
             req = req.bearer_auth(key);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::Unavailable(format!("{provider}: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            tracing::warn!(provider, error = %e, "anti-cheat vendor request failed");
+            Error::Unavailable(format!("{provider} vendor unavailable"))
+        })?;
         let status = resp.status().as_u16();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
-        let ok = (200..300).contains(&status)
-            && (body["ok"]
-                .as_bool()
-                .or(body["valid"].as_bool())
-                .unwrap_or(false));
+        let verdict = vendor_verdict(status, &body);
+        if verdict == Verdict::Unavailable {
+            tracing::warn!(provider, status, "anti-cheat vendor returned no verdict");
+            return Err(Error::Unavailable(format!(
+                "{provider} vendor unavailable (status {status})"
+            )));
+        }
+        let ok = verdict == Verdict::Verified;
         let mut out = json!({ "provider": provider, "verified": ok, "response": body });
         if !ok {
             let f = self
@@ -442,5 +520,86 @@ mod tests {
             g.observe(&cfg, t0, obj(5.0).as_bytes()).map(|v| v.kind),
             Some("impossible_move")
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn vendor_outage_is_not_a_rejection() {
+        assert_eq!(
+            vendor_verdict(200, &json!({ "ok": true })),
+            Verdict::Verified
+        );
+        assert_eq!(
+            vendor_verdict(200, &json!({ "valid": true })),
+            Verdict::Verified
+        );
+        assert_eq!(
+            vendor_verdict(200, &json!({ "ok": false })),
+            Verdict::Rejected
+        );
+        assert_eq!(vendor_verdict(200, &Value::Null), Verdict::Rejected);
+        assert_eq!(
+            vendor_verdict(403, &json!({ "valid": false })),
+            Verdict::Rejected
+        );
+        assert_eq!(vendor_verdict(400, &Value::Null), Verdict::Rejected);
+        assert_eq!(vendor_verdict(401, &Value::Null), Verdict::Unavailable);
+        assert_eq!(vendor_verdict(500, &Value::Null), Verdict::Unavailable);
+        assert_eq!(
+            vendor_verdict(503, &json!({ "ok": false })),
+            Verdict::Unavailable
+        );
+        assert_eq!(vendor_verdict(502, &json!("<html>")), Verdict::Unavailable);
+    }
+
+    #[test]
+    fn flag_arguments_are_bounded() {
+        assert!(validate_flag("speedhack", 10, Some("m-1"), &json!({})).is_ok());
+        assert!(validate_flag("", 10, None, &json!({})).is_err());
+        assert!(validate_flag(&"k".repeat(65), 10, None, &json!({})).is_err());
+        assert!(validate_flag("k", 0, None, &json!({})).is_err());
+        assert!(validate_flag("k", 101, None, &json!({})).is_err());
+        assert!(validate_flag("k", 1, Some(""), &json!({})).is_err());
+        assert!(
+            validate_flag("k", 1, Some(&"m".repeat(MAX_MATCH_ID_LEN + 1)), &json!({})).is_err()
+        );
+        let big = json!({ "blob": "x".repeat(MAX_DETAILS_BYTES) });
+        assert!(validate_flag("k", 1, None, &big).is_err());
+        let fits = json!({ "blob": "x".repeat(MAX_DETAILS_BYTES - 64) });
+        assert!(validate_flag("k", 1, None, &fits).is_ok());
+    }
+
+    #[test]
+    fn idle_guards_are_evicted() {
+        let ac = AntiCheat::new();
+        let now = Instant::now();
+        let fresh = Uuid::now_v7();
+        let idle = Uuid::now_v7();
+        let never = Uuid::now_v7();
+        ac.inputs.insert(
+            fresh,
+            InputGuard {
+                started: Some(now),
+                ..Default::default()
+            },
+        );
+        ac.inputs.insert(
+            idle,
+            InputGuard {
+                started: Some(now - GUARD_IDLE - Duration::from_secs(1)),
+                ..Default::default()
+            },
+        );
+        ac.inputs.insert(never, InputGuard::default());
+        ac.evict_stale(now);
+        assert!(ac.inputs.contains_key(&fresh));
+        assert!(!ac.inputs.contains_key(&idle));
+        assert!(!ac.inputs.contains_key(&never));
+        ac.forget_session(fresh);
+        assert!(ac.inputs.is_empty());
     }
 }

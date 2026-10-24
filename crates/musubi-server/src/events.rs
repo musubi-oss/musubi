@@ -111,6 +111,8 @@ impl Events {
             db,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                // a signed POST must land on the configured endpoint, not wherever it redirects
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             liveops: Default::default(),
@@ -231,7 +233,7 @@ impl Events {
             }
         }
         if let (Some(l), Some(a)) = (self.liveops.get(), account) {
-            l.track(&a.to_string(), kind, payload.clone());
+            l.track(&a.to_string(), kind, redacted(kind, &payload));
         }
         if let Some(m) = self.mailer.get() {
             if let Some(mail) = mail_for(m, kind, &payload) {
@@ -307,7 +309,7 @@ impl Events {
         .map_err(Error::internal)?;
         tx.commit().await.map_err(Error::internal)?;
         if let Some(a) = self.analytics.get() {
-            a.push_domain(kind, account, payload);
+            a.push_domain(kind, account, redacted(kind, &payload));
         }
         Ok(id)
     }
@@ -434,6 +436,102 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/server/webhooks/dispatch", post(dispatch_now))
 }
 
+const MAX_WEBHOOK_URL: usize = 2048;
+const MAX_WEBHOOK_NAME: usize = 128;
+const MAX_WEBHOOK_KINDS: usize = 64;
+const MAX_WEBHOOK_SECRET: usize = 1024;
+
+/// Hosts that must never receive a webhook even though they parse as public names.
+const BLOCKED_HOSTS: &[&str] = &["metadata.google.internal", "metadata"];
+
+/// An absolute `http(s)` URL with a host, no credentials and no link-local / metadata / unroutable
+/// literal target. Loopback and RFC 1918 stay allowed: operators (the only principals that can
+/// register hooks) commonly point them at in-cluster services.
+pub(crate) fn validate_webhook_url(url: &str) -> Result<()> {
+    if url.is_empty() || url.len() > MAX_WEBHOOK_URL {
+        return Err(Error::InvalidArgument(format!(
+            "url must be 1..={MAX_WEBHOOK_URL} chars"
+        )));
+    }
+    let u = reqwest::Url::parse(url)
+        .map_err(|_| Error::InvalidArgument("url must be an absolute http(s) URL".into()))?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err(Error::InvalidArgument("url must be http(s)".into()));
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(Error::InvalidArgument(
+            "url must not carry credentials".into(),
+        ));
+    }
+    let Some(host) = u.host_str().filter(|h| !h.is_empty()) else {
+        return Err(Error::InvalidArgument("url must have a host".into()));
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let ip = bare
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_canonical());
+    if ip.is_none() {
+        let d = host.trim_end_matches('.').to_ascii_lowercase();
+        if BLOCKED_HOSTS.contains(&d.as_str()) {
+            return Err(Error::InvalidArgument("url host is not allowed".into()));
+        }
+    }
+    if let Some(ip) = ip {
+        let bad = match ip {
+            std::net::IpAddr::V4(a) => {
+                a.is_unspecified()
+                    || a.is_link_local()
+                    || a.is_broadcast()
+                    || a.is_multicast()
+                    || a.is_documentation()
+            }
+            std::net::IpAddr::V6(a) => {
+                a.is_unspecified()
+                    || a.is_multicast()
+                    || (a.segments()[0] & 0xffc0) == 0xfe80
+                    || a.segments()[0] == 0x2001 && a.segments()[1] == 0x0db8
+            }
+        };
+        if bad {
+            return Err(Error::InvalidArgument(
+                "url host is not a routable address".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_webhook_kinds(kinds: &[String]) -> Result<()> {
+    if kinds.len() > MAX_WEBHOOK_KINDS {
+        return Err(Error::InvalidArgument(format!(
+            "at most {MAX_WEBHOOK_KINDS} kinds"
+        )));
+    }
+    if kinds
+        .iter()
+        .any(|k| k.is_empty() || k.len() > MAX_WEBHOOK_NAME)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "each kind must be 1..={MAX_WEBHOOK_NAME} chars"
+        )));
+    }
+    Ok(())
+}
+
+/// The copy of a payload that goes to third-party sinks (LiveOps, analytics): one-time secrets
+/// that `account.*` events carry for the mailer / `GET /v1/server/events` are dropped.
+fn redacted(kind: &str, payload: &Value) -> Value {
+    let mut v = payload.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("token");
+        if kind.starts_with("account.") {
+            o.remove("code");
+        }
+    }
+    v
+}
+
 #[derive(Deserialize)]
 struct NewWebhook {
     name: String,
@@ -448,11 +546,21 @@ async fn create_webhook(
     State(s): State<AppState>,
     Json(b): Json<NewWebhook>,
 ) -> Result<Json<Value>, ApiError> {
-    if !(b.url.starts_with("http://") || b.url.starts_with("https://")) {
-        return Err(Error::InvalidArgument("url must be http(s)".into()).into());
+    validate_webhook_url(&b.url)?;
+    if b.name.is_empty() || b.name.len() > MAX_WEBHOOK_NAME {
+        return Err(
+            Error::InvalidArgument(format!("name must be 1..={MAX_WEBHOOK_NAME} chars")).into(),
+        );
     }
+    validate_webhook_kinds(&b.kinds)?;
     if b.secret.len() < 16 {
         return Err(Error::InvalidArgument("secret must be at least 16 chars".into()).into());
+    }
+    if b.secret.len() > MAX_WEBHOOK_SECRET {
+        return Err(Error::InvalidArgument(format!(
+            "secret must be at most {MAX_WEBHOOK_SECRET} chars"
+        ))
+        .into());
     }
     let id = Uuid::now_v7();
     sqlx::query(
@@ -482,6 +590,12 @@ async fn update_webhook(
     Path(id): Path<Uuid>,
     Json(b): Json<PatchWebhook>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(u) = &b.url {
+        validate_webhook_url(u)?;
+    }
+    if let Some(k) = &b.kinds {
+        validate_webhook_kinds(k)?;
+    }
     let r = sqlx::query(
         "update musubi.webhooks set enabled = coalesce($2, enabled), url = coalesce($3, url), kinds = coalesce($4, kinds) where id = $1",
     )
@@ -674,4 +788,80 @@ pub fn start_cluster_events(state: crate::app::AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn webhook_url_accepts_public_and_cluster_targets() {
+        for u in [
+            "https://hooks.example.com/musubi",
+            "http://127.0.0.1:8080/ok",
+            "http://10.0.0.5/hook",
+            "http://[::1]:9/x",
+            "https://example.com./trailing-dot",
+        ] {
+            assert!(validate_webhook_url(u).is_ok(), "{u}");
+        }
+    }
+
+    #[test]
+    fn webhook_url_rejects_unroutable_or_dangerous_targets() {
+        for u in [
+            "",
+            "ftp://nope",
+            "javascript:alert(1)",
+            "http://",
+            "http://user:pw@example.com/x",
+            "http://user@example.com/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/x",
+            "http://[::ffff:169.254.169.254]/x",
+            "http://0.0.0.0/x",
+            "http://224.0.0.1/x",
+            "http://255.255.255.255/x",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://METADATA/",
+            "not a url",
+        ] {
+            assert!(validate_webhook_url(u).is_err(), "{u}");
+        }
+        let long = format!("https://example.com/{}", "a".repeat(MAX_WEBHOOK_URL));
+        assert!(validate_webhook_url(&long).is_err());
+    }
+
+    #[test]
+    fn webhook_kinds_are_capped() {
+        assert!(validate_webhook_kinds(&[]).is_ok());
+        assert!(validate_webhook_kinds(&["account.*".into()]).is_ok());
+        assert!(validate_webhook_kinds(&[String::new()]).is_err());
+        assert!(validate_webhook_kinds(&["k".repeat(MAX_WEBHOOK_NAME + 1)]).is_err());
+        let many: Vec<String> = (0..=MAX_WEBHOOK_KINDS).map(|i| format!("k{i}")).collect();
+        assert!(validate_webhook_kinds(&many).is_err());
+    }
+
+    #[test]
+    fn third_party_copies_drop_one_time_secrets() {
+        let p = json!({ "account_id": "a", "email": "e@x", "token": "secret", "code": "123456" });
+        let r = redacted("account.mfa_code", &p);
+        assert!(r.get("token").is_none());
+        assert!(r.get("code").is_none());
+        assert_eq!(r["email"], "e@x");
+        let r = redacted(
+            "ban_reason.updated",
+            &json!({ "code": "toxic", "token": "t" }),
+        );
+        assert_eq!(r["code"], "toxic");
+        assert!(r.get("token").is_none());
+        assert_eq!(redacted("x", &json!("scalar")), json!("scalar"));
+    }
+
+    #[test]
+    fn signature_is_stable() {
+        let sig = sign("s3cret", 1_700_000_000, "{}");
+        assert!(sig.starts_with("t=1700000000,v1="));
+        assert_eq!(sig.len(), "t=1700000000,v1=".len() + 64);
+    }
 }

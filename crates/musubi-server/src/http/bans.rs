@@ -53,6 +53,38 @@ fn ts(t: Option<OffsetDateTime>) -> Value {
     json!(t.map(|t| t.unix_timestamp()))
 }
 
+/// Longest ban: 100 years. Keeps `now + until_secs` inside `i64` / `timestamptz`.
+pub(crate) const MAX_BAN_SECS: i64 = 100 * 365 * 24 * 3600;
+const MAX_RULE_REASON: usize = 256;
+const MAX_RULE_MESSAGE: usize = 512;
+
+/// Absolute expiry (unix seconds) for an optional relative `until_secs`.
+pub(crate) fn until_from(until_secs: Option<i64>) -> Result<Option<i64>> {
+    match until_secs {
+        None => Ok(None),
+        Some(u) if (1..=MAX_BAN_SECS).contains(&u) => {
+            Ok(Some(OffsetDateTime::now_utc().unix_timestamp() + u))
+        }
+        Some(_) => Err(Error::InvalidArgument(format!(
+            "until_secs must be 1..={MAX_BAN_SECS}"
+        ))),
+    }
+}
+
+fn validate_rule_text(reason: Option<&str>, message: Option<&str>) -> Result<()> {
+    if reason.is_some_and(|r| r.chars().count() > MAX_RULE_REASON) {
+        return Err(Error::InvalidArgument(format!(
+            "reason over {MAX_RULE_REASON} chars"
+        )));
+    }
+    if message.is_some_and(|m| m.chars().count() > MAX_RULE_MESSAGE) {
+        return Err(Error::InvalidArgument(format!(
+            "message over {MAX_RULE_MESSAGE} chars"
+        )));
+    }
+    Ok(())
+}
+
 /// `GET /v1/admin/bans` — every active account ban, newest first (the Steam-style "banned feed").
 async fn list_bans(
     State(s): State<AppState>,
@@ -214,8 +246,10 @@ pub(crate) async fn add_rule(
     until: Option<i64>,
     actor: &str,
 ) -> Result<Rule> {
+    let value = value.trim();
     BanRules::validate(kind, value)?;
-    let value = value.trim().to_string();
+    validate_rule_text(reason, message)?;
+    let value = value.to_string();
     let id: Uuid = sqlx::query_scalar(
         "insert into musubi.ban_rules (id, kind, value, reason, message, until, actor)
          values ($1, $2, $3, $4, $5, to_timestamp($6), $7)
@@ -260,12 +294,7 @@ async fn create_rule(
     ServerKey: ServerKey,
     Json(b): Json<RuleBody>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    if b.until_secs.is_some_and(|u| u <= 0) {
-        return Err(Error::InvalidArgument("until_secs must be positive".into()).into());
-    }
-    let until = b
-        .until_secs
-        .map(|u| OffsetDateTime::now_utc().unix_timestamp() + u);
+    let until = until_from(b.until_secs)?;
     let r = add_rule(
         &s,
         &b.kind,
@@ -589,12 +618,7 @@ async fn ban_devices(
     body: Option<Json<BanDevicesBody>>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     let b = body.map(|Json(b)| b).unwrap_or_default();
-    if b.until_secs.is_some_and(|u| u <= 0) {
-        return Err(Error::InvalidArgument("until_secs must be positive".into()).into());
-    }
-    let until = b
-        .until_secs
-        .map(|u| OffsetDateTime::now_utc().unix_timestamp() + u);
+    let until = until_from(b.until_secs)?;
     let (d, i) = ban_registry(
         &s,
         id,
@@ -618,4 +642,33 @@ async fn security_events(
     Query(q): Query<crate::security::TimelineQ>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     Ok(Json(crate::security::timeline(&s.db, id, &q).await?))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn until_secs_is_positive_and_bounded() {
+        assert_eq!(until_from(None).unwrap(), None);
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let u = until_from(Some(60)).unwrap().unwrap();
+        assert!((now + 59..=now + 61).contains(&u));
+        assert!(until_from(Some(0)).is_err());
+        assert!(until_from(Some(-5)).is_err());
+        assert!(until_from(Some(MAX_BAN_SECS)).is_ok());
+        assert!(until_from(Some(MAX_BAN_SECS + 1)).is_err());
+        assert!(
+            until_from(Some(i64::MAX)).is_err(),
+            "would overflow now + u"
+        );
+    }
+
+    #[test]
+    fn rule_texts_are_capped() {
+        assert!(validate_rule_text(None, None).is_ok());
+        assert!(validate_rule_text(Some("cheating"), Some("bye")).is_ok());
+        assert!(validate_rule_text(Some(&"r".repeat(MAX_RULE_REASON + 1)), None).is_err());
+        assert!(validate_rule_text(None, Some(&"m".repeat(MAX_RULE_MESSAGE + 1))).is_err());
+    }
 }
