@@ -15,6 +15,7 @@ import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppSectionIndexRouteImport } from './routes/_app/$section/index'
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
+import { Route as AppPlayersAccountsIdRouteImport } from './routes/_app/players/accounts/$id'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -45,12 +46,18 @@ const AppSectionPageIdRoute = AppSectionPageIdRouteImport.update({
   path: '/$section/$page/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppPlayersAccountsIdRoute = AppPlayersAccountsIdRouteImport.update({
+  id: '/players/accounts/$id',
+  path: '/players/accounts/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/login': typeof LoginRoute
   '/$section/': typeof AppSectionIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/$section/$page/': typeof AppSectionPageIndexRoute
 }
 export interface FileRoutesByTo {
@@ -58,6 +65,7 @@ export interface FileRoutesByTo {
   '/': typeof AppIndexRoute
   '/$section': typeof AppSectionIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/$section/$page': typeof AppSectionPageIndexRoute
 }
 export interface FileRoutesById {
@@ -67,14 +75,26 @@ export interface FileRoutesById {
   '/_app/': typeof AppIndexRoute
   '/_app/$section/': typeof AppSectionIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/_app/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/_app/$section/$page/': typeof AppSectionPageIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/login' | '/$section/' | '/$section/$page/$id' | '/$section/$page/'
+    | '/'
+    | '/login'
+    | '/$section/'
+    | '/$section/$page/$id'
+    | '/players/accounts/$id'
+    | '/$section/$page/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/login' | '/' | '/$section' | '/$section/$page/$id' | '/$section/$page'
+  to:
+    | '/login'
+    | '/'
+    | '/$section'
+    | '/$section/$page/$id'
+    | '/players/accounts/$id'
+    | '/$section/$page'
   id:
     | '__root__'
     | '/_app'
@@ -82,6 +102,7 @@ export interface FileRouteTypes {
     | '/_app/'
     | '/_app/$section/'
     | '/_app/$section/$page/$id'
+    | '/_app/players/accounts/$id'
     | '/_app/$section/$page/'
   fileRoutesById: FileRoutesById
 }
@@ -134,6 +155,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSectionPageIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/players/accounts/$id': {
+      id: '/_app/players/accounts/$id'
+      path: '/players/accounts/$id'
+      fullPath: '/players/accounts/$id'
+      preLoaderRoute: typeof AppPlayersAccountsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
   }
 }
 
@@ -141,6 +169,7 @@ interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
   AppSectionIndexRoute: typeof AppSectionIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
+  AppPlayersAccountsIdRoute: typeof AppPlayersAccountsIdRoute
   AppSectionPageIndexRoute: typeof AppSectionPageIndexRoute
 }
 
@@ -148,6 +177,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
   AppSectionIndexRoute: AppSectionIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
+  AppPlayersAccountsIdRoute: AppPlayersAccountsIdRoute,
   AppSectionPageIndexRoute: AppSectionPageIndexRoute,
 }
 

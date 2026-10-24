@@ -11,3 +11,10 @@ export function uptime(u?: number | null): string {
   if (u == null) return '—'
   return u < 3600 ? `${Math.round(u / 60)} min` : u < 86400 ? `${(u / 3600).toFixed(1)} h` : `${(u / 86400).toFixed(1)} d`
 }
+
+/** Timestamp (ISO string or unix secs/ms) → `YYYY-MM-DD HH:MM:SS`, `—` when empty. */
+export function ts(v: unknown): string {
+  if (v === null || v === undefined || v === '') return '—'
+  const d = typeof v === 'number' ? new Date(v * (v < 1e12 ? 1000 : 1)) : new Date(String(v))
+  return isNaN(+d) ? String(v) : d.toISOString().replace('T', ' ').slice(0, 19)
+}
