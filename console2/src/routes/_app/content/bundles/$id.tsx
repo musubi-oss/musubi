@@ -53,7 +53,7 @@ function Version() {
     <div className="space-y-4">
       <Crumbs items={[{ title: 'Content', to: '/content' }, { title: 'Versions', to: '/content/bundles' }, { title: `v${id}` }]} />
       <div className="flex flex-wrap items-start gap-3">
-        <div className="min-w-0 flex-1"><h1 className="text-xl font-semibold">Content version {id}{i === 0 && <Badge className="ml-2 align-middle">current</Badge>}</h1><p className="mt-1 text-sm text-muted-foreground">{v.data ? <>{ts(v.data.created_at)}{v.data.note ? ` · ${v.data.note}` : ''} · {names.length} tables, {total} rows{prevId != null ? ` · compared with v${prevId}` : ' · first version, nothing to compare'}</> : 'Loading…'}</p></div>
+        <div className="min-w-0 flex-1"><h1 className="text-xl font-semibold">Content version {id}{i === 0 && <Badge className="ml-2 align-middle">current</Badge>}</h1><p className="mt-1 break-words text-sm text-muted-foreground">{v.data ? <>{ts(v.data.created_at)}{v.data.note ? ` · ${v.data.note}` : ''} · {names.length} tables, {total} rows{prevId != null ? ` · compared with v${prevId}` : ' · first version, nothing to compare'}</> : 'Loading…'}</p></div>
         {i > 0 && <Button size="sm" variant="outline" disabled={pending} onClick={() => confirmThen(`Publish v${id} again as the newest version? Clients will receive this bundle on next content check.`, () => run(() => raw('POST', `/v1/admin/content/versions/${encodeURIComponent(id)}/rollback`), 'Rolled back — new version created'))}>Roll back to this</Button>}
       </div>
       {v.isError && <Alert variant="destructive"><AlertDescription>{String(v.error)}</AlertDescription></Alert>}

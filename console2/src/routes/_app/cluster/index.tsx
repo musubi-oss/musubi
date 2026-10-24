@@ -109,8 +109,8 @@ function ClusterOverview() {
         <Stat k="Nodes alive" v={alive} bad={alive < nodes.length} sub={`of ${nodes.length} · ${new Set(nodes.map((n) => n.region)).size} regions`} to="/cluster/nodes" />
         <Stat k="Raft directory" v={raft.enabled ? leaderName : 'off'} sub={raft.enabled ? `${raft.is_leader ? 'this node leads' : 'leader'} · ${voters.length} voters` : 'single node / no bus'} />
         <Stat k="Bus out / in" v={fmtN(busTx.msgs)} sub={`msg/s · ${mb(busTx.bytes)}/s out · ${fmtN(busRx.msgs)} msg/s in`} />
-        <Stat k="Realtime sessions" v={fmtN(sessions)} sub="on this node" to="/players/sessions" />
-        <Stat k="Worlds / matches" v={worlds.length} sub={`${listOf(worldsQ.data, 'local').length} homed here · ${matches.length} matches, ${String(matchesQ.data?.local ?? 0)} here`} to="/cluster/worlds" />
+        <Stat k="Realtime sessions" v={fmtN(sessions)} sub="on this node" to="/social/sessions" />
+        <Stat k="Worlds / matches" v={worlds.length} sub={`${listOf(worldsQ.data, 'local').length} homed here · ${matches.length} matches, ${String(matchesQ.data?.local ?? 0)} here`} to="/world/worlds" />
       </div>
 
       <Card><CardHeader className="pb-2"><CardTitle className="text-base">Nodes <span className="font-normal text-muted-foreground">({nodes.length})</span></CardTitle></CardHeader><CardContent>
