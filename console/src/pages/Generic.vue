@@ -10,10 +10,8 @@ import Drawer from '../components/Drawer.vue'
 import JsonView from '../components/JsonView.vue'
 import Kv from '../components/Kv.vue'
 import { toast } from '../stores/toast'
-import { about } from '../about'
 const props = defineProps<{ res: Res }>()
 const router = useRouter(); const route = useRoute()
-const intro = computed(() => about[`${route.path.split('/')[1]}/${props.res.id}`] ?? '')
 const pending = ref<{ act: Act; row: any; text: string } | null>(null)
 const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const off = ref(''); const busy = ref(false)
 const q = ref(String(route.query.q ?? '')); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
@@ -102,7 +100,6 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
 <template>
   <div class="card">
     <h2>{{ res.title }} <small v-if="isList">({{ shown.length !== rows.length ? shown.length + ' of ' : '' }}{{ rows.length }}{{ cursor ? '+' : '' }})</small></h2>
-    <p class="about" v-if="intro">{{ intro }}</p>
     <div class="tools" v-if="isList && !off && res.custom !== 'zanshin'">
       <input class="in" v-model="q" placeholder="filter — any field, space = and" @keyup.enter="load()" /><button class="btn s" v-if="q" @click="q = ''" title="clear">×</button>
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>

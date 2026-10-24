@@ -10,7 +10,13 @@ const mode = ref<'password' | 'key'>(localStorage.getItem('musubi.console.login'
 const advanced = ref(!!auth.base)
 function done(ok: boolean) {
   if (ok) { localStorage.setItem('musubi.console.login', mode.value); router.push(String(route.query.to || '/players')) }
-  else err.value = s.error || 'could not sign in'
+  else {
+    const m = s.error || 'could not sign in'
+    const net = /fetch|network|cors|load failed/i.test(m)
+    err.value = net && base.value
+      ? `${m} — the node at ${base.value} did not answer the browser. If it is on another origin, add ${location.origin} to [http] cors_origins in its config (or serve the console from the node itself).`
+      : m
+  }
   busy.value = false
 }
 async function go() {

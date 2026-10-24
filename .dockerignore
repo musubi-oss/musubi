@@ -1,0 +1,6 @@
+target
+**/target
+console/node_modules
+.git
+sdk/unreal/Demo
+docs

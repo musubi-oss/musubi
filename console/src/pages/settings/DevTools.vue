@@ -15,6 +15,18 @@ const ask = (m: string) => window.confirm(m)
 async function act(fn: () => Promise<any>, ok: string) { try { const r = await fn(); toast.show(ok); dlg.value = ''; load(); return r } catch (e: any) { toast.err(e) } }
 const ts = (v: any) => v ? new Date(typeof v === 'number' ? v * (v < 1e12 ? 1000 : 1) : v).toISOString().replace('T', ' ').slice(0, 19) : '—'
 function openFixture() { dlg.value = 'fixture'; form.value = { name: '', reset: false, manifest: JSON.stringify({ accounts: 10 }, null, 2) } }
+const demoManifest = () => ({
+  accounts: Array.from({ length: 12 }, (_, i) => ({
+    username: ['ayla', 'brick', 'cass', 'dorn', 'eiko', 'fenn', 'gale', 'hux', 'iris', 'jude', 'kato', 'lyra'][i],
+    display_name: ['Ayla', 'Brick', 'Cass', 'Dorn', 'Eiko', 'Fenn', 'Gale', 'Hux', 'Iris', 'Jude', 'Kato', 'Lyra'][i],
+    metadata: { platform: ['steam', 'ios', 'android', 'ps5'][i % 4], country: ['DE', 'US', 'BR', 'JP', 'FR', 'KR'][i % 6], level: 3 + i * 4 },
+    wallet: { gold: 250 + i * 175, gems: i % 3 === 0 ? 40 + i * 5 : 0 },
+    inventory: [{ item_id: 'sword_basic', quantity: 1 }, { item_id: 'potion_small', quantity: 2 + i }, ...(i % 2 ? [{ item_id: 'shield_wood', quantity: 1 }] : [])],
+    storage: [{ collection: 'profile', key: 'settings', value: { music: i % 2 === 0, lang: ['en', 'de', 'pt', 'ja'][i % 4] } }],
+  })),
+})
+// One click of demo data for an empty node: 12 players with wallets, inventory and storage, removable as fixture "demo".
+function demo() { act(() => post('/v1/admin/dev/fixtures', { name: 'demo', reset: true, ...demoManifest() }), 'demo fixture applied — 12 players with wallets, inventory and storage') }
 async function lock() { const e = lockEmail.value.trim(); if (!e) return; try { x.value.lock = await get(`/v1/admin/auth/locks/${encodeURIComponent(e)}`) } catch (er: any) { x.value.lock = { email: e, error: er.message } } }
 </script>
 <template>
@@ -30,7 +42,7 @@ async function lock() { const e = lockEmail.value.trim(); if (!e) return; try { 
     <template v-if="x.replay"><h3>Last replay</h3><JsonView :value="x.replay" /></template>
   </div>
   <div class="card">
-    <h3 style="margin-top:0">Fixtures <small>({{ (x.fx?.fixtures ?? []).length }})</small><button class="btn s p" style="margin-left:10px" @click="openFixture">Apply fixture</button></h3>
+    <h3 style="margin-top:0">Fixtures <small>({{ (x.fx?.fixtures ?? []).length }})</small><button class="btn s p" style="margin-left:10px" @click="openFixture">Apply fixture</button><button class="btn s" style="margin-left:6px" @click="demo">Load demo data</button></h3>
     <DataTable :cols="[{ key: 'name', mono: true }, { key: 'applied_at', fmt: (r) => ts(r.applied_at ?? r.created_at), dim: true }, { key: 'summary', fmt: (r) => r.summary ? JSON.stringify(r.summary) : JSON.stringify(r.manifest ?? r.counts ?? {}), dim: true }]" :rows="x.fx?.fixtures ?? []" empty="No fixtures applied">
       <template #actions="{ row }"><button class="btn s d" @click="ask(`Drop fixture ${row.name} and everything it created?`) && act(() => api('DELETE', `/v1/admin/dev/fixtures/${encodeURIComponent(row.name)}`), 'dropped')">Drop</button></template>
     </DataTable>
