@@ -39,10 +39,19 @@ pub async fn start_with(
 ) -> anyhow::Result<SocketAddr> {
     let endpoint = wtransport::Endpoint::server(cfg)?;
     let addr = endpoint.local_addr()?;
-    tracing::info!(%addr, "webtransport listening");
+    // same cap as the QUIC acceptor (`quic.max_pending_handshakes`): WebTransport rides on QUIC
+    // and a flood of half-open handshakes would otherwise spawn a task each, without bound
+    let max_pending = state.cfg.quic.max_pending_handshakes.unwrap_or(1024);
+    let pending = Arc::new(tokio::sync::Semaphore::new(max_pending));
+    tracing::info!(%addr, max_pending, "webtransport listening");
     tokio::spawn(async move {
         loop {
             let incoming = endpoint.accept().await;
+            let Ok(permit) = pending.clone().try_acquire_owned() else {
+                metrics::counter!("musubi_webtransport_refused_total").increment(1);
+                incoming.refuse();
+                continue;
+            };
             let state = state.clone();
             tokio::spawn(async move {
                 let conn = match incoming.await {
@@ -52,6 +61,7 @@ pub async fn start_with(
                         return;
                     }
                 };
+                drop(permit);
                 match conn {
                     Ok(conn) => handle(state, conn).await,
                     Err(e) => tracing::debug!(error = %e, "webtransport session refused"),

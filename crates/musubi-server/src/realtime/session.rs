@@ -133,15 +133,7 @@ pub async fn serve(hub: Arc<Hub>, conn: Box<dyn Connection>, params: ConnectPara
         typing: &typing,
         resume: None,
     };
-    let resume_token = given_token.or_else(|| {
-        resumable.then(|| {
-            format!(
-                "{}{}",
-                uuid::Uuid::now_v7().simple(),
-                uuid::Uuid::now_v7().simple()
-            )
-        })
-    });
+    let resume_token = given_token.or_else(|| resumable.then(super::resume::new_token));
     let tracker = match (&resume_store, &resume_token) {
         (Some(store), Some(t)) => Some(super::resume::ResumeTracker::new(
             store.clone(),

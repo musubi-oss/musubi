@@ -166,6 +166,9 @@ impl RelayedRegistry {
             return Err(Error::InvalidArgument("match name ≤ 64 chars".into()));
         }
         let id = self.new_match_id();
+        if let Some(mine) = self.by_session.get(&me.session_id) {
+            super::check_match_room(&mine, &id)?;
+        }
         let m = Relayed {
             id: id.clone(),
             label: name,
@@ -176,10 +179,7 @@ impl RelayedRegistry {
         };
         let snap = m.snapshot(me);
         let label = m.label.clone();
-        self.by_session
-            .entry(me.session_id)
-            .or_default()
-            .push(id.clone());
+        super::track_match(&mut self.by_session.entry(me.session_id).or_default(), &id);
         self.matches.insert(id.clone(), m);
         self.emit(
             "match.created",
@@ -213,16 +213,16 @@ impl RelayedRegistry {
         if m.members.iter().any(|p| p.session_id == me.session_id) {
             return Ok(m.snapshot(me));
         }
+        if let Some(mine) = self.by_session.get(&me.session_id) {
+            super::check_match_room(&mine, &id)?;
+        }
         if m.members.len() >= MAX_RELAYED_SIZE {
             return Err(Error::ResourceExhausted("match is full".into()));
         }
         let others = m.sessions();
         m.members.push(me.clone());
         let host_ev = m.ensure_host();
-        self.by_session
-            .entry(me.session_id)
-            .or_default()
-            .push(id.clone());
+        super::track_match(&mut self.by_session.entry(me.session_id).or_default(), &id);
         self.emit(
             "match.joined",
             serde_json::json!({ "match_id": id, "account_id": me.account_id, "session_id": me.session_id,

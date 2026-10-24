@@ -632,6 +632,9 @@ impl MatchRegistry {
         metadata: HashMap<String, String>,
         spectator: Option<u64>,
     ) -> Result<ServerMessage> {
+        if let Some(mine) = self.by_session.get(&me.session_id) {
+            super::check_match_room(&mine, match_id)?;
+        }
         let h = match self.get(match_id) {
             Some(h) => h,
             None => self
@@ -640,10 +643,10 @@ impl MatchRegistry {
                 .ok_or_else(|| Error::NotFound("match".into()))?,
         };
         let snap = h.join(me.clone(), metadata, spectator).await?;
-        self.by_session
-            .entry(me.session_id)
-            .or_default()
-            .push(match_id.to_string());
+        super::track_match(
+            &mut self.by_session.entry(me.session_id).or_default(),
+            match_id,
+        );
         self.emit(
             "match.joined",
             serde_json::json!({ "match_id": match_id, "account_id": me.account_id, "session_id": me.session_id,

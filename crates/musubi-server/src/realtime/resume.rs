@@ -57,6 +57,16 @@ pub struct ResumeTracker {
     save_lock: Mutex<()>,
 }
 
+/// A fresh resume token: 256 bits from the OS CSPRNG, hex (64 chars). The token is the only
+/// credential a reconnecting transport presents (`resume_or_reject`), so it must be
+/// unguessable — time-ordered UUIDs are not.
+pub fn new_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 pub fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
@@ -313,5 +323,23 @@ impl ResumeStore {
             .await
             .map_err(Error::internal)?;
         Ok(r.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn new_token_is_random_hex_256_bits() {
+        let a = new_token();
+        let b = new_token();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        // no shared time-ordered prefix (UUIDv7 tokens shared their first 12+ hex digits)
+        assert_ne!(&a[..12], &b[..12]);
+        assert_eq!(hash_token(&a).len(), 64);
+        assert_ne!(hash_token(&a), hash_token(&b));
     }
 }

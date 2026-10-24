@@ -5138,11 +5138,10 @@ impl WorldRegistry {
         self.get(name)?;
         // applied by the world's own tick thread: at 10k players re-sending interest a few
         // times a second, taking the world lock here parked the runtime behind every tick
-        self.interest
-            .entry(name.to_string())
-            .or_default()
-            .lock()
-            .push(PendingInterest {
+        let slot = self.interest.entry(name.to_string()).or_default();
+        queue_interest(
+            &mut slot.lock(),
+            PendingInterest {
                 sid,
                 pos,
                 radius,
@@ -5152,7 +5151,8 @@ impl WorldRegistry {
                 max_hz,
                 unreliable,
                 inside,
-            });
+            },
+        );
         Ok(())
     }
 
@@ -6785,6 +6785,13 @@ fn net_rehome(st: &mut WorldState, name: &str, id: EntityId, from: Uuid, to: Opt
     }
 }
 
+/// Queue a subscription for the next tick: one entry per session (the latest wins), so a client
+/// re-sending `world_subscribe` faster than the tick drains the queue cannot grow it without bound.
+fn queue_interest(q: &mut Vec<PendingInterest>, p: PendingInterest) {
+    q.retain(|x| x.sid != p.sid);
+    q.push(p);
+}
+
 fn push_event(st: &mut WorldState, sim: Uuid, ev: impl Into<Value>) {
     let q = st.sim_events.entry(sim).or_default();
     if q.len() < MAX_SIM_EVENTS {
@@ -6873,5 +6880,43 @@ fn split_delta(
     if !d.spawned.is_empty() || !d.despawned.is_empty() || !reliable.is_empty() {
         d.updated = reliable;
         out.push((sid, delta_msg(world, tick, scale, d, false)));
+    }
+}
+
+#[cfg(test)]
+mod interest_queue_tests {
+    use super::*;
+
+    fn pending(sid: SessionId, radius: f64) -> PendingInterest {
+        PendingInterest {
+            sid,
+            pos: Pos {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            radius,
+            budget_bytes: None,
+            filter: Default::default(),
+            every: 1,
+            max_hz: None,
+            unreliable: false,
+            inside: None,
+        }
+    }
+
+    #[test]
+    fn interest_queue_keeps_one_entry_per_session() {
+        let a = SessionId::new();
+        let b = SessionId::new();
+        let mut q = Vec::new();
+        for i in 0..10_000 {
+            queue_interest(&mut q, pending(a, i as f64));
+        }
+        queue_interest(&mut q, pending(b, 1.0));
+        queue_interest(&mut q, pending(a, 42.0));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.iter().find(|p| p.sid == a).map(|p| p.radius), Some(42.0));
+        assert!(q.iter().any(|p| p.sid == b));
     }
 }

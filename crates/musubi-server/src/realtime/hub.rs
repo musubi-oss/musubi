@@ -7,6 +7,12 @@ use tokio::sync::mpsc;
 
 pub type RemoteHook = Box<dyn Fn(AccountId, Vec<UserPresence>, Vec<UserPresence>) + Send + Sync>;
 
+/// Accounts one session may follow (`status_follow` adds up to 1000 per message and nothing
+/// bounded the total: every target costs a `followers` entry that lives until the session ends).
+pub const MAX_FOLLOWING_PER_SESSION: usize = 4096;
+/// Channels one session may be in at once (`channel_join` with fresh ids created a channel each).
+pub const MAX_CHANNELS_PER_SESSION: usize = 256;
+
 #[derive(Clone)]
 pub struct SessionHandle {
     pub presence: UserPresence,
@@ -320,6 +326,17 @@ impl Hub {
         };
         let me = h.presence.clone();
         drop(h);
+        if self.in_channels.get(&session_id).is_some_and(|mine| {
+            mine.len() >= MAX_CHANNELS_PER_SESSION && !mine.contains(channel_id)
+        }) {
+            metrics::counter!("musubi_channel_join_capped_total").increment(1);
+            tracing::debug!(
+                ?session_id,
+                channel_id,
+                "channel join refused: per-session cap"
+            );
+            return vec![];
+        }
         let mut members = self.channels.entry(channel_id.to_string()).or_default();
         let already = members
             .insert(session_id, Member { hidden, persistent })
@@ -500,6 +517,11 @@ impl Hub {
         let mut snapshot = Vec::new();
         let mut mine = self.following.entry(session_id).or_default();
         for t in targets {
+            if !mine.contains(t) && mine.len() >= MAX_FOLLOWING_PER_SESSION {
+                metrics::counter!("musubi_follow_capped_total").increment(1);
+                tracing::debug!(?session_id, "follow list capped: remaining targets ignored");
+                break;
+            }
             self.followers.entry(*t).or_default().insert(session_id);
             mine.insert(*t);
             if let Some(sids) = self.by_account.get(t) {
@@ -675,5 +697,44 @@ mod tests {
         }
         assert_eq!(hub.session_count(), 1);
         assert_eq!(hub.send_to_account(a_acc, ServerMessage::Pong), 0);
+    }
+
+    #[tokio::test]
+    async fn follow_and_channel_lists_are_capped_per_session() {
+        let hub = Hub::new();
+        let (a, _rx) = handle(AccountId::new());
+        let sid = a.presence.session_id;
+        hub.join(a);
+        let targets: Vec<AccountId> = (0..MAX_FOLLOWING_PER_SESSION + 10)
+            .map(|_| AccountId::new())
+            .collect();
+        for chunk in targets.chunks(1000) {
+            hub.follow(sid, chunk);
+        }
+        assert_eq!(
+            hub.following.get(&sid).unwrap().len(),
+            MAX_FOLLOWING_PER_SESSION
+        );
+        assert!(hub
+            .followers
+            .get(&targets[MAX_FOLLOWING_PER_SESSION])
+            .is_none());
+        // a target already followed is still accepted at the cap
+        hub.follow(sid, &targets[..1]);
+        assert_eq!(
+            hub.following.get(&sid).unwrap().len(),
+            MAX_FOLLOWING_PER_SESSION
+        );
+        for i in 0..MAX_CHANNELS_PER_SESSION + 10 {
+            hub.join_channel(&format!("c{i}"), sid, false, false);
+        }
+        assert_eq!(
+            hub.in_channels.get(&sid).unwrap().len(),
+            MAX_CHANNELS_PER_SESSION
+        );
+        assert_eq!(hub.channels.len(), MAX_CHANNELS_PER_SESSION);
+        // re-joining a channel the session is already in still works at the cap
+        hub.join_channel("c0", sid, false, false);
+        assert!(hub.in_channels.get(&sid).unwrap().contains("c0"));
     }
 }
