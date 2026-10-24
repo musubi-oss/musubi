@@ -22,6 +22,7 @@ use musubi_core::{AccountId, Error, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -56,10 +57,7 @@ fn random_token(prefix: &str) -> String {
     use rand::RngCore;
     let mut b = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut b);
-    format!(
-        "{prefix}{}",
-        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-    )
+    format!("{prefix}{}", hex::encode(b))
 }
 
 fn pkce_s256(verifier: &str) -> String {
@@ -556,7 +554,9 @@ pub async fn token_code(
     }
     match (&row.code_challenge, p.get("code_verifier")) {
         (Some(ch), Some(v)) => {
-            if !(43..=128).contains(&v.len()) || pkce_s256(v) != *ch {
+            if !(43..=128).contains(&v.len())
+                || !bool::from(pkce_s256(v).as_bytes().ct_eq(ch.as_bytes()))
+            {
                 return grant_fail(
                     s,
                     &c.client_id,
@@ -728,12 +728,38 @@ pub async fn token_refresh(
         }
         None => row.scopes.clone(),
     };
-    let _ = sqlx::query(
-        "update musubi.oauth_refresh_tokens set rotated_at = now(), last_used_at = now() where token_hash = $1",
+    // Atomic claim: two concurrent presentations of the same token must yield exactly one
+    // rotation; the loser is treated as reuse (RFC 6749 §10.4 / OAuth 2.1 §6.1).
+    let claimed = sqlx::query(
+        "update musubi.oauth_refresh_tokens set rotated_at = now(), last_used_at = now() \
+         where token_hash = $1 and rotated_at is null and revoked_at is null",
     )
     .bind(hash(tok))
     .execute(&s.db)
-    .await;
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if claimed == 0 {
+        let _ = sqlx::query(
+            "update musubi.oauth_refresh_tokens set revoked_at = coalesce(revoked_at, now()) where family = $1",
+        )
+        .bind(row.family)
+        .execute(&s.db)
+        .await;
+        s.events
+            .emit(
+                "oauth.refresh_reuse_detected",
+                Some(AccountId(row.account_id)),
+                json!({ "client_id": c.client_id, "family": row.family, "ip": ip, "concurrent": true }),
+            )
+            .await;
+        note_failure(s, &c.client_id, "refresh_reused", ip).await;
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "refresh token already rotated; the token family was revoked",
+        );
+    }
     match issue(
         s,
         &c,
@@ -981,4 +1007,81 @@ async fn admin_revoke_grants(
         }
     }
     Ok(Json(json!({ "revoked": n })))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn random_token_is_prefixed_256_bit_hex() {
+        let a = random_token("mrt_");
+        let b = random_token("mrt_");
+        assert_eq!(a.len(), 4 + 64);
+        assert!(a.starts_with("mrt_"));
+        assert!(a[4..].bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn pkce_s256_matches_rfc_7636_appendix_b() {
+        assert_eq!(
+            pkce_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    /// The rotation claim is a conditional update: of two concurrent presentations of one
+    /// refresh token exactly one wins, the other sees zero rows and is handled as reuse.
+    #[tokio::test]
+    async fn refresh_rotation_claim_is_atomic() {
+        let Ok(url) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+            return;
+        };
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let client_id = format!("mc_{}", Uuid::now_v7().simple());
+        sqlx::query(
+            "insert into musubi.oauth_clients (client_id, name, kind, role, scopes, redirect_uris, allowed_ips, token_ttl_secs, secrets)
+             values ($1, 'audit', 'public', 'server', '{}', '{}', '{}', 3600, '[]')",
+        )
+        .bind(&client_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        let tok = random_token("mrt_");
+        sqlx::query(
+            "insert into musubi.oauth_refresh_tokens (token_hash, family, client_id, account_id, scopes, expires_at)
+             values ($1, $2, $3, $4, '{}', now() + interval '1 hour')",
+        )
+        .bind(hash(&tok))
+        .bind(Uuid::now_v7())
+        .bind(&client_id)
+        .bind(Uuid::now_v7())
+        .execute(&db)
+        .await
+        .unwrap();
+        let claim = || async {
+            sqlx::query(
+                "update musubi.oauth_refresh_tokens set rotated_at = now(), last_used_at = now() \
+                 where token_hash = $1 and rotated_at is null and revoked_at is null",
+            )
+            .bind(hash(&tok))
+            .execute(&db)
+            .await
+            .unwrap()
+            .rows_affected()
+        };
+        let (a, b) = tokio::join!(claim(), claim());
+        assert_eq!(a + b, 1, "exactly one presentation rotates the token");
+        sqlx::query("delete from musubi.oauth_clients where client_id = $1")
+            .bind(&client_id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
 }

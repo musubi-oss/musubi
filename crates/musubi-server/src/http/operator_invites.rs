@@ -77,14 +77,19 @@ fn email_ok(e: &str) -> bool {
         && !e.chars().any(char::is_whitespace)
 }
 
+/// 24 chars from a 62-letter alphabet (~143 bits), sampled uniformly (no modulo bias).
 fn token() -> String {
-    use rand::RngCore;
-    let mut b = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    use rand::distributions::{Distribution, Uniform};
     const A: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    b.iter()
-        .map(|x| A[(*x as usize) % A.len()] as char)
-        .collect()
+    let pick = Uniform::from(0..A.len());
+    let mut rng = rand::rngs::OsRng;
+    (0..24).map(|_| A[pick.sample(&mut rng)] as char).collect()
+}
+
+/// Invites are stored by SHA-256 of the token so a database read does not hand out pending
+/// admin invites; rows created before this change still carry the plaintext and keep working.
+fn token_hash(token: &str) -> String {
+    crate::keys::hash(token)
 }
 
 #[derive(Deserialize, Default)]
@@ -102,6 +107,8 @@ async fn invite(
     Extension(caller): Extension<Caller>,
     Json(b): Json<InviteBody>,
 ) -> Result<Json<Value>, ApiError> {
+    // the accepted invite becomes an unscoped key of `role`: only an unscoped key may offer that
+    super::admin::may_delegate(&caller, &[])?;
     if !email_ok(&b.email) {
         return Err(
             Error::InvalidArgument("email: a valid address, at most 254 chars".into()).into(),
@@ -137,20 +144,22 @@ async fn invite(
         return Err(Error::Conflict(format!("{email} already has a pending invite")).into());
     }
     let id = Uuid::now_v7();
-    let row: InviteRow = sqlx::query_as(&format!(
+    let plain = token();
+    let mut row: InviteRow = sqlx::query_as(&format!(
         "insert into musubi.operator_invites (id, email, role, token, note, invited_by, expires_at)
-         values ($1, $2, $3, $4, $5, $6, now() + ($7 || ' hours')::interval) returning {INVITE_COLS}"
+         values ($1, $2, $3, $4, $5, $6, now() + make_interval(hours => $7)) returning {INVITE_COLS}"
     ))
     .bind(id)
     .bind(&email)
     .bind(role.as_str())
-    .bind(token())
+    .bind(token_hash(&plain))
     .bind(&b.note)
     .bind(&caller.name)
-    .bind(ttl.to_string())
+    .bind(ttl as i32)
     .fetch_one(&s.db)
     .await
     .map_err(Error::internal)?;
+    row.3 = plain;
     s.events
         .emit(
             "operator.invited",
@@ -230,8 +239,9 @@ async fn rescind(
 
 async fn live_invite(s: &AppState, token: &str) -> Result<InviteRow> {
     let row: Option<InviteRow> = sqlx::query_as(&format!(
-        "select {INVITE_COLS} from musubi.operator_invites where token = $1"
+        "select {INVITE_COLS} from musubi.operator_invites where token = $1 or token = $2"
     ))
+    .bind(token_hash(token))
     .bind(token)
     .fetch_optional(&s.db)
     .await
@@ -287,28 +297,15 @@ async fn accept(
         .issue_with(&s.db, &name, role, None, Some(&r.1), &[])
         .await?;
     let member_id = Uuid::now_v7();
-    let mut tx = s.db.begin().await.map_err(Error::internal)?;
-    sqlx::query(
-        "insert into musubi.operators (id, email, name, role, key_id, invite_id) values ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(member_id)
-    .bind(&r.1)
-    .bind(&name)
-    .bind(&r.2)
-    .bind(key.id)
-    .bind(r.0)
-    .execute(&mut *tx)
-    .await
-    .map_err(Error::internal)?;
-    sqlx::query(
-        "update musubi.operator_invites set status = 'accepted', decided_at = now(), key_id = $2 where id = $1",
-    )
-    .bind(r.0)
-    .bind(key.id)
-    .execute(&mut *tx)
-    .await
-    .map_err(Error::internal)?;
-    tx.commit().await.map_err(Error::internal)?;
+    // The invite is claimed with a conditional update inside the transaction: a second accept
+    // racing on the same token (or one after a rescind) gets 409 and never keeps a key.
+    if let Err(e) = record_acceptance(s.db.clone(), &r, member_id, &name, key.id).await {
+        let _ = s.keys.revoke(&s.db, key.id).await;
+        return Err(e.into());
+    }
+    if let Some(c) = &s.cluster {
+        let _ = c.publish(crate::keys::KEYS_TOPIC, &key.id).await;
+    }
     s.events
         .emit(
             "operator.joined",
@@ -320,6 +317,47 @@ async fn accept(
         "member_id": member_id, "email": r.1, "name": name, "role": r.2,
         "key_id": key.id, "secret": secret,
     })))
+}
+
+async fn record_acceptance(
+    db: sqlx::PgPool,
+    r: &InviteRow,
+    member_id: Uuid,
+    name: &str,
+    key_id: Uuid,
+) -> Result<()> {
+    let mut tx = db.begin().await.map_err(Error::internal)?;
+    let claimed = sqlx::query(
+        "update musubi.operator_invites set status = 'accepted', decided_at = now(), key_id = $2 \
+         where id = $1 and status = 'invited' and expires_at > now()",
+    )
+    .bind(r.0)
+    .bind(key_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    if claimed == 0 {
+        return Err(Error::Conflict("invite already decided or expired".into()));
+    }
+    sqlx::query(
+        "insert into musubi.operators (id, email, name, role, key_id, invite_id) values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(member_id)
+    .bind(&r.1)
+    .bind(name)
+    .bind(&r.2)
+    .bind(key_id)
+    .bind(r.0)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref d) if d.is_unique_violation() => {
+            Error::Conflict(format!("{} is already a member", r.1))
+        }
+        e => Error::internal(e),
+    })?;
+    tx.commit().await.map_err(Error::internal)
 }
 
 async fn reject(
@@ -395,6 +433,9 @@ async fn remove_member(
     };
     if let Some(kid) = row.4 {
         s.keys.revoke(&s.db, kid).await?;
+        if let Some(c) = &s.cluster {
+            let _ = c.publish(crate::keys::KEYS_TOPIC, &kid).await;
+        }
     }
     s.events
         .emit(
@@ -406,4 +447,73 @@ async fn remove_member(
     Ok(Json(
         json!({"removed": true, "key_revoked": row.4.is_some()}),
     ))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn token_is_24_alphanumerics_and_unique() {
+        let a = token();
+        let b = token();
+        assert_eq!(a.chars().count(), 24);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stored_form_is_the_server_key_hash() {
+        let t = token();
+        assert_eq!(token_hash(&t), crate::keys::hash(&t));
+        assert_ne!(token_hash(&t), t);
+        assert_eq!(token_hash(&t).len(), 64);
+    }
+
+    /// Two accepts of the same invite: the first claims it, the second gets 409 and no member row.
+    #[tokio::test]
+    async fn acceptance_is_claimed_once() {
+        let Ok(url) = std::env::var("MUSUBI_TEST_DATABASE_URL") else {
+            return;
+        };
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let id = Uuid::now_v7();
+        let email = format!("audit-{}@example.test", id.simple());
+        let row: InviteRow = sqlx::query_as(&format!(
+            "insert into musubi.operator_invites (id, email, role, token, note, invited_by, expires_at)
+             values ($1, $2, 'support', $3, '', 'test', now() + interval '1 hour') returning {INVITE_COLS}"
+        ))
+        .bind(id)
+        .bind(&email)
+        .bind(token_hash(&token()))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let first = record_acceptance(db.clone(), &row, Uuid::now_v7(), "a", Uuid::now_v7()).await;
+        assert!(first.is_ok(), "{first:?}");
+        let second = record_acceptance(db.clone(), &row, Uuid::now_v7(), "b", Uuid::now_v7()).await;
+        assert!(matches!(second, Err(Error::Conflict(_))), "{second:?}");
+        let (members,): (i64,) =
+            sqlx::query_as("select count(*) from musubi.operators where invite_id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(members, 1);
+        sqlx::query("delete from musubi.operators where invite_id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("delete from musubi.operator_invites where id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
 }

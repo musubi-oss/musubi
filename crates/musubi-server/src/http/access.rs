@@ -200,7 +200,10 @@ pub async fn load(db: &PgPool) -> Result<Policy> {
             .await
             .map_err(Error::internal)?;
     let p = match row {
-        Some(v) => serde_json::from_value(v).unwrap_or_default(),
+        Some(v) => serde_json::from_value(v).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "access policy row is malformed; falling back to the default (open) policy");
+            Policy::default()
+        }),
         None => Policy::default(),
     };
     *cache().write().unwrap() = Some((Instant::now(), p.clone()));

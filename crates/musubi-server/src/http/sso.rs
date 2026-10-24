@@ -64,19 +64,18 @@ async fn login(
 ) -> Result<Response, ApiError> {
     let c = &s.cfg.operators.sso;
     enabled(c)?;
-    if !q.return_to.is_empty()
-        && !(q.return_to.starts_with("https://") || q.return_to.starts_with("http://"))
-    {
-        return Err(
-            Error::InvalidArgument("return_to must be an absolute http(s) URL".into()).into(),
-        );
-    }
+    check_return_to(&s.cfg, &q.return_to)?;
     let authorize = if c.authorize_url.is_empty() {
         endpoint(&s, "authorization_endpoint").await?
     } else {
         c.authorize_url.clone()
     };
-    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let nonce = {
+        use rand::RngCore;
+        let mut b = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut b);
+        hex::encode(b)
+    };
     let state = sign_state(&s.cfg.session.secret, &nonce, &q.return_to);
     let mut scopes = vec!["openid", "email", "profile"];
     for sc in &c.scopes {
@@ -126,6 +125,7 @@ async fn callback(
         .into());
     }
     let (nonce, return_to) = verify_state(&s.cfg.session.secret, &q.state)?;
+    check_return_to(&s.cfg, &return_to)?;
     if q.code.is_empty() {
         return Err(Error::InvalidArgument("code is required".into()).into());
     }
@@ -311,6 +311,74 @@ fn mac(secret: &str, payload: &str) -> String {
     b64(&m.finalize().into_bytes())
 }
 
+/// `scheme://host[:port]` of an absolute http(s) URL, lower-cased; `None` for anything else
+/// (userinfo and backslashes are rejected so `https://good@evil` cannot pass as `good`).
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() || authority.contains(['@', '\\']) {
+        return None;
+    }
+    Some(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    ))
+}
+
+/// Same site as the callback: `https://console.studio.gg` for a callback on
+/// `https://api.studio.gg/…` (the API host's parent domain, or the host itself when it has no
+/// subdomain). A plain-http `return_to` never qualifies for an https callback.
+fn same_site(return_origin: &str, callback_origin: &str) -> bool {
+    let Some((rs, rh)) = return_origin.split_once("://") else {
+        return false;
+    };
+    let Some((cs, ch)) = callback_origin.split_once("://") else {
+        return false;
+    };
+    if rs != cs && rs != "https" {
+        return false;
+    }
+    let host = |h: &str| h.rsplit_once(':').map_or(h, |(h, _)| h).to_string();
+    let (rh, ch) = (host(rh), host(ch));
+    let site = match ch.matches('.').count() {
+        0 | 1 => ch.as_str(),
+        _ => ch.split_once('.').map_or(ch.as_str(), |(_, rest)| rest),
+    };
+    rh == site || rh.strip_suffix(site).is_some_and(|p| p.ends_with('.'))
+}
+
+/// The callback hands the fresh operator key to `return_to` in the URL fragment, so the target
+/// must be ours: the site of `[operators.sso] redirect_url` or one of `[http] cors_origins`
+/// (exact origin). Anything else would turn the login link into a key-exfiltrating open redirect.
+fn check_return_to(cfg: &musubi_core::config::Config, return_to: &str) -> musubi_core::Result<()> {
+    if return_to.is_empty() {
+        return Ok(());
+    }
+    let origin = origin_of(return_to).ok_or_else(|| {
+        Error::InvalidArgument("return_to must be an absolute http(s) URL".into())
+    })?;
+    let on_site = origin_of(&cfg.operators.sso.redirect_url)
+        .is_some_and(|callback| same_site(&origin, &callback));
+    let listed = cfg
+        .http
+        .cors_origins
+        .iter()
+        .filter_map(|o| origin_of(o))
+        .any(|o| o == origin);
+    if on_site || listed {
+        Ok(())
+    } else {
+        Err(Error::PermissionDenied(
+            "return_to must be on the console site ([operators.sso] redirect_url domain or [http] cors_origins)".into(),
+        ))
+    }
+}
+
 /// `base64url(nonce|exp|return_to).hmac` — self-contained, so any node can take the callback.
 fn sign_state(secret: &str, nonce: &str, return_to: &str) -> String {
     let exp = time::OffsetDateTime::now_utc().unix_timestamp() + STATE_TTL_SECS;
@@ -321,16 +389,12 @@ fn sign_state(secret: &str, nonce: &str, return_to: &str) -> String {
 fn verify_state(secret: &str, state: &str) -> musubi_core::Result<(String, String)> {
     let bad = || Error::InvalidArgument("invalid or expired state".into());
     let (payload, sig) = state.split_once('.').ok_or_else(bad)?;
-    let want = mac(secret, payload);
-    if want.len() != sig.len()
-        || want
-            .bytes()
-            .zip(sig.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            != 0
-    {
-        return Err(bad());
-    }
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(sig)
+        .map_err(|_| bad())?;
+    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| bad())?;
+    m.update(payload.as_bytes());
+    m.verify_slice(&sig).map_err(|_| bad())?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| bad())?;
@@ -361,6 +425,53 @@ fn enc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(redirect: &str, cors: &[&str]) -> musubi_core::config::Config {
+        let mut c = musubi_core::config::Config::default();
+        c.operators.sso.redirect_url = redirect.into();
+        c.http.cors_origins = cors.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    #[test]
+    fn origin_extraction() {
+        assert_eq!(
+            origin_of("HTTPS://Console.Example.com:8443/path?x#y").as_deref(),
+            Some("https://console.example.com:8443")
+        );
+        assert_eq!(origin_of("ftp://x"), None);
+        assert_eq!(origin_of("https://"), None);
+        assert_eq!(origin_of("https://good.example@evil.example/"), None);
+        assert_eq!(origin_of("https://good.example\\@evil.example/"), None);
+        assert_eq!(origin_of("/relative"), None);
+    }
+
+    #[test]
+    fn return_to_is_pinned_to_console_origins() {
+        let c = cfg(
+            "https://api.example.com/v1/admin/sso/callback",
+            &["http://localhost:5173"],
+        );
+        assert!(check_return_to(&c, "").is_ok());
+        assert!(check_return_to(&c, "https://api.example.com/console/#/login").is_ok());
+        assert!(check_return_to(&c, "https://console.example.com/login").is_ok());
+        assert!(check_return_to(&c, "https://example.com/").is_ok());
+        assert!(check_return_to(&c, "http://localhost:5173/sso").is_ok());
+        assert!(check_return_to(&c, "http://localhost:5174/sso").is_err());
+        assert!(check_return_to(&c, "https://notexample.com/").is_err());
+        assert!(check_return_to(&c, "https://example.com.evil.example/").is_err());
+        let bare = cfg("https://example.com/v1/admin/sso/callback", &[]);
+        assert!(check_return_to(&bare, "https://console.example.com/").is_ok());
+        assert!(check_return_to(&bare, "https://com/").is_err());
+        assert!(check_return_to(&c, "https://evil.example/steal").is_err());
+        assert!(check_return_to(&c, "https://api.example.com.evil.example/").is_err());
+        assert!(check_return_to(&c, "https://api.example.com@evil.example/").is_err());
+        assert!(
+            check_return_to(&c, "http://api.example.com/").is_err(),
+            "scheme downgrade"
+        );
+        assert!(check_return_to(&c, "javascript:alert(1)").is_err());
+    }
 
     #[test]
     fn state_round_trips_and_rejects_tampering() {

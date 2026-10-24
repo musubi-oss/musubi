@@ -264,6 +264,9 @@ async fn ban(
 
 /// Apply (or replace) a ban: the row, the account flag, kicks, voice and the cluster-wide cache.
 /// Shared with player-report decisions.
+/// `to_timestamp` rejects anything past year 9999; keep bans inside the representable range.
+const MAX_BAN_UNTIL: i64 = 253_402_300_799;
+
 pub(crate) async fn apply_ban(s: &AppState, id: AccountId, b: BanBody) -> Result<Value, ApiError> {
     let mut b = b;
     if let Some(code) = b.reason_code.as_deref() {
@@ -296,9 +299,16 @@ pub(crate) async fn apply_ban(s: &AppState, id: AccountId, b: BanBody) -> Result
     if b.message.as_ref().is_some_and(|m| m.chars().count() > 512) {
         return Err(Error::InvalidArgument("message over 512 chars".into()).into());
     }
-    let until = b
-        .until_secs
-        .map(|u| time::OffsetDateTime::now_utc().unix_timestamp() + u);
+    let until = match b.until_secs {
+        Some(u) => Some(
+            time::OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .checked_add(u)
+                .filter(|t| *t < MAX_BAN_UNTIL)
+                .ok_or_else(|| Error::InvalidArgument("until_secs too far in the future".into()))?,
+        ),
+        None => None,
+    };
     let info = crate::bans::BanInfo {
         reason: b.reason.clone(),
         message: b.message.clone(),
@@ -736,9 +746,31 @@ fn redact(v: &mut Value, key: &str) {
                 redact(child, k);
             }
         }
+        Value::Array(a) => {
+            for child in a.iter_mut() {
+                redact(child, key);
+            }
+        }
         Value::String(s) if is_secret_key(key) && !s.is_empty() => *s = "***".into(),
         _ => {}
     }
+}
+
+/// A key may only hand out what it could use itself: a caller restricted to some scopes cannot
+/// mint an unscoped key, client or invite, nor one covering scopes it lacks.
+pub(crate) fn may_delegate(
+    caller: &crate::keys::Caller,
+    scopes: &[String],
+) -> musubi_core::Result<()> {
+    let unrestricted = caller.scopes.is_empty() || caller.scopes.iter().any(|s| s == "*");
+    if unrestricted || (!scopes.is_empty() && crate::scopes::within(scopes, &caller.scopes)) {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied(format!(
+        "key '{}' with scopes [{}] cannot issue credentials outside its own scopes",
+        caller.name,
+        caller.scopes.join(", ")
+    )))
 }
 
 fn is_secret_key(k: &str) -> bool {
@@ -946,8 +978,10 @@ async fn keys_list(_k: ServerKey, State(s): State<AppState>) -> Result<Json<Valu
 async fn keys_issue(
     _k: ServerKey,
     State(s): State<AppState>,
+    axum::Extension(issuer): axum::Extension<crate::keys::Caller>,
     Json(b): Json<IssueKey>,
 ) -> Result<Json<Value>, ApiError> {
+    may_delegate(&issuer, &b.scopes)?;
     let (caller, secret) = s
         .keys
         .issue_with(&s.db, &b.name, b.role, None, None, &b.scopes)
@@ -1669,4 +1703,71 @@ async fn deletions_sweep(
 ) -> Result<Json<Value>, ApiError> {
     let ids = crate::deletion_ledger::sweep(&s).await?;
     Ok(Json(json!({ "redeleted": ids })))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn redact_covers_arrays_and_objects_inside_arrays() {
+        let mut v = json!({
+            "security": { "master_keys": ["aa", "bb"] },
+            "projects": [{ "name": "p", "api_key": "k", "key_path": "/x", "secret_url": "u" }],
+            "plain": ["keep"],
+            "token": ""
+        });
+        redact(&mut v, "");
+        assert_eq!(v["security"]["master_keys"], json!(["***", "***"]));
+        assert_eq!(v["projects"][0]["api_key"], "***");
+        assert_eq!(v["projects"][0]["name"], "p");
+        assert_eq!(v["projects"][0]["key_path"], "/x");
+        assert_eq!(v["projects"][0]["secret_url"], "u");
+        assert_eq!(v["plain"], json!(["keep"]));
+        assert_eq!(v["token"], "");
+    }
+
+    fn caller(scopes: &[&str]) -> crate::keys::Caller {
+        let mut c = crate::keys::Caller::bootstrap();
+        c.scopes = scopes.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unscoped_or_wildcard_caller_may_issue_anything() {
+        assert!(may_delegate(&caller(&[]), &[]).is_ok());
+        assert!(may_delegate(&caller(&[]), &strs(&["keys"])).is_ok());
+        assert!(may_delegate(&caller(&["*"]), &[]).is_ok());
+    }
+
+    #[test]
+    fn scoped_caller_cannot_widen() {
+        let c = caller(&["keys:read", "oauth"]);
+        assert!(
+            may_delegate(&c, &[]).is_err(),
+            "unscoped key from a scoped caller"
+        );
+        assert!(may_delegate(&c, &strs(&["accounts"])).is_err());
+        assert!(may_delegate(&c, &strs(&["keys"])).is_err(), "read -> write");
+        assert!(may_delegate(&c, &strs(&["keys:read"])).is_ok());
+        assert!(may_delegate(&c, &strs(&["oauth:read"])).is_ok());
+    }
+
+    #[test]
+    fn ban_until_stays_representable() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(now.checked_add(i64::MAX).is_none());
+        assert!(now
+            .checked_add(3600)
+            .filter(|t| *t < MAX_BAN_UNTIL)
+            .is_some());
+        assert!(now
+            .checked_add(10_000 * 365 * 86_400)
+            .filter(|t| *t < MAX_BAN_UNTIL)
+            .is_none());
+    }
 }

@@ -152,13 +152,10 @@ fn validate_common(
 }
 
 fn new_secret() -> (String, Value) {
-    let seed = format!(
-        "{}{}{:?}",
-        Uuid::now_v7().simple(),
-        Uuid::now_v7().simple(),
-        std::time::SystemTime::now()
-    );
-    let secret = format!("mcs_{}", hash(&seed));
+    use rand::RngCore;
+    let mut raw = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    let secret = format!("mcs_{}", hex::encode(raw));
     let hint = format!("…{}", &secret[secret.len() - 4..]);
     (
         secret.clone(),
@@ -167,11 +164,27 @@ fn new_secret() -> (String, Value) {
     )
 }
 
+/// Server-key names are capped at 64 chars; the client name alone may already be that long.
+fn key_name(client_name: &str) -> String {
+    let mut name = format!("oauth:{client_name}");
+    if name.len() > 64 {
+        let mut cut = 64;
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        name.truncate(cut);
+    }
+    name
+}
+
 fn secret_matches(c: &ClientRow, secret: &str, now: i64) -> bool {
+    use subtle::ConstantTimeEq;
     let h = hash(secret);
     c.secrets.as_array().is_some_and(|a| {
         a.iter().any(|s| {
-            s["hash"].as_str() == Some(h.as_str())
+            s["hash"]
+                .as_str()
+                .is_some_and(|stored| bool::from(stored.as_bytes().ct_eq(h.as_bytes())))
                 && s["expires_at"].as_i64().is_none_or(|e| e > now)
         })
     })
@@ -208,7 +221,7 @@ fn percent_decode(s: &str) -> String {
         match b[i] {
             b'+' => out.push(b' '),
             b'%' if i + 2 < b.len() => {
-                let hex = &s[i + 1..i + 3];
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
                 match u8::from_str_radix(hex, 16) {
                     Ok(v) => {
                         out.push(v);
@@ -442,7 +455,7 @@ async fn token(
         .keys
         .issue_with(
             &s.db,
-            &format!("oauth:{}", c.name),
+            &key_name(&c.name),
             role,
             Some(exp),
             Some(&c.client_id),
@@ -530,6 +543,9 @@ async fn introspect(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(e) = s.limits.auth_ip(&ip.0) {
+        return ApiError(e).into_response();
+    }
     let p = params(&headers, &body);
     let who = match caller_or_client(&s, &headers, &p, &ip.0).await {
         Ok(w) => w,
@@ -566,6 +582,9 @@ async fn revoke(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(e) = s.limits.auth_ip(&ip.0) {
+        return ApiError(e).into_response();
+    }
     let p = params(&headers, &body);
     let who = match caller_or_client(&s, &headers, &p, &ip.0).await {
         Ok(w) => w,
@@ -643,8 +662,10 @@ fn default_ttl() -> i64 {
 async fn create(
     State(s): State<AppState>,
     ServerKey: ServerKey,
+    axum::Extension(issuer): axum::Extension<crate::keys::Caller>,
     Json(b): Json<CreateBody>,
 ) -> std::result::Result<Json<Value>, ApiError> {
+    super::admin::may_delegate(&issuer, &b.scopes)?;
     validate_common(
         &b.name,
         &b.kind,
@@ -768,6 +789,7 @@ struct PatchBody {
 async fn patch(
     State(s): State<AppState>,
     ServerKey: ServerKey,
+    axum::Extension(issuer): axum::Extension<crate::keys::Caller>,
     Path(id): Path<String>,
     Json(b): Json<PatchBody>,
 ) -> std::result::Result<Json<Value>, ApiError> {
@@ -777,6 +799,7 @@ async fn patch(
     let name = b.name.unwrap_or(c.name);
     let role = b.role.unwrap_or(c.role);
     let scopes = b.scopes.unwrap_or(c.scopes);
+    super::admin::may_delegate(&issuer, &scopes)?;
     let redirect_uris = b.redirect_uris.unwrap_or(c.redirect_uris);
     let allowed_ips = b.allowed_ips.unwrap_or(c.allowed_ips);
     let ttl = b.token_ttl_secs.unwrap_or(c.token_ttl_secs);
@@ -894,6 +917,9 @@ struct RotateBody {
 
 /// `POST /v1/admin/oauth/clients/{id}/secrets` — add a secret; old ones keep working until
 /// `expire_old_in_secs` so deployments can roll.
+/// Longest grace period for a retired secret (one year).
+const MAX_SECRET_GRACE: i64 = 365 * 86_400;
+
 async fn rotate(
     State(s): State<AppState>,
     ServerKey: ServerKey,
@@ -910,8 +936,11 @@ async fn rotate(
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let mut secrets: Vec<Value> = c.secrets.as_array().cloned().unwrap_or_default();
     if let Some(grace) = b.expire_old_in_secs {
-        if grace < 0 {
-            return Err(Error::InvalidArgument("expire_old_in_secs must be >= 0".into()).into());
+        if !(0..=MAX_SECRET_GRACE).contains(&grace) {
+            return Err(Error::InvalidArgument(format!(
+                "expire_old_in_secs must be 0..={MAX_SECRET_GRACE}"
+            ))
+            .into());
         }
         for sec in secrets.iter_mut() {
             let cur = sec["expires_at"].as_i64();
@@ -1027,6 +1056,37 @@ async fn revoke_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_survives_multibyte_after_percent() {
+        // `%` followed by bytes that are not a char boundary used to slice the &str and panic
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("a%2Bb+c%zz"), "a+b c%zz");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("é%"), "é%");
+    }
+
+    #[test]
+    fn oauth_key_name_fits_the_server_key_limit() {
+        assert_eq!(key_name("svc"), "oauth:svc");
+        let long = "é".repeat(64);
+        let n = key_name(&long);
+        assert!(n.len() <= 64 && n.starts_with("oauth:"));
+        assert!(n.is_char_boundary(n.len()));
+    }
+
+    #[test]
+    fn client_secrets_are_random_and_stored_hashed() {
+        let (a, ea) = new_secret();
+        let (b, _) = new_secret();
+        assert!(a.starts_with("mcs_") && a.len() == 4 + 64);
+        assert_ne!(a, b);
+        assert_eq!(ea["hash"], hash(&a));
+        assert_eq!(
+            ea["hint"].as_str().unwrap(),
+            format!("…{}", &a[a.len() - 4..])
+        );
+    }
 
     #[test]
     fn redirect_uris() {
