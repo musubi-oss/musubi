@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Section sidebar: grouped catalog entries, highlight follows redirects (e.g. bans → reports?tab=bans),
 // filter box when the list is long. Extra entries (hand-written pages) come via `extra`.
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { catalog, type Res } from '../catalog'
 const props = defineProps<{ section: string; extra?: { id: string; title: string; group?: string; to?: string }[] }>()
@@ -22,21 +22,37 @@ function target(to: string): string {
   return norm(typeof red === 'string' ? red : typeof red === 'function' ? r.fullPath : router.resolve(red as any).fullPath)
 }
 const current = computed(() => { const base = norm(route.path); const tab = route.query.tab; return tab ? `${base}?tab=${tab}` : base })
-function on(e: Entry) {
-  const t = target(e.to); const cur = current.value
+// An entry's own path (redirects not followed): the page a direct link lands on.
+const direct = (e: Entry) => norm(router.resolve(e.to).fullPath) === norm(route.path)
+function matches(e: Entry, cur: string) {
+  const t = target(e.to)
   if (cur === t) return true
   if (t.includes('?') || !(cur.startsWith(t + '/') || cur.startsWith(t + '?'))) return false
   return !items.value.some((o) => { if (o === e) return false; const ot = target(o.to); return ot.length > t.length && (cur === ot || cur.startsWith(ot + '/') || cur.startsWith(ot + '?')) })
 }
+// Several entries may redirect to the same page (allowlist/denials/login queue → access): when the page itself has an
+// entry, only that one lights up; redirect-only entries highlight when the page has no entry of its own (bans → reports?tab=bans).
+function on(e: Entry) {
+  const cur = current.value
+  if (!matches(e, cur)) return false
+  const hit = items.value.filter((o) => matches(o, cur))
+  return hit.some(direct) ? direct(e) : hit[0] === e
+}
+const open = ref(false)
+const label = computed(() => items.value.find((e) => on(e))?.title ?? 'Pages')
+watch(() => route.fullPath, () => { open.value = false })
 const long = computed(() => (catalog[props.section]?.length ?? 0) + (props.extra?.length ?? 0) > 12)
 </script>
 <template>
-  <nav class="side">
+  <nav class="side" :class="{ open }">
+    <button class="tg" @click="open = !open">{{ label }}<i>{{ open ? '▲' : '▼ pages' }}</i></button>
     <input v-if="long" class="in nf" v-model="q" placeholder="find page" />
-    <template v-for="(list, g) in groups" :key="g">
-      <div class="grp" v-if="g">{{ g }}</div>
-      <router-link v-for="it in list" :key="it.id" :to="it.to" :class="{ on: on(it) }">{{ it.title }}</router-link>
-    </template>
-    <div class="note" v-if="!items.length" style="padding:8px 10px">nothing matches</div>
+    <div class="ls">
+      <template v-for="(list, g) in groups" :key="g">
+        <div class="grp" v-if="g">{{ g }}</div>
+        <router-link v-for="it in list" :key="it.id" :to="it.to" active-class="" exact-active-class="" :class="{ on: on(it) }">{{ it.title }}</router-link>
+      </template>
+      <div class="note" v-if="!items.length" style="padding:8px 10px">nothing matches</div>
+    </div>
   </nav>
 </template>
