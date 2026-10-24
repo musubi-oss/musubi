@@ -2,7 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 
-export const Route = createFileRoute('/')({ component: Dashboard })
+export const Route = createFileRoute('/_app/')({ component: Dashboard })
 
 function Dashboard() {
   const node = useQuery({ queryKey: ['node'], queryFn: async () => (await api.GET('/v1/node')).data })
