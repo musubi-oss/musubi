@@ -13,6 +13,8 @@ import { Route as AppRouteImport } from './routes/_app'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppSectionIndexRouteImport } from './routes/_app/$section/index'
+import { Route as AppAnalyticsIndexRouteImport } from './routes/_app/analytics/index'
+import { Route as AppAnalyticsEventsRouteImport } from './routes/_app/analytics/events'
 import { Route as AppClusterIndexRouteImport } from './routes/_app/cluster/index'
 import { Route as AppContentSchedulesRouteImport } from './routes/_app/content/schedules'
 import { Route as AppContentStorage_schemasRouteImport } from './routes/_app/content/storage_schemas'
@@ -78,6 +80,16 @@ const AppIndexRoute = AppIndexRouteImport.update({
 const AppSectionIndexRoute = AppSectionIndexRouteImport.update({
   id: '/$section/',
   path: '/$section/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAnalyticsIndexRoute = AppAnalyticsIndexRouteImport.update({
+  id: '/analytics/',
+  path: '/analytics/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAnalyticsEventsRoute = AppAnalyticsEventsRouteImport.update({
+  id: '/analytics/events',
+  path: '/analytics/events',
   getParentRoute: () => AppRoute,
 } as any)
 const AppClusterIndexRoute = AppClusterIndexRouteImport.update({
@@ -323,6 +335,7 @@ const AppWorldWorldsWEntitiesIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/login': typeof LoginRoute
+  '/analytics/events': typeof AppAnalyticsEventsRoute
   '/content/schedules': typeof AppContentSchedulesRoute
   '/content/storage_schemas': typeof AppContentStorage_schemasRoute
   '/content/ugc': typeof AppContentUgcRoute
@@ -345,6 +358,7 @@ export interface FileRoutesByFullPath {
   '/social/sessions': typeof AppSocialSessionsRoute
   '/social/stats': typeof AppSocialStatsRoute
   '/$section/': typeof AppSectionIndexRoute
+  '/analytics/': typeof AppAnalyticsIndexRoute
   '/cluster/': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/content/bundles/$id': typeof AppContentBundlesIdRoute
@@ -375,6 +389,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/': typeof AppIndexRoute
+  '/analytics/events': typeof AppAnalyticsEventsRoute
   '/content/schedules': typeof AppContentSchedulesRoute
   '/content/storage_schemas': typeof AppContentStorage_schemasRoute
   '/content/ugc': typeof AppContentUgcRoute
@@ -397,6 +412,7 @@ export interface FileRoutesByTo {
   '/social/sessions': typeof AppSocialSessionsRoute
   '/social/stats': typeof AppSocialStatsRoute
   '/$section': typeof AppSectionIndexRoute
+  '/analytics': typeof AppAnalyticsIndexRoute
   '/cluster': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/content/bundles/$id': typeof AppContentBundlesIdRoute
@@ -429,6 +445,7 @@ export interface FileRoutesById {
   '/_app': typeof AppRouteWithChildren
   '/login': typeof LoginRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/analytics/events': typeof AppAnalyticsEventsRoute
   '/_app/content/schedules': typeof AppContentSchedulesRoute
   '/_app/content/storage_schemas': typeof AppContentStorage_schemasRoute
   '/_app/content/ugc': typeof AppContentUgcRoute
@@ -451,6 +468,7 @@ export interface FileRoutesById {
   '/_app/social/sessions': typeof AppSocialSessionsRoute
   '/_app/social/stats': typeof AppSocialStatsRoute
   '/_app/$section/': typeof AppSectionIndexRoute
+  '/_app/analytics/': typeof AppAnalyticsIndexRoute
   '/_app/cluster/': typeof AppClusterIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
   '/_app/content/bundles/$id': typeof AppContentBundlesIdRoute
@@ -483,6 +501,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/login'
+    | '/analytics/events'
     | '/content/schedules'
     | '/content/storage_schemas'
     | '/content/ugc'
@@ -505,6 +524,7 @@ export interface FileRouteTypes {
     | '/social/sessions'
     | '/social/stats'
     | '/$section/'
+    | '/analytics/'
     | '/cluster/'
     | '/$section/$page/$id'
     | '/content/bundles/$id'
@@ -535,6 +555,7 @@ export interface FileRouteTypes {
   to:
     | '/login'
     | '/'
+    | '/analytics/events'
     | '/content/schedules'
     | '/content/storage_schemas'
     | '/content/ugc'
@@ -557,6 +578,7 @@ export interface FileRouteTypes {
     | '/social/sessions'
     | '/social/stats'
     | '/$section'
+    | '/analytics'
     | '/cluster'
     | '/$section/$page/$id'
     | '/content/bundles/$id'
@@ -588,6 +610,7 @@ export interface FileRouteTypes {
     | '/_app'
     | '/login'
     | '/_app/'
+    | '/_app/analytics/events'
     | '/_app/content/schedules'
     | '/_app/content/storage_schemas'
     | '/_app/content/ugc'
@@ -610,6 +633,7 @@ export interface FileRouteTypes {
     | '/_app/social/sessions'
     | '/_app/social/stats'
     | '/_app/$section/'
+    | '/_app/analytics/'
     | '/_app/cluster/'
     | '/_app/$section/$page/$id'
     | '/_app/content/bundles/$id'
@@ -671,6 +695,20 @@ declare module '@tanstack/react-router' {
       path: '/$section'
       fullPath: '/$section/'
       preLoaderRoute: typeof AppSectionIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/analytics/': {
+      id: '/_app/analytics/'
+      path: '/analytics'
+      fullPath: '/analytics/'
+      preLoaderRoute: typeof AppAnalyticsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/analytics/events': {
+      id: '/_app/analytics/events'
+      path: '/analytics/events'
+      fullPath: '/analytics/events'
+      preLoaderRoute: typeof AppAnalyticsEventsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/cluster/': {
@@ -1019,6 +1057,7 @@ const AppEconomyCodesRouteWithChildren = AppEconomyCodesRoute._addFileChildren(
 
 interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
+  AppAnalyticsEventsRoute: typeof AppAnalyticsEventsRoute
   AppContentSchedulesRoute: typeof AppContentSchedulesRoute
   AppContentStorage_schemasRoute: typeof AppContentStorage_schemasRoute
   AppContentUgcRoute: typeof AppContentUgcRoute
@@ -1041,6 +1080,7 @@ interface AppRouteChildren {
   AppSocialSessionsRoute: typeof AppSocialSessionsRoute
   AppSocialStatsRoute: typeof AppSocialStatsRoute
   AppSectionIndexRoute: typeof AppSectionIndexRoute
+  AppAnalyticsIndexRoute: typeof AppAnalyticsIndexRoute
   AppClusterIndexRoute: typeof AppClusterIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
   AppContentBundlesIdRoute: typeof AppContentBundlesIdRoute
@@ -1070,6 +1110,7 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
+  AppAnalyticsEventsRoute: AppAnalyticsEventsRoute,
   AppContentSchedulesRoute: AppContentSchedulesRoute,
   AppContentStorage_schemasRoute: AppContentStorage_schemasRoute,
   AppContentUgcRoute: AppContentUgcRoute,
@@ -1092,6 +1133,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppSocialSessionsRoute: AppSocialSessionsRoute,
   AppSocialStatsRoute: AppSocialStatsRoute,
   AppSectionIndexRoute: AppSectionIndexRoute,
+  AppAnalyticsIndexRoute: AppAnalyticsIndexRoute,
   AppClusterIndexRoute: AppClusterIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
   AppContentBundlesIdRoute: AppContentBundlesIdRoute,
