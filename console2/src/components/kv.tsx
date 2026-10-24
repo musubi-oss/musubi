@@ -5,7 +5,7 @@ import { isValidElement, type ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 
 export function KvGrid({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cn('grid gap-x-8 gap-y-1 sm:grid-cols-2 xl:grid-cols-3', className)}>{children}</div>
+  return <div className={cn('grid grid-cols-1 gap-x-8 gap-y-1 sm:grid-cols-2 xl:grid-cols-3', className)}>{children}</div>
 }
 
 export function Kv({
