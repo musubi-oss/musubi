@@ -23,14 +23,14 @@ onMounted(() => { window.addEventListener('keydown', key); window.addEventListen
   <div class="top">
     <div class="prog" :class="{ on: net.busy > 0 }"></div>
     <div class="brand">
-      <div class="logo"><i></i>musubi</div>
+      <router-link to="/" class="logo"><i></i>musubi</router-link>
       <span class="proj">{{ s.node?.project || 'default' }}</span>
       <span class="badge">{{ s.node?.environment || 'env' }}</span>
       <span class="env"><span class="dot" :class="{ off: !s.authed }"></span>{{ s.node?.name || 'node' }}</span>
       <div class="me">{{ s.node?.region || '' }} <b>{{ s.node?.roles?.join(' · ') }}</b> · <a href="#" @click.prevent="logout">sign out</a></div>
     </div>
     <div class="nav">
-      <router-link v-for="x in sections" :key="x.id" :to="'/' + x.id">{{ x.title }}</router-link>
+      <router-link to="/" exact-active-class="router-link-active">Overview</router-link><router-link v-for="x in sections" :key="x.id" :to="'/' + x.id">{{ x.title }}</router-link>
       <span class="keys" title="keyboard: / search · r refresh · Esc close">/ · r · Esc</span>
     </div>
   </div>

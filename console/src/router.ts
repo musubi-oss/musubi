@@ -19,7 +19,7 @@ export const router = createRouter({
   history: createWebHistory('/console/'),
   routes: [
     { path: '/login', component: () => import('./pages/Login.vue'), meta: { public: true } },
-    { path: '/', redirect: '/players' },
+    { path: '/', component: () => import('./pages/Dashboard.vue') },
     { path: '/players', component: () => import('./pages/players/Index.vue'), children: [
       { path: '', component: () => import('./pages/players/Accounts.vue') },
       { path: 'accounts/:id', component: () => import('./pages/players/Account.vue') },
