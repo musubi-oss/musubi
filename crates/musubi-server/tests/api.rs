@@ -48247,4 +48247,32 @@ async fn operator_password_login_lockout_logout_and_reset() {
         .unwrap();
     assert_eq!(m["has_password"], true);
     assert!(m["last_login_at"].is_string(), "{m}");
+    // stored as argon2id; a legacy bcrypt hash still logs in and is upgraded to argon2id
+    let url = std::env::var("MUSUBI_TEST_DATABASE_URL").unwrap();
+    let db = sqlx::PgPool::connect(&url).await.unwrap();
+    let opid: uuid::Uuid = id.parse().unwrap();
+    let stored = || async {
+        sqlx::query_scalar::<_, String>("select password_hash from musubi.operators where id = $1")
+            .bind(opid)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+    };
+    assert!(stored().await.starts_with("$argon2id$"));
+    sqlx::query("update musubi.operators set password_hash = $2 where id = $1")
+        .bind(opid)
+        .bind(bcrypt::hash("legacy-bcrypt-pw", 4).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        login,
+        "",
+        Some(json!({"email": email, "password": "legacy-bcrypt-pw"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(stored().await.starts_with("$argon2id$"));
 }

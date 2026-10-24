@@ -19,7 +19,6 @@ use crate::keys::{Caller, Role};
 const SESSION_TTL: time::Duration = time::Duration::hours(12);
 const MAX_FAILURES: i32 = 5;
 const LOCK_FOR: time::Duration = time::Duration::minutes(15);
-const BCRYPT_COST: u32 = 10;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -40,8 +39,27 @@ fn check_password(p: &str) -> Result<()> {
     Ok(())
 }
 
-fn hash_password(p: &str) -> Result<String> {
-    bcrypt::hash(p, BCRYPT_COST).map_err(|e| Error::internal(std::io::Error::other(e.to_string())))
+/// argon2id (the same hasher as player passwords, `musubi_auth::password`).
+async fn hash_password(p: &str) -> Result<String> {
+    musubi_auth::password::hash(p.to_string()).await
+}
+
+async fn verify_password(p: &str, hash: &str) -> bool {
+    musubi_auth::password::verify(p.to_string(), hash.to_string())
+        .await
+        .unwrap_or(false)
+}
+
+/// A real argon2id hash to verify against for unknown e-mails, so timing does not reveal membership.
+async fn dummy_hash() -> &'static str {
+    static DUMMY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    DUMMY
+        .get_or_init(|| async {
+            musubi_auth::password::hash("musubi-timing-dummy".into())
+                .await
+                .unwrap_or_default()
+        })
+        .await
 }
 
 fn rfc(t: OffsetDateTime) -> String {
@@ -90,10 +108,7 @@ async fn login(
     .map_err(Error::internal)?;
     let Some(r) = row else {
         // same cost as a real check so timing does not reveal membership
-        let _ = bcrypt::verify(
-            &b.password,
-            "$2b$10$CwTycUXWue0Thq9StjUM0uJ8ZbQ6WIu1gQ1UyG5nQhJXzOeDqeEqS",
-        );
+        let _ = verify_password(&b.password, dummy_hash().await).await;
         return Err(bad().into());
     };
     if let Some(until) = r.6 {
@@ -110,7 +125,17 @@ async fn login(
         )
         .into());
     };
-    let ok = bcrypt::verify(&b.password, hash).unwrap_or(false);
+    let ok = verify_password(&b.password, hash).await;
+    if ok && !hash.starts_with("$argon2id$") {
+        // legacy bcrypt hash from before argon2id: upgrade it now that we know the password
+        let h = hash_password(&b.password).await?;
+        sqlx::query("update musubi.operators set password_hash = $2 where id = $1")
+            .bind(r.0)
+            .bind(h)
+            .execute(&s.db)
+            .await
+            .map_err(Error::internal)?;
+    }
     if !ok {
         let failures = r.5 + 1;
         let lock = if failures >= MAX_FAILURES {
@@ -220,14 +245,14 @@ async fn change_password(
     .await
     .map_err(Error::internal)?;
     let r = row.ok_or_else(|| Error::NotFound("operator".into()))?;
-    let ok =
-        r.4.as_deref()
-            .map(|h| bcrypt::verify(&b.current, h).unwrap_or(false))
-            .unwrap_or(false);
+    let ok = match r.4.as_deref() {
+        Some(h) => verify_password(&b.current, h).await,
+        None => false,
+    };
     if !ok {
         return Err(Error::Unauthenticated("current password is wrong".into()).into());
     }
-    let h = hash_password(&b.password)?;
+    let h = hash_password(&b.password).await?;
     sqlx::query(
         "update musubi.operators set password_hash = $2, password_set_at = now() where id = $1",
     )
@@ -282,7 +307,7 @@ async fn create(
     if exists {
         return Err(Error::Conflict(format!("{email} is already a member")).into());
     }
-    let h = hash_password(&b.password)?;
+    let h = hash_password(&b.password).await?;
     let id = Uuid::now_v7();
     sqlx::query(
         "insert into musubi.operators (id, email, name, role, password_hash, password_set_at) values ($1, $2, $3, $4, $5, now())",
@@ -317,7 +342,7 @@ async fn reset_password(
         return Err(Error::PermissionDenied("admin key required".into()).into());
     }
     check_password(&b.password)?;
-    let h = hash_password(&b.password)?;
+    let h = hash_password(&b.password).await?;
     let n = sqlx::query(
         "update musubi.operators set password_hash = $2, password_set_at = now(), failed_logins = 0, locked_until = null where id = $1",
     )
