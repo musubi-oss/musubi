@@ -1015,14 +1015,7 @@ impl StorageService {
         let (filter, ops) = schema::split_where(filter)?;
         let limit = limit.clamp(1, 100);
         let after_key = cursor.map(decode_cursor).transpose()?;
-        let prefix_like = key_prefix.filter(|p| !p.is_empty()).map(|p| {
-            format!(
-                "{}%",
-                p.replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-            )
-        });
+        let prefix_like = like_prefix(key_prefix);
         // Users list their own objects by default; another owner's collection shows public objects only.
         let (owner_id, min_read): (Option<Uuid>, i16) = match (caller, owner_id) {
             (Caller::Server, o) => (o, 0),

@@ -142,8 +142,9 @@ impl AppleStoreClient {
         let res = self
             .http
             .get(format!(
-                "{}/inApps/v1/transactions/{transaction_id}",
-                self.url
+                "{}/inApps/v1/transactions/{}",
+                self.url,
+                crate::path_segment(transaction_id)
             ))
             .bearer_auth(self.auth_jwt()?)
             .send()
@@ -293,8 +294,10 @@ impl GooglePlayClient {
         let res = self
             .http
             .get(format!(
-                "{}/androidpublisher/v3/applications/{}/purchases/subscriptionsv2/tokens/{purchase_token}",
-                self.url, self.package_name
+                "{}/androidpublisher/v3/applications/{}/purchases/subscriptionsv2/tokens/{}",
+                self.url,
+                self.package_name,
+                crate::path_segment(purchase_token)
             ))
             .bearer_auth(&token)
             .send()
@@ -347,8 +350,11 @@ impl GooglePlayClient {
         let res = self
             .http
             .get(format!(
-                "{}/androidpublisher/v3/applications/{}/purchases/products/{product_id}/tokens/{purchase_token}",
-                self.url, self.package_name
+                "{}/androidpublisher/v3/applications/{}/purchases/products/{}/tokens/{}",
+                self.url,
+                self.package_name,
+                crate::path_segment(product_id),
+                crate::path_segment(purchase_token)
             ))
             .bearer_auth(token)
             .send()
@@ -780,6 +786,9 @@ fn denied(what: &str) -> Error {
     Error::PermissionDenied(format!("apple: {what}"))
 }
 
+/// Longest `x5c` chain we are willing to parse (Apple sends leaf + intermediate + root).
+const MAX_X5C_CERTS: usize = 10;
+
 /// Verify an App Store Server API JWS (`signedTransactionInfo`, notifications): the `x5c` chain
 /// must lead to `root_der`, every certificate must be valid at `now`, the leaf must carry Apple's
 /// receipt-signing extension, and the ES256 signature must verify with the leaf key.
@@ -802,6 +811,9 @@ pub fn verify_apple_jws(jws: &str, root_der: &[u8], now: OffsetDateTime) -> Resu
         .as_array()
         .filter(|a| a.len() >= 2)
         .ok_or_else(|| denied("x5c chain missing"))?;
+    if x5c.len() > MAX_X5C_CERTS {
+        return Err(denied("x5c chain too long"));
+    }
     let ders: Vec<Vec<u8>> = x5c
         .iter()
         .map(|c| {
@@ -862,6 +874,7 @@ pub fn verify_apple_jws(jws: &str, root_der: &[u8], now: OffsetDateTime) -> Resu
 
 #[derive(Debug, Clone)]
 pub struct SteamInitTxn {
+    /// Order id chosen by Musubi; Steam requires it to be unique per app.
     pub order_id: i64,
     pub steam_id: String,
     pub item_id: String,
@@ -870,6 +883,20 @@ pub struct SteamInitTxn {
     pub description: String,
     pub language: String,
     pub currency: String,
+}
+
+/// Steam's `amount[n]` is the line total in the currency's minor unit; both factors come from
+/// the game server, but a product misconfiguration must fail loudly instead of wrapping around
+/// into a negative or tiny charge.
+fn steam_line_amount(amount_cents: i64, quantity: i64) -> Result<i64> {
+    if amount_cents < 0 || quantity <= 0 {
+        return Err(Error::InvalidArgument(
+            "steam: amount_cents must be ≥ 0 and quantity ≥ 1".into(),
+        ));
+    }
+    amount_cents
+        .checked_mul(quantity)
+        .ok_or_else(|| Error::InvalidArgument("steam: amount_cents × quantity overflows".into()))
 }
 
 /// Steamworks Web API microtransactions: InitTxn → (user authorizes in the overlay) →
@@ -943,6 +970,7 @@ impl SteamClient {
 
     /// Starts an order; returns Steam's transaction id. The user must then authorize it.
     pub async fn init_txn(&self, t: &SteamInitTxn) -> Result<String> {
+        let amount = steam_line_amount(t.amount_cents, t.quantity)?;
         let p = self
             .post(
                 "InitTxn",
@@ -957,7 +985,7 @@ impl SteamClient {
                     ("currency", t.currency.clone()),
                     ("itemid[0]", t.item_id.clone()),
                     ("qty[0]", t.quantity.to_string()),
-                    ("amount[0]", (t.amount_cents * t.quantity).to_string()),
+                    ("amount[0]", amount.to_string()),
                     ("description[0]", t.description.chars().take(128).collect()),
                 ],
             )
@@ -1002,5 +1030,42 @@ impl SteamClient {
             )));
         }
         Self::params(res.json().await.map_err(Error::internal)?)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn steam_line_amount_is_checked() {
+        assert_eq!(steam_line_amount(499, 3).unwrap(), 1497);
+        assert_eq!(steam_line_amount(0, 1).unwrap(), 0);
+        assert!(steam_line_amount(i64::MAX, 2).is_err());
+        assert!(steam_line_amount(-1, 1).is_err());
+        assert!(steam_line_amount(100, 0).is_err());
+        assert!(steam_line_amount(100, -1).is_err());
+    }
+
+    #[test]
+    fn store_ids_cannot_escape_the_url_path() {
+        let enc = crate::path_segment("../../v2/x?y=1#z");
+        assert!(!enc.contains('/') && !enc.contains('?') && !enc.contains('#'));
+        assert_eq!(enc, "..%2F..%2Fv2%2Fx%3Fy%3D1%23z");
+        assert_eq!(crate::path_segment("2000000123456789"), "2000000123456789");
+        assert_eq!(crate::path_segment("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(crate::path_segment("Ω"), "%CE%A9");
+    }
+
+    #[test]
+    fn apple_jws_rejects_oversized_x5c() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"alg": "ES256", "x5c": vec!["AA"; MAX_X5C_CERTS + 1]}).to_string(),
+        );
+        let jws = format!("{header}.e30.AA");
+        let err = verify_apple_jws(&jws, &[], time::OffsetDateTime::now_utc())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x5c chain too long"), "{err}");
     }
 }

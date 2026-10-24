@@ -560,13 +560,28 @@ impl wit::musubi::runtime::host::Host for State {
     }
 
     fn log(&mut self, level: u8, msg: String) {
-        let module = self.module.clone();
-        match level {
-            0 => tracing::error!(module, "{msg}"),
-            1 => tracing::warn!(module, "{msg}"),
-            2 => tracing::info!(module, "{msg}"),
-            _ => tracing::debug!(module, "{msg}"),
-        }
+        guest_log(&self.module, level, &msg);
+    }
+}
+
+/// Longest guest log line we forward; anything beyond is cut at a char boundary so a module
+/// cannot push multi-megabyte lines into the log pipeline on every call.
+const MAX_GUEST_LOG_CHARS: usize = 4096;
+
+fn clip_log(msg: &str) -> &str {
+    match msg.char_indices().nth(MAX_GUEST_LOG_CHARS) {
+        Some((i, _)) => &msg[..i],
+        None => msg,
+    }
+}
+
+fn guest_log(module: &str, level: u8, msg: &str) {
+    let msg = clip_log(msg);
+    match level {
+        0 => tracing::error!(module, "{msg}"),
+        1 => tracing::warn!(module, "{msg}"),
+        2 => tracing::info!(module, "{msg}"),
+        _ => tracing::debug!(module, "{msg}"),
     }
 }
 
@@ -686,13 +701,8 @@ impl Runtime {
                 "log",
                 |mut caller: Caller<'_, State>, level: i32, ptr: i32, len: i32| {
                     let msg = read_string(&mut caller, ptr, len).unwrap_or_default();
-                    let module = caller.data().module.clone();
-                    match level {
-                        0 => tracing::error!(module, "{msg}"),
-                        1 => tracing::warn!(module, "{msg}"),
-                        2 => tracing::info!(module, "{msg}"),
-                        _ => tracing::debug!(module, "{msg}"),
-                    }
+                    let level = u8::try_from(level).unwrap_or(u8::MAX);
+                    guest_log(&caller.data().module, level, &msg);
                 },
             )
             .map_err(Error::internal)?;
@@ -1118,6 +1128,17 @@ impl Runtime {
     fn trap_error(id: &str, store: &mut Store<State>, trap: wasmtime::Error) -> Error {
         if let Some(msg) = store.data_mut().error.take() {
             return Error::InvalidArgument(msg);
+        }
+        // Wasmtime reports resource traps as typed `Trap` values; the text match below stays as
+        // a fallback for traps wrapped by the component-model bindings.
+        match trap.root_cause().downcast_ref::<wasmtime::Trap>() {
+            Some(wasmtime::Trap::OutOfFuel) => {
+                return Error::ResourceExhausted(format!("rpc {id}: fuel exhausted"))
+            }
+            Some(wasmtime::Trap::Interrupt) => {
+                return Error::ResourceExhausted(format!("rpc {id}: timed out"))
+            }
+            _ => {}
         }
         let text = trap.to_string();
         if text.contains("fuel") {
@@ -1833,5 +1854,41 @@ mod component_tests {
             calls[1],
             json!({ "__module": "kv", "op": "storage.read", "collection": "c", "key": "k", "owner_id": null })
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn guest_log_lines_are_clipped_at_char_boundaries() {
+        let short = "hello";
+        assert_eq!(clip_log(short), short);
+        let long = "й".repeat(MAX_GUEST_LOG_CHARS + 100);
+        let clipped = clip_log(&long);
+        assert_eq!(clipped.chars().count(), MAX_GUEST_LOG_CHARS);
+        assert!(long.starts_with(clipped));
+    }
+
+    #[test]
+    fn resource_traps_are_classified_by_type() {
+        let rt = Runtime::new(Limits::default()).unwrap();
+        let mut store = rt.new_store("t", &CallContext::default()).unwrap();
+        let fuel: wasmtime::Error = wasmtime::Trap::OutOfFuel.into();
+        assert!(matches!(
+            Runtime::trap_error("x", &mut store, fuel),
+            Error::ResourceExhausted(m) if m.contains("fuel")
+        ));
+        let epoch: wasmtime::Error = wasmtime::Trap::Interrupt.into();
+        assert!(matches!(
+            Runtime::trap_error("x", &mut store, epoch),
+            Error::ResourceExhausted(m) if m.contains("timed out")
+        ));
+        let other = wasmtime::Error::msg("unreachable executed");
+        assert!(matches!(
+            Runtime::trap_error("x", &mut store, other),
+            Error::Internal(_)
+        ));
     }
 }

@@ -9,6 +9,16 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_INDEXES: usize = 16;
 pub const MAX_WHERE_OPS: usize = 8;
+/// Nesting cap shared by schema compilation and validation.
+const MAX_SCHEMA_DEPTH: usize = 64;
+/// Compiled-size cap for `pattern` regexes (operator-defined, but compiled on every write).
+const PATTERN_SIZE_LIMIT: usize = 1 << 18;
+
+fn compile_pattern(p: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(p)
+        .size_limit(PATTERN_SIZE_LIMIT)
+        .build()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CollectionSchema {
@@ -275,6 +285,15 @@ fn parse_cond(it: &Value, group: u32, alt: u32) -> Result<WhereOp> {
         }
         Ok(s.to_string())
     };
+    // Postgres' ARE engine is linear except for back-references, which make it backtrack
+    // exponentially; a player-supplied `\1` could pin a backend for minutes.
+    let regex = |v: &Value| -> Result<String> {
+        let s = text(v)?;
+        if has_backreference(&s) {
+            return Err(bad());
+        }
+        Ok(s)
+    };
     let (op, kind, value): (&'static str, WhereKind, String) = match op_s {
         "=" | "==" | "!=" | "<" | "<=" | ">" | ">=" => {
             let op = match op_s {
@@ -318,8 +337,8 @@ fn parse_cond(it: &Value, group: u32, alt: u32) -> Result<WhereOp> {
             WhereKind::Like,
             format!("{}%", escape_like(&text(v)?)),
         ),
-        "regex" | "~" => ("~", WhereKind::Regex, text(v)?),
-        "iregex" | "~*" => ("~*", WhereKind::IRegex, text(v)?),
+        "regex" | "~" => ("~", WhereKind::Regex, regex(v)?),
+        "iregex" | "~*" => ("~*", WhereKind::IRegex, regex(v)?),
         "exists" => (
             "",
             WhereKind::Exists,
@@ -359,6 +378,13 @@ fn parse_cond(it: &Value, group: u32, alt: u32) -> Result<WhereOp> {
         group,
         alt,
     })
+}
+
+/// `\1`..`\9` anywhere in a POSIX regex (a `\\1` literal is rejected too; acceptable loss).
+fn has_backreference(re: &str) -> bool {
+    re.as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'\\' && w[1].is_ascii_digit())
 }
 
 /// SQL expression of one condition with its value bound as `$p`.
@@ -624,7 +650,14 @@ const TYPES: &[&str] = &[
 /// Reject unknown keywords / malformed constraints up front so a typo cannot silently validate
 /// everything (or nothing).
 fn compile(root: &Value, s: &Value, at: &str) -> Result<()> {
+    compile_at(root, s, at, 0)
+}
+
+fn compile_at(root: &Value, s: &Value, at: &str, depth: usize) -> Result<()> {
     let bad = |m: String| Error::InvalidArgument(format!("{at}: {m}"));
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(bad(format!("schema nested deeper than {MAX_SCHEMA_DEPTH}")));
+    }
     let obj = match s {
         Value::Null => return Ok(()),
         Value::Bool(_) => return Ok(()),
@@ -651,18 +684,18 @@ fn compile(root: &Value, s: &Value, at: &str) -> Result<()> {
                     return Err(bad(format!("{k} must be an object")));
                 };
                 for (name, sub) in m {
-                    compile(root, sub, &format!("{at}.{k}.{name}"))?;
+                    compile_at(root, sub, &format!("{at}.{k}.{name}"), depth + 1)?;
                 }
             }
             "items" | "additionalProperties" | "not" => {
-                compile(root, v, &format!("{at}.{k}"))?;
+                compile_at(root, v, &format!("{at}.{k}"), depth + 1)?;
             }
             "anyOf" | "oneOf" | "allOf" => {
                 let Some(a) = v.as_array() else {
                     return Err(bad(format!("{k} must be an array")));
                 };
                 for (i, sub) in a.iter().enumerate() {
-                    compile(root, sub, &format!("{at}.{k}[{i}]"))?;
+                    compile_at(root, sub, &format!("{at}.{k}[{i}]"), depth + 1)?;
                 }
             }
             "required" => {
@@ -695,7 +728,7 @@ fn compile(root: &Value, s: &Value, at: &str) -> Result<()> {
                 let p = v
                     .as_str()
                     .ok_or_else(|| bad("pattern must be a string".into()))?;
-                regex::Regex::new(p).map_err(|e| bad(format!("bad pattern: {e}")))?;
+                compile_pattern(p).map_err(|e| bad(format!("bad pattern: {e}")))?;
             }
             "$ref" => {
                 let r = v
@@ -749,7 +782,7 @@ fn is_type(v: &Value, t: &str) -> bool {
 }
 
 fn check(root: &Value, s: &Value, v: &Value, at: &str, errs: &mut Vec<String>, depth: usize) {
-    if depth > 64 || errs.len() >= 8 {
+    if depth > MAX_SCHEMA_DEPTH || errs.len() >= 8 {
         return;
     }
     let obj = match s {
@@ -818,7 +851,7 @@ fn check(root: &Value, s: &Value, v: &Value, at: &str, errs: &mut Vec<String>, d
             }
         }
         if let Some(p) = obj.get("pattern").and_then(Value::as_str) {
-            if let Ok(re) = regex::Regex::new(p) {
+            if let Ok(re) = compile_pattern(p) {
                 if !re.is_match(sv) {
                     push_err(errs, at, format!("does not match {p:?}"));
                 }
@@ -837,7 +870,10 @@ fn check(root: &Value, s: &Value, v: &Value, at: &str, errs: &mut Vec<String>, d
             }
         }
         if obj.get("uniqueItems") == Some(&Value::Bool(true)) {
-            let unique = arr.iter().enumerate().all(|(i, a)| !arr[..i].contains(a));
+            // `Value` serializes objects with sorted keys, so the JSON text is a canonical form
+            // and this stays O(n) for the 1 MiB arrays a player may submit.
+            let mut seen = std::collections::HashSet::with_capacity(arr.len());
+            let unique = arr.iter().all(|a| seen.insert(a.to_string()));
             if !unique {
                 push_err(errs, at, "items must be unique".into());
             }
@@ -1056,5 +1092,72 @@ mod tests {
             }
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn deeply_nested_schema_is_rejected() {
+        // serde_json stops parsing at 128 levels, so 100 is the deepest a request can carry;
+        // (deeper literals also overflow the stack when dropped, so keep the fixture small)
+        let mut s = json!({"type": "string"});
+        for _ in 0..100 {
+            s = json!({"type": "object", "properties": {"a": s}});
+        }
+        let e = compile_schema(&s).unwrap_err().to_string();
+        assert!(e.contains("nested deeper"), "{e}");
+        let mut s = json!({"type": "string"});
+        for _ in 0..100 {
+            s = json!({"anyOf": [s]});
+        }
+        assert!(compile_schema(&s).is_err());
+        let mut s = json!({"type": "string"});
+        for _ in 0..40 {
+            s = json!({"items": s});
+        }
+        assert!(compile_schema(&s).is_ok());
+    }
+
+    #[test]
+    fn unique_items_is_linear_and_order_insensitive_for_objects() {
+        let s = json!({"type": "array", "uniqueItems": true});
+        let big: Vec<Value> = (0..200_000).map(|i| json!(i)).collect();
+        let t = std::time::Instant::now();
+        validate(&s, &Value::Array(big.clone())).unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
+        let mut dup = big;
+        dup.push(json!(7));
+        assert!(validate(&s, &Value::Array(dup)).is_err());
+        assert!(validate(&s, &json!([{"a": 1, "b": 2}, {"b": 2, "a": 1}])).is_err());
+        assert!(validate(&s, &json!([1, 1.0, "1"])).is_ok());
+    }
+
+    #[test]
+    fn where_regex_rejects_backreferences() {
+        for bad in [r"(a)\1", r"^(.*)\1$", r"x\9"] {
+            assert!(
+                split_where(Some(&json!({"$where": [["name", "~", bad]]}))).is_err(),
+                "{bad}"
+            );
+            assert!(split_where(Some(&json!({"$where": [["name", "iregex", bad]]}))).is_err());
+        }
+        let (_, ops) = split_where(Some(&json!({"$where": [["name", "~", "^a.*\\d+$"]]}))).unwrap();
+        assert_eq!(ops[0].kind, WhereKind::Regex);
+        assert!(has_backreference(r"\1") && !has_backreference(r"\d"));
+    }
+
+    #[test]
+    fn pattern_size_is_capped() {
+        let huge = format!("{}{{1000}}{{1000}}", "a");
+        assert!(compile_schema(&json!({"pattern": huge})).is_err());
+        assert!(compile_schema(&json!({"pattern": "^[a-z]{1,16}$"})).is_ok());
     }
 }

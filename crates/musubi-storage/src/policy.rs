@@ -268,17 +268,20 @@ impl Parser {
     }
 
     fn unary(&mut self) -> std::result::Result<Expr, String> {
-        match self.peek() {
-            Some(Tok::Op("!")) => {
-                self.pos += 1;
-                Ok(Expr::Unary("!", Box::new(self.unary()?)))
-            }
-            Some(Tok::Op("-")) => {
-                self.pos += 1;
-                Ok(Expr::Unary("-", Box::new(self.unary()?)))
-            }
-            _ => self.primary(),
+        let op = match self.peek() {
+            Some(Tok::Op(op @ ("!" | "-"))) => *op,
+            _ => return self.primary(),
+        };
+        self.pos += 1;
+        // Prefix operators nest outside `expr`, so they need their own share of the depth cap
+        // (`!!!!…true` must not recurse once per character of a 4 KiB expression).
+        self.depth += 1;
+        if self.depth > 64 {
+            return Err("expression too deep".into());
         }
+        let inner = self.unary()?;
+        self.depth -= 1;
+        Ok(Expr::Unary(op, Box::new(inner)))
     }
 
     fn primary(&mut self) -> std::result::Result<Expr, String> {
@@ -706,5 +709,20 @@ mod tests {
         assert!(!allows("value.n / 0 == 1", &e));
         assert!(!allows("!value.n", &e));
         assert!(!allows("matches(key, '(')", &e));
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn prefix_operator_chains_are_depth_limited() {
+        let e = parse(&format!("{}true", "!".repeat(4000))).unwrap_err();
+        assert!(e.contains("too deep"), "{e}");
+        assert!(parse(&format!("{}1", "-".repeat(4000))).is_err());
+        assert!(parse("!!true").is_ok());
+        assert!(parse("-(-1)").is_ok());
+        assert!(parse(&format!("{}true", "!".repeat(60))).is_ok());
     }
 }

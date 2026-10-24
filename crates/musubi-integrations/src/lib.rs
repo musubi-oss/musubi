@@ -20,12 +20,42 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+/// Upper bound on the part of an upstream error body we keep in errors and logs.
+const ERROR_BODY_CHARS: usize = 512;
+
+/// Outbound HTTP client for server-to-server calls: every request has an overall deadline so a
+/// stalled upstream cannot pin request handlers (and their DB connections) forever.
+pub(crate) fn http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(Error::internal)
+}
+
+/// Percent-encode a caller-supplied value for use as a single URL path segment (RFC 3986
+/// unreserved characters pass through), so ids cannot inject `/`, `?`, `#` or `..` into
+/// upstream request paths.
+pub(crate) fn path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 async fn check(res: reqwest::Response, what: &str) -> Result<Value> {
     let status = res.status().as_u16();
     let text = res.text().await.map_err(Error::internal)?;
     if !(200..300).contains(&status) {
+        let body: String = text.chars().take(ERROR_BODY_CHARS).collect();
         return Err(Error::Internal(format!(
-            "{what}: upstream {status}: {text}"
+            "{what}: upstream {status}: {body}"
         )));
     }
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
@@ -56,7 +86,7 @@ pub struct ZanshinClient {
 impl ZanshinClient {
     pub fn new(url: &str, server_key: &str) -> Arc<Self> {
         Arc::new(Self {
-            http: reqwest::Client::new(),
+            http: http_client(Duration::from_secs(10)).unwrap_or_default(),
             base: url.trim_end_matches('/').to_string(),
             key: server_key.to_string(),
             queue: Mutex::new(Vec::new()),
@@ -175,7 +205,7 @@ pub struct AurixClient {
 impl AurixClient {
     pub fn new(url: &str, api_key: &str) -> Arc<Self> {
         Arc::new(Self {
-            http: reqwest::Client::new(),
+            http: http_client(Duration::from_secs(10)).unwrap_or_default(),
             base: url.trim_end_matches('/').to_string(),
             key: api_key.to_string(),
         })

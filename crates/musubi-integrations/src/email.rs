@@ -68,14 +68,18 @@ impl Mailer {
         let timeout = Duration::from_secs(self.cfg.timeout_secs.max(1));
         tokio::time::timeout(timeout, self.send_inner(mail))
             .await
-            .map_err(|_| Error::Unavailable(format!("smtp {}: timed out", self.cfg.host)))?
+            .map_err(|_| {
+                tracing::warn!(host = %self.cfg.host, port = self.cfg.port, "smtp: timed out");
+                Error::Unavailable("smtp: timed out".into())
+            })?
     }
 
     async fn send_inner(&self, mail: Mail<'_>) -> Result<()> {
         let addr = format!("{}:{}", self.cfg.host, self.cfg.port);
-        let tcp = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| Error::Unavailable(format!("smtp {addr}: connect: {e}")))?;
+        let tcp = TcpStream::connect(&addr).await.map_err(|e| {
+            tracing::warn!(%addr, error = %e, "smtp: connect failed");
+            Error::Unavailable("smtp: connect failed".into())
+        })?;
         let message = self.message(&mail);
         match self.cfg.tls.as_str() {
             "none" => {
@@ -109,7 +113,10 @@ impl Mailer {
         tokio_rustls::TlsConnector::from(self.tls.clone())
             .connect(name, tcp)
             .await
-            .map_err(|e| Error::Unavailable(format!("smtp {}: tls: {e}", self.cfg.host)))
+            .map_err(|e| {
+                tracing::warn!(host = %self.cfg.host, error = %e, "smtp: tls handshake failed");
+                Error::Unavailable("smtp: tls handshake failed".into())
+            })
     }
 
     /// EHLO → AUTH → MAIL/RCPT/DATA → QUIT on an established (plain or TLS) stream.
@@ -199,29 +206,33 @@ fn check_address(a: &str) -> Result<()> {
     }
 }
 
+/// RFC 5321 §4.5.3.1.5 allows 512 octets per reply line; be lenient but bounded so a hostile
+/// relay cannot make us buffer an endless line or an endless multi-line reply.
+const MAX_REPLY_LINE_BYTES: u64 = 2048;
+const MAX_REPLY_LINES: usize = 64;
+
 /// Read one (possibly multi-line) reply; Ok(text) when its code matches.
 async fn expect<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut BufReader<S>,
     code: u16,
 ) -> Result<String> {
     let mut text = String::new();
-    loop {
+    for _ in 0..MAX_REPLY_LINES {
         let mut line = String::new();
-        let n = s
+        let n = tokio::io::AsyncReadExt::take(&mut *s, MAX_REPLY_LINE_BYTES)
             .read_line(&mut line)
             .await
             .map_err(|e| Error::Unavailable(format!("smtp: read: {e}")))?;
         if n == 0 {
             return Err(Error::Unavailable("smtp: connection closed".into()));
         }
+        if !line.ends_with('\n') {
+            return Err(Error::Unavailable("smtp: reply line too long".into()));
+        }
         text.push_str(line.trim_end());
         text.push('\n');
-        if line.len() < 4 {
-            return Err(Error::Unavailable(format!("smtp: bad reply {line:?}")));
-        }
-        let got: u16 = line[..3]
-            .parse()
-            .map_err(|_| Error::Unavailable(format!("smtp: bad reply {line:?}")))?;
+        let got = reply_code(&line)
+            .ok_or_else(|| Error::Unavailable(format!("smtp: bad reply {line:?}")))?;
         if line.as_bytes()[3] == b'-' {
             continue;
         }
@@ -233,6 +244,17 @@ async fn expect<S: AsyncRead + AsyncWrite + Unpin>(
         }
         return Ok(text);
     }
+    Err(Error::Unavailable("smtp: reply has too many lines".into()))
+}
+
+/// The 3-digit reply code of a line that is at least `ddd<sep>` long; works on bytes so a reply
+/// starting with multi-byte UTF-8 cannot panic on a char boundary.
+fn reply_code(line: &str) -> Option<u16> {
+    let b = line.as_bytes();
+    if b.len() < 4 || !b[..3].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(u16::from(b[0] - b'0') * 100 + u16::from(b[1] - b'0') * 10 + u16::from(b[2] - b'0'))
 }
 
 async fn command<S: AsyncRead + AsyncWrite + Unpin>(
@@ -244,4 +266,56 @@ async fn command<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|e| Error::Unavailable(format!("smtp: write: {e}")))?;
     expect(s, code).await
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn reply(bytes: &[u8], code: u16) -> Result<String> {
+        let (client, mut server) = tokio::io::duplex(1 << 16);
+        server.write_all(bytes).await.unwrap();
+        drop(server);
+        let mut s = BufReader::new(client);
+        expect(&mut s, code).await
+    }
+
+    #[test]
+    fn reply_code_is_byte_safe() {
+        assert_eq!(reply_code("220 ok\r\n"), Some(220));
+        assert_eq!(reply_code("250-x\r\n"), Some(250));
+        assert_eq!(
+            reply_code("Ω\r\n"),
+            None,
+            "multi-byte prefix must not panic"
+        );
+        assert_eq!(reply_code("ΩΩ ok\r\n"), None);
+        assert_eq!(reply_code("22a ok\r\n"), None);
+        assert_eq!(reply_code("22\n"), None);
+    }
+
+    #[tokio::test]
+    async fn multiline_and_malformed_replies() {
+        let ok = reply(b"250-first\r\n250-second\r\n250 done\r\n", 250)
+            .await
+            .unwrap();
+        assert_eq!(ok, "250-first\n250-second\n250 done\n");
+        assert!(reply(b"550 nope\r\n", 250).await.is_err());
+        assert!(reply("ΩΩΩΩ\r\n".as_bytes(), 220).await.is_err());
+        assert!(reply(b"", 220).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn hostile_replies_are_bounded() {
+        let long = format!("220 {}\r\n", "x".repeat(MAX_REPLY_LINE_BYTES as usize));
+        let e = reply(long.as_bytes(), 220).await.unwrap_err().to_string();
+        assert!(e.contains("too long"), "{e}");
+        let endless = "250-again\r\n".repeat(MAX_REPLY_LINES + 1);
+        let e = reply(endless.as_bytes(), 250)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("too many lines"), "{e}");
+    }
 }

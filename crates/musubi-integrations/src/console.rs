@@ -59,19 +59,6 @@ pub struct ConsoleStoreClient {
     token: Mutex<Option<(String, Instant)>>,
 }
 
-fn pct(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 fn or_default(v: &str, d: &str) -> String {
     if v.is_empty() {
         d.to_string()
@@ -153,7 +140,7 @@ impl ConsoleStoreClient {
     }
 
     fn fill(&self, tpl: &str, user: &str, product: &str, entitlement: &str) -> String {
-        let enc = pct;
+        let enc = crate::path_segment;
         format!(
             "{}{}",
             self.cfg.url,
@@ -226,11 +213,19 @@ impl ConsoleStoreClient {
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         match status {
             200..=299 => Ok(v),
-            400 | 404 => Err(Error::NotFound(format!(
-                "{} {what}: {}",
-                self.platform.as_str(),
-                text.chars().take(200).collect::<String>()
-            ))),
+            400 | 404 => {
+                tracing::debug!(
+                    platform = self.platform.as_str(),
+                    what,
+                    status,
+                    body = %text.chars().take(200).collect::<String>(),
+                    "console store: entitlement not found"
+                );
+                Err(Error::NotFound(format!(
+                    "{} {what}: not found",
+                    self.platform.as_str()
+                )))
+            }
             401 | 403 => {
                 self.token.lock().await.take();
                 Err(Error::Internal(format!(
