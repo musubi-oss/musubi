@@ -53,8 +53,17 @@ pub struct Properties {
     pub numbers: HashMap<String, f64>,
 }
 
+/// Caps on a client-supplied query: every term is evaluated against every candidate per tick.
+pub const MAX_QUERY_LEN: usize = 2048;
+pub const MAX_QUERY_TERMS: usize = 64;
+
 impl Query {
     pub fn parse(src: &str) -> Result<Query> {
+        if src.len() > MAX_QUERY_LEN {
+            return Err(Error::InvalidArgument(format!(
+                "matchmaker query: longer than {MAX_QUERY_LEN} bytes"
+            )));
+        }
         let mut terms = Vec::new();
         let mut rest = src.trim();
         while !rest.is_empty() {
@@ -76,6 +85,11 @@ impl Query {
                 return Err(Error::InvalidArgument(
                     "matchmaker query: empty field".into(),
                 ));
+            }
+            if terms.len() >= MAX_QUERY_TERMS {
+                return Err(Error::InvalidArgument(format!(
+                    "matchmaker query: more than {MAX_QUERY_TERMS} terms"
+                )));
             }
             terms.push(Term {
                 mode,
@@ -257,5 +271,18 @@ mod tests {
             .matches(&props(&[], &[("rank", -3.0)])));
         assert!(Query::parse("+bad").is_err());
         assert!(Query::parse("+x:[1 TO").is_err());
+    }
+
+    #[test]
+    fn parse_caps_length_and_term_count() {
+        let many = (0..MAX_QUERY_TERMS)
+            .map(|i| format!("+p{i}:x"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(Query::parse(&many).unwrap().terms.len(), MAX_QUERY_TERMS);
+        let too_many = format!("{many} +extra:x");
+        assert!(Query::parse(&too_many).is_err());
+        let long = format!("+k:{}", "a".repeat(MAX_QUERY_LEN));
+        assert!(Query::parse(&long).is_err());
     }
 }

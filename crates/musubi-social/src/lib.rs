@@ -740,8 +740,13 @@ impl SocialService {
         Ok(r.map(|(id,)| AccountId(id)))
     }
 
+    /// Counts one use; a no-op once the code is exhausted or expired so `uses` never passes
+    /// `max_uses` when concurrent redeemers raced through `resolve_friend_code`.
     pub async fn consume_friend_code(&self, code: &str) -> Result<()> {
-        sqlx::query("update musubi.friend_codes set uses = uses + 1 where code = $1")
+        sqlx::query(
+            "update musubi.friend_codes set uses = uses + 1 where code = $1 \
+             and (expires_at is null or expires_at > now()) and (max_uses is null or uses < max_uses)",
+        )
             .bind(code)
             .execute(&self.db)
             .await

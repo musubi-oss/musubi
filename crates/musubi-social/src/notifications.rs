@@ -105,9 +105,17 @@ impl NotificationService {
                 ));
             }
             let id = Uuid::now_v7();
-            let expires = n.ttl_secs.filter(|t| *t > 0).map(|t| {
-                OffsetDateTime::now_utc() + time::Duration::seconds(t.min(i64::MAX as u64) as i64)
-            });
+            let expires = n
+                .ttl_secs
+                .filter(|t| *t > 0)
+                .map(|t| {
+                    OffsetDateTime::now_utc()
+                        .checked_add(time::Duration::seconds(
+                            i64::try_from(t).unwrap_or(i64::MAX),
+                        ))
+                        .ok_or_else(|| Error::InvalidArgument("ttl_secs too large".into()))
+                })
+                .transpose()?;
             let created = if n.persistent {
                 sqlx::query_scalar::<_, OffsetDateTime>(
                     "insert into musubi.notifications (id, user_id, sender_id, subject, content, code, expires_at) values ($1, $2, $3, $4, $5, $6, $7) returning created_at",

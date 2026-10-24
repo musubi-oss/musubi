@@ -16,3 +16,4 @@ time.workspace = true
 cron = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
+subtle = "2"

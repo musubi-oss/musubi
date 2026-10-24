@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 pub const MAX_CONTENT_BYTES: usize = 4096;
 pub const MAX_ROOM_NAME: usize = 64;
+/// Distinct emoji kinds one message may carry (new kinds past this are rejected).
+pub const MAX_REACTION_KINDS: i64 = 20;
 
 /// Canonical channel identity. Encodes as `"<kind>.<key>"`; kind numbers follow Nakama (2 room, 3 direct, 4 group).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -541,21 +543,50 @@ impl ChatService {
             ));
         }
         if add {
-            sqlx::query(
-                "insert into musubi.chat_reactions (message_id, account_id, emoji) values ($1, $2, $3)
+            // a new emoji kind is admitted only while the message has fewer than
+            // MAX_REACTION_KINDS distinct ones; joining an existing kind always works
+            let inserted = sqlx::query(
+                "insert into musubi.chat_reactions (message_id, account_id, emoji)
+                 select $1, $2, $3
+                 where exists(select 1 from musubi.chat_reactions where message_id = $1 and emoji = $3)
+                    or (select count(distinct emoji) from musubi.chat_reactions where message_id = $1) < $4
                  on conflict do nothing",
             )
+            .bind(id)
+            .bind(me.0)
+            .bind(emoji)
+            .bind(MAX_REACTION_KINDS)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+            if inserted == 0 {
+                let mine: bool = sqlx::query_scalar(
+                    "select exists(select 1 from musubi.chat_reactions where message_id = $1 and account_id = $2 and emoji = $3)",
+                )
+                .bind(id)
+                .bind(me.0)
+                .bind(emoji)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::internal)?;
+                if !mine {
+                    return Err(Error::ResourceExhausted(format!(
+                        "a message holds at most {MAX_REACTION_KINDS} distinct reactions"
+                    )));
+                }
+            }
         } else {
             sqlx::query(
                 "delete from musubi.chat_reactions where message_id = $1 and account_id = $2 and emoji = $3",
             )
+            .bind(id)
+            .bind(me.0)
+            .bind(emoji)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?;
         }
-        .bind(id)
-        .bind(me.0)
-        .bind(emoji)
-        .execute(&self.db)
-        .await
-        .map_err(Error::internal)?;
         let count: i64 = sqlx::query_scalar(
             "select count(*) from musubi.chat_reactions where message_id = $1 and emoji = $2",
         )
@@ -751,7 +782,9 @@ impl ChatService {
         until_secs: Option<u64>,
     ) -> Result<()> {
         if !matches!(kind, "mute" | "ban" | "shadow") {
-            return Err(Error::InvalidArgument("kind must be mute or ban".into()));
+            return Err(Error::InvalidArgument(
+                "kind must be mute, ban or shadow".into(),
+            ));
         }
         let until = until_secs.map(|s| {
             time::OffsetDateTime::now_utc()

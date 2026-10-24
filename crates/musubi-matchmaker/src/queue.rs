@@ -343,7 +343,7 @@ impl QueueConfig {
                     self.name
                 )));
             }
-            if t.count * t.size != self.max_count {
+            if t.count.checked_mul(t.size) != Some(self.max_count) {
                 return Err(Error::InvalidArgument(format!(
                     "queue {}: teams.count * teams.size must equal max_count",
                     self.name
@@ -887,6 +887,21 @@ mod tests {
         q.validate().unwrap();
         assert!(q.accepts(6) && q.accepts(8) && !q.accepts(7) && !q.accepts(12));
         q.min_count = 5;
+        assert!(q.validate().is_err());
+    }
+
+    #[test]
+    fn validate_teams_rejects_overflowing_product() {
+        let q = QueueConfig {
+            name: "huge".into(),
+            min_count: 2,
+            max_count: 2,
+            teams: Some(Teams {
+                count: usize::MAX,
+                size: 2,
+            }),
+            ..Default::default()
+        };
         assert!(q.validate().is_err());
     }
 }

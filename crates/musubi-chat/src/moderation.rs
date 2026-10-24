@@ -61,6 +61,8 @@ const FILTER_TTL: Duration = Duration::from_secs(30);
 /// this long (writes on this node drop the entry at once, other nodes see them within the TTL).
 const META_TTL: Duration = Duration::from_secs(2);
 const META_CAP: usize = 100_000;
+/// Reports one account may file per rolling hour (each snapshots channel history).
+pub const MAX_REPORTS_PER_HOUR: i64 = 20;
 
 struct Compiled {
     filter: Filter,
@@ -509,6 +511,18 @@ impl ChatService {
                 Uuid::parse_str(m).map_err(|_| Error::InvalidArgument("bad message_id".into()))
             })
             .transpose()?;
+        let recent: i64 = sqlx::query_scalar(
+            "select count(*) from musubi.chat_reports where reporter_id = $1 and created_at > now() - interval '1 hour'",
+        )
+        .bind(reporter.0)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::internal)?;
+        if recent >= MAX_REPORTS_PER_HOUR {
+            return Err(Error::ResourceExhausted(format!(
+                "at most {MAX_REPORTS_PER_HOUR} reports per hour"
+            )));
+        }
         let history = self
             .history(channel, REPORT_CONTEXT, false, None, None)
             .await

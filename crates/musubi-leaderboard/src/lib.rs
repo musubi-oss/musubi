@@ -401,15 +401,11 @@ pub fn window(
         .after(&now_c)
         .next()
         .ok_or_else(|| Error::InvalidArgument("schedule never fires".into()))?;
-    // cron 0.12 has no `before`; walk forward from a bounded start to find the latest fire <= now.
-    let mut prev: Option<chrono::DateTime<chrono_tz::Tz>> = None;
-    let probe = now_c - chrono::Duration::days(366 * 2);
-    for fire in sched.after(&probe) {
-        if fire > now_c {
-            break;
-        }
-        prev = Some(fire);
-    }
+    // latest fire <= now: the schedule iterator walks both ways, so step back once from one
+    // second past `now` (a forward walk from two years back is ~1M steps for `* * * * *`)
+    let prev = sched
+        .after(&(now_c + chrono::Duration::seconds(1)))
+        .next_back();
     let to_t = |d: chrono::DateTime<chrono_tz::Tz>| {
         OffsetDateTime::from_unix_timestamp(d.timestamp()).unwrap_or(OffsetDateTime::UNIX_EPOCH)
     };
@@ -839,7 +835,12 @@ impl LeaderboardService {
             .bind(bucket)
             .fetch_one(&mut *tx)
             .await
-            .map_err(Error::internal)?;
+            .map_err(|e| match &e {
+                sqlx::Error::Database(d) if d.code().as_deref() == Some("22003") => {
+                    Error::InvalidArgument("score out of range".into())
+                }
+                _ => Error::internal(e),
+            })?;
         let mut closed = false;
         if let Some(race) = &board.race {
             if race.reached(board.sort_order, row.3) {
@@ -1084,7 +1085,9 @@ impl LeaderboardService {
         let offset: i64 = match cursor {
             Some(c) => c
                 .parse()
-                .map_err(|_| Error::InvalidArgument("bad cursor".into()))?,
+                .ok()
+                .filter(|o: &i64| *o >= 0)
+                .ok_or_else(|| Error::InvalidArgument("bad cursor".into()))?,
             None => 0,
         };
         let order = match board.sort_order {
@@ -1578,6 +1581,41 @@ impl LeaderboardService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_previous_fire_is_latest_at_or_before_now() {
+        let at = |s: &str| {
+            OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+        };
+        // exactly on a fire: the window starts now and ends at the next fire
+        let (prev, next) = window(Some("0 0 * * *"), at("2024-03-10T00:00:00Z")).unwrap();
+        assert_eq!(prev, at("2024-03-10T00:00:00Z"));
+        assert_eq!(next, at("2024-03-11T00:00:00Z"));
+        // mid-window
+        let (prev, next) = window(Some("0 0 * * *"), at("2024-03-10T13:37:00Z")).unwrap();
+        assert_eq!(prev, at("2024-03-10T00:00:00Z"));
+        assert_eq!(next, at("2024-03-11T00:00:00Z"));
+        // zone-aware: local midnight in Tokyo is 15:00Z the day before
+        let (prev, next) = window(
+            Some("CRON_TZ=Asia/Tokyo 0 0 * * *"),
+            at("2024-03-10T13:37:00Z"),
+        )
+        .unwrap();
+        assert_eq!(prev, at("2024-03-09T15:00:00Z"));
+        assert_eq!(next, at("2024-03-10T15:00:00Z"));
+    }
+
+    #[test]
+    fn window_every_minute_is_cheap() {
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            let (prev, next) = window(Some("* * * * *"), now).unwrap();
+            assert!(prev <= now && next > now);
+            assert!(next - prev <= time::Duration::minutes(1));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     #[test]
     fn league_rules_overrides_score_targets_and_moves() {

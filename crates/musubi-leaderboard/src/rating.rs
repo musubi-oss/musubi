@@ -173,6 +173,9 @@ pub const GLICKO_SCALE: f64 = 173.7178;
 pub const OPENSKILL_MU: f64 = 25.0;
 pub const OPENSKILL_SIGMA: f64 = 25.0 / 3.0;
 const OPENSKILL_KAPPA: f64 = 0.0001;
+/// Bounds for one `apply` call (OpenSkill is O(teams² · players)).
+pub const MAX_RESULT_TEAMS: usize = 64;
+pub const MAX_RESULT_PLAYERS: usize = 256;
 /// OpenSkill μ → display: 25 ↦ 1500, one σ₀ (8.33) ↦ 500 points.
 const OPENSKILL_DISPLAY_PER_MU: f64 = 60.0;
 
@@ -544,9 +547,20 @@ impl RatingService {
 
     pub async fn upsert_queue(&self, c: UpsertRatingQueue) -> Result<RatingQueue> {
         crate::validate_id(&c.id)?;
-        if !(0.05..=2.0).contains(&c.params.glicko_tau) || c.params.elo_k <= 0.0 {
+        let p = &c.params;
+        if !(0.05..=2.0).contains(&p.glicko_tau) || !(p.elo_k.is_finite() && p.elo_k > 0.0) {
             return Err(Error::InvalidArgument(
                 "glicko_tau must be in 0.05..=2, elo_k > 0".into(),
+            ));
+        }
+        let finite_positive = |v: f64| v.is_finite() && v > 0.0;
+        if !finite_positive(p.placement_k_mult)
+            || !p.openskill_beta.is_none_or(finite_positive)
+            || !p.decay_points.is_finite()
+            || !p.decay_floor.is_none_or(f64::is_finite)
+        {
+            return Err(Error::InvalidArgument(
+                "placement_k_mult and openskill_beta must be finite and > 0, decay_points and decay_floor finite".into(),
             ));
         }
         if !(0.0..=1.0).contains(&c.params.season_carry) {
@@ -684,6 +698,13 @@ impl RatingService {
             return Err(Error::InvalidArgument(
                 "need at least two non-empty teams".into(),
             ));
+        }
+        if res.teams.len() > MAX_RESULT_TEAMS
+            || res.teams.iter().map(Vec::len).sum::<usize>() > MAX_RESULT_PLAYERS
+        {
+            return Err(Error::InvalidArgument(format!(
+                "at most {MAX_RESULT_TEAMS} teams and {MAX_RESULT_PLAYERS} players per result"
+            )));
         }
         let ranks: Vec<u32> = match &res.ranks {
             Some(r) if r.len() == res.teams.len() => r.clone(),

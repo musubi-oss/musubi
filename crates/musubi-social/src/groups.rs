@@ -868,7 +868,7 @@ impl GroupService {
         group: GroupId,
         name: &str,
     ) -> Result<Alliance> {
-        if name.is_empty() || name.len() > 64 {
+        if name.is_empty() || name.chars().count() > 64 {
             return Err(Error::InvalidArgument(
                 "alliance name must be 1..=64 chars".into(),
             ));
@@ -1161,7 +1161,7 @@ impl GroupService {
             if !(1..=7).contains(&r.rank) {
                 return Err(Error::InvalidArgument("rank must be 1..=7".into()));
             }
-            if r.name.is_empty() || r.name.len() > 32 {
+            if r.name.is_empty() || r.name.chars().count() > 32 {
                 return Err(Error::InvalidArgument(
                     "role name must be 1..=32 chars".into(),
                 ));
@@ -1206,6 +1206,7 @@ impl GroupService {
         if !(1..=7).contains(&rank) {
             return Err(Error::InvalidArgument("rank must be 1..=7".into()));
         }
+        check_users(users)?;
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         require_perm(&mut tx, group, me, perm::PROMOTE).await?;
         let my_rank: i16 = sqlx::query_scalar(

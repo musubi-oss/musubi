@@ -3,6 +3,7 @@
 use musubi_core::{AccountId, Error, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 
 use crate::{
@@ -584,7 +585,8 @@ impl TournamentService {
     ) -> Result<()> {
         let r = self.row(id).await?;
         if let Some(expected) = self.join_code(id).await? {
-            if code != Some(expected.as_str()) {
+            let ok = code.is_some_and(|c| bool::from(c.as_bytes().ct_eq(expected.as_bytes())));
+            if !ok {
                 return Err(Error::PermissionDenied(
                     "tournament is private: a join code is required".into(),
                 ));
