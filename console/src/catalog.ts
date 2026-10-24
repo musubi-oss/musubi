@@ -6,7 +6,9 @@
 export interface Act { label: string; method: 'POST' | 'PUT' | 'PATCH' | 'DELETE'; path: string; body?: Record<string, unknown>; confirm?: string; danger?: boolean; when?: (row: any) => boolean }
 /** Related lists shown as tabs on the generic detail page; `list` may use {id} and {field} placeholders from the record. */
 export interface DetailTab { id: string; title: string; list: string; rowsKey?: string; cols?: string[] }
-export interface Res { id: string; title: string; list: string; detail?: { tabs?: DetailTab[] }; /** rows are not records (metrics, log lines): no detail page */ noDetail?: boolean; items?: string; key?: string; rowsKey?: string; item?: string; create?: string; method?: 'POST' | 'PUT' | 'PATCH'; template?: Record<string, unknown>; cols?: string[]; group?: string; custom?: string; actions?: Act[]; pageActions?: Act[]; link?: (row: any) => string | null; newPath?: string }
+/** Server-side list filter rendered as a select; the value goes to the list endpoint as ?key=value and lives in the URL. */
+export interface Filter { key: string; label?: string; options: string[]; def?: string }
+export interface Res { id: string; title: string; list: string; detail?: { tabs?: DetailTab[] }; filters?: Filter[]; /** rows are not records (metrics, log lines): no detail page */ noDetail?: boolean; items?: string; key?: string; rowsKey?: string; item?: string; create?: string; method?: 'POST' | 'PUT' | 'PATCH'; template?: Record<string, unknown>; cols?: string[]; group?: string; custom?: string; actions?: Act[]; pageActions?: Act[]; link?: (row: any) => string | null; newPath?: string }
 export const catalog: Record<string, Res[]> = {
   players: [
     { id: 'accounts', title: 'Accounts', list: '/v1/admin/accounts', rowsKey: 'accounts', custom: 'accounts' },

@@ -15,6 +15,12 @@ const router = useRouter(); const route = useRoute()
 const pending = ref<{ act: Act; row: any; text: string } | null>(null)
 const data = ref<any>(null); const rows = ref<any[]>([]); const err = ref(''); const off = ref(''); const busy = ref(false)
 const q = ref(String(route.query.q ?? '')); const cursor = ref<string | null>(null); const stack = ref<string[]>([])
+const flt = ref<Record<string, string>>(Object.fromEntries((props.res.filters ?? []).map((f) => [f.key, String(route.query[f.key] ?? f.def ?? '')])))
+watch(flt, (f) => {
+  const patch: Record<string, string | undefined> = {}
+  for (const d of props.res.filters ?? []) patch[d.key] = f[d.key] && f[d.key] !== (d.def ?? '') ? f[d.key] : undefined
+  router.replace({ query: { ...route.query, ...patch } }); stack.value = []; load()
+}, { deep: true })
 const open = ref<any>(null); const edit = ref(''); const raw = ref(false); const creating = ref(false); const text = ref('')
 const cols = computed<Col[]>(() => {
   const keys = props.res.cols ?? (rows.value[0] ? Object.keys(rows.value[0]).slice(0, 7) : ['id'])
@@ -31,7 +37,7 @@ const isList = computed(() => Array.isArray(rows.value) && (rows.value.length > 
 async function load(c: string | null = null) {
   busy.value = true; err.value = ''; off.value = ''
   try {
-    const d = await get(props.res.list + qs({ q: q.value, cursor: c, limit: 50 }))
+    const d = await get(props.res.list + qs({ q: q.value, cursor: c, limit: 50, ...Object.fromEntries(Object.entries(flt.value).filter(([, v]) => v && v !== 'all')) }))
     data.value = d
     const list = Array.isArray(d) ? d : props.res.rowsKey ? d?.[props.res.rowsKey] : Object.values(d ?? {}).find(Array.isArray)
     rows.value = Array.isArray(list) ? list : []
@@ -109,6 +115,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
     <h2>{{ res.title }} <small v-if="isList">({{ shown.length !== rows.length ? shown.length + ' of ' : '' }}{{ rows.length }}{{ cursor ? '+' : '' }})</small></h2>
     <div class="tools" v-if="isList && !off && res.custom !== 'zanshin'">
       <input class="in" v-model="q" placeholder="filter — any field, space = and" @keyup.enter="load()" /><button class="btn s" v-if="q" @click="q = ''" title="clear">×</button>
+      <select class="sel" v-for="f in res.filters ?? []" :key="f.key" v-model="flt[f.key]" :title="f.label ?? f.key"><option v-for="o in f.options" :key="o" :value="o">{{ f.label ?? f.key }}: {{ o }}</option></select>
       <button class="btn" @click="load()" :disabled="busy">Refresh</button>
       <span style="margin-left:auto;display:flex;gap:8px">
         <button v-for="a in res.pageActions ?? []" :key="a.label" class="btn" :class="{ d: a.danger }" @click="run(a, null)">{{ a.label }}</button>
