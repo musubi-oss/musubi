@@ -110,7 +110,8 @@ function setSize(e: Event) { size.value = Number((e.target as HTMLSelectElement)
         </td>
         <td v-if="$slots.actions" @click.stop><slot name="actions" :row="r" /></td>
       </tr>
-      <tr v-if="!rows.length"><td :colspan="vis.length + 1" class="empty">{{ loading ? 'Loading…' : empty ?? 'No Data' }}</td></tr>
+      <template v-if="!rows.length && loading"><tr v-for="i in 5" :key="'sk' + i" class="sk-row"><td v-for="c in vis" :key="c.key"><span class="sk" :style="{ width: 30 + ((i * 7 + c.key.length * 13) % 50) + '%' }"></span></td><td v-if="$slots.actions"></td></tr></template>
+      <tr v-else-if="!rows.length"><td :colspan="vis.length + 1" class="empty">{{ empty ?? 'No Data' }}</td></tr>
     </tbody>
   </table>
   <div class="pager" v-if="rows.length">
@@ -135,4 +136,7 @@ function setSize(e: Event) { size.value = Number((e.target as HTMLSelectElement)
 .colpick summary::-webkit-details-marker { display: none }
 .colpick .menu { position: absolute; z-index: 20; top: 100%; left: 0; margin-top: 4px; min-width: 180px; max-height: 320px; overflow: auto; padding: 6px 8px; background: var(--panel, #15171c); border: 1px solid var(--line, #2a2d35); border-radius: 6px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; white-space: nowrap }
 .colpick .menu label { display: flex; gap: 6px; align-items: center; cursor: pointer }
+.sk { display: inline-block; height: 11px; border-radius: 3px; background: linear-gradient(90deg, var(--line, #2a2d35) 25%, var(--panel2, #22252d) 50%, var(--line, #2a2d35) 75%); background-size: 200% 100%; animation: sk 1.2s linear infinite }
+.sk-row td { padding-top: 10px; padding-bottom: 10px }
+@keyframes sk { from { background-position: 200% 0 } to { background-position: -200% 0 } }
 </style>

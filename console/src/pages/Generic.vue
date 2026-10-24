@@ -10,6 +10,7 @@ import Drawer from '../components/Drawer.vue'
 import JsonView from '../components/JsonView.vue'
 import Kv from '../components/Kv.vue'
 import { toast } from '../stores/toast'
+import { sections } from '../router'
 const props = defineProps<{ res: Res }>()
 const router = useRouter(); const route = useRoute()
 const pending = ref<{ act: Act; row: any; text: string } | null>(null)
@@ -58,6 +59,7 @@ function itemPath(row: any) {
   return props.res.item.replace(/\{([^}]+)\}/g, (_, k) => encodeURIComponent(row[k] ?? row[props.res.key ?? 'id'] ?? row.id ?? row.name))
 }
 const section = computed(() => String(route.path.split('/')[1]))
+const sectionTitle = computed(() => sections.find((x) => x.id === section.value)?.title ?? section.value)
 function detailPath(row: any) {
   if (props.res.link) return props.res.link(row)
   if (props.res.noDetail) return null
@@ -112,6 +114,7 @@ onMounted(() => { if (props.res.custom !== 'zanshin') load() })
 </script>
 <template>
   <div class="card">
+    <div class="crumb" v-if="isList"><router-link :to="'/' + section">{{ sectionTitle }}</router-link> › <span>{{ res.title }}</span></div>
     <h2>{{ res.title }} <small v-if="isList">({{ shown.length !== rows.length ? shown.length + ' of ' : '' }}{{ rows.length }}{{ cursor ? '+' : '' }})</small></h2>
     <div class="tools" v-if="isList && !off && res.custom !== 'zanshin'">
       <input class="in" v-model="q" placeholder="filter — any field, space = and" @keyup.enter="load()" /><button class="btn s" v-if="q" @click="q = ''" title="clear">×</button>
