@@ -25,6 +25,10 @@ pub enum SdkError {
 
 pub type Result<T> = std::result::Result<T, SdkError>;
 
+/// Every call to the world API is bounded: a stalled server must not freeze the simulator loop.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct WorldClient {
     http: reqwest::Client,
@@ -52,7 +56,11 @@ pub struct Update {
 impl WorldClient {
     pub fn new(base_url: &str, server_key: &str, world: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base: base_url.trim_end_matches('/').to_string(),
             key: server_key.to_string(),
             world: world.to_string(),
@@ -281,7 +289,7 @@ pub async fn run_sim<S: Simulator, F: std::future::Future<Output = ()>>(
             _ = iv.tick() => {}
         }
         n += 1;
-        if n % cfg.renew_every == 0 {
+        if n % cfg.renew_every.max(1) == 0 {
             match client.renew(sim).await {
                 Ok(c) => cells = c,
                 Err(e) => tracing::warn!(error = %e, "renew failed"),

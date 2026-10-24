@@ -147,6 +147,7 @@ impl SimCommand {
         "handover_ack",
         "net_packet",
         "net_close",
+        "net_meta",
     ];
 
     pub fn op(&self) -> &'static str {
@@ -325,5 +326,85 @@ mod sim_command_wire {
                 .to_json(),
             r#"{"id":1,"op":"handover_ack","entity":"e"}"#
         );
+    }
+
+    /// `OPS` is what the server uses to tell a malformed known command from an unknown `op`:
+    /// every variant's `op` must be in it (`net_meta` was missing).
+    #[test]
+    fn ops_lists_every_variant() {
+        let all = [
+            SimCommand::Lease { cells: vec![] },
+            SimCommand::Spawn {
+                x: 0.0,
+                y: 0.0,
+                components: Value::Null,
+                persistent: false,
+                global: false,
+                queue: false,
+                decay_ticks: None,
+                owner: None,
+            },
+            SimCommand::TickDone { tick: 0 },
+            SimCommand::Despawn { entity: "e".into() },
+            SimCommand::Attach {
+                entity: "e".into(),
+                root: "r".into(),
+                contained: false,
+            },
+            SimCommand::Detach { entity: "e".into() },
+            SimCommand::Apply {
+                entity: "e".into(),
+                x: None,
+                y: None,
+                components: Value::Null,
+            },
+            SimCommand::Interact {
+                entity: "e".into(),
+                kind: "k".into(),
+                payload: Value::Null,
+                tick: None,
+                x: None,
+                y: None,
+                tolerance: None,
+            },
+            SimCommand::Colocate {
+                entity: "a".into(),
+                with: "b".into(),
+                ttl_ticks: 1,
+            },
+            SimCommand::Rewind {
+                entity: "e".into(),
+                tick: 0,
+                x: None,
+                y: None,
+                tolerance: None,
+            },
+            SimCommand::HandoverAck { entity: "e".into() },
+            SimCommand::NetPacket {
+                conn: 1,
+                session: Value::Null,
+                data: vec![],
+            },
+            SimCommand::NetClose {
+                conn: 1,
+                session: Value::Null,
+                entity: "e".into(),
+                reason: String::new(),
+            },
+            SimCommand::NetMeta {
+                conn: 1,
+                session: Value::Null,
+                data: vec![],
+            },
+        ];
+        for cmd in &all {
+            assert!(
+                SimCommand::OPS.contains(&cmd.op()),
+                "{} missing from OPS",
+                cmd.op()
+            );
+            assert_eq!(serde_json::to_value(cmd).unwrap()["op"], cmd.op());
+        }
+        assert_eq!(SimCommand::OPS.len(), all.len());
     }
 }

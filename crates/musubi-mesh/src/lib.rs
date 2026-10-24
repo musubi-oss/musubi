@@ -304,6 +304,9 @@ pub struct Lease {
 /// `WorldView::deltas_all` goes parallel from this many clients, in chunks of this size.
 pub const PAR_DELTAS_MIN: usize = 128;
 pub const PAR_DELTAS_CHUNK: usize = 32;
+/// Most client inputs kept for an entity while it is in handover (`route_input`); the oldest
+/// are dropped past this so a flooding client cannot grow the buffer without bound.
+pub const MAX_BUFFERED_INPUTS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1757,7 +1760,7 @@ impl World {
     /// The entity need not be here yet: a node pins before the partner arrives from another
     /// node so that it lands in the pinned cell instead of the one its position says.
     pub fn pin(&mut self, id: EntityId, cell: CellId, ttl_ticks: u64) -> u64 {
-        let until = self.tick + ttl_ticks.max(1);
+        let until = self.tick.saturating_add(ttl_ticks.max(1));
         self.pins.insert(id, (cell, until));
         until
     }
@@ -2334,7 +2337,11 @@ impl World {
     ) -> Result<Option<SimId>, MeshError> {
         let e = self.entities.get(&id).ok_or(MeshError::NoEntity)?;
         if e.transit.is_some() {
-            self.buffered_inputs.entry(id).or_default().push(input);
+            let buf = self.buffered_inputs.entry(id).or_default();
+            if buf.len() >= MAX_BUFFERED_INPUTS {
+                buf.remove(0);
+            }
+            buf.push(input);
             return Ok(None);
         }
         Ok(Some(self.owner(e.cell).ok_or(MeshError::NoLease(e.cell))?))
@@ -4059,6 +4066,108 @@ mod tests {
             d.updated[0].pos
         );
     }
+
+    /// Inputs for an entity in handover are buffered, but only the last `MAX_BUFFERED_INPUTS`:
+    /// a client flooding an entity mid-handover must not grow the buffer without bound.
+    #[test]
+    fn buffered_inputs_are_capped_during_handover() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ghost_margin: 10.0,
+            hysteresis: 5.0,
+            ..Default::default()
+        });
+        let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+        w.grant_lease(CellId::root(0, 0), s1);
+        w.grant_lease(CellId::root(1, 0), s2);
+        let e = w.spawn(
+            Pos {
+                x: 90.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
+        w.apply(
+            s1,
+            e,
+            Some(Pos {
+                x: 108.0,
+                y: 50.0,
+                z: 0.0,
+            }),
+            BTreeMap::<String, serde_json::Value>::new(),
+        )
+        .unwrap();
+        assert_eq!(w.detect_handovers().len(), 1);
+        assert!(w.get(e).unwrap().transit.is_some());
+        let n = MAX_BUFFERED_INPUTS + 50;
+        for i in 0..n {
+            assert_eq!(w.route_input(e, serde_json::json!(i)).unwrap(), None);
+        }
+        let buffered = w.take_buffered_inputs(e);
+        assert_eq!(buffered.len(), MAX_BUFFERED_INPUTS);
+        assert_eq!(
+            buffered[0],
+            serde_json::json!(n - MAX_BUFFERED_INPUTS),
+            "oldest dropped"
+        );
+        assert_eq!(buffered[MAX_BUFFERED_INPUTS - 1], serde_json::json!(n - 1));
+    }
+
+    /// Arithmetic at the edges of the tick counter and the cell grid saturates instead of
+    /// overflowing: a pin near `u64::MAX`, a delta phase near the end of the tick space and
+    /// a position far beyond the i32 cell range all stay panic-free.
+    #[test]
+    fn edge_arithmetic_does_not_overflow() {
+        let mut w = World::new(WorldConfig {
+            cell_size: 100.0,
+            ..Default::default()
+        });
+        let e = w.spawn(
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            BTreeMap::<String, serde_json::Value>::new(),
+            false,
+        );
+        w.tick = u64::MAX - 1;
+        assert_eq!(w.pin(e, CellId::root(0, 0), 5), u64::MAX);
+        // phase 1 (client % 3) added to u64::MAX wraps instead of panicking
+        w.subscribe_with(
+            Uuid::from_u128(1),
+            Pos {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            10.0,
+            None,
+            BTreeMap::new(),
+            3,
+        );
+        w.tick = u64::MAX;
+        let _ = w.deltas_all();
+        // the far corner of the grid: `x + 1` no longer overflows i32
+        let far = CellId {
+            x: i32::MAX,
+            y: i32::MAX,
+            z: 0,
+            level: 0,
+        };
+        let (lo, hi) = w.cell_bounds(far);
+        assert!(lo.x.is_finite() && hi.x > lo.x && hi.y > lo.y);
+        let huge = Pos {
+            x: 1e300,
+            y: -1e300,
+            z: 0.0,
+        };
+        assert_eq!(w.cell_of(huge), CellId::root(i32::MAX, i32::MIN));
+        assert_eq!(w.snapshot().cells_in_radius(huge, 1.0).len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -4198,9 +4307,9 @@ fn grid_bounds(base: f64, c: CellId) -> (Pos, Pos) {
             z: c.z as f64 * s,
         },
         Pos {
-            x: (c.x + 1) as f64 * s,
-            y: (c.y + 1) as f64 * s,
-            z: (c.z + 1) as f64 * s,
+            x: (f64::from(c.x) + 1.0) * s,
+            y: (f64::from(c.y) + 1.0) * s,
+            z: (f64::from(c.z) + 1.0) * s,
         },
     )
 }
@@ -4313,7 +4422,7 @@ impl WorldView {
         interests: &mut HashMap<ClientId, Interest>,
     ) -> Vec<(ClientId, Delta)> {
         let one = |client: &ClientId, interest: &mut Interest| -> Option<(ClientId, Delta)> {
-            if interest.every > 1 && (self.tick + interest.phase) % interest.every != 0 {
+            if interest.every > 1 && self.tick.wrapping_add(interest.phase) % interest.every != 0 {
                 return None;
             }
             let d = self.delta_with(interest)?;

@@ -118,6 +118,12 @@ impl CrashPolicy {
 
 pub const MAX_RESTARTS: u32 = 5;
 pub const CRASH_WINDOW: Duration = Duration::from_secs(60);
+/// Most client inputs an actor holds between two ticks (the pending batch, inputs for future
+/// ticks and late inputs kept for rollback together); past this an input is dropped and
+/// acknowledged as not applied, so a flooding client cannot grow the actor's memory.
+pub const MAX_PENDING_INPUTS: usize = 4096;
+/// Longest spectator delay (ticks) a join may ask for: delayed frames are held in memory.
+pub const MAX_SPECTATOR_DELAY_TICKS: u64 = 3600;
 
 /// A handler failure and what the actor did about it.
 #[derive(Debug, Clone, Serialize)]
@@ -642,17 +648,19 @@ async fn run(
     let mut sleeping = false;
     let journaling = persist.on_journal.is_some() && persist.journal_every > 0;
     let mut journal: Vec<JournalEntry> = Vec::new();
+    let mut saved_tick: Option<u64> = None;
     loop {
         tokio::select! {
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
+                let membership = matches!(cmd, Cmd::Join { .. } | Cmd::Leave { .. });
                 match cmd {
                     Cmd::Join { presence, metadata, spectator, reply } => {
                         if let Some(delay) = spectator {
                             if !spectators.iter().any(|p| p.session_id == presence.session_id) {
                                 spectators.push(presence.clone());
                             }
-                            let delay = delay.max(min_delay);
+                            let delay = delay.max(min_delay).min(MAX_SPECTATOR_DELAY_TICKS);
                             if delay > 0 {
                                 delays.insert(presence.session_id, delay);
                             }
@@ -724,14 +732,31 @@ async fn run(
                         if !members.iter().any(|p| p.session_id == input.presence.session_id) {
                             continue;
                         }
-                        let Some(t) = input.tick else { inputs.push(input); continue; };
+                        let pending = inputs.len()
+                            + future.values().map(Vec::len).sum::<usize>()
+                            + history.iter().map(|(_, _, ins)| ins.len()).sum::<usize>();
+                        let Some(t) = input.tick else {
+                            if pending < MAX_PENDING_INPUTS {
+                                inputs.push(input);
+                            } else {
+                                tracing::warn!(%match_id, session = %input.presence.session_id, "input dropped: pending input cap reached");
+                            }
+                            continue;
+                        };
                         let ack = |applied: bool| ServerMessage::MatchInputAck { match_id: match_id.clone(), tick: t, seq: input.seq.unwrap_or(0), applied };
+                        if pending >= MAX_PENDING_INPUTS {
+                            deliver(vec![input.presence.session_id], ack(false));
+                            continue;
+                        }
                         let Some(rb) = rollback else {
                             deliver(vec![input.presence.session_id], ack(false));
                             inputs.push(input);
                             continue;
                         };
-                        if t > tick {
+                        if t > tick.saturating_add(rb.window) {
+                            // further ahead than the rollback window: never applied, not kept
+                            deliver(vec![input.presence.session_id], ack(false));
+                        } else if t > tick {
                             deliver(vec![input.presence.session_id], ack(true));
                             future.entry(t).or_default().push(input);
                         } else if let Some(k) = history.iter().position(|(ht, _, _)| *ht == t) {
@@ -761,7 +786,12 @@ async fn run(
                 i.size = members.len() as u32;
                 i.state_bytes = state.len();
                 drop(i);
-                persist.save(id, &label, &state, tick);
+                // the state only changes on a tick: one snapshot per tick is enough, membership
+                // changes always go out (a flood of inputs must not become a flood of DB writes)
+                if membership || saved_tick != Some(tick) {
+                    persist.save(id, &label, &state, tick);
+                    saved_tick = Some(tick);
+                }
             }
             _ = interval.tick() => {
                 tick += 1;
@@ -874,6 +904,7 @@ async fn run(
                 }
                 if persist.every > 0 && tick % persist.every == 0 {
                     persist.save(id, &label, &state, tick);
+                    saved_tick = Some(tick);
                 }
                 if res.terminate || grace.is_some_and(|g| g == 0) {
                     break;
@@ -918,7 +949,7 @@ fn fan(
         .into_iter()
         .partition(|s| delays.get(s).is_none_or(|d| *d == 0));
     for s in later {
-        delayed.push_back((tick + delays[&s], s, msg.clone()));
+        delayed.push_back((tick.saturating_add(delays[&s]), s, msg.clone()));
     }
     if !now.is_empty() {
         deliver(now, msg);
@@ -1342,6 +1373,129 @@ mod rollback_tests {
                 _ => continue,
             }
         }
+    }
+
+    fn ledger_spawn(deliver: Deliver, params: serde_json::Value) -> Spawn {
+        Spawn {
+            id: None,
+            module: "ledger".into(),
+            params,
+            resume: None,
+            deliver,
+            on_end: Box::new(|_| {}),
+            on_snapshot: None,
+            snapshot_every: 0,
+            on_journal: None,
+            journal_every: 0,
+            sync: None,
+            crash_policy: None,
+            on_crash: None,
+            on_sleep: None,
+        }
+    }
+
+    /// An input further ahead than the rollback window is acknowledged as not applied and not
+    /// kept (a client could otherwise park inputs at `tick = u64::MAX` forever), and once the
+    /// pending-input cap is reached further inputs are refused instead of growing memory.
+    #[tokio::test]
+    async fn far_future_and_flooded_inputs_are_refused() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let deliver: Deliver = Arc::new(move |_to, msg| {
+            let _ = tx.send(msg);
+        });
+        let h = spawn_with(
+            Arc::new(Ledger),
+            ledger_spawn(
+                deliver,
+                serde_json::json!({ "rollback": { "window": 8, "hash_every": 1 } }),
+            ),
+        )
+        .unwrap();
+        let me = presence();
+        h.join(me.clone(), HashMap::new(), None).await.unwrap();
+        let input = |tick: u64, seq: u64, byte: u8| Input {
+            presence: me.clone(),
+            op_code: 1,
+            data: vec![byte],
+            reliable: true,
+            tick: Some(tick),
+            seq: Some(seq),
+        };
+        let (now, h0) = next_hash(&mut rx).await;
+        assert_eq!(h0, state_hash(&0u64.to_le_bytes()));
+        for (seq, t) in [(1u64, now + 1000), (2, u64::MAX)] {
+            h.data(input(t, seq, 7)).unwrap();
+            let (at, s, applied) = next_ack(&mut rx).await;
+            assert_eq!((at, s, applied), (t, seq, false), "beyond the window");
+        }
+        // nothing was kept: the state stays at zero over the following ticks
+        for _ in 0..3 {
+            let (_, hs) = next_hash(&mut rx).await;
+            assert_eq!(hs, h0);
+        }
+        // flood: more than the cap for one near-future tick; the surplus is refused
+        let (now, _) = next_hash(&mut rx).await;
+        let target = now + 6;
+        let mut refused = 0usize;
+        for seq in 0..(MAX_PENDING_INPUTS as u64 + 64) {
+            while h.data(input(target, 100 + seq, 0)).is_err() {
+                tokio::task::yield_now().await;
+            }
+        }
+        for _ in 0..(MAX_PENDING_INPUTS + 64) {
+            let (_, _, applied) = next_ack(&mut rx).await;
+            if !applied {
+                refused += 1;
+            }
+        }
+        assert!(refused > 0, "the flood must hit the cap");
+        assert!(
+            refused <= 64 + MAX_PENDING_INPUTS / 2,
+            "inputs within the cap are still accepted ({refused} refused)"
+        );
+    }
+
+    /// A snapshot goes out on membership changes and at most once per tick otherwise: a burst
+    /// of client inputs between two ticks must not become a burst of snapshot writes.
+    #[tokio::test]
+    async fn inputs_do_not_snapshot_on_every_message() {
+        let saves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let deliver: Deliver = Arc::new(move |_to, msg| {
+            let _ = tx.send(msg);
+        });
+        let mut sp = ledger_spawn(deliver, serde_json::json!({}));
+        let counter = saves.clone();
+        sp.on_snapshot = Some(Arc::new(move |_id, _snap| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let h = spawn_with(Arc::new(Ledger), sp).unwrap();
+        let me = presence();
+        h.join(me.clone(), HashMap::new(), None).await.unwrap();
+        let n = 300usize;
+        for _ in 0..n {
+            while h
+                .data(Input {
+                    presence: me.clone(),
+                    op_code: 1,
+                    data: vec![0],
+                    reliable: false,
+                    tick: None,
+                    seq: None,
+                })
+                .is_err()
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+        // let a handful of ticks pass (50 Hz): the ledger emits nothing, so wait on the clock
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(rx.try_recv().is_err(), "the ledger emits no messages");
+        let got = saves.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            got < n / 4,
+            "{got} snapshots for {n} inputs: must be bounded by ticks, not inputs"
+        );
     }
 
     #[tokio::test]
