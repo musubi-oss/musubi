@@ -1,0 +1,126 @@
+name: release
+# Tag `vX.Y.Z` → native release builds for linux x86_64 and aarch64 (musubi + musubi-server, the
+# console embedded), a multi-arch image on GHCR (ghcr.io/musubi-oss/musubi:X.Y.Z and :latest)
+# and a GitHub Release with the tarballs, checksums and generated notes.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+  packages: write
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_DEBUG: 0
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h / | tail -1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p musubi-cli -p musubi-server
+      - name: package
+        run: |
+          V=${GITHUB_REF_NAME#v}; [ "$GITHUB_REF_TYPE" = tag ] || V=$(git rev-parse --short HEAD)
+          D=musubi-$V-${{ matrix.target }}
+          mkdir -p dist/$D
+          cp target/${{ matrix.target }}/release/musubi target/${{ matrix.target }}/release/musubi-server LICENSE README.md dist/$D/
+          tar -C dist -czf dist/$D.tar.gz $D
+          (cd dist && sha256sum $D.tar.gz > $D.tar.gz.sha256)
+          mkdir -p image/${{ matrix.arch }} && cp dist/$D/musubi dist/$D/musubi-server image/${{ matrix.arch }}/
+          ./dist/$D/musubi-server --version || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: image
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          path: image
+          merge-multiple: true
+      - run: chmod +x image/*/musubi image/*/musubi-server && ls -lR image
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/musubi
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+  release:
+    needs: [build, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          path: dist
+          merge-multiple: true
+      - name: release notes
+        run: |
+          V=${GITHUB_REF_NAME#v}
+          # the section of CHANGELOG.md for this version, then the image/tarball pointers
+          awk -v v="$V" '/^## /{p = index($0, "## " v) == 1} p' CHANGELOG.md | tail -n +2 > notes.md
+          cat >> notes.md <<N
+
+          ### Artifacts
+          - \`ghcr.io/${{ github.repository_owner }}/musubi:$V\` (linux/amd64, linux/arm64) — \`musubi-server\` entrypoint, \`musubi\` CLI alongside
+          - \`musubi-$V-x86_64-unknown-linux-gnu.tar.gz\`, \`musubi-$V-aarch64-unknown-linux-gnu.tar.gz\` — \`musubi\` + \`musubi-server\` (console embedded), sha256 next to each
+          N
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

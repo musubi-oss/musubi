@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1
+# Release image: prebuilt binaries from the `release` workflow (image/<arch>/musubi{,-server}),
+# so the multi-arch build copies instead of compiling. For a from-source image use ./Dockerfile.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 musubi
+COPY image/${TARGETARCH}/musubi-server image/${TARGETARCH}/musubi /usr/local/bin/
+USER musubi
+EXPOSE 7350/tcp 7351/udp
+ENV MUSUBI_CONFIG=/etc/musubi/musubi.toml
+ENTRYPOINT ["/usr/local/bin/musubi-server"]

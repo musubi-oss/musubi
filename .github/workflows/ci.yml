@@ -60,6 +60,27 @@ jobs:
       - run: sdk/unreal/tools/sim-wire-test.sh
       # QUIC transport: the C-ABI static library the MusubiQuic module links must build.
       - run: sdk/unreal/tools/build-quic-ffi.sh
+  console:
+    # operator console: typecheck, catalog paths against the node's OpenAPI snapshot, vitest, production build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: console2/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm test
+      # the server embeds console/dist; it must be the build of this tree
+      - name: embedded dist is current
+        run: |
+          diff <(ls dist/assets | sort) <(ls ../console/dist/assets | sort) || { echo "console/dist is stale: run pnpm build && rm -rf ../console/dist && cp -r dist ../console/dist"; exit 1; }
   bench:
     # criterion micro-benches (plan 6.2): the base commit (PR base / previous push) is benched on the
     # same runner right before HEAD, so the comparison never crosses machines; >5% slower fails
