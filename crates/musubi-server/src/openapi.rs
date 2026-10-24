@@ -2484,6 +2484,27 @@ mod tests {
     }
 
     /// Every typed body refers to a real route and an existing schema; every `$ref` resolves.
+    /// `console2/openapi.json` is the snapshot the console generates its typed client from
+    /// (`pnpm sync:api` refreshes it); it must equal what the node serves.
+    #[test]
+    fn console_openapi_snapshot_is_current() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../console2/openapi.json");
+        let snap: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let live = document("0.0.0");
+        if snap != live {
+            let a = serde_json::to_string_pretty(&snap).unwrap();
+            let b = serde_json::to_string_pretty(&live).unwrap();
+            let first = a
+                .lines()
+                .zip(b.lines())
+                .enumerate()
+                .find(|(_, (x, y))| x != y)
+                .map(|(i, (x, y))| format!("line {}: snapshot `{x}` vs node `{y}`", i + 1))
+                .unwrap_or_else(|| "lengths differ".into());
+            panic!("console2/openapi.json is stale — run `pnpm sync:api` in console2/ ({first})");
+        }
+    }
+
     #[test]
     fn typed_bodies_refer_to_routes_and_schemas() {
         let schemas = schemas();
