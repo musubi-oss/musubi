@@ -79,6 +79,16 @@ fn default_true() -> bool {
     true
 }
 
+/// Upper bound for operator-supplied spans so `now + span * periods` cannot overflow.
+const MAX_SPAN_SECS: i64 = 10 * 365 * 24 * 3600;
+
+/// Player-supplied subscription metadata is stored verbatim; keep it small.
+const MAX_METADATA_BYTES: usize = 4096;
+
+/// A `pending` subscription older than this never got its first charge finished (crash between
+/// the claim and the wallet debit); it no longer blocks a new subscribe.
+const PENDING_STALE_SECS: i64 = 600;
+
 #[derive(Deserialize)]
 pub struct PlanBody {
     pub name: String,
@@ -188,6 +198,12 @@ async fn save_plan(s: &AppState, id: &str, b: PlanBody) -> Result<Plan> {
     if b.grace_secs < 0 || b.trial_secs < 0 {
         return Err(Error::InvalidArgument(
             "grace_secs / trial_secs must be ≥ 0".into(),
+        ));
+    }
+    if b.period_secs > MAX_SPAN_SECS || b.grace_secs > MAX_SPAN_SECS || b.trial_secs > MAX_SPAN_SECS
+    {
+        return Err(Error::InvalidArgument(
+            "period_secs / grace_secs / trial_secs must be ≤ 10 years".into(),
         ));
     }
     if b.features.len() > 32 || b.features.iter().any(|f| f.is_empty() || f.len() > 64) {
@@ -513,36 +529,56 @@ async fn subscribe(
     if !plan.enabled {
         return Err(Error::NotFound(format!("subscription plan {}", plan.id)).into());
     }
-    let (existing, ever): (bool, bool) = sqlx::query_as(
-        "select exists(select 1 from musubi.subscriptions where account_id = $1 and plan_id = $2
-                        and status in ('trial', 'active', 'grace', 'paused')),
-                exists(select 1 from musubi.subscriptions where account_id = $1 and plan_id = $2)",
+    let metadata = if b.metadata.is_null() {
+        json!({})
+    } else {
+        b.metadata
+    };
+    if metadata.to_string().len() > MAX_METADATA_BYTES {
+        return Err(
+            Error::InvalidArgument(format!("metadata: ≤ {MAX_METADATA_BYTES} bytes")).into(),
+        );
+    }
+    let id = Uuid::now_v7();
+    let now = now_s();
+    // The row is claimed first (status `pending`, no access) under a per-(account, plan) lock,
+    // so two concurrent subscribes cannot both pass the "one live subscription" check and both
+    // charge the wallet; the charge then activates it, and a failed charge removes the claim.
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    sqlx::query("select pg_advisory_xact_lock(hashtext('subscription'), hashtext($1))")
+        .bind(format!("{}:{}", me.account_id.0, plan.id))
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    sqlx::query(
+        "delete from musubi.subscriptions where account_id = $1 and plan_id = $2
+         and status = 'pending' and started_at < $3",
     )
     .bind(me.account_id.0)
     .bind(&plan.id)
-    .fetch_one(&s.db)
+    .bind(now - PENDING_STALE_SECS)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    let (existing, ever): (bool, bool) = sqlx::query_as(
+        "select exists(select 1 from musubi.subscriptions where account_id = $1 and plan_id = $2
+                        and status in ('trial', 'active', 'grace', 'paused', 'pending')),
+                exists(select 1 from musubi.subscriptions where account_id = $1 and plan_id = $2
+                        and status <> 'pending')",
+    )
+    .bind(me.account_id.0)
+    .bind(&plan.id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(Error::internal)?;
     if existing {
         return Err(Error::Conflict("already subscribed".into()).into());
     }
-    let id = Uuid::now_v7();
-    let now = now_s();
-    let (status, end) = if plan.trial_secs > 0 && !ever {
+    let trial = plan.trial_secs > 0 && !ever;
+    let (status, end) = if trial {
         ("trial", now + plan.trial_secs)
     } else {
-        if !charge(&s, &plan, id, me.account_id.0, 1).await? {
-            return Err(Error::ResourceExhausted(format!(
-                "insufficient {} for plan {}",
-                plan.price
-                    .as_ref()
-                    .map(|p| p.currency.as_str())
-                    .unwrap_or(""),
-                plan.id
-            ))
-            .into());
-        }
-        ("active", now + plan.period_secs)
+        ("pending", now + plan.period_secs)
     };
     sqlx::query(
         "insert into musubi.subscriptions (id, account_id, plan_id, status, source, started_at, current_period_end, periods, periods_left, metadata)
@@ -554,16 +590,56 @@ async fn subscribe(
     .bind(status)
     .bind(now)
     .bind(end)
-    .bind(if b.metadata.is_null() { json!({}) } else { b.metadata })
-    .execute(&s.db)
+    .bind(metadata)
+    .execute(&mut *tx)
     .await
     .map_err(Error::internal)?;
-    if status == "active" {
+    tx.commit().await.map_err(Error::internal)?;
+    if !trial {
+        let paid = match charge(&s, &plan, id, me.account_id.0, 1).await {
+            Ok(paid) => paid,
+            Err(e) => {
+                drop_pending(&s, id).await;
+                return Err(e.into());
+            }
+        };
+        if !paid {
+            drop_pending(&s, id).await;
+            return Err(Error::ResourceExhausted(format!(
+                "insufficient {} for plan {}",
+                plan.price
+                    .as_ref()
+                    .map(|p| p.currency.as_str())
+                    .unwrap_or(""),
+                plan.id
+            ))
+            .into());
+        }
+        sqlx::query(
+            "update musubi.subscriptions set status = 'active', updated_at = now()
+             where id = $1 and status = 'pending'",
+        )
+        .bind(id)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?;
         grant_period_rewards(&s, &plan, id, me.account_id.0, 1).await;
     }
     let sub = load_sub(&s, id).await?;
     emit(&s, "started", &sub, json!({ "trial": status == "trial" })).await;
     Ok(Json(sub))
+}
+
+/// Remove a claim whose first charge did not go through.
+async fn drop_pending(s: &AppState, id: Uuid) {
+    if let Err(e) =
+        sqlx::query("delete from musubi.subscriptions where id = $1 and status = 'pending'")
+            .bind(id)
+            .execute(&s.db)
+            .await
+    {
+        tracing::warn!(error = %e, %id, "could not drop pending subscription");
+    }
 }
 
 async fn mine(
@@ -692,9 +768,10 @@ async fn server_grant(
         return Err(Error::InvalidArgument("periods: 1..1000".into()).into());
     }
     let plan = load_plan(&s, &b.plan_id).await?;
+    // a `pending` player claim counts as existing so the grant never creates a second row
     let existing: Option<(Uuid, String, i64)> = sqlx::query_as(
         "select id, status, current_period_end from musubi.subscriptions
-         where account_id = $1 and plan_id = $2 and status in ('trial', 'active', 'grace', 'paused')",
+         where account_id = $1 and plan_id = $2 and status in ('trial', 'active', 'grace', 'paused', 'pending')",
     )
     .bind(b.account_id)
     .bind(&plan.id)

@@ -67,6 +67,9 @@ fn valid_id(id: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Upper bound for operator-supplied durations so timestamp arithmetic cannot overflow.
+const MAX_SPAN_SECS: i64 = 10 * 365 * 24 * 3600;
+
 fn now_s() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
@@ -336,6 +339,11 @@ async fn save_offer(s: &AppState, id: &str, b: OfferBody) -> Result<Offer> {
     if b.cooldown_secs < 0 || b.duration_secs.is_some_and(|d| d <= 0) {
         return Err(Error::InvalidArgument(
             "cooldown_secs ≥ 0, duration_secs > 0".into(),
+        ));
+    }
+    if b.cooldown_secs > MAX_SPAN_SECS || b.duration_secs.is_some_and(|d| d > MAX_SPAN_SECS) {
+        return Err(Error::InvalidArgument(
+            "cooldown_secs / duration_secs must be ≤ 10 years".into(),
         ));
     }
     if matches!((b.starts_at, b.ends_at), (Some(a), Some(e)) if e <= a) {
@@ -674,7 +682,7 @@ async fn evaluate(
                 continue;
             }
             if let Some(last) = mine.last() {
-                if last.ended_at() + o.cooldown_secs > now {
+                if last.ended_at().saturating_add(o.cooldown_secs) > now {
                     continue;
                 }
             }
@@ -689,8 +697,8 @@ async fn evaluate(
             break;
         }
         let expires_at = match (o.duration_secs, o.ends_at) {
-            (Some(d), Some(e)) => Some((now + d).min(e)),
-            (Some(d), None) => Some(now + d),
+            (Some(d), Some(e)) => Some(now.saturating_add(d).min(e)),
+            (Some(d), None) => Some(now.saturating_add(d)),
             (None, e) => e,
         };
         let act = Activation {
@@ -826,7 +834,23 @@ async fn buy_offer(
         })?),
         None => None,
     };
-    let purchase = s
+    // claim the activation first: the conditional update is the only point where two concurrent
+    // buys of one activation can be told apart, so the discounted price is paid at most once
+    let now = now_s();
+    let claimed = sqlx::query(
+        "update musubi.offer_activations set purchased_at = $2
+         where id = $1 and purchased_at is null and dismissed_at is null",
+    )
+    .bind(act.id)
+    .bind(now)
+    .execute(&s.db)
+    .await
+    .map_err(Error::internal)?
+    .rows_affected();
+    if claimed == 0 {
+        return Err(Error::NotFound("offer is not active for this account".into()).into());
+    }
+    let bought = s
         .economy
         .buy_with_price(
             me.account_id,
@@ -836,17 +860,29 @@ async fn buy_offer(
             b.coupon.as_deref(),
             price,
         )
-        .await?;
-    let now = now_s();
-    sqlx::query(
-        "update musubi.offer_activations set purchased_at = $2, purchase_id = $3 where id = $1 and purchased_at is null",
-    )
-    .bind(act.id)
-    .bind(now)
-    .bind(purchase.id)
-    .execute(&s.db)
-    .await
-    .map_err(Error::internal)?;
+        .await;
+    let purchase = match bought {
+        Ok(p) => p,
+        Err(e) => {
+            // release the claim so the player can retry (wallet short, bad coupon, …)
+            sqlx::query(
+                "update musubi.offer_activations set purchased_at = null
+                 where id = $1 and purchased_at = $2 and purchase_id is null",
+            )
+            .bind(act.id)
+            .bind(now)
+            .execute(&s.db)
+            .await
+            .map_err(Error::internal)?;
+            return Err(e.into());
+        }
+    };
+    sqlx::query("update musubi.offer_activations set purchase_id = $2 where id = $1")
+        .bind(act.id)
+        .bind(purchase.id)
+        .execute(&s.db)
+        .await
+        .map_err(Error::internal)?;
     s.events
         .emit(
             "offer.purchased",

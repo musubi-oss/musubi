@@ -73,6 +73,8 @@ struct EnterReq {
     entries: Option<i32>,
 }
 
+const MAX_ENTRIES_PER_REQUEST: i32 = 10_000;
+
 async fn enter(
     State(s): State<AppState>,
     Bearer(me): Bearer,
@@ -80,6 +82,13 @@ async fn enter(
     body: Option<Json<EnterReq>>,
 ) -> Result<Json<Value>, ApiError> {
     let count = body.and_then(|b| b.entries).unwrap_or(1);
+    // the economy adds `count` to the account's running total in i32; keep the request far from
+    // the overflow edge (and from buying an absurd batch in one call)
+    if !(1..=MAX_ENTRIES_PER_REQUEST).contains(&count) {
+        return Err(
+            Error::InvalidArgument(format!("entries: 1..{MAX_ENTRIES_PER_REQUEST}")).into(),
+        );
+    }
     let e = s
         .economy
         .enter_sweepstake(me.account_id, &id, count)

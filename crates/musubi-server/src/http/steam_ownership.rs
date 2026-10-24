@@ -201,6 +201,8 @@ async fn account_steam(
     })))
 }
 
+const MAX_TICKET_LEN: usize = 8192;
+
 #[derive(serde::Deserialize)]
 struct VerifyTicketBody {
     ticket: String,
@@ -215,6 +217,14 @@ async fn verify_app_ticket(
     _k: ServerKey,
     axum::Json(b): axum::Json<VerifyTicketBody>,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    // Steam app tickets are at most 1 KiB (≤ 2 KiB encoded); do not hand arbitrary megabytes
+    // to the decoder
+    if b.ticket.is_empty() || b.ticket.len() > MAX_TICKET_LEN {
+        return Err(musubi_core::Error::InvalidArgument(format!(
+            "ticket: 1..{MAX_TICKET_LEN} chars"
+        ))
+        .into());
+    }
     let t = s.logins.steam_app_ticket(&b.ticket)?;
     let account: Option<(uuid::Uuid,)> = sqlx::query_as(
         "select account_id from musubi.identities where provider = $1 and subject = $2",

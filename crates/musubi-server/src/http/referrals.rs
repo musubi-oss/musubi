@@ -653,12 +653,15 @@ async fn redeem(
         return Err(Error::Conflict(format!("referral program {program} is not active")).into());
     }
     let code = normalize(&b.code)?;
+    // the code row is locked for the rest of the redemption so the per-referrer cap below is
+    // counted and enforced serially across concurrent referees
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
     let referrer: Option<Uuid> = sqlx::query_scalar(
-        "select account_id from musubi.referral_codes where program_id = $1 and code = $2",
+        "select account_id from musubi.referral_codes where program_id = $1 and code = $2 for update",
     )
     .bind(&program)
     .bind(&code)
-    .fetch_optional(&s.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
     let Some(referrer) = referrer else {
@@ -686,7 +689,7 @@ async fn redeem(
     )
     .bind(&program)
     .bind(referrer)
-    .fetch_one(&s.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(Error::internal)?;
     if p.6.is_some_and(|m| used >= m as i64) {
@@ -702,12 +705,13 @@ async fn redeem(
     .bind(referrer)
     .bind(me.account_id.0)
     .bind(&code)
-    .execute(&s.db)
+    .execute(&mut *tx)
     .await
     .map_err(Error::internal)?;
     if r.rows_affected() == 0 {
         return Err(Error::Conflict(format!("already referred in program {program}")).into());
     }
+    tx.commit().await.map_err(Error::internal)?;
     let total = used + 1;
     let mut referee_rewards = Value::Null;
     let mut referrer_rewards = Value::Null;
@@ -773,7 +777,12 @@ async fn grant(s: &AppState, who: AccountId, table: &str, reference: &str) -> Va
         Ok(r) => json!(r),
         Err(e) => {
             tracing::warn!(table, error = %e, "referral reward grant failed");
-            json!({ "error": e.to_string() })
+            // internal failures are traced, not echoed to the player
+            let msg = match &e {
+                Error::Internal(_) => "internal error".to_string(),
+                e => e.to_string(),
+            };
+            json!({ "error": msg })
         }
     }
 }

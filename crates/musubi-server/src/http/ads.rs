@@ -273,11 +273,12 @@ struct Window {
     last_granted: Option<OffsetDateTime>,
 }
 
-async fn window(db: &PgPool, placement: &str, account: Uuid) -> Result<Window> {
+async fn window(db: impl sqlx::PgExecutor<'_>, placement: &str, account: Uuid) -> Result<Window> {
+    // `pending` claims count like grants so a burst of callbacks cannot exceed the daily cap
     let (today, last): (i64, Option<OffsetDateTime>) = sqlx::query_as(
         "select count(*) filter (where created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc')::bigint,
                 max(created_at)
-         from musubi.ad_rewards where placement_id = $1 and account_id = $2 and status = 'granted'",
+         from musubi.ad_rewards where placement_id = $1 and account_id = $2 and status in ('granted', 'pending')",
     )
     .bind(placement)
     .bind(account)
@@ -442,12 +443,11 @@ struct View {
     id: Uuid,
     placement_id: String,
     account_id: Uuid,
-    status: String,
 }
 
 async fn load_view(db: &PgPool, id: Uuid) -> Result<View> {
     sqlx::query_as::<_, View>(
-        "select id, placement_id, account_id, status from musubi.ad_views where id = $1",
+        "select id, placement_id, account_id from musubi.ad_views where id = $1",
     )
     .bind(id)
     .fetch_optional(db)
@@ -459,6 +459,11 @@ async fn load_view(db: &PgPool, id: Uuid) -> Result<View> {
 /// Grants the placement's reward table once per `(provider, external_id)`; caps/cooldowns record
 /// a `rejected` row instead of granting. Never fails for business reasons so networks get their
 /// OK and stop retrying.
+///
+/// Two phases: the claim (duplicate check, cap/cooldown window, view status) runs in one
+/// transaction under a per-account advisory lock and leaves a `pending` row, then the roll
+/// happens and the row is finalised. Concurrent callbacks for the same event or the same view
+/// therefore never roll twice, and a daily cap cannot be exceeded by a burst.
 async fn reward(
     s: &AppState,
     provider: &str,
@@ -467,48 +472,46 @@ async fn reward(
     account: Uuid,
     placement_id: &str,
 ) -> Result<Value> {
-    let existing: Option<(Uuid, String, String)> = sqlx::query_as(
-        "select id, status, reason from musubi.ad_rewards where provider = $1 and external_id = $2",
-    )
-    .bind(provider)
-    .bind(external_id)
-    .fetch_optional(&s.db)
-    .await
-    .map_err(Error::internal)?;
-    if let Some((id, status, reason)) = existing {
-        return Ok(json!({"status": "duplicate", "of": status, "reason": reason, "reward_id": id}));
-    }
     let p = load_placement(&s.db, placement_id).await?;
-    let w = window(&s.db, placement_id, account).await?;
+    let mut tx = s.db.begin().await.map_err(Error::internal)?;
+    sqlx::query("select pg_advisory_xact_lock(hashtext('ad_reward'), hashtext($1))")
+        .bind(account.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    if let Some(d) = duplicate_of(&mut *tx, provider, external_id).await? {
+        return Ok(d);
+    }
+    let w = window(&mut *tx, placement_id, account).await?;
     let (ok, why, _) = availability(&p, &w, OffsetDateTime::now_utc());
-    let view_used = view.map(|v| v.status != "started").unwrap_or(false);
-    let (status, reason, roll) = if view_used {
-        ("rejected", "view already rewarded".to_string(), None)
-    } else if !ok {
-        ("rejected", why.unwrap_or_default(), None)
-    } else {
-        match s
-            .economy
-            .roll(
-                AccountId(account),
-                &p.reward_table,
-                &format!("ad:{provider}:{external_id}"),
-                Some(&format!("ad:{provider}:{external_id}")),
-            )
-            .await
-        {
-            Ok(r) => (
-                "granted",
-                String::new(),
-                serde_json::to_value(&r.rewards).ok(),
-            ),
-            Err(e) => ("rejected", format!("reward table: {e}"), None),
+    let view_used = match view {
+        Some(v) => {
+            let status: Option<String> =
+                sqlx::query_scalar("select status from musubi.ad_views where id = $1 for update")
+                    .bind(v.id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(Error::internal)?;
+            status.as_deref() != Some("started")
         }
+        None => false,
+    };
+    let rejected = if view_used {
+        Some("view already rewarded".to_string())
+    } else if !ok {
+        Some(why.unwrap_or_default())
+    } else {
+        None
+    };
+    let claim_status = if rejected.is_some() {
+        "rejected"
+    } else {
+        "pending"
     };
     let id = Uuid::now_v7();
-    sqlx::query(
-        "insert into musubi.ad_rewards (id, placement_id, account_id, provider, external_id, view_id, status, reason, roll)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    let inserted = sqlx::query(
+        "insert into musubi.ad_rewards (id, placement_id, account_id, provider, external_id, view_id, status, reason)
+         values ($1, $2, $3, $4, $5, $6, $7, $8)
          on conflict (provider, external_id) do nothing",
     )
     .bind(id)
@@ -517,23 +520,75 @@ async fn reward(
     .bind(provider)
     .bind(external_id)
     .bind(view.map(|v| v.id))
-    .bind(status)
-    .bind(&reason)
-    .bind(&roll)
-    .execute(&s.db)
+    .bind(claim_status)
+    .bind(rejected.as_deref().unwrap_or_default())
+    .execute(&mut *tx)
     .await
-    .map_err(Error::internal)?;
+    .map_err(Error::internal)?
+    .rows_affected();
+    if inserted == 0 {
+        // same event id claimed for another account while we waited for the lock
+        if let Some(d) = duplicate_of(&mut *tx, provider, external_id).await? {
+            return Ok(d);
+        }
+        return Err(Error::Internal("ad reward claim lost".into()));
+    }
     if let Some(v) = view {
         sqlx::query(
             "update musubi.ad_views set status = $2, reward_id = $3, completed_at = now() where id = $1 and status = 'started'",
         )
         .bind(v.id)
-        .bind(if status == "granted" { "rewarded" } else { "rejected" })
+        .bind(claim_status)
         .bind(id)
-        .execute(&s.db)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
     }
+    tx.commit().await.map_err(Error::internal)?;
+
+    let (status, reason, roll) = match rejected {
+        Some(reason) => ("rejected", reason, None),
+        None => {
+            let key = format!("ad:{provider}:{external_id}");
+            let (status, reason, roll) = match s
+                .economy
+                .roll(AccountId(account), &p.reward_table, &key, Some(&key))
+                .await
+            {
+                Ok(r) => (
+                    "granted",
+                    String::new(),
+                    serde_json::to_value(&r.rewards).ok(),
+                ),
+                Err(e) => ("rejected", format!("reward table: {e}"), None),
+            };
+            sqlx::query(
+                "update musubi.ad_rewards set status = $2, reason = $3, roll = $4 where id = $1",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(&reason)
+            .bind(&roll)
+            .execute(&s.db)
+            .await
+            .map_err(Error::internal)?;
+            if let Some(v) = view {
+                sqlx::query(
+                    "update musubi.ad_views set status = $2 where id = $1 and status = 'pending'",
+                )
+                .bind(v.id)
+                .bind(if status == "granted" {
+                    "rewarded"
+                } else {
+                    "rejected"
+                })
+                .execute(&s.db)
+                .await
+                .map_err(Error::internal)?;
+            }
+            (status, reason, roll)
+        }
+    };
     s.events
         .emit(
             if status == "granted" {
@@ -549,6 +604,25 @@ async fn reward(
     Ok(
         json!({"status": status, "reason": reason, "reward_id": id, "rewards": roll, "placement_id": placement_id}),
     )
+}
+
+/// The `duplicate` answer for an event that already has a reward row (any status).
+async fn duplicate_of(
+    db: impl sqlx::PgExecutor<'_>,
+    provider: &str,
+    external_id: &str,
+) -> Result<Option<Value>> {
+    let existing: Option<(Uuid, String, String)> = sqlx::query_as(
+        "select id, status, reason from musubi.ad_rewards where provider = $1 and external_id = $2",
+    )
+    .bind(provider)
+    .bind(external_id)
+    .fetch_optional(db)
+    .await
+    .map_err(Error::internal)?;
+    Ok(existing.map(|(id, status, reason)| {
+        json!({"status": "duplicate", "of": status, "reason": reason, "reward_id": id})
+    }))
 }
 
 #[derive(Deserialize, Default)]
@@ -661,11 +735,13 @@ pub fn ironsource_signature(
     hex::encode(h.finalize())
 }
 
+/// Case-insensitive constant-time comparison of two hex digests.
 fn constant_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| {
-            acc | (x.to_ascii_lowercase() ^ y.to_ascii_lowercase())
-        }) == 0
+    use subtle::ConstantTimeEq;
+    a.to_ascii_lowercase()
+        .as_bytes()
+        .ct_eq(b.to_ascii_lowercase().as_bytes())
+        .into()
 }
 
 /// Account + optional view from the network's user field: either our `view_id` (preferred — the
@@ -677,9 +753,13 @@ async fn resolve(
 ) -> Result<(Uuid, Option<View>, String)> {
     let id = Uuid::parse_str(user.trim())
         .map_err(|_| Error::InvalidArgument("user id must be a view id or account id".into()))?;
-    if let Ok(v) = load_view(db, id).await {
-        let pl = v.placement_id.clone();
-        return Ok((v.account_id, Some(v), pl));
+    match load_view(db, id).await {
+        Ok(v) => {
+            let pl = v.placement_id.clone();
+            return Ok((v.account_id, Some(v), pl));
+        }
+        Err(Error::NotFound(_)) => {}
+        Err(e) => return Err(e),
     }
     let Some(pl) = placement_param.filter(|p| !p.is_empty()) else {
         return Err(Error::InvalidArgument(
@@ -758,6 +838,17 @@ async fn callback(
         }
         "custom" => {
             let sig = get("sig");
+            // the canonical string joins with `&` / `=`, so a parameter containing them would
+            // collide with a differently split parameter set under the same signature
+            if params
+                .iter()
+                .any(|(k, v)| k.contains(['&', '=']) || v.contains(['&', '=']))
+            {
+                return Err(Error::InvalidArgument(
+                    "callback parameters must not contain `&` or `=`".into(),
+                )
+                .into());
+            }
             if sig.is_empty() || !constant_eq(&custom_signature(&cfg.secret, &params), &sig) {
                 return Err(Error::Unauthenticated("bad signature".into()).into());
             }
@@ -765,7 +856,7 @@ async fn callback(
                 .parse()
                 .map_err(|_| Error::InvalidArgument("ts".into()))?;
             let now = OffsetDateTime::now_utc().unix_timestamp();
-            if (now - ts).unsigned_abs() > s.cfg.ads.callback_ttl_secs {
+            if now.abs_diff(ts) > s.cfg.ads.callback_ttl_secs {
                 return Err(Error::Unauthenticated("callback expired".into()).into());
             }
             let user = params
@@ -808,6 +899,15 @@ mod tests {
             ironsource_signature("other", "1700000000", "evt1", "user1")
         );
         assert!(constant_eq(&sig, &sig.to_uppercase()));
+    }
+
+    #[test]
+    fn constant_eq_is_case_insensitive_and_length_safe() {
+        assert!(constant_eq("abcdef", "ABCDEF"));
+        assert!(!constant_eq("abcdef", "abcdeg"));
+        assert!(!constant_eq("abcdef", "abcde"));
+        assert!(!constant_eq("", "a"));
+        assert!(constant_eq("", ""));
     }
 
     #[test]

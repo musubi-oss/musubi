@@ -456,6 +456,9 @@ async fn sync(
         c.url.trim_end_matches('/')
     );
     let (mut owned, mut granted, mut revoked) = (vec![], vec![], vec![]);
+    // reqwest errors carry the request URL, and the URL carries the publisher key: strip it
+    // before the error reaches the log
+    let steam_err = |e: reqwest::Error| Error::Internal(format!("steam api: {}", e.without_url()));
     for appid in catalog {
         let v: Value = http
             .get(&url)
@@ -466,20 +469,29 @@ async fn sync(
             ])
             .send()
             .await
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .map_err(steam_err)?
             .error_for_status()
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?
+            .map_err(steam_err)?
             .json()
             .await
-            .map_err(|e| Error::Internal(format!("steam api: {e}")))?;
-        let owns = v["appownership"]["ownsapp"].as_bool().unwrap_or(false);
-        if owns {
-            owned.push(appid.clone());
-            if grant(&s, me.account_id, "steam", &appid).await?.is_some() {
-                granted.push(appid);
+            .map_err(steam_err)?;
+        let owns = v["appownership"]["ownsapp"].as_bool();
+        match owns {
+            Some(true) => {
+                owned.push(appid.clone());
+                if grant(&s, me.account_id, "steam", &appid).await?.is_some() {
+                    granted.push(appid);
+                }
             }
-        } else if revoke(&s, me.account_id, "steam", &appid, "not owned on steam").await? {
-            revoked.push(appid);
+            Some(false) => {
+                if revoke(&s, me.account_id, "steam", &appid, "not owned on steam").await? {
+                    revoked.push(appid);
+                }
+            }
+            // an answer without the ownership flag is not a "not owned": keep the grant
+            None => {
+                tracing::warn!(appid, "steam CheckAppOwnership answered without ownsapp");
+            }
         }
     }
     Ok(Json(
