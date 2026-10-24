@@ -57,10 +57,22 @@ impl Cbor {
     }
 }
 
+/// Nesting allowed in an attestation object / COSE key; real ones need 3. Bounded so a
+/// client-supplied `[[[[…]]]]` cannot overflow the stack.
+pub const MAX_CBOR_DEPTH: usize = 16;
+
+fn bad() -> Error {
+    Error::InvalidArgument("malformed cbor".into())
+}
+
 /// Decode one CBOR item; `(value, bytes consumed)`.
 pub fn decode_cbor(b: &[u8]) -> Result<(Cbor, usize)> {
-    fn bad() -> Error {
-        Error::InvalidArgument("malformed cbor".into())
+    decode_cbor_at(b, 0)
+}
+
+fn decode_cbor_at(b: &[u8], depth: usize) -> Result<(Cbor, usize)> {
+    if depth > MAX_CBOR_DEPTH {
+        return Err(bad());
     }
     let first = *b.first().ok_or_else(bad)?;
     let (major, info) = (first >> 5, first & 0x1f);
@@ -86,8 +98,9 @@ pub fn decode_cbor(b: &[u8]) -> Result<(Cbor, usize)> {
         0 => Cbor::Uint(arg),
         1 => Cbor::Neg(-1 - i64::try_from(arg).map_err(|_| bad())?),
         2 | 3 => {
-            let s = b.get(pos..pos + len).ok_or_else(bad)?;
-            pos += len;
+            let end = pos.checked_add(len).ok_or_else(bad)?;
+            let s = b.get(pos..end).ok_or_else(bad)?;
+            pos = end;
             if major == 2 {
                 Cbor::Bytes(s.to_vec())
             } else {
@@ -97,7 +110,7 @@ pub fn decode_cbor(b: &[u8]) -> Result<(Cbor, usize)> {
         4 => {
             let mut items = Vec::with_capacity(len.min(64));
             for _ in 0..len {
-                let (v, n) = decode_cbor(&b[pos..])?;
+                let (v, n) = decode_cbor_at(&b[pos..], depth + 1)?;
                 pos += n;
                 items.push(v);
             }
@@ -106,16 +119,16 @@ pub fn decode_cbor(b: &[u8]) -> Result<(Cbor, usize)> {
         5 => {
             let mut items = Vec::with_capacity(len.min(64));
             for _ in 0..len {
-                let (k, n) = decode_cbor(&b[pos..])?;
+                let (k, n) = decode_cbor_at(&b[pos..], depth + 1)?;
                 pos += n;
-                let (v, n) = decode_cbor(&b[pos..])?;
+                let (v, n) = decode_cbor_at(&b[pos..], depth + 1)?;
                 pos += n;
                 items.push((k, v));
             }
             Cbor::Map(items)
         }
         6 => {
-            let (_, n) = decode_cbor(&b[pos..])?;
+            let (_, n) = decode_cbor_at(&b[pos..], depth + 1)?;
             pos += n;
             Cbor::Other
         }
@@ -549,5 +562,21 @@ mod tests {
         assert_eq!(v.get_int(1), Some(&Cbor::Uint(2)));
         assert_eq!(v.get_int(-1), Some(&Cbor::Bytes(vec![1, 2, 3])));
         assert!(decode_cbor(&[0x59, 0xff, 0xff, 0x00]).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_cbor_is_rejected_not_a_stack_overflow() {
+        // 100k nested one-element arrays: must return an error, never recurse that deep
+        let deep = vec![0x81u8; 100_000];
+        assert!(decode_cbor(&deep).is_err());
+        let mut maps = vec![0xa1u8, 0x01];
+        maps.extend(std::iter::repeat_n([0xa1u8, 0x01], 50_000).flatten());
+        assert!(decode_cbor(&maps).is_err());
+        // within the limit nesting still decodes
+        let mut ok = vec![0x81u8; MAX_CBOR_DEPTH];
+        ok.push(0x01);
+        assert!(decode_cbor(&ok).is_ok());
+        // a length that would overflow `pos + len` is a plain error
+        assert!(decode_cbor(&[0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe]).is_err());
     }
 }

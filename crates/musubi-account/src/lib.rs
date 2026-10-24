@@ -490,6 +490,17 @@ pub fn validate_username(u: &str) -> Result<()> {
     Ok(())
 }
 
+/// A restore bundle row may only land in `table` when one of the table's account columns
+/// (`market_sales`: `seller_id` or `buyer_id`) names the account being restored; otherwise an
+/// edited bundle could create rows for any other account.
+fn row_belongs_to(table: &str, row: &serde_json::Value, id: AccountId) -> bool {
+    let id = id.0.to_string();
+    ACCOUNT_TABLES
+        .iter()
+        .filter(|(t, _)| *t == table)
+        .any(|(_, col)| row.get(*col).and_then(|v| v.as_str()) == Some(id.as_str()))
+}
+
 fn mask_subject(provider: &str, subject: &str) -> String {
     match provider {
         "email" => match subject.split_once('@') {
@@ -512,6 +523,35 @@ mod tests {
             "a***@example.com"
         );
         assert_eq!(mask_subject("steam", "76561198000000000"), "765611…");
+    }
+
+    #[test]
+    fn restore_rows_must_name_the_restored_account() {
+        let me = AccountId::new();
+        let other = AccountId::new();
+        let row = |col: &str, id: AccountId| serde_json::json!({ col: id.0.to_string(), "x": 1 });
+        assert!(row_belongs_to("wallets", &row("account_id", me), me));
+        assert!(!row_belongs_to("wallets", &row("account_id", other), me));
+        assert!(!row_belongs_to(
+            "wallets",
+            &serde_json::json!({ "x": 1 }),
+            me
+        ));
+        assert!(
+            !row_belongs_to("wallets", &row("owner_id", me), me),
+            "wrong column"
+        );
+        assert!(row_belongs_to("market_sales", &row("buyer_id", me), me));
+        assert!(row_belongs_to("market_sales", &row("seller_id", me), me));
+        assert!(!row_belongs_to(
+            "market_sales",
+            &row("seller_id", other),
+            me
+        ));
+        assert!(
+            !row_belongs_to("nope", &row("account_id", me), me),
+            "unknown table"
+        );
     }
 }
 
@@ -656,7 +696,10 @@ impl AccountService {
         let by_id = Uuid::parse_str(q).ok();
         let pattern = format!(
             "{}%",
-            q.to_lowercase().replace('%', "\\%").replace('_', "\\_")
+            q.to_lowercase()
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
         );
         let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, OffsetDateTime, Option<OffsetDateTime>, Option<OffsetDateTime>)>(
             "select id, username, display_name, created_at, disabled_at, deleted_at from musubi.accounts a
@@ -877,6 +920,11 @@ impl AccountService {
             let _ = col;
             let mut inserted = 0u64;
             for row in rows {
+                if !row_belongs_to(table, row, id) {
+                    return Err(Error::InvalidArgument(format!(
+                        "{table}: row does not belong to the account being restored"
+                    )));
+                }
                 let r = sqlx::query(&format!(
                     "insert into musubi.{table} select * from jsonb_populate_record(null::musubi.{table}, $1) on conflict do nothing"
                 ))

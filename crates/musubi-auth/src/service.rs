@@ -2,7 +2,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use musubi_core::config::SessionConfig;
 use musubi_core::{AccountId, Error, IdentityId, Result, SessionId};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -49,6 +49,10 @@ pub enum Login {
 /// How long a pending second-factor token stays valid.
 pub const MFA_TOKEN_SECS: i64 = 300;
 pub const RECOVERY_CODES: usize = 8;
+/// Wrong authenticator / recovery codes tolerated per account before the second factor pauses.
+pub const TOTP_MAX_FAILS: i64 = 10;
+/// Window (and pause) for `TOTP_MAX_FAILS`, in seconds.
+pub const TOTP_FAIL_WINDOW_SECS: i64 = 300;
 pub const EMAIL_CODE_TTL_SECS: u64 = 600;
 pub const EMAIL_CODE_ATTEMPTS: i32 = 5;
 
@@ -493,9 +497,13 @@ impl AuthService {
                 self.clear_login_failures(&email).await?;
                 (AccountId(acc), false)
             }
-            Some((_, None)) => return Err(self.record_login_failure(&email).await?),
+            Some((_, None)) => {
+                password::verify_dummy(pass.to_owned()).await;
+                return Err(self.record_login_failure(&email).await?);
+            }
             None => {
                 if !opts.create {
+                    password::verify_dummy(pass.to_owned()).await;
                     return Err(self.record_login_failure(&email).await?);
                 }
                 self.policy.check(pass, Some(&email))?;
@@ -598,6 +606,9 @@ impl AuthService {
         if c.vars.contains_key("mfa") {
             return Err(Error::Unauthenticated("second factor pending".into()));
         }
+        if c.vars.contains_key("queue") {
+            return Err(Error::Unauthenticated("login queued".into()));
+        }
         Ok(Authenticated {
             account_id: c.sub,
             session_id: c.sid,
@@ -635,20 +646,42 @@ impl AuthService {
     /// Rotate a refresh token. Reusing an already-rotated token revokes the entire family.
     pub async fn refresh(&self, refresh_token: &str) -> Result<Session> {
         let hash = hash_refresh(refresh_token);
-        let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Option<OffsetDateTime>, OffsetDateTime, serde_json::Value, Option<String>, Option<String>)>(
-            "select id, account_id, family, revoked_at, expires_at, vars, device_id, user_agent from musubi.sessions where refresh_hash = $1",
+        // Consume the token in one conditional UPDATE: of several concurrent redemptions exactly
+        // one wins, the others fall through to the diagnosis below.
+        let row = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Uuid,
+                serde_json::Value,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "update musubi.sessions set revoked_at = now()
+             where refresh_hash = $1 and revoked_at is null and expires_at > now()
+             returning account_id, family, vars, device_id, user_agent",
         )
         .bind(&hash)
         .fetch_optional(&self.db)
         .await
         .map_err(Error::internal)?;
-
-        let Some((id, account_id, family, revoked_at, expires_at, vars, device_id, user_agent)) =
-            row
-        else {
-            return Err(Error::Unauthenticated("unknown refresh token".into()));
-        };
-        if revoked_at.is_some() {
+        let Some((account_id, family, vars, device_id, user_agent)) = row else {
+            let stale = sqlx::query_as::<_, (Uuid, Uuid, Option<OffsetDateTime>)>(
+                "select account_id, family, revoked_at from musubi.sessions where refresh_hash = $1",
+            )
+            .bind(&hash)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(Error::internal)?;
+            let Some((account_id, family, revoked_at)) = stale else {
+                return Err(Error::Unauthenticated("unknown refresh token".into()));
+            };
+            if revoked_at.is_none() {
+                return Err(Error::Unauthenticated("refresh token expired".into()));
+            }
+            // already consumed (by a thief or by a racing redemption): the token leaked
+            // either way, so the whole family goes
             sqlx::query("update musubi.sessions set revoked_at = now() where family = $1 and revoked_at is null")
                 .bind(family)
                 .execute(&self.db)
@@ -656,15 +689,7 @@ impl AuthService {
                 .map_err(Error::internal)?;
             tracing::warn!(%account_id, %family, "refresh token reuse detected; family revoked");
             return Err(Error::Unauthenticated("refresh token reused".into()));
-        }
-        if expires_at < OffsetDateTime::now_utc() {
-            return Err(Error::Unauthenticated("refresh token expired".into()));
-        }
-        sqlx::query("update musubi.sessions set revoked_at = now() where id = $1")
-            .bind(id)
-            .execute(&self.db)
-            .await
-            .map_err(Error::internal)?;
+        };
         let vars = vars.as_object().cloned().unwrap_or_default();
         self.issue(
             AccountId(account_id),
@@ -864,7 +889,7 @@ impl AuthService {
         let Some(email) = email else {
             return Err(Error::Conflict("e-mail codes not enabled".into()));
         };
-        let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
+        let code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32));
         let hash = hex::encode(Sha256::digest(code.as_bytes()));
         sqlx::query(
             "insert into musubi.mfa_codes (account_id, code_hash, expires_at)
@@ -912,7 +937,7 @@ impl AuthService {
     /// e-mail code.
     async fn second_factor_check(&self, account_id: AccountId, code: &str) -> Result<()> {
         let totp = self.totp_required(account_id).await?;
-        if totp && self.totp_check(account_id, code).await.is_ok() {
+        if totp && self.totp_check(account_id, code, true).await.is_ok() {
             return Ok(());
         }
         if self.email_mfa_enabled(account_id).await? {
@@ -950,7 +975,7 @@ impl AuthService {
         let recovery: Vec<String> = (0..RECOVERY_CODES)
             .map(|_| {
                 use rand::RngCore;
-                let mut b = [0u8; 5];
+                let mut b = [0u8; 8];
                 rand::thread_rng().fill_bytes(&mut b);
                 hex::encode(b)
             })
@@ -972,7 +997,7 @@ impl AuthService {
         .bind(IdentityId::new().0)
         .bind(account_id.0)
         .bind(account_id.0.to_string())
-        .bind(&secret)
+        .bind(musubi_core::secrets::seal(&secret))
         .bind(serde_json::json!({ "recovery": hashes }))
         .execute(&mut *tx)
         .await
@@ -996,6 +1021,7 @@ impl AuthService {
                 "no authenticator enrolment in progress".into(),
             ));
         };
+        let secret = musubi_core::secrets::open(&secret).map_err(Error::Internal)?;
         if !crate::totp::verify(&secret, code, OffsetDateTime::now_utc().unix_timestamp()) {
             return Err(Error::Unauthenticated("bad code".into()));
         }
@@ -1009,8 +1035,11 @@ impl AuthService {
         Ok(())
     }
 
-    /// Accept an authenticator code or an unused recovery code (which is burned).
-    async fn totp_check(&self, account_id: AccountId, code: &str) -> Result<()> {
+    /// Accept an authenticator code or an unused recovery code (which is burned). With
+    /// `single_use` (the login gate) a TOTP step is accepted once (`metadata.last_step`, RFC 6238
+    /// §5.2); the already-authenticated paths (disable) only record the step. `TOTP_MAX_FAILS`
+    /// wrong codes within `TOTP_FAIL_WINDOW_SECS` pause the factor for the rest of the window.
+    async fn totp_check(&self, account_id: AccountId, code: &str, single_use: bool) -> Result<()> {
         let row: Option<(Uuid, String, serde_json::Value)> = sqlx::query_as(
             "select id, secret_hash, metadata from musubi.identities where account_id = $1 and provider = 'totp' and verified",
         )
@@ -1021,14 +1050,44 @@ impl AuthService {
         let Some((id, secret, mut meta)) = row else {
             return Err(Error::NotFound("authenticator not enabled".into()));
         };
-        if crate::totp::verify(&secret, code, OffsetDateTime::now_utc().unix_timestamp()) {
-            return Ok(());
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let fails = meta.get("fails").and_then(|v| v.as_i64()).unwrap_or(0);
+        let fail_at = meta.get("fail_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        let in_window = now - fail_at < TOTP_FAIL_WINDOW_SECS;
+        if fails >= TOTP_MAX_FAILS && in_window {
+            return Err(Error::ResourceExhausted(
+                "too many wrong codes; retry later".into(),
+            ));
+        }
+        let secret = musubi_core::secrets::open(&secret).map_err(Error::Internal)?;
+        if let Some(step) = crate::totp::verify_step(&secret, code, now) {
+            let n = sqlx::query(
+                "update musubi.identities
+                 set metadata = (metadata - 'fails' - 'fail_at') || jsonb_build_object('last_step', $2::bigint),
+                     updated_at = now()
+                 where id = $1 and (not $3 or coalesce((metadata->>'last_step')::bigint, -1) < $2)",
+            )
+            .bind(id)
+            .bind(step)
+            .bind(single_use)
+            .execute(&self.db)
+            .await
+            .map_err(Error::internal)?
+            .rows_affected();
+            if n == 1 {
+                return Ok(());
+            }
+            return Err(Error::Unauthenticated("code already used".into()));
         }
         let want = hex::encode(Sha256::digest(code.trim().to_ascii_lowercase().as_bytes()));
         let codes = meta.get_mut("recovery").and_then(|r| r.as_array_mut());
         if let Some(codes) = codes {
             if let Some(pos) = codes.iter().position(|c| c.as_str() == Some(want.as_str())) {
                 codes.remove(pos);
+                if let Some(m) = meta.as_object_mut() {
+                    m.remove("fails");
+                    m.remove("fail_at");
+                }
                 let n = sqlx::query(
                     "update musubi.identities set metadata = $2, updated_at = now() where id = $1 and metadata = $3",
                 )
@@ -1052,12 +1111,26 @@ impl AuthService {
                 }
             }
         }
+        let (fails, fail_at) = if in_window {
+            (fails + 1, fail_at)
+        } else {
+            (1, now)
+        };
+        sqlx::query(
+            "update musubi.identities set metadata = metadata || jsonb_build_object('fails', $2::bigint, 'fail_at', $3::bigint) where id = $1",
+        )
+        .bind(id)
+        .bind(fails)
+        .bind(fail_at)
+        .execute(&self.db)
+        .await
+        .map_err(Error::internal)?;
         Err(Error::Unauthenticated("bad code".into()))
     }
 
     /// Turn the authenticator off (needs a valid code or recovery code).
     pub async fn totp_disable(&self, account_id: AccountId, code: &str) -> Result<()> {
-        self.totp_check(account_id, code).await?;
+        self.totp_check(account_id, code, false).await?;
         sqlx::query("delete from musubi.identities where account_id = $1 and provider = 'totp'")
             .bind(account_id.0)
             .execute(&self.db)
@@ -1629,6 +1702,7 @@ impl AuthService {
         set: serde_json::Map<String, serde_json::Value>,
         unset: &[String],
     ) -> Result<(serde_json::Map<String, serde_json::Value>, String)> {
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
         let row: Option<(serde_json::Value, String)> = sqlx::query_as(
             "update musubi.sessions s set vars = (s.vars || $3::jsonb) - $4::text[]
              from musubi.accounts a
@@ -1640,12 +1714,17 @@ impl AuthService {
         .bind(account.0)
         .bind(serde_json::Value::Object(set))
         .bind(unset)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
         let Some((vars, username)) = row else {
             return Err(Error::NotFound("session".into()));
         };
+        // same cap as at login: the vars ride in every access token
+        if serde_json::to_vec(&vars).map(|v| v.len()).unwrap_or(0) > 4096 {
+            return Err(Error::InvalidArgument("session vars exceed 4 KB".into()));
+        }
+        tx.commit().await.map_err(Error::internal)?;
         let vars = vars.as_object().cloned().unwrap_or_default();
         let now = OffsetDateTime::now_utc();
         let claims = Claims {
@@ -1678,5 +1757,45 @@ mod tests {
     fn emails() {
         assert_eq!(normalize_email(" A@B.co ").unwrap(), "a@b.co");
         assert!(normalize_email("nope").is_err());
+    }
+
+    /// Pending-login tokens (second factor, login queue) are signed with the session key but
+    /// must never pass as access tokens.
+    #[test]
+    fn pending_login_tokens_are_not_access_tokens() {
+        // a lazy pool never connects, but sqlx wants a tokio context to build it
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let db = PgPool::connect_lazy("postgres://unused@localhost:1/unused").unwrap();
+        let svc = AuthService::new(db, &SessionConfig::default()).unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let claims = |vars: serde_json::Value| Claims {
+            sub: AccountId::new(),
+            sid: SessionId::new(),
+            iat: now,
+            exp: now + 60,
+            vars: vars.as_object().cloned().unwrap_or_default(),
+            name: None,
+            scopes: Vec::new(),
+        };
+        let plain = svc.signer.sign(&claims(serde_json::json!({}))).unwrap();
+        assert!(svc.verify_access(&plain).is_ok());
+        let mfa = svc
+            .signer
+            .sign(&claims(serde_json::json!({ "mfa": "pending" })))
+            .unwrap();
+        assert!(svc.verify_access(&mfa).is_err());
+        let queue = svc
+            .signer
+            .sign(&claims(serde_json::json!({
+                "queue": "pending", "created": false, "pending_vars": {}
+            })))
+            .unwrap();
+        assert!(
+            svc.verify_access(&queue).is_err(),
+            "a login-queue ticket must not bypass the queue"
+        );
     }
 }

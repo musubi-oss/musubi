@@ -3,6 +3,7 @@ use argon2::password_hash::{
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use musubi_core::{Error, Result};
+use std::sync::LazyLock;
 
 fn hasher() -> Argon2<'static> {
     // argon2id, 64 MiB, t=3, p=1 — matches the design doc defaults.
@@ -23,6 +24,22 @@ pub async fn hash(password: String) -> Result<String> {
     })
     .await
     .map_err(Error::internal)?
+}
+
+/// A real argon2id hash with a fixed password, so logins for unknown addresses or identities
+/// without a password can burn the same work as a wrong password (no timing enumeration).
+static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+    let salt = SaltString::generate(&mut OsRng);
+    hasher()
+        .hash_password(b"musubi-dummy-password", &salt)
+        .map(|h| h.to_string())
+        .expect("argon2 hash of a constant")
+});
+
+/// Spend the cost of one password verification without an account to verify against; the
+/// result is discarded. Call it on the "no such user" branch of a login.
+pub async fn verify_dummy(password: String) {
+    let _ = verify(password, DUMMY_HASH.clone()).await;
 }
 
 /// Verifies against our argon2id hashes and, for accounts imported from Nakama (`musubi migrate

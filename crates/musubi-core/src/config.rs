@@ -609,6 +609,15 @@ impl Config {
             base["session"]["secret"] =
                 serde_json::Value::String(format!("{}/{}", self.session.secret, p.name));
         }
+        // the same goes for an ES256 key: inheriting the base key pair would let any token of
+        // one project verify in every other (the claims carry no issuer/audience)
+        if self.session.signing_key_pem.is_some() && has(&["session", "signing_key_pem"]).is_none()
+        {
+            return Err(format!(
+                "project {} needs its own session.signing_key_pem (or an explicit null to fall back to a derived HS256 secret)",
+                p.name
+            ));
+        }
         merge_json(&mut base, &serde_json::Value::Object(p.overrides.clone()));
         base["node"]["project"] = serde_json::Value::String(p.name.clone());
         // one HTTP listener serves every project
@@ -687,6 +696,42 @@ mod tests {
             ..Default::default()
         };
         assert!(base.for_project(&bad).is_err());
+    }
+
+    #[test]
+    fn project_must_not_inherit_the_base_signing_key() {
+        let mut base = Config::default();
+        base.database.url = "postgres://x/base".into();
+        base.session.signing_key_pem = Some("-----BEGIN PRIVATE KEY-----…".into());
+        let p: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "name": "game2", "database": {"url": "postgres://x/game2"}
+        }))
+        .unwrap();
+        assert!(base
+            .for_project(&p)
+            .unwrap_err()
+            .contains("signing_key_pem"));
+        let own: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "name": "game2", "database": {"url": "postgres://x/game2"},
+            "session": {"signing_key_pem": "-----BEGIN PRIVATE KEY-----other"}
+        }))
+        .unwrap();
+        assert_eq!(
+            base.for_project(&own)
+                .unwrap()
+                .session
+                .signing_key_pem
+                .as_deref(),
+            Some("-----BEGIN PRIVATE KEY-----other")
+        );
+        let hs: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "name": "game2", "database": {"url": "postgres://x/game2"},
+            "session": {"signing_key_pem": null}
+        }))
+        .unwrap();
+        let c = base.for_project(&hs).unwrap();
+        assert!(c.session.signing_key_pem.is_none());
+        assert_ne!(c.session.secret, base.session.secret);
     }
 
     #[test]

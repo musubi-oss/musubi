@@ -1,6 +1,7 @@
 //! RFC 6238 TOTP (SHA-1, 30 s, 6 digits) and RFC 4648 base32 for authenticator apps.
 
 use ring::hmac;
+use subtle::ConstantTimeEq;
 
 const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 pub const STEP_SECS: i64 = 30;
@@ -73,13 +74,29 @@ pub fn code_at(secret_b32: &str, now: i64) -> Option<String> {
 
 /// Accepts the current step and one step either side (clock skew).
 pub fn verify(secret_b32: &str, code: &str, now: i64) -> bool {
+    verify_step(secret_b32, code, now).is_some()
+}
+
+/// Like [`verify`], but returns the matching time step (`now / STEP_SECS` ± 1) so the caller
+/// can refuse a code whose step was already accepted (RFC 6238 §5.2 replay guard). The
+/// comparison is constant-time.
+pub fn verify_step(secret_b32: &str, code: &str, now: i64) -> Option<i64> {
     let code = code.trim();
     if code.len() != DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+        return None;
     }
+    let secret = base32_decode(secret_b32)?;
     [-1i64, 0, 1]
         .iter()
-        .any(|d| code_at(secret_b32, now + d * STEP_SECS).as_deref() == Some(code))
+        .map(|d| now / STEP_SECS + d)
+        .find(|step| {
+            let want = format!(
+                "{:0width$}",
+                hotp(&secret, *step as u64),
+                width = DIGITS as usize
+            );
+            bool::from(want.as_bytes().ct_eq(code.as_bytes()))
+        })
 }
 
 /// `otpauth://totp/<issuer>:<label>?secret=…&issuer=…` for QR codes.
@@ -108,6 +125,28 @@ pub fn otpauth_uri(issuer: &str, label: &str, secret_b32: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_step_reports_the_matching_step_for_replay_guards() {
+        let secret = new_secret();
+        let now = 1_700_000_000i64;
+        let code = code_at(&secret, now).unwrap();
+        assert_eq!(verify_step(&secret, &code, now), Some(now / STEP_SECS));
+        // skew: the same code is the previous step a window later and the next step a window earlier
+        assert_eq!(
+            verify_step(&secret, &code, now + STEP_SECS),
+            Some(now / STEP_SECS)
+        );
+        assert_eq!(
+            verify_step(&secret, &code, now - STEP_SECS),
+            Some(now / STEP_SECS)
+        );
+        assert_eq!(verify_step(&secret, &code, now + 2 * STEP_SECS), None);
+        assert_eq!(verify_step(&secret, "12345", now), None, "wrong length");
+        assert_eq!(verify_step(&secret, "12345a", now), None, "non-digit");
+        assert_eq!(verify_step("!!not-base32!!", &code, now), None);
+        assert!(verify(&secret, &format!(" {code} "), now), "trimmed");
+    }
 
     #[test]
     fn rfc6238_sha1_vectors() {
