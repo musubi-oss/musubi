@@ -11,6 +11,7 @@ export function FormDialog({
   submit = 'Save',
   destructive,
   pending,
+  wide,
   disabled,
   onSubmit,
   children,
@@ -23,12 +24,13 @@ export function FormDialog({
   destructive?: boolean
   pending?: boolean
   disabled?: boolean
+  wide?: boolean
   onSubmit: () => void
   children: ReactNode
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className={wide ? "max-h-[90vh] overflow-y-auto sm:max-w-3xl" : "max-h-[90vh] overflow-y-auto sm:max-w-lg"}>
         <form
           className="space-y-4"
           onSubmit={(e) => {

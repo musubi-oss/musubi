@@ -1665,6 +1665,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("DELETE", "/v1/server/tournaments/{id}", "tournaments"),
     ("POST", "/v1/server/tournaments/{id}/end", "tournaments"),
     ("GET", "/v1/tournaments/{id}/bracket", "tournaments"),
+    ("GET", "/v1/server/tournaments/{id}/bracket", "tournaments"),
     ("POST", "/v1/server/tournaments/{id}/bracket", "tournaments"),
     (
         "DELETE",

@@ -21,6 +21,6 @@ export function useSub<T = unknown>(path: string | null, enabled = true) {
 /** Rows out of a sub-resource payload: the array itself, `payload[sub]`, or the first array-valued field. */
 export function listOf(v: unknown, sub?: string): Row[] {
   if (!v || typeof v !== 'object') return []
-  const a = sub ? (v as Row)[sub] : Array.isArray(v) ? v : Object.values(v as Row).find(Array.isArray)
+  const a = Array.isArray(v) ? v : sub ? (v as Row)[sub] : Object.values(v as Row).find(Array.isArray)
   return Array.isArray(a) ? (a as Row[]) : []
 }

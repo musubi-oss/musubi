@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 
-export function SubHead({ title, count, children }: { title: string; count?: number; children?: ReactNode }) {
+export function SubHead({ title, count, children }: { title: ReactNode; count?: number; children?: ReactNode }) {
   return (
     <div className="mt-6 mb-2 flex flex-wrap items-center gap-2 first:mt-0">
       <h3 className="text-sm font-semibold">

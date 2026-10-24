@@ -21,6 +21,12 @@ import { Route as AppPlayersData_rightsRouteImport } from './routes/_app/players
 import { Route as AppPlayersReportsRouteImport } from './routes/_app/players/reports'
 import { Route as AppServersBuildsRouteImport } from './routes/_app/servers/builds'
 import { Route as AppServersEdgeRouteImport } from './routes/_app/servers/edge'
+import { Route as AppSocialChat_filtersRouteImport } from './routes/_app/social/chat_filters'
+import { Route as AppSocialMatchesRouteImport } from './routes/_app/social/matches'
+import { Route as AppSocialMatchmakerRouteImport } from './routes/_app/social/matchmaker'
+import { Route as AppSocialRatingRouteImport } from './routes/_app/social/rating'
+import { Route as AppSocialSessionsRouteImport } from './routes/_app/social/sessions'
+import { Route as AppSocialStatsRouteImport } from './routes/_app/social/stats'
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
 import { Route as AppLiveopsAudiencesNameRouteImport } from './routes/_app/liveops/audiences/$name'
@@ -34,6 +40,7 @@ import { Route as AppLiveopsOffersIdRouteImport } from './routes/_app/liveops/of
 import { Route as AppPlayersAccountsIdRouteImport } from './routes/_app/players/accounts/$id'
 import { Route as AppServersFleetsIdRouteImport } from './routes/_app/servers/fleets/$id'
 import { Route as AppServersServersIdRouteImport } from './routes/_app/servers/servers/$id'
+import { Route as AppSocialTournamentsIdRouteImport } from './routes/_app/social/tournaments/$id'
 import { Route as AppWorldWorldsWIndexRouteImport } from './routes/_app/world/worlds/$w/index'
 import { Route as AppWorldWorldsWEntitiesIdRouteImport } from './routes/_app/world/worlds/$w/entities/$id'
 
@@ -95,6 +102,36 @@ const AppServersBuildsRoute = AppServersBuildsRouteImport.update({
 const AppServersEdgeRoute = AppServersEdgeRouteImport.update({
   id: '/servers/edge',
   path: '/servers/edge',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSocialChat_filtersRoute = AppSocialChat_filtersRouteImport.update({
+  id: '/social/chat_filters',
+  path: '/social/chat_filters',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSocialMatchesRoute = AppSocialMatchesRouteImport.update({
+  id: '/social/matches',
+  path: '/social/matches',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSocialMatchmakerRoute = AppSocialMatchmakerRouteImport.update({
+  id: '/social/matchmaker',
+  path: '/social/matchmaker',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSocialRatingRoute = AppSocialRatingRouteImport.update({
+  id: '/social/rating',
+  path: '/social/rating',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSocialSessionsRoute = AppSocialSessionsRouteImport.update({
+  id: '/social/sessions',
+  path: '/social/sessions',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSocialStatsRoute = AppSocialStatsRouteImport.update({
+  id: '/social/stats',
+  path: '/social/stats',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSectionPageIndexRoute = AppSectionPageIndexRouteImport.update({
@@ -162,6 +199,11 @@ const AppServersServersIdRoute = AppServersServersIdRouteImport.update({
   path: '/servers/servers/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppSocialTournamentsIdRoute = AppSocialTournamentsIdRouteImport.update({
+  id: '/social/tournaments/$id',
+  path: '/social/tournaments/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppWorldWorldsWIndexRoute = AppWorldWorldsWIndexRouteImport.update({
   id: '/world/worlds/$w/',
   path: '/world/worlds/$w/',
@@ -184,6 +226,12 @@ export interface FileRoutesByFullPath {
   '/players/reports': typeof AppPlayersReportsRoute
   '/servers/builds': typeof AppServersBuildsRoute
   '/servers/edge': typeof AppServersEdgeRoute
+  '/social/chat_filters': typeof AppSocialChat_filtersRoute
+  '/social/matches': typeof AppSocialMatchesRoute
+  '/social/matchmaker': typeof AppSocialMatchmakerRoute
+  '/social/rating': typeof AppSocialRatingRoute
+  '/social/sessions': typeof AppSocialSessionsRoute
+  '/social/stats': typeof AppSocialStatsRoute
   '/$section/': typeof AppSectionIndexRoute
   '/cluster/': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
@@ -198,6 +246,7 @@ export interface FileRoutesByFullPath {
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/servers/servers/$id': typeof AppServersServersIdRoute
+  '/social/tournaments/$id': typeof AppSocialTournamentsIdRoute
   '/$section/$page/': typeof AppSectionPageIndexRoute
   '/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
   '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
@@ -212,6 +261,12 @@ export interface FileRoutesByTo {
   '/players/reports': typeof AppPlayersReportsRoute
   '/servers/builds': typeof AppServersBuildsRoute
   '/servers/edge': typeof AppServersEdgeRoute
+  '/social/chat_filters': typeof AppSocialChat_filtersRoute
+  '/social/matches': typeof AppSocialMatchesRoute
+  '/social/matchmaker': typeof AppSocialMatchmakerRoute
+  '/social/rating': typeof AppSocialRatingRoute
+  '/social/sessions': typeof AppSocialSessionsRoute
+  '/social/stats': typeof AppSocialStatsRoute
   '/$section': typeof AppSectionIndexRoute
   '/cluster': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
@@ -226,6 +281,7 @@ export interface FileRoutesByTo {
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/servers/servers/$id': typeof AppServersServersIdRoute
+  '/social/tournaments/$id': typeof AppSocialTournamentsIdRoute
   '/$section/$page': typeof AppSectionPageIndexRoute
   '/world/worlds/$w': typeof AppWorldWorldsWIndexRoute
   '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
@@ -242,6 +298,12 @@ export interface FileRoutesById {
   '/_app/players/reports': typeof AppPlayersReportsRoute
   '/_app/servers/builds': typeof AppServersBuildsRoute
   '/_app/servers/edge': typeof AppServersEdgeRoute
+  '/_app/social/chat_filters': typeof AppSocialChat_filtersRoute
+  '/_app/social/matches': typeof AppSocialMatchesRoute
+  '/_app/social/matchmaker': typeof AppSocialMatchmakerRoute
+  '/_app/social/rating': typeof AppSocialRatingRoute
+  '/_app/social/sessions': typeof AppSocialSessionsRoute
+  '/_app/social/stats': typeof AppSocialStatsRoute
   '/_app/$section/': typeof AppSectionIndexRoute
   '/_app/cluster/': typeof AppClusterIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
@@ -256,6 +318,7 @@ export interface FileRoutesById {
   '/_app/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/_app/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/_app/servers/servers/$id': typeof AppServersServersIdRoute
+  '/_app/social/tournaments/$id': typeof AppSocialTournamentsIdRoute
   '/_app/$section/$page/': typeof AppSectionPageIndexRoute
   '/_app/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
   '/_app/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
@@ -272,6 +335,12 @@ export interface FileRouteTypes {
     | '/players/reports'
     | '/servers/builds'
     | '/servers/edge'
+    | '/social/chat_filters'
+    | '/social/matches'
+    | '/social/matchmaker'
+    | '/social/rating'
+    | '/social/sessions'
+    | '/social/stats'
     | '/$section/'
     | '/cluster/'
     | '/$section/$page/$id'
@@ -286,6 +355,7 @@ export interface FileRouteTypes {
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
     | '/servers/servers/$id'
+    | '/social/tournaments/$id'
     | '/$section/$page/'
     | '/world/worlds/$w/'
     | '/world/worlds/$w/entities/$id'
@@ -300,6 +370,12 @@ export interface FileRouteTypes {
     | '/players/reports'
     | '/servers/builds'
     | '/servers/edge'
+    | '/social/chat_filters'
+    | '/social/matches'
+    | '/social/matchmaker'
+    | '/social/rating'
+    | '/social/sessions'
+    | '/social/stats'
     | '/$section'
     | '/cluster'
     | '/$section/$page/$id'
@@ -314,6 +390,7 @@ export interface FileRouteTypes {
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
     | '/servers/servers/$id'
+    | '/social/tournaments/$id'
     | '/$section/$page'
     | '/world/worlds/$w'
     | '/world/worlds/$w/entities/$id'
@@ -329,6 +406,12 @@ export interface FileRouteTypes {
     | '/_app/players/reports'
     | '/_app/servers/builds'
     | '/_app/servers/edge'
+    | '/_app/social/chat_filters'
+    | '/_app/social/matches'
+    | '/_app/social/matchmaker'
+    | '/_app/social/rating'
+    | '/_app/social/sessions'
+    | '/_app/social/stats'
     | '/_app/$section/'
     | '/_app/cluster/'
     | '/_app/$section/$page/$id'
@@ -343,6 +426,7 @@ export interface FileRouteTypes {
     | '/_app/players/accounts/$id'
     | '/_app/servers/fleets/$id'
     | '/_app/servers/servers/$id'
+    | '/_app/social/tournaments/$id'
     | '/_app/$section/$page/'
     | '/_app/world/worlds/$w/'
     | '/_app/world/worlds/$w/entities/$id'
@@ -439,6 +523,48 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppServersEdgeRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/social/chat_filters': {
+      id: '/_app/social/chat_filters'
+      path: '/social/chat_filters'
+      fullPath: '/social/chat_filters'
+      preLoaderRoute: typeof AppSocialChat_filtersRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/social/matches': {
+      id: '/_app/social/matches'
+      path: '/social/matches'
+      fullPath: '/social/matches'
+      preLoaderRoute: typeof AppSocialMatchesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/social/matchmaker': {
+      id: '/_app/social/matchmaker'
+      path: '/social/matchmaker'
+      fullPath: '/social/matchmaker'
+      preLoaderRoute: typeof AppSocialMatchmakerRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/social/rating': {
+      id: '/_app/social/rating'
+      path: '/social/rating'
+      fullPath: '/social/rating'
+      preLoaderRoute: typeof AppSocialRatingRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/social/sessions': {
+      id: '/_app/social/sessions'
+      path: '/social/sessions'
+      fullPath: '/social/sessions'
+      preLoaderRoute: typeof AppSocialSessionsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/social/stats': {
+      id: '/_app/social/stats'
+      path: '/social/stats'
+      fullPath: '/social/stats'
+      preLoaderRoute: typeof AppSocialStatsRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/$section/$page/': {
       id: '/_app/$section/$page/'
       path: '/$section/$page'
@@ -530,6 +656,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppServersServersIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/social/tournaments/$id': {
+      id: '/_app/social/tournaments/$id'
+      path: '/social/tournaments/$id'
+      fullPath: '/social/tournaments/$id'
+      preLoaderRoute: typeof AppSocialTournamentsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/world/worlds/$w/': {
       id: '/_app/world/worlds/$w/'
       path: '/world/worlds/$w'
@@ -556,6 +689,12 @@ interface AppRouteChildren {
   AppPlayersReportsRoute: typeof AppPlayersReportsRoute
   AppServersBuildsRoute: typeof AppServersBuildsRoute
   AppServersEdgeRoute: typeof AppServersEdgeRoute
+  AppSocialChat_filtersRoute: typeof AppSocialChat_filtersRoute
+  AppSocialMatchesRoute: typeof AppSocialMatchesRoute
+  AppSocialMatchmakerRoute: typeof AppSocialMatchmakerRoute
+  AppSocialRatingRoute: typeof AppSocialRatingRoute
+  AppSocialSessionsRoute: typeof AppSocialSessionsRoute
+  AppSocialStatsRoute: typeof AppSocialStatsRoute
   AppSectionIndexRoute: typeof AppSectionIndexRoute
   AppClusterIndexRoute: typeof AppClusterIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
@@ -570,6 +709,7 @@ interface AppRouteChildren {
   AppPlayersAccountsIdRoute: typeof AppPlayersAccountsIdRoute
   AppServersFleetsIdRoute: typeof AppServersFleetsIdRoute
   AppServersServersIdRoute: typeof AppServersServersIdRoute
+  AppSocialTournamentsIdRoute: typeof AppSocialTournamentsIdRoute
   AppSectionPageIndexRoute: typeof AppSectionPageIndexRoute
   AppWorldWorldsWIndexRoute: typeof AppWorldWorldsWIndexRoute
   AppWorldWorldsWEntitiesIdRoute: typeof AppWorldWorldsWEntitiesIdRoute
@@ -584,6 +724,12 @@ const AppRouteChildren: AppRouteChildren = {
   AppPlayersReportsRoute: AppPlayersReportsRoute,
   AppServersBuildsRoute: AppServersBuildsRoute,
   AppServersEdgeRoute: AppServersEdgeRoute,
+  AppSocialChat_filtersRoute: AppSocialChat_filtersRoute,
+  AppSocialMatchesRoute: AppSocialMatchesRoute,
+  AppSocialMatchmakerRoute: AppSocialMatchmakerRoute,
+  AppSocialRatingRoute: AppSocialRatingRoute,
+  AppSocialSessionsRoute: AppSocialSessionsRoute,
+  AppSocialStatsRoute: AppSocialStatsRoute,
   AppSectionIndexRoute: AppSectionIndexRoute,
   AppClusterIndexRoute: AppClusterIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
@@ -598,6 +744,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppPlayersAccountsIdRoute: AppPlayersAccountsIdRoute,
   AppServersFleetsIdRoute: AppServersFleetsIdRoute,
   AppServersServersIdRoute: AppServersServersIdRoute,
+  AppSocialTournamentsIdRoute: AppSocialTournamentsIdRoute,
   AppSectionPageIndexRoute: AppSectionPageIndexRoute,
   AppWorldWorldsWIndexRoute: AppWorldWorldsWIndexRoute,
   AppWorldWorldsWEntitiesIdRoute: AppWorldWorldsWEntitiesIdRoute,

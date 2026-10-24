@@ -25,7 +25,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/tournaments/{id}/bracket", get(bracket_get))
         .route(
             "/v1/server/tournaments/{id}/bracket",
-            post(bracket_create).delete(bracket_delete),
+            get(bracket_get_server).post(bracket_create).delete(bracket_delete),
         )
         .route(
             "/v1/server/tournaments/{id}/bracket/matches/{mid}",
@@ -533,6 +533,17 @@ async fn bracket_create(
 async fn bracket_get(
     State(s): State<AppState>,
     Bearer(_me): Bearer,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match s.tournaments.bracket_get(&id).await? {
+        Some(b) => Ok(Json(bracket_json(&b))),
+        None => Err(musubi_core::Error::NotFound(format!("tournament {id} has no bracket")).into()),
+    }
+}
+
+async fn bracket_get_server(
+    State(s): State<AppState>,
+    _k: ServerKey,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match s.tournaments.bracket_get(&id).await? {
