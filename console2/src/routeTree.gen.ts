@@ -14,6 +14,9 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppSectionIndexRouteImport } from './routes/_app/$section/index'
 import { Route as AppClusterIndexRouteImport } from './routes/_app/cluster/index'
+import { Route as AppContentSchedulesRouteImport } from './routes/_app/content/schedules'
+import { Route as AppContentStorage_schemasRouteImport } from './routes/_app/content/storage_schemas'
+import { Route as AppContentUgcRouteImport } from './routes/_app/content/ugc'
 import { Route as AppEconomyCodesRouteImport } from './routes/_app/economy/codes'
 import { Route as AppEconomyFraudRouteImport } from './routes/_app/economy/fraud'
 import { Route as AppEconomyInventory_opsRouteImport } from './routes/_app/economy/inventory_ops'
@@ -34,6 +37,9 @@ import { Route as AppSocialSessionsRouteImport } from './routes/_app/social/sess
 import { Route as AppSocialStatsRouteImport } from './routes/_app/social/stats'
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
+import { Route as AppContentBundlesIndexRouteImport } from './routes/_app/content/bundles/index'
+import { Route as AppContentBundlesIdRouteImport } from './routes/_app/content/bundles/$id'
+import { Route as AppContentModulesNameRouteImport } from './routes/_app/content/modules/$name'
 import { Route as AppEconomyCodesIdRouteImport } from './routes/_app/economy/codes/$id'
 import { Route as AppEconomyItemsIdRouteImport } from './routes/_app/economy/items/$id'
 import { Route as AppEconomyProgressionIdRouteImport } from './routes/_app/economy/progression/$id'
@@ -77,6 +83,22 @@ const AppSectionIndexRoute = AppSectionIndexRouteImport.update({
 const AppClusterIndexRoute = AppClusterIndexRouteImport.update({
   id: '/cluster/',
   path: '/cluster/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppContentSchedulesRoute = AppContentSchedulesRouteImport.update({
+  id: '/content/schedules',
+  path: '/content/schedules',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppContentStorage_schemasRoute =
+  AppContentStorage_schemasRouteImport.update({
+    id: '/content/storage_schemas',
+    path: '/content/storage_schemas',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppContentUgcRoute = AppContentUgcRouteImport.update({
+  id: '/content/ugc',
+  path: '/content/ugc',
   getParentRoute: () => AppRoute,
 } as any)
 const AppEconomyCodesRoute = AppEconomyCodesRouteImport.update({
@@ -178,6 +200,21 @@ const AppSectionPageIndexRoute = AppSectionPageIndexRouteImport.update({
 const AppSectionPageIdRoute = AppSectionPageIdRouteImport.update({
   id: '/$section/$page/$id',
   path: '/$section/$page/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppContentBundlesIndexRoute = AppContentBundlesIndexRouteImport.update({
+  id: '/content/bundles/',
+  path: '/content/bundles/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppContentBundlesIdRoute = AppContentBundlesIdRouteImport.update({
+  id: '/content/bundles/$id',
+  path: '/content/bundles/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppContentModulesNameRoute = AppContentModulesNameRouteImport.update({
+  id: '/content/modules/$name',
+  path: '/content/modules/$name',
   getParentRoute: () => AppRoute,
 } as any)
 const AppEconomyCodesIdRoute = AppEconomyCodesIdRouteImport.update({
@@ -286,6 +323,9 @@ const AppWorldWorldsWEntitiesIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/login': typeof LoginRoute
+  '/content/schedules': typeof AppContentSchedulesRoute
+  '/content/storage_schemas': typeof AppContentStorage_schemasRoute
+  '/content/ugc': typeof AppContentUgcRoute
   '/economy/codes': typeof AppEconomyCodesRouteWithChildren
   '/economy/fraud': typeof AppEconomyFraudRoute
   '/economy/inventory_ops': typeof AppEconomyInventory_opsRoute
@@ -307,6 +347,8 @@ export interface FileRoutesByFullPath {
   '/$section/': typeof AppSectionIndexRoute
   '/cluster/': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/content/bundles/$id': typeof AppContentBundlesIdRoute
+  '/content/modules/$name': typeof AppContentModulesNameRoute
   '/economy/codes/$id': typeof AppEconomyCodesIdRoute
   '/economy/items/$id': typeof AppEconomyItemsIdRoute
   '/economy/progression/$id': typeof AppEconomyProgressionIdRoute
@@ -326,12 +368,16 @@ export interface FileRoutesByFullPath {
   '/servers/servers/$id': typeof AppServersServersIdRoute
   '/social/tournaments/$id': typeof AppSocialTournamentsIdRoute
   '/$section/$page/': typeof AppSectionPageIndexRoute
+  '/content/bundles/': typeof AppContentBundlesIndexRoute
   '/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
   '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/': typeof AppIndexRoute
+  '/content/schedules': typeof AppContentSchedulesRoute
+  '/content/storage_schemas': typeof AppContentStorage_schemasRoute
+  '/content/ugc': typeof AppContentUgcRoute
   '/economy/codes': typeof AppEconomyCodesRouteWithChildren
   '/economy/fraud': typeof AppEconomyFraudRoute
   '/economy/inventory_ops': typeof AppEconomyInventory_opsRoute
@@ -353,6 +399,8 @@ export interface FileRoutesByTo {
   '/$section': typeof AppSectionIndexRoute
   '/cluster': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/content/bundles/$id': typeof AppContentBundlesIdRoute
+  '/content/modules/$name': typeof AppContentModulesNameRoute
   '/economy/codes/$id': typeof AppEconomyCodesIdRoute
   '/economy/items/$id': typeof AppEconomyItemsIdRoute
   '/economy/progression/$id': typeof AppEconomyProgressionIdRoute
@@ -372,6 +420,7 @@ export interface FileRoutesByTo {
   '/servers/servers/$id': typeof AppServersServersIdRoute
   '/social/tournaments/$id': typeof AppSocialTournamentsIdRoute
   '/$section/$page': typeof AppSectionPageIndexRoute
+  '/content/bundles': typeof AppContentBundlesIndexRoute
   '/world/worlds/$w': typeof AppWorldWorldsWIndexRoute
   '/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
 }
@@ -380,6 +429,9 @@ export interface FileRoutesById {
   '/_app': typeof AppRouteWithChildren
   '/login': typeof LoginRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/content/schedules': typeof AppContentSchedulesRoute
+  '/_app/content/storage_schemas': typeof AppContentStorage_schemasRoute
+  '/_app/content/ugc': typeof AppContentUgcRoute
   '/_app/economy/codes': typeof AppEconomyCodesRouteWithChildren
   '/_app/economy/fraud': typeof AppEconomyFraudRoute
   '/_app/economy/inventory_ops': typeof AppEconomyInventory_opsRoute
@@ -401,6 +453,8 @@ export interface FileRoutesById {
   '/_app/$section/': typeof AppSectionIndexRoute
   '/_app/cluster/': typeof AppClusterIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/_app/content/bundles/$id': typeof AppContentBundlesIdRoute
+  '/_app/content/modules/$name': typeof AppContentModulesNameRoute
   '/_app/economy/codes/$id': typeof AppEconomyCodesIdRoute
   '/_app/economy/items/$id': typeof AppEconomyItemsIdRoute
   '/_app/economy/progression/$id': typeof AppEconomyProgressionIdRoute
@@ -420,6 +474,7 @@ export interface FileRoutesById {
   '/_app/servers/servers/$id': typeof AppServersServersIdRoute
   '/_app/social/tournaments/$id': typeof AppSocialTournamentsIdRoute
   '/_app/$section/$page/': typeof AppSectionPageIndexRoute
+  '/_app/content/bundles/': typeof AppContentBundlesIndexRoute
   '/_app/world/worlds/$w/': typeof AppWorldWorldsWIndexRoute
   '/_app/world/worlds/$w/entities/$id': typeof AppWorldWorldsWEntitiesIdRoute
 }
@@ -428,6 +483,9 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/login'
+    | '/content/schedules'
+    | '/content/storage_schemas'
+    | '/content/ugc'
     | '/economy/codes'
     | '/economy/fraud'
     | '/economy/inventory_ops'
@@ -449,6 +507,8 @@ export interface FileRouteTypes {
     | '/$section/'
     | '/cluster/'
     | '/$section/$page/$id'
+    | '/content/bundles/$id'
+    | '/content/modules/$name'
     | '/economy/codes/$id'
     | '/economy/items/$id'
     | '/economy/progression/$id'
@@ -468,12 +528,16 @@ export interface FileRouteTypes {
     | '/servers/servers/$id'
     | '/social/tournaments/$id'
     | '/$section/$page/'
+    | '/content/bundles/'
     | '/world/worlds/$w/'
     | '/world/worlds/$w/entities/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/login'
     | '/'
+    | '/content/schedules'
+    | '/content/storage_schemas'
+    | '/content/ugc'
     | '/economy/codes'
     | '/economy/fraud'
     | '/economy/inventory_ops'
@@ -495,6 +559,8 @@ export interface FileRouteTypes {
     | '/$section'
     | '/cluster'
     | '/$section/$page/$id'
+    | '/content/bundles/$id'
+    | '/content/modules/$name'
     | '/economy/codes/$id'
     | '/economy/items/$id'
     | '/economy/progression/$id'
@@ -514,6 +580,7 @@ export interface FileRouteTypes {
     | '/servers/servers/$id'
     | '/social/tournaments/$id'
     | '/$section/$page'
+    | '/content/bundles'
     | '/world/worlds/$w'
     | '/world/worlds/$w/entities/$id'
   id:
@@ -521,6 +588,9 @@ export interface FileRouteTypes {
     | '/_app'
     | '/login'
     | '/_app/'
+    | '/_app/content/schedules'
+    | '/_app/content/storage_schemas'
+    | '/_app/content/ugc'
     | '/_app/economy/codes'
     | '/_app/economy/fraud'
     | '/_app/economy/inventory_ops'
@@ -542,6 +612,8 @@ export interface FileRouteTypes {
     | '/_app/$section/'
     | '/_app/cluster/'
     | '/_app/$section/$page/$id'
+    | '/_app/content/bundles/$id'
+    | '/_app/content/modules/$name'
     | '/_app/economy/codes/$id'
     | '/_app/economy/items/$id'
     | '/_app/economy/progression/$id'
@@ -561,6 +633,7 @@ export interface FileRouteTypes {
     | '/_app/servers/servers/$id'
     | '/_app/social/tournaments/$id'
     | '/_app/$section/$page/'
+    | '/_app/content/bundles/'
     | '/_app/world/worlds/$w/'
     | '/_app/world/worlds/$w/entities/$id'
   fileRoutesById: FileRoutesById
@@ -605,6 +678,27 @@ declare module '@tanstack/react-router' {
       path: '/cluster'
       fullPath: '/cluster/'
       preLoaderRoute: typeof AppClusterIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/content/schedules': {
+      id: '/_app/content/schedules'
+      path: '/content/schedules'
+      fullPath: '/content/schedules'
+      preLoaderRoute: typeof AppContentSchedulesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/content/storage_schemas': {
+      id: '/_app/content/storage_schemas'
+      path: '/content/storage_schemas'
+      fullPath: '/content/storage_schemas'
+      preLoaderRoute: typeof AppContentStorage_schemasRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/content/ugc': {
+      id: '/_app/content/ugc'
+      path: '/content/ugc'
+      fullPath: '/content/ugc'
+      preLoaderRoute: typeof AppContentUgcRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/economy/codes': {
@@ -745,6 +839,27 @@ declare module '@tanstack/react-router' {
       path: '/$section/$page/$id'
       fullPath: '/$section/$page/$id'
       preLoaderRoute: typeof AppSectionPageIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/content/bundles/': {
+      id: '/_app/content/bundles/'
+      path: '/content/bundles'
+      fullPath: '/content/bundles/'
+      preLoaderRoute: typeof AppContentBundlesIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/content/bundles/$id': {
+      id: '/_app/content/bundles/$id'
+      path: '/content/bundles/$id'
+      fullPath: '/content/bundles/$id'
+      preLoaderRoute: typeof AppContentBundlesIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/content/modules/$name': {
+      id: '/_app/content/modules/$name'
+      path: '/content/modules/$name'
+      fullPath: '/content/modules/$name'
+      preLoaderRoute: typeof AppContentModulesNameRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/economy/codes/$id': {
@@ -904,6 +1019,9 @@ const AppEconomyCodesRouteWithChildren = AppEconomyCodesRoute._addFileChildren(
 
 interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
+  AppContentSchedulesRoute: typeof AppContentSchedulesRoute
+  AppContentStorage_schemasRoute: typeof AppContentStorage_schemasRoute
+  AppContentUgcRoute: typeof AppContentUgcRoute
   AppEconomyCodesRoute: typeof AppEconomyCodesRouteWithChildren
   AppEconomyFraudRoute: typeof AppEconomyFraudRoute
   AppEconomyInventory_opsRoute: typeof AppEconomyInventory_opsRoute
@@ -925,6 +1043,8 @@ interface AppRouteChildren {
   AppSectionIndexRoute: typeof AppSectionIndexRoute
   AppClusterIndexRoute: typeof AppClusterIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
+  AppContentBundlesIdRoute: typeof AppContentBundlesIdRoute
+  AppContentModulesNameRoute: typeof AppContentModulesNameRoute
   AppEconomyItemsIdRoute: typeof AppEconomyItemsIdRoute
   AppEconomyProgressionIdRoute: typeof AppEconomyProgressionIdRoute
   AppEconomyReward_tablesIdRoute: typeof AppEconomyReward_tablesIdRoute
@@ -943,12 +1063,16 @@ interface AppRouteChildren {
   AppServersServersIdRoute: typeof AppServersServersIdRoute
   AppSocialTournamentsIdRoute: typeof AppSocialTournamentsIdRoute
   AppSectionPageIndexRoute: typeof AppSectionPageIndexRoute
+  AppContentBundlesIndexRoute: typeof AppContentBundlesIndexRoute
   AppWorldWorldsWIndexRoute: typeof AppWorldWorldsWIndexRoute
   AppWorldWorldsWEntitiesIdRoute: typeof AppWorldWorldsWEntitiesIdRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
+  AppContentSchedulesRoute: AppContentSchedulesRoute,
+  AppContentStorage_schemasRoute: AppContentStorage_schemasRoute,
+  AppContentUgcRoute: AppContentUgcRoute,
   AppEconomyCodesRoute: AppEconomyCodesRouteWithChildren,
   AppEconomyFraudRoute: AppEconomyFraudRoute,
   AppEconomyInventory_opsRoute: AppEconomyInventory_opsRoute,
@@ -970,6 +1094,8 @@ const AppRouteChildren: AppRouteChildren = {
   AppSectionIndexRoute: AppSectionIndexRoute,
   AppClusterIndexRoute: AppClusterIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
+  AppContentBundlesIdRoute: AppContentBundlesIdRoute,
+  AppContentModulesNameRoute: AppContentModulesNameRoute,
   AppEconomyItemsIdRoute: AppEconomyItemsIdRoute,
   AppEconomyProgressionIdRoute: AppEconomyProgressionIdRoute,
   AppEconomyReward_tablesIdRoute: AppEconomyReward_tablesIdRoute,
@@ -988,6 +1114,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppServersServersIdRoute: AppServersServersIdRoute,
   AppSocialTournamentsIdRoute: AppSocialTournamentsIdRoute,
   AppSectionPageIndexRoute: AppSectionPageIndexRoute,
+  AppContentBundlesIndexRoute: AppContentBundlesIndexRoute,
   AppWorldWorldsWIndexRoute: AppWorldWorldsWIndexRoute,
   AppWorldWorldsWEntitiesIdRoute: AppWorldWorldsWEntitiesIdRoute,
 }
