@@ -182,9 +182,15 @@ impl Cluster {
         self.members.read().await.get(&id).map(|m| m.state)
     }
 
-    pub(crate) async fn handle_swim(&self, msg: Msg) -> Msg {
+    /// `peer` is the node the bus connection authenticated; a message signed off by another
+    /// `from` is refused, and an indirect probe only dials the target as the registry knows it.
+    pub(crate) async fn handle_swim(&self, msg: Msg, peer: Uuid) -> Msg {
         match msg {
-            Msg::Ping { from, gossip } => {
+            Msg::Ping { from, .. } | Msg::PingReq { from, .. } if from != peer => {
+                tracing::warn!(claimed = %from, peer = %peer, "swim: message from a node claiming another id; refused");
+                Msg::Nack
+            }
+            Msg::Ping { gossip, from } => {
                 self.merge(&gossip).await;
                 self.set_state(from, State::Alive).await;
                 Msg::Ack {
@@ -192,17 +198,29 @@ impl Cluster {
                     gossip: self.gossip().await,
                 }
             }
-            Msg::PingReq { target, .. } => match self.ping(&target).await {
-                Ok(g) => {
-                    self.merge(&g).await;
-                    self.set_state(target.id.0, State::Alive).await;
-                    Msg::Ack {
-                        from: self.me.id.0,
-                        gossip: self.gossip().await,
+            Msg::PingReq { target, .. } => {
+                let known = self
+                    .peers
+                    .read()
+                    .await
+                    .iter()
+                    .find(|p| p.id == target.id && !p.bus_addr.is_empty())
+                    .cloned();
+                let Some(target) = known else {
+                    return Msg::Nack;
+                };
+                match self.ping(&target).await {
+                    Ok(g) => {
+                        self.merge(&g).await;
+                        self.set_state(target.id.0, State::Alive).await;
+                        Msg::Ack {
+                            from: self.me.id.0,
+                            gossip: self.gossip().await,
+                        }
                     }
+                    Err(_) => Msg::Nack,
                 }
-                Err(_) => Msg::Nack,
-            },
+            }
             Msg::Ack { .. } | Msg::Nack => Msg::Nack,
         }
     }

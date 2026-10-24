@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
@@ -113,10 +115,121 @@ pub(crate) struct QuicBus {
     /// wait) instead of after the peer has read them — one round trip per frame serialized the
     /// bus lanes (3 ms a session batch on the stand, 48 s of sends in a 40 s run on bulk).
     lane_streams: Mutex<HashMap<(Uuid, i32), LaneStream>>,
+    /// Our bus certificate and key, presented as the client certificate when dialing a peer.
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    /// Peer certificates the registry vouches for: the only identities the listener admits.
+    pub(crate) trust: Arc<PeerTrust>,
 }
 
 /// A long-lived outgoing bus stream, written by one sender at a time.
 type LaneStream = Arc<tokio::sync::Mutex<quinn::SendStream>>;
+
+/// Mutual TLS for the bus. A connecting node must present the self-signed certificate it
+/// published in `musubi.nodes` (same `cluster_group`) and prove it holds the key; the
+/// connection is then bound to that node id and every frame claiming another origin is
+/// dropped. Without this anyone who can reach the bus port could inject bus messages, SWIM
+/// verdicts, Raft votes and directory writes under any node's identity.
+#[derive(Debug)]
+pub(crate) struct PeerTrust {
+    certs: std::sync::RwLock<HashMap<Vec<u8>, Uuid>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    /// A handshake with a certificate we do not know yet: the registry is re-read early.
+    refresh: tokio::sync::Notify,
+}
+
+impl PeerTrust {
+    fn new() -> Self {
+        Self {
+            certs: std::sync::RwLock::new(HashMap::new()),
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            refresh: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Replace the trusted set with the registry's view (our own row excluded).
+    pub(crate) fn update(&self, me: NodeId, nodes: &[NodeInfo]) {
+        let certs = nodes
+            .iter()
+            .filter(|n| n.id != me && !n.bus_cert.is_empty())
+            .filter_map(|n| hex::decode(&n.bus_cert).ok().map(|der| (der, n.id.0)))
+            .collect();
+        *self.certs.write().unwrap_or_else(|e| e.into_inner()) = certs;
+    }
+
+    pub(crate) fn node_of(&self, der: &[u8]) -> Option<Uuid> {
+        self.certs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(der)
+            .copied()
+    }
+
+    /// The node id a handshake proved: the client certificate rustls verified on `conn`.
+    fn peer_of(&self, conn: &quinn::Connection) -> Option<Uuid> {
+        let certs = conn
+            .peer_identity()?
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .ok()?;
+        self.node_of(certs.first()?.as_ref())
+    }
+}
+
+impl ClientCertVerifier for PeerTrust {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        if self.node_of(end_entity.as_ref()).is_some() {
+            return Ok(ClientCertVerified::assertion());
+        }
+        metrics::counter!("musubi_bus_rejected_peers_total").increment(1);
+        self.refresh.notify_one();
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
 
 /// Transport settings for both ends of a bus connection. The windows are sized for one
 /// connection carrying every lane between two busy nodes (~60 MB/s on the stand): quinn's
@@ -532,9 +645,10 @@ impl Cluster {
             .map_err(Error::internal)?;
         let der = CertificateDer::from(cert.cert.der().to_vec());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+        let trust = Arc::new(PeerTrust::new());
         let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
+            .with_client_cert_verifier(trust.clone())
+            .with_single_cert(vec![der.clone()], key.clone_key())
             .map_err(Error::internal)?;
         tls.alpn_protocols = vec![BUS_ALPN.to_vec()];
         let crypto =
@@ -554,6 +668,9 @@ impl Cluster {
             conns: Mutex::new(HashMap::new()),
             conn_backoff: Mutex::new(HashMap::new()),
             lane_streams: Mutex::new(HashMap::new()),
+            cert: der,
+            key,
+            trust,
         }));
         Ok(self)
     }
@@ -567,6 +684,9 @@ impl Cluster {
     /// Re-read the node table into the peer cache used for QUIC fan-out.
     pub async fn refresh_peers(&self) -> Result<()> {
         let nodes = self.nodes().await?;
+        if let Some(bus) = &self.bus {
+            bus.trust.update(self.me.id, &nodes);
+        }
         self.members
             .write()
             .await
@@ -728,12 +848,29 @@ impl Cluster {
             }
         });
         if let Some(bus) = &self.bus {
+            let (trust, cl) = (bus.trust.clone(), self.clone());
+            tokio::spawn(async move {
+                loop {
+                    trust.refresh.notified().await;
+                    if let Err(e) = cl.refresh_peers().await {
+                        tracing::debug!(error = %e, "peer refresh after an unknown bus certificate failed");
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
             let (ep, cl) = (bus.endpoint.clone(), self.clone());
             tokio::spawn(async move {
                 while let Some(incoming) = ep.accept().await {
                     let cl = cl.clone();
                     tokio::spawn(async move {
                         let Ok(conn) = incoming.await else { return };
+                        // rustls only admitted a registered certificate; this maps it to the node
+                        let Some(peer) = cl.bus.as_ref().and_then(|b| b.trust.peer_of(&conn))
+                        else {
+                            tracing::warn!(remote = %conn.remote_address(), "bus: peer certificate not in the registry; connection closed");
+                            conn.close(1u32.into(), b"unknown peer");
+                            return;
+                        };
                         let (c_uni, conn_uni) = (cl.clone(), conn.clone());
                         tokio::spawn(async move {
                             while let Ok(mut recv) = conn_uni.accept_uni().await {
@@ -754,7 +891,7 @@ impl Cluster {
                                         let mut buf = Vec::with_capacity(rest.len() + 1);
                                         buf.push(first[0]);
                                         buf.extend_from_slice(&rest);
-                                        c.ingest_quic_frame(buf).await;
+                                        c.ingest_quic_frame(buf, peer).await;
                                         return;
                                     }
                                     let mut len = [0u8; 4];
@@ -771,7 +908,7 @@ impl Cluster {
                                     tokio::spawn(async move {
                                         while let Some(buf) = rx.recv().await {
                                             let started = std::time::Instant::now();
-                                            worker.ingest_quic_frame(buf).await;
+                                            worker.ingest_quic_frame(buf, peer).await;
                                             metrics::histogram!("musubi_bus_ingest_ms")
                                                 .record(started.elapsed().as_secs_f64() * 1000.0);
                                         }
@@ -808,10 +945,12 @@ impl Cluster {
                                         else {
                                             return;
                                         };
-                                        serde_json::to_vec(&c.handle_swim(msg).await)
+                                        serde_json::to_vec(&c.handle_swim(msg, peer).await)
                                             .unwrap_or_default()
                                     }
-                                    Some((&raft::TAG_RAFT, body)) => c.handle_raft(body).await,
+                                    Some((&raft::TAG_RAFT, body)) => {
+                                        c.handle_raft(body, peer).await
+                                    }
                                     Some((&raft::TAG_WRITE, body)) => {
                                         c.handle_forwarded_write(body).await
                                     }
@@ -854,8 +993,14 @@ impl Cluster {
         !(msg.via_quic && self.bus.is_some())
     }
 
-    async fn ingest_quic_frame(&self, buf: Vec<u8>) {
+    /// `peer` is the node the connection's client certificate proved; a frame claiming any
+    /// other origin is a forgery (or a bug) and is dropped.
+    async fn ingest_quic_frame(&self, buf: Vec<u8>, peer: Uuid) {
         match serde_json::from_slice::<BusMessage>(&buf) {
+            Ok(msg) if msg.origin.0 != peer => {
+                metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "rx", "ok" => "false").increment(1);
+                tracing::warn!(claimed = %msg.origin.0, peer = %peer, topic = %msg.topic, "bus: origin does not match the authenticated peer; dropped");
+            }
             Ok(msg) if msg.origin != self.me.id => {
                 metrics::counter!("musubi_bus_messages_total", "transport" => "quic", "dir" => "rx", "ok" => "true").increment(1);
                 metrics::counter!("musubi_bus_bytes_total", "transport" => "quic", "dir" => "rx")
@@ -1244,7 +1389,8 @@ impl QuicBus {
         store.add(der).map_err(Error::internal)?;
         let mut tls = rustls::ClientConfig::builder()
             .with_root_certificates(store)
-            .with_no_client_auth();
+            .with_client_auth_cert(vec![self.cert.clone()], self.key.clone_key())
+            .map_err(Error::internal)?;
         tls.alpn_protocols = vec![BUS_ALPN.to_vec()];
         let crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(Error::internal)?;
@@ -1316,5 +1462,153 @@ impl QuicBus {
             return Err(Error::internal(e));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bus_auth_tests {
+    use super::*;
+
+    fn node(id: Uuid, bus_cert: &str) -> NodeInfo {
+        let now = OffsetDateTime::now_utc();
+        NodeInfo {
+            id: NodeId(id),
+            name: "n".into(),
+            region: "r".into(),
+            roles: vec![],
+            version: String::new(),
+            advertise: String::new(),
+            started_at: now,
+            heartbeat_at: now,
+            alive: true,
+            bus_addr: "127.0.0.1:1".into(),
+            bus_cert: bus_cert.into(),
+            state: "alive".into(),
+            raft_id: raft::raft_id(id),
+            group: default_group(),
+            wg_pubkey: String::new(),
+            wg_endpoint: String::new(),
+            wg_addr: String::new(),
+        }
+    }
+
+    fn cert() -> CertificateDer<'static> {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        CertificateDer::from(c.cert.der().to_vec())
+    }
+
+    /// Only a certificate published in the registry (and not our own row) passes the client
+    /// certificate check, and it maps to exactly that node.
+    #[test]
+    fn peer_trust_admits_only_registered_certificates() {
+        let trust = PeerTrust::new();
+        let (me, a, b) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let (my_cert, a_cert, b_cert, stranger) = (cert(), cert(), cert(), cert());
+        let now = UnixTime::now();
+        let check = |der: &CertificateDer<'static>| trust.verify_client_cert(der, &[], now).is_ok();
+        assert!(
+            !check(&a_cert),
+            "nothing is trusted before the first refresh"
+        );
+        trust.update(
+            NodeId(me),
+            &[
+                node(me, &hex::encode(my_cert.as_ref())),
+                node(a, &hex::encode(a_cert.as_ref())),
+                node(b, &hex::encode(b_cert.as_ref())),
+                node(Uuid::now_v7(), ""),
+                node(Uuid::now_v7(), "zz-not-hex"),
+            ],
+        );
+        assert!(check(&a_cert) && check(&b_cert));
+        assert!(
+            !check(&stranger),
+            "a self-signed certificate nobody registered"
+        );
+        assert!(!check(&my_cert), "our own certificate is not a peer");
+        assert_eq!(trust.node_of(a_cert.as_ref()), Some(a));
+        assert_eq!(trust.node_of(b_cert.as_ref()), Some(b));
+        assert_eq!(trust.node_of(stranger.as_ref()), None);
+        // a node that restarted with a new certificate replaces the old one
+        let a_new = cert();
+        trust.update(NodeId(me), &[node(a, &hex::encode(a_new.as_ref()))]);
+        assert!(check(&a_new) && !check(&a_cert) && !check(&b_cert));
+    }
+
+    fn offline_cluster() -> Arc<Cluster> {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        Arc::new(
+            Cluster::new(db, "t", "local", vec![], "")
+                .with_bus("127.0.0.1:0".parse().unwrap(), None)
+                .unwrap(),
+        )
+    }
+
+    /// A frame arriving on a connection authenticated as node X is only accepted when it says
+    /// it comes from X: the transport identity, not the payload, decides the origin.
+    #[tokio::test]
+    async fn quic_frames_are_bound_to_the_authenticated_peer() {
+        let c = offline_cluster();
+        let mut rx = c.subscribe();
+        let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+        let frame = |origin: Uuid, topic: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "origin": origin, "topic": topic, "payload": {"n": 1}, "group": "default"
+            }))
+            .unwrap()
+        };
+        c.ingest_quic_frame(frame(y, "forged"), x).await;
+        c.ingest_quic_frame(frame(c.node_id().0, "self"), x).await;
+        c.ingest_quic_frame(frame(x, "genuine"), x).await;
+        let got = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the genuine frame is delivered")
+            .unwrap();
+        assert_eq!(got.topic, "genuine");
+        assert_eq!(got.origin.0, x);
+        assert!(
+            rx.try_recv().is_err(),
+            "forged and self-originated frames were dropped"
+        );
+    }
+
+    /// SWIM messages claiming another node's id are refused, and an indirect probe only dials
+    /// the target the registry knows (never an address the requester made up).
+    #[tokio::test]
+    async fn swim_refuses_messages_claiming_another_node() {
+        let c = offline_cluster();
+        let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+        let ping = swim::Msg::Ping {
+            from: y,
+            gossip: vec![],
+        };
+        assert!(matches!(c.handle_swim(ping, x).await, swim::Msg::Nack));
+        assert_eq!(
+            c.member_state(y).await,
+            None,
+            "no membership entry for the impostor"
+        );
+        let ping = swim::Msg::Ping {
+            from: x,
+            gossip: vec![],
+        };
+        assert!(matches!(
+            c.handle_swim(ping, x).await,
+            swim::Msg::Ack { .. }
+        ));
+        assert_eq!(c.member_state(x).await, Some(State::Alive));
+        // ping-req for a target we have never seen in the registry: refused without dialing
+        let req = swim::Msg::PingReq {
+            from: x,
+            target: Box::new(node(y, "")),
+        };
+        let started = std::time::Instant::now();
+        assert!(matches!(c.handle_swim(req, x).await, swim::Msg::Nack));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "nothing was dialed"
+        );
     }
 }

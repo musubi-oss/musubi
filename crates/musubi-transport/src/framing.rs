@@ -44,9 +44,10 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         Frame::Binary(b) => (1, b.to_vec()),
         Frame::Close => (2, Vec::new()),
     };
+    let len = u32::try_from(body.len()).map_err(|_| TransportError::TooLarge(body.len()))?;
     let mut buf = Vec::with_capacity(5 + body.len());
     buf.push(t);
-    buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&body);
     send.write_all(&buf)
         .await

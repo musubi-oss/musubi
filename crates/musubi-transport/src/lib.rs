@@ -25,6 +25,18 @@ pub enum Frame {
 }
 
 impl Frame {
+    /// Bytes of application payload the frame carries (0 for `Close`); what `Limits::max_frame_bytes`
+    /// is compared against regardless of the frame being text or binary.
+    pub fn payload_len(&self) -> usize {
+        match self {
+            Frame::Text(s) => s.len(),
+            Frame::Binary(b) => b.len(),
+            Frame::Close => 0,
+        }
+    }
+}
+
+impl Frame {
     pub fn payload(&self) -> Option<&[u8]> {
         match self {
             Frame::Text(s) => Some(s.as_bytes()),

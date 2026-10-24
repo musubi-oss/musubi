@@ -76,14 +76,7 @@ impl Identity {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(Error::internal)?;
         }
-        std::fs::write(path, format!("{}\n", self.private_b64())).map_err(Error::internal)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .map_err(Error::internal)?;
-        }
-        Ok(())
+        write_private(path, format!("{}\n", self.private_b64()).as_bytes()).map_err(Error::internal)
     }
 
     pub fn public_b64(&self) -> String {
@@ -98,6 +91,43 @@ impl Identity {
 /// True for a WireGuard public key as published by peers (32 bytes, base64).
 pub fn valid_public_key(text: &str) -> bool {
     B64.decode(text).map(|b| b.len() == 32).unwrap_or(false)
+}
+
+/// Create (or truncate) `path` owner-readable only and write `bytes`: the mode is set at open,
+/// so a private key never spends a moment with the umask's default permissions.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        // an existing file keeps its old mode on open: tighten it too
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(bytes)
+}
+
+/// A peer row is only rendered when every field is what `wg` expects; the registry is written by
+/// nodes, and a stray newline in a name or endpoint would otherwise inject `[Peer]` directives
+/// (an `AllowedIPs = 0.0.0.0/0` in a comment line hijacks the overlay).
+fn renderable(p: &Peer) -> bool {
+    let token_ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic());
+    p.address.parse::<Ipv4Addr>().is_ok()
+        && valid_public_key(&p.public_key)
+        && token_ok(&p.public_key)
+        && (p.endpoint.is_empty() || token_ok(&p.endpoint))
+}
+
+/// Free text for a `#` comment line: control characters (newlines above all) removed.
+fn comment(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// IPv4 overlay subnet.
@@ -209,8 +239,18 @@ fn render_peers(peers: &[Peer], keepalive_secs: u16) -> String {
     sorted.sort_by(|a, b| a.address.cmp(&b.address).then(a.node.cmp(&b.node)));
     let mut out = String::new();
     for p in sorted {
+        if !renderable(p) {
+            tracing::warn!(node = %p.node, "mesh: peer row is malformed; left out of the wireguard config");
+            continue;
+        }
         out.push_str("\n[Peer]\n");
-        let _ = writeln!(out, "# {} ({}) {}", p.name, p.region, p.node);
+        let _ = writeln!(
+            out,
+            "# {} ({}) {}",
+            comment(&p.name),
+            comment(&p.region),
+            p.node
+        );
         let _ = writeln!(out, "PublicKey = {}", p.public_key);
         if !p.endpoint.is_empty() {
             let _ = writeln!(out, "Endpoint = {}", p.endpoint);
@@ -391,12 +431,8 @@ pub async fn apply(
     .await?;
     run(&["ip", "link", "set", "up", "dev", iface]).await?;
     let conf = scratch_dir.join(format!("{iface}.conf"));
-    std::fs::write(&conf, setconf).map_err(|e| format!("write {}: {e}", conf.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600));
-    }
+    write_private(&conf, setconf.as_bytes())
+        .map_err(|e| format!("write {}: {e}", conf.display()))?;
     let res = run(&["wg", "syncconf", iface, &conf.to_string_lossy()]).await;
     let _ = std::fs::remove_file(&conf);
     res.map(|_| true)
@@ -452,7 +488,59 @@ mod tests {
         let a = Identity::load_or_create(&path).unwrap();
         let b = Identity::load_or_create(&path).unwrap();
         assert_eq!(a.public_b64(), b.public_b64());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "private key is owner-only from creation");
+        }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Registry rows are untrusted text as far as the config renderer is concerned.
+    #[test]
+    fn render_refuses_injection_and_malformed_rows() {
+        let id = Identity::from_bytes([7u8; 32]);
+        let s = Subnet::parse("10.77.0.0/16").unwrap();
+        let good = Peer {
+            node: Uuid::from_u128(1),
+            name: "ok\nAllowedIPs = 0.0.0.0/0".into(),
+            region: "eu\r".into(),
+            public_key: Identity::from_bytes([1; 32]).public_b64(),
+            endpoint: "203.0.113.3:51820".into(),
+            address: "10.77.0.1".into(),
+            alive: true,
+        };
+        let bad_endpoint = Peer {
+            node: Uuid::from_u128(2),
+            endpoint: "203.0.113.4:51820\nAllowedIPs = 0.0.0.0/0".into(),
+            address: "10.77.0.2".into(),
+            ..good.clone()
+        };
+        let bad_addr = Peer {
+            node: Uuid::from_u128(3),
+            address: "10.77.0.3/0\nEndpoint = evil:1".into(),
+            ..good.clone()
+        };
+        let bad_key = Peer {
+            node: Uuid::from_u128(4),
+            public_key: "not-a-key".into(),
+            address: "10.77.0.4".into(),
+            ..good.clone()
+        };
+        let out = render(
+            &id,
+            "10.77.0.9".parse().unwrap(),
+            &s,
+            51820,
+            0,
+            &[good, bad_endpoint, bad_addr, bad_key],
+            false,
+        );
+        assert_eq!(out.matches("[Peer]").count(), 1, "only the well-formed row");
+        assert!(!out.contains("\nAllowedIPs = 0.0.0.0/0") && !out.contains("evil"));
+        assert!(out.contains("\n# okAllowedIPs = 0.0.0.0/0 (eu) "), "{out}");
+        assert_eq!(out.matches("\nAllowedIPs = ").count(), 1);
     }
 
     #[test]

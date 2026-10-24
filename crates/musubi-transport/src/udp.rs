@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
@@ -59,17 +61,44 @@ fn io(e: impl std::fmt::Display) -> TransportError {
     TransportError::Io(e.to_string())
 }
 
+/// Stateless handshake cookie: HMAC-SHA256 over (address, nonce, 30 s slot), truncated to 128
+/// bits. Keyed MAC rather than a bare hash so the construction does not depend on SHA-256
+/// having no extension/prefix weaknesses, and compared in constant time by the server.
 fn cookie(secret: &[u8; 32], addr: SocketAddr, nonce: u64, slot: u64) -> [u8; 16] {
-    let mut h = Sha256::new();
-    h.update(secret);
+    let mut h = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("hmac accepts any key size");
     h.update(addr.to_string().as_bytes());
-    h.update(nonce.to_be_bytes());
-    h.update(slot.to_be_bytes());
-    let d = h.finalize();
+    h.update(&nonce.to_be_bytes());
+    h.update(&slot.to_be_bytes());
+    let d = h.finalize().into_bytes();
     let mut out = [0u8; 16];
     out.copy_from_slice(&d[..16]);
     out
 }
+
+fn cookie_valid(secret: &[u8; 32], addr: SocketAddr, nonce: u64, given: &[u8; 16]) -> bool {
+    let slot = slot_now();
+    let now = cookie(secret, addr, nonce, slot);
+    let prev = cookie(secret, addr, nonce, slot.wrapping_sub(1));
+    // every candidate is evaluated: no early exit leaks which one (if any) matched
+    let fresh = given.ct_eq(&now) | given.ct_eq(&prev);
+    bool::from(fresh) && *given != [0; 16]
+}
+
+/// Largest reliable message the peer may make us buffer: `max_frame` plus the datagram tag,
+/// rounded up to whole fragments.
+fn max_frags(max_frame: usize) -> usize {
+    (max_frame + 1).div_ceil(FRAG).max(1)
+}
+
+/// Fragment slots the receiver buffers for reliable messages waiting on an earlier one, as a
+/// multiple of the largest message (`max_frags`). Beyond that a new message is dropped (not
+/// acked) and the sender retransmits it once the gap has closed, so a peer cannot make us
+/// allocate ahead of what we deliver.
+const PENDING_BUDGET_FRAMES: usize = 4;
+const MIN_PENDING_SLOTS: usize = 1024;
+/// Connections one endpoint serves; the handshake answers with a challenge regardless, so a flood
+/// of valid handshakes cannot push the table past this.
+pub const MAX_CONNS: usize = 65_536;
 
 fn slot_now() -> u64 {
     std::time::SystemTime::now()
@@ -144,14 +173,20 @@ struct Conn {
     last_recv: Instant,
     last_send: Instant,
     closing: bool,
+    /// Fragments per reliable message this peer may make us buffer (`max_frags(max_frame)`).
+    max_frags: usize,
+    /// Fragment slots currently held in `reliable_pending`.
+    pending_slots: usize,
 }
 
 impl Conn {
-    fn new(addr: SocketAddr, inbound: mpsc::Sender<Frame>) -> Self {
+    fn new(addr: SocketAddr, inbound: mpsc::Sender<Frame>, max_frame: usize) -> Self {
         let now = Instant::now();
         Self {
             addr,
             inbound,
+            max_frags: max_frags(max_frame),
+            pending_slots: 0,
             send_seq: 0,
             msg_id: [0, 0],
             unacked: BTreeMap::new(),
@@ -276,10 +311,21 @@ impl Conn {
                 if !newer(mid, self.next_reliable) && mid != self.next_reliable {
                     return out; // already delivered
                 }
-                let entry = self
-                    .reliable_pending
-                    .entry(mid)
-                    .or_insert_with(|| (count, vec![None; count as usize]));
+                // a fragment the sender cannot legitimately produce: a count past the frame
+                // limit, or a body larger than the MTU allows
+                if count as usize > self.max_frags || body.len() > FRAG {
+                    return out;
+                }
+                if !self.reliable_pending.contains_key(&mid) {
+                    let budget = (self.max_frags * PENDING_BUDGET_FRAMES).max(MIN_PENDING_SLOTS);
+                    if self.pending_slots + count as usize > budget {
+                        return out; // ahead of what we can hold: not acked, retransmitted later
+                    }
+                    self.pending_slots += count as usize;
+                    self.reliable_pending
+                        .insert(mid, (count, vec![None; count as usize]));
+                }
+                let entry = self.reliable_pending.get_mut(&mid).expect("just inserted");
                 if entry.0 == count && entry.1[idx as usize].is_none() {
                     entry.1[idx as usize] = Some(body.to_vec());
                 }
@@ -287,7 +333,8 @@ impl Conn {
                     if frags.iter().any(Option::is_none) || *c == 0 {
                         break;
                     }
-                    let (_, frags) = self.reliable_pending.remove(&self.next_reliable).unwrap();
+                    let (c, frags) = self.reliable_pending.remove(&self.next_reliable).unwrap();
+                    self.pending_slots = self.pending_slots.saturating_sub(c as usize);
                     let mut whole = Vec::new();
                     for f in frags.into_iter().flatten() {
                         whole.extend_from_slice(&f);
@@ -310,7 +357,6 @@ struct Endpoint {
     secret: [u8; 32],
     conns: HashMap<u32, Conn>,
     by_addr: HashMap<SocketAddr, u32>,
-    next_id: u32,
     accept_tx: Option<mpsc::Sender<UdpConnection>>,
     cmd_tx: mpsc::Sender<Cmd>,
     /// Client handshake in flight: nonce, cookie we were given, who is waiting.
@@ -341,15 +387,17 @@ impl Endpoint {
         self.send_raw(addr, &buf, false);
     }
 
+    /// A fresh, unpredictable connection id: data packets are accepted on (id, source address)
+    /// alone, so a guessable counter would let an off-path sender inject into other sessions.
     fn new_conn(&mut self, addr: SocketAddr) -> (u32, UdpConnection) {
         let id = loop {
-            self.next_id = self.next_id.wrapping_add(1).max(1);
-            if !self.conns.contains_key(&self.next_id) {
-                break self.next_id;
+            let id: u32 = rand::random();
+            if id != 0 && !self.conns.contains_key(&id) {
+                break id;
             }
         };
         let (tx, rx) = mpsc::channel(1024);
-        self.conns.insert(id, Conn::new(addr, tx));
+        self.conns.insert(id, Conn::new(addr, tx, self.max_frame));
         self.by_addr.insert(addr, id);
         (
             id,
@@ -384,15 +432,11 @@ impl Endpoint {
                 }
                 let nonce = u64::from_be_bytes(body[..8].try_into().unwrap());
                 let given: [u8; 16] = body[8..24].try_into().unwrap();
-                let slot = slot_now();
-                let valid = given != [0; 16]
-                    && (given == cookie(&self.secret, from, nonce, slot)
-                        || given == cookie(&self.secret, from, nonce, slot.wrapping_sub(1)));
-                if !valid {
+                if !cookie_valid(&self.secret, from, nonce, &given) {
                     let mut buf = Vec::with_capacity(HDR + 24);
                     header(T_CHALLENGE, 0, &mut buf);
                     buf.extend_from_slice(&nonce.to_be_bytes());
-                    buf.extend_from_slice(&cookie(&self.secret, from, nonce, slot));
+                    buf.extend_from_slice(&cookie(&self.secret, from, nonce, slot_now()));
                     self.send_raw(from, &buf, false);
                     return;
                 }
@@ -400,6 +444,9 @@ impl Endpoint {
                 let id = match self.by_addr.get(&from) {
                     Some(id) => *id,
                     None => {
+                        if self.conns.len() >= MAX_CONNS {
+                            return;
+                        }
                         let (id, conn) = self.new_conn(from);
                         if let Some(tx) = &self.accept_tx {
                             if tx.try_send(conn).is_err() {
@@ -433,7 +480,7 @@ impl Endpoint {
                     if *addr == from {
                         let (addr, _, _, waiter) = self.connecting.take().unwrap();
                         let (tx, rx) = mpsc::channel(1024);
-                        self.conns.insert(id, Conn::new(addr, tx));
+                        self.conns.insert(id, Conn::new(addr, tx, self.max_frame));
                         self.by_addr.insert(addr, id);
                         let _ = waiter.send(UdpConnection {
                             id,
@@ -539,7 +586,8 @@ impl Endpoint {
         let mut gone = Vec::new();
         let mut resend: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
         for (id, c) in self.conns.iter_mut() {
-            if now.saturating_duration_since(c.last_recv) > IDLE {
+            // the session loop dropped its handle without `close()`: stop keeping the peer alive
+            if now.saturating_duration_since(c.last_recv) > IDLE || c.inbound.is_closed() {
                 gone.push(*id);
                 continue;
             }
@@ -601,7 +649,6 @@ fn spawn_endpoint(
         secret,
         conns: HashMap::new(),
         by_addr: HashMap::new(),
-        next_id: 0,
         accept_tx,
         cmd_tx: cmd_tx.clone(),
         connecting: None,
@@ -771,8 +818,8 @@ impl Connection for UdpConnection {
     fn recv(&mut self) -> BoxFuture<'_, Result<Frame, TransportError>> {
         Box::pin(async move {
             match self.inbound.recv().await {
-                Some(Frame::Binary(b)) if b.len() > self.max_frame => {
-                    Err(TransportError::TooLarge(b.len()))
+                Some(f) if f.payload_len() > self.max_frame => {
+                    Err(TransportError::TooLarge(f.payload_len()))
                 }
                 Some(f) => Ok(f),
                 None => Err(TransportError::Closed),
@@ -861,7 +908,7 @@ mod tests {
     #[test]
     fn ack_history_tracks_out_of_order_and_duplicates() {
         let (tx, _rx) = mpsc::channel(1);
-        let mut c = Conn::new("127.0.0.1:1".parse().unwrap(), tx);
+        let mut c = Conn::new("127.0.0.1:1".parse().unwrap(), tx, 64 * 1024);
         assert!(c.note_recv(5));
         assert!(c.note_recv(7));
         assert!(c.note_recv(6));
@@ -870,5 +917,98 @@ mod tests {
         assert_eq!(c.ack_fields(), (7, 0b11));
         assert!(c.note_recv(3));
         assert_eq!(c.ack_fields(), (7, 0b1011));
+    }
+
+    /// The handshake cookie is a keyed MAC bound to the source address and nonce; a zero or
+    /// altered cookie, another secret or another source never validates.
+    #[test]
+    fn cookie_is_keyed_and_bound_to_source() {
+        let secret = [9u8; 32];
+        let addr: SocketAddr = "203.0.113.7:4000".parse().unwrap();
+        let other: SocketAddr = "203.0.113.8:4000".parse().unwrap();
+        let good = cookie(&secret, addr, 42, slot_now());
+        assert!(cookie_valid(&secret, addr, 42, &good));
+        assert!(cookie_valid(
+            &secret,
+            addr,
+            42,
+            &cookie(&secret, addr, 42, slot_now().wrapping_sub(1))
+        ));
+        assert!(!cookie_valid(&secret, addr, 42, &[0; 16]));
+        assert!(!cookie_valid(&secret, other, 42, &good));
+        assert!(!cookie_valid(&secret, addr, 43, &good));
+        assert!(!cookie_valid(&[8u8; 32], addr, 42, &good));
+        let mut flipped = good;
+        flipped[15] ^= 1;
+        assert!(!cookie_valid(&secret, addr, 42, &flipped));
+        assert!(!cookie_valid(
+            &secret,
+            addr,
+            42,
+            &cookie(&secret, addr, 42, slot_now().wrapping_sub(2))
+        ));
+    }
+
+    /// A peer cannot make the receiver allocate for messages it could not legitimately have in
+    /// flight: fragment counts past the frame limit, fragments larger than the MTU allows, or
+    /// more buffered fragments than the reassembly budget while an earlier message is missing.
+    #[test]
+    fn reassembly_refuses_what_the_sender_cannot_have_in_flight() {
+        let (tx, _rx) = mpsc::channel(1);
+        let max_frame = 64 * 1024;
+        let mut c = Conn::new("127.0.0.1:1".parse().unwrap(), tx, max_frame);
+        assert!(c.on_message(CH_RELIABLE, 0, 0, u16::MAX, b"x").is_empty());
+        assert!(
+            c.reliable_pending.is_empty(),
+            "65535-fragment claim allocates nothing"
+        );
+        let limit = max_frags(max_frame) as u16;
+        assert!(c.on_message(CH_RELIABLE, 0, 0, limit + 1, b"x").is_empty());
+        assert!(c.reliable_pending.is_empty());
+        assert!(c
+            .on_message(CH_RELIABLE, 1, 0, 2, &vec![0u8; FRAG + 1])
+            .is_empty());
+        assert!(
+            c.reliable_pending.is_empty(),
+            "oversized fragment is not buffered"
+        );
+        // message 0 is missing; full-size messages 1.. are held up to the budget, then dropped
+        let budget = (max_frags(max_frame) * PENDING_BUDGET_FRAMES).max(MIN_PENDING_SLOTS);
+        let mut mid = 1u16;
+        while (c.pending_slots + limit as usize) <= budget {
+            assert!(c.on_message(CH_RELIABLE, mid, 0, limit, b"x").is_empty());
+            mid += 1;
+        }
+        let held = c.reliable_pending.len();
+        assert!(held >= PENDING_BUDGET_FRAMES && c.pending_slots <= budget);
+        assert!(c.on_message(CH_RELIABLE, mid, 0, limit, b"x").is_empty());
+        assert_eq!(c.reliable_pending.len(), held, "over budget: not buffered");
+        // the missing message arrives: it is delivered and its slots are released
+        let got = c.on_message(CH_RELIABLE, 0, 0, 1, b"\x00hi");
+        assert_eq!(got, vec![Frame::Text("hi".into())]);
+        assert_eq!(c.pending_slots, held * limit as usize);
+        assert_eq!(c.reliable_pending.len(), held);
+    }
+
+    /// Connection ids come from the CSPRNG (an off-path sender must not be able to guess the id
+    /// of a live session), and a session loop that drops its handle without `close()` still
+    /// tears the peer down instead of keeping it alive with keepalives forever.
+    #[tokio::test]
+    async fn ids_are_unpredictable_and_dropped_handles_close() {
+        let (mut c1, s1) = pair(0).await;
+        let (_c2, s2) = pair(0).await;
+        assert!(s1.id != 0 && s2.id != 0);
+        assert!(
+            !(s1.id == 1 && s2.id == 2),
+            "ids are not a counter: {} {}",
+            s1.id,
+            s2.id
+        );
+        assert_eq!(s1.id, c1.id);
+        drop(s1);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), c1.recv()).await,
+            Ok(Err(TransportError::Closed))
+        ));
     }
 }

@@ -19,6 +19,10 @@ use tokio::net::UdpSocket;
 pub const MAGIC: [u8; 2] = [0xED, 0x6E];
 pub const MAX_TOKEN: usize = 128;
 const MAX_DATAGRAM: usize = 65_535;
+/// Client sessions one proxy holds at once. Each session is a connected upstream socket plus a
+/// reply task, and a client address is never authenticated (UDP), so one holder of a valid token
+/// could otherwise open a session per forged source until the ephemeral ports run out.
+pub const MAX_SESSIONS: usize = 20_000;
 
 /// Maps a routing token to the game server it belongs to. `None` = drop the packet.
 #[async_trait::async_trait]
@@ -156,6 +160,10 @@ impl UdpProxy {
             };
             let session = match session {
                 Some(s) => s,
+                None if self.sessions.len() >= MAX_SESSIONS => {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 None => match self.open(from, token).await {
                     Some(s) => s,
                     None => {

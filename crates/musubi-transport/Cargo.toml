@@ -23,3 +23,5 @@ str0m = "0.24"
 serde_json.workspace = true
 sha2.workspace = true
 rand.workspace = true
+hmac = "0.12"
+subtle = "2"

@@ -554,3 +554,66 @@ mod json_text_buffered_tests {
         assert_eq!(back, c);
     }
 }
+
+#[cfg(test)]
+mod postcard_optional_fields_tests {
+    use super::*;
+    use crate::realtime::{PartyListing, ServerMessage};
+
+    /// postcard is not self-describing: an `Option` field that is skipped when `None` cannot be
+    /// decoded back (the bytes of the next field are read as the option tag), so every optional
+    /// field must always be written, as the crate docs demand.
+    #[test]
+    fn none_fields_round_trip_in_postcard() {
+        let n = ServerMessage::Notification {
+            id: "n1".into(),
+            subject: "hi".into(),
+            content: serde_json::json!({"k": 1}),
+            code: 3,
+            sender_id: None,
+            create_time: 12,
+            persistent: true,
+            expire_time: None,
+        };
+        let bin = Encoding::Postcard.encode(&n).unwrap();
+        let back: ServerMessage = Encoding::Postcard.decode(&bin).unwrap();
+        match back {
+            ServerMessage::Notification {
+                id, expire_time, ..
+            } => {
+                assert_eq!(id, "n1");
+                assert_eq!(expire_time, None);
+            }
+            other => panic!("decoded {other:?}"),
+        }
+        let s = ServerMessage::StreamData {
+            stream: "lobby".into(),
+            data: serde_json::json!([1, 2]),
+            sender: None,
+        };
+        let bin = Encoding::Postcard.encode(&s).unwrap();
+        let back: ServerMessage = Encoding::Postcard.decode(&bin).unwrap();
+        match back {
+            ServerMessage::StreamData { stream, sender, .. } => {
+                assert_eq!(stream, "lobby");
+                assert!(sender.is_none());
+            }
+            other => panic!("decoded {other:?}"),
+        }
+        let p = PartyListing {
+            party_id: "p".into(),
+            label: "l".into(),
+            open: true,
+            max_size: 4,
+            size: 1,
+            leader_id: None,
+        };
+        let bin = Encoding::Postcard.encode(&p).unwrap();
+        let back: PartyListing = Encoding::Postcard.decode(&bin).unwrap();
+        assert_eq!(back, p);
+        // JSON clients see an explicit null instead of a missing key
+        let json: serde_json::Value =
+            serde_json::from_slice(&Encoding::Json.encode(&p).unwrap()).unwrap();
+        assert!(json["leader_id"].is_null());
+    }
+}

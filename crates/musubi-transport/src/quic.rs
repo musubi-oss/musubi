@@ -73,42 +73,11 @@ impl QuicConnection {
         recv: &mut RecvStream,
         max_frame: usize,
     ) -> Result<Frame, TransportError> {
-        let mut head = [0u8; 5];
-        recv.read_exact(&mut head).await.map_err(|e| match e {
-            quinn::ReadExactError::FinishedEarly(_) => TransportError::Closed,
-            other => TransportError::Io(other.to_string()),
-        })?;
-        let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
-        if len > max_frame {
-            return Err(TransportError::TooLarge(len));
-        }
-        let mut body = vec![0u8; len];
-        recv.read_exact(&mut body)
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))?;
-        match head[0] {
-            0 => String::from_utf8(body)
-                .map(Frame::Text)
-                .map_err(|_| TransportError::Io("invalid utf-8 text frame".into())),
-            1 => Ok(Frame::Binary(Bytes::from(body))),
-            2 => Ok(Frame::Close),
-            t => Err(TransportError::Io(format!("unknown frame type {t}"))),
-        }
+        crate::framing::read_frame(recv, max_frame).await
     }
 
     pub async fn write_frame(send: &mut SendStream, frame: Frame) -> Result<(), TransportError> {
-        let (t, body): (u8, Vec<u8>) = match frame {
-            Frame::Text(s) => (0, s.into_bytes()),
-            Frame::Binary(b) => (1, b.to_vec()),
-            Frame::Close => (2, Vec::new()),
-        };
-        let mut buf = Vec::with_capacity(5 + body.len());
-        buf.push(t);
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&body);
-        send.write_all(&buf)
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))
+        crate::framing::write_frame(send, frame).await
     }
 }
 

@@ -142,6 +142,22 @@ pub struct Counters {
     pub open_rate: AtomicU64,
     pub strikes: AtomicU64,
     pub blocks_issued: AtomicU64,
+    /// Packets admitted without a per-source bucket because the source table was full.
+    pub untracked: AtomicU64,
+}
+
+/// Source addresses the guard tracks at once. UDP sources are forged for free, so without a
+/// ceiling a spoofed flood grows one bucket per address until the next idle sweep (tens of
+/// millions of entries in a minute). Past it a new source is admitted without its own bucket
+/// (the global ceiling still applies) after an attempt to evict sources idle for a second.
+pub const MAX_TRACKED_SOURCES: usize = 262_144;
+const EMERGENCY_SWEEP_IDLE: Duration = Duration::from_secs(1);
+/// Longest block (10 years): `Instant + Duration` panics on overflow, so operator-supplied or
+/// escalated durations are clamped instead.
+const MAX_BLOCK: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+fn block_duration(secs: u64) -> Duration {
+    Duration::from_secs(secs).min(MAX_BLOCK)
 }
 
 pub struct Guard {
@@ -149,6 +165,9 @@ pub struct Guard {
     sources: DashMap<IpAddr, Bucket>,
     global: std::sync::Mutex<(f64, Instant)>,
     pub counters: Counters,
+    max_sources: usize,
+    /// Last time a full table was swept for idle sources (at most once a second).
+    last_emergency_sweep: std::sync::Mutex<Instant>,
 }
 
 /// A blocked source as reported by `Guard::blocklist`.
@@ -168,7 +187,37 @@ impl Guard {
             sources: DashMap::new(),
             global: std::sync::Mutex::new((burst, Instant::now())),
             counters: Counters::default(),
+            max_sources: MAX_TRACKED_SOURCES,
+            last_emergency_sweep: std::sync::Mutex::new(Instant::now()),
         }
+    }
+
+    /// Override [`MAX_TRACKED_SOURCES`] (tests, small boxes).
+    pub fn with_max_sources(mut self, n: usize) -> Self {
+        self.max_sources = n.max(1);
+        self
+    }
+
+    /// Room for one more source bucket? A full table is swept for idle sources first (once a
+    /// second at most); `false` = admit the packet unaccounted rather than allocate.
+    fn can_track(&self, ip: IpAddr, now: Instant) -> bool {
+        if self.sources.len() < self.max_sources || self.sources.contains_key(&ip) {
+            return true;
+        }
+        let mut last = self
+            .last_emergency_sweep
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if now.saturating_duration_since(*last) >= EMERGENCY_SWEEP_IDLE {
+            *last = now;
+            drop(last);
+            self.sources.retain(|_, b| {
+                b.blocked_until.is_some_and(|u| u > now)
+                    || now.saturating_duration_since(b.last_seen) < EMERGENCY_SWEEP_IDLE
+            });
+            return self.sources.len() < self.max_sources;
+        }
+        false
     }
 
     pub fn allowed(&self, ip: IpAddr) -> bool {
@@ -209,7 +258,9 @@ impl Guard {
             return Verdict::Pass;
         }
         if len < self.cfg.min_packet_bytes {
-            self.strike_at(ip, now);
+            if self.can_track(ip, now) {
+                self.strike_at(ip, now);
+            }
             return Verdict::TooSmall;
         }
         if self.cfg.global_max_pps > 0 {
@@ -222,6 +273,10 @@ impl Guard {
                 return Verdict::GlobalRate;
             }
             g.0 -= 1.0;
+        }
+        if !self.can_track(ip, now) {
+            self.counters.untracked.fetch_add(1, Ordering::Relaxed);
+            return Verdict::Pass;
         }
         let cfg = &self.cfg;
         let mut b = self.sources.entry(ip).or_insert_with(|| Bucket {
@@ -273,8 +328,9 @@ impl Guard {
 
     /// The proxy found the packet malformed or its token unknown: counts toward a block.
     pub fn strike(&self, from: SocketAddr) {
-        if self.cfg.enabled && !self.allowed(from.ip()) {
-            self.strike_at(from.ip(), Instant::now());
+        let now = Instant::now();
+        if self.cfg.enabled && !self.allowed(from.ip()) && self.can_track(from.ip(), now) {
+            self.strike_at(from.ip(), now);
         }
     }
 
@@ -311,7 +367,7 @@ impl Guard {
         {
             // repeat offenders stay out longer: 1×, 2×, 4× … up to 16× block_secs
             let factor = 1u64 << b.blocks.min(4);
-            b.blocked_until = Some(now + Duration::from_secs(cfg.block_secs * factor));
+            b.blocked_until = Some(now + block_duration(cfg.block_secs.saturating_mul(factor)));
             b.blocks += 1;
             c.blocks_issued.fetch_add(1, Ordering::Relaxed);
         }
@@ -322,7 +378,7 @@ impl Guard {
         let now = Instant::now();
         self.strike_at(ip, now);
         if let Some(mut b) = self.sources.get_mut(&ip) {
-            b.blocked_until = Some(now + Duration::from_secs(secs));
+            b.blocked_until = Some(now + block_duration(secs));
             b.blocks = b.blocks.max(1);
         }
     }
@@ -500,6 +556,7 @@ mod tests {
             assert_eq!(off.check_inner(src(1).ip(), 1, true, now), Verdict::Pass);
         }
         assert!(parse_cidr("10.0.0.0/33").is_none());
+        assert!(parse_cidr("2001:db8::/129").is_none());
         assert!(parse_cidr("2001:db8::/32").is_some());
         assert_eq!(g.tracked_sources(), 3);
         g.sweep(Duration::from_secs(0));
@@ -507,6 +564,41 @@ mod tests {
             g.tracked_sources(),
             0,
             "idle unblocked sources are forgotten"
+        );
+    }
+
+    /// A spoofed flood of distinct sources stops allocating buckets at the ceiling; packets from
+    /// new sources still pass (the global budget covers them) and the table shrinks again once
+    /// the sources go idle.
+    #[test]
+    fn source_table_is_bounded() {
+        let g = Guard::new(cfg()).with_max_sources(8);
+        let now = Instant::now();
+        for n in 0..200u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+            assert_eq!(g.check_inner(ip, 10, true, now), Verdict::Pass);
+        }
+        assert_eq!(g.tracked_sources(), 8);
+        assert_eq!(g.counters.untracked.load(Ordering::Relaxed), 192);
+        // strikes from untracked sources do not allocate either
+        g.strike(SocketAddr::from(([10, 9, 9, 9], 1)));
+        assert_eq!(g.tracked_sources(), 8);
+        // a second later the idle entries are evicted to make room for a new source
+        let later = now + Duration::from_secs(2);
+        let fresh = IpAddr::from([10, 1, 2, 3]);
+        assert_eq!(g.check_inner(fresh, 10, true, later), Verdict::Pass);
+        assert_eq!(g.tracked_sources(), 1);
+        assert_eq!(g.counters.untracked.load(Ordering::Relaxed), 192);
+        // block durations never overflow for absurd configs
+        let huge = Guard::new(GuardConfig {
+            block_secs: u64::MAX,
+            strikes_to_block: 1,
+            ..cfg()
+        });
+        huge.strike(SocketAddr::from(([10, 0, 0, 1], 1)));
+        assert_eq!(
+            huge.check_inner(IpAddr::from([10, 0, 0, 1]), 10, false, Instant::now()),
+            Verdict::Blocked
         );
     }
 }

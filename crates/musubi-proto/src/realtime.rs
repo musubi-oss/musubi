@@ -452,7 +452,7 @@ pub enum ServerMessage {
         create_time: i64,
         persistent: bool,
         /// Unix time after which the client should drop it (absent = keep).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         expire_time: Option<i64>,
     },
     /// Reply to `ChannelJoin`.
@@ -727,7 +727,7 @@ pub enum ServerMessage {
         stream: String,
         #[serde(with = "crate::json_in_binary")]
         data: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         sender: Option<UserPresence>,
     },
 }
@@ -866,6 +866,6 @@ pub struct PartyListing {
     pub open: bool,
     pub max_size: u32,
     pub size: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub leader_id: Option<String>,
 }

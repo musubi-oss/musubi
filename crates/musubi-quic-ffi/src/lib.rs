@@ -13,9 +13,16 @@ use bytes::Bytes;
 use rustls_pki_types::pem::PemObject;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::ToSocketAddrs;
-use std::sync::{Arc, Mutex};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Every exported function runs under this: a panic must not unwind across the C boundary
+/// (that aborts the host process — the whole Unreal editor or game), so it becomes `fallback`.
+fn guarded<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
+}
 
 pub const ALPN: &[u8] = b"musubi-rt/1";
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -216,7 +223,12 @@ async fn run(
     events: Arc<Mutex<std::collections::VecDeque<Event>>>,
     datagram_max: Arc<Mutex<usize>>,
 ) {
-    let push = |e: Event| events.lock().unwrap().push_back(e);
+    let push = |e: Event| {
+        events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(e)
+    };
     let bind: std::net::SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -240,7 +252,8 @@ async fn run(
         Ok(s) => s,
         Err(e) => return push(Event::Error(format!("open_bi: {e}"))),
     };
-    *datagram_max.lock().unwrap() = conn.max_datagram_size().unwrap_or(0);
+    *datagram_max.lock().unwrap_or_else(PoisonError::into_inner) =
+        conn.max_datagram_size().unwrap_or(0);
     push(Event::Connected);
     loop {
         tokio::select! {
@@ -292,6 +305,18 @@ async fn run(
 /// Returns a handle or null when the arguments are invalid; connection errors arrive as events.
 #[no_mangle]
 pub extern "C" fn mq_connect(
+    host: *const c_char,
+    port: u16,
+    sni: *const c_char,
+    insecure: c_int,
+    root_pem: *const c_char,
+) -> *mut MqConn {
+    guarded(std::ptr::null_mut(), || {
+        mq_connect_inner(host, port, sni, insecure, root_pem)
+    })
+}
+
+fn mq_connect_inner(
     host: *const c_char,
     port: u16,
     sni: *const c_char,
@@ -352,6 +377,8 @@ pub extern "C" fn mq_connect(
 }
 
 /// Queue a frame. `frame_type` 0 = text, 1 = binary. `unreliable != 0` → datagram when it fits.
+/// Returns 0, -1 for bad arguments, -2 when the connection is gone, -3 when the body exceeds
+/// `MAX_FRAME` (the node would drop the connection on such a frame).
 /// # Safety
 /// `conn` must be null or a live handle from `mq_connect`; pointers/lengths must describe valid memory.
 #[no_mangle]
@@ -365,21 +392,26 @@ pub unsafe extern "C" fn mq_send(
     if conn.is_null() || (data.is_null() && len > 0) || ty_byte > 1 {
         return -1;
     }
+    if len as usize > MAX_FRAME {
+        return -3;
+    }
     let c = unsafe { &*conn };
     let body = if len == 0 {
         Bytes::new()
     } else {
         Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(data, len as usize) })
     };
-    let ty = frame_type(ty_byte).unwrap_or(FrameType::Binary);
-    match c.0.cmd.send(Cmd::Send {
-        ty,
-        body,
-        unreliable: unreliable != 0,
-    }) {
-        Ok(()) => 0,
-        Err(_) => -2,
-    }
+    guarded(-2, || {
+        let ty = frame_type(ty_byte).unwrap_or(FrameType::Binary);
+        match c.0.cmd.send(Cmd::Send {
+            ty,
+            body,
+            unreliable: unreliable != 0,
+        }) {
+            Ok(()) => 0,
+            Err(_) => -2,
+        }
+    })
 }
 
 /// Pop the next event; returns 0 and `kind = None` when the queue is empty.
@@ -391,7 +423,6 @@ pub unsafe extern "C" fn mq_poll(conn: *mut MqConn, out: *mut MqEvent) -> c_int 
         return -1;
     }
     let c = unsafe { &mut *conn };
-    let ev = c.0.events.lock().unwrap().pop_front();
     let o = unsafe { &mut *out };
     *o = MqEvent {
         kind: MqEventKind::None,
@@ -400,6 +431,15 @@ pub unsafe extern "C" fn mq_poll(conn: *mut MqConn, out: *mut MqEvent) -> c_int 
         len: 0,
         data: std::ptr::null(),
     };
+    guarded(-1, || mq_poll_inner(c, o))
+}
+
+fn mq_poll_inner(c: &mut MqConn, o: &mut MqEvent) -> c_int {
+    let ev =
+        c.0.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
     let Some(ev) = ev else { return 0 };
     match ev {
         Event::Connected => o.kind = MqEventKind::Connected,
@@ -435,7 +475,12 @@ pub unsafe extern "C" fn mq_max_datagram(conn: *mut MqConn) -> u32 {
     if conn.is_null() {
         return 0;
     }
-    *unsafe { &*conn }.0.datagram_max.lock().unwrap() as u32
+    let c = unsafe { &*conn };
+    guarded(0, || {
+        *c.0.datagram_max
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) as u32
+    })
 }
 
 /// Close and free. Safe to call with null.
@@ -447,8 +492,10 @@ pub unsafe extern "C" fn mq_close(conn: *mut MqConn) {
         return;
     }
     let c = unsafe { Box::from_raw(conn) };
-    let _ = c.0.cmd.send(Cmd::Close);
-    c.0.rt.shutdown_timeout(Duration::from_millis(500));
+    guarded((), move || {
+        let _ = c.0.cmd.send(Cmd::Close);
+        c.0.rt.shutdown_timeout(Duration::from_millis(500));
+    });
 }
 
 /// Keep the exported symbol table stable for the UE loader.
@@ -462,4 +509,58 @@ fn _assert_send() {
     fn f<T: Send>() {}
     f::<Inner>();
     let _ = std::ptr::null::<c_void>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exports_validate_arguments_without_touching_memory() {
+        unsafe {
+            assert_eq!(mq_send(std::ptr::null_mut(), 1, std::ptr::null(), 0, 0), -1);
+            assert_eq!(mq_poll(std::ptr::null_mut(), std::ptr::null_mut()), -1);
+            assert_eq!(mq_max_datagram(std::ptr::null_mut()), 0);
+            mq_close(std::ptr::null_mut());
+        }
+        assert_eq!(mq_abi_version(), 1);
+    }
+
+    /// An unresolvable host yields null (no panic), a live handle refuses frames above the
+    /// node's limit and a bad type byte, and the handle is freed cleanly.
+    #[test]
+    fn handle_lifecycle_and_frame_limit() {
+        let bad = std::ffi::CString::new("host.invalid.").unwrap();
+        let no = mq_connect(bad.as_ptr(), 1, std::ptr::null(), 1, std::ptr::null());
+        // DNS for `.invalid` must fail; a resolver that answers anyway still gives a handle
+        if !no.is_null() {
+            unsafe { mq_close(no) };
+        }
+        let host = std::ffi::CString::new("127.0.0.1").unwrap();
+        let h = mq_connect(host.as_ptr(), 9, std::ptr::null(), 1, std::ptr::null());
+        assert!(!h.is_null());
+        let body = vec![0u8; MAX_FRAME + 1];
+        unsafe {
+            assert_eq!(mq_send(h, 1, body.as_ptr(), body.len() as u32, 0), -3);
+            assert_eq!(mq_send(h, 2, body.as_ptr(), 1, 0), -1);
+            assert_eq!(mq_send(h, 1, std::ptr::null(), 1, 0), -1);
+            assert_eq!(mq_send(h, 1, body.as_ptr(), 4, 0), 0);
+            let mut ev = MqEvent {
+                kind: MqEventKind::None,
+                frame_type: 0,
+                unreliable: 0,
+                len: 0,
+                data: std::ptr::null(),
+            };
+            // whatever the connection did meanwhile, polling never fails on a live handle
+            assert!(mq_poll(h, &mut ev) >= 0);
+            mq_close(h);
+        }
+    }
+
+    #[test]
+    fn panics_are_contained() {
+        assert_eq!(guarded(7, || panic!("boom")), 7);
+        assert_eq!(guarded(0, || 1), 1);
+    }
 }

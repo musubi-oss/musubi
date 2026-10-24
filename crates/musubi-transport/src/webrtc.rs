@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,13 @@ use crate::{Connection, Frame, TransportError};
 
 pub const RELIABLE_LABEL: &str = "reliable";
 pub const UNRELIABLE_LABEL: &str = "unreliable";
+/// A peer whose reliable channel is not open this long after its offer was accepted is dropped:
+/// an offer is posted anonymously over HTTP, so an abandoned one must not keep ICE/DTLS state.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Peers one `RtcServer` holds at once (each is an ICE agent + DTLS + SCTP state machine).
+pub const MAX_PEERS: usize = 4096;
+/// Frames a session may queue for a peer before its channel opens.
+const MAX_PENDING: usize = 256;
 
 enum Cmd {
     Peer {
@@ -53,6 +60,8 @@ struct Peer {
     /// Frames queued before the browser opened its channels.
     pending: Vec<(bool, Vec<u8>)>,
     deadline: Instant,
+    /// When the offer was accepted (handshake timeout runs from here).
+    since: Instant,
 }
 
 impl Peer {
@@ -68,6 +77,7 @@ impl Peer {
                     self.rtc.disconnect();
                 }
             }
+            None if self.pending.len() >= MAX_PENDING => self.rtc.disconnect(),
             None => self.pending.push((reliable, bytes)),
         }
     }
@@ -122,6 +132,8 @@ pub struct RtcServer {
     local: SocketAddr,
     public: SocketAddr,
     next_id: AtomicU64,
+    /// Peers the driver currently holds (handshaking or connected).
+    live: Arc<AtomicUsize>,
 }
 
 fn io(e: impl std::fmt::Display) -> TransportError {
@@ -145,12 +157,14 @@ impl RtcServer {
             }
         });
         let (tx, rx) = mpsc::channel(4096);
-        tokio::spawn(drive(socket, rx));
+        let live = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(drive(socket, rx, live.clone()));
         Ok(Arc::new(Self {
             cmds: tx,
             local,
             public,
             next_id: AtomicU64::new(1),
+            live,
         }))
     }
 
@@ -162,6 +176,11 @@ impl RtcServer {
         self.public
     }
 
+    /// Peers currently held by the driver (handshaking or connected).
+    pub fn peers(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
     /// A browser's offer (`RTCSessionDescription` JSON: `{type, sdp}`) → the answer in the same
     /// form, plus the connection the session loop serves once the data channel is up.
     pub async fn accept_offer(
@@ -169,6 +188,9 @@ impl RtcServer {
         offer: serde_json::Value,
         max_frame: usize,
     ) -> Result<(serde_json::Value, RtcConnection), TransportError> {
+        if self.live.load(Ordering::Relaxed) >= MAX_PEERS {
+            return Err(TransportError::Io("too many webrtc peers".into()));
+        }
         let offer: SdpOffer =
             serde_json::from_value(offer).map_err(|e| io(format!("offer: {e}")))?;
         let mut rtc = Rtc::builder().set_ice_lite(true).build(Instant::now());
@@ -198,7 +220,7 @@ impl RtcServer {
     }
 }
 
-async fn drive(socket: UdpSocket, mut cmds: mpsc::Receiver<Cmd>) {
+async fn drive(socket: UdpSocket, mut cmds: mpsc::Receiver<Cmd>, live: Arc<AtomicUsize>) {
     let Ok(local) = socket.local_addr() else {
         return;
     };
@@ -210,6 +232,9 @@ async fn drive(socket: UdpSocket, mut cmds: mpsc::Receiver<Cmd>) {
         let mut next = now + Duration::from_secs(1);
         let mut gone = Vec::new();
         for (id, p) in peers.iter_mut() {
+            if p.reliable.is_none() && now.saturating_duration_since(p.since) > HANDSHAKE_TIMEOUT {
+                p.rtc.disconnect();
+            }
             match p.drain(&socket) {
                 Ok(t) => next = next.min(t),
                 Err(()) => gone.push(*id),
@@ -219,6 +244,7 @@ async fn drive(socket: UdpSocket, mut cmds: mpsc::Receiver<Cmd>) {
             peers.remove(&id);
             by_addr.retain(|_, v| *v != id);
         }
+        live.store(peers.len(), Ordering::Relaxed);
         let wake = tokio::time::Instant::from_std(next.max(now + Duration::from_millis(1)));
         tokio::select! {
             r = socket.recv_from(&mut buf) => {
@@ -252,7 +278,9 @@ async fn drive(socket: UdpSocket, mut cmds: mpsc::Receiver<Cmd>) {
                         unreliable: None,
                         pending: Vec::new(),
                         deadline: Instant::now(),
+                        since: Instant::now(),
                     });
+                    live.store(peers.len(), Ordering::Relaxed);
                 }
                 Some(Cmd::Send { id, reliable, bytes }) => {
                     if let Some(p) = peers.get_mut(&id) {
@@ -314,8 +342,8 @@ impl Connection for RtcConnection {
     fn recv(&mut self) -> BoxFuture<'_, Result<Frame, TransportError>> {
         Box::pin(async move {
             match self.frames.recv().await {
-                Some(Frame::Binary(b)) if b.len() > self.max_frame => {
-                    Err(TransportError::TooLarge(b.len()))
+                Some(f) if f.payload_len() > self.max_frame => {
+                    Err(TransportError::TooLarge(f.payload_len()))
                 }
                 Some(f) => Ok(f),
                 None => Err(TransportError::Closed),

@@ -638,13 +638,24 @@ impl Cluster {
         }
     }
 
-    pub(crate) async fn handle_raft(&self, body: &[u8]) -> Vec<u8> {
+    /// `peer` is the node the bus connection authenticated: the RPC's vote must be that node's
+    /// own (leader or candidate), so no peer can append entries or vote in another's name.
+    pub(crate) async fn handle_raft(&self, body: &[u8], peer: Uuid) -> Vec<u8> {
         let Some(r) = self.raft_state() else {
             return b"null".to_vec();
         };
         let Ok(rpc) = serde_json::from_slice::<RaftRpc>(body) else {
             return b"null".to_vec();
         };
+        let sender = match &rpc {
+            RaftRpc::Append(req) => req.vote.leader_id().voted_for(),
+            RaftRpc::Vote(req) => req.vote.leader_id().voted_for(),
+            RaftRpc::Snapshot(req) => req.vote.leader_id().voted_for(),
+        };
+        if sender != Some(raft_id(peer)) {
+            tracing::warn!(?sender, peer = %peer, "raft: rpc from a node claiming another raft id; dropped");
+            return b"null".to_vec();
+        }
         match rpc {
             RaftRpc::Append(req) => serde_json::to_vec(&r.raft.append_entries(req).await),
             RaftRpc::Vote(req) => serde_json::to_vec(&r.raft.vote(req).await),
