@@ -46,10 +46,10 @@ impl WebhookProvider {
 
     fn started(v: &Value) -> Option<Started> {
         let address = v["address"].as_str().or(v["host"].as_str())?;
-        let port = v["port"].as_i64()?;
+        let port = crate::port_from_i64(v["port"].as_i64()?)?;
         Some(Started {
             address: address.to_string(),
-            port: port as i32,
+            port,
             pid: None,
         })
     }

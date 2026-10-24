@@ -166,12 +166,12 @@ impl GameLiftProvider {
 }
 
 fn session_endpoint(gs: &Value) -> Option<(String, i32)> {
-    let port = gs["Port"].as_i64()?;
+    let port = crate::port_from_i64(gs["Port"].as_i64()?)?;
     let addr = gs["DnsName"]
         .as_str()
         .filter(|s| !s.is_empty())
         .or(gs["IpAddress"].as_str())?;
-    Some((addr.to_string(), port as i32))
+    Some((addr.to_string(), port))
 }
 
 impl Provider for GameLiftProvider {

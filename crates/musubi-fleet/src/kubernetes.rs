@@ -263,9 +263,11 @@ impl KubernetesProvider {
                     return Err(Error::Unavailable(format!("gameserver {state}")));
                 }
                 let addr = obj["status"]["address"].as_str().filter(|a| !a.is_empty());
-                let port = obj["status"]["ports"][0]["port"].as_i64();
+                let port = obj["status"]["ports"][0]["port"]
+                    .as_i64()
+                    .and_then(crate::port_from_i64);
                 Ok(match (addr, port) {
-                    (Some(a), Some(p)) => Some((a.to_string(), p as i32)),
+                    (Some(a), Some(p)) => Some((a.to_string(), p)),
                     _ => None,
                 })
             }

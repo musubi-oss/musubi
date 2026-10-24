@@ -131,13 +131,14 @@ impl Provider for EdgegapProvider {
                             m.get("game")
                                 .or_else(|| m.values().next())
                                 .and_then(|p| p["external"].as_i64())
+                                .and_then(crate::port_from_i64)
                         })
                         .ok_or_else(|| {
                             Error::internal(format!("edgegap ready without ports: {s}"))
                         })?;
                     return Ok(Started {
                         address,
-                        port: port as i32,
+                        port,
                         pid: None,
                     });
                 }
