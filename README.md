@@ -87,8 +87,11 @@ docker run -d --name musubi-pg --network musubi \
 docker run -d --name musubi --network musubi -p 7350:7350 \
   -e MUSUBI__DATABASE__URL=postgres://musubi:musubi@musubi-pg:5432/musubi \
   -e MUSUBI__HTTP__SERVER_KEY=change-me \
+  -e MUSUBI__SESSION__SECRET="$(openssl rand -hex 32)" \
   ghcr.io/musubi-oss/musubi:latest
 ```
+
+The node refuses to start on built-in secrets: `MUSUBI__SESSION__SECRET` (or `session.signing_key_pem` for ES256) and the server key are required; `musubi doctor` lists everything else it wants before production.
 
 Or from source (Rust 1.85+):
 
