@@ -11,6 +11,7 @@ name = "musubi-server"
 path = "src/main.rs"
 
 [dependencies]
+bcrypt.workspace = true
 rand.workspace = true
 tokio-tungstenite.workspace = true
 rayon = "1"

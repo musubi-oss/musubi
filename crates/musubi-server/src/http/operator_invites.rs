@@ -355,16 +355,23 @@ type MemberRow = (
 );
 
 async fn members(State(s): State<AppState>, ServerKey: ServerKey) -> Result<Json<Value>, ApiError> {
-    let rows: Vec<MemberRow> = sqlx::query_as(
-        "select id, email, name, role, key_id, invite_id, joined_at from musubi.operators order by joined_at",
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(MemberRow, bool, Option<OffsetDateTime>)> = sqlx::query_as::<_, (
+        Uuid, String, String, String, Option<Uuid>, Option<Uuid>, OffsetDateTime, bool, Option<OffsetDateTime>,
+    )>(
+        "select id, email, name, role, key_id, invite_id, joined_at, password_hash is not null, last_login_at \
+         from musubi.operators order by joined_at",
     )
     .fetch_all(&s.db)
     .await
-    .map_err(Error::internal)?;
+    .map_err(Error::internal)?
+    .into_iter()
+    .map(|r| ((r.0, r.1, r.2, r.3, r.4, r.5, r.6), r.7, r.8))
+    .collect();
     Ok(Json(json!({
-        "members": rows.iter().map(|r| json!({
+        "members": rows.iter().map(|(r, has_password, last_login)| json!({
             "id": r.0, "email": r.1, "name": r.2, "role": r.3, "key_id": r.4, "invite_id": r.5,
-            "joined_at": rfc(r.6),
+            "joined_at": rfc(r.6), "has_password": has_password, "last_login_at": last_login.map(rfc),
         })).collect::<Vec<_>>()
     })))
 }

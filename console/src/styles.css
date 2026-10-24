@@ -53,6 +53,8 @@ kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-
 .prog{position:fixed;left:0;top:0;height:2px;width:100%;z-index:40;background:linear-gradient(90deg,transparent,var(--blue2),transparent);background-size:40% 100%;opacity:0;transition:opacity .2s}.prog.on{opacity:1;animation:prog 1s linear infinite}@keyframes prog{from{background-position:-40% 0}to{background-position:140% 0}}
 .crumb .id{cursor:copy}.crumb .id:hover{color:var(--fg2)}
 
+.lnk{color:var(--fg3);cursor:pointer;font-size:12px;margin-right:auto;align-self:center}.lnk:hover{color:var(--fg)}
+.login .tabs a{cursor:pointer}
 /* phones / narrow windows: one column, the section menu folds into a toggle, cards scroll their tables instead of the page */
 .side .tg{display:none}
 @media (max-width: 900px){
@@ -61,6 +63,7 @@ kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-
   .page{padding:14px 12px 48px}.head{flex-wrap:wrap;gap:4px 10px;margin-bottom:12px}.head h1{font-size:20px}.head .sub{width:100%;font-size:13px}.head .act{margin-left:0;width:100%;flex-wrap:wrap}
   .lay{grid-template-columns:minmax(0,1fr);gap:12px}.lay>div{min-width:0}
   .page span[style*="margin-left"],.page div[style*="margin-left"]{margin-left:0!important;width:100%;flex-wrap:wrap}
+  .page .in[style*="width"],.page .sel[style*="width"]{width:auto!important;max-width:100%}.toasts{max-width:calc(100vw - 24px)}
   .page table{display:block;overflow-x:auto;max-width:100%;-webkit-overflow-scrolling:touch}.page table tbody,.page table thead{display:table;width:100%;min-width:max-content}
   .side{border:1px solid var(--line);border-radius:8px;background:var(--card)}.side .tg{display:flex;width:100%;align-items:center;justify-content:space-between;padding:9px 12px;border:0;background:transparent;color:var(--fg);font-size:14px;cursor:pointer}
   .side .tg i{font-style:normal;color:var(--fg3);font-size:12px}.side .ls,.side .nf{display:none}.side.open .ls{display:block;padding:4px 6px 8px}.side.open .nf{display:block;margin:0 6px 6px;width:calc(100% - 12px)}

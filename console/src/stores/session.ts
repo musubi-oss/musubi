@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { auth, get } from '../api/client'
+import { api, auth, get } from '../api/client'
 
 export interface NodeInfo { name: string; roles: string[]; region: string; project?: string; environment?: string; version?: string; [k: string]: any }
 export interface Whoami { key_name?: string; role?: string; project?: string; [k: string]: any }
@@ -21,6 +21,18 @@ export const useSession = defineStore('session', {
       return this.authed
     },
     async login(key: string, base = '') { auth.base = base; auth.key = key.trim(); return this.probe() },
-    logout() { auth.key = ''; this.authed = false; this.me = null },
+    /** E-mail + password: the node issues a short-lived session key of the operator's role; we keep only that key. */
+    async loginPassword(email: string, password: string, base = '') {
+      this.error = ''; auth.base = base; auth.key = ''
+      try {
+        const r = await api<{ key: string; operator?: Whoami }>('POST', '/v1/operator/login', { email, password })
+        auth.key = r.key; this.me = r.operator ?? null
+      } catch (e: any) { this.error = e?.message ?? String(e); return false }
+      return this.probe()
+    },
+    async logout() {
+      try { if (auth.key) await api('DELETE', '/v1/operator/logout') } catch {}
+      auth.key = ''; this.authed = false; this.me = null
+    },
   },
 })

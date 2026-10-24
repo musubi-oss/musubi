@@ -17,17 +17,20 @@ async function load() {
 }
 onMounted(load)
 async function act(fn: () => Promise<any>, ok: string) { try { await fn(); toast.show(ok); dlg.value = ''; load() } catch (e: any) { toast.err(e) } }
+async function addOperator() { try { await post('/v1/admin/operators', { email: form.value.email, name: form.value.name || undefined, role: form.value.role, password: form.value.password }); toast.show('operator added — they sign in with e-mail & password'); dlg.value = ''; load() } catch (e: any) { toast.err(e) } }
+async function resetPassword() { try { await api('PUT', `/v1/admin/operators/${form.value.id}/password`, { password: form.value.password }); toast.show('password reset; their sessions were signed out'); dlg.value = ''; load() } catch (e: any) { toast.err(e) } }
+const signIn = (r: any) => [r.has_password ? 'password' : '', r.source ?? r.provider ?? ''].filter(Boolean).join(' + ') || 'key'
 async function invite() { try { made.value = await post('/v1/admin/operators/invites', { email: form.value.email, role: form.value.role, expires_in_hours: form.value.hours || undefined }); toast.show('invite created'); load() } catch (e: any) { toast.err(e) } }
 const ts = (v: any) => v ? String(typeof v === 'number' ? new Date(v * 1000).toISOString() : v).replace('T', ' ').slice(0, 16) : '—'
 const inviteState = (i: any) => i.decided_at ? (i.accepted ? 'accepted' : 'declined') : i.expired ? 'expired' : 'pending'
 const pg1 = usePager(() => jwt.value?.keys ?? [])
 </script>
 <template>
-  <div class="crumb"><span>Operators &amp; access</span><span style="margin-left:auto;display:flex;gap:8px"><button class="btn s p" @click="dlg = 'invite'; made = null; form = { email: '', role: 'support', hours: 72 }">Invite operator</button></span></div>
+  <div class="crumb"><span>Operators &amp; access</span><span style="margin-left:auto;display:flex;gap:8px"><button class="btn s" @click="dlg = 'invite'; made = null; form = { email: '', role: 'support', hours: 72 }">Invite operator</button><button class="btn s p" @click="dlg = 'add'; form = { email: '', name: '', role: 'support', password: '' }">Add operator</button></span></div>
   <p class="err" v-if="err">{{ err }}</p>
   <div class="cards2" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
     <div class="card"><h3>SSO <small>(OIDC)</small></h3>
-      <template v-if="sso"><Kv k="Status"><span :class="sso.enabled ? 'ok' : 'dim'">{{ sso.enabled ? 'enabled' : 'disabled — operators sign in with keys' }}</span></Kv><Kv k="Issuer" :v="sso.issuer ?? '—'" mono /><Kv k="Login URL" :v="sso.login_url ?? '—'" mono /><Kv k="Default role" :v="sso.default_role ?? '—'" /><Kv k="Session" :v="`${sso.session_hours} h`" /><Kv k="Group → role mappings" :v="(sso.roles ?? []).length ? JSON.stringify(sso.roles) : 'none'" /></template>
+      <template v-if="sso"><Kv k="Status"><span :class="sso.enabled ? 'ok' : 'dim'">{{ sso.enabled ? 'enabled' : 'disabled — operators sign in with e-mail & password or keys' }}</span></Kv><Kv k="Issuer" :v="sso.issuer ?? '—'" mono /><Kv k="Login URL" :v="sso.login_url ?? '—'" mono /><Kv k="Default role" :v="sso.default_role ?? '—'" /><Kv k="Session" :v="`${sso.session_hours} h`" /><Kv k="Group → role mappings" :v="(sso.roles ?? []).length ? JSON.stringify(sso.roles) : 'none'" /></template>
       <p class="note">Configured in <code>[sso]</code> on the node; this card reflects what the cluster currently serves.</p></div>
     <div class="card"><h3>Player JWT signing keys <small>({{ jwt?.keys?.length ?? 0 }})</small> <button class="btn s" style="margin-left:8px" @click="ask('Rotate: a new key becomes active, the old one keeps verifying until retired.') && act(() => post('/v1/admin/jwt/rotate'), 'rotated')">Rotate</button></h3>
       <template v-if="jwt"><Kv k="Active kid" :v="jwt.active" mono />
@@ -35,14 +38,25 @@ const pg1 = usePager(() => jwt.value?.keys ?? [])
           <tr v-for="k in pg1.rows" :key="k.kid"><td class="m" :class="{ ok: k.kid === jwt.active }">{{ k.kid }}{{ k.kid === jwt.active ? ' · active' : '' }}</td><td class="dim">{{ ts(k.created_at) }}</td><td class="dim">{{ ts(k.retired_at) }}</td><td><button class="btn s d" v-if="k.kid !== jwt.active && !k.retired_at" @click="ask(`Retire ${k.kid}? Tokens signed with it stop verifying.`) && act(() => api('DELETE', `/v1/admin/jwt/keys/${k.kid}`), 'retired')">Retire</button></td></tr></tbody></table><Pager :p="pg1" /></template></div>
   </div>
   <div class="card" style="margin-top:12px"><h3>Operators <small>({{ ops.length }})</small></h3>
-    <DataTable :cols="[{ key: 'email', fmt: (r) => r.email ?? r.subject ?? r.id }, { key: 'name', fmt: (r) => r.name ?? '' }, { key: 'role' }, { key: 'source', fmt: (r) => r.source ?? r.provider ?? '', dim: true }, { key: 'last_login_at', fmt: (r) => ts(r.last_login_at ?? r.last_seen_at), dim: true }, { key: 'created_at', fmt: (r) => ts(r.created_at), dim: true }]" :rows="ops">
-      <template #actions="{ row }"><button class="btn s d" @click="ask(`Remove operator ${row.email ?? row.id}?`) && act(() => api('DELETE', `/v1/admin/operators/${row.id}`), 'removed')">Remove</button></template>
+    <DataTable :cols="[{ key: 'email', fmt: (r) => r.email ?? r.subject ?? r.id }, { key: 'name', fmt: (r) => r.name ?? '' }, { key: 'role' }, { key: 'sign_in', fmt: signIn, dim: true }, { key: 'last_login_at', fmt: (r) => ts(r.last_login_at ?? r.last_seen_at), dim: true }, { key: 'created_at', fmt: (r) => ts(r.created_at), dim: true }]" :rows="ops">
+      <template #actions="{ row }"><button class="btn s" @click="dlg = 'reset'; form = { id: row.id, email: row.email, password: '' }">{{ row.has_password ? 'Reset password' : 'Set password' }}</button> <button class="btn s d" @click="ask(`Remove operator ${row.email ?? row.id}?`) && act(() => api('DELETE', `/v1/admin/operators/${row.id}`), 'removed')">Remove</button></template>
     </DataTable>
-    <p class="empty" v-if="!ops.length">No SSO / invited operators yet — access is by keys only</p></div>
+    <p class="empty" v-if="!ops.length">No operators yet — add one with a password, invite by e-mail, or enable SSO; until then access is by keys only</p></div>
   <div class="card" style="margin-top:12px"><h3>Invites <small>({{ invites.length }})</small></h3>
     <DataTable :cols="[{ key: 'email' }, { key: 'role' }, { key: 'state', fmt: inviteState }, { key: 'created_at', fmt: (r) => ts(r.created_at), dim: true }, { key: 'expires_at', fmt: (r) => ts(r.expires_at), dim: true }]" :rows="invites">
       <template #actions="{ row }"><button class="btn s d" v-if="inviteState(row) === 'pending'" @click="act(() => api('DELETE', `/v1/admin/operators/invites/${row.id}`), 'invite revoked')">Revoke</button></template>
     </DataTable></div>
+  <Drawer v-if="dlg === 'add'" title="Add operator" @close="dlg = ''"><div class="form">
+    <div class="f"><label>E-mail</label><input class="in" v-model="form.email" type="email" /></div><div class="f"><label>Name</label><input class="in" v-model="form.name" /></div>
+    <div class="f"><label>Role</label><select class="sel" v-model="form.role"><option>admin</option><option>ops</option><option>liveops</option><option>support</option></select></div>
+    <div class="f"><label>Initial password <small>(10+ characters; ask them to change it under their account)</small></label><input class="in" v-model="form.password" type="password" autocomplete="new-password" /></div>
+    <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.email || (form.password?.length ?? 0) < 10" @click="addOperator">Add</button></div>
+  </div></Drawer>
+  <Drawer v-if="dlg === 'reset'" :title="`Password for ${form.email}`" @close="dlg = ''"><div class="form">
+    <p class="note">Sets a new password and signs out every password session of this operator.</p>
+    <div class="f"><label>New password <small>(10+ characters)</small></label><input class="in" v-model="form.password" type="password" autocomplete="new-password" /></div>
+    <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="(form.password?.length ?? 0) < 10" @click="resetPassword">Save</button></div>
+  </div></Drawer>
   <Drawer v-if="dlg === 'invite'" title="Invite operator" @close="dlg = ''"><div class="form">
     <template v-if="!made"><div class="f"><label>Email</label><input class="in" v-model="form.email" /></div><div class="f"><label>Role</label><select class="sel" v-model="form.role"><option>admin</option><option>ops</option><option>liveops</option><option>support</option></select></div><div class="f"><label>Valid for hours</label><input class="in" type="number" min="1" v-model.number="form.hours" /></div>
       <div class="row"><button class="btn" @click="dlg = ''">Cancel</button><button class="btn p" :disabled="!form.email" @click="invite">Create invite</button></div></template>

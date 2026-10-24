@@ -48093,3 +48093,158 @@ async fn gameserver_tokens_are_per_server() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
 }
+
+#[tokio::test]
+async fn operator_password_login_lockout_logout_and_reset() {
+    let Some(app) = app().await else { return };
+    let k = "defaultkey";
+    let sfx = uuid::Uuid::now_v7().simple().to_string();
+    let email = format!("pw-{sfx}@example.io");
+    let pw = "correct-horse-battery";
+    let login = "/v1/operator/login";
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/operators",
+        k,
+        Some(json!({"email": email, "role": "liveops", "password": "short"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/operators",
+        k,
+        Some(json!({"email": email, "name": "PW", "role": "liveops", "password": pw})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["has_password"], true);
+    let id = v["id"].as_str().unwrap().to_string();
+    // wrong password and unknown e-mail look the same
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        login,
+        "",
+        Some(json!({"email": email, "password": "nope-nope-nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, w) = call_server(
+        &app,
+        "POST",
+        login,
+        "",
+        Some(json!({"email": format!("ghost-{sfx}@example.io"), "password": "nope-nope-nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{w}");
+    assert_eq!(v["message"], w["message"]);
+    // success: session key of the operator's role, usable for the API, visible in /me, revoked by logout
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        login,
+        "",
+        Some(json!({"email": email.to_ascii_uppercase(), "password": pw})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let sk = v["key"].as_str().unwrap().to_string();
+    assert!(sk.starts_with("msk_"), "{v}");
+    assert_eq!(v["operator"]["role"], "liveops");
+    let (st, me) = call_server(&app, "GET", "/v1/operator/me", &sk, None).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    assert_eq!(me["operator"]["id"], id);
+    assert_eq!(me["key_name"], format!("session:{email}"));
+    let (st, v) = call_server(&app, "GET", "/v1/admin/operators", &sk, None).await;
+    assert_eq!(st, StatusCode::OK, "operator roles read everything: {v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        "/v1/admin/operators",
+        &sk,
+        Some(json!({"email": format!("x-{sfx}@example.io"), "role": "admin", "password": pw})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "liveops session must not manage operators: {v}"
+    );
+    // self-service change: needs the current password, old sessions stay valid
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/operator/me/password",
+        &sk,
+        Some(json!({"current": "wrong-wrong-wrong", "password": "another-fine-password"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        "/v1/operator/me/password",
+        &sk,
+        Some(json!({"current": pw, "password": "another-fine-password"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "DELETE", "/v1/operator/logout", &sk, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = call_server(&app, "GET", "/v1/operator/me", &sk, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // five failures lock the account, even for the right password; admin reset clears the lock
+    for _ in 0..5 {
+        let (st, _) = call_server(
+            &app,
+            "POST",
+            login,
+            "",
+            Some(json!({"email": email, "password": "nope-nope-nope"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        login,
+        "",
+        Some(json!({"email": email, "password": "another-fine-password"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("locked"), "{v}");
+    let (st, v) = call_server(
+        &app,
+        "PUT",
+        &format!("/v1/admin/operators/{id}/password"),
+        k,
+        Some(json!({"password": "reset-by-admin-1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(
+        &app,
+        "POST",
+        login,
+        "",
+        Some(json!({"email": email, "password": "reset-by-admin-1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call_server(&app, "GET", "/v1/admin/operators", k, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let m = v["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .unwrap();
+    assert_eq!(m["has_password"], true);
+    assert!(m["last_login_at"].is_string(), "{m}");
+}

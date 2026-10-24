@@ -6,7 +6,7 @@ import { useRouter } from 'vue-router'
 import { toast } from '../stores/toast'
 import { net } from '../api/client'
 const s = useSession(); const router = useRouter()
-function logout() { s.logout(); router.push('/login') }
+async function logout() { await s.logout(); router.push('/login') }
 // `/` focuses the first search / filter box on the page, `r` refreshes it, `Esc` blurs an input.
 function key(e: KeyboardEvent) {
   const t = e.target as HTMLElement; const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(t?.tagName) || t?.isContentEditable

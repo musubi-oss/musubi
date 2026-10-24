@@ -68,6 +68,7 @@ mod notifications;
 pub mod oauth;
 mod oauth_authz;
 mod offers;
+pub mod operator_auth;
 pub mod operator_invites;
 mod parties;
 mod passkeys;
@@ -264,6 +265,7 @@ pub fn router(state: AppState) -> Router {
         .merge(countries::router())
         .merge(edge_guard::router())
         .merge(console::routes())
+        .merge(operator_auth::routes())
         .merge(config_sources::router())
         .merge(build_artifacts::router())
         .merge(placements::router())

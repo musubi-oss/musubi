@@ -149,6 +149,10 @@ impl Role {
         if read {
             return true;
         }
+        // every operator manages their own sign-in (`/v1/operator/me`, `/me/password`, `/logout`)
+        if path.starts_with("/v1/operator/") {
+            return true;
+        }
         // keys are issued by admins only, whatever the caller's area
         if path.starts_with("/v1/admin/keys") {
             return false;
