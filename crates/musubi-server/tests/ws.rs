@@ -22788,7 +22788,7 @@ async fn owned_entity_refuses_other_accounts() {
     )
     .await;
     assert_eq!(st, 200, "{e}");
-    assert_eq!(e["owner"].as_str(), Some(owner.as_str()), "{e}");
+    assert_eq!(e["entity"]["owner"].as_str(), Some(owner.as_str()), "{e}");
 }
 
 /// `world_join` gives a session its avatar: spawned from the world's `player_spawn` policy the
@@ -22862,8 +22862,8 @@ async fn world_join_finds_or_spawns_the_avatar() {
     )
     .await;
     assert_eq!(st, 200, "{e}");
-    assert_eq!(e["owner"].as_str(), Some(acc_a.as_str()), "{e}");
-    assert_eq!(e["components"]["hp"]["value"], json!(100), "{e}");
+    assert_eq!(e["entity"]["owner"].as_str(), Some(acc_a.as_str()), "{e}");
+    assert_eq!(e["entity"]["components"]["hp"], json!(100), "{e}");
     // and only its owner may relay on it
     send(
         &mut b,

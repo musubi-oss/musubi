@@ -2980,7 +2980,7 @@ impl WorldRegistry {
             .map(|e| {
                 json!({
                     "id": e.id, "cell": e.cell, "pos": e.pos, "persistent": e.persistent,
-                    "transit": e.transit,
+                    "transit": e.transit, "owner": e.owner,
                     "remote_to": st.remote_transit.get(&e.id).map(|(h, _, _)| *h),
                 })
             })
@@ -3000,7 +3000,7 @@ impl WorldRegistry {
         json!({
             "id": e.id, "cell": e.cell, "pos": e.pos, "persistent": e.persistent,
             "global": e.global, "attached_to": e.attached_to, "contained": e.contained,
-            "rev": e.rev, "transit": e.transit, "remote_to": remote_to,
+            "rev": e.rev, "transit": e.transit, "remote_to": remote_to, "owner": e.owner,
             "components": e.components.iter().map(|(k, c)| (k.clone(), c.value.to_json())).collect::<serde_json::Map<_, _>>(),
         })
     }
