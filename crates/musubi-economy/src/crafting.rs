@@ -174,7 +174,7 @@ impl EconomyService {
             .collect();
         for id in currencies {
             let known: Option<i32> =
-                sqlx::query_scalar("select 1 from musubi.currencies where id = $1")
+                sqlx::query_scalar("select 1 from musubi.currencies where code = $1")
                     .bind(id)
                     .fetch_optional(&self.db)
                     .await
@@ -297,6 +297,7 @@ impl EconomyService {
     ) -> Result<Crafted> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
         if let Some(k) = idempotency_key {
+            Self::lock_key(&mut tx, "crafting_log", &format!("{}:{k}", account.0)).await?;
             let prior: Option<Value> = sqlx::query_scalar(
                 "select result from musubi.crafting_log where account_id = $1 and idempotency_key = $2",
             )
@@ -372,7 +373,9 @@ impl EconomyService {
         let reference = format!("craft:{recipe_id}");
         let mut consumed = Vec::new();
         for i in &r.inputs {
-            let amount = i.amount * count;
+            let amount = i.amount.checked_mul(count).ok_or_else(|| {
+                Error::InvalidArgument("ingredient amount × count overflows".into())
+            })?;
             if let Some(item) = &i.item_id {
                 consumed.extend(Self::consume_item_tx(&mut tx, account, item, amount).await?);
             }
@@ -394,7 +397,10 @@ impl EconomyService {
         }
         let mut granted = Vec::new();
         for o in &r.outputs {
-            let amount = o.amount * count;
+            let amount = o
+                .amount
+                .checked_mul(count)
+                .ok_or_else(|| Error::InvalidArgument("output amount × count overflows".into()))?;
             if let Some(item) = &o.item_id {
                 let e =
                     Self::grant_item_tx(&mut tx, account, item, amount, o.instance.clone()).await?;

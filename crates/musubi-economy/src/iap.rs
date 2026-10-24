@@ -200,6 +200,14 @@ impl EconomyService {
     /// from the same account returns the original receipt; from another account it is a conflict.
     pub async fn redeem(&self, account: AccountId, input: ReceiptInput) -> Result<Receipt> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        // A receipt seen for the first time has no row to lock: serialise on (provider, tx id)
+        // so a double submit replays instead of tripping the unique index.
+        Self::lock_key(
+            &mut tx,
+            "iap_receipt",
+            &format!("{}:{}", input.provider, input.transaction_id),
+        )
+        .await?;
         let prior: Option<ReceiptRow> = sqlx::query_as(&format!(
             "select {COLS} from musubi.iap_receipts where provider = $1 and transaction_id = $2 for update"
         ))
@@ -507,7 +515,7 @@ impl EconomyService {
                 .await
                 .map_err(Error::internal)?;
         if let Some((item_id, per_unit)) = store {
-            let mut left = per_unit.max(1) * units.max(1);
+            let mut left = per_unit.max(1).saturating_mul(units.max(1));
             let rows: Vec<(Uuid, i64)> = sqlx::query_as(
                 "select id, quantity from musubi.inventory where account_id = $1 and item_id = $2 order by quantity desc for update",
             )

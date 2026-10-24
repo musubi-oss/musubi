@@ -476,7 +476,25 @@ impl EconomyService {
         if cur.3.is_some() {
             return Err(Error::Conflict("goal already completed".into()));
         }
-        let used: i32 = rows.iter().map(|r| r.5).sum();
+        // Quota check and the reroll itself run under one per-(account, pool, period) lock so two
+        // concurrent rerolls cannot both pass the check.
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        Self::lock_key(
+            &mut tx,
+            "quest_pool.reroll",
+            &format!("{}:{}:{key}", account.0, p.id),
+        )
+        .await?;
+        let used: i32 = sqlx::query_scalar(
+            "select coalesce(sum(rerolled), 0)::int from musubi.quest_assignments
+             where account_id = $1 and pool_id = $2 and period_key = $3",
+        )
+        .bind(account.0)
+        .bind(&p.id)
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
         if used >= p.rerolls_per_period {
             return Err(Error::ResourceExhausted(format!(
                 "no rerolls left this period ({} per period)",
@@ -505,9 +523,10 @@ impl EconomyService {
         .bind(&key)
         .bind(slot)
         .bind(&next.id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
         let rows = self.ensure_assignments(account, &p, &key).await?;
         Ok(Self::view(&p, start, &key, &rows))
     }
@@ -550,7 +569,7 @@ impl EconomyService {
                 }
                 let mut progress = r.2.clone();
                 let cur = progress[event].as_i64().unwrap_or(0);
-                progress[event] = json!((cur + delta).min(obj.target));
+                progress[event] = json!(cur.saturating_add(delta).min(obj.target));
                 let done = goal_complete(g, &progress);
                 sqlx::query(
                     "update musubi.quest_assignments set progress = $5, completed_at = $6

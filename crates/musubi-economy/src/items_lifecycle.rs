@@ -224,7 +224,7 @@ impl EconomyService {
         match durability {
             Some(d) => {
                 let cur = instance["durability"].as_i64().unwrap_or(d.max);
-                let left = cur - d.per_use * quantity;
+                let left = cur.saturating_sub(d.per_use.saturating_mul(quantity));
                 if left <= 0 {
                     out.broken = true;
                     out.durability_left = Some(0);
@@ -374,7 +374,7 @@ impl EconomyService {
         };
         let cur = instance["durability"].as_i64().unwrap_or(d.max);
         let new = match amount {
-            Some(a) if a > 0 => (cur + a).min(d.max),
+            Some(a) if a > 0 => cur.saturating_add(a).min(d.max),
             Some(_) => return Err(Error::InvalidArgument("amount must be positive".into())),
             None => d.max,
         };

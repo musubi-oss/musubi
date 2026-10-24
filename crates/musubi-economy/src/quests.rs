@@ -241,6 +241,15 @@ impl EconomyService {
         if completed.flatten().is_some() {
             return Err(Error::Conflict("quest already completed".into()));
         }
+        // Quota check and insert share one per-(account, kind, period) lock: two concurrent
+        // rerolls must not both pass the count.
+        let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        Self::lock_key(
+            &mut tx,
+            "quest.reroll",
+            &format!("{}:{}:{}", account.0, q.kind, ps.unix_timestamp()),
+        )
+        .await?;
         let used: i64 = sqlx::query_scalar(
             "select count(*) from musubi.quest_rerolls r join musubi.quests q on q.id = r.quest_id
              where r.account_id = $1 and r.period_start = $2 and q.kind = $3 and r.quest_id <> $4",
@@ -249,7 +258,7 @@ impl EconomyService {
         .bind(ps)
         .bind(&q.kind)
         .bind(quest_id)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(Error::internal)?;
         if used >= q.rerolls_per_period as i64 {
@@ -264,9 +273,10 @@ impl EconomyService {
         .bind(account.0)
         .bind(quest_id)
         .bind(ps)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
         Ok(json!({
             "quest_id": quest_id,
             "rerolls_left": (q.rerolls_per_period as i64 - used - 1).max(0),
@@ -323,7 +333,7 @@ impl EconomyService {
                 continue;
             }
             let cur = progress[event].as_i64().unwrap_or(0);
-            progress[event] = json!((cur + delta).min(obj.target));
+            progress[event] = json!(cur.saturating_add(delta).min(obj.target));
             let done = is_complete(&q, &progress);
             sqlx::query(
                 "update musubi.quest_progress set progress = $4, completed_at = $5 where account_id = $1 and quest_id = $2 and period_start = $3",

@@ -216,7 +216,13 @@ impl EventRule {
                 .push(")");
             return;
         }
-        let field = self.field.as_deref().unwrap_or("count");
+        // `field` is spliced into the SQL text: resolve it through the whitelist here as well,
+        // never through the caller's validation alone.
+        let field = EVENT_FIELDS
+            .iter()
+            .copied()
+            .find(|f| Some(*f) == self.field.as_deref())
+            .unwrap_or("count");
         qb.push(" and exists (select 1 from musubi.player_event_props e where e.account_id = a.id and e.event = ")
             .push_bind(self.event.clone());
         if let Some(min) = self.min {
@@ -279,6 +285,15 @@ impl Audience {
             if !m.is_object() {
                 return Err(Error::InvalidArgument("metadata must be an object".into()));
             }
+        }
+        if self.any.len() + self.all.len() > 32 {
+            return Err(Error::InvalidArgument("at most 32 nested rule sets".into()));
+        }
+        for c in self.any.iter().chain(self.all.iter()) {
+            c.validate()?;
+        }
+        if let Some(n) = &self.not {
+            n.validate()?;
         }
         Ok(())
     }
@@ -925,5 +940,62 @@ impl EconomyService {
             .await
             .map_err(Error::internal)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sql_of(aud: &Audience) -> String {
+        let mut qb = QueryBuilder::new("select a.id from musubi.accounts a");
+        aud.push_where(&mut qb, OffsetDateTime::UNIX_EPOCH);
+        qb.sql().to_string()
+    }
+
+    #[test]
+    fn event_field_is_whitelisted_even_when_nested() {
+        let bad = EventRule {
+            event: "login".into(),
+            field: Some("count >= 0); drop table musubi.accounts; --".into()),
+            min: Some(1.0),
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+        let nested = Audience {
+            any: vec![Audience {
+                events: vec![bad.clone()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            nested.validate().is_err(),
+            "validate() must recurse into any/all/not"
+        );
+        let negated = Audience {
+            not: Some(Box::new(Audience {
+                events: vec![bad.clone()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(negated.validate().is_err());
+        // defence in depth: even unvalidated, the splice falls back to a known column
+        let sql = sql_of(&nested);
+        assert!(!sql.contains("drop table"), "{sql}");
+        assert!(sql.contains("e.count >= "), "{sql}");
+        let ok = EventRule {
+            event: "login".into(),
+            field: Some("value_sum".into()),
+            max: Some(5.0),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+        assert!(sql_of(&Audience {
+            events: vec![ok],
+            ..Default::default()
+        })
+        .contains("e.value_sum <= "));
     }
 }

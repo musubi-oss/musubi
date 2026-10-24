@@ -192,8 +192,11 @@ impl StreakDef {
     }
 
     pub fn bucket_start(&self, b: i64, tz_offset_min: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(b * self.period_seconds + self.shift(tz_offset_min))
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        OffsetDateTime::from_unix_timestamp(
+            b.saturating_mul(self.period_seconds)
+                .saturating_add(self.shift(tz_offset_min)),
+        )
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
     }
 
     fn grace_periods(&self) -> i64 {
@@ -210,7 +213,10 @@ impl StreakDef {
             let b = self.bucket(last, tz_offset_min);
             (
                 self.bucket_start(b + 1, tz_offset_min),
-                self.bucket_start(b + 2 + self.grace_periods(), tz_offset_min),
+                self.bucket_start(
+                    b.saturating_add(2).saturating_add(self.grace_periods()),
+                    tz_offset_min,
+                ),
             )
         } else {
             (
@@ -272,7 +278,9 @@ pub fn regenerate(
     let elapsed = (now - updated_at).whole_seconds().max(0);
     let ticks = elapsed / def.regen_seconds;
     let per_tick = def.refill_count.max(1) as i64;
-    let units = (ticks * per_tick).min((def.max - amount) as i64);
+    let units = ticks
+        .saturating_mul(per_tick)
+        .min((def.max - amount) as i64);
     let cur = amount + units as i32;
     if cur >= def.max {
         (cur, now)
@@ -733,7 +741,7 @@ impl EconomyService {
             }
         } else {
             let cap = def.max_overfill.max(def.max);
-            ((cur + delta).min(cap).max(cur), at)
+            (cur.saturating_add(delta).min(cap).max(cur), at)
         };
         let at = if next >= def.max { now } else { at };
         sqlx::query("update musubi.energy_state set amount = $3, updated_at = $4 where account_id = $1 and energy_id = $2")
@@ -1286,5 +1294,27 @@ mod tests {
         assert_eq!(progress(&t, 120).level, 1);
         assert_eq!(progress(&t, 250).level, 2);
         assert_eq!(progress(&t, 999).next_level_xp, None);
+    }
+
+    #[test]
+    fn energy_and_streak_math_saturates_instead_of_overflowing() {
+        let t0 = OffsetDateTime::UNIX_EPOCH;
+        let huge = EnergyDef {
+            refill_count: i32::MAX,
+            ..def()
+        };
+        assert_eq!(regenerate(0, t0, &huge, t0 + Duration::days(40_000)).0, 10);
+        let d = StreakDef {
+            calendar: true,
+            grace_seconds: i64::MAX,
+            ..Default::default()
+        };
+        let (next, _) = d.window(t0 + Duration::days(1), 0);
+        assert_eq!(next, t0 + Duration::days(2));
+        assert_eq!(
+            d.bucket_start(i64::MAX, 0),
+            OffsetDateTime::UNIX_EPOCH,
+            "out-of-range bucket degrades instead of panicking"
+        );
     }
 }

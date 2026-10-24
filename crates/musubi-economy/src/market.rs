@@ -729,13 +729,13 @@ impl EconomyService {
         }
         if let Some(b) = l.buyout {
             if amount >= b {
-                drop(tx);
+                tx.rollback().await.map_err(Error::internal)?;
                 self.buyout(bidder, id, rules).await?;
                 return self.listing(id).await;
             }
         }
         let floor = match l.bid {
-            Some(cur) => cur + 1,
+            Some(cur) => cur.saturating_add(1),
             None => l.min_bid.max(1),
         };
         if amount < floor {
@@ -911,6 +911,15 @@ impl EconomyService {
             && n.want_currency.is_empty()
         {
             return Err(Error::InvalidArgument("empty trade".into()));
+        }
+        if n.offer_items.len() > 50
+            || n.want_items.len() > 50
+            || n.offer_currency.len() > 16
+            || n.want_currency.len() > 16
+        {
+            return Err(Error::InvalidArgument(
+                "at most 50 item lines and 16 currencies per side".into(),
+            ));
         }
         for (c, a) in n.offer_currency.iter().chain(n.want_currency.iter()) {
             check_amount(*a, &format!("currency {c}"))?;

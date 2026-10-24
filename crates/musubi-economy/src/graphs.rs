@@ -481,6 +481,8 @@ impl EconomyService {
         now: OffsetDateTime,
     ) -> Result<Value> {
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        // The first unlock of a node has no state row to lock: serialise per (account, graph).
+        Self::lock_key(&mut tx, "graph", &format!("{}:{graph_id}", account.0)).await?;
         let g = Self::load_graph(&mut tx, graph_id).await?;
         let Some(node) = g.nodes.iter().find(|n| n.id == node_id) else {
             return Err(Error::NotFound(format!("node {node_id}")));
@@ -607,7 +609,8 @@ impl EconomyService {
         let mut refund: BTreeMap<String, i64> = BTreeMap::new();
         for s in states.values() {
             for (c, a) in &s.spent {
-                *refund.entry(c.clone()).or_default() += a * g.refund_pct as i64 / 100;
+                let e = refund.entry(c.clone()).or_default();
+                *e = e.saturating_add(a.saturating_mul(g.refund_pct as i64) / 100);
             }
         }
         for (c, a) in refund.iter().filter(|(_, a)| **a > 0) {

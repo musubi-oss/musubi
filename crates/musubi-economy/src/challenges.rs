@@ -145,11 +145,11 @@ pub fn score(objectives: &[Objective], progress: &Value) -> i64 {
 }
 
 fn join_code() -> String {
-    let b = Uuid::now_v7();
-    let b = b.as_bytes();
+    use rand::seq::SliceRandom;
     const A: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    (8..16)
-        .map(|i| A[(b[i] as usize) % A.len()] as char)
+    let mut rng = rand::thread_rng();
+    (0..8)
+        .map(|_| *A.choose(&mut rng).expect("non-empty alphabet") as char)
         .collect()
 }
 
@@ -485,7 +485,7 @@ impl EconomyService {
                 continue;
             };
             let cur = progress[event].as_i64().unwrap_or(0);
-            progress[event] = json!((cur + delta).min(o.target));
+            progress[event] = json!(cur.saturating_add(delta).min(o.target));
             let s = score(&objectives, &progress);
             sqlx::query(
                 "update musubi.challenge_participants set progress = $3, score = $4 where challenge_id = $1 and account_id = $2",
@@ -727,5 +727,18 @@ mod tests {
         assert_eq!(t.table_for_rank(7).as_deref(), Some("bronze"));
         assert_eq!(ChallengeTemplate::default().table_for_rank(1), None);
         assert_eq!(join_code().len(), 8);
+    }
+
+    #[test]
+    fn join_codes_use_the_unambiguous_alphabet_and_vary() {
+        let codes: Vec<String> = (0..32).map(|_| join_code()).collect();
+        for c in &codes {
+            assert_eq!(c.len(), 8);
+            assert!(c
+                .bytes()
+                .all(|b| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&b)));
+        }
+        let distinct: std::collections::HashSet<_> = codes.iter().collect();
+        assert!(distinct.len() > 1);
     }
 }

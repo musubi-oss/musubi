@@ -646,6 +646,22 @@ impl EconomyService {
         Ok(r)
     }
 
+    /// Transaction-scoped advisory lock on (`ns`, `key`): serialises check-then-act sequences
+    /// whose row does not exist yet (idempotency pre-checks, first requests, per-period quotas).
+    pub(crate) async fn lock_key(
+        tx: &mut Transaction<'_, Postgres>,
+        ns: &str,
+        key: &str,
+    ) -> Result<()> {
+        sqlx::query("select pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(ns)
+            .bind(key)
+            .execute(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn adjust_tx(
         tx: &mut Transaction<'_, Postgres>,
@@ -661,6 +677,7 @@ impl EconomyService {
             return Err(Error::InvalidArgument("delta must be non-zero".into()));
         }
         if let Some(k) = idempotency_key {
+            Self::lock_key(tx, "wallet_ledger", &format!("{}:{k}", account.0)).await?;
             let prior: Option<LedgerRow> = sqlx::query_as(&format!(
                 "select {LEDGER_COLS} from musubi.wallet_ledger where account_id = $1 and idempotency_key = $2"
             ))

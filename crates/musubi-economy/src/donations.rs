@@ -430,6 +430,13 @@ impl EconomyService {
             )));
         }
         let mut tx = self.db.begin().await.map_err(Error::internal)?;
+        // No row to lock before the first request: serialise per (account, definition).
+        Self::lock_key(
+            &mut tx,
+            "donation.request",
+            &format!("{}:{def_id}", account.0),
+        )
+        .await?;
         let live: Option<(Uuid,)> = sqlx::query_as(
             "select id from musubi.donations where account_id = $1 and def_id = $2
                and count < max_count and expires_at > now() for update",
