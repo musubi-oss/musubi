@@ -25,7 +25,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/tournaments/{id}/bracket", get(bracket_get))
         .route(
             "/v1/server/tournaments/{id}/bracket",
-            get(bracket_get_server).post(bracket_create).delete(bracket_delete),
+            get(bracket_get_server)
+                .post(bracket_create)
+                .delete(bracket_delete),
         )
         .route(
             "/v1/server/tournaments/{id}/bracket/matches/{mid}",
