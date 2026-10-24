@@ -1,0 +1,1 @@
+import{t as e}from"./queryOptions-Dfvzj6n2.js";import{s as t}from"./dist-_sEeMNqJ.js";var n=e({queryKey:[`node`],queryFn:async()=>{let e=await t.GET(`/v1/node`);if(e.error)throw e.error;return e.data},staleTime:6e4});export{n as t};
