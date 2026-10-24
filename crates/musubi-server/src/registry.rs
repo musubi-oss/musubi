@@ -15,6 +15,14 @@ pub struct ImageRef {
     pub reference: String,
 }
 
+/// Registries reached over plaintext HTTP: local and private-network hosts only.
+fn plain_http_host(bare: &str) -> bool {
+    bare == "localhost"
+        || bare == "127.0.0.1"
+        || bare.starts_with("10.")
+        || bare.starts_with("192.168.")
+}
+
 pub fn parse_image(image: &str) -> Result<ImageRef> {
     let image = image.trim();
     if image.is_empty() || image.len() > 512 || image.chars().any(char::is_whitespace) {
@@ -53,10 +61,7 @@ pub fn parse_image(image: &str) -> Result<ImageRef> {
         )));
     }
     let bare = host.split(':').next().unwrap_or("");
-    let plain = bare == "localhost"
-        || bare == "127.0.0.1"
-        || bare.starts_with("10.")
-        || bare.starts_with("192.168.");
+    let plain = plain_http_host(bare);
     let registry = match host.as_str() {
         "docker.io" | "index.docker.io" => "https://registry-1.docker.io".to_string(),
         h if plain => format!("http://{h}"),
@@ -125,7 +130,19 @@ pub async fn verify_image(
                 "image `{image}`: registry token challenge without realm"
             )));
         };
-        let mut tok = http.get(&realm).query(&[
+        // the realm is whatever the registry answered: only an http(s) URL, and plaintext only
+        // when the registry itself is reached over plaintext (credentials travel with it)
+        let realm_url = reqwest::Url::parse(&realm).map_err(|_| {
+            Error::InvalidArgument(format!("image `{image}`: bad token realm `{realm}`"))
+        })?;
+        let plain_ok =
+            realm_url.scheme() == "http" && realm_url.host_str().is_some_and(plain_http_host);
+        if !(realm_url.scheme() == "https" || plain_ok) {
+            return Err(Error::InvalidArgument(format!(
+                "image `{image}`: token realm must be https ({realm})"
+            )));
+        }
+        let mut tok = http.get(realm_url).query(&[
             ("service", param("service").unwrap_or_default()),
             (
                 "scope",
@@ -182,6 +199,18 @@ pub async fn verify_image(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     Ok(digest.unwrap_or_else(|| r.reference.clone()))
+}
+
+#[cfg(test)]
+mod plain_tests {
+    use super::plain_http_host;
+
+    #[test]
+    fn plaintext_registries_are_local_or_private() {
+        assert!(plain_http_host("localhost") && plain_http_host("10.1.2.3"));
+        assert!(plain_http_host("192.168.0.9"));
+        assert!(!plain_http_host("ghcr.io") && !plain_http_host("100.64.0.1"));
+    }
 }
 
 #[cfg(test)]

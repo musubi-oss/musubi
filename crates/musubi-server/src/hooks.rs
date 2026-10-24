@@ -9,7 +9,7 @@
 //! it). After: `{method, path, params, status, request, response}`, fire-and-forget. With no module
 //! exporting the hook the request path is untouched (two map lookups).
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::header;
 use axum::middleware::Next;
@@ -227,6 +227,17 @@ pub async fn before_after(State(s): State<AppState>, req: Request, next: Next) -
     let res = next.run(req).await;
     let Some(name) = after else { return res };
 
+    // a response too big for the hook (or streamed, unbounded) goes to the client as is: the
+    // hook is skipped, the request must not fail because of it
+    if !res
+        .body()
+        .size_hint()
+        .upper()
+        .is_some_and(|n| n <= MAX_HOOK_BODY as u64)
+    {
+        tracing::debug!(hook = %name, "after hook skipped: response too large");
+        return res;
+    }
     let (parts, body) = res.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_HOOK_BODY).await {
         Ok(b) => b,

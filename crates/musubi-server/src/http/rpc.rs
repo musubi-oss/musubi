@@ -24,8 +24,7 @@ pub(crate) async fn context(s: &AppState, headers: &HeaderMap) -> Result<CallCon
         .and_then(|v| v.to_str().ok())
     {
         let expected = s.cfg.http.server_key.as_bytes();
-        let ok = k.len() == expected.len()
-            && k.bytes().zip(expected).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0;
+        let ok = crate::http::extract::ct_eq(k.as_bytes(), expected);
         if !ok {
             return Err(musubi_core::Error::Unauthenticated("bad server key".into()).into());
         }

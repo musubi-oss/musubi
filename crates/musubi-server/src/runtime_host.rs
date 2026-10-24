@@ -165,6 +165,17 @@ fn str_field<'a>(req: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::InvalidArgument(format!("host request needs string `{name}`")))
 }
 
+/// Optional integer field that must fit the column type (no silent wrap on `as` narrowing).
+fn small_int<T: TryFrom<i64>>(req: &Value, name: &str, default: T) -> Result<T> {
+    match req.get(name) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_i64()
+            .and_then(|n| T::try_from(n).ok())
+            .ok_or_else(|| Error::InvalidArgument(format!("`{name}` out of range"))),
+    }
+}
+
 fn account(req: &Value, ctx: &CallContext) -> Result<AccountId> {
     match req.get("account_id").and_then(|v| v.as_str()) {
         Some(s) => Uuid::parse_str(s)
@@ -215,7 +226,7 @@ impl ServerHost {
                         req.get("match_id").and_then(|v| v.as_str()),
                         "module",
                         str_field(&req, "kind")?,
-                        req.get("severity").and_then(|v| v.as_i64()).unwrap_or(10) as i32,
+                        small_int::<i32>(&req, "severity", 10)?,
                         req.get("details").cloned().unwrap_or(Value::Null),
                     )
                     .await
@@ -320,8 +331,8 @@ impl ServerHost {
                                 .get("version")
                                 .and_then(|v| v.as_str())
                                 .map(String::from),
-                            read_permission: req["read_permission"].as_i64().unwrap_or(1) as i16,
-                            write_permission: req["write_permission"].as_i64().unwrap_or(0) as i16,
+                            read_permission: small_int::<i16>(&req, "read_permission", 1)?,
+                            write_permission: small_int::<i16>(&req, "write_permission", 0)?,
                             ttl_secs: None,
                         }],
                     )
@@ -406,7 +417,7 @@ impl ServerHost {
                         sender_id: None,
                         subject: str_field(&req, "subject")?.into(),
                         content: req.get("content").cloned().unwrap_or(json!({})),
-                        code: req["code"].as_i64().unwrap_or(0) as i32,
+                        code: small_int::<i32>(&req, "code", 0)?,
                         persistent: req["persistent"].as_bool().unwrap_or(true),
                         ttl_secs: None,
                     }])
@@ -630,5 +641,24 @@ impl musubi_fleet::ScaleHook for RuntimeScaleHook {
                 .map_err(|e| e.to_string())?;
             serde_json::from_slice(&out).map_err(|e| format!("non-JSON answer: {e}"))
         })
+    }
+}
+
+#[cfg(test)]
+mod narrowing_tests {
+    use super::small_int;
+    use serde_json::json;
+
+    #[test]
+    fn host_ints_must_fit_the_column() {
+        let req = json!({ "a": 5, "big": 70_000, "neg": -1, "f": 1.5, "s": "7", "n": null });
+        assert_eq!(small_int::<i16>(&req, "a", 0).unwrap(), 5);
+        assert_eq!(small_int::<i16>(&req, "missing", 9).unwrap(), 9);
+        assert_eq!(small_int::<i16>(&req, "n", 9).unwrap(), 9);
+        assert_eq!(small_int::<i32>(&req, "big", 0).unwrap(), 70_000);
+        assert!(small_int::<i16>(&req, "big", 0).is_err());
+        assert!(small_int::<u16>(&req, "neg", 0).is_err());
+        assert!(small_int::<i32>(&req, "f", 0).is_err());
+        assert!(small_int::<i32>(&req, "s", 0).is_err());
     }
 }

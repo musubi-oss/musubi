@@ -1228,7 +1228,24 @@ impl Fanout {
     /// The world a bulk frame belongs to, read off the raw payload (`{"WorldGhosts":{"world":"…"`
     /// or the batch's first item) without parsing it.
     fn bulk_world(m: &BusMessage) -> Option<String> {
-        let text = m.payload.get();
+        Self::bulk_world_of(m.payload.get())
+    }
+
+    fn bulk_world_of(text: &str) -> Option<String> {
+        // only world frames name a world up front; a `Session` frame's message body is player
+        // data and must not pick (or create) a per-world worker
+        let mut t = musubi_cluster::first_key(text);
+        if t == Some("WorldBatch") {
+            t = text
+                .find('[')
+                .and_then(|i| musubi_cluster::first_key(&text[i + 1..]));
+        }
+        if !matches!(
+            t,
+            Some("WorldGhosts" | "WorldRepl" | "WorldReplAck" | "WorldCmd" | "WorldInput")
+        ) {
+            return None;
+        }
         let i = text.find("\"world\":\"")? + "\"world\":\"".len();
         let rest = &text[i..];
         let end = rest.find('"')?;
@@ -2144,5 +2161,34 @@ mod order_tests {
         );
         let a = st.accept(2, 1, w(1), t0 + Duration::from_millis(6));
         assert_eq!(names(&a.ready), vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+
+    #[test]
+    fn bulk_world_only_trusts_world_frames() {
+        assert_eq!(
+            Fanout::bulk_world_of(r#"{"WorldGhosts":{"world":"w1","delta":{}}}"#).as_deref(),
+            Some("w1")
+        );
+        assert_eq!(
+            Fanout::bulk_world_of(r#"{"WorldBatch":[{"WorldRepl":{"world":"w2"}}]}"#).as_deref(),
+            Some("w2")
+        );
+        // a session frame carrying player JSON with a `world` key must not pick a world worker
+        assert_eq!(
+            Fanout::bulk_world_of(
+                r#"{"Session":{"session_id":"s","msg":{"Notification":{"content":{"world":"evil"}}}}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            Fanout::bulk_world_of(r#"{"WorldBatch":[{"Session":{"msg":{"world":"evil"}}}]}"#),
+            None
+        );
+        assert_eq!(Fanout::bulk_world_of(r#"{"Account":{"world":"x"}}"#), None);
     }
 }

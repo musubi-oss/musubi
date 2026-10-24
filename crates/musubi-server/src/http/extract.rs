@@ -126,6 +126,12 @@ impl FromRequestParts<AppState> for GameServerAuth {
 
 /// `X-Musubi-Server-Key`: the config key (constant-time compare, bootstrap admin) or a key issued
 /// through `/v1/admin/keys` with its role.
+/// Constant-time equality for keys/tokens (length leaks, bytes do not).
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
+
 pub fn check_server_key(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -143,13 +149,7 @@ pub fn check_server_key(
         .or(bearer)
         .ok_or_else(|| Error::Unauthenticated("missing X-Musubi-Server-Key".into()))?;
     let expected = state.cfg.http.server_key.as_bytes();
-    let ok = given.len() == expected.len()
-        && given
-            .bytes()
-            .zip(expected)
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0;
-    if ok {
+    if ct_eq(given.as_bytes(), expected) {
         return Ok(crate::keys::Caller::bootstrap());
     }
     if let Some(c) = state.keys.lookup(given) {

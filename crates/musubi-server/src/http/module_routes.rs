@@ -4,7 +4,7 @@
 //! like RPCs (bearer or server key, any method).
 
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -48,10 +48,6 @@ fn reply(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({ "error": msg.into() }))).into_response()
 }
 
-fn ct_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |x, (p, q)| x | (p ^ q)) == 0
-}
-
 struct Cors {
     origin: HeaderValue,
     wildcard: bool,
@@ -82,11 +78,23 @@ fn cors_headers(c: &Cors, h: &mut HeaderMap) {
     }
 }
 
+/// Buckets kept at most: beyond this the idle ones are dropped (a bucket that has not been
+/// touched for a while is full again anyway), so spoofed `X-Forwarded-For` values cannot grow
+/// the map without bound.
+const MAX_RATE_BUCKETS: usize = 10_000;
+const RATE_BUCKET_IDLE: Duration = Duration::from_secs(60);
+
 fn rate_ok(key: &str, per_sec: f64) -> bool {
     static BUCKETS: OnceLock<DashMap<String, (f64, Instant)>> = OnceLock::new();
     let buckets = BUCKETS.get_or_init(DashMap::new);
     let burst = per_sec.max(1.0);
     let now = Instant::now();
+    if buckets.len() >= MAX_RATE_BUCKETS && !buckets.contains_key(key) {
+        buckets.retain(|_, (_, at)| now.duration_since(*at) < RATE_BUCKET_IDLE);
+        if buckets.len() >= MAX_RATE_BUCKETS {
+            buckets.clear();
+        }
+    }
     let mut e = buckets.entry(key.to_string()).or_insert((burst, now));
     let (tokens, at) = *e;
     let tokens = (tokens + at.elapsed().as_secs_f64() * per_sec).min(burst);
@@ -149,10 +157,12 @@ async fn handle(
             if !wildcard && !c.origins.iter().any(|x| x == o) {
                 return reply(StatusCode::FORBIDDEN, "origin not allowed");
             }
+            // `*` with credentials is the classic misconfiguration (any site reads the user's
+            // authenticated response): credentials are only honoured for explicit origins
             cors = Some(Cors {
                 origin: origin.clone(),
                 wildcard,
-                credentials: c.credentials,
+                credentials: c.credentials && !wildcard,
                 expose: c.expose_headers.clone(),
             });
             if method == Method::OPTIONS {
@@ -178,7 +188,8 @@ async fn handle(
                 if let Some(age) = c.max_age_secs {
                     h.insert(
                         header::ACCESS_CONTROL_MAX_AGE,
-                        HeaderValue::from_str(&age.to_string()).unwrap(),
+                        HeaderValue::from_str(&age.to_string())
+                            .unwrap_or(HeaderValue::from_static("0")),
                     );
                 }
                 return (StatusCode::NO_CONTENT, h).into_response();
@@ -189,7 +200,7 @@ async fn handle(
         let mut h = HeaderMap::new();
         h.insert(
             header::ALLOW,
-            HeaderValue::from_str(&allowed_methods).unwrap(),
+            HeaderValue::from_str(&allowed_methods).unwrap_or(HeaderValue::from_static("GET")),
         );
         return (StatusCode::NO_CONTENT, h).into_response();
     }
@@ -197,7 +208,7 @@ async fn handle(
         let mut h = HeaderMap::new();
         h.insert(
             header::ALLOW,
-            HeaderValue::from_str(&allowed_methods).unwrap(),
+            HeaderValue::from_str(&allowed_methods).unwrap_or(HeaderValue::from_static("GET")),
         );
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -324,10 +335,11 @@ async fn auth(
                 .and_then(|b| String::from_utf8(b).ok())
                 .unwrap_or_default();
             let (user, pass) = decoded.split_once(':').unwrap_or((&decoded, ""));
-            let ok = b
-                .users
-                .get(user)
-                .is_some_and(|expected| ct_eq(expected, pass));
+            // unknown user compares against the supplied password itself so the reply takes
+            // the same time as a wrong password for a known user
+            let expected = b.users.get(user).map(String::as_str).unwrap_or(pass);
+            let ok = b.users.contains_key(user)
+                & crate::http::extract::ct_eq(expected.as_bytes(), pass.as_bytes());
             if !ok {
                 return Err(Box::new(challenge()));
             }
@@ -376,7 +388,10 @@ fn render(out: Vec<u8>) -> Response {
         };
         return (StatusCode::OK, [(header::CONTENT_TYPE, ct)], out).into_response();
     };
-    let status = StatusCode::from_u16(status as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = u16::try_from(status)
+        .ok()
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut h = HeaderMap::new();
     if let Some(hs) = o.get("headers").and_then(|v| v.as_object()) {
         for (k, v) in hs.iter().take(MAX_RESPONSE_HEADERS) {

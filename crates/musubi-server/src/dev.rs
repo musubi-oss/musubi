@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use musubi_core::{AccountId, Error, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -83,6 +83,62 @@ impl DevTools {
     }
 }
 
+/// Buffered per body when recording; bodies above this (or of unknown length) are not recorded.
+const MAX_BUFFER: usize = 8 << 20;
+
+fn body_fits<B: axum::body::HttpBody>(b: &B) -> bool {
+    b.size_hint()
+        .upper()
+        .is_some_and(|n| n <= MAX_BUFFER as u64)
+}
+
+/// JSON fields whose values are secrets (credentials, tokens, one-time codes): a recording must
+/// not become a second copy of them.
+const SECRET_FIELDS: &[&str] = &[
+    "password",
+    "new_password",
+    "old_password",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "id_token_hint",
+    "secret",
+    "client_secret",
+    "code",
+    "api_key",
+    "server_key",
+    "connect_token",
+    "authorization",
+];
+
+fn redact_value(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            for (k, v) in o.iter_mut() {
+                if SECRET_FIELDS.contains(&k.to_ascii_lowercase().as_str()) && !v.is_null() {
+                    *v = json!("[redacted]");
+                } else {
+                    redact_value(v);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(redact_value),
+        _ => {}
+    }
+}
+
+/// Redact secret fields of a JSON body; a body that is not JSON is stored as is.
+fn redact_text(text: &str) -> String {
+    match serde_json::from_str::<Value>(text) {
+        Ok(mut v) if v.is_object() || v.is_array() => {
+            redact_value(&mut v);
+            v.to_string()
+        }
+        _ => text.to_string(),
+    }
+}
+
 fn text_of(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
@@ -96,17 +152,35 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
     if !s.dev.should_record(req.uri().path(), req.headers()) {
         return next.run(req).await;
     }
+    // Only bodies that fit are buffered; a bigger or unbounded (streaming) one is passed
+    // through unrecorded instead of being silently replaced by an empty body.
+    if !body_fits(req.body()) {
+        return next.run(req).await;
+    }
     let (parts, body) = req.into_parts();
-    let body_bytes = axum::body::to_bytes(body, 8 << 20)
-        .await
-        .unwrap_or_default();
+    let body_bytes = match axum::body::to_bytes(body, MAX_BUFFER).await {
+        Ok(b) => b,
+        Err(_) => {
+            return crate::http::error::ApiError::from(Error::InvalidArgument(
+                "request body too large".into(),
+            ))
+            .into_response();
+        }
+    };
     let req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
     let started = Instant::now();
     let res = next.run(req).await;
+    if !body_fits(res.body()) {
+        return res;
+    }
     let (rparts, rbody) = res.into_parts();
-    let rbytes = axum::body::to_bytes(rbody, 8 << 20)
-        .await
-        .unwrap_or_default();
+    let rbytes = match axum::body::to_bytes(rbody, MAX_BUFFER).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "request recording: response body not read");
+            return Response::from_parts(rparts, Body::empty());
+        }
+    };
     let res = Response::from_parts(rparts.clone(), Body::from(rbytes.clone()));
     let duration_ms = started.elapsed().as_millis() as i32;
     let account = parts
@@ -147,9 +221,9 @@ pub async fn record(State(s): State<AppState>, req: Request, next: Next) -> Resp
         .bind(&method)
         .bind(&path)
         .bind(Value::Object(headers))
-        .bind(text_of(&body_bytes))
+        .bind(text_of(&body_bytes).map(|t| redact_text(&t)))
         .bind(status)
-        .bind(text_of(&rbytes))
+        .bind(text_of(&rbytes).map(|t| redact_text(&t)))
         .bind(account)
         .bind(server_key)
         .bind(duration_ms)
@@ -290,17 +364,25 @@ pub async fn replay(s: &AppState, rec: &Recording) -> Result<Value> {
     )
 }
 
-fn fixture_device(fixture: &str, username: &str) -> String {
-    let raw = format!("fixture-{fixture}-{username}");
-    let digest = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes());
-    let hex: String = digest.as_ref()[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+/// Device id of a server-seeded account (fixtures, load-test bots). Keyed with the server key:
+/// a plain hash of the public name would let anyone log into the seeded accounts through
+/// `POST /v1/auth/device`.
+pub(crate) fn seeded_device_id(key: &str, kind: &str, label: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("hmac key");
+    mac.update(kind.as_bytes());
+    mac.update(b"\0");
+    mac.update(label.as_bytes());
+    let tag = mac.finalize().into_bytes();
     format!(
-        "fixture-{hex}-{}",
-        username.chars().take(80).collect::<String>()
+        "{kind}-{}-{}",
+        hex::encode(&tag[..16]),
+        label.chars().take(80).collect::<String>()
     )
+}
+
+fn fixture_device(key: &str, fixture: &str, username: &str) -> String {
+    seeded_device_id(key, "fixture", &format!("{fixture}-{username}"))
 }
 
 /// Apply a fixture: every account is created once (same device identity on re-apply), wallet
@@ -336,7 +418,7 @@ pub async fn apply_fixture(
             .as_str()
             .filter(|u| !u.is_empty())
             .ok_or_else(|| Error::InvalidArgument("account.username is required".into()))?;
-        let device = fixture_device(name, username);
+        let device = fixture_device(&s.cfg.http.server_key, name, username);
         let opts: musubi_auth::AuthOptions =
             serde_json::from_value(json!({ "create": true, "username": username }))?;
         let session = s.auth.authenticate_device(&device, opts).await?;
@@ -477,4 +559,54 @@ pub async fn drop_fixture(s: &AppState, name: &str) -> Result<Option<Value>> {
     Ok(Some(
         json!({ "name": name, "purged": purged, "rows": rows }),
     ))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn seeded_device_ids_are_keyed_and_stable() {
+        let a = seeded_device_id("k1", "fixture", "smoke-alice");
+        let b = seeded_device_id("k1", "fixture", "smoke-alice");
+        let c = seeded_device_id("k2", "fixture", "smoke-alice");
+        assert_eq!(a, b);
+        assert_ne!(a, c, "another server key must give another device id");
+        assert_ne!(
+            seeded_device_id("k1", "loadbot", "000001"),
+            seeded_device_id("k1", "fixture", "000001")
+        );
+        assert!(a.starts_with("fixture-") && a.ends_with("-smoke-alice"));
+        let tag = a
+            .trim_start_matches("fixture-")
+            .trim_end_matches("-smoke-alice");
+        assert_eq!(tag.len(), 32, "128-bit tag in hex");
+    }
+
+    #[test]
+    fn recordings_redact_secret_fields() {
+        let out = redact_text(
+            r#"{"email":"a@b.c","password":"pw","session":{"token":"t","refresh_token":"r","user":{"id":1}},"codes":[{"code":"123456"}]}"#,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["email"], "a@b.c");
+        assert_eq!(v["password"], "[redacted]");
+        assert_eq!(v["session"]["token"], "[redacted]");
+        assert_eq!(v["session"]["refresh_token"], "[redacted]");
+        assert_eq!(v["session"]["user"]["id"], 1);
+        assert_eq!(v["codes"][0]["code"], "[redacted]");
+        assert_eq!(redact_text("not json"), "not json");
+        assert_eq!(redact_text("\"token\""), "\"token\"");
+    }
+
+    #[test]
+    fn only_bounded_bodies_are_recorded() {
+        assert!(body_fits(&Body::from("hello")));
+        assert!(body_fits(&Body::empty()));
+        let stream = Body::from_stream(futures::stream::iter(vec![Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"x"),
+        )]));
+        assert!(!body_fits(&stream), "unknown length is not buffered");
+        assert!(!body_fits(&Body::from(vec![0u8; MAX_BUFFER + 1])));
+    }
 }

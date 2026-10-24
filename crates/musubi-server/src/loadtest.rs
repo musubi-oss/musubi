@@ -1,7 +1,7 @@
 //! P1-35: simulated players driven by the server itself.
 //!
 //! `POST /v1/admin/dev/loadtests` spawns `bots` thin clients inside this node: each one
-//! authenticates with a stable device id (`loadbot:<n:06>`, so accounts do not pile up across runs),
+//! authenticates with a stable device id (HMAC of `loadbot:<n:06>` under the server key, so accounts do not pile up across runs),
 //! opens a real WebSocket to the node (or another environment when `[dev.loadtest] allow_remote`)
 //! and plays a scenario at `rate_hz` until the deadline or `…/stop`. Every request carries a
 //! `cid`; the matching reply closes an RTT sample, so the numbers are what a client would see
@@ -197,15 +197,14 @@ impl Request {
             }
         }
         if let Some(u) = &self.url {
-            let host = u
-                .strip_prefix("ws://")
-                .or_else(|| u.strip_prefix("wss://"))
-                .ok_or_else(|| {
-                    Error::InvalidArgument("url must start with ws:// or wss://".into())
-                })?;
-            let host = host.split('/').next().unwrap_or("");
-            let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-            let local = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1");
+            let parsed = reqwest::Url::parse(u)
+                .map_err(|_| Error::InvalidArgument("url: not a valid URL".into()))?;
+            if !matches!(parsed.scheme(), "ws" | "wss") {
+                return Err(Error::InvalidArgument(
+                    "url must start with ws:// or wss://".into(),
+                ));
+            }
+            let local = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
             if !local && !cfg.allow_remote {
                 return Err(Error::PermissionDenied(
                     "url: remote targets need [dev.loadtest] allow_remote".into(),
@@ -565,7 +564,11 @@ async fn run(s: &AppState, live: Arc<Live>, req: Request, url: String) -> Value 
         let token = match s
             .auth
             .authenticate_device(
-                &format!("loadbot:{n:06}"),
+                &crate::dev::seeded_device_id(
+                    &s.cfg.http.server_key,
+                    "loadbot",
+                    &format!("{n:06}"),
+                ),
                 musubi_auth::AuthOptions {
                     create: true,
                     vars: [("loadtest".to_string(), json!(live.id))]
@@ -1136,6 +1139,47 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(steps.len(), 5);
+    }
+
+    #[test]
+    fn url_host_check_uses_a_real_parser() {
+        for ok in [
+            "ws://[::1]/ws",
+            "ws://[::1]:7350/ws",
+            "wss://localhost/ws?x=1",
+        ] {
+            Request {
+                url: Some(ok.into()),
+                ..Default::default()
+            }
+            .validate(&cfg())
+            .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for remote in [
+            "ws://localhost@evil.example/ws",
+            "ws://127.0.0.1.evil.example/ws",
+            "ws://[::2]/ws",
+        ] {
+            assert!(
+                matches!(
+                    Request {
+                        url: Some(remote.into()),
+                        ..Default::default()
+                    }
+                    .validate(&cfg()),
+                    Err(Error::PermissionDenied(_))
+                ),
+                "{remote}"
+            );
+        }
+        assert!(matches!(
+            Request {
+                url: Some("ws://".into()),
+                ..Default::default()
+            }
+            .validate(&cfg()),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]

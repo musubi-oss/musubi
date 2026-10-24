@@ -164,7 +164,8 @@ async fn logs(
         let Ok(r) = m.decode::<Reply>() else {
             continue;
         };
-        if r.id != req.id {
+        // the reply speaks for the node that sent it, not for whichever id it names
+        if r.id != req.id || r.node != m.origin.0 {
             continue;
         }
         expect.retain(|id| *id != r.node);

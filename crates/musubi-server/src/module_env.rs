@@ -91,7 +91,10 @@ pub fn coerce(ty: &str, v: Value) -> Result<Value> {
         },
         "int" => match &v {
             Value::Number(n) if n.is_i64() => v,
-            Value::Number(n) if n.as_f64().is_some_and(|f| f.fract() == 0.0) => {
+            Value::Number(n)
+                if n.as_f64()
+                    .is_some_and(|f| f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0) =>
+            {
                 json!(n.as_f64().unwrap_or(0.0) as i64)
             }
             Value::String(t) => json!(t
@@ -429,5 +432,23 @@ type = "string"
         assert!(problems.iter().any(|p| p.contains("unknown type `enum`")));
         assert!(problems.iter().any(|p| p.contains("nomodule")));
         assert!(idl.env["shop/STRIPE_KEY"].secret);
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::coerce;
+    use serde_json::json;
+
+    #[test]
+    fn int_coercion_rejects_floats_beyond_exact_range() {
+        assert_eq!(coerce("int", json!(42.0)).unwrap(), json!(42));
+        assert_eq!(coerce("int", json!(-3.0)).unwrap(), json!(-3));
+        assert!(
+            coerce("int", json!(1e300)).is_err(),
+            "would saturate under `as i64`"
+        );
+        assert!(coerce("int", json!(-1e19)).is_err());
+        assert!(coerce("int", json!(1.5)).is_err());
     }
 }

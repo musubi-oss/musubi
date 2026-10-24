@@ -13,8 +13,28 @@ pub struct S3Store {
     client: reqwest::Client,
 }
 
+/// Object keys are plain paths under the prefix: no empty, `.` or `..` segments (the URL
+/// would be normalized by the client and the signature would not match, or worse, resolve
+/// outside the prefix).
+fn check_key(key: &str) -> Result<()> {
+    let key = key.trim_start_matches('/');
+    if key.is_empty() || key.len() > 1024 {
+        return Err(Error::InvalidArgument("object key: 1..=1024 chars".into()));
+    }
+    if key
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        || key.chars().any(|c| c.is_control())
+    {
+        return Err(Error::InvalidArgument(
+            "object key: bad path segment".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    ::hex::encode(b)
 }
 
 fn sha256_hex(b: &[u8]) -> String {
@@ -180,22 +200,28 @@ impl S3Store {
         }
         if !resp.status().is_success() {
             let st = resp.status();
+            // the S3 error XML (bucket, endpoint, request ids) stays in the log; the client
+            // gets the status only
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Unavailable(format!(
-                "object storage {st}: {}",
-                text.chars().take(300).collect::<String>()
-            )));
+            tracing::warn!(
+                status = %st,
+                body = %text.chars().take(300).collect::<String>(),
+                "object storage request failed"
+            );
+            return Err(Error::Unavailable(format!("object storage {st}")));
         }
         Ok(resp)
     }
 
     pub async fn put(&self, key: &str, bytes: Vec<u8>, mime: &str) -> Result<()> {
+        check_key(key)?;
         self.send(reqwest::Method::PUT, key, "", Some((bytes, mime)))
             .await?;
         Ok(())
     }
 
     pub async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        check_key(key)?;
         let resp = self.send(reqwest::Method::GET, key, "", None).await?;
         resp.bytes()
             .await
@@ -212,6 +238,7 @@ impl S3Store {
         Option<u64>,
         impl futures::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>,
     )> {
+        check_key(key)?;
         use futures::TryStreamExt;
         let resp = self.send(reqwest::Method::GET, key, "", None).await?;
         let len = resp.content_length();
@@ -221,6 +248,7 @@ impl S3Store {
     /// Multipart upload: begin → `upload_part` (≥ 5 MiB each on AWS, any size on the last) →
     /// `complete`; `abort` drops the parts of an upload that will not be completed.
     pub async fn begin_multipart(&self, key: &str, mime: &str) -> Result<String> {
+        check_key(key)?;
         let resp = self
             .send(
                 reqwest::Method::POST,
@@ -301,6 +329,7 @@ impl S3Store {
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {
+        check_key(key)?;
         match self.send(reqwest::Method::DELETE, key, "", None).await {
             Ok(_) | Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
@@ -360,5 +389,20 @@ mod tests {
         assert_eq!(amz, "20231114T221320Z");
         assert!(a1.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="));
         assert!(S3Store::new(&S3Config::default()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::check_key;
+
+    #[test]
+    fn object_keys_are_plain_paths() {
+        check_key("saves/abc/slot1.bin").unwrap();
+        check_key("/leading/slash").unwrap();
+        for bad in ["", "a//b", "a/./b", "../x", "a/..", "a/b\n", "."] {
+            assert!(check_key(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_key(&"k".repeat(1025)).is_err());
     }
 }
