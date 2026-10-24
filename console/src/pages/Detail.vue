@@ -23,10 +23,19 @@ const tabRows = ref<any[]>([]); const tabErr = ref(''); const tabBusy = ref(fals
 const key = computed(() => props.res.key ?? 'id')
 function fill(path: string, row: any) { return path.replace(/\{([^}]+)\}/g, (_, k) => encodeURIComponent(k === 'id' ? id.value : (row?.[k] ?? id.value))) }
 const itemPath = computed(() => (props.res.item ? fill(props.res.item, { ...(item.value ?? {}), [key.value]: id.value }) : null))
+// Resources without a GET-by-id route are looked up in their list: the list already carries the
+// full record for those, and every row still gets a page with tabs, actions and cross-links.
+async function fromList() {
+  const d = await get(props.res.list + qs({ limit: 500 }))
+  const list = Array.isArray(d) ? d : props.res.rowsKey ? d?.[props.res.rowsKey] : Object.values(d ?? {}).find(Array.isArray)
+  const row = (Array.isArray(list) ? list : []).find((r: any) => String(r?.[key.value] ?? r?.id ?? r?.name) === id.value)
+  if (!row) throw new Error(`${props.res.title.replace(/s$/, '')} ${id.value} is not in the list any more`)
+  return row
+}
 async function load() {
   busy.value = true; err.value = ''
   try {
-    const r = await get(itemPath.value!)
+    const r = itemPath.value ? await get(itemPath.value) : await fromList()
     item.value = r && typeof r === 'object' && !Array.isArray(r) && Object.keys(r).length === 1 && typeof Object.values(r)[0] === 'object' ? Object.values(r)[0] : r
     text.value = JSON.stringify(item.value, null, 2)
   } catch (e: any) { err.value = e.message; item.value = null }
@@ -82,7 +91,7 @@ function copyJson() { navigator.clipboard?.writeText(text.value); toast.show('co
   <div class="crumb"><router-link :to="listPath">{{ res.title }}</router-link> › <span>{{ title }}</span><span class="id" v-if="title !== id">{{ id }}</span>
     <span style="margin-left:auto;display:flex;gap:8px" v-if="item">
       <button v-for="a in visible(res.actions)" :key="a.label" class="btn s" :class="{ d: a.danger }" @click="run(a)">{{ a.label }}</button>
-      <button class="btn s" v-if="res.item" @click="editing = !editing; text = JSON.stringify(item, null, 2)">{{ editing ? 'Cancel' : 'Edit' }}</button>
+      <button class="btn s" v-if="res.item && res.method !== 'POST'" @click="editing = !editing; text = JSON.stringify(item, null, 2)">{{ editing ? 'Cancel' : 'Edit' }}</button>
       <button class="btn s d" v-if="res.item && res.method !== 'POST'" @click="remove">Delete</button>
     </span></div>
   <p class="err" v-if="err">{{ err }} <router-link :to="listPath">← back to {{ res.title.toLowerCase() }}</router-link></p>
