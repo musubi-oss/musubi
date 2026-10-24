@@ -1477,7 +1477,8 @@ async fn mesh_leaser(
                     Ok(r) => {
                         let st = r.status();
                         let body = r.text().await.unwrap_or_default();
-                        last.push_str(&format!(" | {u} -> {st} {}", &body[..body.len().min(160)]));
+                        let body: String = body.chars().take(160).collect();
+                        last.push_str(&format!(" | {u} -> {st} {body}"));
                     }
                     Err(e) => last.push_str(&format!(" | {u} -> {e}")),
                 }

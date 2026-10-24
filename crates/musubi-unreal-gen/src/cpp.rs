@@ -175,6 +175,10 @@ fn pc_write(model: &Model, t: &Ty, expr: &str, pos_cm: bool, depth: usize) -> St
     }
 }
 
+/// Upper bound on the elements a postcard reader pre-allocates from a length prefix; a hostile
+/// or corrupt frame can claim 2^63 elements and must not turn into a multi-gigabyte `Reset`.
+const PC_RESERVE_CAP: u64 = 1024;
+
 fn pc_read(model: &Model, t: &Ty, target: &str, pos_cm: bool, depth: usize) -> String {
     let v = format!("V{depth}");
     match t {
@@ -199,13 +203,16 @@ fn pc_read(model: &Model, t: &Ty, target: &str, pos_cm: bool, depth: usize) -> S
         Ty::Opt(i) if matches!(**i, Ty::Json) => format!(
             "{{ FString {v} = R.Str(); if ({v} == TEXT(\"null\")) {target}.Reset(); else {target} = FMusubiJson::FromText({v}); }}"
         ),
+        // postcard encodes Option as one byte 0/1; anything else is a corrupt frame, not None
         Ty::Opt(i) => format!(
-            "if (R.Byte() == 1) {{ {} {v}{{}}; {} {target} = MoveTemp({v}); }} else {target}.Reset();",
+            "{{ uint8 {v}T = R.Byte(); if ({v}T == 1) {{ {} {v}{{}}; {} {target} = MoveTemp({v}); }} else {{ if ({v}T != 0) R.Fail(); {target}.Reset(); }} }}",
             cpp_ty(model, i),
             pc_read(model, i, &v, pos_cm, depth + 1)
         ),
+        // the length prefix is peer-controlled: reserve at most PC_RESERVE_CAP elements up front,
+        // the loop still stops at the real end of the frame via R.Ok()
         Ty::Vec(i) => format!(
-            "{{ uint64 {v}N = R.Len(); {target}.Reset((int32){v}N); for (uint64 {v}I = 0; {v}I < {v}N && R.Ok(); ++{v}I) {{ {} {v}{{}}; {} {target}.Add(MoveTemp({v})); }} }}",
+            "{{ uint64 {v}N = R.Len(); {target}.Reset((int32)FMath::Min<uint64>({v}N, {PC_RESERVE_CAP})); for (uint64 {v}I = 0; {v}I < {v}N && R.Ok(); ++{v}I) {{ {} {v}{{}}; {} {target}.Add(MoveTemp({v})); }} }}",
             cpp_ty(model, i),
             pc_read(model, i, &v, pos_cm, depth + 1)
         ),
@@ -682,5 +689,55 @@ fn named_deps(t: &Ty) -> Vec<String> {
         Ty::Named(n) => vec![n.clone()],
         Ty::Opt(i) | Ty::Vec(i) | Ty::Map(i) => named_deps(i),
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model() -> Model {
+        Model {
+            structs: vec![Struct {
+                name: "Pkt".into(),
+                fields: vec![
+                    Field {
+                        name: "ids".into(),
+                        ty: Ty::Vec(Box::new(Ty::U32)),
+                        rename: None,
+                        default: false,
+                        default_fn: None,
+                        skip_if_default: false,
+                        pos_cm: false,
+                    },
+                    Field {
+                        name: "note".into(),
+                        ty: Ty::Opt(Box::new(Ty::Str)),
+                        rename: None,
+                        default: false,
+                        default_fn: None,
+                        skip_if_default: false,
+                        pos_cm: false,
+                    },
+                ],
+            }],
+            enums: vec![],
+        }
+    }
+
+    #[test]
+    fn postcard_reader_bounds_preallocation_and_rejects_bad_option_tags() {
+        let out = emit(&model(), "test", "TEST_API", "Test.h", &[]);
+        let read = out
+            .cpp
+            .split("void FMusubiPkt::Read(")
+            .nth(1)
+            .expect("Read impl");
+        assert!(
+            read.contains(&format!("FMath::Min<uint64>(V0N, {PC_RESERVE_CAP})")),
+            "{read}"
+        );
+        assert!(!read.contains("Reset((int32)V0N)"), "{read}");
+        assert!(read.contains("if (V0T != 0) R.Fail();"), "{read}");
     }
 }

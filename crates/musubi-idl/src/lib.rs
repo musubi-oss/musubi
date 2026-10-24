@@ -70,6 +70,15 @@ pub enum Ty {
 impl Ty {
     /// Parse a type expression without the optional marker.
     pub fn parse(s: &str) -> Result<Ty> {
+        Self::parse_depth(s, 0)
+    }
+
+    fn parse_depth(s: &str, depth: usize) -> Result<Ty> {
+        if depth > MAX_TYPE_DEPTH {
+            return err(format!(
+                "type expression nests deeper than {MAX_TYPE_DEPTH}"
+            ));
+        }
         let s = s.trim();
         Ok(match s {
             "string" => Ty::String,
@@ -81,10 +90,10 @@ impl Ty {
             "json" | "any" => Ty::Json,
             _ => {
                 if let Some(inner) = s.strip_prefix("list<").and_then(|r| r.strip_suffix('>')) {
-                    Ty::List(Box::new(Ty::parse(inner)?))
+                    Ty::List(Box::new(Ty::parse_depth(inner, depth + 1)?))
                 } else if let Some(inner) = s.strip_prefix("map<").and_then(|r| r.strip_suffix('>'))
                 {
-                    Ty::Map(Box::new(Ty::parse(inner)?))
+                    Ty::Map(Box::new(Ty::parse_depth(inner, depth + 1)?))
                 } else if is_ident(s) {
                     Ty::Named(s.to_string())
                 } else {
@@ -104,6 +113,10 @@ impl Ty {
         }
     }
 }
+
+/// `list<list<...>>` nesting the parser (and every schema walker after it) accepts; an IDL is
+/// operator input over `PUT /v1/admin/idl`, so recursion must be bounded.
+const MAX_TYPE_DEPTH: usize = 32;
 
 fn is_ident(s: &str) -> bool {
     let mut ch = s.chars();
@@ -442,7 +455,7 @@ impl Idl {
             let Some((module, name)) = key.split_once('/') else {
                 return err(format!("http `{key}`: key must be `module/name`"));
             };
-            if module.is_empty() || !is_ident(name) {
+            if !is_ident(module) || !is_ident(name) {
                 return err(format!("http `{key}`: bad module or handler name"));
             }
             for m in &h.methods {
@@ -461,8 +474,15 @@ impl Idl {
                         return err(format!("http `{key}`: unknown cors method `{m}`"));
                     }
                 }
+                // the Fetch spec forbids `Access-Control-Allow-Origin: *` with credentials;
+                // reflecting the request origin instead would open the handler to any site
+                if c.credentials && c.origins.iter().any(|o| o == "*") {
+                    return err(format!(
+                        "http `{key}`: cors.credentials = true needs explicit origins, not `*`"
+                    ));
+                }
             }
-            if h.rate_per_sec.is_some_and(|r| r <= 0.0) {
+            if h.rate_per_sec.is_some_and(|r| !r.is_finite() || r <= 0.0) {
                 return err(format!("http `{key}`: rate_per_sec must be positive"));
             }
         }
@@ -481,6 +501,20 @@ impl Idl {
             let set: BTreeSet<&String> = e.values.iter().collect();
             if set.len() != e.values.len() {
                 return err(format!("enum `{name}` repeats a value"));
+            }
+            let mut variants = BTreeSet::new();
+            for v in &e.values {
+                let variant = pascal(v);
+                if !is_ident(&variant) {
+                    return err(format!(
+                        "enum `{name}`: value `{v}` cannot be turned into an identifier"
+                    ));
+                }
+                if !variants.insert(variant) {
+                    return err(format!(
+                        "enum `{name}`: values `{v}` and another one map to the same variant"
+                    ));
+                }
             }
         }
         for (tname, t) in &self.types {
@@ -507,9 +541,19 @@ impl Idl {
                         "{tname}.{fname}: min_len/max_len apply to string, list and map only"
                     ));
                 }
+                if f.min.zip(f.max).is_some_and(|(lo, hi)| lo > hi) {
+                    return err(format!("{tname}.{fname}: min is greater than max"));
+                }
+                if f.min_len.zip(f.max_len).is_some_and(|(lo, hi)| lo > hi) {
+                    return err(format!("{tname}.{fname}: min_len is greater than max_len"));
+                }
             }
         }
         for (cname, c) in &self.collections {
+            // the name becomes a storage collection, a URL segment and (`musubi idl gen`) a file name
+            if !is_ident(cname) {
+                return err(format!("collection `{cname}`: not a valid name"));
+            }
             if !self.types.contains_key(&c.ty) {
                 return err(format!("collection `{cname}`: unknown type `{}`", c.ty));
             }
@@ -812,7 +856,7 @@ impl Idl {
         );
         for (name, e) in &self.enums {
             if let Some(d) = &e.doc {
-                out.push_str(&format!("/// {d}\n"));
+                out.push_str(&doc_comment(d, ""));
             }
             out.push_str(
                 "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]\n",
@@ -820,7 +864,7 @@ impl Idl {
             out.push_str(&format!("pub enum {name} {{\n"));
             for v in &e.values {
                 out.push_str(&format!(
-                    "    #[serde(rename = \"{v}\")]\n    {},\n",
+                    "    #[serde(rename = {v:?})]\n    {},\n",
                     pascal(v)
                 ));
             }
@@ -828,22 +872,26 @@ impl Idl {
         }
         for (name, t) in &self.types {
             if let Some(d) = &t.doc {
-                out.push_str(&format!("/// {d}\n"));
+                out.push_str(&doc_comment(d, ""));
             }
             out.push_str("#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]\n");
             out.push_str(&format!("pub struct {name} {{\n"));
             for (fname, f) in &t.fields {
                 if let Some(d) = &f.doc {
-                    out.push_str(&format!("    /// {d}\n"));
+                    out.push_str(&doc_comment(d, "    "));
                 }
                 let ty = rust_ty(&f.ty);
+                let field = rust_field(fname);
+                if field != fname.as_str() && !field.starts_with("r#") {
+                    out.push_str(&format!("    #[serde(rename = {fname:?})]\n"));
+                }
                 if f.optional {
                     out.push_str(
                         "    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n",
                     );
-                    out.push_str(&format!("    pub {}: Option<{ty}>,\n", rust_field(fname)));
+                    out.push_str(&format!("    pub {field}: Option<{ty}>,\n"));
                 } else {
-                    out.push_str(&format!("    pub {}: {ty},\n", rust_field(fname)));
+                    out.push_str(&format!("    pub {field}: {ty},\n"));
                 }
             }
             out.push_str("}\n\n");
@@ -864,7 +912,7 @@ impl Idl {
         out.push_str("/// One method per `[rpcs.*]`; implement it for `crate::Handlers`.\npub trait Rpcs {\n");
         for (name, r) in &self.rpcs {
             if let Some(d) = &r.doc {
-                out.push_str(&format!("    /// {d}\n"));
+                out.push_str(&doc_comment(d, "    "));
             }
             out.push_str(&format!(
                 "    fn {}(ctx: &CallContext, input: {}) -> Result<{}, String>;\n",
@@ -900,7 +948,7 @@ impl Idl {
                 .clone()
                 .unwrap_or_else(|| "serde_json::Value".into());
             if let Some(d) = &m.doc {
-                out.push_str(&format!("/// {d}\n"));
+                out.push_str(&doc_comment(d, ""));
             }
             out.push_str(&format!(
                 "/// Authoritative match module `{module}` (`match_{module}_*` exports); implement for `crate::Handlers`.\n\
@@ -1138,19 +1186,32 @@ fn rust_ty(t: &Ty) -> String {
     }
 }
 
+/// Strict and reserved keywords (Rust reference, edition 2021+) that `r#` can escape.
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
-    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-    "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
-    "while", "async", "await", "dyn",
+    "as", "break", "const", "continue", "else", "enum", "extern", "false", "fn", "for", "if",
+    "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "static",
+    "struct", "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn",
+    "abstract", "become", "box", "do", "final", "macro", "override", "priv", "typeof", "unsized",
+    "virtual", "yield", "try", "gen",
 ];
+
+/// Path keywords `r#` cannot escape (`r#self` is not an identifier): the field gets a `_`
+/// suffix and a `#[serde(rename)]` back to the IDL name.
+const RUST_UNESCAPABLE: &[&str] = &["self", "Self", "super", "crate", "_"];
 
 fn rust_field(name: &str) -> String {
     if RUST_KEYWORDS.contains(&name) {
         format!("r#{name}")
+    } else if RUST_UNESCAPABLE.contains(&name) {
+        format!("{name}_")
     } else {
         name.to_string()
     }
+}
+
+/// `/// ` lines for a doc string; a newline inside the text must not end the comment.
+fn doc_comment(doc: &str, indent: &str) -> String {
+    doc.lines().map(|l| format!("{indent}/// {l}\n")).collect()
 }
 
 fn pascal(s: &str) -> String {
@@ -2005,5 +2066,117 @@ export class GameState extends Schema {
         assert!(forced.contains("state = \"Player\""));
         assert!(from_colyseus("const x = 1;", "m", None).is_err());
         assert!(from_colyseus("class A extends Schema { @type(\"vec3\") p; }", "m", None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    fn parse(src: &str) -> Result<Idl> {
+        Idl::parse(src)
+    }
+
+    #[test]
+    fn type_nesting_is_bounded() {
+        let deep = format!("{}int{}", "list<".repeat(40), ">".repeat(40));
+        let e = Ty::parse(&deep).unwrap_err().to_string();
+        assert!(e.contains("nests deeper"), "{e}");
+        assert!(Ty::parse(&format!("{}int{}", "list<".repeat(8), ">".repeat(8))).is_ok());
+        let e = parse(&format!("[types.T]\nx = \"{deep}\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nests deeper"), "{e}");
+    }
+
+    #[test]
+    fn collection_and_http_module_names_are_identifiers() {
+        for bad in ["../../etc/x", "a/b", "a b", "a.b", ""] {
+            let src =
+                format!("[types.P]\nname = \"string\"\n[collections.\"{bad}\"]\ntype = \"P\"\n");
+            let e = parse(&src).unwrap_err().to_string();
+            assert!(e.contains("not a valid name"), "{bad}: {e}");
+        }
+        assert!(
+            parse("[types.P]\nname = \"string\"\n[collections.profiles]\ntype = \"P\"\n").is_ok()
+        );
+        let e = parse("[http.\"../x/handler\"]\nmethods = [\"GET\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("bad module or handler name"), "{e}");
+    }
+
+    #[test]
+    fn cors_wildcard_with_credentials_and_nan_rate_are_rejected() {
+        let e = parse("[http.\"m/n\"]\ncors = { origins = [\"*\"], credentials = true }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("credentials"), "{e}");
+        assert!(parse(
+            "[http.\"m/n\"]\ncors = { origins = [\"https://a.example\"], credentials = true }\n"
+        )
+        .is_ok());
+        let e = parse("[http.\"m/n\"]\nrate_per_sec = nan\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rate_per_sec"), "{e}");
+        let e = parse("[http.\"m/n\"]\nrate_per_sec = inf\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rate_per_sec"), "{e}");
+    }
+
+    #[test]
+    fn inverted_bounds_are_rejected() {
+        let e = parse("[types.T]\nn = { type = \"int\", min = 10, max = 1 }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("min is greater than max"), "{e}");
+        let e = parse("[types.T]\ns = { type = \"string\", min_len = 5, max_len = 2 }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("min_len is greater than max_len"), "{e}");
+    }
+
+    #[test]
+    fn enum_values_that_collide_or_cannot_be_identifiers_are_rejected() {
+        let e = parse("[enums.E]\nvalues = [\"a_b\", \"a-b\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("same variant"), "{e}");
+        let e = parse("[enums.E]\nvalues = [\"a.b\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot be turned into an identifier"), "{e}");
+        let e = parse("[enums.E]\nvalues = ['x\"y']\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot be turned into an identifier"), "{e}");
+        assert!(parse("[enums.E]\nvalues = [\"1st\", \"second-one\"]\n").is_ok());
+    }
+
+    #[test]
+    fn generated_rust_escapes_docs_and_names() {
+        let idl = parse(
+            "[types.T]\ndoc = \"line one\\nline two\"\nself = { type = \"int\", doc = \"a\\n*/ fn evil() {}\" }\ncrate = \"string\"\ntype = \"bool\"\nbox = \"bool\"\n",
+        )
+        .unwrap();
+        let rs = idl.rust();
+        assert!(rs.contains("/// line one\n/// line two\n"), "{rs}");
+        assert!(rs.contains("    /// a\n    /// */ fn evil() {}\n"), "{rs}");
+        assert!(!rs.contains("\n*/ fn evil"), "{rs}");
+        assert!(
+            rs.contains("#[serde(rename = \"self\")]\n    pub self_: i64"),
+            "{rs}"
+        );
+        assert!(
+            rs.contains("#[serde(rename = \"crate\")]\n    pub crate_: String"),
+            "{rs}"
+        );
+        assert!(rs.contains("pub r#type: bool"), "{rs}");
+        assert!(rs.contains("pub r#box: bool"), "{rs}");
+        assert!(!rs.contains("r#self"), "{rs}");
+        let g = idl.guest_rust();
+        assert!(g.contains("pub self_: i64"), "{g}");
     }
 }

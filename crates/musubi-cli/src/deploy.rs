@@ -205,6 +205,12 @@ enum Body {
     Bytes(Vec<u8>),
 }
 
+/// Percent-encode one path segment: names come from manifests, fleet files and server replies,
+/// and a `/`, `?` or `#` in them must not re-route the request.
+fn seg(s: &str) -> String {
+    urlencoding::encode(s).into_owned()
+}
+
 impl Api {
     pub fn new(base: &str, key: &str) -> Self {
         Self {
@@ -219,6 +225,20 @@ impl Api {
 
     pub fn from_args(cfg: &Config, a: &ApiArgs) -> Self {
         let key = a.key.clone().unwrap_or_else(|| cfg.http.server_key.clone());
+        if let Ok(u) = reqwest::Url::parse(&a.url) {
+            let host = u.host_str().unwrap_or_default();
+            let local = host == "localhost"
+                || host
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback());
+            if u.scheme() == "http" && !local {
+                eprintln!(
+                    "warning: sending the server key to {} over plain http; use https",
+                    u.host_str().unwrap_or_default()
+                );
+            }
+        }
         Self::new(&a.url, &key)
     }
 
@@ -266,7 +286,7 @@ impl Api {
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("{name}-{version}.bin"));
         let manifest = Manifest::of(&data, &ChunkParams::default());
-        let base = format!("/v1/server/builds/{name}/{version}");
+        let base = format!("/v1/server/builds/{}/{}", seg(name), seg(version));
         let opened = self
             .call(
                 "POST",
@@ -300,10 +320,20 @@ impl Api {
             missing_bytes,
             manifest.chunks.len() - missing.len()
         );
+        // the chunk table comes from the server: a range outside the artifact is a protocol
+        // error, not a reason to panic
+        for (hash, off, size) in &missing {
+            let end = off.checked_add(*size).filter(|end| *end <= data.len());
+            anyhow::ensure!(
+                end.is_some() && *size > 0,
+                "{name}@{version}: server asked for chunk {hash} at {off}+{size}, artifact is {} bytes",
+                data.len()
+            );
+        }
         let data = std::sync::Arc::new(data);
         let mut tasks = futures::stream::iter(missing.into_iter().map(|(hash, off, size)| {
             let data = data.clone();
-            let path = format!("{base}/chunks/{hash}");
+            let path = format!("{base}/chunks/{}", seg(&hash));
             async move {
                 let bytes = data[off..off + size].to_vec();
                 self.call("PUT", &path, Body::Bytes(bytes))
@@ -311,7 +341,7 @@ impl Api {
                     .map(|_| size)
             }
         }))
-        .buffer_unordered(parallel);
+        .buffer_unordered(parallel.max(1));
         let mut sent = 0usize;
         while let Some(r) = tasks.next().await {
             sent += r?;
@@ -331,7 +361,7 @@ impl Api {
     pub async fn module_publish(&self, name: &str, bytes: Vec<u8>) -> anyhow::Result<Value> {
         self.call(
             "PUT",
-            &format!("/v1/admin/runtime/modules/{name}"),
+            &format!("/v1/admin/runtime/modules/{}", seg(name)),
             Body::Bytes(bytes),
         )
         .await
@@ -352,7 +382,7 @@ impl Api {
         );
         self.call(
             "POST",
-            &format!("/v1/admin/runtime/modules/{name}/canary{q}"),
+            &format!("/v1/admin/runtime/modules/{}/canary{q}", seg(name)),
             Body::Bytes(bytes),
         )
         .await
@@ -362,14 +392,14 @@ impl Api {
         if drop {
             self.call(
                 "DELETE",
-                &format!("/v1/admin/runtime/modules/{name}/canary"),
+                &format!("/v1/admin/runtime/modules/{}/canary", seg(name)),
                 Body::None,
             )
             .await
         } else {
             self.call(
                 "POST",
-                &format!("/v1/admin/runtime/modules/{name}/canary/promote"),
+                &format!("/v1/admin/runtime/modules/{}/canary/promote", seg(name)),
                 Body::None,
             )
             .await
@@ -379,7 +409,10 @@ impl Api {
     pub async fn module_rollback(&self, name: &str, version: i32) -> anyhow::Result<Value> {
         self.call(
             "POST",
-            &format!("/v1/admin/runtime/modules/{name}/versions/{version}/rollback"),
+            &format!(
+                "/v1/admin/runtime/modules/{}/versions/{version}/rollback",
+                seg(name)
+            ),
             Body::None,
         )
         .await
@@ -390,7 +423,7 @@ impl Api {
             Some(n) => {
                 self.call(
                     "GET",
-                    &format!("/v1/admin/runtime/modules/{n}/versions"),
+                    &format!("/v1/admin/runtime/modules/{}/versions", seg(n)),
                     Body::None,
                 )
                 .await
@@ -421,7 +454,7 @@ impl Api {
             .ok_or_else(|| anyhow::anyhow!("schema file needs a `collection`"))?;
         self.call(
             "PUT",
-            &format!("/v1/admin/storage_schemas/{collection}"),
+            &format!("/v1/admin/storage_schemas/{}", seg(&collection)),
             Body::Json(spec),
         )
         .await
@@ -438,8 +471,12 @@ impl Api {
     }
 
     pub async fn idl_show(&self, format: &str) -> anyhow::Result<Value> {
-        self.call("GET", &format!("/v1/admin/idl?format={format}"), Body::None)
-            .await
+        self.call(
+            "GET",
+            &format!("/v1/admin/idl?format={}", seg(format)),
+            Body::None,
+        )
+        .await
     }
 
     pub async fn fleet_push(&self, mut spec: Value) -> anyhow::Result<Value> {
@@ -466,7 +503,7 @@ impl Api {
                 "created",
             ),
             Some(f) => {
-                let id = f["id"].as_str().unwrap_or_default().to_string();
+                let id = fleet_id(&f)?;
                 let mut scale = serde_json::Map::new();
                 for k in ["buffer", "max_servers", "min_servers", "policy"] {
                     if !spec[k].is_null() {
@@ -478,7 +515,7 @@ impl Api {
                 } else {
                     self.call(
                         "POST",
-                        &format!("/v1/server/fleets/{id}/scale"),
+                        &format!("/v1/server/fleets/{}/scale", seg(&id)),
                         Body::Json(Value::Object(scale)),
                     )
                     .await?
@@ -486,7 +523,7 @@ impl Api {
                 (fleet, "updated")
             }
         };
-        let id = fleet["id"].as_str().unwrap_or_default().to_string();
+        let id = fleet_id(&fleet)?;
         let mut out = json!({ "fleet": fleet, "action": action });
         if let Some(mut b) = build {
             if b["spec"].is_null() && !spec["spec"].is_null() {
@@ -498,7 +535,7 @@ impl Api {
             out["build"] = self
                 .call(
                     "POST",
-                    &format!("/v1/server/fleets/{id}/builds"),
+                    &format!("/v1/server/fleets/{}/builds", seg(&id)),
                     Body::Json(b),
                 )
                 .await?;
@@ -546,6 +583,15 @@ impl Api {
 }
 
 /// Parse a TOML (default) or JSON (`.json`, or a leading `{`) file into a JSON value.
+/// `id` of a fleet object the server returned; an empty one would address `/fleets//scale`.
+fn fleet_id(fleet: &Value) -> anyhow::Result<String> {
+    fleet["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("fleet reply without an id: {fleet}"))
+}
+
 pub fn read_value(path: &Path) -> anyhow::Result<Value> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
@@ -639,7 +685,9 @@ pub async fn build(cfg: &Config, cmd: BuildCmd) -> anyhow::Result<()> {
                 .await?
         }
         BuildCmd::List { name, api } => {
-            let q = name.map(|n| format!("?name={n}")).unwrap_or_default();
+            let q = name
+                .map(|n| format!("?name={}", urlencoding::encode(&n)))
+                .unwrap_or_default();
             Api::from_args(cfg, &api)
                 .call("GET", &format!("/v1/server/builds{q}"), Body::None)
                 .await?
@@ -994,6 +1042,57 @@ port_end = 7100
             log[4]
         );
         assert!(log[8].2.contains("\"buffer\":3"), "{:?}", log[8]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use axum::{routing::post, Json, Router};
+
+    #[test]
+    fn path_segments_are_percent_encoded() {
+        assert_eq!(seg("profiles"), "profiles");
+        assert_eq!(seg("../admin"), "..%2Fadmin");
+        assert_eq!(seg("a?b#c"), "a%3Fb%23c");
+        assert_eq!(seg("v1.2 beta"), "v1.2%20beta");
+    }
+
+    #[test]
+    fn fleet_replies_without_an_id_are_errors() {
+        assert_eq!(fleet_id(&json!({"id": "f1"})).unwrap(), "f1");
+        assert!(fleet_id(&json!({"id": ""})).is_err());
+        assert!(fleet_id(&json!({"name": "x"})).is_err());
+    }
+
+    /// The server's chunk table decides what gets sliced out of the artifact: a range past the
+    /// end must fail with an error instead of a panic in the upload task.
+    #[tokio::test]
+    async fn build_push_rejects_chunk_ranges_outside_the_artifact() {
+        let app = Router::new().route(
+            "/v1/server/builds/{name}/{version}/upload",
+            post(|| async {
+                Json(json!({
+                    "missing": [{"hash": "h", "offset": 10, "size": u64::MAX - 5}],
+                    "missing_chunks": 1
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("musubi-audit-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("game.bin");
+        std::fs::write(&file, vec![7u8; 16]).unwrap();
+        let api = Api::new(&format!("http://{addr}"), "k");
+        let err = api
+            .build_push("game", "1.0", &file, None, None, 4)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("server asked for chunk h"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -82,6 +82,13 @@ pub async fn tables(db: &PgPool, only: Option<&[String]>) -> anyhow::Result<Vec<
     Ok(out)
 }
 
+/// Quote a catalog identifier for interpolation into SQL (`"` doubled, as `quote_ident` does):
+/// names come from `pg_class`/`pg_attribute`, so this guards against mixed case and keywords
+/// rather than an attacker, but the identifier must never be pasted in raw.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 pub async fn export(
     db: &PgPool,
     out: &mut dyn Write,
@@ -89,10 +96,12 @@ pub async fn export(
 ) -> anyhow::Result<BTreeMap<String, u64>> {
     let mut counts = BTreeMap::new();
     for t in tables(db, only).await? {
-        let rows: Vec<String> =
-            sqlx::query_scalar(&format!("select row_to_json(t)::text from musubi.{t} t"))
-                .fetch_all(db)
-                .await?;
+        let rows: Vec<String> = sqlx::query_scalar(&format!(
+            "select row_to_json(t)::text from musubi.{} t",
+            quote_ident(&t)
+        ))
+        .fetch_all(db)
+        .await?;
         for r in &rows {
             let row: Value = serde_json::from_str(r)?;
             writeln!(out, "{}", json!({ "table": t, "row": row }))?;
@@ -107,14 +116,12 @@ pub async fn import(
     input: &mut dyn BufRead,
     replace: bool,
 ) -> anyhow::Result<BTreeMap<String, (u64, u64)>> {
-    let known = tables(db, None).await?;
     let all: Vec<String> = sqlx::query_scalar(
         "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace
          where n.nspname = 'musubi' and c.relkind = 'r'",
     )
     .fetch_all(db)
     .await?;
-    let _ = known;
     let mut by_table: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for line in input.lines() {
         let line = line?;
@@ -147,13 +154,14 @@ pub async fn import(
         .bind(&t)
         .fetch_all(db)
         .await?;
+        let pk: Vec<String> = pk.iter().map(|c| quote_ident(c)).collect();
         let conflict = if pk.is_empty() {
             String::new()
         } else if replace {
             let sets: Vec<String> = cols
                 .iter()
                 .filter(|c| !pk.contains(c))
-                .map(|c| format!("{c} = excluded.{c}"))
+                .map(|c| format!("{0} = excluded.{0}", quote_ident(c)))
                 .collect();
             if sets.is_empty() {
                 format!("on conflict ({}) do nothing", pk.join(", "))
@@ -168,7 +176,8 @@ pub async fn import(
             format!("on conflict ({}) do nothing", pk.join(", "))
         };
         let sql = format!(
-            "insert into musubi.{t} select * from json_populate_record(null::musubi.{t}, $1::json) {conflict}"
+            "insert into musubi.{0} select * from json_populate_record(null::musubi.{0}, $1::json) {conflict}",
+            quote_ident(&t)
         );
         let mut tx = db.begin().await?;
         let (mut written, mut skipped) = (0u64, 0u64);
@@ -188,4 +197,17 @@ pub async fn import(
         counts.insert(t, (written, skipped));
     }
     Ok(counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_ident;
+
+    #[test]
+    fn identifiers_are_quoted_and_escaped() {
+        assert_eq!(quote_ident("accounts"), "\"accounts\"");
+        assert_eq!(quote_ident("User"), "\"User\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote_ident("x; drop table y"), "\"x; drop table y\"");
+    }
 }

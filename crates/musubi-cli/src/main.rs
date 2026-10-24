@@ -109,10 +109,13 @@ enum Cmd {
     /// Check the configuration and the environment (secrets, TTLs, database, pending migrations,
     /// data dir, ports) and exit 1 if anything would stop the server.
     Doctor,
-    /// Print the effective configuration.
+    /// Print the effective configuration. Secrets (server key, session secret, database
+    /// password, provider tokens) are masked unless `--show-secrets` is given.
     Config {
         #[arg(long, default_value = "toml")]
         format: String,
+        #[arg(long)]
+        show_secrets: bool,
     },
     /// Load-test a running server: device auth per client, then http | storage | ws | all loops;
     /// prints p50/p95/p99 latencies, throughput and errors.
@@ -381,13 +384,118 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Cmd::Config { format } => {
+        Cmd::Config {
+            format,
+            show_secrets,
+        } => {
+            let mut v = serde_json::to_value(&cfg)?;
+            if !show_secrets {
+                redact_secrets(&mut v);
+            }
             let out = match format.as_str() {
-                "json" => serde_json::to_string_pretty(&cfg)?,
-                _ => toml::to_string_pretty(&cfg)?,
+                "json" => serde_json::to_string_pretty(&v)?,
+                _ => toml::to_string_pretty(&v)?,
             };
             println!("{out}");
             Ok(())
         }
+    }
+}
+
+const REDACTED: &str = "***";
+
+/// Config keys whose values are credentials: `musubi config` output lands in tickets and CI
+/// logs, so they are masked unless the operator asks for them.
+const SECRET_KEYS: &[&str] = &[
+    "server_key",
+    "legacy_server_key",
+    "secret",
+    "signing_key_pem",
+    "captcha_secret",
+    "master_keys",
+    "secrets",
+    "token",
+    "password",
+    "client_secret",
+    "private_key",
+    "api_key",
+];
+
+/// Mask secret values in a serialised config: known keys everywhere in the tree, plus the
+/// password part of any `scheme://user:password@host` URL.
+fn redact_secrets(v: &mut serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m.iter_mut() {
+                if SECRET_KEYS.contains(&k.as_str()) {
+                    match val {
+                        Value::Null => {}
+                        Value::Array(a) => a.iter_mut().for_each(|x| *x = Value::from(REDACTED)),
+                        Value::Object(o) => o.values_mut().for_each(|x| *x = Value::from(REDACTED)),
+                        _ => *val = Value::from(REDACTED),
+                    }
+                } else {
+                    redact_secrets(val);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(redact_secrets),
+        Value::String(s) => {
+            if let Some(masked) = redact_url_password(s) {
+                *s = masked;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_url_password(s: &str) -> Option<String> {
+    let (scheme, rest) = s.split_once("://")?;
+    let (userinfo, host) = rest.split_once('@')?;
+    let (user, _password) = userinfo.split_once(':')?;
+    if host.is_empty() || host.contains('/') && host.find('/') < host.find(':') {
+        return None;
+    }
+    Some(format!("{scheme}://{user}:{REDACTED}@{host}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn config_output_masks_secrets_but_keeps_structure() {
+        let mut v = json!({
+            "http": { "listen": "0.0.0.0:7350", "server_key": "k" },
+            "session": { "secret": "s", "signing_key_pem": null, "ttl_secs": 60 },
+            "database": { "url": "postgres://musubi:hunter2@db:5432/musubi", "max_connections": 8 },
+            "security": { "master_keys": ["a", "b"] },
+            "runtime": { "secrets": { "STRIPE": "sk_live" } },
+            "nested": [{ "token": "t", "url": "https://api.example.com/v1" }]
+        });
+        redact_secrets(&mut v);
+        assert_eq!(v["http"]["server_key"], "***");
+        assert_eq!(v["http"]["listen"], "0.0.0.0:7350");
+        assert_eq!(v["session"]["secret"], "***");
+        assert!(v["session"]["signing_key_pem"].is_null());
+        assert_eq!(v["session"]["ttl_secs"], 60);
+        assert_eq!(v["database"]["url"], "postgres://musubi:***@db:5432/musubi");
+        assert_eq!(v["security"]["master_keys"], json!(["***", "***"]));
+        assert_eq!(v["runtime"]["secrets"]["STRIPE"], "***");
+        assert_eq!(v["nested"][0]["token"], "***");
+        assert_eq!(v["nested"][0]["url"], "https://api.example.com/v1");
+        assert!(!serde_json::to_string(&v).unwrap().contains("hunter2"));
+    }
+
+    #[test]
+    fn url_passwords_only() {
+        assert_eq!(redact_url_password("http://h/x"), None);
+        assert_eq!(redact_url_password("mailto:a@b"), None);
+        assert_eq!(
+            redact_url_password("redis://:pw@cache:6379").as_deref(),
+            Some("redis://:***@cache:6379")
+        );
     }
 }

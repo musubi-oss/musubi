@@ -42,8 +42,14 @@ pub struct Opts {
     pub match_size: usize,
 }
 
-/// Dev server key (`[auth] server_key` default) for the world scenario's simulator side.
-const KEY: &str = "defaultkey";
+/// Server key for the world scenario's simulator side: `MUSUBI_SERVER_KEY`, else the dev
+/// default (`[http] server_key`), so a hardened node can be benchmarked without editing code.
+static SERVER_KEY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("MUSUBI_SERVER_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| "defaultkey".to_string())
+});
 
 /// Totals of the `world` scenario across all clients.
 #[derive(Default)]
@@ -97,7 +103,7 @@ async fn world_setup(
     let side = ((entities.max(1) as f64).sqrt() * 20.0).max(cell);
     let r = http
         .post(format!("{url}/v1/server/worlds"))
-        .header("x-musubi-server-key", KEY)
+        .header("x-musubi-server-key", SERVER_KEY.as_str())
         .json(&json!({"name": name, "config": {"cell_size": cell}, "controller": controller.cloned().unwrap_or(json!({}))}))
         .send()
         .await?;
@@ -126,7 +132,7 @@ async fn world_setup(
                 }
                 let r = http
                     .post(format!("{url}/v1/server/worlds/{name}/lease"))
-                    .header("x-musubi-server-key", KEY)
+                    .header("x-musubi-server-key", SERVER_KEY.as_str())
                     .json(&json!({"sim": sims[k], "cells": cells}))
                     .send()
                     .await?;
@@ -139,7 +145,7 @@ async fn world_setup(
                 for c in cells {
                     let r = http
                         .post(format!("{url}/v1/server/worlds/{name}/lease"))
-                        .header("x-musubi-server-key", KEY)
+                        .header("x-musubi-server-key", SERVER_KEY.as_str())
                         .json(&json!({"sim": sims[k], "cells": [c]}))
                         .send()
                         .await?;
@@ -167,7 +173,7 @@ async fn world_setup(
             json!({"sim": sim, "x": x, "y": y, "components": {"hp": 100}, "persistent": false});
         let mut r = http
             .post(format!("{url}/v1/server/worlds/{name}/spawn"))
-            .header("x-musubi-server-key", KEY)
+            .header("x-musubi-server-key", SERVER_KEY.as_str())
             .json(&body)
             .send()
             .await?;
@@ -178,14 +184,14 @@ async fn world_setup(
             let (cx, cy) = ((x / cell) as i64, (y / cell) as i64);
             let l = http
                 .post(format!("{host}/v1/server/worlds/{name}/lease"))
-                .header("x-musubi-server-key", KEY)
+                .header("x-musubi-server-key", SERVER_KEY.as_str())
                 .json(&json!({"sim": sim, "cells": [{"x": cx, "y": cy}]}))
                 .send()
                 .await?;
             anyhow::ensure!(l.status().is_success(), "lease after move: {}", l.status());
             r = http
                 .post(format!("{url}/v1/server/worlds/{name}/spawn"))
-                .header("x-musubi-server-key", KEY)
+                .header("x-musubi-server-key", SERVER_KEY.as_str())
                 .json(&body)
                 .send()
                 .await?;
@@ -249,7 +255,7 @@ async fn world_sim(
             last_lease = Instant::now();
             let _ = http
                 .post(format!("{url}/v1/server/worlds/{}/lease", arena.name))
-                .header("x-musubi-server-key", KEY)
+                .header("x-musubi-server-key", SERVER_KEY.as_str())
                 .json(&json!({"sim": arena.sim, "cells": cells}))
                 .timeout(Duration::from_secs(2))
                 .send()
@@ -269,7 +275,7 @@ async fn world_sim(
                 let t0 = Instant::now();
                 let res = http
                     .post(format!("{url}/v1/server/worlds/{}/apply", arena.name))
-                    .header("x-musubi-server-key", KEY)
+                    .header("x-musubi-server-key", SERVER_KEY.as_str())
                     .json(&json!({"sim": arena.sim, "entity": arena.entities[i], "x": x, "y": y}))
                     .timeout(Duration::from_secs(2))
                     .send()
@@ -603,7 +609,7 @@ async fn host_stream(
             return;
         };
         req.headers_mut()
-            .insert("x-musubi-server-key", KEY.parse().unwrap());
+            .insert("x-musubi-server-key", SERVER_KEY.parse().unwrap());
         let Ok(Ok((mut ws, _))) = tokio::time::timeout(
             Duration::from_secs(5),
             tokio_tungstenite::connect_async(req),
@@ -828,7 +834,7 @@ async fn scrape_tick(http: &reqwest::Client, url: &str, prefix: &str, metric: &s
             .iter()
             .map(|(le, c)| (le.parse::<f64>().unwrap_or(f64::INFINITY), *c))
             .collect();
-        bs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        bs.sort_by(|a, b| a.0.total_cmp(&b.0));
         let total = bs.last()?.1;
         bs.iter()
             .find(|(_, c)| *c >= total * p)
@@ -1424,7 +1430,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
     for a in &arenas {
         let _ = http
             .delete(format!("{url}/v1/server/worlds/{}", a.name))
-            .header("x-musubi-server-key", KEY)
+            .header("x-musubi-server-key", SERVER_KEY.as_str())
             .send()
             .await;
     }
@@ -1476,7 +1482,7 @@ pub async fn run(o: Opts) -> anyhow::Result<()> {
             .iter()
             .filter(|s| s.scenario == *sc && !s.ok && !s.throttled)
             .count();
-        ok.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ok.sort_by(|a, b| a.total_cmp(b));
         report["scenarios"][*sc] = json!({
             "ops": ok.len(), "errors": errors, "throttled": throttled, "rps": ok.len() as f64 / secs,
             "p50_ms": percentile(&ok, 50.0), "p95_ms": percentile(&ok, 95.0),
