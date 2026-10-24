@@ -20,7 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/server/configs", get(list_server))
         .route(
             "/v1/server/configs/{name}",
-            axum::routing::put(put).delete(delete),
+            get(get_server).put(put).delete(delete),
         )
 }
 
@@ -63,6 +63,21 @@ async fn list_server(
     let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let configs = resolve(&s, None, &ctx, None).await?;
     Ok(Json(json!({ "configs": configs })))
+}
+
+async fn get_server(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<Ctx>,
+) -> Result<Json<Value>, ApiError> {
+    let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
+    let mut configs = resolve(&s, Some(&name), &ctx, None).await?;
+    match configs.pop() {
+        Some(c) => Ok(Json(c)),
+        None => Err(Error::NotFound(format!("config `{name}`")).into()),
+    }
 }
 
 async fn get_one(

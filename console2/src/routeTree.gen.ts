@@ -23,6 +23,14 @@ import { Route as AppServersBuildsRouteImport } from './routes/_app/servers/buil
 import { Route as AppServersEdgeRouteImport } from './routes/_app/servers/edge'
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
+import { Route as AppLiveopsAudiencesNameRouteImport } from './routes/_app/liveops/audiences/$name'
+import { Route as AppLiveopsChangesetsIdRouteImport } from './routes/_app/liveops/changesets/$id'
+import { Route as AppLiveopsConfigsNameRouteImport } from './routes/_app/liveops/configs/$name'
+import { Route as AppLiveopsExperimentsIdRouteImport } from './routes/_app/liveops/experiments/$id'
+import { Route as AppLiveopsFlagsNameRouteImport } from './routes/_app/liveops/flags/$name'
+import { Route as AppLiveopsLive_eventsIdRouteImport } from './routes/_app/liveops/live_events/$id'
+import { Route as AppLiveopsNewsIdRouteImport } from './routes/_app/liveops/news/$id'
+import { Route as AppLiveopsOffersIdRouteImport } from './routes/_app/liveops/offers/$id'
 import { Route as AppPlayersAccountsIdRouteImport } from './routes/_app/players/accounts/$id'
 import { Route as AppServersFleetsIdRouteImport } from './routes/_app/servers/fleets/$id'
 import { Route as AppServersServersIdRouteImport } from './routes/_app/servers/servers/$id'
@@ -99,6 +107,46 @@ const AppSectionPageIdRoute = AppSectionPageIdRouteImport.update({
   path: '/$section/$page/$id',
   getParentRoute: () => AppRoute,
 } as any)
+const AppLiveopsAudiencesNameRoute = AppLiveopsAudiencesNameRouteImport.update({
+  id: '/liveops/audiences/$name',
+  path: '/liveops/audiences/$name',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLiveopsChangesetsIdRoute = AppLiveopsChangesetsIdRouteImport.update({
+  id: '/liveops/changesets/$id',
+  path: '/liveops/changesets/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLiveopsConfigsNameRoute = AppLiveopsConfigsNameRouteImport.update({
+  id: '/liveops/configs/$name',
+  path: '/liveops/configs/$name',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLiveopsExperimentsIdRoute = AppLiveopsExperimentsIdRouteImport.update({
+  id: '/liveops/experiments/$id',
+  path: '/liveops/experiments/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLiveopsFlagsNameRoute = AppLiveopsFlagsNameRouteImport.update({
+  id: '/liveops/flags/$name',
+  path: '/liveops/flags/$name',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLiveopsLive_eventsIdRoute = AppLiveopsLive_eventsIdRouteImport.update({
+  id: '/liveops/live_events/$id',
+  path: '/liveops/live_events/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLiveopsNewsIdRoute = AppLiveopsNewsIdRouteImport.update({
+  id: '/liveops/news/$id',
+  path: '/liveops/news/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLiveopsOffersIdRoute = AppLiveopsOffersIdRouteImport.update({
+  id: '/liveops/offers/$id',
+  path: '/liveops/offers/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppPlayersAccountsIdRoute = AppPlayersAccountsIdRouteImport.update({
   id: '/players/accounts/$id',
   path: '/players/accounts/$id',
@@ -139,6 +187,14 @@ export interface FileRoutesByFullPath {
   '/$section/': typeof AppSectionIndexRoute
   '/cluster/': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/liveops/audiences/$name': typeof AppLiveopsAudiencesNameRoute
+  '/liveops/changesets/$id': typeof AppLiveopsChangesetsIdRoute
+  '/liveops/configs/$name': typeof AppLiveopsConfigsNameRoute
+  '/liveops/experiments/$id': typeof AppLiveopsExperimentsIdRoute
+  '/liveops/flags/$name': typeof AppLiveopsFlagsNameRoute
+  '/liveops/live_events/$id': typeof AppLiveopsLive_eventsIdRoute
+  '/liveops/news/$id': typeof AppLiveopsNewsIdRoute
+  '/liveops/offers/$id': typeof AppLiveopsOffersIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/servers/servers/$id': typeof AppServersServersIdRoute
@@ -159,6 +215,14 @@ export interface FileRoutesByTo {
   '/$section': typeof AppSectionIndexRoute
   '/cluster': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/liveops/audiences/$name': typeof AppLiveopsAudiencesNameRoute
+  '/liveops/changesets/$id': typeof AppLiveopsChangesetsIdRoute
+  '/liveops/configs/$name': typeof AppLiveopsConfigsNameRoute
+  '/liveops/experiments/$id': typeof AppLiveopsExperimentsIdRoute
+  '/liveops/flags/$name': typeof AppLiveopsFlagsNameRoute
+  '/liveops/live_events/$id': typeof AppLiveopsLive_eventsIdRoute
+  '/liveops/news/$id': typeof AppLiveopsNewsIdRoute
+  '/liveops/offers/$id': typeof AppLiveopsOffersIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/servers/servers/$id': typeof AppServersServersIdRoute
@@ -181,6 +245,14 @@ export interface FileRoutesById {
   '/_app/$section/': typeof AppSectionIndexRoute
   '/_app/cluster/': typeof AppClusterIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
+  '/_app/liveops/audiences/$name': typeof AppLiveopsAudiencesNameRoute
+  '/_app/liveops/changesets/$id': typeof AppLiveopsChangesetsIdRoute
+  '/_app/liveops/configs/$name': typeof AppLiveopsConfigsNameRoute
+  '/_app/liveops/experiments/$id': typeof AppLiveopsExperimentsIdRoute
+  '/_app/liveops/flags/$name': typeof AppLiveopsFlagsNameRoute
+  '/_app/liveops/live_events/$id': typeof AppLiveopsLive_eventsIdRoute
+  '/_app/liveops/news/$id': typeof AppLiveopsNewsIdRoute
+  '/_app/liveops/offers/$id': typeof AppLiveopsOffersIdRoute
   '/_app/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/_app/servers/fleets/$id': typeof AppServersFleetsIdRoute
   '/_app/servers/servers/$id': typeof AppServersServersIdRoute
@@ -203,6 +275,14 @@ export interface FileRouteTypes {
     | '/$section/'
     | '/cluster/'
     | '/$section/$page/$id'
+    | '/liveops/audiences/$name'
+    | '/liveops/changesets/$id'
+    | '/liveops/configs/$name'
+    | '/liveops/experiments/$id'
+    | '/liveops/flags/$name'
+    | '/liveops/live_events/$id'
+    | '/liveops/news/$id'
+    | '/liveops/offers/$id'
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
     | '/servers/servers/$id'
@@ -223,6 +303,14 @@ export interface FileRouteTypes {
     | '/$section'
     | '/cluster'
     | '/$section/$page/$id'
+    | '/liveops/audiences/$name'
+    | '/liveops/changesets/$id'
+    | '/liveops/configs/$name'
+    | '/liveops/experiments/$id'
+    | '/liveops/flags/$name'
+    | '/liveops/live_events/$id'
+    | '/liveops/news/$id'
+    | '/liveops/offers/$id'
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
     | '/servers/servers/$id'
@@ -244,6 +332,14 @@ export interface FileRouteTypes {
     | '/_app/$section/'
     | '/_app/cluster/'
     | '/_app/$section/$page/$id'
+    | '/_app/liveops/audiences/$name'
+    | '/_app/liveops/changesets/$id'
+    | '/_app/liveops/configs/$name'
+    | '/_app/liveops/experiments/$id'
+    | '/_app/liveops/flags/$name'
+    | '/_app/liveops/live_events/$id'
+    | '/_app/liveops/news/$id'
+    | '/_app/liveops/offers/$id'
     | '/_app/players/accounts/$id'
     | '/_app/servers/fleets/$id'
     | '/_app/servers/servers/$id'
@@ -357,6 +453,62 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSectionPageIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/liveops/audiences/$name': {
+      id: '/_app/liveops/audiences/$name'
+      path: '/liveops/audiences/$name'
+      fullPath: '/liveops/audiences/$name'
+      preLoaderRoute: typeof AppLiveopsAudiencesNameRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/liveops/changesets/$id': {
+      id: '/_app/liveops/changesets/$id'
+      path: '/liveops/changesets/$id'
+      fullPath: '/liveops/changesets/$id'
+      preLoaderRoute: typeof AppLiveopsChangesetsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/liveops/configs/$name': {
+      id: '/_app/liveops/configs/$name'
+      path: '/liveops/configs/$name'
+      fullPath: '/liveops/configs/$name'
+      preLoaderRoute: typeof AppLiveopsConfigsNameRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/liveops/experiments/$id': {
+      id: '/_app/liveops/experiments/$id'
+      path: '/liveops/experiments/$id'
+      fullPath: '/liveops/experiments/$id'
+      preLoaderRoute: typeof AppLiveopsExperimentsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/liveops/flags/$name': {
+      id: '/_app/liveops/flags/$name'
+      path: '/liveops/flags/$name'
+      fullPath: '/liveops/flags/$name'
+      preLoaderRoute: typeof AppLiveopsFlagsNameRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/liveops/live_events/$id': {
+      id: '/_app/liveops/live_events/$id'
+      path: '/liveops/live_events/$id'
+      fullPath: '/liveops/live_events/$id'
+      preLoaderRoute: typeof AppLiveopsLive_eventsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/liveops/news/$id': {
+      id: '/_app/liveops/news/$id'
+      path: '/liveops/news/$id'
+      fullPath: '/liveops/news/$id'
+      preLoaderRoute: typeof AppLiveopsNewsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/liveops/offers/$id': {
+      id: '/_app/liveops/offers/$id'
+      path: '/liveops/offers/$id'
+      fullPath: '/liveops/offers/$id'
+      preLoaderRoute: typeof AppLiveopsOffersIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/players/accounts/$id': {
       id: '/_app/players/accounts/$id'
       path: '/players/accounts/$id'
@@ -407,6 +559,14 @@ interface AppRouteChildren {
   AppSectionIndexRoute: typeof AppSectionIndexRoute
   AppClusterIndexRoute: typeof AppClusterIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
+  AppLiveopsAudiencesNameRoute: typeof AppLiveopsAudiencesNameRoute
+  AppLiveopsChangesetsIdRoute: typeof AppLiveopsChangesetsIdRoute
+  AppLiveopsConfigsNameRoute: typeof AppLiveopsConfigsNameRoute
+  AppLiveopsExperimentsIdRoute: typeof AppLiveopsExperimentsIdRoute
+  AppLiveopsFlagsNameRoute: typeof AppLiveopsFlagsNameRoute
+  AppLiveopsLive_eventsIdRoute: typeof AppLiveopsLive_eventsIdRoute
+  AppLiveopsNewsIdRoute: typeof AppLiveopsNewsIdRoute
+  AppLiveopsOffersIdRoute: typeof AppLiveopsOffersIdRoute
   AppPlayersAccountsIdRoute: typeof AppPlayersAccountsIdRoute
   AppServersFleetsIdRoute: typeof AppServersFleetsIdRoute
   AppServersServersIdRoute: typeof AppServersServersIdRoute
@@ -427,6 +587,14 @@ const AppRouteChildren: AppRouteChildren = {
   AppSectionIndexRoute: AppSectionIndexRoute,
   AppClusterIndexRoute: AppClusterIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
+  AppLiveopsAudiencesNameRoute: AppLiveopsAudiencesNameRoute,
+  AppLiveopsChangesetsIdRoute: AppLiveopsChangesetsIdRoute,
+  AppLiveopsConfigsNameRoute: AppLiveopsConfigsNameRoute,
+  AppLiveopsExperimentsIdRoute: AppLiveopsExperimentsIdRoute,
+  AppLiveopsFlagsNameRoute: AppLiveopsFlagsNameRoute,
+  AppLiveopsLive_eventsIdRoute: AppLiveopsLive_eventsIdRoute,
+  AppLiveopsNewsIdRoute: AppLiveopsNewsIdRoute,
+  AppLiveopsOffersIdRoute: AppLiveopsOffersIdRoute,
   AppPlayersAccountsIdRoute: AppPlayersAccountsIdRoute,
   AppServersFleetsIdRoute: AppServersFleetsIdRoute,
   AppServersServersIdRoute: AppServersServersIdRoute,

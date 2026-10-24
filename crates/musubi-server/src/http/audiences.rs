@@ -165,7 +165,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/server/audiences", get(list))
         .route(
             "/v1/server/audiences/{name}",
-            axum::routing::put(put).delete(delete_one),
+            get(get_one).put(put).delete(delete_one),
         )
         .route("/v1/server/audiences/of/{account_id}", get(of_account))
         .route("/v1/server/audiences/refresh", post(refresh_all))
@@ -231,6 +231,31 @@ async fn list(State(s): State<AppState>, _k: ServerKey) -> Result<Json<Value>, A
             v
         }).collect::<Vec<_>>(),
     })))
+}
+
+async fn get_one(
+    State(s): State<AppState>,
+    _k: ServerKey,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let row: Option<ListRow> = sqlx::query_as(
+        "select a.name, a.rules, a.description, extract(epoch from a.updated_at)::bigint, a.kind, a.source,
+            (select count(*) from musubi.audience_overrides o where o.audience = a.name and o.mode = 'include' and (o.expires_at is null or o.expires_at > now())),
+            (select count(*) from musubi.audience_overrides o where o.audience = a.name and o.mode = 'exclude' and (o.expires_at is null or o.expires_at > now())),
+            (select count(*) from musubi.audience_managed_members m where m.audience = a.name)
+         from musubi.audiences a where a.name = $1",
+    )
+    .bind(&name)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(Error::internal)?;
+    let Some((n, r, d, u, k, src, inc, exc, mem)) = row else {
+        return Err(Error::NotFound(format!("audience `{name}`")).into());
+    };
+    let mut v = doc((n, r, d, u, k, src));
+    v["overrides"] = json!({ "include": inc, "exclude": exc });
+    v["managed_members"] = json!(mem);
+    Ok(Json(v))
 }
 
 fn rule_kind() -> String {
