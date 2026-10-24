@@ -125,6 +125,21 @@ fn check_text(title: &str, description: &str) -> Result<(), Error> {
     Ok(())
 }
 
+const MAX_METADATA_BYTES: usize = 16 * 1024;
+
+/// Free-form `metadata` is stored as given and echoed in every card: an object, bounded.
+fn check_metadata(m: &Value) -> Result<(), Error> {
+    if !m.is_object() {
+        return Err(Error::InvalidArgument("metadata must be an object".into()));
+    }
+    if m.to_string().len() > MAX_METADATA_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "metadata must be ≤ {MAX_METADATA_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn check_url(url: &Option<String>) -> Result<(), Error> {
     if let Some(u) = url {
         if !(u.starts_with("https://") || u.starts_with("http://")) || u.len() > 2048 {
@@ -203,6 +218,12 @@ async fn create(
     check_text(&r.title, &r.description)?;
     check_url(&r.url)?;
     let tags = normalize_tags(&r.tags)?;
+    let metadata = if r.metadata.is_null() {
+        json!({})
+    } else {
+        r.metadata
+    };
+    check_metadata(&metadata)?;
     let id = Uuid::now_v7();
     sqlx::query(
         "insert into musubi.ugc_items (id, owner_id, kind, title, description, tags, visibility, url, metadata)
@@ -216,7 +237,7 @@ async fn create(
     .bind(&tags)
     .bind(&r.visibility)
     .bind(&r.url)
-    .bind(if r.metadata.is_null() { json!({}) } else { r.metadata })
+    .bind(&metadata)
     .execute(&s.db)
     .await
     .map_err(Error::internal)?;
@@ -398,6 +419,9 @@ async fn update(
         return Err(
             Error::InvalidArgument("visibility must be public|unlisted|private".into()).into(),
         );
+    }
+    if let Some(m) = &r.metadata {
+        check_metadata(m)?;
     }
     let metadata = r.metadata.unwrap_or_else(|| row.get("metadata"));
     sqlx::query(
@@ -717,6 +741,8 @@ async fn submit(
     Bearer(me): Bearer,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
+    s.banned.check_feature(me.account_id, "ugc")?;
+    s.age.check(me.account_id, "ugc")?;
     let row = owned(&s, id, me.account_id).await?;
     let status: String = row.get("status");
     if status != "draft" && status != "rejected" {
@@ -1171,6 +1197,9 @@ async fn moderate(
         )
         .into());
     }
+    if r.reason.chars().count() > 2000 || r.by.chars().count() > 128 {
+        return Err(Error::InvalidArgument("reason ≤ 2000 chars, by ≤ 128 chars".into()).into());
+    }
     let Some(row) = fetch(&s, id).await? else {
         return Err(Error::NotFound(format!("ugc item {id}")).into());
     };
@@ -1198,4 +1227,31 @@ async fn moderate(
         .await?
         .ok_or_else(|| Error::internal("ugc row vanished"))?;
     Ok(Json(item_json(&row)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_is_a_bounded_object() {
+        assert!(check_metadata(&json!({ "a": 1 })).is_ok());
+        assert!(check_metadata(&json!([1, 2])).is_err());
+        assert!(check_metadata(&json!("s")).is_err());
+        assert!(check_metadata(&Value::Null).is_err());
+        let big = json!({ "blob": "x".repeat(MAX_METADATA_BYTES) });
+        assert!(check_metadata(&big).is_err());
+    }
+
+    #[test]
+    fn like_escapes_wildcards_and_tags_normalize() {
+        assert_eq!(like("50%_off\\"), "%50\\%\\_off\\\\%");
+        assert_eq!(
+            normalize_tags(&[" Map ".into(), "map".into()]).unwrap(),
+            vec!["map"]
+        );
+        assert!(normalize_tags(&vec!["t".into(); 11]).is_err());
+        assert!(check_url(&Some("ftp://x".into())).is_err());
+        assert!(check_url(&Some("https://x".into())).is_ok());
+    }
 }

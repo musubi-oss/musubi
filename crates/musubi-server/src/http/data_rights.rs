@@ -238,11 +238,20 @@ pub async fn poll(s: &AppState) -> Result<(usize, usize, u64)> {
                 done += 1;
             }
             Err(e) => {
+                // `error` is shown to the player in `GET /v1/account/data_requests`: internal
+                // (DB / IO) texts stay in the log
+                let shown = match &e {
+                    Error::Internal(_) => {
+                        tracing::warn!(request_id = %r.0, kind = %r.2, error = %e, "data rights request failed");
+                        "internal error".to_string()
+                    }
+                    other => other.to_string(),
+                };
                 sqlx::query(
                     "update musubi.data_rights_requests set status = 'failed', completed_at = now(), error = $2 where id = $1",
                 )
                 .bind(r.0)
-                .bind(e.to_string())
+                .bind(&shown)
                 .execute(&s.db)
                 .await
                 .map_err(Error::internal)?;
@@ -250,7 +259,7 @@ pub async fn poll(s: &AppState) -> Result<(usize, usize, u64)> {
                     .emit(
                         "data_rights.failed",
                         Some(acc),
-                        json!({ "request_id": r.0, "kind": r.2, "error": e.to_string() }),
+                        json!({ "request_id": r.0, "kind": r.2, "error": shown }),
                     )
                     .await;
                 failed += 1;

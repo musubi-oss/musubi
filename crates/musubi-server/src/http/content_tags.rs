@@ -93,10 +93,11 @@ async fn fetch(s: &AppState, tag: Option<&str>, table: Option<&str>) -> Result<V
         valid_tag(t)?;
     }
     sqlx::query_as(
-        "select table_name, entry_key, tag from musubi.content_tags
-         where ($1::text is null or table_name = $1) and ($2::text is null or entry_key in
-               (select entry_key from musubi.content_tags where tag = $2 and table_name = musubi.content_tags.table_name))
-         order by table_name, entry_key, tag limit 10000",
+        "select c.table_name, c.entry_key, c.tag from musubi.content_tags c
+         where ($1::text is null or c.table_name = $1) and ($2::text is null or exists
+               (select 1 from musubi.content_tags i
+                 where i.tag = $2 and i.table_name = c.table_name and i.entry_key = c.entry_key))
+         order by c.table_name, c.entry_key, c.tag limit 10000",
     )
     .bind(table)
     .bind(tag)

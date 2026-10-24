@@ -60,6 +60,27 @@ fn doc_json(d: &Doc, with_body: bool) -> Value {
     v
 }
 
+/// What a player may declare as country / locale (stored on consents and legal_profiles): an
+/// ISO 3166-1 alpha-2 country and a BCP 47-ish locale tag; empty means "unchanged".
+fn check_region(country: Option<&str>, locale: Option<&str>) -> Result<()> {
+    if country.is_some_and(|c| c.len() > 2 || !c.bytes().all(|b| b.is_ascii_alphabetic())) {
+        return Err(Error::InvalidArgument(
+            "country must be an ISO 3166-1 alpha-2 code".into(),
+        ));
+    }
+    if locale.is_some_and(|l| {
+        l.len() > 16
+            || !l
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }) {
+        return Err(Error::InvalidArgument(
+            "locale must be 1..=16 of [A-Za-z0-9_-]".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn valid_key(k: &str) -> bool {
     !k.is_empty()
         && k.len() <= 64
@@ -240,6 +261,7 @@ async fn consent(
     if b.accept.len() + b.decline.len() > 64 {
         return Err(Error::InvalidArgument("too many choices".into()).into());
     }
+    check_region(b.country.as_deref(), b.locale.as_deref())?;
     if b.country.is_some() || b.locale.is_some() {
         sqlx::query(
             "insert into musubi.legal_profiles (account_id, country, locale) values ($1, $2, $3)
@@ -403,11 +425,34 @@ async fn upsert(
     if version < 1 {
         return Err(Error::InvalidArgument("version starts at 1".into()).into());
     }
-    if b.title.trim().is_empty() {
-        return Err(Error::InvalidArgument("title is required".into()).into());
+    if b.title.trim().is_empty() || b.title.chars().count() > 256 {
+        return Err(Error::InvalidArgument("title is required (≤ 256 chars)".into()).into());
     }
     if b.body.len() > 1_000_000 {
         return Err(Error::InvalidArgument("body too large (1 MB)".into()).into());
+    }
+    if b.url.len() > 2048
+        || !(b.url.is_empty() || b.url.starts_with("https://") || b.url.starts_with("http://"))
+    {
+        return Err(
+            Error::InvalidArgument("url must be an http(s) URL (≤ 2048 chars)".into()).into(),
+        );
+    }
+    if b.countries.len() > 64
+        || b.countries
+            .iter()
+            .any(|c| check_region(Some(c), None).is_err())
+    {
+        return Err(Error::InvalidArgument(
+            "countries: at most 64 ISO 3166-1 alpha-2 codes".into(),
+        )
+        .into());
+    }
+    if b.locale
+        .as_deref()
+        .is_some_and(|l| check_region(None, Some(l)).is_err())
+    {
+        return Err(Error::InvalidArgument("locale must be 1..=16 of [A-Za-z0-9_-]".into()).into());
     }
     let locale = b
         .locale
@@ -585,4 +630,23 @@ async fn consents_of_account(
         "consents": rows.iter().map(consent_json).collect::<Vec<_>>(),
         "pending": pending.iter().map(|(r, e)| json!({ "key": r.key, "version": r.version, "enforced": e })).collect::<Vec<_>>(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_inputs_are_strict() {
+        assert!(check_region(Some("DE"), Some("de-DE")).is_ok());
+        assert!(check_region(Some(""), Some("")).is_ok());
+        assert!(check_region(None, None).is_ok());
+        assert!(check_region(Some("DEU"), None).is_err());
+        assert!(check_region(Some("D1"), None).is_err());
+        assert!(check_region(None, Some("en US")).is_err());
+        assert!(check_region(None, Some(&"a".repeat(17))).is_err());
+        assert!(valid_key("terms-of_service1"));
+        assert!(!valid_key("Terms"));
+        assert!(!valid_key(&"k".repeat(65)));
+    }
 }

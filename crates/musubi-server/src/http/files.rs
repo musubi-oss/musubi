@@ -79,6 +79,26 @@ const FILE_COLS: &str = "path, size, sha256, mime, public, selector, metadata, v
 const MAX_TAGS: usize = 16;
 
 /// `a,b, C` → `["a", "b", "c"]`: lower-case, trimmed, deduplicated, `[a-z0-9_.:-]{1,32}`, ≤ 16.
+/// `metadata` is merged with `||` in SQL: anything but an object makes Postgres fail (500).
+fn check_metadata(m: &Value) -> Result<(), Error> {
+    if !m.is_object() {
+        return Err(Error::InvalidArgument("metadata must be an object".into()));
+    }
+    Ok(())
+}
+
+/// `LIKE` pattern matching exactly the paths that start with `prefix` (`%`, `_` and `\` in the
+/// prefix are literals, not wildcards).
+fn like_prefix(prefix: &str) -> String {
+    format!(
+        "{}%",
+        prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
+}
+
 fn parse_tags(raw: &str) -> Result<Vec<String>, ApiError> {
     let mut out: Vec<String> = Vec::new();
     for t in raw.split(',') {
@@ -189,7 +209,10 @@ async fn upload(
         .to_string();
     let metadata: Value = match &q.metadata {
         Some(m) => {
-            serde_json::from_str(m).map_err(|e| Error::InvalidArgument(format!("metadata: {e}")))?
+            let v: Value = serde_json::from_str(m)
+                .map_err(|e| Error::InvalidArgument(format!("metadata: {e}")))?;
+            check_metadata(&v)?;
+            v
         }
         None => json!({}),
     };
@@ -257,6 +280,9 @@ async fn patch_meta(
     Path(path): Path<String>,
     Json(b): Json<MetaBody>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(m) = &b.metadata {
+        check_metadata(m)?;
+    }
     if let Some(sel) = &b.selector {
         if !sel.is_object() {
             return Err(Error::InvalidArgument("selector must be an object".into()).into());
@@ -321,10 +347,10 @@ async fn list_server(
     Query(q): Query<ListQ>,
 ) -> Result<Json<Value>, ApiError> {
     let rows: Vec<FileRow> = sqlx::query_as(&format!(
-        "select {FILE_COLS} from musubi.files where path like $1 || '%'
+        "select {FILE_COLS} from musubi.files where path like $1
            and ($2::text is null or $2 = any(tags)) order by path"
     ))
-    .bind(q.prefix.unwrap_or_default())
+    .bind(like_prefix(q.prefix.as_deref().unwrap_or_default()))
     .bind(q.tag.map(|t| t.trim().to_ascii_lowercase()))
     .fetch_all(&s.db)
     .await
@@ -376,9 +402,9 @@ async fn tags_index(
     let authed = maybe_account(&s, &headers)?;
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "select t, count(*) from musubi.files, unnest(tags) t
-         where path like $1 || '%' and (public or $2) group by t order by t",
+         where path like $1 and (public or $2) group by t order by t",
     )
-    .bind(q.prefix.unwrap_or_default())
+    .bind(like_prefix(q.prefix.as_deref().unwrap_or_default()))
     .bind(authed)
     .fetch_all(&s.db)
     .await
@@ -416,9 +442,9 @@ async fn manifest(
         .is_some_and(|v| v == "true" || v == "1");
     let ctx = crate::http::remote_config::enrich(&s, ctx_from(q, &headers)).await;
     let rows: Vec<FileRow> = sqlx::query_as(&format!(
-        "select {FILE_COLS} from musubi.files where path like $1 || '%' and (public or $2) order by path"
+        "select {FILE_COLS} from musubi.files where path like $1 and (public or $2) order by path"
     ))
-    .bind(&prefix)
+    .bind(like_prefix(&prefix))
     .bind(authed)
     .fetch_all(&s.db)
     .await
@@ -546,5 +572,20 @@ mod tests {
         assert!(check_path("manifest").is_err());
         assert!(check_path("sp ace").is_err());
         assert!(check_path("").is_err());
+    }
+
+    #[test]
+    fn like_prefix_escapes_wildcards() {
+        assert_eq!(like_prefix(""), "%");
+        assert_eq!(like_prefix("patches/1.2"), "patches/1.2%");
+        assert_eq!(like_prefix("a%b_c\\d"), "a\\%b\\_c\\\\d%");
+    }
+
+    #[test]
+    fn metadata_must_be_an_object() {
+        assert!(check_metadata(&json!({ "k": 1 })).is_ok());
+        assert!(check_metadata(&json!([1])).is_err());
+        assert!(check_metadata(&json!("x")).is_err());
+        assert!(check_metadata(&Value::Null).is_err());
     }
 }

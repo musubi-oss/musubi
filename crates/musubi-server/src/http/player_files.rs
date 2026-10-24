@@ -469,6 +469,8 @@ async fn download(
                 header::CONTENT_DISPOSITION,
                 format!("inline; filename=\"{filename}\""),
             ),
+            // the mime is whatever the uploader declared: never let a browser sniff it into HTML
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
             (
                 header::HeaderName::from_static("x-musubi-file-revision"),
                 rev.to_string(),

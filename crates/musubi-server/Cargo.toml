@@ -76,6 +76,8 @@ maxminddb.workspace = true
 tar.workspace = true
 flate2.workspace = true
 hex.workspace = true
+# constant-time comparison of capability tokens (build artifacts)
+subtle = "2"
 include_dir.workspace = true
 
 jsonwebtoken.workspace = true

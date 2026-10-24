@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,6 +31,8 @@ use crate::app::AppState;
 use crate::http::{ApiError, ServerKey};
 
 const MAX_BYTES: usize = 4 << 30;
+/// `POST …/delta` carries up to a million chunk hashes (66 bytes each as JSON).
+const DELTA_MAX_BYTES: usize = 96 << 20;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -39,11 +41,17 @@ pub fn router() -> Router<AppState> {
         .route("/v1/server/builds/gc", post(gc))
         .route(
             "/v1/server/builds/{name}/{version}",
-            get(get_one).put(upload).delete(delete),
+            get(get_one)
+                .put(upload)
+                .delete(delete)
+                .layer(DefaultBodyLimit::max(MAX_BYTES)),
         )
         .route("/v1/server/builds/{name}/{version}/download", get(download))
         .route("/v1/server/builds/{name}/{version}/manifest", get(manifest))
-        .route("/v1/server/builds/{name}/{version}/delta", post(delta))
+        .route(
+            "/v1/server/builds/{name}/{version}/delta",
+            post(delta).layer(DefaultBodyLimit::max(DELTA_MAX_BYTES)),
+        )
         .route(
             "/v1/server/builds/{name}/{version}/upload",
             post(begin_upload),
@@ -51,10 +59,11 @@ pub fn router() -> Router<AppState> {
         .route("/v1/server/builds/{name}/{version}/commit", post(commit))
         .route(
             "/v1/server/builds/{name}/{version}/chunks/{hash}",
-            get(get_chunk).put(put_chunk),
+            get(get_chunk)
+                .put(put_chunk)
+                .layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/server/fleets/{id}/cost", get(fleet_cost))
-        .layer(DefaultBodyLimit::max(MAX_BYTES))
 }
 
 type Row = (
@@ -436,6 +445,20 @@ struct Meta {
     metadata: Value,
 }
 
+/// Printable ASCII only: these bytes end up in `Content-Type` / `Content-Disposition` headers.
+fn header_safe(b: u8) -> bool {
+    (0x20..0x7f).contains(&b)
+}
+
+/// A filename that is safe to echo in `Content-Disposition: attachment; filename="…"`: no path
+/// separators, no quotes, no control or non-ASCII bytes.
+fn filename_ok(f: &str) -> bool {
+    !f.is_empty()
+        && f.len() <= 128
+        && f.bytes()
+            .all(|b| header_safe(b) && b != b'"' && b != b'/' && b != b'\\')
+}
+
 fn meta_from(
     name: &str,
     version: &str,
@@ -445,7 +468,7 @@ fn meta_from(
     metadata: Option<Value>,
 ) -> Result<Meta> {
     let filename = filename
-        .filter(|f| !f.is_empty() && f.len() <= 128 && !f.contains('/') && !f.contains('\\'))
+        .filter(|f| filename_ok(f))
         .unwrap_or_else(|| format!("{name}-{version}.bin"));
     if notes.as_ref().is_some_and(|n| n.len() > 500) {
         return Err(Error::InvalidArgument("notes exceed 500 chars".into()));
@@ -460,7 +483,7 @@ fn meta_from(
         None => json!({}),
     };
     let mime = mime
-        .filter(|m| !m.is_empty() && m.len() <= 128)
+        .filter(|m| !m.is_empty() && m.len() <= 128 && m.bytes().all(header_safe))
         .unwrap_or_else(|| "application/octet-stream".into());
     Ok(Meta {
         filename,
@@ -825,18 +848,19 @@ async fn put_chunk(
     State(s): State<AppState>,
     _k: ServerKey,
     Path((name, version, hash)): Path<(String, String, String)>,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> Result<Json<Value>, ApiError> {
     check_ident("build name", &name)?;
     check_ident("build version", &version)?;
     check_hash(&hash)?;
     let p = params(&s)?;
-    if body.is_empty() || body.len() > p.max.max(64 << 20) {
-        return Err(Error::InvalidArgument(format!(
-            "chunk must be 1..={} bytes",
-            p.max.max(64 << 20)
-        ))
-        .into());
+    let max = p.max.max(64 << 20);
+    // read at most `max` bytes: a 4 GiB body must not be buffered just to be rejected below
+    let body = axum::body::to_bytes(body, max)
+        .await
+        .map_err(|_| Error::InvalidArgument(format!("chunk must be 1..={max} bytes")))?;
+    if body.is_empty() || body.len() > max {
+        return Err(Error::InvalidArgument(format!("chunk must be 1..={max} bytes")).into());
     }
     let declared: Option<i64> = sqlx::query_scalar(
         "select (c->>'size')::bigint from musubi.build_uploads u,
@@ -984,15 +1008,18 @@ struct TokenQ {
 
 /// Launchers hold the artifact's token (capability URL), operators the server key.
 fn authorize(s: &AppState, r: &Row, q: &TokenQ, headers: &HeaderMap) -> Result<()> {
-    let by_token = q.token.as_deref() == Some(r.7.as_str());
-    let by_key = headers
-        .get("x-musubi-server-key")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|k| s.fleets.server_key_matches(k));
-    if !by_token && !by_key {
-        return Err(Error::Unauthenticated("artifact token required".into()));
+    let by_token = q.token.as_deref().is_some_and(|t| token_matches(t, &r.7));
+    // the same check every `/v1/server` route runs: constant-time, issued keys included
+    if by_token || crate::http::extract::check_server_key(s, headers).is_ok() {
+        return Ok(());
     }
-    Ok(())
+    Err(Error::Unauthenticated("artifact token required".into()))
+}
+
+/// Capability tokens are compared in constant time so a launcher cannot learn one byte at a time.
+fn token_matches(given: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    !expected.is_empty() && bool::from(given.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 /// `GET /v1/server/builds/{name}/{version}/download?token=` — the whole artifact (chunked
@@ -1041,21 +1068,23 @@ async fn download(
             }
         }
     };
-    Ok(Response::builder()
+    // rows written before `filename_ok` / `header_safe` may hold bytes a header cannot carry
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{}\"", r.2))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    let mime = HeaderValue::from_str(&r.5)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, &r.5)
+        .header(header::CONTENT_TYPE, mime)
         .header(header::CONTENT_LENGTH, r.3)
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", r.2),
-        )
+        .header(header::CONTENT_DISPOSITION, disposition)
         .header("x-artifact-sha256", &r.4)
         .header(
             header::CACHE_CONTROL,
             "private, max-age=31536000, immutable",
         )
         .body(body)
-        .unwrap())
+        .map_err(|e| Error::internal(e).into())
 }
 
 /// `GET /v1/server/builds/{name}/{version}/manifest?token=` — chunk list for launchers that
@@ -1332,4 +1361,48 @@ async fn fleet_cost(
         "max_hourly": c.hourly_per_server * f.max_servers as f64,
         "max_monthly": c.hourly_per_server * f.max_servers as f64 * 730.0,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_compare_exactly() {
+        assert!(token_matches("abc", "abc"));
+        assert!(!token_matches("abc", "abd"));
+        assert!(!token_matches("ab", "abc"));
+        assert!(!token_matches("abcd", "abc"));
+        assert!(!token_matches("", ""));
+    }
+
+    #[test]
+    fn filenames_are_header_safe() {
+        assert!(filename_ok("game-1.2.zip"));
+        assert!(filename_ok("Game Build (final).bin"));
+        assert!(!filename_ok(""));
+        assert!(!filename_ok("a/b"));
+        assert!(!filename_ok("a\\b"));
+        assert!(!filename_ok("a\"b"));
+        assert!(!filename_ok("a\r\nX-Injected: 1"));
+        assert!(!filename_ok("игра.zip"));
+        assert!(!filename_ok(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn meta_falls_back_on_bad_filename_and_mime() {
+        let m = meta_from(
+            "game",
+            "1.0",
+            Some("bad\nname".into()),
+            Some("text/plain\r\n".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(m.filename, "game-1.0.bin");
+        assert_eq!(m.mime, "application/octet-stream");
+        assert!(meta_from("g", "1", None, None, None, Some(json!([1]))).is_err());
+        assert!(meta_from("g", "1", None, None, Some("x".repeat(501)), None).is_err());
+    }
 }

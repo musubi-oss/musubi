@@ -52,12 +52,7 @@ fn rfc(t: OffsetDateTime) -> String {
 }
 
 fn doc(r: &Row) -> Value {
-    let ak = &r.6;
-    let hint = if ak.len() > 4 {
-        format!("…{}", &ak[ak.len() - 4..])
-    } else {
-        "…".into()
-    };
+    let hint = access_key_hint(&r.6);
     json!({
         "name": r.0, "endpoint": r.1, "region": r.2, "bucket": r.3, "prefix": r.4,
         "path_style": r.5, "access_key_hint": hint, "secret_key": "***", "note": r.8,
@@ -78,6 +73,16 @@ struct PutBody {
     secret_key: Option<String>,
     note: String,
     labels: Vec<String>,
+}
+
+/// Last four characters of the access key (never bytes: a non-ASCII key must not panic `list`).
+fn access_key_hint(ak: &str) -> String {
+    let n = ak.chars().count();
+    if n > 4 {
+        format!("…{}", ak.chars().skip(n - 4).collect::<String>())
+    } else {
+        "…".into()
+    }
 }
 
 fn name_ok(n: &str) -> bool {
@@ -288,4 +293,18 @@ async fn probe(
     Ok(Json(
         json!({"name": name, "status": status, "error": error, "ms": ms, "key": key}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_key_hint_is_char_safe() {
+        assert_eq!(access_key_hint("AKIAEXAMPLE"), "…MPLE");
+        assert_eq!(access_key_hint("abcd"), "…");
+        assert_eq!(access_key_hint(""), "…");
+        assert_eq!(access_key_hint("ключ-доступа"), "…тупа");
+        assert_eq!(access_key_hint("ab€"), "…");
+    }
 }
