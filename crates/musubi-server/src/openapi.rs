@@ -65,6 +65,7 @@ pub const ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/v1/admin/accounts/policy", "admin"),
     ("PUT", "/v1/admin/accounts/policy", "admin"),
     ("GET", "/v1/admin/accounts/lookup", "admin"),
+    ("GET", "/v1/admin/search", "admin"),
     ("POST", "/v1/admin/accounts/dormant/sweep", "admin"),
     ("GET", "/v1/account/policy", "admin"),
     ("GET", "/v1/admin/auth/locks/{email}", "admin"),

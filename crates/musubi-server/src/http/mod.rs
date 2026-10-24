@@ -86,6 +86,7 @@ pub mod reputation;
 mod rpc;
 mod rtc;
 pub mod sanctions;
+mod search;
 pub mod secrets;
 mod server_browser;
 mod session_vars;
@@ -245,6 +246,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/v1/node", get(node_info))
         .merge(admin::routes())
+        .merge(search::routes())
         .merge(crate::idl::router())
         .merge(configs::router())
         .merge(timers::router())

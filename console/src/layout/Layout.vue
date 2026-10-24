@@ -5,6 +5,7 @@ import { sections } from '../router'
 import { useRouter } from 'vue-router'
 import { toast } from '../stores/toast'
 import { net } from '../api/client'
+import CmdK from '../components/CmdK.vue'
 const s = useSession(); const router = useRouter()
 async function logout() { await s.logout(); router.push('/login') }
 // `/` focuses the first search / filter box on the page, `r` refreshes it, `Esc` blurs an input.
@@ -31,9 +32,10 @@ onMounted(() => { window.addEventListener('keydown', key); window.addEventListen
     </div>
     <div class="nav">
       <router-link to="/" exact-active-class="router-link-active">Overview</router-link><router-link v-for="x in sections" :key="x.id" :to="'/' + x.id">{{ x.title }}</router-link>
-      <span class="keys" title="keyboard: / search · r refresh · Esc close">/ · r · Esc</span>
+      <span class="keys" title="keyboard: ⌘K / Ctrl-K global search · / page filter · r refresh · Esc close">⌘K · / · r · Esc</span>
     </div>
   </div>
+  <CmdK />
   <slot />
   <div class="toasts"><div v-for="t in toast.items" :key="t.id" class="toast" :class="{ bad: t.bad }" @click="toast.dismiss(t.id)">{{ t.msg }}</div></div>
 </template>
