@@ -16,6 +16,9 @@ API="${MUSUBI_API:-http://127.0.0.1:7360}"; KEY="${MUSUBI_SERVER_KEY:-defaultkey
 DB="${MUSUBI_TEST_DATABASE_URL:-postgres://musubi:musubi@localhost:5433/musubi}"
 # NITL_CHAOS=1 (phase 9g-7): node netsim on the client sessions (latency/jitter/loss), a second client on its own
 # entity owned by s2, s2 killed while the handover is in flight, s2b takes the cell over.
+# NITL_JOIN=1: the world carries a player_spawn policy and s1 spawns nothing; the client travels to musubi://<world>:0
+# without an entity and the node spawns its avatar on world_join (owner = the client's account); s1 walks it.
+JOIN="${NITL_JOIN:-0}"
 CHAOS="${NITL_CHAOS:-0}"; NAMES="nitl-s1 nitl-s2 nitl-c"; [ "$CHAOS" = 1 ] && NAMES="nitl-s1 nitl-s2 nitl-c nitl-c2 nitl-s2b"
 # NITL_PROJECT=<dir of a built project incl. Plugins/Musubi> + NITL_MAP=<map>: run the same scenario on another project
 # (the Third Person demo, phase 9g-9: `tools/demo-build.sh <ver>` then NITL_PROJECT=target/ue/demo-<ver>/MusubiThirdPerson).
@@ -42,7 +45,13 @@ if ! curl -fsS "$API/healthz" >/dev/null 2>&1; then
 fi
 curl -fsS "$API/healthz" >/dev/null || { echo "node not up"; tail -20 "$OUT/node.log"; exit 1; }
 echo "== world $WORLD"
-curl -fsS -X POST "$API/v1/server/worlds" -H "x-musubi-server-key: $KEY" -H 'content-type: application/json' -d "{\"name\":\"$WORLD\"}" > "$OUT/world.json"
+WBODY="{\"name\":\"$WORLD\"}"
+if [ "$JOIN" = 1 ]; then
+  # default cell size 256 (see WorldConfig::default); the avatar appears 40 units before the border of cell 0,0
+  JX=$((${NITL_CELL:-256} - 40)); JZ="${NITL_SPAWN_Z:-0}"
+  WBODY="{\"name\":\"$WORLD\",\"config\":{\"player_spawn\":{\"components\":{\"z\":$JZ},\"points\":[{\"x\":$JX,\"y\":100,\"z\":0}],\"persistent\":false}}}"
+fi
+curl -fsS -X POST "$API/v1/server/worlds" -H "x-musubi-server-key: $KEY" -H 'content-type: application/json' -d "$WBODY" > "$OUT/world.json"
 CELL=$(python3 -c "import json,sys;d=json.load(open('$OUT/world.json'));print(int(d.get('config',d).get('cell_size',1000)))")
 echo "cell_size=$CELL"
 X0=$((CELL - 40)); WALK=${NITL_WALK:-60}; [ "$CHAOS" = 1 ] && X0=$((CELL / 4)) # chaos: a longer walk to the border so s2 can be killed just before it
@@ -65,10 +74,22 @@ S2SPAWN=""; if [ "$CHAOS" = 1 ]; then
   echo "netsim: $(head -c 300 "$OUT/netsim.json")"
 fi
 SZ=""; [ -n "${NITL_SPAWN_Z:-}" ] && SZ=",$NITL_SPAWN_Z" # a map with a floor (the demo): spawn height, the Entry map has none
-ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" -MusubiNitlSpawn="$X0,100$SZ" -MusubiNitlWalk="$WALK"
+S1SPAWN="-MusubiNitlSpawn=$X0,100$SZ"; [ "$JOIN" = 1 ] && S1SPAWN="" # join: the node spawns the avatar from the policy
+ue nitl-s1 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="0,0" $S1SPAWN -MusubiNitlWalk="$WALK"
 ue nitl-s2 -server ${NITL_SERVER_EXTRA:-} -MusubiNitl=server -MusubiCells="1,0" -MusubiNitlWalk="$WALK" $S2SPAWN
 ENTITY=""
+if [ "$JOIN" = 1 ]; then
+  # s1 must hold its cell before the client joins, so the policy spawn lands on a live lease
+  for i in $(seq 1 180); do docker logs nitl-s1 2>&1 | grep -q "nitl: cell .* assigned=1" && break; sleep 1; done
+  echo "== client (join)"
+  ue nitl-c -game -MusubiNitl=client -MusubiNitlJoin -MusubiNitlWalk="$WALK"
+  for i in $(seq 1 180); do
+    ENTITY=$(docker logs nitl-c 2>&1 | sed -n 's/.*my avatar in .* is \([0-9a-f-]*\) .*/\1/p' | head -1); [ -n "$ENTITY" ] && break; sleep 1
+  done
+  [ -n "$ENTITY" ] || { echo "client never got its avatar (world_join)"; docker logs nitl-c 2>&1 | grep -i "musubi\|error" | tail -40; exit 1; }
+fi
 for i in $(seq 1 180); do
+  [ -n "$ENTITY" ] && break
   ENTITY=$(docker logs nitl-s1 2>&1 | sed -n 's/.*nitl: spawned \([0-9a-f-]*\).*/\1/p' | head -1); [ -n "$ENTITY" ] && break; sleep 1
 done
 curl -fsS "$API/v1/server/worlds/$WORLD" -H "x-musubi-server-key: $KEY" > "$OUT/world-after.json" 2>/dev/null; echo "world state: $(head -c 600 "$OUT/world-after.json")"
@@ -78,8 +99,10 @@ ENTITY2=""; if [ "$CHAOS" = 1 ]; then
   for i in $(seq 1 120); do ENTITY2=$(docker logs nitl-s2 2>&1 | sed -n 's/.*nitl: spawned \([0-9a-f-]*\).*/\1/p' | head -1); [ -n "$ENTITY2" ] && break; sleep 1; done
   [ -n "$ENTITY2" ] || { echo "s2 never spawned the second entity"; exit 1; }; echo "entity2=$ENTITY2"
 fi
-echo "== client"
-ue nitl-c -game -MusubiNitl=client -MusubiEntity="$ENTITY" -MusubiNitlWalk="$WALK"
+if [ "$JOIN" != 1 ]; then
+  echo "== client"
+  ue nitl-c -game -MusubiNitl=client -MusubiEntity="$ENTITY" -MusubiNitlWalk="$WALK"
+fi
 if [ "$CHAOS" = 1 ]; then
   ue nitl-c2 -game -MusubiNitl=client -MusubiEntity="$ENTITY2" -MusubiNitlWalk=0
   # kill s2 when the walking pawn is 1-2 s from the border: its lease (2 s) is still valid, so the node starts the
@@ -109,6 +132,7 @@ chk() { if grep -q -- "$2" "$OUT/$1.log"; then echo "PASS $1: $2"; else echo "FA
 chk nitl-s1 "nitl: handover $ENTITY completed"
 chk $S2LOG "nitl: handover $ENTITY request ack"
 chk nitl-c  "nitl: travelling to musubi://"
+if [ "$JOIN" = 1 ]; then chk nitl-c "my avatar in $WORLD is $ENTITY (spawned)"; chk nitl-c "relay .* open on $ENTITY" ; fi
 chk nitl-c  "Welcomed by server"
 chk nitl-c  "rehoming in place"
 chk nitl-c  "rehomed in place"
@@ -155,6 +179,7 @@ case "$H" in *"changes=0 live=1") echo "PASS nitl-c: entity handle resolves to t
 # replicated components in the binary iris state: the ghost on s2 saw the inventory before owning, the new owner carried on from it
 EXPC=$(grep -o "first binary iris state exported ([0-9]* component" "$OUT/nitl-s1.log" | head -1 | grep -o "[0-9]*")
 if [ "${EXPC:-0}" -ge 1 ]; then echo "PASS nitl-s1: replicated components exported in the iris state ($EXPC)"; else echo "FAIL nitl-s1: replicated components exported in the iris state (${EXPC:-0})"; ok=0; fi
+if [ "$JOIN" = 1 ]; then echo "SKIP nitl-s: inventory / iris-seed / subobject-seed checks (the node-spawned avatar carries no NITL seed; the client did see the new owner's FastArray and subobject above)"; else
 GINV=$(grep "nitl: server pawn .* id=$ENTITY owned=0 " "$OUT/$S2LOG.log" | grep -o "inv=[0-9]* gold=[0-9]*" | tail -1)
 GHOW="ghost received the inventory component via iris"
 if [ -z "$GINV" ]; then
@@ -183,6 +208,7 @@ MC=$(grep "nitl: client pawn .* id=$ENTITY " "$OUT/nitl-c.log" | tail -1 | grep 
 if [ "${M1:--1}" = "-1" ]; then echo "SKIP nitl-s: registered subobject carried across the handover (pawn has no Loadout subobject)"
 elif [ -n "$M2" ] && [ "$M1" -ge 1 ] && [ "$M2" -ge "$M1" ]; then echo "PASS nitl-s: registered subobject carried across the handover without reset (ammo s1 $M1 -> s2 $M2)"; else echo "FAIL nitl-s: registered subobject carried across the handover without reset (ammo s1 ${M1:-?} -> s2 ${M2:-?})"; ok=0; fi
 if [ "${M1:--1}" = "-1" ]; then :; elif [ -n "$MC" ] && [ "$MC" -ge "$M1" ]; then echo "PASS nitl-c: client sees the registered subobject from the new owner (ammo=$MC)"; else echo "FAIL nitl-c: client sees the registered subobject from the new owner (ammo=${MC:-?}, s1 had $M1)"; ok=0; fi
+fi
 if grep -q "already has a push id" "$OUT/nitl-s1.log" "$OUT/$S2LOG.log"; then echo "FAIL nitl-s: no push id conflict between the Iris export and the GameNetDriver"; ok=0; else echo "PASS nitl-s: no push id conflict between the Iris export and the GameNetDriver"; fi
 if [ "$CHAOS" = 1 ]; then
   chk nitl-s1 "nitl: handover $ENTITY cancelled"

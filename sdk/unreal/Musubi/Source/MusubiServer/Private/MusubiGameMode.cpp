@@ -6,6 +6,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "Engine/NetConnection.h"
 #include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"
 #include "Dom/JsonObject.h"
@@ -37,6 +38,18 @@ APawn* AMusubiGameMode::OwnedPawnFor(const FString& Entity) const
 	APawn* P = Cast<APawn>(A);
 	const UMusubiAuthorityComponent* Auth = P ? P->FindComponentByClass<UMusubiAuthorityComponent>() : nullptr;
 	return (Auth && Auth->IsOwned() && !Auth->IsInHandover()) ? P : nullptr;
+}
+
+APlayerController* AMusubiGameMode::Login(UPlayer* NewPlayer, ENetRole InRemoteRole, const FString& Portal, const FString& Options, const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage)
+{
+	FString Opts = Options;
+	if (UGameplayStatics::ParseOption(Options, TEXT("entity")).IsEmpty())
+		if (const UNetConnection* Conn = Cast<UNetConnection>(NewPlayer))
+		{
+			const FString Entity = Conn->URL.GetOption(TEXT("entity="), TEXT(""));
+			if (!Entity.IsEmpty()) Opts += FString::Printf(TEXT("?entity=%s"), *Entity);
+		}
+	return Super::Login(NewPlayer, InRemoteRole, Portal, Opts, UniqueId, ErrorMessage);
 }
 
 FString AMusubiGameMode::InitNewPlayer(APlayerController* NewPlayerController, const FUniqueNetIdRepl& UniqueId, const FString& Options, const FString& Portal)

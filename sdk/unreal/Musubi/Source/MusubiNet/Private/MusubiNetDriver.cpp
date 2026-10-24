@@ -481,7 +481,11 @@ UMusubiNetConnection* UMusubiNetDriver::FindOrOpen(uint64 ConnId, const FMusubiJ
 	Conn->ConnId = ConnId;
 	Conn->Session = Session;
 	Conn->Entity = Entity.ToString();
-	Conn->InitRemoteConnection(this, nullptr, FURL(), *Addr, USOCK_Open);
+	// the entity rides on the connection URL: a client that joined without `?entity=` (world_join)
+	// never put it in its travel URL, so the game mode reads it from here instead of the login options
+	FURL RelayURL;
+	RelayURL.AddOption(*FString::Printf(TEXT("entity=%s"), *Conn->Entity));
+	Conn->InitRemoteConnection(this, nullptr, RelayURL, *Addr, USOCK_Open);
 	AddClientConnection(Conn);
 	if (Conn->Handler.IsValid()) Conn->Handler->BeginHandshaking();
 	ByConn.Add(ConnId, Conn);

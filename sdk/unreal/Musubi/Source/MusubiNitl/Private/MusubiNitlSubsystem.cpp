@@ -136,9 +136,11 @@ void UMusubiNitlSubsystem::OnSocketConnected()
 	FParse::Value(FCommandLine::Get(), TEXT("MusubiWorld="), W);
 	FParse::Value(FCommandLine::Get(), TEXT("MusubiEntity="), E);
 	UWorld* World = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
-	if (W.IsEmpty() || E.IsEmpty() || !World || !GEngine) { UE_LOG(LogMusubiNitl, Error, TEXT("nitl: need -MusubiWorld= and -MusubiEntity=")); return; }
+	// -MusubiNitlJoin: no entity on the URL, the driver asks the node for this account's avatar (world_join)
+	const bool bJoin = FParse::Param(FCommandLine::Get(), TEXT("MusubiNitlJoin"));
+	if (W.IsEmpty() || (E.IsEmpty() && !bJoin) || !World || !GEngine) { UE_LOG(LogMusubiNitl, Error, TEXT("nitl: need -MusubiWorld= and -MusubiEntity= (or -MusubiNitlJoin)")); return; }
 	bTravelled = true;
-	const FString URL = FString::Printf(TEXT("musubi://%s:0?entity=%s"), *W, *E);
+	const FString URL = bJoin ? FString::Printf(TEXT("musubi://%s:0"), *W) : FString::Printf(TEXT("musubi://%s:0?entity=%s"), *W, *E);
 	UE_LOG(LogMusubiNitl, Log, TEXT("nitl: travelling to %s"), *URL);
 	GEngine->SetClientTravel(World, *URL, TRAVEL_Absolute);
 }

@@ -17,6 +17,8 @@ class MUSUBISERVER_API AMusubiGameMode : public AGameModeBase
 	GENERATED_BODY()
 public:
 	AMusubiGameMode();
+	/** A player who joined through `world_join` (musubi://<world>:0, no ?entity=) has no entity in its login options; the relay connection carries it (`UNetConnection::URL`), so it is added to the options here before the regular login. */
+	virtual APlayerController* Login(UPlayer* NewPlayer, ENetRole InRemoteRole, const FString& Portal, const FString& Options, const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage) override;
 	virtual FString InitNewPlayer(APlayerController* NewPlayerController, const FUniqueNetIdRepl& UniqueId, const FString& Options, const FString& Portal = TEXT("")) override;
 	virtual APawn* SpawnDefaultPawnFor_Implementation(AController* NewPlayer, AActor* StartSpot) override;
 	virtual void PostLogin(APlayerController* NewPlayer) override;
