@@ -13,6 +13,7 @@ import { Route as AppRouteImport } from './routes/_app'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppSectionIndexRouteImport } from './routes/_app/$section/index'
+import { Route as AppClusterIndexRouteImport } from './routes/_app/cluster/index'
 import { Route as AppSectionPageIndexRouteImport } from './routes/_app/$section/$page/index'
 import { Route as AppSectionPageIdRouteImport } from './routes/_app/$section/$page/$id'
 import { Route as AppPlayersAccountsIdRouteImport } from './routes/_app/players/accounts/$id'
@@ -37,6 +38,11 @@ const AppIndexRoute = AppIndexRouteImport.update({
 const AppSectionIndexRoute = AppSectionIndexRouteImport.update({
   id: '/$section/',
   path: '/$section/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppClusterIndexRoute = AppClusterIndexRouteImport.update({
+  id: '/cluster/',
+  path: '/cluster/',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSectionPageIndexRoute = AppSectionPageIndexRouteImport.update({
@@ -75,6 +81,7 @@ export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/login': typeof LoginRoute
   '/$section/': typeof AppSectionIndexRoute
+  '/cluster/': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
@@ -86,6 +93,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/': typeof AppIndexRoute
   '/$section': typeof AppSectionIndexRoute
+  '/cluster': typeof AppClusterIndexRoute
   '/$section/$page/$id': typeof AppSectionPageIdRoute
   '/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/servers/fleets/$id': typeof AppServersFleetsIdRoute
@@ -99,6 +107,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/_app/': typeof AppIndexRoute
   '/_app/$section/': typeof AppSectionIndexRoute
+  '/_app/cluster/': typeof AppClusterIndexRoute
   '/_app/$section/$page/$id': typeof AppSectionPageIdRoute
   '/_app/players/accounts/$id': typeof AppPlayersAccountsIdRoute
   '/_app/servers/fleets/$id': typeof AppServersFleetsIdRoute
@@ -112,6 +121,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/$section/'
+    | '/cluster/'
     | '/$section/$page/$id'
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
@@ -123,6 +133,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/'
     | '/$section'
+    | '/cluster'
     | '/$section/$page/$id'
     | '/players/accounts/$id'
     | '/servers/fleets/$id'
@@ -135,6 +146,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/_app/'
     | '/_app/$section/'
+    | '/_app/cluster/'
     | '/_app/$section/$page/$id'
     | '/_app/players/accounts/$id'
     | '/_app/servers/fleets/$id'
@@ -176,6 +188,13 @@ declare module '@tanstack/react-router' {
       path: '/$section'
       fullPath: '/$section/'
       preLoaderRoute: typeof AppSectionIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/cluster/': {
+      id: '/_app/cluster/'
+      path: '/cluster'
+      fullPath: '/cluster/'
+      preLoaderRoute: typeof AppClusterIndexRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/$section/$page/': {
@@ -226,6 +245,7 @@ declare module '@tanstack/react-router' {
 interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
   AppSectionIndexRoute: typeof AppSectionIndexRoute
+  AppClusterIndexRoute: typeof AppClusterIndexRoute
   AppSectionPageIdRoute: typeof AppSectionPageIdRoute
   AppPlayersAccountsIdRoute: typeof AppPlayersAccountsIdRoute
   AppServersFleetsIdRoute: typeof AppServersFleetsIdRoute
@@ -237,6 +257,7 @@ interface AppRouteChildren {
 const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
   AppSectionIndexRoute: AppSectionIndexRoute,
+  AppClusterIndexRoute: AppClusterIndexRoute,
   AppSectionPageIdRoute: AppSectionPageIdRoute,
   AppPlayersAccountsIdRoute: AppPlayersAccountsIdRoute,
   AppServersFleetsIdRoute: AppServersFleetsIdRoute,
