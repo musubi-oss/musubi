@@ -441,7 +441,15 @@ impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self, config::ConfigError> {
         let mut b = config::Config::builder();
         if let Some(p) = path {
-            b = b.add_source(config::File::from(p));
+            // The container image sets MUSUBI_CONFIG to a conventional path that is only there
+            // when the operator mounts a file; env-only nodes must still start.
+            if !p.exists() {
+                eprintln!(
+                    "config file {} not found, starting from defaults + MUSUBI__* env",
+                    p.display()
+                );
+            }
+            b = b.add_source(config::File::from(p).required(false));
         }
         b = b.add_source(
             config::Environment::with_prefix("MUSUBI")
